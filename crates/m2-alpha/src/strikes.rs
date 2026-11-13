@@ -68,6 +68,8 @@ pub struct Strikes {
     shells: Vec<Shell>,
     /// Aircraft over their mark since the last take (guid, where).
     pub arrived: Vec<(u32, Vec3)>,
+    /// Aircraft flown on out of play since the last take.
+    pub gone: Vec<u32>,
     /// Ordnance gone off since the last take (guid, template, where).
     pub burst: Vec<(u32, Option<u32>, Vec3)>,
     /// Ordnance gone off in all, and where the first went off.
@@ -158,6 +160,14 @@ impl Strikes {
             .collect()
     }
 
+    /// The aircraft in the air: each one's guid, place and heading (yaw),
+    /// for the scripts' world (their radar blips follow them).
+    pub fn jets(&self) -> impl Iterator<Item = (u32, Vec3, f32)> + '_ {
+        self.jets
+            .iter()
+            .map(|j| (j.guid, j.at, j.dir.x.atan2(j.dir.z)))
+    }
+
     /// Flies everything on by `dt` seconds.
     pub fn step(&mut self, physics: &Physics, dt: f32) {
         for j in &mut self.jets {
@@ -171,7 +181,14 @@ impl Strikes {
                 None => {}
             }
         }
-        self.jets.retain(|j| j.past.is_none_or(|p| p < FLY_ON));
+        let gone = &mut self.gone;
+        self.jets.retain(|j| {
+            let stays = j.past.is_none_or(|p| p < FLY_ON);
+            if !stays {
+                gone.push(j.guid);
+            }
+            stays
+        });
         let mut burst = Vec::new();
         self.shells.retain_mut(|s| {
             s.age += dt;
@@ -295,6 +312,11 @@ mod tests {
             s.step(&physics, 0.1);
         }
         assert_eq!(s.arrived, vec![(7, Vec3::new(0.0, 0.0, 200.0))]);
+        // In the air it is where it has flown to, heading north; gone,
+        // it says so once.
+        let (guid, at, yaw) = s.jets().next().unwrap();
+        assert_eq!((guid, yaw), (7, 0.0));
+        assert!((at.z - 300.0).abs() < 1.0 && s.gone.is_empty(), "{at}");
         assert_eq!(s.jets.len(), 1);
         // It is heard from where it is for as long as it flies (no
         // template database here: no sound set).
@@ -303,5 +325,7 @@ mod tests {
             s.step(&physics, 0.1);
         }
         assert!(s.sounding().is_empty());
+        assert!(s.jets().next().is_none());
+        assert_eq!(s.gone, vec![7]);
     }
 }

@@ -259,9 +259,6 @@ const ENGINE_FIRED: [&str; 4] = [
 struct Pending {
     id: u32,
     kind: String,
-    params: Table,
-    callback: Value,
-    data: Option<Table>,
     persistent: bool,
     /// For persistent timers: when it last fired.
     last: f64,
@@ -291,6 +288,32 @@ struct Pending {
     lua: LuaHandle,
 }
 
+/// A pending event's values of the scripts': its parameters, its callback
+/// and the callback's data. They are kept in a table of the scripts'
+/// ([`Store::kept`]) by the event's id and read out for a check, not held
+/// from here: each value held from Rust takes a slot of mlua's reference
+/// stack, which is about 8000 deep, and three for each pending event ran
+/// it out ("out of auxiliary stack space") with some 80 script-run layers
+/// in at once.
+#[derive(Debug)]
+struct Live {
+    params: Table,
+    callback: Value,
+    data: Option<Table>,
+}
+
+impl Live {
+    /// Event id's values, kept in kept.
+    fn of(kept: &Table, id: u32) -> Option<Self> {
+        let entry: Table = kept.raw_get(id).ok()?;
+        Some(Self {
+            params: entry.raw_get(1).ok()?,
+            callback: entry.raw_get(2).ok()?,
+            data: entry.raw_get(3).ok()?,
+        })
+    }
+}
+
 /// The scripts' state, weakly (the state holds the events).
 struct LuaHandle(mlua::WeakLua);
 
@@ -304,6 +327,9 @@ impl std::fmt::Debug for LuaHandle {
 struct Store {
     next_id: u32,
     pending: Vec<Pending>,
+    /// The pending events' values, by id ([`Live`]): a table of the
+    /// scripts' state, made as the library is installed.
+    kept: Option<Table>,
     /// `Event.Post` calls not yet delivered: name and data.
     posted: Vec<(String, Value)>,
     /// The names whose `Event.Post`s are copied out too
@@ -334,6 +360,22 @@ impl std::fmt::Debug for LuaRef {
     }
 }
 
+impl Store {
+    /// A pending event's values, read out of the scripts' table.
+    fn live(&self, p: &Pending) -> Option<Live> {
+        Live::of(self.kept.as_ref()?, p.id)
+    }
+
+    /// Lets go of the values of events no longer pending.
+    fn forget(&self, ids: &[u32]) {
+        if let Some(kept) = &self.kept {
+            for &id in ids {
+                let _ = kept.raw_set(id, Value::Nil);
+            }
+        }
+    }
+}
+
 /// The pending events, shared with the `Event` library.
 #[derive(Debug, Clone, Default)]
 pub struct Events {
@@ -351,7 +393,11 @@ impl Events {
     /// Installs the `Event` library: the kind constants and `Create`,
     /// `CreatePersistent`, `Delete` and `Post`.
     pub fn install(&self, lua: &Lua) -> mlua::Result<()> {
-        self.store.borrow_mut().lua = LuaRef(Some(lua.weak()));
+        {
+            let mut s = self.store.borrow_mut();
+            s.lua = LuaRef(Some(lua.weak()));
+            s.kept = Some(lua.create_table()?);
+        }
         let event = lua.create_table()?;
         for kind in KINDS {
             event.set(kind, kind)?;
@@ -397,12 +443,16 @@ impl Events {
                         s.trace
                             .push(format!("{name} {id} {kind}{{{}}}", shown.join(", ")));
                     }
+                    if let Some(kept) = &s.kept {
+                        let entry = lua.create_table_with_capacity(3, 0)?;
+                        entry.raw_set(1, params)?;
+                        entry.raw_set(2, callback)?;
+                        entry.raw_set(3, data)?;
+                        kept.raw_set(id, entry)?;
+                    }
                     s.pending.push(Pending {
                         id,
                         kind,
-                        params,
-                        callback,
-                        data,
                         persistent,
                         last: now,
                         held: false,
@@ -441,6 +491,7 @@ impl Events {
                     let found = s.pending.iter().any(|p| p.id == id);
                     s.deleted.insert(id);
                     s.pending.retain(|p| p.id != id);
+                    s.forget(&[id]);
                     return Ok(MultiValue::from_vec(vec![Value::Boolean(found)]));
                 }
                 Ok(MultiValue::from_vec(vec![Value::Boolean(false)]))
@@ -488,9 +539,17 @@ impl Events {
                         .pending
                         .iter()
                         .filter(|p| p.kind == kind)
-                        .map(|p| (p.callback.clone(), p.data.clone()))
+                        .filter_map(|p| s.live(p))
+                        .map(|h| (h.callback, h.data))
+                        .collect();
+                    let gone: Vec<u32> = s
+                        .pending
+                        .iter()
+                        .filter(|p| !p.persistent && p.kind == kind)
+                        .map(|p| p.id)
                         .collect();
                     s.pending.retain(|p| p.persistent || p.kind != kind);
+                    s.forget(&gone);
                     hits
                 };
                 let mut ran = 0;
@@ -521,7 +580,7 @@ impl Events {
         s.pending
             .iter()
             .filter(|p| p.kind == "Minigame")
-            .filter_map(|p| crate::hijack::Minigame::of(&p.params, s.now - p.made))
+            .filter_map(|p| crate::hijack::Minigame::of(&s.live(p)?.params, s.now - p.made))
             .collect()
     }
 
@@ -542,13 +601,13 @@ impl Events {
     /// game to look whether something solid stands between each and the
     /// camera.
     pub fn sight_watched(&self, world: &dyn World) -> Vec<u32> {
-        let mut out: Vec<u32> = self
-            .store
-            .borrow()
+        let s = self.store.borrow();
+        let mut out: Vec<u32> = s
             .pending
             .iter()
             .filter(|p| p.kind == "ObjectIsVisible")
-            .flat_map(|p| objects(&p.params, 1, world))
+            .filter_map(|p| s.live(p))
+            .flat_map(|h| objects(&h.params, 1, world))
             .collect();
         out.sort_unstable();
         out.dedup();
@@ -559,13 +618,14 @@ impl Events {
     /// (mode `"exit"`: PmcCon034's `PMCCon034OutOfBounds`, which cancels
     /// the contract), for the autoplay to keep her within.
     pub fn exits_watched(&self, world: &dyn World) -> Vec<u32> {
-        let mut out: Vec<u32> = self
-            .store
-            .borrow()
+        let s = self.store.borrow();
+        let mut out: Vec<u32> = s
             .pending
             .iter()
-            .filter(|p| p.kind == "Boundary" && text(&p.params, 3).as_deref() == Some("exit"))
-            .filter_map(|p| boundary_of(&p.params, world))
+            .filter(|p| p.kind == "Boundary")
+            .filter_map(|p| s.live(p))
+            .filter(|h| text(&h.params, 3).as_deref() == Some("exit"))
+            .filter_map(|h| boundary_of(&h.params, world))
             .collect();
         out.sort_unstable();
         out.dedup();
@@ -594,15 +654,14 @@ impl Events {
     /// Pending events with their parameters, for diagnostics:
     /// `ObjectHealth{1, "<", 100}`.
     pub fn describe(&self) -> Vec<String> {
-        self.store
-            .borrow()
-            .pending
+        let s = self.store.borrow();
+        s.pending
             .iter()
             .map(|p| {
-                let params: Vec<String> = p
-                    .params
-                    .clone()
-                    .sequence_values::<Value>()
+                let params: Vec<String> = s
+                    .live(p)
+                    .into_iter()
+                    .flat_map(|h| h.params.sequence_values::<Value>().collect::<Vec<_>>())
                     .filter_map(Result::ok)
                     .map(|v| crate::script::show_arg(&v))
                     .collect();
@@ -613,12 +672,11 @@ impl Events {
 
     /// The names pending `ScriptEvent` events wait to be posted.
     pub fn awaited(&self) -> Vec<String> {
-        self.store
-            .borrow()
-            .pending
+        let s = self.store.borrow();
+        s.pending
             .iter()
             .filter(|p| p.kind == "ScriptEvent")
-            .filter_map(|p| p.params.raw_get::<String>(1).ok())
+            .filter_map(|p| s.live(p)?.params.raw_get::<String>(1).ok())
             .collect()
     }
 
@@ -680,8 +738,9 @@ impl Events {
                 .iter()
                 .filter(|p| p.kind == "ScriptEvent")
                 .filter_map(|p| {
-                    let name = p.params.raw_get::<String>(1).ok()?;
-                    let f = p.params.raw_get::<Option<Function>>(2).ok().flatten()?;
+                    let h = s.live(p)?;
+                    let name = h.params.raw_get::<String>(1).ok()?;
+                    let f = h.params.raw_get::<Option<Function>>(2).ok().flatten()?;
                     Some((name, f))
                 })
                 .collect();
@@ -719,13 +778,15 @@ impl Events {
             s.deleted.clear();
             let mut fired = Vec::new();
             let mut keep = Vec::with_capacity(s.pending.len());
+            let before: Vec<u32> = s.pending.iter().map(|p| p.id).collect();
             for mut p in std::mem::take(&mut s.pending) {
+                // An event whose values are gone can't be checked or run.
+                let Some(mut h) = s.live(&p) else {
+                    continue;
+                };
                 // The wildcard characters stand for her ([`with_wildcards`]).
-                let own = with_wildcards(&mut p, world);
-                let checked = check(&p, now, &posted, accepted, world);
-                if let Some(own) = own {
-                    p.params = own;
-                }
+                with_wildcards(&mut h, &p, world);
+                let checked = check(&p, &h, now, &posted, accepted, world);
                 let extra = match checked {
                     Check::Fire(extra) => Some(vec![extra]),
                     Check::FireWords(mut extra, words) => {
@@ -755,7 +816,7 @@ impl Events {
                     // `held_by` keeps who was seated at the last check
                     // (none before the first).
                     Check::Seats(riders) => {
-                        let mode = seat_mode(&p);
+                        let mode = seat_mode(&h);
                         let any = mode.contains('a');
                         let mut fire = Vec::new();
                         let mut seated = BTreeSet::new();
@@ -797,7 +858,7 @@ impl Events {
                         // killed before). Objects named one by one still
                         // fire, dead already or not.
                         if !p.checked && p.kind == "ObjectDeath" {
-                            let labelled = by_label(&p.params, world);
+                            let labelled = by_label(&h.params, world);
                             p.held_by = members
                                 .iter()
                                 .filter(|m| m.1 && labelled.contains(&m.0))
@@ -893,13 +954,7 @@ impl Events {
                             };
                             let mut extra = vec![Value::String(text)];
                             extra.extend(value.map(Value::Number));
-                            fired.push((
-                                p.id,
-                                p.kind.clone(),
-                                p.callback.clone(),
-                                p.data.clone(),
-                                extra,
-                            ));
+                            fired.push((p.id, p.kind.clone(), extra));
                         }
                         if !m.done {
                             keep.push(p);
@@ -910,13 +965,7 @@ impl Events {
                 match extra {
                     Some(extras) => {
                         for extra in extras {
-                            fired.push((
-                                p.id,
-                                p.kind.clone(),
-                                p.callback.clone(),
-                                p.data.clone(),
-                                extra,
-                            ));
+                            fired.push((p.id, p.kind.clone(), extra));
                         }
                         if p.persistent {
                             // A repeating timer keeps what it overran by
@@ -924,7 +973,7 @@ impl Events {
                             // delay off the time counted, 0x82355480
                             // counts on from there), so it keeps its rate
                             // whatever the frame length.
-                            p.last = match (p.kind.as_str(), number(&p.params, 1)) {
+                            p.last = match (p.kind.as_str(), number(&h.params, 1)) {
                                 ("TimerRelative", Some(delay)) => p.last + delay,
                                 _ => now,
                             };
@@ -935,6 +984,20 @@ impl Events {
                 }
             }
             s.pending = keep;
+            // Those that fired keep their values until they have run
+            // ([`fire`]).
+            let gone: Vec<u32> = if s.pending.len() == before.len() {
+                Vec::new()
+            } else {
+                let stay: std::collections::HashSet<u32> = s
+                    .pending
+                    .iter()
+                    .map(|p| p.id)
+                    .chain(fired.iter().map(|f: &Fired| f.0))
+                    .collect();
+                before.into_iter().filter(|id| !stay.contains(id)).collect()
+            };
+            s.forget(&gone);
             // Proximities that hold at once go newest first: OilCon002's
             // transit teleports her, and its arrival check (made as the
             // trip began) is to end the trip before the older one that
@@ -946,12 +1009,7 @@ impl Events {
                 .collect();
             let mut near: Vec<Fired> = slots
                 .iter()
-                .map(|&i| {
-                    std::mem::replace(
-                        &mut fired[i],
-                        (0, String::new(), Value::Nil, None, Vec::new()),
-                    )
-                })
+                .map(|&i| std::mem::take(&mut fired[i]))
                 .collect();
             near.sort_by_key(|f| std::cmp::Reverse(f.0));
             for (slot, f) in slots.into_iter().zip(near) {
@@ -962,9 +1020,10 @@ impl Events {
     }
 }
 
-/// An event that fired: its id, kind, callback, its data, and the values to
-/// pass after the data.
-type Fired = (u32, String, Value, Option<Table>, Vec<Value>);
+/// An event that fired: its id, kind, and the values to pass after its
+/// data. Its callback and data are read from the scripts' table as it
+/// runs, not held meanwhile.
+type Fired = (u32, String, Vec<Value>);
 
 /// Runs the callbacks of the events that fired, in turn: one deleted by
 /// an earlier callback of the same pass doesn't run (OilCon002's transit:
@@ -972,16 +1031,33 @@ type Fired = (u32, String, Value, Option<Table>, Vec<Value>);
 /// cleaned-up objective).
 fn fire(store: &RefCell<Store>, fired: Vec<Fired>) -> Vec<EventError> {
     let mut errors = Vec::new();
-    for (id, kind, callback, data, extra) in fired {
-        if store.borrow().deleted.contains(&id) {
-            continue;
-        }
-        let Value::Function(f) = callback else {
+    let ids: Vec<u32> = fired.iter().map(|f| f.0).collect();
+    for (id, kind, extra) in fired {
+        let live = {
+            let s = store.borrow();
+            if s.deleted.contains(&id) {
+                continue;
+            }
+            s.kept.as_ref().and_then(|kept| Live::of(kept, id))
+        };
+        let Some(Live {
+            callback: Value::Function(f),
+            data,
+            ..
+        }) = live
+        else {
             continue;
         };
         if let Err(error) = call(&f, data.as_ref(), extra) {
             errors.push(EventError { kind, error });
         }
+    }
+    // The one-shots among them are used up: their values let go.
+    if !ids.is_empty() {
+        let s = store.borrow();
+        let pending: std::collections::HashSet<u32> = s.pending.iter().map(|p| p.id).collect();
+        let gone: Vec<u32> = ids.into_iter().filter(|id| !pending.contains(id)).collect();
+        s.forget(&gone);
     }
     errors
 }
@@ -1002,27 +1078,33 @@ pub const ALL_CHARACTERS: u32 = 0xf000_0001;
 /// only when it holds for every one (a bit per player, 0x82359f80). With
 /// one player both are her. Other natives handed a wildcard find no object
 /// in it, as on the 360.
-fn with_wildcards(p: &mut Pending, world: &dyn World) -> Option<Table> {
+fn with_wildcards(h: &mut Live, p: &Pending, world: &dyn World) {
     let wild = |v: &Value| {
         matches!(as_guid(v), Some(ANY_CHARACTER | ALL_CHARACTERS))
             && matches!(v, Value::LightUserData(_))
     };
-    let values: Vec<(Value, Value)> = p
+    let values: Vec<(Value, Value)> = h
         .params
         .pairs::<Value, Value>()
         .filter_map(Result::ok)
         .collect();
     if !values.iter().any(|(_, v)| wild(v)) {
-        return None;
+        return;
     }
-    let lua = p.lua.0.try_upgrade()?;
+    let Some(lua) = p.lua.0.try_upgrade() else {
+        return;
+    };
     let her = world.player().map_or(Value::Nil, guid_value);
-    let copy = lua.create_table().ok()?;
+    let Ok(copy) = lua.create_table() else {
+        return;
+    };
     for (k, v) in values {
         let v = if wild(&v) { her.clone() } else { v };
-        copy.raw_set(k, v).ok()?;
+        if copy.raw_set(k, v).is_err() {
+            return;
+        }
     }
-    Some(std::mem::replace(&mut p.params, copy))
+    h.params = copy;
 }
 /// A guid as scripts see it: userdata, as in the game (scripts check
 /// `type(target) == "userdata"`). Light userdata compares by value, so the
@@ -1092,8 +1174,8 @@ pub(crate) fn class_terms(expr: &str) -> Vec<(u32, bool)> {
 
 /// How a seat event's mode letters (`"E"`, `"xo"`, ...) read; the old
 /// words `"enter"` and `"exit"` as `"ei"` and `"xo"`.
-fn seat_mode(p: &Pending) -> String {
-    match text(&p.params, 4).as_deref() {
+fn seat_mode(h: &Live) -> String {
+    match text(&h.params, 4).as_deref() {
         Some("enter") | None => "ei".to_owned(),
         Some("exit") => "xo".to_owned(),
         Some(m) => m.to_owned(),
@@ -1323,6 +1405,17 @@ fn objects(t: &Table, i: i64, world: &dyn World) -> Vec<u32> {
                     .collect();
                 out.retain(|g| !excluded.contains(g));
             }
+            // A filter's player wildcards (`UsePlayers`, or the answers of
+            // `Player.GetAnyCharacter`/`GetAllCharacters` added to it)
+            // stand for the players' characters, as the 360's filter test
+            // has them (0x82359F80): with one player, her.
+            if out
+                .iter()
+                .any(|&g| matches!(g, ANY_CHARACTER | ALL_CHARACTERS))
+            {
+                out.retain(|&g| !matches!(g, ANY_CHARACTER | ALL_CHARACTERS));
+                out.extend(world.player());
+            }
             out.sort_unstable();
             out.dedup();
             out
@@ -1368,6 +1461,7 @@ fn health_comparison(s: &str) -> Option<(bool, bool, bool)> {
 
 fn check(
     p: &Pending,
+    h: &Live,
     now: f64,
     posted: &[(String, Value)],
     accepted: &Accepted,
@@ -1378,7 +1472,7 @@ fn check(
     match p.kind.as_str() {
         // { seconds }: that long after it was made (persistent: every
         // that long).
-        "TimerRelative" => match number(&p.params, 1) {
+        "TimerRelative" => match number(&h.params, 1) {
             Some(delay) if now - p.last >= delay => Check::Fire(Vec::new()),
             _ => no,
         },
@@ -1391,7 +1485,7 @@ fn check(
         // the players' characters for a hero-only bounty (from the
         // scripts; what the second value is was not found).
         "ObjectDeath" => Check::Each(
-            objects(&p.params, 1, world)
+            objects(&h.params, 1, world)
                 .into_iter()
                 .map(|g| {
                     let mut pass = vec![id(g)];
@@ -1409,7 +1503,7 @@ fn check(
         // Passes nothing (from the 360 code: its arguments slot is the
         // empty 0x8225e998; the support helicopter's callback takes only
         // its data).
-        "ObjectDelete" => match guid(&p.params, 1) {
+        "ObjectDelete" => match guid(&h.params, 1) {
             Some(g) => Check::Holds(world.position(g).is_none(), Vec::new()),
             None => no,
         },
@@ -1422,7 +1516,7 @@ fn check(
         // every update; an object this world doesn't hold is left waiting
         // (inferred: the engine only tests on a health change).
         "ObjectHealthLessThan" => {
-            let (Some(g), Some(figure)) = (guid(&p.params, 1), number(&p.params, 2)) else {
+            let (Some(g), Some(figure)) = (guid(&h.params, 1), number(&h.params, 2)) else {
                 return no;
             };
             match world.health(g) {
@@ -1443,10 +1537,10 @@ fn check(
         // proximity, `MrxTaskObjectiveFlee.HeroProximity`, doesn't read
         // it). From the scripts.
         "ObjectProximity" => {
-            let r = number(&p.params, 4).unwrap_or(0.0);
-            let beyond = text(&p.params, 3).is_some_and(|op| op.starts_with('>'));
-            let flat = matches!(p.params.raw_get::<Value>(6), Ok(Value::Boolean(true)));
-            let (aa, bb) = (objects(&p.params, 1, world), objects(&p.params, 2, world));
+            let r = number(&h.params, 4).unwrap_or(0.0);
+            let beyond = text(&h.params, 3).is_some_and(|op| op.starts_with('>'));
+            let flat = matches!(h.params.raw_get::<Value>(6), Ok(Value::Boolean(true)));
+            let (aa, bb) = (objects(&h.params, 1, world), objects(&h.params, 2, world));
             let holds = |a: u32| {
                 let Some(pa) = world.position(a) else {
                     return false;
@@ -1468,7 +1562,7 @@ fn check(
                 return no;
             }
             let one = !matches!(
-                p.params.raw_get::<Value>(1),
+                h.params.raw_get::<Value>(1),
                 Ok(Value::String(_) | Value::Table(_))
             );
             if one {
@@ -1494,9 +1588,9 @@ fn check(
         // pending, so the two never fire for the same move. Passes the
         // rider and vehicle.
         "ObjectInSeat" => {
-            let wanted = |v: u32| match p.params.raw_get::<Value>(2) {
+            let wanted = |v: u32| match h.params.raw_get::<Value>(2) {
                 Ok(Value::String(s)) => {
-                    let named = objects(&p.params, 2, world);
+                    let named = objects(&h.params, 2, world);
                     if named.is_empty() {
                         class_matches(&s.to_string_lossy(), &world.labels(v))
                     } else {
@@ -1507,7 +1601,7 @@ fn check(
                 Err(_) => true,
             };
             Check::Seats(
-                objects(&p.params, 1, world)
+                objects(&h.params, 1, world)
                     .into_iter()
                     .map(|r| {
                         let seated = world.vehicle_of(r).filter(|&v| wanted(v));
@@ -1530,19 +1624,19 @@ fn check(
                 return no;
             };
             let riding = world.vehicle_of(hero).is_some();
-            let on_foot = match text(&p.params, 2).as_deref() {
+            let on_foot = match text(&h.params, 2).as_deref() {
                 Some("human") => true,
                 Some("vehicle") => false,
                 _ => return no,
             };
-            let exit = text(&p.params, 3).as_deref() == Some("exit");
+            let exit = text(&h.params, 3).as_deref() == Some("exit");
             Check::Holds((riding != on_foot) != exit, Vec::new())
         }
         // { object, want = true } (0x82354CB0; test 0x82354AA0): when the
         // object's being on the ground is `want`; passes both.
         "ObjectIsGrounded" => {
-            let want = !matches!(p.params.raw_get::<Value>(2), Ok(Value::Boolean(false)));
-            for o in objects(&p.params, 1, world) {
+            let want = !matches!(h.params.raw_get::<Value>(2), Ok(Value::Boolean(false)));
+            for o in objects(&h.params, 1, world) {
                 if world.grounded(o) == want {
                     return Check::Holds(true, vec![id(o), Value::Boolean(want)]);
                 }
@@ -1554,21 +1648,21 @@ fn check(
         // test 0x82355628, and the empty arguments slot 0x8225e998; the
         // scripts' callbacks take only their data).
         "GameStateChange" => {
-            let (Some(state), Some(current)) = (text(&p.params, 1), world.game_state()) else {
+            let (Some(state), Some(current)) = (text(&h.params, 1), world.game_state()) else {
                 return no;
             };
-            let exit = text(&p.params, 2).as_deref() == Some("exit");
+            let exit = text(&h.params, 2).as_deref() == Some("exit");
             Check::Holds(current.eq_ignore_ascii_case(&state) != exit, Vec::new())
         }
         // { object, boundary, "enter" or "exit" }.
         "Boundary" => {
-            let boundary = boundary_of(&p.params, world);
-            let mode = text(&p.params, 3);
+            let boundary = boundary_of(&h.params, world);
+            let mode = text(&h.params, 3);
             // `"any"`: both ways, the callback told which (the faction
             // zones' trespass watch).
             if let (Some(b), Some("any")) = (boundary, mode.as_deref()) {
                 return Check::Crossings(
-                    objects(&p.params, 1, world)
+                    objects(&h.params, 1, world)
                         .into_iter()
                         .filter_map(|o| Some((o, world.inside(o, b)?, vec![id(o), id(b)])))
                         .collect(),
@@ -1582,8 +1676,8 @@ fn check(
             // shipped scripts read the direction as the callback's argument
             // after the boundary (`WifVzAtmosphere.CrossedBoundary`
             // concatenates it). The 360's argument order is not yet traced.
-            let direction = p.params.raw_get::<Value>(3).unwrap_or(Value::Nil);
-            for o in objects(&p.params, 1, world) {
+            let direction = h.params.raw_get::<Value>(3).unwrap_or(Value::Nil);
+            for o in objects(&h.params, 1, world) {
                 if let Some(inside) = world.inside(o, b)
                     && inside != exit
                 {
@@ -1598,7 +1692,7 @@ fn check(
         // `"gateStuck"`); passes the object and the name (inferred: no
         // callback reads either).
         "ObjectPhysicsEvent" => {
-            let (Some(object), Some(name)) = (guid(&p.params, 1), text(&p.params, 2)) else {
+            let (Some(object), Some(name)) = (guid(&h.params, 1), text(&h.params, 2)) else {
                 return no;
             };
             match world.physics_event(object, &name) {
@@ -1606,7 +1700,7 @@ fn check(
                     holds,
                     vec![
                         id(object),
-                        p.params.raw_get::<Value>(2).unwrap_or(Value::Nil),
+                        h.params.raw_get::<Value>(2).unwrap_or(Value::Nil),
                     ],
                 ),
                 None => Check::Unhandled,
@@ -1624,11 +1718,11 @@ fn check(
         // Here the occurrences are the changes in the world's winch state
         // ([`World::winch`]) between checks. The first look only records it.
         "ObjectWinched" => {
-            let Some(cargo) = guid(&p.params, 1) else {
+            let Some(cargo) = guid(&h.params, 1) else {
                 return no;
             };
-            let carrier = guid(&p.params, 2).unwrap_or(0);
-            let mode = match text(&p.params, 3) {
+            let carrier = guid(&h.params, 2).unwrap_or(0);
+            let mode = match text(&h.params, 3) {
                 Some(m) => {
                     let mut c = m.chars().map(|c| c.to_ascii_lowercase());
                     match (c.next(), c.next()) {
@@ -1657,13 +1751,13 @@ fn check(
         // (inferred), a named part never holds (the 360 answers false for
         // a part the object lacks).
         "ObjectHealth" => {
-            let four = p.params.raw_len() >= 4;
+            let four = h.params.raw_len() >= 4;
             let (at, part) = if four {
-                (3, text(&p.params, 2))
+                (3, text(&h.params, 2))
             } else {
                 (2, None)
             };
-            let (Some(comparison), Some(figure)) = (text(&p.params, at), number(&p.params, at + 1))
+            let (Some(comparison), Some(figure)) = (text(&h.params, at), number(&h.params, at + 1))
             else {
                 return no;
             };
@@ -1680,7 +1774,7 @@ fn check(
                 (_, true, false) => ">",
                 _ => "=",
             };
-            for o in objects(&p.params, 1, world) {
+            for o in objects(&h.params, 1, world) {
                 if let Some(h) = world.health(o).map(f64::from) {
                     let holds =
                         (equal && h == figure) || (less && h < figure) || (more && h > figure);
@@ -1696,10 +1790,10 @@ fn check(
         // the verify objective's `{ target, "*", "KnockedDown.Idle" }`),
         // after the event was made. Passes the character.
         "HumanStateTransition" => {
-            let (Some(from), Some(to)) = (text(&p.params, 2), text(&p.params, 3)) else {
+            let (Some(from), Some(to)) = (text(&h.params, 2), text(&h.params, 3)) else {
                 return no;
             };
-            let who = objects(&p.params, 1, world);
+            let who = objects(&h.params, 1, world);
             let hit = world.state_changes().iter().find(|(t, g, a, b)| {
                 *t >= p.last
                     && (*t > p.last || !p.persistent)
@@ -1721,14 +1815,14 @@ fn check(
         // weapon may be left out, for any weapon; it passes the holder
         // and the weapon.
         "WeaponEvent" => {
-            let Some(what) = text(&p.params, 2) else {
+            let Some(what) = text(&h.params, 2) else {
                 return no;
             };
-            let holders = objects(&p.params, 1, world);
+            let holders = objects(&h.params, 1, world);
             if holders.is_empty() {
                 return no;
             }
-            let weapons = objects(&p.params, 3, world);
+            let weapons = objects(&h.params, 3, world);
             let hit = world.weapon_events().iter().find(|(t, who, did, weapon)| {
                 *t >= p.last
                     && (*t > p.last || !p.persistent)
@@ -1743,7 +1837,7 @@ fn check(
         }
         // { character }: when the action `Human.SetState` gave it has
         // played to its end.
-        "HumanActionComplete" => match guid(&p.params, 1) {
+        "HumanActionComplete" => match guid(&h.params, 1) {
             Some(g) => Check::Holds(world.action_done(g), Vec::new()),
             None => no,
         },
@@ -1761,7 +1855,7 @@ fn check(
         // object filter: on any of its objects, as the action objectives'
         // `{ 0, _uTgtObjFilter }`, a prisoner to release).
         "ContextAction" => {
-            let targets = objects(&p.params, 2, world);
+            let targets = objects(&h.params, 2, world);
             let taken = world.context_presses().iter().find_map(|(t, o)| {
                 (targets.contains(o) && *t >= p.last && (*t > p.last || !p.persistent))
                     .then_some(*o)
@@ -1776,9 +1870,9 @@ fn check(
         // anyone. The HQ briefings' frames wait on `{ 0, "CinematicStart"
         // }` to fade in and `{ actor, "CinematicEnd" }` to go on, events
         // 252 of their 258 clips carry (from samples).
-        "AnimationEvent" => match text(&p.params, 2) {
+        "AnimationEvent" => match text(&h.params, 2) {
             Some(event) => {
-                let who = guid(&p.params, 1).filter(|&g| g != 0);
+                let who = guid(&h.params, 1).filter(|&g| g != 0);
                 let met = world.animation_events().iter().any(|(t, g, e)| {
                     who.is_none_or(|w| w == *g)
                         && e.eq_ignore_ascii_case(&event)
@@ -1789,7 +1883,7 @@ fn check(
             }
             None => no,
         },
-        "Button" => match text(&p.params, 2) {
+        "Button" => match text(&h.params, 2) {
             Some(button) => {
                 let pressed = world
                     .button_presses()
@@ -1805,7 +1899,7 @@ fn check(
             None => no,
         },
         "Minigame" => Check::Minigame(crate::hijack::check_minigame(
-            &p.params, p.made, now, p.read, p.memo, world,
+            &h.params, p.made, now, p.read, p.memo, world,
         )),
         // { object, "awake" or "hibernated" }: while it is simulated near
         // the player (or hibernates away from her); passes the object.
@@ -1821,9 +1915,9 @@ fn check(
         // that little left (the briefings' named spiel clips: `WifHq`'s
         // cheap cinematic waits on it with 0.1 before the next line; from
         // the scripts). Passes the character.
-        "HumanAnimationNearlyCompleted" => match guid(&p.params, 1) {
+        "HumanAnimationNearlyCompleted" => match guid(&h.params, 1) {
             Some(g) => {
-                let margin = p.params.raw_get::<f64>(2).unwrap_or(0.1) as f32;
+                let margin = h.params.raw_get::<f64>(2).unwrap_or(0.1) as f32;
                 // Passes nothing (from the 360 code: parse 0x82356228, test
                 // 0x823562a0, and the empty arguments slot 0x8225e998).
                 match world.raw_clip_left(g) {
@@ -1841,9 +1935,9 @@ fn check(
         // "hibernated" and a missing mode. Its arguments slot (0x8225e998)
         // passes nothing. The optional level (a streaming detail the
         // object must have reached) isn't modelled.
-        "ObjectHibernation" => match guid(&p.params, 1) {
+        "ObjectHibernation" => match guid(&h.params, 1) {
             Some(g) => {
-                let want_awake = text(&p.params, 2).is_some_and(|t| t.starts_with('a'));
+                let want_awake = text(&h.params, 2).is_some_and(|t| t.starts_with('a'));
                 Check::Holds(world.is_awake(g) == want_awake, Vec::new())
             }
             None => no,
@@ -1852,7 +1946,7 @@ fn check(
         // 360 code (0x82352c28, 0x82352ab0) it checks the object is loaded
         // rather than awake; here awake stands in for that (inferred).
         // Passes nothing (0x8225e998).
-        "ObjectIsReady" => match guid(&p.params, 1) {
+        "ObjectIsReady" => match guid(&h.params, 1) {
             Some(g) => Check::Holds(world.is_awake(g), Vec::new()),
             None => no,
         },
@@ -1863,7 +1957,7 @@ fn check(
         // first seen. Passes nothing (from the 360 code: parse 0x823551e8,
         // test 0x82355230, and the empty arguments slot 0x8225e998).
         "ObjectIsVisible" => {
-            let seen = objects(&p.params, 1, world)
+            let seen = objects(&h.params, 1, world)
                 .into_iter()
                 .any(|g| world.is_visible(g) == Some(true));
             if seen {
@@ -1877,11 +1971,11 @@ fn check(
         // manager's attitude watches compare it with what they want);
         // passes the posted data.
         "ScriptEvent" => {
-            let Ok(name) = p.params.raw_get::<String>(1) else {
+            let Ok(name) = h.params.raw_get::<String>(1) else {
                 return no;
             };
             // Filters ran before the checks ([`Events::filter_posts`]).
-            let filter = p.params.raw_get::<Option<Function>>(2).ok().flatten();
+            let filter = h.params.raw_get::<Option<Function>>(2).ok().flatten();
             let wanted = |i: usize| {
                 filter
                     .as_ref()
@@ -2411,6 +2505,40 @@ mod tests {
         assert_eq!(got, ["dead 5", "filter 5", "one 4"]);
     }
 
+    // A filter holding a player wildcard (`ObjectFilter.UsePlayers`, or a
+    // module's `vTgtInclude = Player.GetAllCharacters()`, VzaCon001) stands
+    // for her (0x82359F80): her death fires its event; others' don't.
+    #[test]
+    fn a_filter_of_the_player_wildcard_is_her() {
+        let (host, events) = setup();
+        let g = host.lua().globals();
+        g.set("all", guid_value(ALL_CHARACTERS)).unwrap();
+        g.set("any", guid_value(ANY_CHARACTER)).unwrap();
+        host.lua()
+            .load(
+                r#"
+                local f = { objs = { all }, ex = {} }
+                Event.CreatePersistent(Event.ObjectDeath, { f },
+                    function(g) table.insert(log, "all " .. tostring(gid(g))) end)
+                local u = { objs = { any, 7 }, ex = {} }
+                Event.CreatePersistent(Event.ObjectDeath, { u },
+                    function(g) table.insert(log, "any " .. tostring(gid(g))) end)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld::default();
+        events.update(0.1, &world);
+        world.dead.push(5);
+        events.update(0.1, &world);
+        assert!(log(&host).is_empty(), "{:?}", log(&host));
+        world.dead.push(1);
+        events.update(0.1, &world);
+        let mut got = log(&host);
+        got.sort();
+        assert_eq!(got, ["all 1", "any 1"]);
+    }
+
     #[test]
     fn a_filter_picks_which_posts_fire() {
         let (host, events) = setup();
@@ -2561,6 +2689,47 @@ mod tests {
         post(guid_value(1));
         events.update(0.1, &world);
         assert_eq!(log(&host), ["in the PDA"]);
+    }
+
+    /// Each pending event used to hold three references into the scripts'
+    /// state from Rust, and mlua has room for about 8000: some 80
+    /// script-run layers in at once ran it out ("out of auxiliary stack
+    /// space"). Their values are kept in a table of the scripts' now.
+    #[test]
+    fn thousands_of_pending_events_wait_fire_and_are_let_go() {
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                r#"ids, fired = {}, 0
+                for i = 1, 6000 do
+                    ids[i] = Event.Create(Event.ScriptEvent, { "Go" },
+                        function(self) fired = fired + self.n end, { { n = 1 } })
+                end
+                for i = 1, 6000 do
+                    Event.CreatePersistent(Event.ScriptEvent, { "Never" }, function() end, {})
+                end"#,
+            )
+            .exec()
+            .unwrap();
+        assert_eq!(events.len(), 12000);
+        let world = TestWorld::default();
+        assert!(events.update(0.1, &world).is_empty());
+        assert_eq!(events.len(), 12000);
+        events.post("Go");
+        let errors = events.update(0.1, &world);
+        assert!(errors.is_empty(), "{:?}", errors.first());
+        let fired: u32 = host.lua().globals().get("fired").unwrap();
+        assert_eq!(fired, 6000);
+        // The one-shots are used up, and their values let go with them.
+        assert_eq!(events.len(), 6000);
+        let kept = events.store.borrow().kept.clone().unwrap();
+        assert_eq!(kept.pairs::<Value, Value>().count(), 6000);
+        host.lua()
+            .load("for id = 6001, 12000 do Event.Delete(id) end")
+            .exec()
+            .unwrap();
+        assert!(events.is_empty());
+        assert_eq!(kept.pairs::<Value, Value>().count(), 0);
     }
 
     #[test]

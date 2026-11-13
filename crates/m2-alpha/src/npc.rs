@@ -1116,6 +1116,11 @@ impl FightClips {
     }
 }
 
+/// The least health the 360's damage code leaves an unkillable object
+/// (`Object.SetUnkillable`): a hit that would take it lower takes it to
+/// this (0x822889F8, its 1.0 at 0x820baee8). Invincible ones take nothing.
+pub const UNKILLABLE_FLOOR: f32 = 1.0;
+
 #[derive(Debug)]
 pub struct Npc {
     pub kind: usize,
@@ -1164,6 +1169,11 @@ pub struct Npc {
     heard: Option<u32>,
     /// She hurt them: they fight her while her pursuit lasts.
     pub provoked: bool,
+    /// Their attitude to her from an infraction the scripts added
+    /// (`Ai.AddInfraction`: their record of her's +0xE4): they fight her
+    /// while it is low enough to attack, as it calms back to their
+    /// faction's relation to the PMC ([`People::add_infraction`]).
+    pub her_attitude: Option<m2_engine::ai_target::Attitude>,
     /// Their death was taken as an infraction already.
     pub reported_dead: bool,
     /// Hurt since the last look ([`People::pursue`]).
@@ -1187,6 +1197,9 @@ pub struct Npc {
     /// Seconds before he fires his launcher again.
     launcher_wait: f32,
     pub hp: f32,
+    /// The scripts keep them from dying (`Object.SetUnkillable`): hurt,
+    /// their health stops at [`UNKILLABLE_FLOOR`].
+    pub unkillable: bool,
     /// The health they started with (their template's for a soldier, 100
     /// for a civilian): the HUD's target arc shows a share of it.
     pub most_hp: f32,
@@ -1487,6 +1500,7 @@ impl Npc {
             shot_by: None,
             heard: None,
             provoked: false,
+            her_attitude: None,
             hurt_by_her: false,
             killed_by_her: false,
             reported_dead: false,
@@ -1495,6 +1509,7 @@ impl Npc {
             launches: false,
             launcher_wait: 0.0,
             hp: 100.0,
+            unkillable: false,
             most_hp: 100.0,
             alive: true,
             alert: false,
@@ -1724,6 +1739,9 @@ impl Npc {
             return false;
         }
         self.hp -= damage;
+        if self.unkillable {
+            self.hp = self.hp.max(UNKILLABLE_FLOOR.min(self.hp + damage));
+        }
         self.hurt_by_her = true;
         self.alert = self.soldier;
         self.hit = true;
@@ -3360,6 +3378,9 @@ const LEDGE: f32 = 3.0;
 pub struct People {
     pub kinds: Vec<PersonKind>,
     pub npcs: Vec<Npc>,
+    /// Those the scripts keep from dying (`Object.SetUnkillable`), by
+    /// spawn entity, here or still to come.
+    unkillable: HashSet<u32>,
     /// Soldiers (by spawn entity) killed: they stay dead.
     pub killed: HashSet<u32>,
     /// Spawns a mission wants soldiers at though their names don't say
@@ -3833,6 +3854,17 @@ pub fn faction_by_label(label: &str) -> Option<&'static str> {
     })
 }
 
+/// What one unit of an infraction (`Ai.AddInfraction`'s amount, kind 6)
+/// takes from an attitude to her, before the faction's multiplier: the
+/// 360's 80 (0x820BAF98, 0x822DD4D8).
+pub const INFRACTION_COST: f32 = 80.0;
+/// How recently a person must have sensed her to note an infraction the
+/// scripts add, seconds (their record's +0x8C below 0.5: 0x820D9EDC,
+/// 0x822F6FB8).
+pub const INFRACTION_SEEN_WITHIN: f32 = 0.5;
+/// Her army as the faction manager names it (`GetRelation(f, "Pmc")`).
+pub const PMC: &str = "Pmc";
+
 /// Seconds the soldiers of a faction she provoked fight her: the first of
 /// the pursuit level times the faction manager sets
 /// (`Pg.SetPursuitLevelTimes(120, 300)`, from the scripts; which level is
@@ -4133,9 +4165,66 @@ impl People {
         }
     }
 
+    /// The scripts add an infraction against her (`Ai.AddInfraction(her,
+    /// faction, amount)`): from the 360 code (0x823137C8, 0x822F6FB8), each
+    /// person of `faction` (any, for `None`) whose record of her was
+    /// merged under [`INFRACTION_SEEN_WITHIN`] seconds ago notes it (kind
+    /// 6), and their attitude to her drops by `amount` times
+    /// [`INFRACTION_COST`] (0x822DD4D8, with the faction's multiplier,
+    /// 1 unless set), kept within -100..100 (0x822D52E0). How many noted
+    /// it. AllCon003 turns China on her this way (100); a munitions
+    /// pickup of another faction's crate, by 5 (`MrxMunitionsPickup`).
+    pub fn add_infraction(&mut self, faction: Option<&str>, amount: f32) -> usize {
+        let mut noted = 0;
+        for i in 0..self.npcs.len() {
+            let n = &self.npcs[i];
+            let Some(side) = n.faction else { continue };
+            if !n.alive
+                || faction.is_some_and(|f| f != side)
+                || !n
+                    .senses
+                    .get(HER)
+                    .is_some_and(|r| r.since_update < INFRACTION_SEEN_WITHIN)
+            {
+                continue;
+            }
+            let start = m2_engine::ai_target::Attitude::new(self.relation(side, PMC));
+            let n = &mut self.npcs[i];
+            let was = n.her_attitude.unwrap_or(start);
+            n.her_attitude = Some(m2_engine::ai_target::Attitude(
+                (was.0 - amount * INFRACTION_COST).clamp(-100.0, 100.0),
+            ));
+            noted += 1;
+        }
+        if noted > 0 {
+            eprintln!(
+                "people: an infraction of {amount} against her, noted by {noted} of {}",
+                faction.unwrap_or("every faction")
+            );
+            self.refresh_sides();
+        }
+        noted
+    }
+
     /// Each person's attitudes follow their army's relations, `dt`
     /// seconds on (0x822DE240 then 0x822D5948).
     fn calm(&mut self, dt: f32) {
+        // Their attitude to her too, toward their faction's relation to
+        // the PMC; no longer attacking, they stand down.
+        let mut calmed = false;
+        for i in 0..self.npcs.len() {
+            let (Some(side), Some(mut a)) = (self.npcs[i].faction, self.npcs[i].her_attitude)
+            else {
+                continue;
+            };
+            let was = a.attacks();
+            a.think(self.relation(side, PMC), dt);
+            calmed |= was && !a.attacks();
+            self.npcs[i].her_attitude = Some(a);
+        }
+        if calmed {
+            self.refresh_sides();
+        }
         for i in 0..self.npcs.len() {
             let Some(side) = self.npcs[i].faction else {
                 continue;
@@ -4531,6 +4620,7 @@ impl People {
             .map(|n| match n.faction {
                 Some(f) => {
                     n.provoked
+                        || n.her_attitude.is_some_and(|a| a.attacks())
                         || self.fights_for(f)
                         || n.spawn.is_some_and(|s| self.mission_soldiers.contains(&s))
                 }
@@ -4887,6 +4977,10 @@ impl People {
         self.refill(spawns, focus, dt);
         self.populate(physics, spawns, focus);
         lap.mark("people: spawning");
+        // Those the scripts keep from dying, as they come into play.
+        for n in &mut self.npcs {
+            n.unkillable = n.spawn.is_some_and(|e| self.unkillable.contains(&e));
+        }
         let scripted = std::mem::take(&mut self.scripted);
         if !scripted.is_empty() {
             self.populate(physics, &scripted, focus);
@@ -5328,6 +5422,40 @@ impl People {
                 route[0]
             );
         }
+    }
+
+    /// The scripts keep the person of spawn `entity` from dying, or let
+    /// them die again (`Object.SetUnkillable`): one in play at once, one
+    /// still to come when they come.
+    pub fn set_unkillable(&mut self, entity: u32, on: bool) {
+        if on {
+            self.unkillable.insert(entity);
+        } else {
+            self.unkillable.remove(&entity);
+        }
+        for n in self.npcs.iter_mut().filter(|n| n.spawn == Some(entity)) {
+            n.unkillable = on;
+        }
+    }
+
+    /// The scripts cleared every goal of the person of spawn `entity`
+    /// (`Ai.RemoveGoal` with `Handle` 0: the 360 code, 0x822F9188 and
+    /// 0x822CEE48, empties the AI's goal list): a route they were sent
+    /// along is dropped, here or still to come, and one running it stands
+    /// where they are. Following her is a role (`Ai.Role`), not a goal, so
+    /// it stays. Whether they had a route.
+    pub fn clear_goals(&mut self, entity: u32) -> bool {
+        let mut had = self.routes.remove(&entity).is_some();
+        for n in self.npcs.iter_mut().filter(|n| n.spawn == Some(entity)) {
+            if matches!(n.brain, Brain::Route { .. }) {
+                had = true;
+                n.brain = Brain::Post { facing: n.facing };
+            }
+        }
+        if had {
+            eprintln!("people: {entity:08x} has its goals cleared");
+        }
+        had
     }
 
     /// The scripts killed the soldier of spawn `entity` (or took it away,
@@ -6206,6 +6334,70 @@ pub(crate) mod tests {
         people.pursuit.clear();
         people.set_disguise(None);
         assert!(people.fights_for("Oil"));
+    }
+
+    // `Ai.AddInfraction(her, faction, amount)` (0x822F6FB8): only those of
+    // the faction sensing her now note it; their attitude to her drops by
+    // amount x 80 to no less than -100, and they fight her; it calms back
+    // toward their faction's relation to the PMC at 0.3 a second.
+    #[test]
+    fn an_infraction_the_scripts_add_turns_those_sensing_her_on_her() {
+        let mut physics = ground();
+        let mut people = People::default();
+        let oc = |entity, x| SpawnPoint {
+            template: Some("OC Soldier".into()),
+            ai: Some(AiProfile::default()),
+            model: Some(0x0d0b),
+            ..spawn(entity, "OC Soldier 0x0011055e", x)
+        };
+        let spawns = [oc(5, 10.0), oc(6, 12.0)];
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        people.add_kind(kind("OC Soldier", true));
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        let fights = |p: &People, e| {
+            p.npcs
+                .iter()
+                .find(|n| n.spawn == Some(e))
+                .map(|n| n.soldier)
+        };
+        assert_eq!(
+            (fights(&people, 5), fights(&people, 6)),
+            (Some(false), Some(false))
+        );
+        let record = m2_engine::ai_sense::SenseRecord {
+            offset: Vec3::ZERO,
+            distance: 10.0,
+            flat_distance: 10.0,
+            likelihood: 1.0,
+            hearing: 0.0,
+            sight: 1.0,
+            perceived: true,
+            since_update: 0.0,
+            person: true,
+            lifetime: 30.0,
+        };
+        if let Some(n) = people.npcs.iter_mut().find(|n| n.spawn == Some(5)) {
+            n.senses.merge(HER, record);
+        }
+        // Another army's infraction: nobody.
+        assert_eq!(people.add_infraction(Some("Chi"), 5.0), 0);
+        // OC's (a munitions pickup's 5): only he who senses her.
+        assert_eq!(people.add_infraction(Some("Oil"), 5.0), 1);
+        let att = |p: &People| {
+            p.npcs
+                .iter()
+                .find(|n| n.spawn == Some(5))
+                .and_then(|n| n.her_attitude)
+        };
+        assert_eq!(att(&people).map(|a| a.0), Some(-100.0));
+        assert_eq!(
+            (fights(&people, 5), fights(&people, 6)),
+            (Some(true), Some(false))
+        );
+        // Calmed back toward OC's relation to the PMC (none set: 0).
+        people.calm(300.0);
+        assert!(att(&people).is_some_and(|a| a.0 > -33.0));
+        assert_eq!(fights(&people, 5), Some(false));
     }
 
     #[test]
@@ -7951,6 +8143,71 @@ pub(crate) mod tests {
         );
         assert!(people.checks.arrived.contains(&1));
         assert!(people.checks.stuck.is_empty(), "{:?}", people.checks);
+    }
+
+    // `Ai.RemoveGoal` with `Handle` 0 (OilCon001's executive, PmcCon003's
+    // pursuers): one running a route stops and stands; one not yet in
+    // play doesn't run it when they come; a follower keeps following.
+    #[test]
+    fn cleared_goals_stop_a_route_but_not_following() {
+        let mut physics = ground();
+        let mut people = People::default();
+        people.kinds.push(kind("vz_hum_soldier", false));
+        let far = Vec3::new(0.0, 0.0, 40.0);
+        people.walk(1, vec![far]);
+        let spawns = [spawn(1, "VZ Soldier 01", 0.0)];
+        for _ in 0..60 {
+            people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        }
+        assert!(matches!(people.npcs[0].brain, Brain::Route { .. }));
+        assert!(people.clear_goals(1));
+        assert!(matches!(people.npcs[0].brain, Brain::Post { .. }));
+        let at = people.npcs[0].character.position;
+        for _ in 0..60 * 3 {
+            people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        }
+        let n = &people.npcs[0];
+        // Running, three seconds would carry them some 10 m on; they slow
+        // to a stand within a stride or so.
+        assert!(
+            (n.character.position - at).with_y(0.0).length() < 2.0,
+            "stands: {} from {at}",
+            n.character.position
+        );
+        assert!(!people.checks.arrived.contains(&1));
+        assert!(!people.clear_goals(1), "nothing left to clear");
+
+        // Sent before they come, cleared before they come.
+        people.walk(2, vec![far]);
+        assert!(people.clear_goals(2));
+        assert!(!people.routes.contains_key(&2));
+
+        // Following her is a role, not a goal.
+        people.follow(1, Some(3.0));
+        assert!(!people.clear_goals(1));
+        assert!(matches!(people.npcs[0].brain, Brain::Follow { .. }));
+    }
+
+    // `Object.SetUnkillable`: hurt, never below 1 health (0x822889F8),
+    // whether set before they come or while in play; let go, they die.
+    #[test]
+    fn the_unkillable_are_hurt_but_do_not_die() {
+        let mut physics = ground();
+        let mut people = People::default();
+        people.kinds.push(kind("vz_hum_soldier", false));
+        people.set_unkillable(1, true);
+        let spawns = [spawn(1, "VZ Soldier 01", 0.0)];
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        let n = &mut people.npcs[0];
+        assert!(n.unkillable);
+        let hp = n.hp;
+        assert!(!n.hurt(hp - 10.0, Vec3::ZERO));
+        assert!((n.hp - 10.0).abs() < 1e-4, "hurt: {}", n.hp);
+        assert!(!n.hurt(1000.0, Vec3::ZERO));
+        assert!(n.alive);
+        assert!((n.hp - UNKILLABLE_FLOOR).abs() < 1e-4);
+        people.set_unkillable(1, false);
+        assert!(people.npcs[0].hurt(5.0, Vec3::ZERO), "dies once let go");
     }
 
     // Playtest 8: with the island's soldiers at the most about, the

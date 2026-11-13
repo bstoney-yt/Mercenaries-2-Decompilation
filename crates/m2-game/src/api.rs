@@ -1004,6 +1004,9 @@ pub struct ScriptWorld {
     /// The PDA map's callbacks for its two modes
     /// (`Player.SetPDAMapModeCallback`).
     pub pda_map_callbacks: [Option<Function>; 2],
+    /// The PDA map mode while the scripts have it up
+    /// (`Player.SetPDAMapMode`: the satellite view).
+    pub pda_map: Option<crate::pda_map::MapMode>,
     /// `Player.SetWaitForInGame`: the player waits for the game proper.
     pub wait_for_in_game: bool,
     /// Places people kept by `Human.PersistTransform`: place and yaw.
@@ -1066,6 +1069,15 @@ pub struct ScriptWorld {
     pub reticle_target: Option<([f32; 3], Option<u32>)>,
     /// Templates' labels (name hashes) by name in lower case, for spawns.
     pub template_labels: HashMap<String, Vec<u32>>,
+    /// Templates' object scripts by name in lower case: the module's hash
+    /// and its data ([`crate::mission::GameData::template_scripts`]).
+    pub template_scripts: HashMap<String, (u32, Option<u32>)>,
+    /// Objects spawned since the last tick whose template names an object
+    /// script (guid, script, data), for the mission to run it on them;
+    /// those it ran one on, by guid; and those of them removed since.
+    pub script_spawns: Vec<(u32, u32, Option<u32>)>,
+    pub scripted: HashMap<u32, u32>,
+    pub script_removals: Vec<(u32, u32)>,
     /// Templates' cash values by name in lower case ([`crate::cash`]).
     pub template_cash: HashMap<String, i32>,
     /// Every template the template database names, in lower case: the
@@ -1427,6 +1439,7 @@ impl ScriptWorld {
         }
         self.insert(guid, object);
         self.fresh.push(guid);
+        self.note_script(guid, &lower);
         self.commands.push(Command::Spawn {
             guid,
             what,
@@ -1565,6 +1578,16 @@ impl ScriptWorld {
         });
         if let Some(c) = found.and_then(|w| self.inventory.carried.get_mut(&w)) {
             c.reserve = rounds;
+        }
+    }
+
+    /// Notes that `guid`, just spawned from template `lower` (its name in
+    /// lower case), is to have its template's object script run on it, as
+    /// the engine runs it on every object of the template.
+    pub(crate) fn note_script(&mut self, guid: u32, lower: &str) {
+        if let Some(&(script, data)) = self.template_scripts.get(lower) {
+            self.script_spawns.push((guid, script, data));
+            self.scripted.insert(guid, script);
         }
     }
 
@@ -2373,6 +2396,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     crate::ported_sp::install(&lib, &add)?;
     crate::shop::install(lua, &lib("Hud")?)?;
     crate::ported::install(&lib, &add)?;
+    crate::pda_map::install(&lib, &add)?;
     crate::ported_sys::install(&lib, &add)?;
     crate::cash::install(&lib, &add)?;
 
@@ -3109,6 +3133,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         if let Some(guid) = id(a.first()) {
             if w.objects.remove(&guid).is_some_and(|o| o.alive) {
                 w.removed_alive.insert(guid);
+            }
+            if let Some(script) = w.scripted.remove(&guid) {
+                w.script_removals.push((guid, script));
             }
             w.inventory.drop(guid);
             w.commands.push(Command::Remove(guid));
@@ -5423,31 +5450,55 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Object filters: sets of objects scripts build (objects added or
     // excluded one by one, the players, a label) and hand to objectives
     // and events. Events read the same fields (see `events::objects`).
+    //
+    // From the 360 code: a filter keeps its entries in the order added,
+    // each marked included or excluded (`AddObject` 823587B0 / 82359A58:
+    // adding one already there only changes its mark). `UsePlayers(f)`
+    // (82358AD8) adds the any-player wildcard `Player.GetAnyCharacter()`;
+    // `false` adds nothing. The wildcards (0xf0000000 any player,
+    // 0xf0000001 all players, since #507 what `GetAnyCharacter` and
+    // `GetAllCharacters` answer) are entries like any other:
+    // - `GetObjects(f [, excluded])` (823588F0, 82359D58) lists the
+    //   entries, wildcards too, all of them without the flag, else the
+    //   included (false) or the excluded (true) only; then, when a
+    //   wildcard is among them, each player's character as included.
+    // - `GetCoopPlayerGuid(f)` (82358ED8, 82359EE8) answers the first
+    //   wildcard entry itself, else nothing.
+    // - `Eval(f, g)` (82358E50, 82359860, 82359F80) looks from the last
+    //   entry back: for a player's character a wildcard entry holds (all
+    //   players: once each has been seen, so with one player at once); an
+    //   entry equal to `g` holds when included. Then the label.
     lua.load(
         r#"
         local F = {}
         local meta = { __index = F }
+        local function wild(g)
+            return g == Player.GetAnyCharacter() or g == Player.GetAllCharacters()
+        end
         local function has(f, g)
             for _, v in ipairs(f.objs) do if v == g then return true end end
             return false
         end
         local function ok(f) return type(f) == "table" and getmetatable(f) == meta end
-        function F.Create() return setmetatable({ objs = {}, ex = {}, players = false }, meta) end
-        function F.UsePlayers(f, b) if ok(f) then f.players = b and true or false end end
-        function F.SetFilter(f, label) if ok(f) then f.label = label end end
+        function F.Create() return setmetatable({ objs = {}, ex = {} }, meta) end
         function F.AddObject(f, g, exclude)
             if not ok(f) or g == nil then return end
-            if exclude then f.ex[g] = true elseif not has(f, g) then f.objs[#f.objs + 1] = g end
+            if not has(f, g) then f.objs[#f.objs + 1] = g end
+            f.ex[g] = exclude and true or nil
         end
+        function F.UsePlayers(f, b)
+            if ok(f) and b ~= false then F.AddObject(f, Player.GetAnyCharacter()) end
+        end
+        function F.SetFilter(f, label) if ok(f) then f.label = label end end
         function F.RemoveObject(f, g)
             if not ok(f) then return end
-            -- A list of them (`Player.GetAllCharacters()`): each.
+            -- A list of them: each.
             if type(g) == "table" then
                 for _, one in ipairs(g) do F.RemoveObject(f, one) end
                 return
             end
             for i, v in ipairs(f.objs) do
-                if v == g then table.remove(f.objs, i) return end
+                if v == g then table.remove(f.objs, i) f.ex[g] = nil return end
             end
         end
         -- A copy to change on its own (the release objective's targets
@@ -5457,36 +5508,42 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             local c = F.Create()
             for i, v in ipairs(f.objs) do c.objs[i] = v end
             for k, v in pairs(f.ex) do c.ex[k] = v end
-            c.players, c.label = f.players, f.label
+            c.label = f.label
             return c
         end
-        function F.GetObjects(f)
+        function F.GetObjects(f, excluded)
             local r = {}
             if not ok(f) then return r end
-            for _, v in ipairs(f.objs) do if not f.ex[v] then r[#r + 1] = v end end
+            local any = false
+            for _, v in ipairs(f.objs) do
+                any = any or wild(v)
+                local out = f.ex[v] == true
+                if excluded == nil or out == (excluded and true or false) then r[#r + 1] = v end
+            end
             -- A label (`SetFilter`) lists nothing: it is only matched,
-            -- object by object (`Eval`, the death events). From the 360
-            -- code: GetObjects (823588F0) walks the filter's own objects
-            -- and the players (82359D58); SetFilter (8235A0E0) only keeps
-            -- the label's hash. So a label objective (a bounty's
-            -- `sTgtLabelFilter`) puts no targets on the radar or the map,
-            -- and counts its kills as they come.
-            if f.players then
+            -- object by object (`Eval`, the death events). SetFilter
+            -- (8235A0E0) only keeps the label's hash. So a label objective
+            -- (a bounty's `sTgtLabelFilter`) puts no targets on the radar
+            -- or the map, and counts its kills as they come.
+            if any and excluded ~= true then
                 local p = Player.GetLocalCharacter()
-                if p ~= nil and not has(f, p) and not f.ex[p] then r[#r + 1] = p end
+                if p ~= nil then r[#r + 1] = p end
             end
             return r
         end
         function F.GetCoopPlayerGuid(f)
             if not ok(f) then return nil end
-            local p = Player.GetLocalCharacter()
-            if p ~= nil and (f.players or has(f, p)) then return p end
+            for _, v in ipairs(f.objs) do if wild(v) then return v end end
             return nil
         end
         function F.Eval(f, g)
-            if not ok(f) or g == nil or f.ex[g] then return false end
-            if has(f, g) then return true end
-            if f.players and g == Player.GetLocalCharacter() then return true end
+            if not ok(f) or g == nil then return false end
+            local her = g == Player.GetLocalCharacter()
+            for i = #f.objs, 1, -1 do
+                local v = f.objs[i]
+                if her and wild(v) then return true end
+                if v == g then return not f.ex[v] end
+            end
             return f.label ~= nil and Object.HasLabel(g, f.label) or false
         end
         ObjectFilter = F
@@ -8068,11 +8125,81 @@ mod tests {
                 ObjectFilter.UsePlayers(f, true)
                 local c = ObjectFilter.Copy(f)
                 ObjectFilter.RemoveObject(c, { Sys.StringToGuid("0x70") })
-                return #f.objs, #c.objs, c.players"#,
+                return #f.objs, #c.objs,
+                    ObjectFilter.GetCoopPlayerGuid(c) == Player.GetAnyCharacter()"#,
             )
             .eval()
             .unwrap();
-        assert_eq!((orig, copy, players), (2, 1, true));
+        // The players are the any-player wildcard, an entry of its own.
+        assert_eq!((orig, copy, players), (3, 2, true));
+    }
+
+    // From the 360 code (ObjectFilter natives 0x823587B0..0x82358ED8):
+    // the player wildcards (#507) are entries of a filter. Each objective
+    // module builds its target filter from `vTgtInclude`; VzaCon001's
+    // "Land on the beach" gives `Player.GetAllCharacters()`.
+    #[test]
+    fn a_filter_of_the_player_wildcards_finds_her_for_every_objective() {
+        let (host, _) = setup();
+        let r: Vec<bool> = host
+            .lua()
+            .load(
+                r#"local her = Player.GetLocalCharacter()
+                local all, any = Player.GetAllCharacters(), Player.GetAnyCharacter()
+                local f = ObjectFilter.Create()
+                ObjectFilter.AddObject(f, all)
+                -- Deliver: the player delivery (`GetCoopPlayerGuid` is the
+                -- wildcard itself, compared with GetAllCharacters).
+                local coop = ObjectFilter.GetCoopPlayerGuid(f)
+                -- Destroy, Action, EnterVehicle: the target list, the
+                -- wildcard first, then her.
+                local objs = ObjectFilter.GetObjects(f, false)
+                -- Verify and the death events: the filter test.
+                local u = ObjectFilter.Create()
+                ObjectFilter.UsePlayers(u)
+                local g = ObjectFilter.Create()
+                ObjectFilter.AddObject(g, Sys.StringToGuid("0x70"))
+                return {
+                    coop == all, coop ~= any,
+                    #objs == 2, objs[1] == all, objs[2] == her,
+                    #ObjectFilter.GetObjects(f, true) == 0,
+                    ObjectFilter.Eval(f, her), ObjectFilter.Eval(u, her),
+                    ObjectFilter.GetCoopPlayerGuid(u) == any,
+                    -- No wildcard: no co-op player, and her own guid is not one.
+                    ObjectFilter.GetCoopPlayerGuid(g) == nil,
+                    not ObjectFilter.Eval(g, her),
+                    #ObjectFilter.GetObjects(g) == 1,
+                }"#,
+            )
+            .eval()
+            .unwrap();
+        assert!(r.iter().all(|&b| b), "{r:?}");
+    }
+
+    // From the 360 code (0x82359A58, 0x82359D58, 0x82359F80): an entry
+    // added again only changes its mark; `GetObjects` lists all, the
+    // included or the excluded by its flag; `Eval` holds for an included
+    // entry, not an excluded one; `UsePlayers(f, false)` adds nothing.
+    #[test]
+    fn filter_entries_keep_their_order_and_their_exclusion_mark() {
+        let (host, _) = setup();
+        let r: (i64, i64, i64, bool, bool, i64) = host
+            .lua()
+            .load(
+                r#"local a, b = Sys.StringToGuid("0x70"), Sys.StringToGuid("0x71")
+                local f = ObjectFilter.Create()
+                ObjectFilter.AddObject(f, a)
+                ObjectFilter.AddObject(f, b, true)
+                ObjectFilter.AddObject(f, a, true)
+                ObjectFilter.AddObject(f, b)
+                ObjectFilter.UsePlayers(f, false)
+                return #ObjectFilter.GetObjects(f), #ObjectFilter.GetObjects(f, false),
+                    #ObjectFilter.GetObjects(f, true), ObjectFilter.Eval(f, b),
+                    ObjectFilter.Eval(f, a), #f.objs"#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(r, (2, 1, 1, true, false, 2));
     }
 
     #[test]
