@@ -2117,6 +2117,42 @@ impl MissionLink {
         // The lines that started and stopped: the speaker's mouth flaps
         // while theirs plays, as the 360's voice manager has it
         // (0x822782D8, 0x82278440; [`m2_engine::face_expression`]).
+        // The scripts' own expressions (`Animation.PlayFacialExpression`,
+        // 0x82316078): the same table as the engine's, by the
+        // expression's name; a name not in it does nothing (0x8241DF40).
+        let facial = std::mem::take(&mut mission.world().borrow_mut().sp.facial);
+        for f in facial {
+            let name = m2_assets::name_hash(&f.expression);
+            if m2_engine::face_expression::expression(name).is_none()
+                && name != m2_engine::face_expression::DISABLE_ALL
+            {
+                eprintln!(
+                    "face: the scripts ask {:#x} for {:?}: no such expression",
+                    f.character, f.expression
+                );
+                continue;
+            }
+            let face = if f.character == m2_game::mission::PLAYER {
+                game.scene.player.as_mut().map(|p| &mut p.face)
+            } else {
+                game.scene
+                    .people
+                    .npcs
+                    .iter_mut()
+                    .find(|n| n.spawn == Some(f.character))
+                    .map(|n| &mut n.face)
+            };
+            let Some(face) = face else { continue };
+            eprintln!(
+                "face: the scripts give {:#x} {:?} at {:.2} for {:.1} s",
+                f.character, f.expression, f.a, f.b
+            );
+            if name == m2_engine::face_expression::DISABLE_ALL {
+                face.disable_all();
+            } else {
+                face.play(name, f.a, f.b, [0.5, 0.25, 0.75, 0.5]);
+            }
+        }
         for speech in mission.world().borrow_mut().vo.take_speech() {
             let (on, speaker, cue) = match speech {
                 m2_game::vo::Speech::Started { speaker, cue, .. } => (true, speaker, cue),
