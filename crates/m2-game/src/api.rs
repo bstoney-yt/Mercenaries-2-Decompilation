@@ -261,8 +261,11 @@ pub enum Command {
     Kill(u32),
     /// `ObjectState.SendDamage` dealt `damage` to `guid`'s node `node`
     /// (0: the whole object), leaving it `health` (`None` for the whole
-    /// object); the node takes `message`, if any, and the object itself
-    /// `pass_through` of the damage ([`crate::node_damage`]).
+    /// object); the node takes `message`, if any, and the object's
+    /// `Health` took `pass_through` of the damage, leaving it
+    /// `object_health` ([`crate::node_damage`]). A node destroyed by its
+    /// object's death comes as one with no damage. The death itself
+    /// follows as [`Command::Kill`].
     NodeDamage {
         guid: u32,
         node: u32,
@@ -270,6 +273,7 @@ pub enum Command {
         health: Option<u16>,
         message: Option<u32>,
         pass_through: f32,
+        object_health: f32,
     },
     /// `Object.Revive(object, fraction)`: back in play, at that share of
     /// its most health.
@@ -1109,8 +1113,13 @@ pub struct ScriptWorld {
     pub template_cash: HashMap<String, i32>,
     /// Templates' `NodeHealth` records by name in lower case, and the
     /// node tables built from them, by object ([`crate::node_damage`]).
-    pub template_nodes: HashMap<String, Vec<m2_engine::node_health::NodeRecord>>,
+    pub template_nodes: HashMap<String, crate::node_damage::TemplateNodes>,
     pub node_tables: HashMap<u32, m2_engine::node_health::NodeTable>,
+    /// The nodes of objects' models the game has hidden (a building's
+    /// broken part and what hangs under it), by object, as name hashes: a
+    /// node there no longer keeps its object alive
+    /// ([`crate::node_damage`]).
+    pub hidden_nodes: HashMap<u32, std::collections::HashSet<u32>>,
     /// Every template the template database names, in lower case: the
     /// names `Pg.GetGuidByName` answers with a template's guid
     /// ([`ScriptWorld::is_template`]).

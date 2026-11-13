@@ -908,7 +908,11 @@ const ON_ENTER: u32 = 0x9da9_7065;
 /// `InitState` and `InitDestroyedState`: the states a part's machine
 /// starts in, intact and loaded destroyed, which put it in another
 /// (`PristineState`, `DestroyedState`) with a `SetState`.
-const START_STATES: [u32; 2] = [0x0ace_072a, 0x5d30_8f4f];
+const START_STATES: [u32; 2] = [STATE_INIT, 0x5d30_8f4f];
+/// `InitState`. A part whose `InitState` sets no other state stays in it
+/// (the island fortress's whole, node `cf37044a`, which takes its
+/// `DestroyMsg` there; from samples).
+pub const STATE_INIT: u32 = 0x0ace_072a;
 /// The verb `SetState`.
 const SET_STATE: u32 = 0x9b31_491a;
 /// The verbs `StartEmitter`, `CreateObject` and `SendDamage`, and the

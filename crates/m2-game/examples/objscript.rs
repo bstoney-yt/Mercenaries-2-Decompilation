@@ -192,6 +192,200 @@ fn main() -> Result<()> {
             println!("{s}");
         }
     }
+    if name.eq_ignore_ascii_case("islandfortress")
+        && let Some(&(_, first, at)) = on.first()
+    {
+        fortress(&mut mission, first, at, args.get(2).map(String::as_str))?;
+    }
     println!("{name} lines logged: {failures}");
     Ok(())
+}
+
+/// The island fortress's part whose `DestroyMsg` its script waits for.
+const FORTRESS_PART: u32 = 0xcf37_044a;
+
+/// For `islandfortress`: the first fortress's node and object health; its
+/// part `cf37044a` destroyed by `ObjectState.SendDamage` of 1; where its
+/// model's state machine sends that part on `DestroyMsg` (with `<install
+/// dir>` given: the model is read from it), told to the script's
+/// `OnStateChange`; then the script's slices coming down over time, and
+/// whether the whole fortress was destroyed.
+fn fortress(mission: &mut Mission, guid: u32, at: [f32; 3], install: Option<&str>) -> Result<()> {
+    mission.put_player([at[0] + 40.0, at[1], at[2]]);
+    let status = |m: &Mission| {
+        let mut w = m.world().borrow_mut();
+        w.node_table(guid);
+        let (health, most, alive) = w
+            .objects
+            .get(&guid)
+            .map_or((0.0, 0.0, false), |o| (o.health, o.max_health, o.alive));
+        let (left, nodes) = w.node_table(guid).map_or((0, 0), |t| {
+            (
+                t.entries().iter().filter(|e| e.health > 0).count(),
+                t.entries().len(),
+            )
+        });
+        format!(
+            "object health {health:.1}/{most:.1}, alive {alive}, nodes with health {left}/{nodes}"
+        )
+    };
+    println!("fortress {guid:#x}: {}", status(mission));
+    let template = mission
+        .world()
+        .borrow()
+        .placed_as
+        .get(&guid)
+        .cloned()
+        .unwrap_or_default();
+    let state = match install {
+        Some(root) => part_state(root, &template)?,
+        None => None,
+    };
+    mission
+        .run(
+            &format!(
+                "ObjectState.SendDamage(Sys.StringToGuid('{guid:#x}'), \
+                 Sys.StringToGuid('{FORTRESS_PART:#x}'), 1)"
+            ),
+            "fortress part",
+        )
+        .map_err(|e| e.to_string())?;
+    let messages: Vec<String> = mission
+        .take_commands()
+        .into_iter()
+        .filter_map(|c| match c {
+            Command::NodeDamage { node, message, .. } => Some(format!("{node:#x}:{message:x?}")),
+            _ => None,
+        })
+        .collect();
+    println!(
+        "part {FORTRESS_PART:#x} sent 1: messages {messages:?}; {}",
+        status(mission)
+    );
+    match state {
+        Some(s) => {
+            println!("model: DestroyMsg sends part {FORTRESS_PART:#x} to state {s:#x}");
+            mission.object_state_changed(guid, FORTRESS_PART, s);
+        }
+        None => println!("model: no DestroyMsg state found for part {FORTRESS_PART:#x}"),
+    }
+    let (mut kills, mut destroyed_at) = (0, None);
+    let end = mission.now() + 120.0;
+    while mission.now() < end {
+        mission.tick(0.25);
+        for c in mission.take_commands() {
+            match c {
+                Command::NodeDamage {
+                    message: Some(_), ..
+                } => kills += 1,
+                Command::Kill(g) if g == guid && destroyed_at.is_none() => {
+                    destroyed_at = Some(mission.now());
+                }
+                _ => {}
+            }
+        }
+        mission.take_log();
+    }
+    println!(
+        "after 120 s: {kills} node messages, {}; {}",
+        status(mission),
+        destroyed_at.map_or("not destroyed".into(), |t| format!(
+            "destroyed (Kill at t={t:.1})"
+        ))
+    );
+    // What the cascade left (nodes no part's breaking hides here, with no
+    // game to hide them): each sent 1 until the fortress dies.
+    let left: Vec<u32> = mission
+        .world()
+        .borrow_mut()
+        .node_table(guid)
+        .map(|t| {
+            t.entries()
+                .iter()
+                .filter(|e| e.health > 0)
+                .map(|e| e.node)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut sent = 0;
+    for n in left {
+        if !mission.world().borrow().objects[&guid].alive {
+            break;
+        }
+        mission
+            .run(
+                &format!(
+                    "ObjectState.SendDamage(Sys.StringToGuid('{guid:#x}'),                      Sys.StringToGuid('{n:#x}'), 1)"
+                ),
+                "fortress node",
+            )
+            .map_err(|e| e.to_string())?;
+        sent += 1;
+    }
+    let killed = mission.take_commands().contains(&Command::Kill(guid));
+    mission.tick(0.25);
+    let deaths: Vec<String> = mission
+        .take_log()
+        .into_iter()
+        .filter(|l| l.contains("OnDeath"))
+        .collect();
+    println!(
+        "the rest sent 1, {sent} nodes: {}; Kill sent {killed}; OnDeath errors {deaths:?}",
+        status(mission)
+    );
+    Ok(())
+}
+
+/// Where template `template`'s model sends part `FORTRESS_PART` on
+/// `DestroyMsg` from its intact state.
+fn part_state(root: &str, template: &str) -> Result<Option<u32>> {
+    use m2_assets::layer::{Layer, TEMPLATE_DB_TYPE};
+    use m2_assets::model::{DESTROY_MSG, PartStates};
+    let install = m2_engine::Install::find(std::path::Path::new(root))?;
+    let mut source = install.open_world()?;
+    let index = source.archive().index();
+    let db_hash = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+        .ok_or("no template database")?;
+    let data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&data)?;
+    let names = db.names();
+    let Some(id) = names
+        .iter()
+        .find(|(_, n)| n.eq_ignore_ascii_case(template))
+        .map(|(id, _)| *id)
+    else {
+        return Ok(None);
+    };
+    let Some(&model) = db.hashes("ModelName").get(&id) else {
+        return Ok(None);
+    };
+    let data = source.model(model)?;
+    let model = data.parse()?;
+    let Some(states) = model.states.as_ref() else {
+        return Ok(None);
+    };
+    let Some(m) = states.machines.iter().find(|m| {
+        m.node
+            .and_then(|n| model.nodes.get(usize::from(n)))
+            .is_some_and(|n| n.name_hash == FORTRESS_PART)
+    }) else {
+        return Ok(None);
+    };
+    // A part whose InitState puts it nowhere stays there.
+    let Some(s) = PartStates::intact_state(m).or_else(|| {
+        m.states
+            .iter()
+            .position(|x| x.0 == m2_assets::model::STATE_INIT)
+    }) else {
+        return Ok(None);
+    };
+    Ok(m.acts.get(s).and_then(|a| {
+        a.on.iter()
+            .find(|(msg, _)| *msg == DESTROY_MSG)
+            .map(|&(_, to)| to)
+    }))
 }

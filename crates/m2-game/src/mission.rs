@@ -359,7 +359,7 @@ pub struct GameData {
     pub template_cash: HashMap<String, i32>,
     /// Templates' `NodeHealth` records by name in lower case
     /// ([`crate::node_damage::template_nodes`]).
-    pub template_nodes: HashMap<String, Vec<m2_engine::node_health::NodeRecord>>,
+    pub template_nodes: HashMap<String, crate::node_damage::TemplateNodes>,
     /// Every template's name in the template database, in lower case:
     /// the names scripts look templates up by (`Pg.GetGuidByName("OC")`).
     pub template_names: std::collections::HashSet<String>,
@@ -3169,7 +3169,7 @@ fn seat_crew(
 /// `repairpad` is the script of the helipads and the PMC's garage
 /// (0xcd561a19): awake, its lights are on (`Vehicle.SetParts` of
 /// `LightFront`), and they go out when it dies.
-pub const OBJECT_SCRIPTS: [(&str, u32); 14] = [
+pub const OBJECT_SCRIPTS: [(&str, u32); 15] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3184,7 +3184,16 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 14] = [
     ("pmcgate", PMC_GATE),
     ("repairpad", REPAIR_PAD),
     ("pursuitcopter", PURSUIT_COPTER),
+    ("islandfortress", ISLAND_FORTRESS),
 ];
+
+/// `islandfortress`'s module hash: the script of the island fortress
+/// (`_island_bld_fortress01`'s `ObjectScript`). Its `OnStateChange` hears
+/// the part of node `cf37044a` go to state `694683eb` and brings the
+/// fortress down slice by slice (`KillNode`: `Object.GetNodeHealth`, then
+/// `ObjectState.SendDamage` of 1 and a timer for the slices next to it,
+/// [`crate::node_damage`]).
+pub const ISLAND_FORTRESS: u32 = 0x37b3_668c;
 
 /// `pursuitcopter`'s module hash.
 pub const PURSUIT_COPTER: u32 = 0x3e29_6216;
@@ -3308,11 +3317,17 @@ fn object_script(
 ) -> Option<Result<(), String>> {
     let (module, _) = OBJECT_SCRIPTS.iter().find(|(_, s)| *s == script)?;
     let call = if load { "OnActivate" } else { "OnDeactivate" };
+    // A module without the hook is passed over (0x823094F0 looks the name
+    // up first, [`crate::object_hooks`]): the island fortress has no
+    // `OnActivate`.
     Some(
         lua.globals()
             .get::<mlua::Table>(*module)
-            .and_then(|m| m.get::<mlua::Function>(call))
-            .and_then(|f| f.call::<()>((crate::events::guid_value(guid), mlua::Value::Nil, data)))
+            .and_then(|m| m.get::<Option<mlua::Function>>(call))
+            .and_then(|f| match f {
+                Some(f) => f.call::<()>((crate::events::guid_value(guid), mlua::Value::Nil, data)),
+                None => Ok(()),
+            })
             .map_err(|err| format!("{module}.{call}: {}", first_lines(&err.to_string()))),
     )
 }

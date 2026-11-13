@@ -1164,6 +1164,55 @@ impl ModelParts {
         self.states.part_of(node as u16)
     }
 
+    /// Where message `msg` sends part `k` from its intact state (or its
+    /// `InitState`, for a part that never leaves it), by its handlers there (the verb [`ON_MESSAGE`]): the part's node name hash
+    /// (the machine an object script's `OnStateChange` is told of) and the
+    /// state's name hash. `None` when the intact state has no handler for
+    /// it, or one that drops it.
+    ///
+    /// [`ON_MESSAGE`]: m2_assets::model::ON_MESSAGE
+    pub fn on_message(&self, k: usize, msg: u32) -> Option<(u32, u32)> {
+        let m = self.states.machines.get(k)?;
+        // A part whose `InitState` puts it nowhere stays there.
+        let s = m2_assets::model::PartStates::intact_state(m).or_else(|| {
+            m.states
+                .iter()
+                .position(|x| x.0 == m2_assets::model::STATE_INIT)
+        })?;
+        let to = m
+            .acts
+            .get(s)?
+            .on
+            .iter()
+            .find(|(x, _)| *x == msg)
+            .map(|&(_, to)| to)
+            .filter(|&to| to != 0 && to != m.states[s].0)?;
+        let node = self.nodes.get(usize::from(m.node?))?.name_hash;
+        Some((node, to))
+    }
+
+    /// The name hashes of the nodes part `k` shows only while it stands,
+    /// and of every node under them: what its breaking hides.
+    pub fn hidden_by(&self, k: usize) -> Vec<u32> {
+        let Some(shows) = self.shows.get(k) else {
+            return Vec::new();
+        };
+        (0..self.nodes.len())
+            .filter(|&i| {
+                let mut at = Some(i as u16);
+                for _ in 0..=self.nodes.len() {
+                    match at {
+                        Some(n) if shows.contains(&n) => return true,
+                        Some(n) => at = self.nodes[usize::from(n)].parent,
+                        None => return false,
+                    }
+                }
+                false
+            })
+            .map(|i| self.nodes[i].name_hash)
+            .collect()
+    }
+
     /// The box of what part `k` shows intact (model space), if anything.
     pub fn part_box(&self, k: usize) -> Option<(Vec3, Vec3)> {
         self.boxes.get(k).copied().flatten()
@@ -2252,6 +2301,61 @@ impl GpuModel {
 mod tests {
     use super::*;
     use m2_render::NullBackend;
+
+    // A part's DestroyMsg handler in its intact state sends it on: the
+    // fortress's part told its object script's OnStateChange.
+    #[test]
+    fn a_part_message_names_its_node_and_new_state() {
+        use m2_assets::model::{DESTROY_MSG, PartMachine, PartStates, StateActs};
+        let machine = PartMachine {
+            node: Some(1),
+            states: vec![(0x0ace_072a, vec![]), (0x6946_83eb, vec![(2, true)])],
+            // As the island fortress's whole: no start out of InitState.
+            starts: [None, Some(0x7687_df41)],
+            acts: vec![
+                StateActs {
+                    on: vec![(DESTROY_MSG, 0x6946_83eb), (0xc650_7ee1, 0)],
+                    ..Default::default()
+                },
+                StateActs::default(),
+            ],
+        };
+        let nodes = vec![
+            m2_assets::model::Node::default(),
+            m2_assets::model::Node {
+                name_hash: 0xcf37_044a,
+                ..Default::default()
+            },
+        ];
+        let parts = ModelParts {
+            states: PartStates {
+                machines: vec![machine],
+                ..Default::default()
+            },
+            nodes,
+            shows: vec![vec![]],
+            boxes: vec![None],
+            meshes: Vec::new(),
+        };
+        assert_eq!(
+            parts.on_message(0, DESTROY_MSG),
+            Some((0xcf37_044a, 0x6946_83eb))
+        );
+        // A handler that drops it, none, or no such part.
+        assert_eq!(parts.on_message(0, 0xc650_7ee1), None);
+        assert_eq!(parts.on_message(0, 0x1234), None);
+        assert_eq!(parts.on_message(1, DESTROY_MSG), None);
+        // What part 0 hides: node 1 and a locator under it.
+        let mut parts = parts;
+        parts.shows = vec![vec![1]];
+        parts.nodes.push(m2_assets::model::Node {
+            name_hash: 0x26c4_7dc0,
+            parent: Some(1),
+            ..Default::default()
+        });
+        assert_eq!(parts.hidden_by(0), [0xcf37_044a, 0x26c4_7dc0]);
+        assert!(parts.hidden_by(1).is_empty());
+    }
 
     #[test]
     fn a_phone_drops_top_mips_only_while_the_texture_stays_over_256() {
