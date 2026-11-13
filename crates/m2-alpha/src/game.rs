@@ -3072,16 +3072,12 @@ impl Game {
     /// strings, once the scripts have read them).
     pub fn hud_info(&self, strings: Option<&m2_assets::StringTable>) -> HudInfo {
         let player = self.scene.player.as_ref();
+        // The island-wide tiles (nearby detail streams in quietly), its
+        // vehicles and people, or her arrival: the loading screen's.
         let loading = match &self.scene.world {
-            // The island-wide tiles; nearby detail streams in quietly.
-            Some(w) if w.stats().tiles + w.stats().failed < w.index.tiles.len() => {
-                Some("Loading the island...".to_owned())
-            }
-            Some(_) if self.scene.vehicles_loading() => {
-                Some("Finding vehicles and people...".to_owned())
-            }
-            _ if self.arrival.is_some() => Some("Arriving...".to_owned()),
-            _ => None,
+            Some(w) if w.stats().tiles + w.stats().failed < w.index.tiles.len() => true,
+            Some(_) if self.scene.vehicles_loading() => true,
+            _ => self.arrival.is_some(),
         };
         let driving = player.and_then(|p| p.driving).and_then(|i| {
             let v = self.scene.vehicles.get(i)?;
