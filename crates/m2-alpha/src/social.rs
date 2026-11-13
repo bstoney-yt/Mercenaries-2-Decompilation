@@ -235,6 +235,67 @@ impl Social {
         }
     }
 
+    /// For checking (`--use-nearest`): the usable thing with seats
+    /// nearest `her` calls the person nearest it over at once, whatever
+    /// its timer and the candidate rules say (anyone alive, on their
+    /// feet and free). The thing and the person, if it took.
+    pub fn force_call(
+        &mut self,
+        index: &WorldIndex,
+        destroyed: &HashSet<usize>,
+        mut source: Option<&mut AssetSource<BufReader<File>>>,
+        people: &mut People,
+        her: Vec3,
+    ) -> Option<(usize, usize)> {
+        let mut things: Vec<(f32, usize)> = self
+            .placed(index)
+            .iter()
+            .copied()
+            .filter(|i| !destroyed.contains(i))
+            .map(|i| (index.objects[i].position.distance(her), i))
+            .collect();
+        things.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (d, i) in things.into_iter().take(5) {
+            let o = &index.objects[i];
+            let duration = index
+                .template_db
+                .social_use
+                .get(&o.template)
+                .map_or(30.0, |r| r.duration);
+            let free = |n: &crate::npc::Npc| {
+                n.alive && n.landed && !n.held && n.down.is_none() && n.using().is_none()
+            };
+            let who = people
+                .npcs
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| free(n))
+                .min_by(|a, b| {
+                    let d = |n: &crate::npc::Npc| n.character.position.distance(o.position);
+                    d(a.1).total_cmp(&d(b.1))
+                })
+                .map(|(k, _)| k)?;
+            match self.job(index, source.as_deref_mut(), people, i, who, duration) {
+                Some(job) => {
+                    eprintln!(
+                        "use-check: object {i} (template {:08x}, {d:.0} m from her) calls person {who} over to seat {:08x}, {:.1} m off",
+                        o.template,
+                        job.seat,
+                        people.npcs[who].character.position.distance(job.entrance)
+                    );
+                    people.npcs[who].start_use(job);
+                    return Some((i, who));
+                }
+                None => eprintln!(
+                    "use-check: object {i} (template {:08x}) has no free seat with clips for person {who}",
+                    o.template
+                ),
+            }
+        }
+        eprintln!("use-check: no usable thing took anyone");
+        None
+    }
+
     /// The job of person `who` called over to placed object `i`: its
     /// first seat nobody uses, with a place and a seated clip on their
     /// rig.

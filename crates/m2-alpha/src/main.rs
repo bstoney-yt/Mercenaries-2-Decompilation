@@ -409,6 +409,12 @@ struct Options {
     /// `--check-shots <s>,<s>...` with `--screenshot` on foot: the scene
     /// is pictured at those seconds in too (`<out>-at<s>.ppm`).
     check_shots: Vec<f32>,
+    /// `--use-nearest <s>` with `--screenshot` on foot: that many seconds
+    /// in, the usable thing with seats nearest her calls the person
+    /// nearest it over at once (whatever its timer and the candidate
+    /// rules say); then each second where that person is at (use-check
+    /// lines).
+    use_nearest: Option<f32>,
     /// `--people-watch` with `--screenshot` on foot: each second, how
     /// many people are in play by what they are doing, and the nearest
     /// five's state, clip and distance (people-watch lines).
@@ -1020,6 +1026,9 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 }
             }
             "--people-watch" => o.people_watch = true,
+            "--use-nearest" => {
+                o.use_nearest = Some(value()?.parse().context("--use-nearest expects seconds")?)
+            }
             "--pause-at" => o.pause_at = Some(value()?.parse()?),
             "--contracts" => {
                 o.contracts = value()?.parse().context("--contracts expects a count")?
@@ -2311,7 +2320,32 @@ fn screenshot(
         let knock_tick = options
             .knock_nearest
             .map(|(s, ram)| ((s * 60.0).round() as usize, ram));
+        // `--use-nearest`: the tick, and the person called over.
+        let use_tick = options.use_nearest.map(|s| (s * 60.0).round() as usize);
+        let mut user: Option<usize> = None;
         for i in 0..ticks {
+            if use_tick == Some(i) {
+                user = use_pick(&mut game);
+            }
+            if let (Some(at), Some(k)) = (use_tick, user)
+                && i > at
+                && (i - at).is_multiple_of(60)
+                && let Some(n) = game.scene.people.npcs.get(k)
+            {
+                eprintln!(
+                    "use-check: {} s: person {k} {} ({:?}), at {:.1}",
+                    (i - at) / 60,
+                    if n.seated_at_use() {
+                        "seated"
+                    } else if n.using().is_some() {
+                        "on the way"
+                    } else {
+                        "not using it"
+                    },
+                    n.using(),
+                    n.character.position
+                );
+            }
             if let Some((at, _)) = knock_tick
                 && i == at
             {
@@ -6027,6 +6061,22 @@ fn knock_log(game: &Game, k: usize, second: usize) {
     );
 }
 
+/// `--use-nearest`: the nearest usable thing calls the person nearest
+/// it over. That person's index into the people, if it took.
+fn use_pick(game: &mut Game) -> Option<usize> {
+    let her = game.scene.player.as_ref()?.character.position;
+    let world = game.scene.world.as_ref()?;
+    game.social
+        .force_call(
+            &world.index,
+            &world.destroyed,
+            game.scene.source.as_mut(),
+            &mut game.scene.people,
+            her,
+        )
+        .map(|(_, who)| who)
+}
+
 /// `--people-watch`: how many people are in play by what they are
 /// doing, and the nearest five to her, `second` seconds in.
 fn people_watch(game: &Game, second: usize) {
@@ -6054,8 +6104,15 @@ fn people_watch(game: &Game, second: usize) {
         .map(|&(d, k)| {
             let n = &game.scene.people.npcs[k];
             format!(
-                "{k}: {} {:08x} {d:.0} m",
+                "{k}: {}{} {:08x} {d:.0} m",
                 n.human_state(),
+                if n.seated_at_use() {
+                    " seated"
+                } else if n.using().is_some() {
+                    " to-seat"
+                } else {
+                    ""
+                },
                 n.rig
                     .animator
                     .current()
