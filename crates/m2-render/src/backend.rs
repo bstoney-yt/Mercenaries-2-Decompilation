@@ -92,6 +92,46 @@ pub struct PointLight {
     pub outer: f32,
 }
 
+/// The game's screen overlay (its "rain" quad: `PgRainVP`/`PgRainFP`, the
+/// PC's shaders 421 and 420), drawn over the finished frame: a texture
+/// laid out by view direction, scrolled, tinted, and added to the frame,
+/// taken from it, or blended over it. See `gpu::post` for the maths.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScreenOverlay {
+    /// The texture (`global_rain` in every record), sampled as stored.
+    pub map: crate::TextureHandle,
+    /// The shader's `rainVelocity`: the unit direction it scrolls along,
+    /// how far it has scrolled, and its density (the strength).
+    pub velocity: [f32; 4],
+    /// The shader's `rainColor`.
+    pub colour: [f32; 4],
+    pub blend: OverlayBlend,
+}
+
+/// How the overlay meets the frame, by the record's type (from the 360
+/// code, 0x821BF628 and the blend tables at 0x82B74CBC; the operation and
+/// factor numbers read by the 360's Direct3D values).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverlayBlend {
+    /// Type 0 and any other: added, weighed by its alpha.
+    #[default]
+    Add,
+    /// Type 1: taken from the frame, weighed by its alpha.
+    Subtract,
+    /// Type 2: blended over the frame by its alpha.
+    Alpha,
+}
+
+impl OverlayBlend {
+    pub fn from_type(kind: u32) -> Self {
+        match kind {
+            1 => Self::Subtract,
+            2 => Self::Alpha,
+            _ => Self::Add,
+        }
+    }
+}
+
 /// Light and atmosphere for a frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Lighting {
@@ -106,6 +146,8 @@ pub struct Lighting {
     pub sun_disc: Vec3,
     /// The sun flare's texture (`radial_flare`); `None` draws no flare.
     pub flare_map: Option<crate::TextureHandle>,
+    /// The atmosphere record's screen overlay; `None` draws none.
+    pub screen_overlay: Option<ScreenOverlay>,
     /// Linear RGB (see [`gamma_light`](Self::gamma_light)).
     pub sun_color: Vec3,
     /// Linear RGB light reaching surfaces from every side, by the way they
@@ -343,6 +385,7 @@ impl Default for Lighting {
             shadow_direction: None,
             sun_disc: Vec3::ZERO,
             flare_map: None,
+            screen_overlay: None,
             sun_color: Vec3::new(1.0, 0.95, 0.85),
             // Sky above, warm bounce from the ground below.
             ambient_cube: [
@@ -440,6 +483,20 @@ impl View {
             far,
             lighting: Lighting::default(),
         }
+    }
+
+    /// The same view between other near and far distances: the picture's
+    /// width and height (the projection's x and y scales) kept.
+    pub fn with_near_far(mut self, near: f32, far: f32) -> Self {
+        let (x, y) = (self.projection.x_axis.x, self.projection.y_axis.y);
+        // Reversed depth, as `perspective`: the planes swapped.
+        let mut p = Mat4::perspective_rh(1.0, 1.0, far, near);
+        p.x_axis.x = x;
+        p.y_axis.y = y;
+        self.projection = p;
+        self.near = near;
+        self.far = far;
+        self
     }
 
     /// The camera's world position.
@@ -554,4 +611,25 @@ pub trait RenderBackend {
 
     /// Closes the frame and presents it.
     fn end_frame(&mut self) -> Result<(), BackendError>;
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    #[test]
+    fn other_near_and_far_keep_the_pictures_shape() {
+        let v = View::perspective(Vec3::ZERO, Vec3::NEG_Z, 0.8, 16.0 / 9.0, 0.2, 2400.0);
+        let w = v.with_near_far(0.3, 500.0);
+        assert_eq!(w.projection.x_axis.x, v.projection.x_axis.x);
+        assert_eq!(w.projection.y_axis.y, v.projection.y_axis.y);
+        assert_eq!((w.near, w.far), (0.3, 500.0));
+        // Reversed depth: the near plane at depth 1, the far at 0.
+        let depth = |z: f32| {
+            let c = w.projection * m2_math::glam::Vec4::new(0.0, 0.0, -z, 1.0);
+            c.z / c.w
+        };
+        assert!((depth(0.3) - 1.0).abs() < 1e-5);
+        assert!(depth(500.0).abs() < 1e-5);
+    }
 }

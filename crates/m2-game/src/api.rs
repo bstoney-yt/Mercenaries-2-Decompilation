@@ -5042,11 +5042,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([Value::Boolean(w.music.locked)])
     })?;
     add(&sound, "SetDynamicMusic", |w, _, a| {
-        w.music.dynamic = matches!(a.first(), Some(Value::Boolean(true)));
+        w.music.fixed = !matches!(a.first(), Some(Value::Boolean(true)));
         values([])
     })?;
     add(&sound, "IsDynamicMusic", |w, _, _| {
-        values([Value::Boolean(w.music.dynamic)])
+        values([Value::Boolean(!w.music.fixed)])
     })?;
     // Sound.LoadTempBank(name, type, callback, data) and
     // Sound.LoadBankWithCallback(name, type, callback): how
@@ -5075,17 +5075,85 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&sound, "UnloadBankWithCallback", |w, _, a| {
         bank(w, a, false)
     })?;
-    // Set-up and the action level the score is not driven by yet.
-    for name in [
-        "AddFactionMusic",
-        "AddMusicState",
-        "AddMusicTransition",
-        "SetActionThresholdsMusic",
-        "SetActionLevelsMusic",
-        "LockActionLevelMusic",
-    ] {
-        add(&sound, name, |_, _, _| values([]))?;
-    }
+    // The score's state machine ([`crate::music_machine`]). Each answers
+    // nothing; with an argument missing the 360 answers nil and does
+    // nothing, which here is nothing done.
+    //
+    // AddFactionMusic(name) (0x82341858): the new faction is the one in
+    // use, so the states that follow are its own.
+    add(&sound, "AddFactionMusic", |w, _, a| {
+        if let Some(Value::String(name)) = a.first() {
+            w.music.set_faction(&name.to_string_lossy());
+        }
+        values([])
+    })?;
+    // AddMusicState(name, length, level, delay, interval, flags [, least])
+    // (0x82342130).
+    add(&sound, "AddMusicState", |w, _, a| {
+        let (Some(Value::String(name)), Some(length), Some(level), Some(delay)) =
+            (a.first(), num(a.get(1)), num(a.get(2)), num(a.get(3)))
+        else {
+            return values([]);
+        };
+        let (Some(interval), Some(flags)) = (num(a.get(4)), num(a.get(5))) else {
+            return values([]);
+        };
+        w.music.machine().add_state(crate::music_machine::State {
+            name: name.to_string_lossy().to_ascii_lowercase(),
+            length,
+            level: level as i32,
+            delay,
+            interval,
+            least: num(a.get(6)).unwrap_or(0.0),
+            flags: flags as u8,
+            thresholds: (0.0, 0.0),
+            transitions: Vec::new(),
+        });
+        values([])
+    })?;
+    // AddMusicTransition(from, to, weight, sync, kind) (0x823422A0).
+    add(&sound, "AddMusicTransition", |w, _, a| {
+        if let (Some(Value::String(from)), Some(Value::String(to)), Some(weight)) =
+            (a.first(), a.get(1), num(a.get(2)))
+            && let (Some(sync), Some(kind)) = (num(a.get(3)), num(a.get(4)))
+        {
+            w.music.machine().add_transition(
+                &from.to_string_lossy(),
+                &to.to_string_lossy(),
+                weight,
+                sync as i32,
+                kind as i32,
+            );
+        }
+        values([])
+    })?;
+    // SetActionThresholdsMusic(state, first, second) (0x82341F68).
+    add(&sound, "SetActionThresholdsMusic", |w, _, a| {
+        if let (Some(Value::String(state)), Some(first), Some(second)) =
+            (a.first(), num(a.get(1)), num(a.get(2)))
+        {
+            w.music
+                .machine()
+                .set_thresholds(&state.to_string_lossy(), first, second);
+        }
+        values([])
+    })?;
+    // SetActionLevelsMusic(a, b, c, d) (0x82341A88).
+    add(&sound, "SetActionLevelsMusic", |w, _, a| {
+        if let (Some(p), Some(q), Some(r), Some(s)) =
+            (num(a.first()), num(a.get(1)), num(a.get(2)), num(a.get(3)))
+        {
+            w.music.set_action_levels(p, q, r, s);
+        }
+        values([])
+    })?;
+    // LockActionLevelMusic(on) (0x82341BB0).
+    add(&sound, "LockActionLevelMusic", |w, _, a| {
+        if let Some(Value::Boolean(on)) = a.first() {
+            w.music.action_locked = *on;
+        }
+        values([])
+    })?;
 
     // Scripted voice lines, as (speaker, cue, callback, values, priority,
     // send over the network); speaker 0 is the radio. The sequences that
@@ -5105,10 +5173,22 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => None,
         };
         let subtitled = subtitled && !w.subtitles_off;
-        let say =
-            w.vo.cue(speaker, cue.to_string_lossy(), callback, subtitled);
-        w.commands.push(say);
-        values([Value::Boolean(true)])
+        // The callback takes two places (the function and its values),
+        // so the priority is the fifth argument (0x82349000).
+        let priority = num(a.get(4)).map_or(crate::vo::DEFAULT_PRIORITY, |p| p as i32);
+        let sequences = std::mem::take(&mut w.vo_sequences);
+        let say = w.vo.cue(
+            speaker,
+            cue.to_string_lossy(),
+            callback,
+            subtitled,
+            priority,
+            &sequences,
+        );
+        w.vo_sequences = sequences;
+        let played = say.is_some();
+        w.commands.extend(say.into_iter().flatten());
+        values([Value::Boolean(played)])
     }
     add(&vo, "Cue", |w, _, a| cue(w, a, true))?;
     add(&vo, "CueWithoutSubtitles", |w, _, a| cue(w, a, false))?;
@@ -5502,7 +5582,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // each marked included or excluded (`AddObject` 823587B0 / 82359A58:
     // adding one already there only changes its mark). `UsePlayers(f)`
     // (82358AD8) adds the any-player wildcard `Player.GetAnyCharacter()`;
-    // `false` adds nothing. The wildcards (0xf0000000 any player,
+    // `false` or nil adds nothing (0x82308230 takes nil as false; only
+    // an absent flag is true). The wildcards (0xf0000000 any player,
     // 0xf0000001 all players, since #507 what `GetAnyCharacter` and
     // `GetAllCharacters` answer) are entries like any other:
     // - `GetObjects(f [, excluded])` (823588F0, 82359D58) lists the
@@ -5533,8 +5614,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             if not has(f, g) then f.objs[#f.objs + 1] = g end
             f.ex[g] = exclude and true or nil
         end
-        function F.UsePlayers(f, b)
-            if ok(f) and b ~= false then F.AddObject(f, Player.GetAnyCharacter()) end
+        -- The flag as the 360 reads it (0x82308230): a boolean or nil
+        -- (false) is taken; only when none is passed at all is it true.
+        -- `MrxTaskObjective.Activated` passes `bTgtPlayers`, nil for most
+        -- objectives: no players then.
+        function F.UsePlayers(f, ...)
+            local on = true
+            if select('#', ...) > 0 then on = (...) and true or false end
+            if ok(f) and on then F.AddObject(f, Player.GetAnyCharacter()) end
         end
         function F.SetFilter(f, label) if ok(f) then f.label = label end end
         function F.RemoveObject(f, g)
@@ -8247,6 +8334,30 @@ mod tests {
             .eval()
             .unwrap();
         assert!(r.iter().all(|&b| b), "{r:?}");
+    }
+
+    // `MrxTaskObjective.Activated` calls `UsePlayers(f, cfg.bTgtPlayers)`,
+    // nil for most objectives. The 360 reads the flag with 0x82308230,
+    // which takes nil as false: no players. Treated as true, MecCon001's
+    // "Enter vehicle" found her among its vehicles and its script failed
+    // ("attempt to index field '?'").
+    #[test]
+    fn use_players_with_nil_adds_no_players() {
+        let (host, _) = setup();
+        let r: (i64, i64, i64, i64) = host
+            .lua()
+            .load(
+                r#"local a, b, c, d = ObjectFilter.Create(), ObjectFilter.Create(),
+                    ObjectFilter.Create(), ObjectFilter.Create()
+                ObjectFilter.UsePlayers(a, nil)
+                ObjectFilter.UsePlayers(b, false)
+                ObjectFilter.UsePlayers(c)
+                ObjectFilter.UsePlayers(d, true)
+                return #a.objs, #b.objs, #c.objs, #d.objs"#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(r, (0, 0, 1, 1));
     }
 
     // From the 360 code (0x82359A58, 0x82359D58, 0x82359F80): an entry

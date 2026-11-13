@@ -242,7 +242,9 @@ impl WindowConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CameraConfig {
-    /// Vertical field of view in degrees.
+    /// The game's field of view in degrees: the picture's width on a 4:3
+    /// screen, wider on a wider one ([`m2_engine::projection`]). The
+    /// game's own is 54.99 (0.95974994 radians).
     pub fov: f32,
     /// Radians per pixel of mouse movement.
     pub mouse_sensitivity: f32,
@@ -254,7 +256,7 @@ pub struct CameraConfig {
 impl Default for CameraConfig {
     fn default() -> Self {
         Self {
-            fov: 60.0,
+            fov: m2_engine::projection::FOV.to_degrees(),
             mouse_sensitivity: 0.0025,
             speed: 8.0,
             invert_y: false,

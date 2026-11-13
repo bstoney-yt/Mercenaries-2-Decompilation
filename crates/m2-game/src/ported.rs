@@ -110,6 +110,7 @@ pub(crate) fn install(
         let Some(on) = flag(a.first()) else {
             return values([Value::Nil]);
         };
+        w.vo.cinematic = on;
         w.commands.push(Command::VoCinematic(on));
         values([Value::Boolean(true)])
     })?;

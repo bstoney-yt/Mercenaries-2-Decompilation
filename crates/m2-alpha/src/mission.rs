@@ -44,6 +44,7 @@ use m2_game::events::World as _;
 use m2_game::hud::ObjectiveMessage;
 use m2_game::layers::LayerOp;
 use m2_game::mission::{GameData, Mission, PLAYER};
+use m2_game::vehicle_state::VehicleCommand;
 use m2_math::glam::Vec3;
 
 use crate::combat::{self, Weapon};
@@ -198,7 +199,24 @@ pub struct RadarView {
     pub sticky: bool,
     /// Draw order: lower over higher.
     pub sort: i64,
+    /// Its sonar rings, under its icon: their texture and colour, and
+    /// each one's width (radar units) and opacity
+    /// ([`m2_game::radar_anim::SonarAnim`]).
+    pub rings: Option<Rings>,
+    /// Half its width and height, in the radar's own units (see
+    /// [`m2_game::hud::Blip::size`]).
+    pub size: [f32; 2],
+    /// Its target's heading (yaw), when it has a target.
+    pub yaw: Option<f32>,
+    /// Turns with the map, and takes its target's heading (the scripts'
+    /// `bRotate` and `bOriented`).
+    pub rotate: bool,
+    pub oriented: bool,
 }
+
+/// A blip's sonar rings: their texture and colour, and each one's width
+/// and opacity.
+pub type Rings = (String, [u8; 3], Vec<(f32, f32)>);
 
 /// A marker the scripts put over one of their objects (`Marker.AddBlip`),
 /// as the HUD shows it.
@@ -1067,6 +1085,11 @@ pub struct MissionLink {
     states: HashMap<u32, &'static str>,
     /// The reverb to switch to, if the scripts changed it.
     reverb: Option<Option<m2_engine::reverb::ReverbPreset>>,
+    /// The master volume fades the scripts asked for since last taken
+    /// (`Sound.SetMasterVolume`: level, seconds), in order.
+    master_volumes: Vec<(f32, f32)>,
+    /// `Sound.LockListenerPosition`, as the scripts last set it.
+    listener_locked: bool,
     /// The ambiences the scripts cued (true) or stopped since last taken,
     /// by name hash, in order.
     ambiences: Vec<(u32, bool)>,
@@ -1090,6 +1113,8 @@ pub struct MissionLink {
     saves: Vec<String>,
     /// Steps to the next look at her support stock.
     stock_look: u32,
+    /// The counts last given to the score's action level (for the log).
+    music_aware: [u32; 4],
     /// Her support stock by item key, as last looked at.
     stock_counts: Vec<(String, u32)>,
     /// Aimed designators' marks (guid, where) waiting to settle, and the
@@ -1233,6 +1258,8 @@ impl MissionLink {
             radio: Radio::default(),
             states: HashMap::new(),
             reverb: None,
+            master_volumes: Vec::new(),
+            listener_locked: false,
             ambiences: Vec::new(),
             music_region: None,
             support: Vec::new(),
@@ -1242,6 +1269,7 @@ impl MissionLink {
             sighted: HashMap::new(),
             saves: Vec::new(),
             stock_look: 0,
+            music_aware: [0; 4],
             stock_counts: Vec::new(),
             aimed: Vec::new(),
             landed: HashSet::new(),
@@ -2115,6 +2143,110 @@ impl MissionLink {
         // `Graphics.Effect.CameraFade`'s constants, for the particles.
         if let Some(p) = game.scene.particles.as_mut() {
             p.camera_fade = mission.world().borrow().effects.camera_fade;
+        }
+        // `Graphics.Camera.SetFovParams`, `SetNearFar` and their restores
+        // for the first view: a new call starts that set's blend, and both
+        // run on every tick (0x824B8208).
+        {
+            use m2_engine::projection::{FAR, FOV, NEAR};
+            let (fov, near_far) = {
+                let w = mission.world().borrow();
+                (w.effects.fov[0], w.effects.near_far[0])
+            };
+            if fov.calls != game.camera_calls[0] {
+                game.camera_calls[0] = fov.calls;
+                game.fov_blend.ask(fov.params.map(|f| [f]), fov.seconds);
+                eprintln!(
+                    "camera: the scripts set the field of view to {:?} rad over {} s",
+                    fov.params, fov.seconds
+                );
+            }
+            if near_far.calls != game.camera_calls[1] {
+                game.camera_calls[1] = near_far.calls;
+                game.near_far_blend.ask(near_far.params, near_far.seconds);
+                eprintln!(
+                    "camera: the scripts set near and far to {:?} over {} s",
+                    near_far.params, near_far.seconds
+                );
+            }
+            game.fov_blend.step(dt, [FOV]);
+            game.near_far_blend.step(dt, [NEAR, FAR]);
+        }
+        // The lines that started and stopped: the speaker's mouth flaps
+        // while theirs plays, as the 360's voice manager has it
+        // (0x822782D8, 0x82278440; [`m2_engine::face_expression`]).
+        // The scripts' own expressions (`Animation.PlayFacialExpression`,
+        // 0x82316078): the same table as the engine's, by the
+        // expression's name; a name not in it does nothing (0x8241DF40).
+        let facial = std::mem::take(&mut mission.world().borrow_mut().sp.facial);
+        for f in facial {
+            let name = m2_assets::name_hash(&f.expression);
+            if m2_engine::face_expression::expression(name).is_none()
+                && name != m2_engine::face_expression::DISABLE_ALL
+            {
+                eprintln!(
+                    "face: the scripts ask {:#x} for {:?}: no such expression",
+                    f.character, f.expression
+                );
+                continue;
+            }
+            let face = if f.character == m2_game::mission::PLAYER {
+                game.scene.player.as_mut().map(|p| &mut p.face)
+            } else {
+                game.scene
+                    .people
+                    .npcs
+                    .iter_mut()
+                    .find(|n| n.spawn == Some(f.character))
+                    .map(|n| &mut n.face)
+            };
+            let Some(face) = face else { continue };
+            eprintln!(
+                "face: the scripts give {:#x} {:?} at {:.2} for {:.1} s",
+                f.character, f.expression, f.a, f.b
+            );
+            if name == m2_engine::face_expression::DISABLE_ALL {
+                face.disable_all();
+            } else {
+                face.play(name, f.a, f.b, [0.5, 0.25, 0.75, 0.5]);
+            }
+        }
+        for speech in mission.world().borrow_mut().vo.take_speech() {
+            let (on, speaker, cue) = match speech {
+                m2_game::vo::Speech::Started { speaker, cue, .. } => (true, speaker, cue),
+                m2_game::vo::Speech::Stopped { speaker, cue, .. } => (false, speaker, cue),
+            };
+            let Some(guid) = speaker else { continue };
+            // Her own lines.
+            if guid == m2_game::mission::PLAYER {
+                if let Some(p) = game.scene.player.as_mut() {
+                    eprintln!(
+                        "face: she {} speaking (line {cue:08x})",
+                        if on { "starts" } else { "stops" }
+                    );
+                    p.speak(on);
+                }
+                continue;
+            }
+            match game
+                .scene
+                .people
+                .npcs
+                .iter_mut()
+                .find(|n| n.spawn == Some(guid))
+            {
+                Some(n) => {
+                    eprintln!(
+                        "face: {guid:#x} {} speaking (line {cue:08x})",
+                        if on { "starts" } else { "stops" }
+                    );
+                    n.speak(on);
+                }
+                None if on => {
+                    eprintln!("face: line {cue:08x}'s speaker {guid:#x} is no person here")
+                }
+                None => {}
+            }
         }
         let focus = game.focus();
         let mut lap = crate::spans::Lap::new();
@@ -3047,6 +3179,22 @@ impl MissionLink {
                     mission.set_hardpoint(g, name, place);
                 }
             }
+            // Soldiers running to raise their alarms, and the alarms they
+            // reach raised ([`crate::npc::People::raise_alarms`]).
+            let towers = {
+                let w = mission.world().borrow();
+                alarm_towers(game, &mut self.prop_nodes, &w.alarms)
+            };
+            if !towers.is_empty() {
+                for t in game.scene.people.raise_alarms(&towers) {
+                    eprintln!("people: alarm {t:#x} raised by a soldier");
+                    mission
+                        .world()
+                        .borrow_mut()
+                        .alarms
+                        .post(t, m2_game::alarm::ON);
+                }
+            }
             // The scripts' vehicles' load beds, where they count the goods
             // on them (`Object.GetHardpointPosition(truck, "HP_Truckbed")`),
             // their mass (`Object.GetMass`, the jump and boost scripts')
@@ -3364,6 +3512,45 @@ impl MissionLink {
             let spare = game.combat.rifle_rounds.stored;
             mission.set_player_reserve(CARBINE, spare.div_ceil(combat::RIFLE_CLIP));
             crate::spans::time("scripts: look", || look(game, mission, &mut self.sighted));
+            // The score's action level, from those hostile and aware of
+            // her, grouped as the 360 does by the seat they are in: the
+            // soldiers on foot turned on her and each vehicle gunner
+            // settled on her are the fourth group; the driver of a
+            // vehicle with such a gunner counts by its kind (inferred:
+            // the game does not say what a driver is aware of).
+            let on_foot = game
+                .scene
+                .people
+                .npcs
+                .iter()
+                .filter(|n| n.alive && n.alert)
+                .count();
+            let mut aware = [0; 4];
+            aware[m2_game::music_machine::group(0)] = on_foot as u32;
+            if let Some(world) = game.scene.world.as_ref() {
+                let mut crews = game.combat.crews_on_her();
+                aware[m2_game::music_machine::group(m2_engine::vehicle_class::TURRET)] +=
+                    crews.len() as u32;
+                crews.sort_unstable();
+                crews.dedup();
+                for i in crews {
+                    if let Some(v) = game.scene.vehicles.get(i).filter(|v| v.exhausting(false)) {
+                        let class = world
+                            .index
+                            .template_db
+                            .vehicle_class_for_model(v.spec.model);
+                        aware[m2_game::music_machine::group(class)] += 1;
+                    }
+                }
+                if aware != self.music_aware {
+                    eprintln!(
+                        "music: hostile and aware of her, by group (helicopter pilots, tank \
+                         and boat drivers, car drivers, the rest): {aware:?}"
+                    );
+                    self.music_aware = aware;
+                }
+            }
+            mission.set_hostile_aware(aware);
             crate::spans::time("scripts: lua", || mission.tick(f64::from(STEP)));
             // The scripts' own interface runs too: its animations finish
             // and their callbacks run (`MrxGuiCinematic.ShowMovie` plays
@@ -3472,6 +3659,12 @@ impl MissionLink {
                         }
                     }
                     Command::Reverb(preset) => self.reverb = Some(preset.clone()),
+                    Command::MasterVolume { volume, seconds } => {
+                        self.master_volumes.push((*volume, *seconds));
+                    }
+                    Command::Ported(m2_game::ported_player::PortedCommand::ListenerLocked(on)) => {
+                        self.listener_locked = *on;
+                    }
                     Command::Ambience { name, on } => {
                         self.ambiences.push((m2_assets::name_hash(name), *on));
                     }
@@ -3853,6 +4046,18 @@ impl MissionLink {
     /// carries: a radio's place and reach; `None` for the score.
     pub fn music_at(&self) -> Option<(Vec3, f32)> {
         self.music_at
+    }
+
+    /// The master volume fades the scripts asked for since last asked
+    /// (`Sound.SetMasterVolume`: level, seconds), in order.
+    pub fn take_master_volumes(&mut self) -> Vec<(f32, f32)> {
+        std::mem::take(&mut self.master_volumes)
+    }
+
+    /// Whether the scripts have the listener locked
+    /// (`Sound.LockListenerPosition`).
+    pub fn listener_locked(&self) -> bool {
+        self.listener_locked
     }
 
     /// The reverb to switch to, if the scripts changed it.
@@ -4708,12 +4913,13 @@ impl MissionLink {
         let models = self.marker_models(&w);
         let radar = radar_views(mission.lua(), &hud.radar, |g| {
             let o = w.objects.get(&g)?;
-            Some(
+            Some((
                 self.marked
                     .get(&g)
                     .copied()
                     .unwrap_or_else(|| Vec3::from(o.position)),
-            )
+                o.yaw,
+            ))
         });
         MissionView {
             status: None,
@@ -5043,7 +5249,7 @@ fn radar_regions(lua: &mlua::Lua) -> Vec<RadarRegion> {
 fn radar_views(
     lua: &mlua::Lua,
     radar: &std::collections::BTreeMap<String, m2_game::hud::Blip>,
-    place: impl Fn(u32) -> Option<Vec3>,
+    place: impl Fn(u32) -> Option<(Vec3, f32)>,
 ) -> Vec<RadarView> {
     let name_of = lua
         .globals()
@@ -5059,9 +5265,12 @@ fn radar_views(
         .values()
         .filter_map(|b| {
             let offset = Vec3::from(b.offset);
-            let at = match b.target {
-                Some(g) => place(g)? + offset,
-                None => offset,
+            let (at, yaw) = match b.target {
+                Some(g) => {
+                    let (at, yaw) = place(g)?;
+                    (at + offset, Some(yaw))
+                }
+                None => (offset, None),
             };
             let icon = b
                 .texture
@@ -5077,9 +5286,18 @@ fn radar_views(
             Some(RadarView {
                 at,
                 icon,
-                colour: [r, g, bl, 255],
+                colour: [r, g, bl, b.alpha],
                 sticky: b.sticky,
                 sort: b.sort,
+                rings: b
+                    .anims
+                    .sonar
+                    .as_ref()
+                    .map(|s| (s.texture.clone(), s.colour, s.rings())),
+                size: b.size,
+                yaw,
+                rotate: b.rotate,
+                oriented: b.oriented,
             })
         })
         .collect()
@@ -6553,6 +6771,44 @@ fn fly(game: &mut Game, mission: &mut Mission, landed: &mut HashSet<u32>, c: &Co
 /// Carries out a script command about the player, the scripts' vehicles
 /// or the layers they stream; true when it seated her in a vehicle the
 /// island doesn't show, so she stands where it is.
+/// The scripts' turret angle ([`VehicleCommand::Turret`]) on vehicle `v`:
+/// its main turret (`main_turret`) through its physics, else the aimer
+/// whose `Turret` record the hash names. A name it has no turret of does
+/// nothing.
+fn set_turret(
+    v: &mut crate::scene::ParkedVehicle,
+    physics: Option<&mut m2_engine::Physics>,
+    turret: u32,
+    angle: f32,
+    yaw: bool,
+) {
+    let main = v.spec.tuning.turret.is_some_and(|t| t.main)
+        && turret == m2_assets::name_hash(m2_engine::tuning::MAIN_TURRET);
+    if main {
+        match (yaw, v.id, physics) {
+            (true, Some(id), Some(p)) => {
+                p.turn_turret(id, angle);
+                v.turret = p.turret_yaw(id).unwrap_or(angle);
+            }
+            (false, Some(id), Some(p)) => {
+                p.aim_gun(id, angle);
+                v.gun = p.gun_pitch(id).unwrap_or(angle);
+            }
+            (true, ..) => v.turret = angle,
+            (false, ..) => v.gun = angle,
+        }
+        return;
+    }
+    if let Some(k) = v.spec.aimers.iter().position(|a| a.record.name == turret) {
+        v.aims.resize(v.spec.aimers.len(), (0.0, 0.0));
+        if yaw {
+            v.aims[k].0 = angle;
+        } else {
+            v.aims[k].1 = angle;
+        }
+    }
+}
+
 fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> bool {
     // A person the scripts make (`Pg.Spawn` of a person's template) stands
     // as a layer's spawn would; one they take away goes.
@@ -6646,6 +6902,23 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
         }
         // `Object.SetWinchState` on one of the scripts' helicopters: its
         // winch takes that state and pays out or reels in to match.
+        // `Vehicle.SetTurretYaw` / `SetTurretPitch` (0x82347E00,
+        // 0x82347D20): the turret the name hash names takes that angle as
+        // its target, radians as the script gives it (the turret message
+        // 0x82275CD8 sets yaw +0x0C or pitch +0x10 unconverted, which the
+        // turret action turns towards, 0x82275608): the main turret
+        // through its physics, another (a seat's) as its aim.
+        Command::Vehicle(VehicleCommand::Turret {
+            vehicle,
+            turret,
+            angle,
+            yaw,
+        }) => {
+            if let Some(i) = index(vehicle) {
+                let physics = game.scene.world.as_mut().map(|w| &mut w.physics);
+                set_turret(&mut game.scene.vehicles[i], physics, *turret, *angle, *yaw);
+            }
+        }
         Command::WinchState { carrier, state } => {
             let s = [
                 WinchState::Retracted,
@@ -6858,6 +7131,20 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             if game.paths.stop(vehicle.unwrap_or(*guid)) {
                 eprintln!("mission: {guid:#x}'s goals cleared: its vehicle leaves its path");
             }
+            return false;
+        }
+        // A vehicle's door the scripts open or shut (`Vehicle.OpenDoor`:
+        // PmcCon033's targets stand up on their `pivot`; a tank's hatch):
+        // it swings as her boarding's do ([`crate::hijack::Hijacks`]).
+        Command::Door { guid, door, open } => {
+            game.door_requests.push((*guid, *door, *open));
+            return false;
+        }
+        // In or out of the living world (`Ai.LivingWorld`: `MrxFollow`
+        // takes out one following her): out, pushed off their post they
+        // stay where they end up.
+        Command::LivingWorld { guid, on } => {
+            game.scene.people.set_living_world(*guid, *on);
             return false;
         }
         // Someone following her (`Ai.Role` `Follow`: a VIP to deliver).
@@ -7966,6 +8253,56 @@ fn prop_hardpoints(
         .collect()
 }
 
+/// The alarms in play that stand as props, as their soldiers see them:
+/// where each is, its faction (its `Association`, by [`faction_of`]),
+/// whether its flag is on, and where its model's four alarm hardpoints
+/// are ([`m2_engine::alarm_goal::HARDPOINTS`]); each model's nodes are
+/// read once (`nodes`).
+///
+/// [`faction_of`]: crate::npc::faction_of
+fn alarm_towers(
+    game: &mut Game,
+    nodes: &mut HashMap<u32, Vec<(u32, Vec3)>>,
+    alarms: &m2_game::alarm::Alarms,
+) -> Vec<crate::npc::AlarmTower> {
+    let mut out = Vec::new();
+    for (&guid, &on) in &alarms.on {
+        let Some((p, _)) = game.scene.props.get(guid) else {
+            continue;
+        };
+        let (model, at) = (
+            p.model,
+            m2_math::glam::Mat4::from_rotation_translation(p.rotation, p.position),
+        );
+        let position = p.position;
+        let known = nodes.entry(model).or_insert_with(|| {
+            game.scene
+                .source
+                .as_mut()
+                .map(|s| crate::hijack::nodes(s, model))
+                .unwrap_or_default()
+        });
+        let placed = hardpoints_at(known, at);
+        let hardpoints = m2_engine::alarm_goal::HARDPOINTS
+            .iter()
+            .filter_map(|h| placed.iter().find(|(n, _)| n == h))
+            .map(|(_, p)| Vec3::from_array(*p))
+            .collect();
+        out.push(crate::npc::AlarmTower {
+            guid,
+            at: position,
+            faction: alarms
+                .factions
+                .get(&guid)
+                .and_then(|f| crate::npc::faction_of(&format!("{f} "))),
+            on,
+            hardpoints,
+        });
+    }
+    out.sort_by_key(|t| t.guid);
+    out
+}
+
 /// Where the scripts' character `guid` stands for a camera shot: the
 /// player, someone the scripts stand, or someone seated on a prop (the
 /// PMC HQ's starter), with node `hardpoint` of their posed model in the
@@ -8080,6 +8417,84 @@ fn send_pursuit_car(
 
 #[cfg(test)]
 mod tests {
+    // `Vehicle.SetTurretYaw` / `SetTurretPitch` (0x82347E00, 0x82347D20
+    // -> 0x82275CD8): the named turret's target, radians as given.
+    #[test]
+    fn the_scripts_turn_a_turret_by_its_name() {
+        use m2_engine::vehicle::Aimer;
+        use m2_engine::{Physics, seats::TurretRecord};
+        let mut spec = crate::npc::tests::tank(m2_engine::tuning::VehicleTuning {
+            turret: Some(m2_engine::tuning::TurretTuning {
+                main: true,
+                yaw_speed: 1.0,
+                yaw_accel: 1.0,
+                pitch: (-0.2, 0.5),
+                pitch_speed: 1.0,
+                pitch_accel: 1.0,
+                yaw: None,
+            }),
+            ..Default::default()
+        });
+        let cupola = m2_assets::name_hash("cupola");
+        spec.aimers = vec![Aimer {
+            record: TurretRecord {
+                name: cupola,
+                bone_yaw: None,
+                bone_pitch: None,
+                yaw: (-1.0, 1.0),
+                yaw_speed: 1.0,
+                pitch: (-0.2, 0.5),
+                pitch_speed: 1.0,
+            },
+            yaw_nodes: Vec::new(),
+            pitch_nodes: Vec::new(),
+            yaw_pivot: None,
+            pitch_pivot: None,
+        }];
+        let mut physics = Physics::new();
+        let id = physics.add_vehicle(&spec, Vec3::ZERO, 0.0);
+        let mut v = crate::scene::ParkedVehicle {
+            spec,
+            model: crate::npc::tests::empty_model(),
+            id: Some(id),
+            wrecked: false,
+            guid: Some(77),
+            spot: None,
+            crew: Vec::new(),
+            turret: 0.0,
+            hijack_nodes: Vec::new(),
+            door_turns: Vec::new(),
+            gun: 0.0,
+            aims: Vec::new(),
+            rolled: 0.0,
+            fired: 0,
+            mg_fired: 0,
+            damage: 0.0,
+            hit: 0.0,
+            parts: None,
+            loose: Vec::new(),
+            debris_thrown: false,
+        };
+        let main = m2_assets::name_hash("main_turret");
+        set_turret(&mut v, Some(&mut physics), main, 1.2, true);
+        assert!((v.turret - 1.2).abs() < 1e-5, "{}", v.turret);
+        set_turret(&mut v, Some(&mut physics), main, 0.3, false);
+        assert!((v.gun - 0.3).abs() < 1e-5, "{}", v.gun);
+        set_turret(&mut v, Some(&mut physics), cupola, -0.5, true);
+        set_turret(&mut v, Some(&mut physics), cupola, 0.25, false);
+        assert_eq!(v.aims, vec![(-0.5, 0.25)]);
+        // A name it has no turret of: nothing.
+        set_turret(
+            &mut v,
+            Some(&mut physics),
+            m2_assets::name_hash("x"),
+            2.0,
+            true,
+        );
+        assert!((v.turret - 1.2).abs() < 1e-5, "{}", v.turret);
+        assert_eq!(v.aims, vec![(-0.5, 0.25)]);
+    }
+
     // Playtest: while the scripts are still being read the screen stays
     // black (she would be seen swimming off the start before the
     // opening's movie); once they run, theirs is the fade.

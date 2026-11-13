@@ -65,6 +65,8 @@ pub const SCARED: u32 = 0xf3f0_0055;
 pub const IDLE: u32 = 0xb4da_003b;
 pub const FLAP: u32 = 0xd388_246c;
 pub const BLINK: u32 = 0x416c_2f99;
+/// Not an expression: every expression of the person off at once.
+pub const DISABLE_ALL: u32 = 0xc7f8_9834;
 
 /// The expressions, in the table's order.
 pub const TABLE: [Expression; 6] = [
@@ -366,6 +368,7 @@ mod tests {
             (IDLE, "Idle"),
             (FLAP, "Flap"),
             (BLINK, "Blink"),
+            (DISABLE_ALL, "DisableAll"),
         ] {
             assert_eq!(hash, name_hash(name), "{name}");
         }
