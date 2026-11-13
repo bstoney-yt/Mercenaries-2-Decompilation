@@ -1930,6 +1930,16 @@ impl Autoplay {
                 }
                 Aim::Laser => intent.trigger.fire = true,
             },
+            // A satellite item's view and wheel: confirmed where it opens,
+            // each wedge pressed as the needle comes into it.
+            Phase::Viewing { .. } => {
+                self.tapped = !self.tapped;
+                intent.trigger.fire = self.tapped;
+            }
+            Phase::Timing { .. } => {
+                self.tapped = !self.tapped;
+                intent.trigger.fire = self.tapped && game.support.wheel_ready();
+            }
             _ => {}
         }
         intent

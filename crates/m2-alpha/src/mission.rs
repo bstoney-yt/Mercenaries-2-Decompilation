@@ -3472,9 +3472,12 @@ impl MissionLink {
                 .support
                 .fallback(Kind::SatelliteBomb, !sturdy.is_empty(), STEP)
             {
+                // Their own free bomb, as the first contract gives it.
+                let given = mission.run(SAT_BOMB_FALLBACK, "satellite bomb fallback");
                 eprintln!(
-                    "mission: no bomb from the scripts in {FALLBACK_AFTER:.0} s with a gate to bring down: one is given her"
+                    "mission: no bomb from the scripts in {FALLBACK_AFTER:.0} s with a gate to bring down: theirs is given her ({given:?})"
                 );
+                self.stock_look = 0;
             }
             // A vehicle driven hard into a target (a gate) breaks it too:
             // by its speed of late, as the gate stops it.
@@ -3600,8 +3603,9 @@ impl MissionLink {
                 self.stock_look = STOCK_LOOK;
             }
             self.stock_look -= 1;
-            let (flown, burst) =
-                crate::spans::time("scripts: strikes", || report_strikes(game, mission));
+            let (flown, burst) = crate::spans::time("scripts: strikes", || {
+                report_strikes(game, mission, &mut self.bombs)
+            });
             self.counts.flown += flown;
             self.counts.burst += burst;
             mission.set_player_reserve("C4", game.combat.charges);
@@ -3900,7 +3904,7 @@ impl MissionLink {
                     }
                     _ => {}
                 }
-                support_item(game, &c);
+                support_item(&c);
                 strike(game, &c);
                 fly(game, mission, &mut self.landed, &c);
                 if obey(game, mission, &mut self.vehicles, &c) {
@@ -6315,7 +6319,7 @@ fn strike(game: &mut Game, c: &Command) {
 /// Tells the scripts of her designators thrown and come to rest, the
 /// aircraft over their marks and the ordnance gone off; how many of the
 /// last two there were.
-fn report_strikes(game: &mut Game, mission: &mut Mission) -> (u32, u32) {
+fn report_strikes(game: &mut Game, mission: &mut Mission, bombs: &mut Vec<Vec3>) -> (u32, u32) {
     let settle = game
         .scene
         .world
@@ -6345,7 +6349,7 @@ fn report_strikes(game: &mut Game, mission: &mut Mission) -> (u32, u32) {
     let counts = (strikes.arrived.len() as u32, strikes.burst.len() as u32);
     // The planes in the air, where they are (their radar blips follow
     // them), and those flown off.
-    for (g, at, yaw) in strikes.jets() {
+    for (g, at, yaw) in strikes.jets().chain(strikes.ordnance()) {
         mission.place(g, at.to_array(), yaw);
     }
     for g in strikes.gone.drain(..) {
@@ -6354,11 +6358,30 @@ fn report_strikes(game: &mut Game, mission: &mut Mission) -> (u32, u32) {
     for (g, at) in strikes.arrived.drain(..) {
         mission.flyby_arrived(g, at.to_array());
     }
-    for (g, _, at) in strikes.burst.drain(..) {
+    let bomb = game
+        .scene
+        .world
+        .as_ref()
+        .and_then(|w| w.index.template_db.id(SAT_BOMB));
+    for (g, template, at) in strikes.burst.drain(..) {
+        // The satellite guided bomb's (its script's `sBomb`): what brings
+        // the first contract's gates down.
+        if template.is_some() && template == bomb {
+            bombs.push(at);
+        }
         mission.ordnance_burst(g, at.to_array());
     }
     counts
 }
+
+/// The satellite guided bomb's ordnance (`mrxsatelliteguidedbomb`'s
+/// `sBomb`).
+const SAT_BOMB: &str = "Smart Bomb Projectile";
+
+/// The scripts' free satellite guided bomb, given her by the fallback
+/// (`MrxSupportData.AddFreebie` as its own loop calls it: key, one, no
+/// player, true; at most one).
+const SAT_BOMB_FALLBACK: &str = "MrxSupportData.AddFreebie(\"VzaCon01_SatBomb\", 1, nil, true, 1)";
 
 /// How high over a munition the munitions helicopter hovers to take it
 /// up, metres (invented).
@@ -6702,8 +6725,6 @@ fn stocked(m: &Mission) -> Vec<support::Stocked> {
     m.support_items()
         .into_iter()
         .filter(|i| i.stock > 0 || i.free > 0 || i.active)
-        // The free Satellite Guided Bomb is her own item ([`Kind`]).
-        .filter(|i| Kind::from_freebie(&i.key).is_none())
         .map(|i| support::Stocked {
             name: {
                 let shown = m.text(&i.name);
@@ -6724,29 +6745,18 @@ fn stocked(m: &Mission) -> Vec<support::Stocked> {
 }
 
 /// The scripts' free support items, given her or taken back.
-fn support_item(game: &mut Game, c: &Command) {
+fn support_item(c: &Command) {
     match c {
         Command::Freebie {
             key,
             quantity,
             limit,
-        } => match Kind::from_freebie(key) {
-            Some(kind) => {
-                game.support.grant(kind, *quantity, *limit);
-                eprintln!(
-                    "mission: the scripts give her {quantity} {} free ({key}, at most {limit:?}): she has {}",
-                    kind.name(),
-                    game.support.ready().map_or(0, |i| i.count)
-                );
-            }
-            None => eprintln!(
-                "mission: the scripts give her {quantity} {key:?}, a support item not known here"
-            ),
-        },
+        } => {
+            // Their item, in her stock as the scripts hold it
+            // ([`stocked`]): called in, their own script brings it.
+            eprintln!("mission: the scripts give her {quantity} {key:?} free (at most {limit:?})");
+        }
         Command::RemoveFreebie(key) => {
-            if let Some(kind) = Kind::from_freebie(key) {
-                game.support.take_back(kind);
-            }
             eprintln!("mission: the scripts take back her free {key:?}");
         }
         _ => {}
