@@ -171,6 +171,12 @@ pub struct Widget {
     pub sprite_run: Option<SpriteRun>,
     /// `SetImagePieSliceRender` arguments, as given.
     pub pie_slice: Option<Vec<f32>>,
+    /// Its clock wipe (`SetImageClockAnimation`, [`crate::gui_anim`]).
+    pub clock: Option<crate::gui_anim::Clock>,
+    /// `SetImageClockCallback`: called once when the clock ends.
+    clock_end: Option<u32>,
+    /// Its text animation under way (`AnimateText`, [`crate::gui_anim`]).
+    pub reveal: Option<crate::gui_anim::TextReveal>,
     pub text: String,
     pub font: String,
     pub scale: f32,
@@ -247,6 +253,9 @@ impl Widget {
             sprite_frame: 0,
             sprite_run: None,
             pie_slice: None,
+            clock: None,
+            clock_end: None,
+            reveal: None,
             text: String::new(),
             font: String::new(),
             scale: 1.0,
@@ -329,6 +338,10 @@ pub enum DrawItem {
         size: f32,
         colour: [f32; 4],
         justification: Anchor,
+        /// Its text animation, if one is under way: each character drawn
+        /// at [`crate::gui_anim::TextReveal::scale`] of its width, about
+        /// its middle, counted in order across the spans.
+        reveal: Option<crate::gui_anim::TextReveal>,
     },
     /// A Flash movie's place (`swf` once set). A `fullscreen` movie's
     /// rect is the whole screen.
@@ -708,6 +721,30 @@ impl Screen {
                     w.sprite_run = None;
                 }
             }
+            // The clock wipe (0x823856C8): at its end the image goes
+            // unless kept, and its callback is called once.
+            if let Some(crate::gui_anim::ClockEvent::Ended { hide }) =
+                w.clock.as_mut().and_then(|c| c.step(dt))
+            {
+                if hide {
+                    w.visible = false;
+                }
+                if let Some(cb) = w.clock_end.take() {
+                    due.push((cb, Vec::new()));
+                }
+            }
+            // The text animation (0x8238A248, done in 0x8238DE68, halted
+            // by 0x8238A2B8): over once every character is at its last
+            // state; a fade-out's text is put away.
+            if let Some(r) = &mut w.reveal {
+                r.t += dt;
+                if r.done(w.text.chars().count()) {
+                    if r.mode == crate::gui_anim::TextMode::FadeOut {
+                        w.visible = false;
+                    }
+                    w.reveal = None;
+                }
+            }
         }
         let ids: Vec<u32> = self.widgets.keys().copied().collect();
         for id in ids {
@@ -995,7 +1032,7 @@ impl Screen {
                             colour,
                             rect,
                             rotation: w.rotation,
-                            pie: pie(w),
+                            pie: w.clock.map(|c| c.pie()).or_else(|| pie(w)),
                         });
                     }
                     None => out.push(DrawItem::Fill {
@@ -1029,6 +1066,7 @@ impl Screen {
                             size: c.scale * VIRTUAL_SIZE.1 / FONT_LINES * w.scale,
                             colour,
                             justification: w.justification,
+                            reveal: w.reveal,
                         });
                     }
                 }
@@ -2242,14 +2280,29 @@ natives! {
         }
         Ok(out)
     },
-    // Recorded as calls only: the text and sprite animations and the clock
-    // wipe draw as their full image or text (see the module docs).
+    // (widget, mode): a text widget with text starts its animation
+    // ([`crate::gui_anim`], 0x82320250); an unknown mode does nothing.
     "AnimateText" => |s, _, a| {
-        s.log_unknown("AnimateText (drawn whole)");
-        let _ = a;
+        let mode = a.text(1).and_then(|m| crate::gui_anim::TextMode::named(&m));
+        if let (Some(mode), Some(w)) = (mode, s.widgets.get_mut(&a.id(0)))
+            && w.kind == Kind::Text
+            && !w.text.is_empty()
+        {
+            w.reveal = Some(crate::gui_anim::TextReveal::new(mode));
+        }
         Ok(MultiValue::new())
     },
-    "HaltTextAnimation" => |_, _, _| Ok(MultiValue::new()),
+    // (widget): ends its text animation (0x82320398, 0x8238AB68); the text
+    // shows whole, a fade-out's goes.
+    "HaltTextAnimation" => |s, _, a| {
+        if let Some(w) = s.widgets.get_mut(&a.id(0))
+            && let Some(r) = w.reveal.take()
+            && r.mode == crate::gui_anim::TextMode::FadeOut
+        {
+            w.visible = false;
+        }
+        Ok(MultiValue::new())
+    },
     "AnimateSprite" => |s, _, a| {
         let run = SpriteRun {
             from: a.num(1).map_or(0, |f| f.max(0.0) as u32),
@@ -2270,13 +2323,43 @@ natives! {
         }
         Ok(MultiValue::new())
     },
+    // (image, start, seconds, keep, emptying): its clock wipe
+    // ([`crate::gui_anim::Clock`], 0x8231F0B0 into 0x82385A10); the native
+    // takes `emptying` as true when not given.
     "SetImageClockAnimation" => |s, _, a| {
-        s.log_unknown("SetImageClockAnimation (drawn whole)");
-        let _ = a;
+        let (start, seconds) = (a.f(1).unwrap_or(0.0), a.f(2).unwrap_or(10.0));
+        let emptying = !matches!(a.get(4), Some(Value::Boolean(false)));
+        if let Some(w) = s.widgets.get_mut(&a.id(0))
+            && w.kind == Kind::Image
+            && seconds > 0.0
+        {
+            let (clock, over) = crate::gui_anim::Clock::start(start, seconds, a.truthy(3), emptying);
+            w.clock = Some(clock);
+            w.visible = !over;
+        }
         Ok(MultiValue::new())
     },
-    "SetImageClockCallback" => |_, _, _| Ok(MultiValue::new()),
-    "GetImageClockElapsed" => |_, l, _| ret(l, 0),
+    // (image, function, data): called once when its clock ends (0x8231F1E0).
+    "SetImageClockCallback" => |s, l, a| {
+        let cb = keep_callback(s, l, a.get(1), a.get(2))?;
+        let old = match s.widgets.get_mut(&a.id(0)) {
+            Some(w) => std::mem::replace(&mut w.clock_end, cb),
+            None => cb,
+        };
+        if let Some(old) = old {
+            forget_callback(l, old)?;
+        }
+        Ok(MultiValue::new())
+    },
+    // (image): the seconds its clock has run (0x8231F2D8).
+    "GetImageClockElapsed" => |s, l, a| {
+        let elapsed = s
+            .widgets
+            .get(&a.id(0))
+            .and_then(|w| w.clock)
+            .map_or(0.0, |c| c.elapsed());
+        ret(l, f64::from(elapsed))
+    },
     // Settings with nothing to draw differently here.
     "SetWidgetViewport" => |_, _, _| Ok(MultiValue::new()),
     // (widget, flag): the widget's ignores-pause flag; read back by
@@ -2930,6 +3013,54 @@ mod tests {
         // To the front, in order again, a parent before its children.
         run(&host, "_GuiInternal.PushWidgetToFront(box)");
         assert_eq!(screen.borrow().order, [4, 1, 3, 2]);
+    }
+
+    /// The tutorial's typewriter: the text comes out a character each
+    /// 1/30 s and the animation ends once it is all out; a clock wipe
+    /// empties its image in its seconds, puts it away and calls back once.
+    #[test]
+    fn text_animations_and_clock_wipes_run_their_time() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            words = G.CreateTextWidget()
+            G.SetTextText(words, "Get to the gate")
+            G.AnimateText(words, "typewriter")
+            ring = G.CreateImageWidget()
+            G.SetImageClockAnimation(ring, 0, 2, false, true)
+            rang = 0
+            G.SetImageClockCallback(ring, function() rang = rang + 1 end)
+            "#,
+        );
+        let id = |name: &str| host.lua().globals().get::<u32>(name).unwrap();
+        let (words, ring) = (id("words"), id("ring"));
+        let reveal = || screen.borrow().widget(words).unwrap().reveal;
+        tick(host.lua(), 0.1);
+        let r = reveal().expect("under way");
+        assert_eq!(r.mode, crate::gui_anim::TextMode::Typewriter);
+        // Three characters out at 0.1 s, not the fourth.
+        assert_eq!((r.scale(2), r.scale(3)), (1.0, 0.0));
+        let elapsed: f64 = host
+            .lua()
+            .load("return _GuiInternal.GetImageClockElapsed(ring)")
+            .eval()
+            .unwrap();
+        assert!((elapsed - 0.1).abs() < 1e-3, "{elapsed}");
+        // 15 characters: all out by 0.5 s.
+        tick(host.lua(), 0.45);
+        assert_eq!(reveal(), None);
+        assert!(screen.borrow().widget(words).unwrap().visible);
+        tick(host.lua(), 1.5);
+        let w = |g: u32| screen.borrow().widget(g).unwrap().visible;
+        assert!(!w(ring), "the ring goes at its end");
+        tick(host.lua(), 0.1);
+        let rang: u32 = host.lua().globals().get("rang").unwrap();
+        assert_eq!(rang, 1);
+        // An unknown mode does nothing.
+        run(&host, "_GuiInternal.AnimateText(words, 'scroll')");
+        assert_eq!(reveal(), None);
     }
 
     #[test]

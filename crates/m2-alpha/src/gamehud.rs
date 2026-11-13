@@ -4758,10 +4758,16 @@ impl Thread {
                 size,
                 colour,
                 justification,
+                reveal,
                 ..
             } => {
                 if let Some(f) = self.fonts.get(&font.to_ascii_lowercase()) {
-                    text(f, spans, *rect, *size, *colour, *justification, out, want);
+                    let look = Look {
+                        colour: *colour,
+                        justify: *justification,
+                        reveal: *reveal,
+                    };
+                    text(f, spans, *rect, *size, look, out, want);
                 }
             }
             DrawItem::Minimap {
@@ -6314,19 +6320,34 @@ fn wedge(
         .collect()
 }
 
+/// How a text is drawn: its colour, justification and animation.
+#[derive(Clone, Copy, Debug)]
+struct Look {
+    colour: [f32; 4],
+    justify: Anchor,
+    reveal: Option<m2_game::gui_anim::TextReveal>,
+}
+
 /// Glyph quads for coloured `spans` in box `rect`: lines from its top,
-/// each justified, `size` points per font pixel.
-#[allow(clippy::too_many_arguments)]
+/// each justified, `size` points per font pixel. Under a text animation
+/// each character is drawn at its share of its width about its middle,
+/// none where that is nothing (from the 360 code, 0x8238DE68).
 fn text(
     font: &Font,
     spans: &[TextSpan],
     rect: [f32; 4],
     size: f32,
-    colour: [f32; 4],
-    justify: Anchor,
+    look: Look,
     out: &mut Vec<Prim>,
     want: &mut Vec<u32>,
 ) {
+    let Look {
+        colour,
+        justify,
+        reveal,
+    } = look;
+    // The characters drawn so far, in order across the spans.
+    let mut index = 0usize;
     // Each line's parts: text, or an inline icon a line high and square;
     // and the colour.
     type Part<'a> = (&'a str, Option<&'a str>, [f32; 4]);
@@ -6373,14 +6394,19 @@ fn text(
                 continue;
             }
             for code in part.encode_utf16() {
-                if let Some(g) = font.glyph(code)
+                let share = reveal.map_or(1.0, |r| r.scale(index));
+                index += 1;
+                if share > 0.0
+                    && let Some(g) = font.glyph(code)
                     && let Some(m) = font.materials.get(usize::from(g.material))
                 {
                     let y = top + f32::from(g.y_offset) * size;
+                    let width = f32::from(g.width) * size;
+                    let left = x + width * (1.0 - share) / 2.0;
                     let r = [
-                        x,
+                        left,
                         y,
-                        x + f32::from(g.width) * size,
+                        left + width * share,
                         y + f32::from(g.height) * size,
                     ];
                     want.push(m.texture);
@@ -7258,6 +7284,7 @@ mod tests {
             size: 1.0,
             colour: [1.0; 4],
             justification: Anchor::Start,
+            reveal: None,
         };
         let held = HashSet::from([1, 2]);
         let frame = DrawItem::Quad {

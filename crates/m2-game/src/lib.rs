@@ -9,6 +9,7 @@ pub mod character_binding;
 pub mod cheat;
 pub mod events;
 pub mod gui;
+pub mod gui_anim;
 pub mod gui_runtime;
 pub mod heliwaves;
 pub mod hijack;
