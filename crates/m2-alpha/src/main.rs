@@ -70,6 +70,7 @@ mod halt;
 mod held;
 mod hero;
 mod hijack;
+mod homing;
 mod input;
 mod jobs;
 mod keytable;
@@ -10589,6 +10590,14 @@ fn world_sounds(audio: &mut sound::GameAudio, game: &mut Game, was_driving: &mut
     let sounds = game.combat.take_sounds();
     let db = game.scene.world.as_ref().map(|w| &w.index.template_db);
     audio.play_fight(&sounds, db);
+    // The locks on her vehicle she hears ([`homing::Warnings`]).
+    for (cue, stop) in game.combat.take_warning_cues() {
+        if stop {
+            audio.stop_ui_sound(cue);
+        } else {
+            audio.ui_sound(cue);
+        }
+    }
     let cues = game.scene.take_cues(ear, CUE_REACH);
     audio.play_cues(&cues);
     let engine = game.engine();

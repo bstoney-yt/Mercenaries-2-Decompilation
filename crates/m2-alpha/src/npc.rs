@@ -1150,6 +1150,8 @@ pub struct Npc {
     /// Set by a tick when a soldier fires his launcher; the fight takes
     /// the shot ([`crate::combat`]).
     pub launches: bool,
+    /// His homing launcher's lock ([`crate::homing`]).
+    pub seeking: crate::homing::Seeking<m2_engine::VehicleId>,
     /// Seconds before he fires his launcher again.
     launcher_wait: f32,
     pub hp: f32,
@@ -1456,6 +1458,7 @@ impl Npc {
             gun: None,
             launcher: None,
             launches: false,
+            seeking: Default::default(),
             launcher_wait: 0.0,
             hp: 100.0,
             unkillable: false,
@@ -6805,6 +6808,7 @@ pub(crate) mod tests {
         n.gun = Some(rifle());
         n.launcher = Some(NpcLauncher {
             template: 7,
+            seeker: None,
             hint: FireHint {
                 kinds: [1, 1],
                 against: [1, 1, 1, 1],
