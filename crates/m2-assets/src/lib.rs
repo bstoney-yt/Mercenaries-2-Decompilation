@@ -61,6 +61,7 @@ pub mod block;
 mod bytes;
 pub mod dxt;
 pub mod effect;
+pub mod facefx;
 pub mod flash;
 pub mod font;
 pub mod gfx;

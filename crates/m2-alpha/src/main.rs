@@ -403,8 +403,12 @@ struct Options {
     /// what that person does is logged (knock-check lines). With `r`
     /// after the seconds (`4r`) they are run into instead, by a car that
     /// is not there (1.5 t at 6 m/s, as the vehicles' ram is taken): for
-    /// checking a knockdown without playing a contract.
-    knock_nearest: Option<(f32, bool)>,
+    /// checking a knockdown without playing a contract. With `k` they are
+    /// knocked down at once, unhurt (a knockdown's own time, for the limp
+    /// body and the getting up); with `s` they take a light direct hit
+    /// from her that leaves them alive (for a stagger). The nearest
+    /// soldier is picked if there is one, else the nearest person.
+    knock_nearest: Option<(f32, KnockHow)>,
     /// `--check-shots <s>,<s>...` with `--screenshot` on foot: the scene
     /// is pictured at those seconds in too (`<out>-at<s>.ppm`).
     check_shots: Vec<f32>,
@@ -496,6 +500,9 @@ struct Options {
     /// With `--mission --screenshot`: the scripts' movies wait for the
     /// game, which opens each, decodes a few frames and pictures one.
     movies: bool,
+    /// With `--mission --screenshot`: the game's sound runs, through a
+    /// mixer with no device, and logs what it plays (`--sound`).
+    sound: bool,
     /// With `--screenshot`: the front end alone (the shell's menus),
     /// pictured as `--shell-key`s are pressed.
     front_end: bool,
@@ -754,6 +761,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--no-boot" => o.no_boot = true,
             "--to-front-end" => o.to_front_end = true,
             "--movies" => o.movies = true,
+            "--sound" => o.sound = true,
             "--front-end" => o.front_end = true,
             "--shell-key" => o.shell_keys.push(
                 value()?
@@ -1001,15 +1009,17 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
             "--knock-nearest" => {
                 let v = value()?;
-                let (seconds, ram) = match v.strip_suffix('r') {
-                    Some(s) => (s, true),
-                    None => (v.as_str(), false),
+                let (seconds, how) = match v.chars().last() {
+                    Some('r') => (&v[..v.len() - 1], KnockHow::Ram),
+                    Some('k') => (&v[..v.len() - 1], KnockHow::Knock),
+                    Some('s') => (&v[..v.len() - 1], KnockHow::Hit),
+                    _ => (v.as_str(), KnockHow::Bash),
                 };
                 o.knock_nearest = Some((
                     seconds
                         .parse()
-                        .context("--knock-nearest expects seconds, or seconds and r")?,
-                    ram,
+                        .context("--knock-nearest expects seconds, then r, k or s if any")?,
+                    how,
                 ));
             }
             "--check-shots" => {
@@ -1103,6 +1113,7 @@ const SCREENSHOT_ONLY: &[&str] = &[
     "--hijack",
     "--autoplay-avoid",
     "--movies",
+    "--sound",
 ];
 
 /// Those of [`SCREENSHOT_ONLY`] given without `--screenshot`, in the order
@@ -2309,20 +2320,29 @@ fn screenshot(
         let mut knocked: Option<usize> = None;
         let knock_tick = options
             .knock_nearest
-            .map(|(s, ram)| ((s * 60.0).round() as usize, ram));
+            .map(|(s, how)| ((s * 60.0).round() as usize, how));
+        // Where she was asked to start, and where she is.
+        if let (Some((x, z)), Some(p)) = (options.spawn, game.scene.player.as_ref()) {
+            let at = p.character.position;
+            let off = m2_math::glam::Vec2::new(at.x - x, at.z - z).length();
+            eprintln!(
+                "spawn: asked for {x:.0},{z:.0}; she is at {at:.1}, {off:.0} m from it{}",
+                if off > 50.0 { " (NOT where asked)" } else { "" }
+            );
+        }
         for i in 0..ticks {
             if let Some((at, _)) = knock_tick
                 && i == at
             {
                 knocked = knock_pick(&mut game);
             }
-            if let (Some((at, true)), Some(k)) = (knock_tick, knocked)
+            if let (Some((at, how)), Some(k)) = (knock_tick, knocked)
                 && i == at + 12
             {
-                knock_ram(&mut game, k);
+                knock_other(&mut game, k, how);
             }
-            let knock_bash =
-                matches!(knock_tick, Some((at, false)) if i == at + 12) && knocked.is_some();
+            let knock_bash = matches!(knock_tick, Some((at, KnockHow::Bash)) if i == at + 12)
+                && knocked.is_some();
             if let (Some(face), Some(p)) = (options.face, game.scene.player.as_mut()) {
                 p.yaw = face;
                 if i == 0 {
@@ -4454,6 +4474,13 @@ fn mission_for_screenshot(
     // running: when each is due back, by call number; the last seen.
     let (mut boxed, mut boxed_seen): (Vec<(f32, u64)>, u64) = (Vec::new(), 0);
     let mut lap = spans::Lap::new();
+    // The game's sound, heard by nobody: what it plays is logged.
+    let mut audio = options.sound.then(|| {
+        let mut audio = sound::GameAudio::silent(Some(install));
+        audio.hero = game.scene.hero;
+        audio
+    });
+    let mut was_driving = false;
     for i in 0..(seconds / tick).round() as u32 {
         lap.mark("loop: pictures and checks");
         let intent = match auto.as_mut().filter(|_| play_done.is_none()) {
@@ -4831,6 +4858,13 @@ fn mission_for_screenshot(
         lap.mark("loop: before the step");
         spans::time("game", || game.step(intent, tick));
         spans::time("scripts", || link.tick(game, tick));
+        if let Some(audio) = &mut audio {
+            spans::time("sound", || {
+                mission_sounds(audio, &mut link);
+                world_sounds(audio, game, &mut was_driving, tick);
+                audio.run_silent(tick);
+            });
+        }
         lap.mark("loop: step and scripts");
         // In a starter's box (her menu, then a contract's terms), autoplay
         // picks after a moment the contract on offer and then Accept, as a
@@ -5930,17 +5964,64 @@ fn look_at_story_character(game: &mut Game) {
 /// forward for four seconds (backing out first if it is parked close
 /// behind something, and steering round what it meets), printing how it
 /// went.
-/// `--knock-nearest`: puts her 1.2 m from the nearest person on their
-/// feet, facing them. Their index into the people, if anyone is about.
+/// How `--knock-nearest` deals with the one it picks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KnockHow {
+    /// She bashes them.
+    Bash,
+    /// A car that is not there runs into them.
+    Ram,
+    /// Knocked down at once, unhurt.
+    Knock,
+    /// A light direct hit from her.
+    Hit,
+}
+
+/// `--knock-nearest` with `r`, `k` or `s`: what is done to person `k`
+/// (a bash is her own, by the trigger).
+fn knock_other(game: &mut Game, k: usize, how: KnockHow) {
+    use m2_math::glam::Vec3;
+    match how {
+        KnockHow::Bash => {}
+        KnockHow::Ram => knock_ram(game, k),
+        KnockHow::Knock => {
+            let seconds = m2_engine::melee::knockdown_seconds(
+                m2_engine::melee::KNOCKDOWN_SECONDS,
+                false,
+                0.5,
+            );
+            eprintln!("knock-check: person {k} knocked down for {seconds:.1} s, unhurt");
+            game.scene.people.npcs[k].knock_down_for(seconds, Vec3::ZERO);
+        }
+        KnockHow::Hit => {
+            let her = game.scene.player.as_ref().map(|p| p.character.position);
+            let n = &mut game.scene.people.npcs[k];
+            let chest = n.chest();
+            let way = her.map_or(Vec3::X, |h| (chest - h - Vec3::Y).normalize_or(Vec3::X));
+            n.last_hit = Some((chest, way));
+            let killed = n.hurt(1.0, way * 0.2);
+            eprintln!(
+                "knock-check: person {k} hit lightly from her (health {:.0}, killed {killed})",
+                n.hp
+            );
+        }
+    }
+}
+
+/// `--knock-nearest`: puts her 1.2 m from the nearest soldier on their
+/// feet (the nearest person if there is no soldier), facing them. Their
+/// index into the people, if anyone is about.
 fn knock_pick(game: &mut Game) -> Option<usize> {
     let her = game.scene.player.as_ref()?.character.position;
+    let up = |n: &npc::Npc| n.alive && n.landed && !n.held && n.down.is_none();
+    let any_soldier = game.scene.people.npcs.iter().any(|n| up(n) && n.soldier);
     let (k, there) = game
         .scene
         .people
         .npcs
         .iter()
         .enumerate()
-        .filter(|(_, n)| n.alive && n.landed && !n.held && n.down.is_none())
+        .filter(|(_, n)| up(n) && (n.soldier || !any_soldier))
         .map(|(k, n)| (k, n.character.position))
         .min_by(|a, b| a.1.distance(her).total_cmp(&b.1.distance(her)))
         .or_else(|| {
@@ -10426,88 +10507,107 @@ impl Running {
         if let Some(m) = &mut self.mission {
             spans::time("scripts", || m.tick(&mut self.game, TICK.as_secs_f32()));
             self.game.dress(&mut self.backend);
-            for (name, load) in m.take_voice_banks() {
-                self.audio.voice_bank(&name, load);
-            }
-            let (lines, hushed) = m.take_lines();
-            for (id, cue, at) in lines {
-                if let Some(seconds) = self.audio.say(id, &cue, at) {
-                    m.line_length(id, seconds);
-                }
-            }
-            for id in hushed {
-                self.audio.hush(id);
-            }
-            for change in m.take_fades() {
-                self.audio.change_category(change);
-            }
-            for (cue, stop) in m.take_sounds() {
-                if stop {
-                    self.audio.stop_ui_sound(&cue);
-                } else {
-                    self.audio.ui_sound(&cue);
-                }
-            }
-            if let Some(cue) = m.take_music() {
-                self.audio.music_cue_at(cue.as_deref(), m.music_at());
-            }
-            if let Some(preset) = m.take_reverb() {
-                self.audio.set_reverb(preset);
-            }
-            for (cue, on) in m.take_ambiences() {
-                self.audio.script_ambience(cue, on);
-            }
-            self.audio.silence_ambience(m.ambience_silenced());
+            mission_sounds(&mut self.audio, m);
         }
         self.answer_saves(config.options.autosave);
-        let (ear, facing) = self.game.listener();
-        self.audio.update(ear, facing);
-        // Every ambience region the listener is in asks for its ambience,
-        // as the scripts do; the one the list picks plays its bed and
-        // one-shots. Until they are read, the town's or jungle's stand in.
-        let inside: Vec<_> = self.game.scene.world.as_ref().map_or_else(Vec::new, |w| {
-            m2_engine::sound_regions::ambiences_at(&w.index.sound_regions, ear.x, ear.z)
-                .filter_map(|r| Some((r.entity, r.ambience?)))
-                .collect()
-        });
-        let zone = self.audio.ambience_heard(&inside);
-        if !self.audio.zone_ambience(zone, ear, TICK.as_secs_f32())
-            && self.audio.ambient_due(TICK.as_secs_f32())
-        {
-            let town = self.game.near_town();
-            self.audio.play_ambient(town, ear);
+        world_sounds(
+            &mut self.audio,
+            &mut self.game,
+            &mut self.was_driving,
+            TICK.as_secs_f32(),
+        );
+    }
+}
+
+/// Hands the sound what the scripts asked for since the last tick: voice
+/// lines and their banks, category fades, interface sounds, music,
+/// reverb and ambience. The window and the offscreen runs (`--sound`)
+/// alike.
+fn mission_sounds(audio: &mut sound::GameAudio, m: &mut mission::MissionLink) {
+    for (name, load) in m.take_voice_banks() {
+        audio.voice_bank(&name, load);
+    }
+    let (lines, hushed) = m.take_lines();
+    for (id, cue, at) in lines {
+        if let Some(seconds) = audio.say(id, &cue, at) {
+            m.line_length(id, seconds);
         }
-        for (i, shout, at) in self.game.scene.people.take_shouts() {
-            let sets = match shout {
-                npc::Shout::Alert => sound::VZ_SOLDIERS,
-                npc::Shout::Flee if self.game.scene.people.is_woman(i) => sound::CIVILIAN_WOMEN,
-                npc::Shout::Flee => sound::CIVILIANS,
-            };
-            self.audio.shout(sets[i % sets.len()], Some(at));
+    }
+    for id in hushed {
+        audio.hush(id);
+    }
+    for change in m.take_fades() {
+        audio.change_category(change);
+    }
+    for (cue, stop) in m.take_sounds() {
+        if stop {
+            audio.stop_ui_sound(&cue);
+        } else {
+            audio.ui_sound(&cue);
         }
-        let sounds = self.game.combat.take_sounds();
-        let db = self.game.scene.world.as_ref().map(|w| &w.index.template_db);
-        self.audio.play_fight(&sounds, db);
-        let cues = self.game.scene.take_cues(ear, CUE_REACH);
-        self.audio.play_cues(&cues);
-        let engine = self.game.engine();
-        self.audio.engine(engine, TICK.as_secs_f32());
-        self.audio.rotors(&self.game.scene.flights.sounding());
-        self.audio.flybys(&self.game.scene.strikes.sounding());
-        let others = self.game.others_engines(ear);
-        self.audio.others_engines(&others, ear);
-        let driving = self.game.driving().is_some();
-        let mut remarks = self.game.combat.take_remarks();
-        if driving && !self.was_driving && self.game.car_remark_due() {
-            remarks.push(combat::Remark::Vehicle);
-        }
-        if !driving {
-            self.game.scripts_seated = false;
-        }
-        self.was_driving = driving;
-        for remark in remarks {
-            self.audio.remark(remark);
-        }
+    }
+    if let Some(cue) = m.take_music() {
+        audio.music_cue_at(cue.as_deref(), m.music_at());
+    }
+    if let Some(preset) = m.take_reverb() {
+        audio.set_reverb(preset);
+    }
+    for (cue, on) in m.take_ambiences() {
+        audio.script_ambience(cue, on);
+    }
+    audio.silence_ambience(m.ambience_silenced());
+}
+
+/// Hands the sound what the world did over `dt` seconds: the listener,
+/// ambience, shouts, the fight, clip sounds, engines, rotors, strike
+/// aircraft and her remarks. The window and the offscreen runs
+/// (`--sound`) alike.
+fn world_sounds(audio: &mut sound::GameAudio, game: &mut Game, was_driving: &mut bool, dt: f32) {
+    let (ear, facing) = game.listener();
+    audio.update(ear, facing);
+    // Every ambience region the listener is in asks for its ambience,
+    // as the scripts do; the one the list picks plays its bed and
+    // one-shots. Until they are read, the town's or jungle's stand in.
+    let inside: Vec<_> = game.scene.world.as_ref().map_or_else(Vec::new, |w| {
+        m2_engine::sound_regions::ambiences_at(&w.index.sound_regions, ear.x, ear.z)
+            .filter_map(|r| Some((r.entity, r.ambience?)))
+            .collect()
+    });
+    let zone = audio.ambience_heard(&inside);
+    if !audio.zone_ambience(zone, ear, dt) && audio.ambient_due(dt) {
+        let town = game.near_town();
+        audio.play_ambient(town, ear);
+    }
+    for (i, shout, at) in game.scene.people.take_shouts() {
+        let sets = match shout {
+            npc::Shout::Alert => sound::VZ_SOLDIERS,
+            npc::Shout::Flee if game.scene.people.is_woman(i) => sound::CIVILIAN_WOMEN,
+            npc::Shout::Flee => sound::CIVILIANS,
+        };
+        audio.shout(sets[i % sets.len()], Some(at));
+    }
+    let sounds = game.combat.take_sounds();
+    let db = game.scene.world.as_ref().map(|w| &w.index.template_db);
+    audio.play_fight(&sounds, db);
+    let cues = game.scene.take_cues(ear, CUE_REACH);
+    audio.play_cues(&cues);
+    let engine = game.engine();
+    audio.engine(engine, dt);
+    audio.rotors(&game.scene.flights.sounding());
+    audio.flybys(&game.scene.strikes.sounding());
+    let others = game.others_engines(ear);
+    audio.others_engines(&others, ear);
+    let driving = game.driving().is_some();
+    let mut remarks = game.combat.take_remarks();
+    if driving && !*was_driving && game.car_remark_due() {
+        remarks.push(combat::Remark::Vehicle);
+    }
+    if !driving {
+        game.scripts_seated = false;
+    }
+    *was_driving = driving;
+    for remark in remarks {
+        audio.remark(remark);
     }
 }
 
@@ -10901,6 +11001,28 @@ mod tests {
         offscreen.extend(args(&["--screenshot", "out.ppm"]));
         assert!(screenshot_only_ignored(&offscreen).is_empty());
         assert!(screenshot_only_ignored(&args(&["--mission", "--hijack-crew", "x"])).is_empty());
+        // The offscreen sound is the offscreen run's alone.
+        assert_eq!(screenshot_only_ignored(&args(&["--sound"])), ["--sound"]);
+        let o = parse_args(&args(&["--mission", "--screenshot", "o.ppm", "--sound"])).unwrap();
+        assert!(o.sound);
+    }
+
+    #[test]
+    fn the_silent_mixer_runs_its_voices_out() {
+        let mut audio = sound::GameAudio::silent(None);
+        let tone = m2_engine::SoundBuffer {
+            hash: 1,
+            channels: 1,
+            rate: 48_000,
+            samples: vec![1000; 4800].into(),
+        };
+        let voice = audio.out.with(|m| m.play(m2_engine::Play::flat(tone)));
+        assert!(audio.out.with(|m| m.is_playing(voice)));
+        // 0.1 s of sound: gone after a little more than that.
+        audio.run_silent(0.06);
+        assert!(audio.out.with(|m| m.is_playing(voice)));
+        audio.run_silent(0.06);
+        assert!(!audio.out.with(|m| m.is_playing(voice)));
     }
 
     #[test]

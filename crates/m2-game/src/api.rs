@@ -401,8 +401,10 @@ pub enum Command {
         at: Option<[f32; 3]>,
     },
     /// An object fades from sight over `seconds` (`Object.FadeOut(object,
-    /// seconds, flag)`); what the flag asks isn't known (OilCon001 passes
-    /// true as its executive leaves).
+    /// seconds, flag)`): from the 360 code (0x821B8630) its alpha goes
+    /// from 1 to 0 over them; with `flag` it then goes (the scripts' world
+    /// removes it and sends [`Command::Remove`]). OilCon001's executive
+    /// leaves this way.
     FadeOut {
         guid: u32,
         seconds: f32,
@@ -913,6 +915,9 @@ pub struct ScriptWorld {
     /// left once the game has said its length ([`ScriptWorld::raw_clip_length`]),
     /// `None` until then.
     pub raw_clips: HashMap<u32, Option<f32>>,
+    /// Objects fading from sight (`Object.FadeOut`): seconds left, and
+    /// whether the object goes once faded ([`ScriptWorld::tick_fades`]).
+    pub fades: HashMap<u32, (f32, bool)>,
     /// The player's character.
     pub player: Option<u32>,
     pub commands: Vec<Command>,
@@ -1600,6 +1605,42 @@ impl ScriptWorld {
     /// runs out from now.
     pub fn raw_clip_length(&mut self, guid: u32, seconds: f32) {
         self.raw_clips.insert(guid, Some(seconds));
+    }
+
+    /// Takes object `guid` out of the world, as `Object.Remove` does: its
+    /// object script hears it went, and the game is told.
+    pub fn remove_object(&mut self, guid: u32) {
+        if self.objects.remove(&guid).is_some_and(|o| o.alive) {
+            self.removed_alive.insert(guid);
+        }
+        if let Some(script) = self.scripted.remove(&guid) {
+            self.script_removals.push((guid, script));
+        }
+        self.inventory.drop(guid);
+        self.fades.remove(&guid);
+        self.commands.push(Command::Remove(guid));
+    }
+
+    /// Moves the fades on by `dt` seconds. From the 360 code (0x821B8630):
+    /// a fade's time left runs down; once it is below 0, an object faded
+    /// with the flag goes, by the queue `Object.Remove` uses (0x822567D0
+    /// on 0x8357F9B8); without it, it stays.
+    pub fn tick_fades(&mut self, dt: f32) {
+        let mut gone = Vec::new();
+        self.fades.retain(|&g, (left, remove)| {
+            *left -= dt;
+            if *left < 0.0 {
+                if *remove {
+                    gone.push(g);
+                }
+                return false;
+            }
+            true
+        });
+        gone.sort_unstable();
+        for g in gone {
+            self.remove_object(g);
+        }
     }
 
     /// Moves the raw clips on by `dt` seconds.
@@ -3027,10 +3068,23 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Object.FadeOut(object, seconds, flag): the object fades from sight
     // over the seconds; gives true. From the 360 code (8232FDB0): the
     // object and the seconds are needed, the flag is false when left out.
+    // The fade (0x821B8768, 0x821B8630) takes its alpha from 1 to 0 over
+    // the seconds; with the flag the object then goes, as `Object.Remove`
+    // has it go ([`ScriptWorld::tick_fades`]). OilCon001's executive
+    // leaves this way.
     add(&object, "FadeOut", |w, _, a| {
         let (Some(guid), Some(seconds)) = (id(a.first()), num(a.get(1))) else {
             return values([]);
         };
+        let remove = matches!(a.get(2), Some(Value::Boolean(true)));
+        if seconds < 0.0 {
+            // Done already (0x821B8768): gone at once with the flag.
+            if remove {
+                w.remove_object(guid);
+            }
+        } else {
+            w.fades.insert(guid, (seconds, remove));
+        }
         w.commands.push(Command::FadeOut {
             guid,
             seconds,
@@ -3131,14 +3185,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     add(&object, "Remove", |w, _, a| {
         if let Some(guid) = id(a.first()) {
-            if w.objects.remove(&guid).is_some_and(|o| o.alive) {
-                w.removed_alive.insert(guid);
-            }
-            if let Some(script) = w.scripted.remove(&guid) {
-                w.script_removals.push((guid, script));
-            }
-            w.inventory.drop(guid);
-            w.commands.push(Command::Remove(guid));
+            w.remove_object(guid);
         }
         values([])
     })?;
@@ -5450,31 +5497,55 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Object filters: sets of objects scripts build (objects added or
     // excluded one by one, the players, a label) and hand to objectives
     // and events. Events read the same fields (see `events::objects`).
+    //
+    // From the 360 code: a filter keeps its entries in the order added,
+    // each marked included or excluded (`AddObject` 823587B0 / 82359A58:
+    // adding one already there only changes its mark). `UsePlayers(f)`
+    // (82358AD8) adds the any-player wildcard `Player.GetAnyCharacter()`;
+    // `false` adds nothing. The wildcards (0xf0000000 any player,
+    // 0xf0000001 all players, since #507 what `GetAnyCharacter` and
+    // `GetAllCharacters` answer) are entries like any other:
+    // - `GetObjects(f [, excluded])` (823588F0, 82359D58) lists the
+    //   entries, wildcards too, all of them without the flag, else the
+    //   included (false) or the excluded (true) only; then, when a
+    //   wildcard is among them, each player's character as included.
+    // - `GetCoopPlayerGuid(f)` (82358ED8, 82359EE8) answers the first
+    //   wildcard entry itself, else nothing.
+    // - `Eval(f, g)` (82358E50, 82359860, 82359F80) looks from the last
+    //   entry back: for a player's character a wildcard entry holds (all
+    //   players: once each has been seen, so with one player at once); an
+    //   entry equal to `g` holds when included. Then the label.
     lua.load(
         r#"
         local F = {}
         local meta = { __index = F }
+        local function wild(g)
+            return g == Player.GetAnyCharacter() or g == Player.GetAllCharacters()
+        end
         local function has(f, g)
             for _, v in ipairs(f.objs) do if v == g then return true end end
             return false
         end
         local function ok(f) return type(f) == "table" and getmetatable(f) == meta end
-        function F.Create() return setmetatable({ objs = {}, ex = {}, players = false }, meta) end
-        function F.UsePlayers(f, b) if ok(f) then f.players = b and true or false end end
-        function F.SetFilter(f, label) if ok(f) then f.label = label end end
+        function F.Create() return setmetatable({ objs = {}, ex = {} }, meta) end
         function F.AddObject(f, g, exclude)
             if not ok(f) or g == nil then return end
-            if exclude then f.ex[g] = true elseif not has(f, g) then f.objs[#f.objs + 1] = g end
+            if not has(f, g) then f.objs[#f.objs + 1] = g end
+            f.ex[g] = exclude and true or nil
         end
+        function F.UsePlayers(f, b)
+            if ok(f) and b ~= false then F.AddObject(f, Player.GetAnyCharacter()) end
+        end
+        function F.SetFilter(f, label) if ok(f) then f.label = label end end
         function F.RemoveObject(f, g)
             if not ok(f) then return end
-            -- A list of them (`Player.GetAllCharacters()`): each.
+            -- A list of them: each.
             if type(g) == "table" then
                 for _, one in ipairs(g) do F.RemoveObject(f, one) end
                 return
             end
             for i, v in ipairs(f.objs) do
-                if v == g then table.remove(f.objs, i) return end
+                if v == g then table.remove(f.objs, i) f.ex[g] = nil return end
             end
         end
         -- A copy to change on its own (the release objective's targets
@@ -5484,36 +5555,42 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             local c = F.Create()
             for i, v in ipairs(f.objs) do c.objs[i] = v end
             for k, v in pairs(f.ex) do c.ex[k] = v end
-            c.players, c.label = f.players, f.label
+            c.label = f.label
             return c
         end
-        function F.GetObjects(f)
+        function F.GetObjects(f, excluded)
             local r = {}
             if not ok(f) then return r end
-            for _, v in ipairs(f.objs) do if not f.ex[v] then r[#r + 1] = v end end
+            local any = false
+            for _, v in ipairs(f.objs) do
+                any = any or wild(v)
+                local out = f.ex[v] == true
+                if excluded == nil or out == (excluded and true or false) then r[#r + 1] = v end
+            end
             -- A label (`SetFilter`) lists nothing: it is only matched,
-            -- object by object (`Eval`, the death events). From the 360
-            -- code: GetObjects (823588F0) walks the filter's own objects
-            -- and the players (82359D58); SetFilter (8235A0E0) only keeps
-            -- the label's hash. So a label objective (a bounty's
-            -- `sTgtLabelFilter`) puts no targets on the radar or the map,
-            -- and counts its kills as they come.
-            if f.players then
+            -- object by object (`Eval`, the death events). SetFilter
+            -- (8235A0E0) only keeps the label's hash. So a label objective
+            -- (a bounty's `sTgtLabelFilter`) puts no targets on the radar
+            -- or the map, and counts its kills as they come.
+            if any and excluded ~= true then
                 local p = Player.GetLocalCharacter()
-                if p ~= nil and not has(f, p) and not f.ex[p] then r[#r + 1] = p end
+                if p ~= nil then r[#r + 1] = p end
             end
             return r
         end
         function F.GetCoopPlayerGuid(f)
             if not ok(f) then return nil end
-            local p = Player.GetLocalCharacter()
-            if p ~= nil and (f.players or has(f, p)) then return p end
+            for _, v in ipairs(f.objs) do if wild(v) then return v end end
             return nil
         end
         function F.Eval(f, g)
-            if not ok(f) or g == nil or f.ex[g] then return false end
-            if has(f, g) then return true end
-            if f.players and g == Player.GetLocalCharacter() then return true end
+            if not ok(f) or g == nil then return false end
+            local her = g == Player.GetLocalCharacter()
+            for i = #f.objs, 1, -1 do
+                local v = f.objs[i]
+                if her and wild(v) then return true end
+                if v == g then return not f.ex[v] end
+            end
             return f.label ~= nil and Object.HasLabel(g, f.label) or false
         end
         ObjectFilter = F
@@ -8080,6 +8157,32 @@ mod tests {
         );
     }
 
+    // `Object.FadeOut(object, seconds, true)` (OilCon001's executive): it
+    // goes once faded, as `Object.Remove` has it go; without the flag it
+    // stays (0x821B8630).
+    #[test]
+    fn an_object_faded_out_with_the_flag_goes_once_faded() {
+        let (host, world) = setup();
+        world
+            .borrow_mut()
+            .insert(51, Object::new("_global_veh_jeep 0x0002", [5.0, 0.0, 0.0]));
+        host.lua()
+            .load(
+                "Object.FadeOut(Sys.StringToGuid('0x32'), 2, true)                  Object.FadeOut(Sys.StringToGuid('0x33'), 2)",
+            )
+            .exec()
+            .unwrap();
+        world.borrow_mut().tick_fades(1.0);
+        assert!(world.borrow().objects.contains_key(&50), "fading");
+        world.borrow_mut().tick_fades(1.5);
+        let w = world.borrow();
+        assert!(!w.objects.contains_key(&50), "gone");
+        assert!(w.commands.contains(&Command::Remove(50)));
+        assert!(w.objects.contains_key(&51), "no flag: it stays");
+        assert!(!w.commands.contains(&Command::Remove(51)));
+        assert!(w.fades.is_empty());
+    }
+
     #[test]
     fn a_copied_object_filter_changes_on_its_own() {
         // `MrxTaskObjectiveRelease` copies its targets' filter, takes the
@@ -8095,11 +8198,81 @@ mod tests {
                 ObjectFilter.UsePlayers(f, true)
                 local c = ObjectFilter.Copy(f)
                 ObjectFilter.RemoveObject(c, { Sys.StringToGuid("0x70") })
-                return #f.objs, #c.objs, c.players"#,
+                return #f.objs, #c.objs,
+                    ObjectFilter.GetCoopPlayerGuid(c) == Player.GetAnyCharacter()"#,
             )
             .eval()
             .unwrap();
-        assert_eq!((orig, copy, players), (2, 1, true));
+        // The players are the any-player wildcard, an entry of its own.
+        assert_eq!((orig, copy, players), (3, 2, true));
+    }
+
+    // From the 360 code (ObjectFilter natives 0x823587B0..0x82358ED8):
+    // the player wildcards (#507) are entries of a filter. Each objective
+    // module builds its target filter from `vTgtInclude`; VzaCon001's
+    // "Land on the beach" gives `Player.GetAllCharacters()`.
+    #[test]
+    fn a_filter_of_the_player_wildcards_finds_her_for_every_objective() {
+        let (host, _) = setup();
+        let r: Vec<bool> = host
+            .lua()
+            .load(
+                r#"local her = Player.GetLocalCharacter()
+                local all, any = Player.GetAllCharacters(), Player.GetAnyCharacter()
+                local f = ObjectFilter.Create()
+                ObjectFilter.AddObject(f, all)
+                -- Deliver: the player delivery (`GetCoopPlayerGuid` is the
+                -- wildcard itself, compared with GetAllCharacters).
+                local coop = ObjectFilter.GetCoopPlayerGuid(f)
+                -- Destroy, Action, EnterVehicle: the target list, the
+                -- wildcard first, then her.
+                local objs = ObjectFilter.GetObjects(f, false)
+                -- Verify and the death events: the filter test.
+                local u = ObjectFilter.Create()
+                ObjectFilter.UsePlayers(u)
+                local g = ObjectFilter.Create()
+                ObjectFilter.AddObject(g, Sys.StringToGuid("0x70"))
+                return {
+                    coop == all, coop ~= any,
+                    #objs == 2, objs[1] == all, objs[2] == her,
+                    #ObjectFilter.GetObjects(f, true) == 0,
+                    ObjectFilter.Eval(f, her), ObjectFilter.Eval(u, her),
+                    ObjectFilter.GetCoopPlayerGuid(u) == any,
+                    -- No wildcard: no co-op player, and her own guid is not one.
+                    ObjectFilter.GetCoopPlayerGuid(g) == nil,
+                    not ObjectFilter.Eval(g, her),
+                    #ObjectFilter.GetObjects(g) == 1,
+                }"#,
+            )
+            .eval()
+            .unwrap();
+        assert!(r.iter().all(|&b| b), "{r:?}");
+    }
+
+    // From the 360 code (0x82359A58, 0x82359D58, 0x82359F80): an entry
+    // added again only changes its mark; `GetObjects` lists all, the
+    // included or the excluded by its flag; `Eval` holds for an included
+    // entry, not an excluded one; `UsePlayers(f, false)` adds nothing.
+    #[test]
+    fn filter_entries_keep_their_order_and_their_exclusion_mark() {
+        let (host, _) = setup();
+        let r: (i64, i64, i64, bool, bool, i64) = host
+            .lua()
+            .load(
+                r#"local a, b = Sys.StringToGuid("0x70"), Sys.StringToGuid("0x71")
+                local f = ObjectFilter.Create()
+                ObjectFilter.AddObject(f, a)
+                ObjectFilter.AddObject(f, b, true)
+                ObjectFilter.AddObject(f, a, true)
+                ObjectFilter.AddObject(f, b)
+                ObjectFilter.UsePlayers(f, false)
+                return #ObjectFilter.GetObjects(f), #ObjectFilter.GetObjects(f, false),
+                    #ObjectFilter.GetObjects(f, true), ObjectFilter.Eval(f, b),
+                    ObjectFilter.Eval(f, a), #f.objs"#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(r, (2, 1, 1, true, false, 2));
     }
 
     #[test]

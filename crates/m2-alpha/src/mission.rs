@@ -734,7 +734,7 @@ fn faction_relations(m: &Mission) -> Option<HashMap<(&'static str, &'static str)
              if type(m) ~= 'table' or type(m.GetRelation) ~= 'function' then return nil end \
              local out = {} \
              for _, a in ipairs({ 'All', 'Chi', 'Gur', 'Oil', 'Pir', 'Vza' }) do \
-                 for _, b in ipairs({ 'All', 'Chi', 'Gur', 'Oil', 'Pir', 'Vza' }) do \
+                 for _, b in ipairs({ 'All', 'Chi', 'Gur', 'Oil', 'Pir', 'Vza', 'Pmc' }) do \
                      local ok, r = pcall(m.GetRelation, a, b) \
                      if ok and type(r) == 'number' then out[a .. b] = r end \
                  end \
@@ -747,7 +747,9 @@ fn faction_relations(m: &Mission) -> Option<HashMap<(&'static str, &'static str)
     let got = got?;
     let mut relations = HashMap::new();
     for a in ARMIES {
-        for b in ARMIES {
+        // And how each regards her PMC, for their attitudes to her
+        // ([`crate::npc::People::add_infraction`]).
+        for b in ARMIES.into_iter().chain([crate::npc::PMC]) {
             if a != b
                 && let Ok(Some(r)) = got.get::<Option<f32>>(format!("{a}{b}"))
             {
@@ -3476,6 +3478,35 @@ impl MissionLink {
                     Command::Invincible { guid, on } if *guid == PLAYER => {
                         game.combat.invincible = *on;
                     }
+                    // Kept from dying, though hurt (`Object.SetUnkillable`:
+                    // the PMC's support planes, `SupportAirPlane`): her, a
+                    // person, or a vehicle.
+                    Command::Unkillable { guid, on } => {
+                        if *guid == PLAYER {
+                            game.combat.unkillable_her = *on;
+                        } else {
+                            if *on {
+                                game.combat.unkillable.insert(*guid);
+                            } else {
+                                game.combat.unkillable.remove(guid);
+                            }
+                            game.scene.people.set_unkillable(*guid, *on);
+                        }
+                    }
+                    // The shooting gallery holds her fire till it starts
+                    // (`MrxShootingGallery`: `Human.SetFireLock`).
+                    Command::FireLock { guid, on } if *guid == PLAYER => {
+                        eprintln!(
+                            "mission: her fire is {}",
+                            if *on { "locked" } else { "free" }
+                        );
+                        game.combat.fire_lock = *on;
+                    }
+                    // `Player.SetScopeEnabled` (MrxState, MrxGuiSatellite,
+                    // MrxGuiHudMessage): scopes off while any of them asks.
+                    Command::ScopeEnabled(on) => {
+                        game.combat.scope_off = !*on;
+                    }
                     // Her weapons, as the contract's scripts hand them out:
                     // fresh ones come with nothing in reserve.
                     Command::Loadout { who, weapons } if *who == PLAYER => {
@@ -4382,6 +4413,10 @@ impl MissionLink {
         };
         let w = mission.world().borrow();
         let place = |g: u32| w.objects.get(&g).map(|o| Vec3::from(o.position));
+        // A player wildcard among the targets (`vTgtInclude =
+        // Player.GetAllCharacters()`, VzaCon001's "Land on the beach")
+        // stands for her, as the scripts' filter has it.
+        let resolve = |g: u32| player_target(g, w.player);
         found
             .sequence_values::<mlua::Table>()
             .flatten()
@@ -4402,6 +4437,7 @@ impl MissionLink {
                         t.sequence_values::<mlua::Value>()
                             .flatten()
                             .filter_map(|v| m2_game::events::as_guid(&v))
+                            .filter_map(resolve)
                             .collect()
                     })
                     .unwrap_or_default();
@@ -5447,6 +5483,17 @@ return walk(m, 0)
 /// it is measured flat (`bXZOnly`), how many of its targets must be there
 /// (`nQuota`) and those targets (`vTgtInclude`). OilCon020's guns: a place
 /// and 15 m, flat, 1 of its pickups, no region (from the scripts).
+/// A target as the game finds it: a player wildcard
+/// (`Player.GetAnyCharacter`, `GetAllCharacters`: 0xf0000000, 0xf0000001)
+/// is the players' characters, with one player `her`; anything else is
+/// itself.
+fn player_target(g: u32, her: Option<u32>) -> Option<u32> {
+    match g {
+        m2_game::events::ANY_CHARACTER | m2_game::events::ALL_CHARACTERS => her,
+        g => Some(g),
+    }
+}
+
 const CONTRACT_DELIVERIES: &str = r#"
 local ps = rawget(_G, "MrxPlayState")
 if type(ps) ~= "table" or not ps.GetCurrentMission then return {} end
@@ -6798,6 +6845,21 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
+        // Every goal of an AI cleared (`Ai.RemoveGoal` with `Handle` 0:
+        // OilCon001's executive, PmcCon003's pursuers before their next
+        // goal): a route it runs on foot is dropped, a path its vehicle
+        // drives is left, and her own `MoveTo` is forgotten.
+        Command::ClearGoals { guid } => {
+            if *guid == PLAYER {
+                fleet.player_goal = None;
+            }
+            game.scene.people.clear_goals(*guid);
+            let vehicle = mission.world().borrow().vehicle_of(*guid);
+            if game.paths.stop(vehicle.unwrap_or(*guid)) {
+                eprintln!("mission: {guid:#x}'s goals cleared: its vehicle leaves its path");
+            }
+            return false;
+        }
         // Someone following her (`Ai.Role` `Follow`: a VIP to deliver).
         Command::Follow { guid, target, near } => {
             game.scene
@@ -7073,6 +7135,33 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                     "mission: Object.OpenGate {name} ({guid:#x}): no model of it up to open"
                 ),
             }
+            return false;
+        }
+        // An infraction the scripts add against her (`Ai.AddInfraction`:
+        // AllCon003 turns China on her, a munitions pickup of another's
+        // crate by 5): those of the faction (every one, for 0) who sense
+        // her now turn on her.
+        Command::Infraction {
+            who,
+            faction,
+            amount,
+        } if *who == PLAYER => {
+            let army = if *faction == 0 {
+                None
+            } else {
+                let w = mission.world().borrow();
+                match w
+                    .template_name(*faction)
+                    .and_then(crate::npc::faction_by_label)
+                {
+                    Some(f) => Some(f),
+                    None => {
+                        eprintln!("mission: an infraction for {faction:#x}, not an army here");
+                        return false;
+                    }
+                }
+            };
+            game.scene.people.add_infraction(army, *amount);
             return false;
         }
         // The scripts' pursuit: that army's soldiers fight her for a while,
@@ -8289,6 +8378,18 @@ mod tests {
     }
 
     use super::*;
+
+    // VzaCon001's "Land on the beach": `vTgtInclude =
+    // Player.GetAllCharacters()` read as no target ("quota 1 of 0
+    // targets") after #507 made it the wildcard. It is her.
+    #[test]
+    fn a_player_wildcard_target_is_her() {
+        use m2_game::events::{ALL_CHARACTERS, ANY_CHARACTER};
+        assert_eq!(player_target(ALL_CHARACTERS, Some(1)), Some(1));
+        assert_eq!(player_target(ANY_CHARACTER, Some(1)), Some(1));
+        assert_eq!(player_target(ALL_CHARACTERS, None), None);
+        assert_eq!(player_target(0x4000_0176, Some(1)), Some(0x4000_0176));
+    }
 
     fn entry(model: u32, kind: &str, label: &str) -> CatalogueEntry {
         CatalogueEntry {
