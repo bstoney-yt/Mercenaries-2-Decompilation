@@ -724,6 +724,9 @@ impl Atmosphere {
                             let slot = match f {
                                 "BloomTargetLuminance" => Some(&mut t.target),
                                 "BloomAdaptiveLuminancePercent" => Some(&mut t.retention),
+                                // The record's own field feeds the same
+                                // value (adaptiveParams' scale, 0x821BD348).
+                                "BloomAdaptiveLuminanceScale" => Some(&mut t.speed),
                                 "BloomContastLimit" => Some(&mut t.contrast_limit),
                                 "BloomContastMultiplier" => Some(&mut t.contrast),
                                 _ => None,
@@ -1658,6 +1661,41 @@ mod tests {
 
     /// The satellite bomb's blast script (228f1fde): grey ambient light,
     /// sunlight 3.75, then back to the region's light over 1.7 s.
+    #[test]
+    fn a_script_sets_the_eyes_adaptation_speed() {
+        // Every blast-light script sets `fBloomAdaptiveLuminanceScale`
+        // (15 to 30); it is the record field the tone map's speed is read
+        // from.
+        let day = Atmosphere {
+            tone_map: Some(m2_render::ToneMap {
+                target: 0.4,
+                min: 0.01,
+                max: 0.8,
+                min_key: 2.5,
+                max_key: 0.85,
+                retention: 0.98,
+                speed: 30.37,
+                contrast_limit: 0.145,
+                contrast: 1.95,
+                log_average: false,
+                average_power: -1.0,
+            }),
+            ..plain(0.2, 0.0)
+        };
+        let script = ScriptAtmosphere {
+            edits: vec![(
+                "fBloomAdaptiveLuminanceScale".into(),
+                EditValue::Float(25.0),
+            )],
+            interpolate: 0.0,
+            restore: None,
+        };
+        let mut mix = AtmosphereMix::default();
+        mix.update(&day, &[], Vec3::ZERO, 0.0);
+        assert!(mix.script(&day, &script).is_empty());
+        assert_eq!(mix.current(&day).tone_map.unwrap().speed, 25.0);
+    }
+
     #[test]
     fn a_script_s_light_comes_in_at_once_and_eases_back_over_its_restore() {
         let day = Atmosphere {
