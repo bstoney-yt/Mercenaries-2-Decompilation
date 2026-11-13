@@ -1649,6 +1649,13 @@ pub struct Combat {
     pub scripted_health: bool,
     /// She just got back up after going down (taken by the mission).
     pub revived: bool,
+    /// The scripts keep her from dying (`Object.SetUnkillable`): her
+    /// health stops at [`crate::npc::UNKILLABLE_FLOOR`].
+    pub unkillable_her: bool,
+    /// Vehicles the scripts keep from being wrecked
+    /// (`Object.SetUnkillable`: the PMC's support planes), by guid: their
+    /// health stops at [`crate::npc::UNKILLABLE_FLOOR`].
+    pub unkillable: std::collections::HashSet<u32>,
     /// The scripts keep her from firing (`Human.SetFireLock`: the
     /// shooting gallery before its start). From the 360 code (0x82325498):
     /// a bit of the person's own, and locking stops a shot under way.
@@ -1999,6 +2006,8 @@ impl Default for Combat {
             health_clamp: false,
             scripted_health: false,
             revived: false,
+            unkillable_her: false,
+            unkillable: std::collections::HashSet::new(),
             fire_lock: false,
             scope_off: false,
             quiet: 0.0,
@@ -3783,7 +3792,13 @@ impl Combat {
         }
         self.hurts.push((damage, from));
         self.quiet = 0.0;
-        let floor = if self.health_clamp { CLAMP_FLOOR } else { 0.0 };
+        let floor = if self.unkillable_her {
+            crate::npc::UNKILLABLE_FLOOR.max(if self.health_clamp { CLAMP_FLOOR } else { 0.0 })
+        } else if self.health_clamp {
+            CLAMP_FLOOR
+        } else {
+            0.0
+        };
         let before = self.hp;
         self.hp = (self.hp - damage).max(floor.min(self.hp));
         let lost = (before - self.hp).max(0.0);
@@ -4910,6 +4925,12 @@ impl Combat {
         if v.wrecked {
             return;
         }
+        // Unkillable: never past its health less the floor (0x822889F8).
+        let damage = if v.guid.is_some_and(|g| self.unkillable.contains(&g)) {
+            damage.min((v.most_health() - crate::npc::UNKILLABLE_FLOOR - v.damage).max(0.0))
+        } else {
+            damage
+        };
         v.damage += damage;
         v.hit += damage / v.most_health().max(1e-3);
         if v.damage >= v.most_health() {
@@ -6797,6 +6818,52 @@ mod tests {
                 assert_eq!(people.npcs[0].hp, 100.0);
             }
         }
+    }
+
+    // `Object.SetUnkillable` (the PMC's support planes): the 360's damage
+    // code (0x822889F8) never takes its health below 1; let go, it can be
+    // wrecked again.
+    #[test]
+    fn an_unkillable_vehicle_is_hurt_but_not_wrecked() {
+        let mut physics = ground();
+        let spec = crate::npc::tests::tank(m2_engine::tuning::VehicleTuning {
+            health: Some(200.0),
+            ..m2_engine::tuning::VehicleTuning::default()
+        });
+        let id = physics.add_vehicle(&spec, Vec3::new(0.0, 0.1, 0.0), 0.0);
+        let mut v = ParkedVehicle {
+            spec,
+            model: crate::npc::tests::empty_model(),
+            id: Some(id),
+            wrecked: false,
+            guid: Some(0x4000_0010),
+            spot: None,
+            crew: Vec::new(),
+            turret: 0.0,
+            hijack_nodes: Vec::new(),
+            door_turns: Vec::new(),
+            gun: 0.0,
+            aims: Vec::new(),
+            rolled: 0.0,
+            fired: 0,
+            mg_fired: 0,
+            damage: 0.0,
+            hit: 0.0,
+            parts: None,
+            loose: Vec::new(),
+            debris_thrown: false,
+        };
+        let most = v.most_health();
+        let mut combat = Combat::default();
+        combat.unkillable.insert(0x4000_0010);
+        combat.hurt_vehicle(&mut physics, &mut v, 0, most * 0.5);
+        assert!((v.damage - most * 0.5).abs() < 1e-3, "hurt");
+        combat.hurt_vehicle(&mut physics, &mut v, 0, most * 10.0);
+        assert!(!v.wrecked);
+        assert!((most - v.damage - crate::npc::UNKILLABLE_FLOOR).abs() < 1e-3);
+        combat.unkillable.clear();
+        combat.hurt_vehicle(&mut physics, &mut v, 0, 5.0);
+        assert!(v.wrecked);
     }
 
     #[test]

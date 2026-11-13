@@ -1072,6 +1072,11 @@ impl FightClips {
     }
 }
 
+/// The least health the 360's damage code leaves an unkillable object
+/// (`Object.SetUnkillable`): a hit that would take it lower takes it to
+/// this (0x822889F8, its 1.0 at 0x820baee8). Invincible ones take nothing.
+pub const UNKILLABLE_FLOOR: f32 = 1.0;
+
 #[derive(Debug)]
 pub struct Npc {
     pub kind: usize,
@@ -1143,6 +1148,9 @@ pub struct Npc {
     /// Seconds before he fires his launcher again.
     launcher_wait: f32,
     pub hp: f32,
+    /// The scripts keep them from dying (`Object.SetUnkillable`): hurt,
+    /// their health stops at [`UNKILLABLE_FLOOR`].
+    pub unkillable: bool,
     /// The health they started with (their template's for a soldier, 100
     /// for a civilian): the HUD's target arc shows a share of it.
     pub most_hp: f32,
@@ -1444,6 +1452,7 @@ impl Npc {
             launches: false,
             launcher_wait: 0.0,
             hp: 100.0,
+            unkillable: false,
             most_hp: 100.0,
             alive: true,
             alert: false,
@@ -1673,6 +1682,9 @@ impl Npc {
             return false;
         }
         self.hp -= damage;
+        if self.unkillable {
+            self.hp = self.hp.max(UNKILLABLE_FLOOR.min(self.hp + damage));
+        }
         self.hurt_by_her = true;
         self.alert = self.soldier;
         self.hit = true;
@@ -3150,6 +3162,9 @@ const LEDGE: f32 = 3.0;
 pub struct People {
     pub kinds: Vec<PersonKind>,
     pub npcs: Vec<Npc>,
+    /// Those the scripts keep from dying (`Object.SetUnkillable`), by
+    /// spawn entity, here or still to come.
+    unkillable: HashSet<u32>,
     /// Soldiers (by spawn entity) killed: they stay dead.
     pub killed: HashSet<u32>,
     /// Spawns a mission wants soldiers at though their names don't say
@@ -4659,6 +4674,10 @@ impl People {
         self.refill(spawns, focus, dt);
         self.populate(physics, spawns, focus);
         lap.mark("people: spawning");
+        // Those the scripts keep from dying, as they come into play.
+        for n in &mut self.npcs {
+            n.unkillable = n.spawn.is_some_and(|e| self.unkillable.contains(&e));
+        }
         let scripted = std::mem::take(&mut self.scripted);
         if !scripted.is_empty() {
             self.populate(physics, &scripted, focus);
@@ -5099,6 +5118,20 @@ impl People {
                 route.len(),
                 route[0]
             );
+        }
+    }
+
+    /// The scripts keep the person of spawn `entity` from dying, or let
+    /// them die again (`Object.SetUnkillable`): one in play at once, one
+    /// still to come when they come.
+    pub fn set_unkillable(&mut self, entity: u32, on: bool) {
+        if on {
+            self.unkillable.insert(entity);
+        } else {
+            self.unkillable.remove(&entity);
+        }
+        for n in self.npcs.iter_mut().filter(|n| n.spawn == Some(entity)) {
+            n.unkillable = on;
         }
     }
 
@@ -7682,6 +7715,28 @@ pub(crate) mod tests {
         people.follow(1, Some(3.0));
         assert!(!people.clear_goals(1));
         assert!(matches!(people.npcs[0].brain, Brain::Follow { .. }));
+    }
+
+    // `Object.SetUnkillable`: hurt, never below 1 health (0x822889F8),
+    // whether set before they come or while in play; let go, they die.
+    #[test]
+    fn the_unkillable_are_hurt_but_do_not_die() {
+        let mut physics = ground();
+        let mut people = People::default();
+        people.kinds.push(kind("vz_hum_soldier", false));
+        people.set_unkillable(1, true);
+        let spawns = [spawn(1, "VZ Soldier 01", 0.0)];
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        let n = &mut people.npcs[0];
+        assert!(n.unkillable);
+        let hp = n.hp;
+        assert!(!n.hurt(hp - 10.0, Vec3::ZERO));
+        assert!((n.hp - 10.0).abs() < 1e-4, "hurt: {}", n.hp);
+        assert!(!n.hurt(1000.0, Vec3::ZERO));
+        assert!(n.alive);
+        assert!((n.hp - UNKILLABLE_FLOOR).abs() < 1e-4);
+        people.set_unkillable(1, false);
+        assert!(people.npcs[0].hurt(5.0, Vec3::ZERO), "dies once let go");
     }
 
     // Playtest 8: with the island's soldiers at the most about, the
