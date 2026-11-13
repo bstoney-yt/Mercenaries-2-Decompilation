@@ -219,6 +219,8 @@ pub struct GameAudio {
     flybys: HashMap<u32, Option<VoiceId>>,
     /// Where [`Self::run_silent`] mixes to.
     silent_buffer: Vec<f32>,
+    /// `Sound.LockListenerPosition`: the listener stays where it is.
+    listener_locked: bool,
     /// Others' engines heard: their cue and a voice per track.
     others: HashMap<usize, (Arc<EngineCue>, Vec<VoiceId>)>,
     /// Banks read and found to have no engine sounds.
@@ -526,6 +528,8 @@ struct Zone {
     /// The bed stream asked for (by hash), until it plays.
     bed_wanted: Option<u32>,
     bed: Option<VoiceId>,
+    /// Seconds it has played (for the log).
+    age: f32,
 }
 
 /// Seconds a bed fades in and out over as the region changes (invented).
@@ -1318,6 +1322,7 @@ impl GameAudio {
             rotors: HashMap::new(),
             flybys: HashMap::new(),
             silent_buffer: Vec::new(),
+            listener_locked: false,
             others: HashMap::new(),
             silent: HashSet::new(),
             ambient_wait: 3.0,
@@ -1696,20 +1701,18 @@ impl GameAudio {
 
     /// The hero says something about `remark`, now and then: a cue from
     /// [`hero_cues`] (one of a group's variants), flat, as their own.
-    pub fn remark(&mut self, remark: Remark) {
+    /// Returns how long the line lasts, seconds, if one is said (their
+    /// mouth flaps for as long, [`crate::player::Player::speak_for`]).
+    pub fn remark(&mut self, remark: Remark) -> Option<f32> {
         let now = Instant::now();
         // Going down cuts in; anything else waits its turn.
         if (now < self.quiet_until && remark != Remark::Down)
             || self.random() >= remark_chance(remark)
         {
-            return;
+            return None;
         }
-        let Some(voices) = self.voices.clone() else {
-            return;
-        };
-        let Some(table) = voices.set(self.hero.voice_set()) else {
-            return;
-        };
+        let voices = self.voices.clone()?;
+        let table = voices.set(self.hero.voice_set())?;
         let streams: Vec<(u32, f32)> = hero_cues(self.hero, remark)
             .iter()
             .filter_map(|&cue| {
@@ -1724,7 +1727,7 @@ impl GameAudio {
             .flat_map(|(streams, volume)| streams.into_iter().map(move |s| (s, volume)))
             .collect();
         if streams.is_empty() {
-            return;
+            return None;
         }
         let pick = ((self.random() * streams.len() as f32) as usize).min(streams.len() - 1);
         let (stream, volume) = streams[pick];
@@ -1736,6 +1739,7 @@ impl GameAudio {
         self.quiet_until = now + Duration::from_secs_f32(seconds + REMARK_GAP);
         eprintln!("voice: {}, {remark:?}, stream {stream}", self.hero);
         self.speak(voices, stream, None, Falloff::default(), volume, None);
+        Some(seconds)
     }
 
     /// Plays the scripts' line `cue` (`Fiona-In-Mission-Contract-Vz01-146`,
@@ -2068,12 +2072,14 @@ impl GameAudio {
                     layers,
                     bed_wanted,
                     bed: None,
+                    age: 0.0,
                 });
             }
         }
         let Some(mut zone) = self.zone.take() else {
             return true;
         };
+        zone.age += dt;
         let fire = {
             let mut seed = self.seed;
             let fire = zone.layers.step(&zone.plan, dt, || {
@@ -2093,13 +2099,29 @@ impl GameAudio {
             let Some(buffer) = sounds.sound(bank, index).cloned() else {
                 continue;
             };
+            eprintln!(
+                "ambience: one-shot {i} of cue {:08x} at {:.2} s (its track: {:.2} s in, \
+                 passes {}, span {:.2} to {:.2} s), sound {:08x}",
+                zone.plan.cue,
+                zone.age,
+                layer.at,
+                layer.looping.passes,
+                layer.looping.start,
+                layer.looping.end,
+                buffer.hash
+            );
             let angle = self.random() * std::f32::consts::TAU;
             let distance = 10.0 + self.random() * 30.0;
             let at = listener + Vec3::new(angle.cos() * distance, 2.0, angle.sin() * distance);
             let falloff =
                 Falloff::of_record(layer.min_distance, layer.max_distance, layer.exponent)
                     .unwrap_or_default();
-            let play = Play::at(buffer, at).gain(layer.volume).falloff(falloff);
+            let play = Play {
+                pitch: layer.start.rate(self.random()),
+                ..Play::at(buffer, at)
+                    .gain(layer.volume * layer.start.level_scale(self.random()))
+                    .falloff(falloff)
+            };
             self.out.with(|m| m.play(play));
         }
         self.zone = Some(zone);
@@ -2459,7 +2481,16 @@ impl GameAudio {
                         buffer.hash,
                         buffer.seconds()
                     );
-                    let play = Play::at(buffer, at).gain(found.volume);
+                    let (gain, pitch) = found.started(self.random(), self.random());
+                    eprintln!(
+                        "sound: key {key:08x} starts at level {gain:.4}, rate {pitch:.4} \
+                         (its record's ranges: {:?})",
+                        found.start
+                    );
+                    let play = Play {
+                        pitch,
+                        ..Play::at(buffer, at).gain(gain)
+                    };
                     let play = match found.falloff {
                         Some(f) => play.falloff(f),
                         None => play,
@@ -3145,14 +3176,20 @@ impl GameAudio {
                 Some(Some(found)) => {
                     let found = found.clone();
                     let pick = self.random();
+                    let (gain, pitch) = found.started(self.random(), self.random());
                     let voice = found.pick(pick).cloned().map(|buffer| {
                         eprintln!(
                             "sound: fly-past, set {set:08x}, cue {cue:08x}: sound {:08x} \
-                             ({:.2} s) at {at:.0}",
+                             ({:.2} s) at {at:.0}, level {gain:.4}, rate {pitch:.4} (its \
+                             record's ranges: {:?})",
                             buffer.hash,
-                            buffer.seconds()
+                            buffer.seconds(),
+                            found.start
                         );
-                        let play = Play::at(buffer, at).gain(found.volume);
+                        let play = Play {
+                            pitch,
+                            ..Play::at(buffer, at).gain(gain)
+                        };
                         let play = match found.falloff {
                             Some(f) => play.falloff(f),
                             None => play,
@@ -3326,7 +3363,28 @@ impl GameAudio {
             }
             self.bed_decoded(buffer);
         }
-        self.out.with(|m| m.set_listener(listener, forward));
+        // Locked, the listener stays where it was (from the 360 code,
+        // the listener's update 0x8236D4D8: the camera's place is taken
+        // only while the lock, the manager's byte at +0x50, is clear).
+        if !self.listener_locked {
+            self.out.with(|m| m.set_listener(listener, forward));
+        }
+    }
+
+    /// `Sound.LockListenerPosition(on)` (0x823412D8).
+    pub fn lock_listener(&mut self, on: bool) {
+        if on != self.listener_locked {
+            eprintln!("sound: listener {}", if on { "locked" } else { "unlocked" });
+        }
+        self.listener_locked = on;
+    }
+
+    /// `Sound.SetMasterVolume(level, seconds)` (0x82343FB8): every
+    /// sound's level fades to `level` times its own over `seconds`
+    /// ([`m2_engine::audio::MasterFade`]).
+    pub fn master_volume(&mut self, level: f32, seconds: f32) {
+        eprintln!("sound: master volume to {level:.2} over {seconds:.2} s");
+        self.out.with(|m| m.script_master.set(level, seconds));
     }
 }
 
@@ -3556,6 +3614,7 @@ mod tests {
             volume: 1.0,
             min_distance: 10.0,
             max_distance: 1000.0,
+            start: m2_assets::voice::StartDraw::FLAT,
             positional: false,
             exponent: 1.0,
             variants: vec![(table, stream, 1.0)],

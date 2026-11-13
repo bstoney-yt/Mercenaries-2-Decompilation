@@ -6106,6 +6106,19 @@ impl Physics {
         Some(out)
     }
 
+    /// The speed of a ragdoll's fastest limb, m/s; `None` once removed.
+    pub fn ragdoll_speed(&self, id: RagdollId) -> Option<f32> {
+        let doll = self.ragdolls.get(id.0)?.as_ref()?;
+        Some(
+            doll.bodies
+                .iter()
+                .flatten()
+                .filter_map(|h| self.world.bodies.get(*h))
+                .map(|b| vec3(b.linvel()).length())
+                .fold(0.0, f32::max),
+        )
+    }
+
     /// Shoves every limb of a ragdoll by `velocity` (m/s).
     pub fn push_ragdoll(&mut self, id: RagdollId, velocity: Vec3) {
         let Some(doll) = self.ragdolls.get(id.0).and_then(Option::as_ref) else {
@@ -6134,7 +6147,10 @@ impl Physics {
     }
 
     /// [`cast_ray`](Self::cast_ray) that passes through vehicle `skip`:
-    /// shots from its own gun.
+    /// shots from its own gun. All of it: its hull, and a tank's turret
+    /// and gun where they are bodies of their own ([`TurretHinge`]), which
+    /// a shell leaving the muzzle would otherwise meet at once and burst
+    /// in its own barrel.
     pub fn cast_ray_past(
         &self,
         origin: Vec3,
@@ -6143,14 +6159,27 @@ impl Physics {
         skip: VehicleId,
     ) -> Option<(f32, Vec3)> {
         let ray = r::Ray::new(vector(origin), vector(direction.normalize_or_zero()));
-        let mut filter = solid();
-        if let Some(v) = self.vehicles.get(skip.0).and_then(Option::as_ref) {
-            filter = filter.exclude_rigid_body(v.controller.chassis);
-        }
+        let own = self.vehicle_bodies(skip);
+        let not_own =
+            |_: r::ColliderHandle, c: &r::Collider| c.parent().is_none_or(|b| !own.contains(&b));
         self.world
-            .query_pipeline_with_filter(filter)
+            .query_pipeline_with_filter(solid().predicate(&not_own))
             .cast_ray_and_get_normal(&ray, max, true)
             .map(|(_, hit)| (hit.time_of_impact, vec3(hit.normal)))
+    }
+
+    /// The bodies vehicle `id` is made of: its chassis, and its turret's
+    /// and gun's where they hinge on it as bodies of their own.
+    fn vehicle_bodies(&self, id: VehicleId) -> Vec<r::RigidBodyHandle> {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return Vec::new();
+        };
+        let mut out = vec![v.controller.chassis];
+        if let Some(h) = &v.hinge {
+            out.push(h.body);
+            out.extend(h.gun.as_ref().map(|g| g.body));
+        }
+        out
     }
 
     /// Whether a ball of `radius` swept from `origin` `down` metres
@@ -7178,6 +7207,40 @@ mod tests {
         let alone = p.add_vehicle(&car(), Vec3::new(10.0, 0.5, 0.0), 0.0);
         assert!((p.vehicle_mass(alone).unwrap() - car().mass).abs() < 1.0);
         assert_eq!(p.vehicle_mass(VehicleId(99)), None);
+    }
+
+    /// A shot from a tank's own gun passes through all of it: its hull,
+    /// and its turret and gun on bodies of their own (playtest 11-12: a
+    /// hijacked tank's shell burst in its own barrel). Anything else
+    /// still stops it.
+    #[test]
+    fn a_shot_from_its_own_gun_passes_through_its_turret_and_gun() {
+        let mut p = Physics::new();
+        let id = p.add_vehicle(&gun_tank(), Vec3::new(0.0, 0.5, 0.0), 0.0);
+        p.step(1.0 / 60.0);
+        let at = p.vehicle_transform(id).unwrap();
+        // From inside the barrel, along it, and from the turret's middle.
+        let barrel = at.transform_point3(Vec3::new(0.0, 2.0, 1.5));
+        let ahead = at.transform_vector3(Vec3::Z);
+        let middle = at.transform_point3(Vec3::new(0.0, 2.0, 0.0));
+        assert!(
+            p.cast_ray(barrel, ahead, 10.0).is_some(),
+            "its gun is there"
+        );
+        assert_eq!(p.cast_ray_past(barrel, ahead, 10.0, id), None);
+        assert_eq!(p.cast_ray_past(middle, ahead, 10.0, id), None);
+        // Another vehicle ahead is met, from inside its own hull.
+        let other = p.add_vehicle(&car(), at.transform_point3(Vec3::new(0.0, 0.0, 8.0)), 0.0);
+        p.step(1.0 / 60.0);
+        // Half a metre under the other's roof.
+        let over = p.vehicle_transform(other).unwrap().w_axis.truncate() + Vec3::Y * 5.0;
+        let roof = over.y - p.cast_ray(over, Vec3::NEG_Y, 20.0).unwrap().0;
+        let hull = at.transform_point3(Vec3::ZERO).with_y(roof - 0.5);
+        let hit = p.cast_ray_past(hull, ahead, 20.0, id);
+        assert!(
+            hit.is_some_and(|(t, _)| t > 4.0 && t < 10.0),
+            "{hit:?} {other:?}"
+        );
     }
 
     #[test]

@@ -16,16 +16,23 @@
 //!   range of the particles' fade close to the camera (the particle sort
 //!   pass, `0x821E3440`), which the alpha's particle draw applies from
 //!   [`EffectsState::camera_fade`] (`m2_engine::particles::camera_fade`).
-//! - `Graphics.Effect.Terrain(name, a [, b] [, at])` (`0x8231A5D0`) and
-//!   `AmbientTop`/`AmbientSides(name, slot, a [, b])` (`0x8231A4F0`,
-//!   `0x8231A6D0`) spawn an effect object from the named model (kinds 6 and
-//!   2, `0x821DA650`/`0x821DA518`) and answer its guid, or nil.
+//! - `Graphics.Effect.Terrain(name, a [, b] [, x, y, z])` (`0x8231A5D0`)
+//!   reads the template's name (hashed), a number, an optional number
+//!   (1 without) and an optional point (a global's without), and spawns
+//!   the template's effect over the ground there (kind 6, `0x821DA650`):
+//!   `a` is the patch's half-size, `b`, not below 0, the particles per
+//!   unit of ground a frame. Nil without the name and `a`. The scripts
+//!   (the dust falls: `("global_particle_dustfall", 20, 0.005, x, 8, z)`;
+//!   the bunker buster's ground shockwave) drop the answer.
+//! - `AmbientTop`/`AmbientSides(name, slot, a [, b])` (`0x8231A4F0`,
+//!   `0x8231A6D0`) spawn an effect kept about the camera (kind 2,
+//!   `0x821DA518`) and answer its guid, or nil. No script calls them.
 //!
-//! Stand-in: the port has no scripted effect objects, so the three
-//! spawning calls check their arguments and answer nil, which the 360
-//! answers when the effect can't be made. The real answer is the effect's
-//! guid; scripts that keep it (the dust falls, the bunker buster's ground
-//! shockwave) get nil for now.
+//! Stand-ins: `Terrain` hands the game a [`TerrainEffect`] and answers
+//! nil, where the 360 answers the effect object's guid (the port has no
+//! scripted effect objects; no script keeps the answer). Without a point
+//! the 360 takes a global's (`0x82E806A0`, not traced): the port makes no
+//! effect then. `AmbientTop` and `AmbientSides` answer nil.
 
 //! - `Graphics.Camera.SetFocusParams(view, n0, n1, f0, f1, amount [, t])`
 //!   (`0x823185B8`) reads a view's number, five numbers and an optional
@@ -73,6 +80,18 @@ pub struct RequiredAsset {
     pub kind: u32,
     pub n: i32,
     pub flag: bool,
+}
+
+/// One `Graphics.Effect.Terrain` call, for the game to carry out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerrainEffect {
+    /// The template's name hash.
+    pub template: u32,
+    /// The ground patch's half-size, metres.
+    pub radius: f32,
+    /// Particles per unit of ground (by the game's count) a frame.
+    pub density: f32,
+    pub at: [f32; 3],
 }
 
 /// The camera's own focus, where no script sets one (`0x821B6148`): near
@@ -127,6 +146,8 @@ impl<T> Default for CameraAsk<T> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EffectsState {
     pub required_assets: Vec<RequiredAsset>,
+    /// `Effect.Terrain` calls the game hasn't taken yet.
+    pub terrain: Vec<TerrainEffect>,
     /// The three constants `CameraFade` last set.
     pub camera_fade: [f32; 3],
     /// Each view's scripted focus (`Graphics.Camera.SetFocusParams`).
@@ -141,6 +162,7 @@ impl Default for EffectsState {
     fn default() -> Self {
         Self {
             required_assets: Vec::new(),
+            terrain: Vec::new(),
             camera_fade: FADE_ON,
             focus: [FocusAsk::default(); VIEWS],
             fov: [CameraAsk::default(); VIEWS],
@@ -182,7 +204,34 @@ fn camera_fade(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiV
     Ok(none())
 }
 
-/// `Effect.Terrain` / `AmbientTop` / `AmbientSides`: nil whatever the
+/// `Graphics.Effect.Terrain(name, a [, b] [, x, y, z])`: see the module's
+/// notes. As the 360's readers step through the arguments: `b` is the
+/// third when that is a number, and the point the three after it.
+fn terrain(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiValue> {
+    let (Some(template), Some(radius)) = (hash_arg(a, 1), num_arg(a, 2)) else {
+        return Ok(nil());
+    };
+    let (density, first) = match num_arg(a, 3) {
+        Some(b) => (b, 4),
+        None => (1.0, 3),
+    };
+    let point = (
+        num_arg(a, first),
+        num_arg(a, first + 1),
+        num_arg(a, first + 2),
+    );
+    if let (Some(x), Some(y), Some(z)) = point {
+        w.effects.terrain.push(TerrainEffect {
+            template,
+            radius,
+            density: density.max(0.0),
+            at: [x, y, z],
+        });
+    }
+    Ok(nil())
+}
+
+/// `AmbientTop` / `AmbientSides`: nil whatever the
 /// arguments (the 360's answer without an effect; stand-in, see above).
 fn no_effect(_: &mut ScriptWorld, _: &Lua, _: &[Value]) -> mlua::Result<MultiValue> {
     Ok(nil())
@@ -314,7 +363,7 @@ pub(crate) fn install(
     };
     let handlers: [(&str, Handler); 4] = [
         ("CameraFade", camera_fade),
-        ("Terrain", no_effect),
+        ("Terrain", terrain),
         ("AmbientTop", no_effect),
         ("AmbientSides", no_effect),
     ];
@@ -341,6 +390,45 @@ pub(crate) fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terrain_hands_the_game_the_dust_falls_call() {
+        let lua = Lua::new();
+        let mut w = ScriptWorld::default();
+        let name = Value::String(lua.create_string("global_particle_dustfall").unwrap());
+        // The dust fall's own call: name, 20, 0.005, x, 8, z.
+        let args = [
+            name.clone(),
+            Value::Integer(20),
+            Value::Number(0.005),
+            Value::Number(100.0),
+            Value::Integer(8),
+            Value::Number(-40.0),
+        ];
+        assert_eq!(terrain(&mut w, &lua, &args).unwrap().len(), 1);
+        let t = w.effects.terrain[0];
+        assert_eq!(t.template, hash_arg(&args, 1).unwrap());
+        assert_eq!((t.radius, t.density), (20.0, 0.005));
+        assert_eq!(t.at, [100.0, 8.0, -40.0]);
+        // A density below 0 is 0. Without a point: nothing asked (the
+        // 360 takes a global's place, not traced).
+        let low = [
+            name.clone(),
+            Value::Integer(5),
+            Value::Number(-1.0),
+            Value::Number(1.0),
+            Value::Number(2.0),
+            Value::Number(3.0),
+        ];
+        terrain(&mut w, &lua, &low).unwrap();
+        assert_eq!(w.effects.terrain[1].density, 0.0);
+        assert_eq!(w.effects.terrain[1].at, [1.0, 2.0, 3.0]);
+        terrain(&mut w, &lua, &[name.clone(), Value::Integer(5)]).unwrap();
+        // No name or no size: nil and nothing asked.
+        terrain(&mut w, &lua, &[name]).unwrap();
+        terrain(&mut w, &lua, &[]).unwrap();
+        assert_eq!(w.effects.terrain.len(), 2);
+    }
     use crate::script_hash::engine_hash;
 
     #[test]

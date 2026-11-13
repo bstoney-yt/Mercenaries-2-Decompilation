@@ -1067,12 +1067,7 @@ impl Rig {
             self.animator.set_upper(None);
             return;
         }
-        let (whole, upper) = match (gait, carry) {
-            (Gait::Idle, Carry::Aim) => (clips.aim, None),
-            (_, Carry::Aim) => (None, clips.aim),
-            (Gait::Run, _) => (clips.run_low, None),
-            _ => (None, None),
-        };
+        let (whole, upper) = rifle_clips(gait, carry, clips, self.gait_clip(Gait::FullSprint));
         match whole {
             Some(clip) => {
                 self.gait = gait;
@@ -1414,8 +1409,20 @@ const MAX_TWIST: f32 = 1.3;
 /// And bends up or down.
 const MAX_BEND: f32 = 0.9;
 
+/// A person's face is kept on the GPU this many frames after they were
+/// last drawn.
+const FACE_KEPT: u64 = 600;
+
 #[derive(Debug)]
 pub struct Scene {
+    /// People's faces on the GPU, by the person's own number, with the
+    /// frame each was last drawn in: freed once they have not been drawn
+    /// for a while ([`FACE_KEPT`]).
+    faces: HashMap<u64, (m2_engine::MorphedFace, u64)>,
+    /// Her face on the GPU ([`crate::player::Player::face`]).
+    hero_face: m2_engine::MorphedFace,
+    /// Frames drawn.
+    frame: u64,
     /// The grid, drawn when there is no island.
     ground: (VertexBufferHandle, IndexBufferHandle, MaterialId),
     /// The vehicles (the mission scripts' objects, the island's entities)
@@ -2247,6 +2254,9 @@ impl Scene {
         let effects = Effects::new(backend, &mut materials)?;
         Ok(Self {
             ruins: Default::default(),
+            faces: HashMap::new(),
+            hero_face: Default::default(),
+            frame: 0,
             mission_crews: Default::default(),
             prop_crews: Vec::new(),
             prop_rider_spots: Vec::new(),
@@ -2585,6 +2595,33 @@ impl Scene {
                 .asset(table::CHARACTER_ANIMATIONS, table::ANIMATION_TABLE_TYPE)
                 .ok()
                 .and_then(|a| AnimationTable::parse(&a).ok());
+        }
+        // How long people's `ThreatReaction` lasts (their scared look):
+        // its clip on the people's rig, by both tables.
+        if self.people.threat_seconds.is_none()
+            && let (Some(t), Some(rig)) = (&self.on_foot, &self.people_rig)
+        {
+            use m2_assets::animation_table::{self as table, AnimationTable};
+            let actions = source
+                .asset(table::ACTIONS, table::ANIMATION_TABLE_TYPE)
+                .ok()
+                .and_then(|a| AnimationTable::parse(&a).ok());
+            self.people.threat_seconds = actions.and_then(|actions| {
+                npc::threat_reaction_seconds(t, &actions, |c| {
+                    rig.clips
+                        .iter()
+                        .find(|b| b.hash == c)
+                        .map(|b| b.info.duration)
+                })
+            });
+            eprintln!(
+                "people: ThreatReaction lasts {}",
+                self.people
+                    .threat_seconds
+                    .map_or("? (not found: scared until they settle)".to_owned(), |s| {
+                        format!("{s:.2} s")
+                    })
+            );
         }
         // The clips by name, then as the on-foot table gives them the
         // hero, then the hero's own group's for those it doesn't.
@@ -3526,6 +3563,22 @@ impl Scene {
         fight: &combat::Combat,
     ) -> anyhow::Result<()> {
         let eye = view.eye();
+        // Faces of people not drawn for a while are let go.
+        self.frame += 1;
+        if self.frame.is_multiple_of(FACE_KEPT) {
+            let frame = self.frame;
+            let mut stale = Vec::new();
+            self.faces.retain(|_, f| {
+                let keep = frame - f.1 < FACE_KEPT;
+                if !keep {
+                    stale.push(std::mem::take(&mut f.0));
+                }
+                keep
+            });
+            for mut f in stale {
+                f.destroy(backend)?;
+            }
+        }
         if let Some(world) = &mut self.world {
             let frustum = Frustum::from_view_proj(view.projection * view.view);
             world.draw(backend, queue, eye, &frustum)?;
@@ -3670,7 +3723,16 @@ impl Scene {
                     (nodes, skin, player.model_matrix())
                 }
             };
-            model.draw_posed(backend, queue, body, &nodes, &skin)?;
+            // Her face: her own copy of the head's vertices, once an
+            // expression has moved it.
+            let face = if model.has_blend_shapes()
+                && model.blend_face(backend, &mut self.hero_face, player.face.weights())?
+            {
+                Some(&self.hero_face)
+            } else {
+                None
+            };
+            model.draw_posed_face(backend, queue, body, &nodes, &skin, None, face)?;
             // Throwing, her weapon is put away and the grenade is in her
             // hand until it goes; calling a support strike, the
             // designator is. Her rifle is her own or the carbine
@@ -3750,7 +3812,17 @@ impl Scene {
             }
             let (nodes, skin) = n.rig.posed();
             let body = n.model_matrix();
-            model.draw_posed_as(backend, queue, body, &nodes, &skin, outfit)?;
+            // Their face: their own copy of the head's vertices, once an
+            // expression has moved it ([`m2_engine::face_expression`]).
+            let mut face = None;
+            if model.has_blend_shapes() {
+                let slot = self.faces.entry(n.uid).or_default();
+                slot.1 = self.frame;
+                if model.blend_face(backend, &mut slot.0, n.face.weights())? {
+                    face = Some(&slot.0);
+                }
+            }
+            model.draw_posed_face(backend, queue, body, &nodes, &skin, outfit, face)?;
             // Swimming, their gun is away (as hers is).
             if (n.soldier || n.faction.is_some())
                 && n.alive
@@ -4214,8 +4286,72 @@ fn ground(
     Ok((vb, ib, material))
 }
 
+/// The clips a rifle is held by at `gait` and `carry`: one played whole
+/// (held in both hands), and one over the upper body (the aim's arms).
+/// Neither: the gait's own clip, the rifle carried low in the right hand
+/// with the standing arm over it. `full_sprint` is the 360's sprint's
+/// clip, where the rig has its own (`gait` comes as [`Gait::Sprint`]
+/// where it has not).
+fn rifle_clips(
+    gait: Gait,
+    carry: Carry,
+    clips: &npc::FightClips,
+    full_sprint: Option<usize>,
+) -> (Option<usize>, Option<usize>) {
+    match (gait, carry) {
+        (Gait::Idle, Carry::Aim) => (clips.aim, None),
+        (_, Carry::Aim) => (None, clips.aim),
+        (Gait::Run, _) => (clips.run_low, None),
+        // The 360's sprint with a clip of its own (the on-foot table's
+        // `Upright_Sprint_Forward` for what she holds) is made with the
+        // rifle in both hands: played whole, held in both, not with the
+        // standing arm laid over it, which left her front hand under the
+        // rifle (playtest 11-12, Chris).
+        (Gait::FullSprint, _) => (full_sprint, None),
+        _ => (None, None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The 360's sprint with its own clip plays it whole, the rifle in
+    /// both hands; the walk and the alpha's sprint keep the carry (the
+    /// standing arm over the gait), the jog its low two-handed run, and
+    /// aiming the aim's arms.
+    #[test]
+    fn the_sprint_holds_the_rifle_in_both_hands() {
+        let clips = npc::FightClips {
+            aim: Some(1),
+            run_low: Some(2),
+            ..Default::default()
+        };
+        let own = Some(7);
+        assert_eq!(
+            rifle_clips(Gait::FullSprint, Carry::Low, &clips, own),
+            (own, None)
+        );
+        assert_eq!(
+            rifle_clips(Gait::FullSprint, Carry::Aim, &clips, own),
+            (None, Some(1))
+        );
+        assert_eq!(
+            rifle_clips(Gait::Run, Carry::Low, &clips, own),
+            (Some(2), None)
+        );
+        assert_eq!(
+            rifle_clips(Gait::Walk, Carry::Low, &clips, own),
+            (None, None)
+        );
+        assert_eq!(
+            rifle_clips(Gait::Sprint, Carry::Low, &clips, own),
+            (None, None)
+        );
+        assert_eq!(
+            rifle_clips(Gait::Idle, Carry::Aim, &clips, own),
+            (Some(1), None)
+        );
+    }
+
     use super::*;
     use m2_render::NullBackend;
 

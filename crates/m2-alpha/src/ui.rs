@@ -55,6 +55,16 @@ pub struct HudInfo {
     /// ([`crate::gamehud::HudState::context_action`]), so [`Self::prompt`]
     /// is drawn here only without it.
     pub context_action: Option<String>,
+    /// A homing launcher is up ([`crate::combat::Combat::homing`]): how
+    /// far its lock has come (0 to 1) and where its target is, if it is
+    /// locking on.
+    pub homing: Option<Option<(f32, Vec3)>>,
+    /// The engine's own prompt for what the use key does in reach, as its
+    /// kind (the HUD's priority) and text
+    /// ([`crate::action_prompt::Action`]); the game's HUD draws it, so
+    /// [`Self::prompt`] and [`Self::can_enter`] are drawn here only
+    /// without it.
+    pub action: Option<(u32, String)>,
     /// A hijack's button prompt is up and the keyboard plays: the keys
     /// that press it ("Space"), under the game's icon
     /// ([`crate::hijack::key_hint`]).
@@ -216,6 +226,9 @@ impl Hud {
         state.blips = blips(info);
         state.textures = marker_textures(info);
         state.reticle = reticle(info);
+        state.homing = info
+            .homing
+            .map(|lock| lock.and_then(|(share, at)| Some((share, on_screen(info, at)?))));
         state.support = info.support.clone();
         state.cash = info.mission.as_ref().and_then(|m| m.cash);
         state.fuel = info.mission.as_ref().and_then(|m| m.fuel);
@@ -229,6 +242,7 @@ impl Hud {
             .as_ref()
             .map_or_else(Vec::new, |m| m.radar_regions.clone());
         state.tutorial = info.mission.as_ref().and_then(|m| m.game_tutorial.clone());
+        state.action = info.action.clone();
         if let Some(m) = &info.mission {
             state.hud_calls = game.hud_calls(&m.hud_calls);
             state.key_names = m.key_names.clone();
@@ -286,6 +300,9 @@ impl Hud {
         state.blips = blips(info);
         state.textures = marker_textures(info);
         state.reticle = reticle(info);
+        state.homing = info
+            .homing
+            .map(|lock| lock.and_then(|(share, at)| Some((share, on_screen(info, at)?))));
         state.support = info.support.clone();
         state.cash = info.mission.as_ref().and_then(|m| m.cash);
         state.fuel = info.mission.as_ref().and_then(|m| m.fuel);
@@ -299,6 +316,7 @@ impl Hud {
             .as_ref()
             .map_or_else(Vec::new, |m| m.radar_regions.clone());
         state.tutorial = info.mission.as_ref().and_then(|m| m.game_tutorial.clone());
+        state.action = info.action.clone();
         if let Some(m) = &info.mission {
             state.hud_calls = game.hud_calls(&m.hud_calls);
             state.key_names = m.key_names.clone();
@@ -599,6 +617,17 @@ fn reticle(info: &HudInfo) -> Option<[f32; 2]> {
     Some([ndc.x.clamp(-1.0, 1.0), ndc.y.clamp(-1.0, 1.0)])
 }
 
+/// Where the world point `at` is on the screen, x right and y up, -1 to
+/// 1, if it is in front of the camera and on it.
+fn on_screen(info: &HudInfo, at: Vec3) -> Option<[f32; 2]> {
+    let clip = info.view_proj? * at.extend(1.0);
+    if clip.w <= 0.01 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    (ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0).then_some([ndc.x, ndc.y])
+}
+
 /// The textures the world's markers draw: the objective markers' icons,
 /// the pickups' markers' backing, and each icon.
 fn marker_textures(info: &HudInfo) -> Vec<u32> {
@@ -794,7 +823,7 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>, covered: bool)
             white,
         );
     }
-    if game.is_some() && info.context_action.is_some() {
+    if game.is_some() && (info.context_action.is_some() || info.action.is_some()) {
         // The game's own prompt is up (`Context Action Text`).
     } else if let Some(prompt) = &info.prompt {
         use_prompt(prompt);

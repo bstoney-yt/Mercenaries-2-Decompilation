@@ -555,6 +555,65 @@ pub const STAGGER_CLIPS: [(Stagger, Direction, [u32; 4]); 12] = {
 /// movement record whose meaning is not established).
 const STAGGER_MOVING: f32 = 0.5;
 
+/// Someone using a thing by one of its seats ([`crate::social`]): where
+/// they get on, where and which way they sit, and how long a use of the
+/// thing lasts (its `SocialUse` record's duration).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UseJob {
+    /// The placed object and the seat's name hash.
+    pub object: usize,
+    pub seat: u32,
+    pub entrance: Vec3,
+    /// How near the entrance they get on: its `UseDistance`, metres.
+    pub reach: f32,
+    pub seat_at: Vec3,
+    pub seat_yaw: f32,
+    pub duration: f32,
+    /// The seat's clips on their rig: getting on, seated, getting off.
+    pub enter: Option<usize>,
+    pub idle: usize,
+    pub exit: Option<usize>,
+}
+
+/// Where someone using a thing is at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum UsePhase {
+    /// Walking to the seat's entrance, for this long so far.
+    Walk(f32),
+    /// Getting on: the clip.
+    Enter(usize),
+    Sit,
+    /// Getting off: the clip.
+    Exit(usize),
+}
+
+/// How near a seat's entrance they get on where the entrance has no
+/// `UseDistance`, metres. From the 360 code: the use task's step
+/// (0x822B1F50) walks them to the entrance until they are within its
+/// record's distance, 2.0 (0x820C77A4) with no record, then boards.
+pub const USE_REACH: f32 = 2.0;
+
+/// They give a thing up when they have not reached it after this long,
+/// seconds. A stand-in: the 360 has no such timer, its task fails when
+/// the path does (0x822D19C8) or the seat is taken (0x822B22E0), and
+/// the port's people have no word of a path failing.
+const USE_GIVE_UP: f32 = 30.0;
+
+/// Where a limp body lies: the middle of its nodes over the ground
+/// plane, at their lowest. `None` for no nodes.
+fn limp_middle(nodes: &[Mat4]) -> Option<Vec3> {
+    if nodes.is_empty() {
+        return None;
+    }
+    let sum: Vec3 = nodes.iter().map(|m| m.w_axis.truncate()).sum();
+    let low = nodes
+        .iter()
+        .map(|m| m.w_axis.y)
+        .fold(f32::INFINITY, f32::min);
+    let mid = sum / nodes.len() as f32;
+    Some(Vec3::new(mid.x, low, mid.z))
+}
+
 /// How far apart a clip's hands get over the whole clip, for its hip
 /// height: a rifle held in both hands keeps them close.
 pub fn hand_spread(rig: &Rig, c: &BoundClip) -> Option<f32> {
@@ -1130,6 +1189,16 @@ pub struct Npc {
     /// while it is low enough to attack, as it calms back to their
     /// faction's relation to the PMC ([`People::add_infraction`]).
     pub her_attitude: Option<m2_engine::ai_target::Attitude>,
+    /// They take part in the living world (`Ai.LivingWorld`, the 360's
+    /// +0x17DD bit 7): standing at a post, pushed more than
+    /// [`LIVING_WORLD_SLACK`] from the spot they stood at, they walk back
+    /// to it. Off (`MrxFollow` for one following her), they stay where
+    /// they end up.
+    pub living_world: bool,
+    /// The spot they took their post at, and whether they are walking back
+    /// to it ([`Npc::living_world`]).
+    post_at: Option<Vec3>,
+    returning: bool,
     /// Their death was taken as an infraction already.
     pub reported_dead: bool,
     /// Hurt since the last look ([`People::pursue`]).
@@ -1150,6 +1219,8 @@ pub struct Npc {
     /// Set by a tick when a soldier fires his launcher; the fight takes
     /// the shot ([`crate::combat`]).
     pub launches: bool,
+    /// His homing launcher's lock ([`crate::homing`]).
+    pub seeking: crate::homing::Seeking<m2_engine::VehicleId>,
     /// Seconds before he fires his launcher again.
     launcher_wait: f32,
     pub hp: f32,
@@ -1225,6 +1296,8 @@ pub struct Npc {
     /// ([`m2_engine::ai_anchor`]): the scripts' (`Ai.Anchor`), or their
     /// spawner's.
     pub anchor: Option<Anchor>,
+    /// Running to raise an alarm ([`People::raise_alarms`]).
+    pub alarm: Option<AlarmRun>,
     /// Put out of a vehicle's seat ([`People::put_out`]): no spawn keeps
     /// them, so they go once out of range.
     put_out: bool,
@@ -1243,11 +1316,17 @@ pub struct Npc {
     pub shooter: u32,
     /// Seconds since they died.
     dead_for: f32,
-    /// Their body gone limp, once dead.
+    /// Their body gone limp: once dead, and while knocked down.
     pub ragdoll: Option<RagdollId>,
     /// A shove not yet given to their body (m/s): they went limp, or
     /// were hit again after.
     fling: Option<Vec3>,
+    /// Knocked down and limp, they get up (or are subdued) this step:
+    /// the limp body is given up and they are where it lay.
+    rise: bool,
+    /// Knocked down and limp: seconds the body has lain still, and
+    /// seconds it has been limp ([`LIMP_STILL`], [`LIMP_LONGEST`]).
+    limp: (f32, f32),
     /// Where the round now striking them landed and the way it flew, set
     /// by the shot just before [`hurt`](Self::hurt) and read by it.
     pub last_hit: Option<(Vec3, Vec3)>,
@@ -1255,10 +1334,29 @@ pub struct Npc {
     /// (`DieAnimatedRagdoll`) and the shove kept for when it ends and
     /// they go limp ([`m2_engine::death`]).
     dying: Option<(usize, Vec3)>,
+    /// The expressions on their face and the weights they give the
+    /// head's blend shapes ([`m2_engine::face_expression`]). Everyone
+    /// blinks from the start, as the 360's animation driver has it
+    /// (0x8241F360).
+    pub face: m2_engine::face_expression::Face,
+    /// A number of their own, for what the scene keeps for them from
+    /// frame to frame (their face's vertices).
+    pub uid: u64,
+    /// The state of their face's own random numbers.
+    face_seed: u64,
+    /// Scared while getting out of a vehicle's way: the seconds the
+    /// `ThreatReaction` action has left ([`People::threat_seconds`]), or
+    /// below 0 when its length isn't known (until they settle).
+    scared: Option<f32>,
     /// The stagger's clip they play, hit and still alive, and the seconds
     /// since their last stagger began ([`m2_engine::stagger`]).
     stagger: Option<usize>,
     since_stagger: Option<f32>,
+    /// The thing they are using or going to use, and where they are at
+    /// with it ([`crate::social`]).
+    using: Option<(UseJob, UsePhase)>,
+    /// How lately they used something ([`m2_engine::social_use::UseMeter`]).
+    pub use_meter: m2_engine::social_use::UseMeter,
     /// Has shouted since they were last calm.
     shouted: bool,
     /// Killed since [`People::take_deaths`] last looked.
@@ -1379,8 +1477,24 @@ pub enum Down {
     Carried,
 }
 
+/// When someone knocked down stands up again. From the 360 code
+/// (0x8225CAE0, for a person in `KnockedDown` `Idle`): `Stand` is posted
+/// once they have been in that state longer than their time down (the
+/// record's +0x38, [`m2_engine::melee::knockdown_seconds`]), and, when
+/// their physics object is of kind 0xC, once a float of it (+0x300) is
+/// over 0.5 (0x820D9EDC) or another (+0x304) over 19.0 (0x820F8C84).
+///
+/// **Inferred**: kind 0xC is the limp body, the first float the seconds
+/// it has lain still and the second the seconds it has been limp. So
+/// they do not get up while still tumbling, but always after 19 s.
+/// Under [`LIMP_AT_REST`] m/s counts as still (invented).
+const LIMP_STILL: f32 = 0.5;
+const LIMP_LONGEST: f32 = 19.0;
+const LIMP_AT_REST: f32 = 0.2;
+
 /// Seconds a fall takes, someone lies knocked down, gets up, and is
-/// subdued (all invented).
+/// subdued (all invented). The time down the 360 sets counts from when
+/// they lie (`KnockedDown` `Idle`), after the fall.
 const FALL_SECONDS: f32 = 1.0;
 const KNOCKED_SECONDS: f32 = 10.0;
 const GETUP_SECONDS: f32 = 1.5;
@@ -1413,6 +1527,8 @@ impl Npc {
         rig.set_gait(Gait::Idle);
         let clips = FightClips::find(&rig);
         let hand = rig.rifle_hand();
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let uid = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
             clips,
             hand,
@@ -1421,10 +1537,30 @@ impl Npc {
             dead_for: 0.0,
             ragdoll: None,
             fling: None,
+            rise: false,
+            limp: (0.0, 0.0),
             last_hit: None,
             dying: None,
+            face: {
+                let mut face = m2_engine::face_expression::Face::default();
+                let r = |k: u64| {
+                    ((uid.wrapping_mul(0x9e37_79b9).wrapping_add(k * 7919)) % 1000) as f32 / 1000.0
+                };
+                face.play(
+                    m2_engine::face_expression::BLINK,
+                    1.0,
+                    -1.0,
+                    [r(1), r(2), r(3), r(4)],
+                );
+                face
+            },
+            uid,
+            face_seed: uid.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1,
+            scared: None,
             stagger: None,
             since_stagger: None,
+            using: None,
+            use_meter: Default::default(),
             shouted: false,
             died: false,
             kind,
@@ -1450,12 +1586,16 @@ impl Npc {
             heard: None,
             provoked: false,
             her_attitude: None,
+            living_world: true,
+            post_at: None,
+            returning: false,
             hurt_by_her: false,
             killed_by_her: false,
             reported_dead: false,
             gun: None,
             launcher: None,
             launches: false,
+            seeking: Default::default(),
             launcher_wait: 0.0,
             hp: 100.0,
             unkillable: false,
@@ -1491,6 +1631,7 @@ impl Npc {
             since_shot: f32::INFINITY,
             flee: None,
             anchor: None,
+            alarm: None,
             put_out: false,
             down: None,
             brain,
@@ -1822,8 +1963,221 @@ impl Npc {
         self.rig
             .animator
             .play_action(clip, true, pick.stagger.action());
+        // As the stagger starts they are turned at once to the heading
+        // the picker chose (0x8241FE38: the heading is set, not turned
+        // to).
+        self.facing = pick.turn_to;
+        self.show(
+            m2_engine::face_expression::ANGRY,
+            m2_engine::face_expression::ANGRY_SECONDS,
+        );
         self.stagger = Some(clip);
         self.since_stagger = Some(0.0);
+    }
+
+    /// The thing they use or are on their way to, and its seat.
+    pub fn using(&self) -> Option<(usize, u32)> {
+        self.using.map(|(j, _)| (j.object, j.seat))
+    }
+
+    /// Whether they are seated at a thing (getting on or off too).
+    pub fn seated_at_use(&self) -> bool {
+        matches!(self.using, Some((_, p)) if !matches!(p, UsePhase::Walk(_)))
+    }
+
+    /// Whether a usable thing may call them over this tick: the 360
+    /// lists those standing idle whose use meter is low
+    /// ([`m2_engine::social_use::is_candidate`]). Here: pausing on a
+    /// stroll, calm, on their feet and free.
+    pub fn use_candidate(&self, listed: usize) -> bool {
+        self.alive
+            && self.landed
+            && !self.alert
+            && !self.held
+            && self.flee.is_none()
+            && self.down.is_none()
+            && self.swim.is_none()
+            && self.using.is_none()
+            && self.stagger.is_none()
+            && matches!(self.brain, Brain::Wander { wait, .. } if wait > 0.0)
+            && m2_engine::social_use::is_candidate(self.use_meter.0, listed)
+    }
+
+    /// Called over to use a thing: they walk to its seat's entrance.
+    pub fn start_use(&mut self, job: UseJob) {
+        self.using = Some((job, UsePhase::Walk(0.0)));
+    }
+
+    /// The thing they use or walk to is gone (destroyed): they give it
+    /// up where they are, on their feet at its entrance if seated. The
+    /// 360's use task ends when its seat is no longer usable
+    /// (0x822B22E0).
+    pub fn drop_use(&mut self) {
+        if let Some((job, phase)) = self.using.take()
+            && !matches!(phase, UsePhase::Walk(_))
+        {
+            self.character.position = job.entrance;
+        }
+    }
+
+    /// Whether something has put them off using a thing.
+    fn use_disturbed(&self) -> bool {
+        self.alert || self.held || self.flee.is_some() || self.hit
+    }
+
+    /// One step of using a thing, once at its seat: getting on, seated,
+    /// getting off. True while seated, when they do nothing else. The
+    /// use is over when their meter says so (the 360's use step,
+    /// 0x822ABD60) or something disturbs them (invented: what the 360
+    /// does with a seated person who is alarmed was not traced).
+    fn update_use(&mut self, dt: f32) -> bool {
+        let Some((job, phase)) = self.using else {
+            self.use_meter.step(dt, None);
+            return false;
+        };
+        let over = |rig: &Rig, clip: usize| {
+            rig.animator
+                .current()
+                .is_none_or(|(c, at)| c != clip || at + 1e-3 >= rig.clips[c].info.duration)
+        };
+        let leave = |n: &mut Self| match job.exit {
+            Some(c) => {
+                n.rig
+                    .animator
+                    .play_action(c, true, m2_engine::blend::action::EXIT_VEHICLE);
+                Some((job, UsePhase::Exit(c)))
+            }
+            None => {
+                n.character.position = job.entrance;
+                None
+            }
+        };
+        let next = match phase {
+            UsePhase::Walk(_) => {
+                self.use_meter.step(dt, None);
+                return false;
+            }
+            UsePhase::Enter(c) if over(&self.rig, c) => {
+                if job.idle < self.rig.clips.len() {
+                    self.rig.animator.play(job.idle);
+                }
+                Some((job, UsePhase::Sit))
+            }
+            UsePhase::Sit if self.use_meter.done() || self.use_disturbed() => leave(self),
+            UsePhase::Exit(c) if over(&self.rig, c) => {
+                self.character.position = job.entrance;
+                None
+            }
+            p => Some((job, p)),
+        };
+        self.using = next;
+        // The meter rises while they sit, and falls again after.
+        let sitting = matches!(next, Some((_, UsePhase::Enter(_) | UsePhase::Sit)));
+        self.use_meter.step(dt, sitting.then_some(job.duration));
+        if next.is_none() {
+            return false;
+        }
+        self.character.position = job.seat_at;
+        self.character.velocity = Vec3::ZERO;
+        self.facing = job.seat_yaw;
+        self.rig.advance(dt);
+        true
+    }
+
+    /// Walking to the thing they were called over to: the way to its
+    /// seat's entrance, `None` once there (then they get on) or once
+    /// they give it up.
+    fn walk_to_use(&mut self, dt: f32) -> Option<Vec3> {
+        let (job, UsePhase::Walk(t)) = self.using? else {
+            return None;
+        };
+        if self.use_disturbed() || t > USE_GIVE_UP {
+            self.using = None;
+            return None;
+        }
+        let to = (job.entrance - self.character.position).with_y(0.0);
+        if to.length() > job.reach {
+            self.using = Some((job, UsePhase::Walk(t + dt)));
+            return Some(to.normalize());
+        }
+        self.rig.animator.set_upper(None);
+        let phase = match job.enter {
+            Some(c) => {
+                self.rig
+                    .animator
+                    .play_action(c, true, m2_assets::name_hash("EnterVehicle"));
+                UsePhase::Enter(c)
+            }
+            None => {
+                if job.idle < self.rig.clips.len() {
+                    self.rig.animator.play(job.idle);
+                }
+                UsePhase::Sit
+            }
+        };
+        self.using = Some((job, phase));
+        self.character.position = job.seat_at;
+        self.character.velocity = Vec3::ZERO;
+        self.facing = job.seat_yaw;
+        None
+    }
+
+    /// An expression on their face at full weight for `seconds` (under
+    /// 0: until stopped).
+    pub fn show(&mut self, expression: u32, seconds: f32) {
+        let r = |k: u64| {
+            ((self.uid.wrapping_mul(0x9e37_79b9).wrapping_add(k * 7919)) % 1000) as f32 / 1000.0
+        };
+        self.face
+            .play(expression, 1.0, seconds, [r(5), r(6), r(7), r(8)]);
+    }
+
+    /// The 360's `ThreatReaction` starting (a vehicle coming at them):
+    /// the driver's action handler (0x8241FE38) posts `Scared` at weight
+    /// 1 until stopped as the action starts, and at 0 when it is left,
+    /// so their face is scared for the action's `seconds` (`None`: not
+    /// known, until they settle).
+    pub fn threat_reaction(&mut self, seconds: Option<f32>) {
+        self.show(m2_engine::face_expression::SCARED, -1.0);
+        self.scared = Some(seconds.filter(|&s| s > 0.0).unwrap_or(-1.0));
+    }
+
+    /// `dt` seconds of the threat reaction: its time up, the scared look
+    /// goes with it (0x8241FE38 posts `Scared` at 0 as the action is
+    /// left).
+    fn scared_step(&mut self, dt: f32) {
+        if let Some(left) = &mut self.scared
+            && *left >= 0.0
+        {
+            *left -= dt;
+            if *left <= 0.0 {
+                self.stop_scared();
+            }
+        }
+    }
+
+    /// The threat reaction left: `Scared` at weight 0 (0x8241FE38).
+    fn stop_scared(&mut self) {
+        if self.scared.is_some() {
+            eprintln!("face: person {} no longer scared", self.uid);
+        }
+        self.scared = None;
+        self.face
+            .play(m2_engine::face_expression::SCARED, 0.0, -1.0, [0.0; 4]);
+    }
+
+    /// Their mouth flapping while a line of theirs plays (`on`), as the
+    /// 360's voice system has every speaker's (0x822782D8, 0x82278440).
+    pub fn speak(&mut self, on: bool) {
+        let r = |k: u64| {
+            ((self.uid.wrapping_mul(0x9e37_79b9).wrapping_add(k * 7919)) % 1000) as f32 / 1000.0
+        };
+        self.face.play(
+            m2_engine::face_expression::FLAP,
+            if on { 1.0 } else { 0.0 },
+            -1.0,
+            [r(9), r(10), r(11), r(12)],
+        );
     }
 
     /// One step of a stagger: true while its clip plays, when they do
@@ -1885,8 +2239,8 @@ impl Npc {
         if !self.alive || self.down.is_some() {
             return;
         }
-        self.character.velocity += push;
         self.knock_down();
+        self.fling = Some(push);
         self.knocked_for = Some(seconds);
     }
 
@@ -1895,10 +2249,21 @@ impl Npc {
             return;
         }
         self.down = Some(Down::Falling(FALL_SECONDS));
+        // `Knockdown` is one of the actions the 360 shows `Angry` on.
+        self.show(
+            m2_engine::face_expression::ANGRY,
+            m2_engine::face_expression::ANGRY_SECONDS,
+        );
         self.alert = false;
         self.flee = None;
         self.rig.animator.set_upper(None);
         self.rig.two_handed = false;
+        // `Upright` `KnockDown` and `KnockedDown` `Idle` are of the mode
+        // `FULL` in the state table, as `Die` is: limp at once, and limp
+        // while they lie. The clip below shows only where no limp body
+        // can be made.
+        self.fling = Some(Vec3::ZERO);
+        self.character.velocity = Vec3::ZERO;
         if let Some(c) = self.clips.die.or(self.clips.knocked) {
             self.rig.animator.play_once(c);
         }
@@ -1911,6 +2276,8 @@ impl Npc {
             return false;
         }
         self.down = Some(Down::Subduing(SUBDUE_SECONDS));
+        // `KnockedDown` `SubdueDefender` is a clip's (mode `NONE`).
+        self.rise = true;
         true
     }
 
@@ -1936,14 +2303,24 @@ impl Npc {
                 if let Some(c) = clips.knocked {
                     self.rig.animator.play(c);
                 }
-                let lie = self
-                    .knocked_for
-                    .take()
-                    .map_or(KNOCKED_SECONDS, |s| (s - FALL_SECONDS).max(0.0));
+                let lie = self.knocked_for.take().unwrap_or(KNOCKED_SECONDS);
                 Some(Down::Knocked(lie))
             }
             Down::Falling(t) => Some(Down::Falling(t - dt)),
+            // Their time down over, but the limp body still tumbling:
+            // not yet.
+            Down::Knocked(t)
+                if t - dt <= 0.0
+                    && self.ragdoll.is_some()
+                    && self.limp.0 <= LIMP_STILL
+                    && self.limp.1 <= LIMP_LONGEST =>
+            {
+                Some(Down::Knocked(0.0))
+            }
             Down::Knocked(t) if t - dt <= 0.0 => {
+                // `KnockedDown.Getup` is a clip's (mode `NONE`): no
+                // longer limp.
+                self.rise = true;
                 if let Some(c) = clips.getup {
                     // `KnockedDown.Getup`: the original snaps into it.
                     self.rig
@@ -2834,6 +3211,9 @@ impl Npc {
         if !self.landed {
             return "landing";
         }
+        if self.alarm.is_some() {
+            return "running to raise an alarm";
+        }
         if self.alert {
             return "fighting";
         }
@@ -2867,6 +3247,19 @@ impl Npc {
     }
 
     fn update(&mut self, physics: &Physics, rng: &mut Rng, threat: Option<Vec3>, dt: f32) {
+        // Their face goes on while they live; a dead face stays as it
+        // was.
+        if self.alive {
+            // Its own random numbers, so faces do not change what the
+            // people's shared ones decide.
+            let seed = &mut self.face_seed;
+            self.face.step(dt, || {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 7;
+                *seed ^= *seed << 17;
+                (*seed >> 40) as f32 / (1u64 << 24) as f32
+            });
+        }
         if !self.landed {
             // Onto the ground (or the roof or floor of their post) under
             // where they were placed.
@@ -2915,6 +3308,7 @@ impl Npc {
         }
         if self.down.is_some() {
             self.stagger = None;
+            self.using = None;
             self.update_down(dt);
             return;
         }
@@ -2925,6 +3319,9 @@ impl Npc {
             return;
         }
         if self.update_stagger(dt) {
+            return;
+        }
+        if self.update_use(dt) {
             return;
         }
         self.since_shot += dt;
@@ -2949,7 +3346,9 @@ impl Npc {
         // villa's waves come in to the hall).
         let sent = matches!(self.brain, Brain::Route { .. });
         lap.mark("person: look");
-        if self.alert && !sent {
+        // Running to raise an alarm (its goal, 9.9, outranks the fight;
+        // [`People::raise_alarms`]).
+        if self.alert && !sent && self.alarm.is_none() {
             let fights = threat.is_some_and(|t| self.fight(physics, t, rng, dt));
             lap.mark("person: fight");
             match threat {
@@ -2967,6 +3366,7 @@ impl Npc {
         let at = self.character.position;
         let mut wanted = Vec3::ZERO;
         let mut face = None;
+        self.scared_step(dt);
         let mut speed = self.push(HUMAN_WALK);
         let run = self.push(HUMAN_RUN);
         if let Some((target, left)) = &mut self.flee {
@@ -2980,6 +3380,10 @@ impl Npc {
                     wait: rng.range(PAUSE.0, PAUSE.1),
                 };
                 self.flee = None;
+                // Out of the way: a scared look of no known length goes.
+                if self.scared.is_some_and(|s| s < 0.0) {
+                    self.stop_scared();
+                }
             } else {
                 speed = self.push(HUMAN_RUN);
                 wanted = to.normalize() * speed;
@@ -2987,9 +3391,37 @@ impl Npc {
         }
         let mut arrived = false;
         let mut glide = None;
+        if self.flee.is_some() || !matches!(self.brain, Brain::Post { .. }) {
+            self.post_at = None;
+            self.returning = false;
+        }
         match &mut self.brain {
             _ if self.flee.is_some() => {}
-            Brain::Post { facing } => face = Some(*facing),
+            _ if self.alarm.is_some() => {
+                let to = self.alarm.as_ref().map_or(at, |r| r.to);
+                if !m2_engine::alarm_goal::reached(at.to_array(), to.to_array()) {
+                    wanted = (to - at).with_y(0.0).normalize_or_zero() * run;
+                }
+            }
+            // From the 360 code (0x822B1BD0): the spot is kept when they
+            // first stand there; moved more than 1 m from it (squared, in
+            // 3D) and in the living world, they go back to it.
+            Brain::Post { facing } => {
+                let spot = *self.post_at.get_or_insert(at);
+                let off = spot - at;
+                if self.living_world
+                    && off.length_squared() > LIVING_WORLD_SLACK * LIVING_WORLD_SLACK
+                {
+                    self.returning = true;
+                }
+                let flat = off.with_y(0.0);
+                if self.returning && flat.length() > LIVING_WORLD_BACK {
+                    wanted = flat.normalize() * speed;
+                } else {
+                    self.returning = false;
+                    face = Some(*facing);
+                }
+            }
             Brain::Patrol {
                 route,
                 next,
@@ -3095,6 +3527,14 @@ impl Npc {
             self.reached = true;
             self.ended = true;
         }
+        // Called over to a thing: to its seat's entrance, at a walk.
+        if let Some(way) = self.walk_to_use(dt) {
+            wanted = way * self.push(HUMAN_WALK);
+            glide = None;
+        } else if self.seated_at_use() {
+            // Got on this step.
+            return;
+        }
         match glide {
             Some(point) => {
                 let to = point - self.character.position;
@@ -3163,14 +3603,40 @@ impl Npc {
 /// A follower keeps off a drop deeper than this (metres).
 const LEDGE: f32 = 3.0;
 
+/// How long the `ThreatReaction` action lasts for someone unarmed:
+/// the clip the on-foot table `t` gives the action's handle in the stance
+/// and action table `actions` (`Upright` `ThreatReaction`, handle
+/// f796ff3b: clip edec954e, 4.54 s, standing still), of those `length`
+/// knows (clip hash to seconds).
+pub fn threat_reaction_seconds(
+    t: &m2_assets::animation_table::AnimationTable,
+    actions: &m2_assets::animation_table::AnimationTable,
+    length: impl Fn(u32) -> Option<f32>,
+) -> Option<f32> {
+    use m2_assets::animation_table as table;
+    let handle = table::action_handle(actions, "Upright", "ThreatReaction")?;
+    let clip = table::handle_clip(t, handle, (table::ANY, table::ANY), table::UNARMED, |c| {
+        length(c).is_some()
+    })?;
+    length(clip.clip)
+}
+
 /// Everyone on the island but the player.
 #[derive(Debug, Default)]
 pub struct People {
     pub kinds: Vec<PersonKind>,
     pub npcs: Vec<Npc>,
+    /// How long the `ThreatReaction` action lasts, seconds: its clip's
+    /// length by the on-foot table ([`threat_reaction_seconds`]), `None`
+    /// when not known. Someone getting out of a vehicle's way looks
+    /// scared for as long.
+    pub threat_seconds: Option<f32>,
     /// Those the scripts keep from dying (`Object.SetUnkillable`), by
     /// spawn entity, here or still to come.
     unkillable: HashSet<u32>,
+    /// Those the scripts took out of the living world (`Ai.LivingWorld`
+    /// off), by spawn entity, here or still to come.
+    out_of_living_world: HashSet<u32>,
     /// Soldiers (by spawn entity) killed: they stay dead.
     pub killed: HashSet<u32>,
     /// Spawns a mission wants soldiers at though their names don't say
@@ -3654,6 +4120,12 @@ pub const INFRACTION_COST: f32 = 80.0;
 pub const INFRACTION_SEEN_WITHIN: f32 = 0.5;
 /// Her army as the faction manager names it (`GetRelation(f, "Pmc")`).
 pub const PMC: &str = "Pmc";
+/// How far a person at a post may be pushed from their spot before they
+/// walk back to it, metres (0x822B1BD0 against 1.0, 0x820BAEE8, squared).
+pub const LIVING_WORLD_SLACK: f32 = 1.0;
+/// How near the spot they stop once walking back (invented: the 360's
+/// move goal's own arrival isn't traced).
+pub const LIVING_WORLD_BACK: f32 = 0.25;
 
 /// Seconds the soldiers of a faction she provoked fight her: the first of
 /// the pursuit level times the faction manager sets
@@ -4683,6 +5155,24 @@ impl People {
         self.kinds.push(kind);
     }
 
+    /// This tick's candidates for the usable things, in the people's
+    /// order: who (index into `npcs`) and where
+    /// ([`Npc::use_candidate`]).
+    pub fn use_candidates(&self) -> Vec<(usize, Vec3)> {
+        let mut out = Vec::new();
+        for (i, n) in self.npcs.iter().enumerate() {
+            if n.use_candidate(out.len()) {
+                out.push((i, n.character.position));
+            }
+        }
+        out
+    }
+
+    /// A random number in [0, 1) of the people's own.
+    pub fn random(&mut self) -> f32 {
+        self.rng.next()
+    }
+
     /// One fixed tick: people come and go around `focus`, then move;
     /// soldiers on alert fight the player at `threat` (her chest; `None`
     /// while she is down or not playing).
@@ -4752,6 +5242,11 @@ impl People {
         // Those the scripts keep from dying, as they come into play.
         for n in &mut self.npcs {
             n.unkillable = n.spawn.is_some_and(|e| self.unkillable.contains(&e));
+        }
+        for n in &mut self.npcs {
+            n.living_world = !n
+                .spawn
+                .is_some_and(|e| self.out_of_living_world.contains(&e));
         }
         let scripted = std::mem::take(&mut self.scripted);
         if !scripted.is_empty() {
@@ -4836,8 +5331,34 @@ impl People {
             if std::mem::take(&mut npc.spotted) && npc.alive && self.smarter.enabled {
                 callouts.push(npc.character.position);
             }
-            // The dead go limp from where they stood, shoved as they were
-            // hit.
+            // How long the living's limp body has lain still, and been
+            // limp.
+            match npc.ragdoll.filter(|_| npc.alive) {
+                Some(id) => {
+                    let still = physics.ragdoll_speed(id).is_none_or(|v| v < LIMP_AT_REST);
+                    npc.limp.0 = if still { npc.limp.0 + dt } else { 0.0 };
+                    npc.limp.1 += dt;
+                }
+                None => npc.limp = (0.0, 0.0),
+            }
+            // Up from a knockdown (or subdued): where the limp body lay,
+            // on the ground under it.
+            if std::mem::take(&mut npc.rise)
+                && npc.alive
+                && let Some(id) = npc.ragdoll.take()
+            {
+                if let Some(at) = physics.ragdoll_nodes(id).and_then(|n| limp_middle(&n)) {
+                    let from = at + Vec3::Y;
+                    let y = physics
+                        .cast_ray(from, -Vec3::Y, 6.0)
+                        .map_or(npc.character.position.y, |(d, _)| from.y - d + 0.05);
+                    npc.character.position = Vec3::new(at.x, y, at.z);
+                    npc.character.velocity = Vec3::ZERO;
+                }
+                physics.remove_ragdoll(id);
+            }
+            // The dead, and the knocked down, go limp from where they
+            // stood, shoved as they were hit.
             let Some(push) = npc.fling.take() else {
                 continue;
             };
@@ -4929,7 +5450,8 @@ impl People {
                         let rel = (p - centre).with_y(0.0);
                         let side = (rel - heading * rel.dot(heading))
                             .normalize_or(Vec3::new(heading.z, 0.0, -heading.x));
-                        n.character.velocity = heading * speed * 0.5 + side * SHOVE;
+                        let shove = heading * speed * 0.5 + side * SHOVE;
+                        n.character.velocity = shove;
                         n.rammed = RAM_GAP;
                         n.panic(centre);
                         // Hit hard enough by a vehicle, the 360 knocks
@@ -4940,7 +5462,7 @@ impl People {
                                 false,
                                 self.rng.next(),
                             );
-                            n.knock_down_for(seconds, Vec3::ZERO);
+                            n.knock_down_for(seconds, shove);
                         }
                     }
                     continue;
@@ -4951,7 +5473,21 @@ impl People {
                 let ahead = rel.dot(heading);
                 let side = (rel - heading * ahead).length();
                 if ahead > 0.0 && ahead < speed * DODGE_TIME && side < width + 1.5 {
+                    let calm = n.flee.is_none();
                     n.panic(centre + heading * ahead);
+                    // Getting out of a vehicle's way is the 360's
+                    // `ThreatReaction` (request 0x24 from the AI's sense
+                    // of a vehicle coming at them, 0x822E02A0), and
+                    // `Scared` shows while it lasts (0x8241FE38).
+                    if calm && n.flee.is_some() {
+                        n.threat_reaction(self.threat_seconds);
+                        eprintln!(
+                            "face: person {} scared by a vehicle for {}",
+                            n.uid,
+                            self.threat_seconds
+                                .map_or("? s (until settled)".to_owned(), |s| format!("{s:.2} s"))
+                        );
+                    }
                 }
             }
         }
@@ -5228,6 +5764,21 @@ impl People {
             eprintln!("people: {entity:08x} has its goals cleared");
         }
         had
+    }
+
+    /// The scripts put the person of spawn `entity` into the living world
+    /// or take them out (`Ai.LivingWorld` with `Attrib =
+    /// "LivingWorldBehaviour"`; `MrxFollow` takes out one following her):
+    /// one in play at once, one still to come when they come.
+    pub fn set_living_world(&mut self, entity: u32, on: bool) {
+        if on {
+            self.out_of_living_world.remove(&entity);
+        } else {
+            self.out_of_living_world.insert(entity);
+        }
+        for n in self.npcs.iter_mut().filter(|n| n.spawn == Some(entity)) {
+            n.living_world = on;
+        }
     }
 
     /// The scripts killed the soldier of spawn `entity` (or took it away,
@@ -5743,9 +6294,182 @@ impl Rng {
     }
 }
 
+/// A soldier's run to raise an alarm ([`People::raise_alarms`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AlarmRun {
+    /// The alarm's guid.
+    pub tower: u32,
+    /// The hardpoint he runs to.
+    pub to: Vec3,
+    /// His claim on it ([`m2_engine::alarm_goal::score`]), renewed each
+    /// tick.
+    pub score: f32,
+}
+
+/// An alarm in play, as its soldiers see it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlarmTower {
+    pub guid: u32,
+    pub at: Vec3,
+    /// Its faction, as [`faction_of`] has it.
+    pub faction: Option<&'static str>,
+    /// Its flag is on.
+    pub on: bool,
+    /// Where its hardpoints are ([`m2_engine::alarm_goal::HARDPOINTS`]),
+    /// those its model has.
+    pub hardpoints: Vec<Vec3>,
+}
+
+impl People {
+    /// Sends soldiers to raise their alarms and keeps those running at it
+    /// ([`m2_engine::alarm_goal`]): a soldier of an alarm's faction with
+    /// someone to fight, within 50 m of it while its flag is off, runs to
+    /// its nearest hardpoint unless another holds it with a score he
+    /// can't beat by a tenth; of several alarms, the one he scores
+    /// highest. A run ends when the flag is on, the alarm goes, he is
+    /// down or dead, or another takes it over; within half a metre of the
+    /// hardpoint the alarm is raised. Returns the alarms to raise
+    /// (`m2_game::alarm::ON`).
+    ///
+    /// Not ported: the use clip he plays there (0x29EFE0B5), going on to
+    /// the next hardpoint when stuck (he runs straight, as the alpha's
+    /// people do), and the score doubling for an AI whose +0x1010 is 0.
+    pub fn raise_alarms(&mut self, towers: &[AlarmTower]) -> Vec<u32> {
+        use m2_engine::alarm_goal::{
+            Candidate, by_distance, may_claim, pins, proposes, reached, score,
+        };
+        let mut raised = Vec::new();
+        for n in &mut self.npcs {
+            let Some(run) = n.alarm else { continue };
+            n.alarm = match towers.iter().find(|t| t.guid == run.tower) {
+                Some(t) if n.alive && n.down.is_none() && !t.on => {
+                    let at = n.character.position;
+                    if reached(at.to_array(), run.to.to_array()) {
+                        if !raised.contains(&t.guid) {
+                            raised.push(t.guid);
+                        }
+                        None
+                    } else {
+                        Some(AlarmRun {
+                            score: score(at.distance(t.at)),
+                            ..run
+                        })
+                    }
+                }
+                _ => None,
+            };
+        }
+        for i in 0..self.npcs.len() {
+            let n = &self.npcs[i];
+            let sent = matches!(n.brain, Brain::Route { .. });
+            if n.alarm.is_some() || !n.alive || !n.soldier || n.down.is_some() || sent {
+                continue;
+            }
+            let at = n.character.position;
+            let pinned = n.anchor.is_some_and(|a| pins(a.radius));
+            let best = towers
+                .iter()
+                .filter(|t| !t.hardpoints.is_empty())
+                .filter_map(|t| {
+                    let c = Candidate {
+                        on: t.on,
+                        same_faction: t.faction.is_some() && t.faction == n.faction,
+                        fighting: n.alert,
+                        pinned,
+                        distance: at.distance(t.at),
+                    };
+                    let mine = score(c.distance);
+                    let held = self
+                        .npcs
+                        .iter()
+                        .filter_map(|m| m.alarm)
+                        .find(|r| r.tower == t.guid)
+                        .map(|r| r.score);
+                    (proposes(&c) && may_claim(held, mine)).then_some((t, mine))
+                })
+                .max_by(|a, b| a.1.total_cmp(&b.1));
+            let Some((t, mine)) = best else { continue };
+            for m in &mut self.npcs {
+                if m.alarm.is_some_and(|r| r.tower == t.guid) {
+                    m.alarm = None;
+                }
+            }
+            let points: Vec<[f32; 3]> = t.hardpoints.iter().map(|p| p.to_array()).collect();
+            let to = Vec3::from_array(by_distance(at.to_array(), &points)[0]);
+            eprintln!(
+                "people: soldier at {at:.1} runs to raise alarm {:#x} ({:.1} m off)",
+                t.guid,
+                at.distance(t.at)
+            );
+            self.npcs[i].alarm = Some(AlarmRun {
+                tower: t.guid,
+                to,
+                score: mine,
+            });
+        }
+        raised
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn the_nearest_fighting_soldier_of_its_faction_runs_to_raise_the_alarm() {
+        let post = || Brain::Post { facing: 0.0 };
+        let soldier = |x: f32, faction: &'static str, alert: bool| {
+            let mut n = Npc::new(0, &rig(), Vec3::new(x, 0.0, 0.0), 0.0, post(), Some(1));
+            n.soldier = true;
+            n.faction = Some(faction);
+            n.alert = alert;
+            n
+        };
+        let mut people = People {
+            npcs: vec![
+                soldier(30.0, "Vza", true), // 30 m off: score 20
+                soldier(20.0, "Vza", true), // 20 m off: score 30, the nearest
+                soldier(10.0, "Chi", true), // another army's
+                soldier(5.0, "Vza", false), // not fighting
+                soldier(60.0, "Vza", true), // beyond 50 m
+            ],
+            ..Default::default()
+        };
+        let mut tower = AlarmTower {
+            guid: 0x5150,
+            at: Vec3::ZERO,
+            faction: Some("Vza"),
+            on: false,
+            hardpoints: vec![Vec3::new(-2.0, 0.0, 0.0), Vec3::new(2.0, 0.0, 0.0)],
+        };
+        assert!(people.raise_alarms(std::slice::from_ref(&tower)).is_empty());
+        let runs: Vec<Option<u32>> = people
+            .npcs
+            .iter()
+            .map(|n| n.alarm.map(|r| r.tower))
+            .collect();
+        // One soldier only: the second in the list may take it from the
+        // first by more than a tenth.
+        assert_eq!(runs, [None, Some(0x5150), None, None, None]);
+        assert_eq!(people.npcs[1].alarm.unwrap().to, Vec3::new(2.0, 0.0, 0.0));
+        // There: raised, and his run is over.
+        people.npcs[1].character.position = Vec3::new(2.3, 0.0, 0.2);
+        assert_eq!(people.raise_alarms(std::slice::from_ref(&tower)), [0x5150]);
+        // The flag on: nobody goes, and a run under way ends.
+        tower.on = true;
+        people.npcs[0].alarm = Some(AlarmRun {
+            tower: 0x5150,
+            to: Vec3::ZERO,
+            score: 1.0,
+        });
+        assert!(people.raise_alarms(std::slice::from_ref(&tower)).is_empty());
+        assert!(people.npcs.iter().all(|n| n.alarm.is_none()));
+        // A tower without the hardpoints: nobody goes.
+        tower.on = false;
+        tower.hardpoints.clear();
+        people.raise_alarms(std::slice::from_ref(&tower));
+        assert!(people.npcs.iter().all(|n| n.alarm.is_none()));
+    }
 
     #[test]
     fn the_aim_gaits_are_kept_for_rebinding() {
@@ -6805,6 +7529,7 @@ pub(crate) mod tests {
         n.gun = Some(rifle());
         n.launcher = Some(NpcLauncher {
             template: 7,
+            seeker: None,
             hint: FireHint {
                 kinds: [1, 1],
                 against: [1, 1, 1, 1],
@@ -7495,6 +8220,167 @@ pub(crate) mod tests {
         assert!(DEATH_CLIPS.iter().all(|d| !d.1.is_empty()));
     }
 
+    /// Called over, they walk to the entrance, get on, sit their time
+    /// out and are back on their feet at the entrance.
+    #[test]
+    fn called_over_they_walk_sit_the_duration_and_get_up() {
+        let physics = ground();
+        let mut rng = Rng::default();
+        let mut n = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Wander {
+                home: Vec3::ZERO,
+                target: Vec3::ZERO,
+                wait: 100.0,
+            },
+            None,
+        );
+        let step = |n: &mut Npc, seconds: f32, rng: &mut Rng| {
+            for _ in 0..(seconds * 60.0) as usize {
+                n.update(&physics, rng, None, 1.0 / 60.0);
+            }
+        };
+        step(&mut n, 0.5, &mut rng);
+        assert!(n.use_candidate(0));
+        assert!(!n.use_candidate(m2_engine::social_use::CANDIDATES_MOST));
+        let job = UseJob {
+            object: 3,
+            seat: 0xa759_c6cc,
+            entrance: n.character.position + Vec3::new(2.0, 0.0, 0.0),
+            reach: 0.6,
+            seat_at: n.character.position + Vec3::new(2.0, 0.4, 0.5),
+            seat_yaw: 1.0,
+            duration: 2.0,
+            enter: None,
+            idle: 0,
+            exit: None,
+        };
+        n.start_use(job);
+        assert_eq!(n.using(), Some((3, 0xa759_c6cc)));
+        assert!(!n.use_candidate(0) && !n.seated_at_use());
+        // Walking: nearer the entrance, not yet seated.
+        step(&mut n, 0.5, &mut rng);
+        assert!(n.character.position.x > 0.2 && !n.seated_at_use());
+        // There: seated at the seat, facing its way.
+        let mut walked = 0.5;
+        while !n.seated_at_use() && walked < 6.0 {
+            step(&mut n, 0.1, &mut rng);
+            walked += 0.1;
+        }
+        assert!(n.seated_at_use(), "not there after {walked:.1} s");
+        assert_eq!(n.character.position, job.seat_at);
+        assert_eq!(n.facing, 1.0);
+        // The duration over (and a little): up, at the entrance, and not
+        // a candidate again at once.
+        step(&mut n, 2.5, &mut rng);
+        assert_eq!(n.using(), None);
+        assert!((n.character.position - job.entrance).with_y(0.0).length() < 0.5);
+        assert!(!n.use_candidate(0));
+    }
+
+    /// Alarmed on the way, they give the thing up; alarmed seated, they
+    /// get off.
+    #[test]
+    fn alarm_puts_them_off_a_thing() {
+        let mut n = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            None,
+        );
+        let job = UseJob {
+            object: 1,
+            seat: 2,
+            entrance: Vec3::new(5.0, 0.0, 0.0),
+            reach: USE_REACH,
+            seat_at: Vec3::new(5.0, 0.4, 0.0),
+            seat_yaw: 0.0,
+            duration: 30.0,
+            enter: None,
+            idle: 0,
+            exit: None,
+        };
+        n.start_use(job);
+        n.alert = true;
+        assert_eq!(n.walk_to_use(0.1), None);
+        assert_eq!(n.using(), None);
+        n.alert = false;
+        n.using = Some((job, UsePhase::Sit));
+        assert!(n.update_use(0.1));
+        n.hit = true;
+        assert!(!n.update_use(0.1));
+        assert_eq!(n.using(), None);
+        assert_eq!(n.character.position, job.entrance);
+        // The thing gone from under them: on their feet at its entrance.
+        n.using = Some((job, UsePhase::Sit));
+        n.character.position = job.seat_at;
+        n.drop_use();
+        assert_eq!(n.using(), None);
+        assert_eq!(n.character.position, job.entrance);
+    }
+
+    /// Everyone blinks from the start; a knockdown shows Angry for its
+    /// two seconds; speaking flaps the mouth until the line is over.
+    #[test]
+    fn faces_blink_show_anger_and_flap_while_speaking() {
+        use m2_engine::face_expression::{ANGRY, BLINK, FLAP};
+        let physics = ground();
+        let mut rng = Rng::default();
+        let mut n = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            None,
+        );
+        let other = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            None,
+        );
+        assert_ne!(n.uid, other.uid);
+        assert!(n.face.plays(BLINK) && !n.face.plays(ANGRY));
+        let mut step = |n: &mut Npc, seconds: f32| {
+            for _ in 0..(seconds * 60.0) as usize {
+                n.update(&physics, &mut rng, None, 1.0 / 60.0);
+            }
+        };
+        // Over ten seconds the eyes shut now and then.
+        let mut shut = 0;
+        for _ in 0..600 {
+            step(&mut n, 1.0 / 60.0);
+            shut += usize::from(n.face.weight(BLINK) > 0.5);
+        }
+        assert!((10..200).contains(&shut), "{shut} frames shut in 10 s");
+        n.speak(true);
+        step(&mut n, 1.0);
+        assert!(n.face.plays(FLAP));
+        n.speak(false);
+        step(&mut n, 0.5);
+        assert!(!n.face.plays(FLAP));
+        assert_eq!(n.face.weight(FLAP), 0.0);
+        n.knock_down();
+        assert!(n.face.plays(ANGRY));
+        step(&mut n, 0.5);
+        assert!(n.face.weight(ANGRY) >= 0.5);
+        step(&mut n, 2.0);
+        assert!(!n.face.plays(ANGRY));
+        // Dead, the face stays as it was.
+        n.hurt(f32::INFINITY, Vec3::ZERO);
+        let before = n.face.clone();
+        step(&mut n, 1.0);
+        assert_eq!(n.face, before);
+    }
+
     /// Each of the three staggers has its four directions, once each.
     #[test]
     fn the_stagger_clips_are_the_tables_twelve_rows() {
@@ -7560,6 +8446,46 @@ pub(crate) mod tests {
         assert_eq!(m.fling, Some(Vec3::X));
     }
 
+    /// The scared look lasts the `ThreatReaction` action's length and
+    /// goes as it ends, fleeing or not (0x8241FE38); of no known length
+    /// it stays until they settle.
+    #[test]
+    fn a_threat_reaction_scares_them_for_its_length() {
+        use m2_engine::face_expression::SCARED;
+        let still = || Brain::Wander {
+            home: Vec3::ZERO,
+            target: Vec3::ZERO,
+            wait: 10.0,
+        };
+        let mut n = Npc::new(0, &rig(), Vec3::ZERO, 0.0, still(), None);
+        n.threat_reaction(Some(4.5));
+        assert!(n.face.plays(SCARED));
+        for _ in 0..60 * 4 {
+            n.scared_step(1.0 / 60.0);
+        }
+        assert!(n.face.plays(SCARED) && n.scared.is_some(), "4 s in");
+        for _ in 0..40 {
+            n.scared_step(1.0 / 60.0);
+        }
+        assert!(n.scared.is_none(), "4.67 s in, the action is over");
+        // Stopped: the expression now blends to 0, not held at 1.
+        let mut seed = 3u64;
+        for _ in 0..60 {
+            n.face.step(1.0 / 60.0, || {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (seed >> 40) as f32 / (1u64 << 24) as f32
+            });
+        }
+        assert_eq!(n.face.weight(SCARED), 0.0);
+        // Its length unknown: no timer, it waits for them to settle.
+        let mut m = Npc::new(0, &rig(), Vec3::ZERO, 0.0, still(), None);
+        m.threat_reaction(None);
+        for _ in 0..60 * 30 {
+            m.scared_step(1.0 / 60.0);
+        }
+        assert!(m.face.plays(SCARED) && m.scared.is_some_and(|s| s < 0.0));
+    }
+
     #[test]
     fn cars_knock_people_flying_and_the_rest_dive_aside() {
         let stroll = || Brain::Wander {
@@ -7567,7 +8493,10 @@ pub(crate) mod tests {
             target: Vec3::ZERO,
             wait: 10.0,
         };
-        let mut people = People::default();
+        let mut people = People {
+            threat_seconds: Some(4.5),
+            ..People::default()
+        };
         for z in [1.5, 12.0, -6.0] {
             let mut n = Npc::new(0, &rig(), Vec3::new(0.3, 0.0, z), 0.0, stroll(), None);
             n.landed = true;
@@ -7583,6 +8512,11 @@ pub(crate) mod tests {
         assert!(!hit.alive && hit.fling.is_some_and(|v| v.z > 10.0 && v.y > 2.0));
         assert!(ahead.alive && ahead.flee.is_some(), "dives aside");
         assert!(behind.alive && behind.flee.is_none());
+        // Getting out of its way, the one ahead looks scared; the one
+        // behind does not.
+        assert!(ahead.face.plays(m2_engine::face_expression::SCARED));
+        assert_eq!(ahead.scared, Some(4.5), "for the reaction's length");
+        assert!(!behind.face.plays(m2_engine::face_expression::SCARED));
         // Parked, nobody minds.
         let mut people = People::default();
         let mut n = Npc::new(0, &rig(), Vec3::new(0.3, 0.0, 1.5), 0.0, stroll(), None);
@@ -7632,7 +8566,10 @@ pub(crate) mod tests {
         assert_eq!(people.traffic(&[slow], Some(&table)), 0);
         let n = &people.npcs[0];
         assert!(n.alive && n.hp == 55.0 && n.rammed == RAM_GAP);
-        assert!(n.character.velocity.x > 0.0, "shoved off its line");
+        assert!(
+            n.fling.is_some_and(|f| f.x > 0.0),
+            "their limp body is shoved off its line"
+        );
         // 45 of damage is over the 360's 2.0: knocked down, for 4 to 6 s.
         assert!(matches!(n.down, Some(Down::Falling(_))));
         assert!(n.knocked_for.is_some_and(|s| (4.0..=6.0).contains(&s)));
@@ -7878,6 +8815,41 @@ pub(crate) mod tests {
         assert!(people.npcs[0].hurt(5.0, Vec3::ZERO), "dies once let go");
     }
 
+    // `Ai.LivingWorld` (0x822B1BD0): one at a post pushed more than 1 m
+    // off their spot walks back to it; taken out of the living world
+    // (`MrxFollow`), they stay where they were put.
+    #[test]
+    fn in_the_living_world_one_pushed_off_their_post_walks_back() {
+        let pushed = |living: bool| {
+            let mut physics = ground();
+            let mut people = People::default();
+            people.kinds.push(kind("vz_hum_soldier", false));
+            if !living {
+                people.set_living_world(1, false);
+            }
+            let spawns = [spawn(1, "VZ Soldier 01", 0.0)];
+            for _ in 0..30 {
+                people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+            }
+            let n = &mut people.npcs[0];
+            n.brain = Brain::Post { facing: 0.0 };
+            n.flee = None;
+            people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+            let spot = people.npcs[0].character.position;
+            people.npcs[0].character.position += Vec3::new(3.0, 0.0, 0.0);
+            for _ in 0..60 * 8 {
+                people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+            }
+            (people.npcs[0].character.position - spot)
+                .with_y(0.0)
+                .length()
+        };
+        let back = pushed(true);
+        assert!(back <= 1.0, "walked back: {back}");
+        let stays = pushed(false);
+        assert!(stays > 2.5, "stays: {stays}");
+    }
+
     // Playtest 8: with the island's soldiers at the most about, the
     // villa's waves never stood. Those the scripts sent come anyway.
     #[test]
@@ -8078,9 +9050,32 @@ pub(crate) mod tests {
         };
         step(&mut n, 0.5, &mut rng);
         assert_eq!(n.human_state(), "Upright.Idle");
-        // Knocked down: the fall, lying, then up again.
+        // Knocked down: limp at once (the fall, lying), then up again.
         n.knock_down();
         assert_eq!(n.human_state(), "Upright.KnockDown");
+        assert_eq!(n.fling, Some(Vec3::ZERO), "a limp body is asked for");
+        assert!(!n.rise);
+        // Their time down over, a limp body still tumbling keeps them
+        // down; lain still half a second, or limp 19 s, they get up.
+        let mut m = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            None,
+        );
+        m.down = Some(Down::Knocked(0.0));
+        m.ragdoll = Some(ground().add_ragdoll(&[None], &[Mat4::IDENTITY], Vec3::ZERO));
+        m.update_down(0.1);
+        assert_eq!(m.down, Some(Down::Knocked(0.0)));
+        m.limp = (0.0, LIMP_LONGEST + 0.1);
+        m.update_down(0.1);
+        assert!(matches!(m.down, Some(Down::GettingUp(_))) && m.rise);
+        m.down = Some(Down::Knocked(0.0));
+        m.limp = (LIMP_STILL + 0.1, 1.0);
+        m.update_down(0.1);
+        assert!(matches!(m.down, Some(Down::GettingUp(_))));
         step(&mut n, FALL_SECONDS + 0.1, &mut rng);
         assert_eq!(n.human_state(), "KnockedDown.Idle");
         step(&mut n, KNOCKED_SECONDS + 0.1, &mut rng);

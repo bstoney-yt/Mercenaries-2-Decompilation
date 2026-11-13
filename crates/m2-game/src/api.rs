@@ -17,6 +17,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
+pub use m2_engine::heli_land::DropZone;
 use m2_math::glam::Vec3;
 use mlua::{Function, Lua, MultiValue, Table, Value};
 
@@ -503,8 +504,9 @@ pub enum Command {
     /// A call the game only needs to hear about:
     /// `"Pg.ContractActivated"`, `"Pg.ContractCompleted"`, ...
     Notify(String),
-    /// Save the game now, in slot `slot`: the scripts' checkpoints
-    /// (`Pg.SaveGame("retry")`), and their autosaves (`Sys.RequestAutosave`
+    /// Save the game now, in slot `slot`: the scripts' retry save as a
+    /// contract starts (`Pg.SaveGame("retry")`, kept in memory, not
+    /// written: [`ScriptWorld::retry_save`]), and their autosaves (`Sys.RequestAutosave`
     /// after a contract, `Pg.SaveGame("autosave")`) in slot [`AUTOSAVE`].
     Save {
         slot: String,
@@ -953,9 +955,17 @@ pub struct ScriptWorld {
     pub layers: crate::layers::LayerState,
     /// Goal callbacks waiting for the AI to finish: guid, callback, data.
     goal_callbacks: Vec<(u32, Function, Option<Table>)>,
-    /// Drop and landing zone tests asked for (`Ai.TestDropZone`): the
-    /// callback to answer and the spot tested.
-    drop_tests: Vec<(Function, [f32; 3])>,
+    /// Drop zone tests asked for (`Ai.TestDropZone`) and not yet
+    /// answered: their number, callback, the point tested and the test.
+    drop_tests: Vec<(u32, Function, [f32; 3], DropZone)>,
+    /// Drop zone tests' outcomes from the game ([`ScriptWorld::answer_drop_test`]):
+    /// number, found, the spot.
+    drop_answers: Vec<(u32, bool, [f32; 3])>,
+    /// Whether the game searches the drop zones
+    /// ([`ScriptWorld::search_drop_zones`]); if not, each test is answered
+    /// found at its point.
+    drop_searcher: bool,
+    next_drop_test: u32,
     /// Assets asked for with a callback (`Pg.LoadAsset(name, type,
     /// callback, data)`): answered as loaded on the next tick
     /// ([`answer_asset_loads`]).
@@ -1113,6 +1123,24 @@ pub struct ScriptWorld {
     /// A save's script data to load, as Lua text ([`crate::savedata`]):
     /// while it is here `Pg.LoadGame` answers that a save is loading.
     pub saved: Option<String>,
+    /// The scripts' save data taken at a contract's start
+    /// (`Pg.SaveGame("retry")`), kept in memory for the fail fanfare's
+    /// Retry (`Pg.LoadGame("retry")`). From the 360 code: the retry slot is
+    /// never written as a user save; 0x8230C200 hands it to 0x8230C4A8,
+    /// which keeps it compressed in a buffer of the game's own (the size
+    /// at +0x473C of the block at 0x82F0EDF0) where other slots go to the
+    /// profile (0x8239ACB0). The game fills it in
+    /// ([`crate::Mission::keep_retry`]).
+    pub retry_save: Option<String>,
+    /// `Pg.LoadIsRetry`: whether the last `Pg.LoadGame` was of the retry
+    /// slot. From the 360 code: 0x8230C880 sets the byte at +0xC3D to
+    /// `slot == "retry"` on every call, and `LoadIsRetry` (0x823389F8)
+    /// answers it.
+    pub load_is_retry: bool,
+    /// The scripts asked for the retry save to be loaded
+    /// (`Pg.LoadGame("retry")` with one kept): [`crate::Mission`] loads
+    /// it once the call that asked has returned.
+    pub retry_load: bool,
     /// `Player.SetHealthClamp` and `Player.SetSurvivalMode`, as last set.
     pub health_clamp: bool,
     pub survival_mode: bool,
@@ -1473,8 +1501,10 @@ impl ScriptWorld {
         // A full one (`"Ka29b (Full)"`, a soldier delivery's) comes with its
         // passengers too, as its other `Rider` records name them
         // (inferred from the name: `MrxSoldierDelivery` takes them out with
-        // `Ai.Deploy` once it has landed).
-        if lower.contains("(full)") {
+        // `Ai.Deploy` once it has landed). So does an army's pursuit
+        // helicopter (`"MH53J (Pursuit)"`), whose own script
+        // (`pursuitcopter`) lands it and takes them out the same way.
+        if lower.contains("(full)") || lower.contains("(pursuit)") {
             for rider in self
                 .template_passengers
                 .get(&lower)
@@ -1909,14 +1939,56 @@ pub fn arrived(world: &Shared, guid: u32, at: [f32; 3]) -> Vec<mlua::Error> {
     goal_finished(world, guid)
 }
 
-/// Answers the drop zone tests asked for since the last call: each spot
-/// will do, as tested (`callback(true, x, y, z)`; the engine's own test of
-/// the ground there isn't modelled). Returns any errors.
+impl ScriptWorld {
+    /// The game searches the drop zones the scripts test from now on
+    /// ([`ScriptWorld::drop_tests`], [`ScriptWorld::answer_drop_test`]).
+    pub fn search_drop_zones(&mut self) {
+        self.drop_searcher = true;
+    }
+
+    /// The drop zone tests under way: number, point, test.
+    pub fn drop_tests(&self) -> Vec<(u32, [f32; 3], DropZone)> {
+        self.drop_tests
+            .iter()
+            .map(|(id, _, at, zone)| (*id, *at, *zone))
+            .collect()
+    }
+
+    /// Drop zone test `id` ended: `found`, and the spot (the search's
+    /// window either way, as the 360 reports it). Its callback hears so on
+    /// the next tick.
+    pub fn answer_drop_test(&mut self, id: u32, found: bool, at: [f32; 3]) {
+        self.drop_answers.push((id, found, at));
+    }
+}
+
+/// Answers the drop zone tests whose outcome is in: the game's searches'
+/// ([`ScriptWorld::answer_drop_test`]), the callback hearing `(found, x,
+/// y, z)` as the 360's does (0x822CEB80); or, with no game searching
+/// them (a run of the scripts alone), every test found at its point.
+/// Returns any errors.
 pub fn answer_drop_tests(world: &Shared) -> Vec<mlua::Error> {
-    let tests = std::mem::take(&mut world.borrow_mut().drop_tests);
+    let due: Vec<(Function, bool, [f32; 3])> = {
+        let mut w = world.borrow_mut();
+        if w.drop_searcher {
+            let answers = std::mem::take(&mut w.drop_answers);
+            answers
+                .into_iter()
+                .filter_map(|(id, found, at)| {
+                    let i = w.drop_tests.iter().position(|t| t.0 == id)?;
+                    Some((w.drop_tests.remove(i).1, found, at))
+                })
+                .collect()
+        } else {
+            std::mem::take(&mut w.drop_tests)
+                .into_iter()
+                .map(|(_, f, at, _)| (f, true, at))
+                .collect()
+        }
+    };
     let mut errors = Vec::new();
-    for (f, [x, y, z]) in tests {
-        if let Err(e) = f.call::<()>((true, x, y, z)) {
+    for (f, found, [x, y, z]) in due {
+        if let Err(e) = f.call::<()>((found, x, y, z)) {
             errors.push(e);
         }
     }
@@ -2359,6 +2431,11 @@ fn values<I: IntoIterator<Item = Value>>(v: I) -> mlua::Result<MultiValue> {
 
 /// The save slot of the scripts' autosaves ([`Command::Save`]).
 pub const AUTOSAVE: &str = "autosave";
+
+/// The save slot the scripts take at a contract's start and the fail
+/// fanfare's Retry loads (`Pg.SaveGame("retry")`, `Pg.LoadGame("retry")`;
+/// from the 360 code, the string at 0x820D3A34 both compare against).
+pub const RETRY: &str = "retry";
 
 /// The table of the game's own functions that hear the scripts' free
 /// support items (`AddFreebie`, `RemoveFreebie`).
@@ -3628,7 +3705,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             Some(&s) => values([Value::String(
                 lua.create_string(WINCH_STATES[usize::from(s & 3)])?,
             )]),
-            None => Err(mlua::Error::runtime("Object.GetWinchState: no winch")),
+            // 0x823336E8: no winch (or no object), nil (0x82206F20).
+            None => values([Value::Nil]),
         }
     })?;
     add(&object, "SetWinchState", |w, _, a| {
@@ -3650,9 +3728,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 });
                 values([])
             }
-            _ => Err(mlua::Error::runtime(
-                "Object.SetWinchState: no winch or state",
-            )),
+            // 0x823337E8: no winch, or a name not among the four, is
+            // let be and answers nil (0x82206F20, which pushes nil): not
+            // an error, so the intro deliveries' callback (which sets
+            // "deployed" on a helicopter the world has no winch for)
+            // goes on to send it.
+            _ => values([Value::Nil]),
         }
     })?;
     add(&object, "IsWinching", |w, _, a| {
@@ -4339,11 +4420,32 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([Value::Number(f64::from(value))])
     })?;
     // Whether a helicopter can set a load down near `Location` (a supply
-    // drop, a vehicle): answered later through `Callback`
-    // ([`answer_drop_tests`]); true now, the test under way.
+    // drop, a vehicle, a pursuit's soldiers): the 360 (0x82312540) reads
+    // the table's sizes into a landing-zone search (0x822CE968,
+    // [`DropZone`]) and answers through `Callback` once it ends
+    // ([`answer_drop_tests`]); true now, the test under way (false: its
+    // 32 searches all busy, not modelled).
     add(&ai, "TestDropZone", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
             return values([Value::Boolean(false)]);
+        };
+        // Unset sizes are the 360's default (0x820BAF14, its value not
+        // read; taken as 0 here).
+        let size = |k: &str| -> mlua::Result<f32> {
+            Ok(num(Some(&t.raw_get::<Value>(k)?)).unwrap_or(0.0))
+        };
+        let flag = |k: &str| -> mlua::Result<bool> {
+            Ok(matches!(t.raw_get::<Value>(k)?, Value::Boolean(true)))
+        };
+        let zone = DropZone {
+            search_radius: size("SearchRadius")?,
+            inner_radius: size("InnerRadius")?,
+            outer_radius: size("OuterRadius")?,
+            inner_height: size("InnerHeightTolerance")?,
+            outer_height: size("OuterHeightTolerance")?,
+            height_max: size("HeightMax")?,
+            water: flag("Water")?,
+            no_height_restriction: flag("NoHeightRestriction")?,
         };
         let at = match t.raw_get::<Value>("Location")? {
             Value::Table(l) => {
@@ -4354,7 +4456,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         };
         match (t.raw_get::<Value>("Callback")?, at) {
             (Value::Function(f), Some(at)) => {
-                w.drop_tests.push((f, at));
+                w.next_drop_test += 1;
+                let id = w.next_drop_test;
+                w.drop_tests.push((id, f, at, zone));
                 values([Value::Boolean(true)])
             }
             _ => values([Value::Boolean(false)]),
@@ -4804,8 +4908,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([Value::Table(t)])
     })?;
-    add(&pg, "LoadIsRetry", |_, _, _| {
-        values([Value::Boolean(false)])
+    add(&pg, "LoadIsRetry", |w, _, _| {
+        values([Value::Boolean(w.load_is_retry)])
     })?;
     // The bootstrap's `Init` asks (`Pg.LoadGame("InitialSaveData")`)
     // whether a save is loading. Answered false, it starts a new game
@@ -4813,8 +4917,23 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // handed the save's data (`LoadSingleton(data)`) by the engine, here
     // by `Mission::start` (from the bootstrap's bytecode; the engine's
     // side is not read).
-    add(&pg, "LoadGame", |w, _, _| {
+    //
+    // From the 360 code (0x82338828 -> 0x8230C880): every call sets the
+    // retry flag `LoadIsRetry` answers to whether the slot is "retry"
+    // (0x820D3A34). The retry slot loads the save kept in memory at the
+    // contract's start, and answers false when none is kept; its data is
+    // compiled as `"return " .. data` and handed to the scripts'
+    // `LoadSingleton` (0x820D3A90) in place, without starting the scripts
+    // again. Here that load runs once this call has returned
+    // ([`crate::Mission`]'s `answer_retry_load`).
+    add(&pg, "LoadGame", |w, _, a| {
+        let retry = matches!(a.first(), Some(Value::String(s)) if s.to_string_lossy() == RETRY);
+        w.load_is_retry = retry;
         w.commands.push(Command::Notify("Pg.LoadGame".into()));
+        if retry {
+            w.retry_load = w.retry_save.is_some();
+            return values([Value::Boolean(w.retry_load)]);
+        }
         values([Value::Boolean(w.saved.is_some())])
     })?;
 
@@ -5042,11 +5161,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([Value::Boolean(w.music.locked)])
     })?;
     add(&sound, "SetDynamicMusic", |w, _, a| {
-        w.music.dynamic = matches!(a.first(), Some(Value::Boolean(true)));
+        w.music.fixed = !matches!(a.first(), Some(Value::Boolean(true)));
         values([])
     })?;
     add(&sound, "IsDynamicMusic", |w, _, _| {
-        values([Value::Boolean(w.music.dynamic)])
+        values([Value::Boolean(!w.music.fixed)])
     })?;
     // Sound.LoadTempBank(name, type, callback, data) and
     // Sound.LoadBankWithCallback(name, type, callback): how
@@ -5075,17 +5194,85 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&sound, "UnloadBankWithCallback", |w, _, a| {
         bank(w, a, false)
     })?;
-    // Set-up and the action level the score is not driven by yet.
-    for name in [
-        "AddFactionMusic",
-        "AddMusicState",
-        "AddMusicTransition",
-        "SetActionThresholdsMusic",
-        "SetActionLevelsMusic",
-        "LockActionLevelMusic",
-    ] {
-        add(&sound, name, |_, _, _| values([]))?;
-    }
+    // The score's state machine ([`crate::music_machine`]). Each answers
+    // nothing; with an argument missing the 360 answers nil and does
+    // nothing, which here is nothing done.
+    //
+    // AddFactionMusic(name) (0x82341858): the new faction is the one in
+    // use, so the states that follow are its own.
+    add(&sound, "AddFactionMusic", |w, _, a| {
+        if let Some(Value::String(name)) = a.first() {
+            w.music.set_faction(&name.to_string_lossy());
+        }
+        values([])
+    })?;
+    // AddMusicState(name, length, level, delay, interval, flags [, least])
+    // (0x82342130).
+    add(&sound, "AddMusicState", |w, _, a| {
+        let (Some(Value::String(name)), Some(length), Some(level), Some(delay)) =
+            (a.first(), num(a.get(1)), num(a.get(2)), num(a.get(3)))
+        else {
+            return values([]);
+        };
+        let (Some(interval), Some(flags)) = (num(a.get(4)), num(a.get(5))) else {
+            return values([]);
+        };
+        w.music.machine().add_state(crate::music_machine::State {
+            name: name.to_string_lossy().to_ascii_lowercase(),
+            length,
+            level: level as i32,
+            delay,
+            interval,
+            least: num(a.get(6)).unwrap_or(0.0),
+            flags: flags as u8,
+            thresholds: (0.0, 0.0),
+            transitions: Vec::new(),
+        });
+        values([])
+    })?;
+    // AddMusicTransition(from, to, weight, sync, kind) (0x823422A0).
+    add(&sound, "AddMusicTransition", |w, _, a| {
+        if let (Some(Value::String(from)), Some(Value::String(to)), Some(weight)) =
+            (a.first(), a.get(1), num(a.get(2)))
+            && let (Some(sync), Some(kind)) = (num(a.get(3)), num(a.get(4)))
+        {
+            w.music.machine().add_transition(
+                &from.to_string_lossy(),
+                &to.to_string_lossy(),
+                weight,
+                sync as i32,
+                kind as i32,
+            );
+        }
+        values([])
+    })?;
+    // SetActionThresholdsMusic(state, first, second) (0x82341F68).
+    add(&sound, "SetActionThresholdsMusic", |w, _, a| {
+        if let (Some(Value::String(state)), Some(first), Some(second)) =
+            (a.first(), num(a.get(1)), num(a.get(2)))
+        {
+            w.music
+                .machine()
+                .set_thresholds(&state.to_string_lossy(), first, second);
+        }
+        values([])
+    })?;
+    // SetActionLevelsMusic(a, b, c, d) (0x82341A88).
+    add(&sound, "SetActionLevelsMusic", |w, _, a| {
+        if let (Some(p), Some(q), Some(r), Some(s)) =
+            (num(a.first()), num(a.get(1)), num(a.get(2)), num(a.get(3)))
+        {
+            w.music.set_action_levels(p, q, r, s);
+        }
+        values([])
+    })?;
+    // LockActionLevelMusic(on) (0x82341BB0).
+    add(&sound, "LockActionLevelMusic", |w, _, a| {
+        if let Some(Value::Boolean(on)) = a.first() {
+            w.music.action_locked = *on;
+        }
+        values([])
+    })?;
 
     // Scripted voice lines, as (speaker, cue, callback, values, priority,
     // send over the network); speaker 0 is the radio. The sequences that
@@ -5105,10 +5292,22 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => None,
         };
         let subtitled = subtitled && !w.subtitles_off;
-        let say =
-            w.vo.cue(speaker, cue.to_string_lossy(), callback, subtitled);
-        w.commands.push(say);
-        values([Value::Boolean(true)])
+        // The callback takes two places (the function and its values),
+        // so the priority is the fifth argument (0x82349000).
+        let priority = num(a.get(4)).map_or(crate::vo::DEFAULT_PRIORITY, |p| p as i32);
+        let sequences = std::mem::take(&mut w.vo_sequences);
+        let say = w.vo.cue(
+            speaker,
+            cue.to_string_lossy(),
+            callback,
+            subtitled,
+            priority,
+            &sequences,
+        );
+        w.vo_sequences = sequences;
+        let played = say.is_some();
+        w.commands.extend(say.into_iter().flatten());
+        values([Value::Boolean(played)])
     }
     add(&vo, "Cue", |w, _, a| cue(w, a, true))?;
     add(&vo, "CueWithoutSubtitles", |w, _, a| cue(w, a, false))?;
@@ -8021,6 +8220,25 @@ mod tests {
         );
     }
 
+    // From the 360 code (0x8230C880): every `Pg.LoadGame` sets the flag
+    // `Pg.LoadIsRetry` answers to whether its slot was "retry", and the
+    // retry slot loads only the save kept in memory.
+    #[test]
+    fn load_game_retry_loads_only_a_kept_retry_save_and_sets_load_is_retry() {
+        let (host, world) = setup();
+        let eval = |code: &str| -> bool { host.lua().load(code).eval().unwrap() };
+        assert!(!eval("return Pg.LoadIsRetry()"));
+        assert!(!eval(r#"return Pg.LoadGame("retry")"#), "nothing kept yet");
+        assert!(eval("return Pg.LoadIsRetry()"));
+        assert!(!world.borrow().retry_load);
+        world.borrow_mut().retry_save = Some("{}".into());
+        assert!(eval(r#"return Pg.LoadGame("retry")"#));
+        assert!(world.borrow().retry_load, "the game is asked to load it");
+        assert!(eval("return Pg.LoadIsRetry()"));
+        assert!(!eval(r#"return Pg.LoadGame("InitialSaveData")"#));
+        assert!(!eval("return Pg.LoadIsRetry()"), "another slot clears it");
+    }
+
     #[test]
     fn load_game_says_a_save_loads_only_while_one_is_pending() {
         let (host, world) = setup();
@@ -8033,6 +8251,58 @@ mod tests {
         assert!(!ask(), "a new game");
         world.borrow_mut().saved = Some("{}".into());
         assert!(ask(), "a save to load");
+    }
+
+    // `pursuitcopter`'s `FindLZ` test: its sizes reach the game's search
+    // (by the 360's field names, 0x82312540), and its callback hears the
+    // search's outcome, `(found, x, y, z)`, only once the game answers.
+    #[test]
+    fn a_drop_zone_test_waits_for_the_games_search_and_hears_its_outcome() {
+        let (host, world) = setup();
+        world.borrow_mut().search_drop_zones();
+        host.lua()
+            .load(
+                r#"heard = nil
+                ok = Ai.TestDropZone({ Callback = function(found, x, y, z)
+                        heard = { found, x, y, z } end,
+                    Location = { 1, 2, 3 }, InnerRadius = 6,
+                    InnerHeightTolerance = 1, OuterRadius = 19,
+                    OuterHeightTolerance = 2.5, HeightMax = 20,
+                    SearchRadius = 40, Water = false })"#,
+            )
+            .exec()
+            .unwrap();
+        let tests = world.borrow().drop_tests();
+        assert_eq!(tests.len(), 1);
+        let (id, at, zone) = tests[0];
+        assert_eq!(at, [1.0, 2.0, 3.0]);
+        assert_eq!(
+            zone,
+            DropZone {
+                search_radius: 40.0,
+                inner_radius: 6.0,
+                outer_radius: 19.0,
+                inner_height: 1.0,
+                outer_height: 2.5,
+                height_max: 20.0,
+                water: false,
+                no_height_restriction: false,
+            }
+        );
+        let heard = || -> Value { host.lua().load("return heard").eval().unwrap() };
+        assert!(answer_drop_tests(&world).is_empty());
+        assert!(matches!(heard(), Value::Nil), "not yet searched");
+        world
+            .borrow_mut()
+            .answer_drop_test(id, false, [4.0, 5.0, 6.0]);
+        assert!(answer_drop_tests(&world).is_empty());
+        let got: (bool, f32, f32, f32) = host
+            .lua()
+            .load("return heard[1], heard[2], heard[3], heard[4]")
+            .eval()
+            .unwrap();
+        assert_eq!(got, (false, 4.0, 5.0, 6.0));
+        assert!(world.borrow().drop_tests().is_empty());
     }
 
     #[test]
@@ -9030,7 +9300,19 @@ mod tests {
             .map(|n| m2_assets::name_hash(n))
             .collect();
         assert_eq!(h, [0xA62D_3A27, 0x07D7_44CF, 0x0A76_5168, 0xBB52_2D10]);
-        assert!(host.lua().load("Object.GetWinchState(50)").exec().is_err());
+        // No winch: nil from both, as the 360's natives answer (0x823336E8,
+        // 0x823337E8 fall to 0x82206F20), and the state is let be.
+        let (get, set, bad, kept): (Value, Value, Value, String) = host
+            .lua()
+            .load(
+                "return Object.GetWinchState(50), Object.SetWinchState(50, 'deployed'),
+                   Object.SetWinchState(1, 'sideways'), Object.GetWinchState(1)",
+            )
+            .eval()
+            .unwrap();
+        assert!(get.is_nil() && set.is_nil() && bad.is_nil());
+        assert_eq!(kept, "deploying");
+        assert!(!world.borrow().winches.contains_key(&50));
     }
 
     #[test]

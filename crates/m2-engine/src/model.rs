@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 
 use m2_assets::mixer::Mixer;
 use m2_assets::model::{GeometryKind, Material, ModelInfo, Node, TOPOLOGY};
-use m2_assets::vertex::DeclUsage;
+use m2_assets::vertex::{DeclType, DeclUsage};
 use m2_assets::{Model, Ucfx};
 use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::{
@@ -757,7 +757,159 @@ pub struct CpuPiece {
     /// The node its segment places it at (skinned or not), for showing
     /// and hiding parts.
     pub at: u16,
+    /// Its blend shapes, if it has any ([`PieceMorph`]).
+    pub morph: Option<std::sync::Arc<PieceMorph>>,
 }
+
+/// A skinned piece's blend shapes (morph targets): its vertices' rest
+/// positions and, per shape, how far the shape at full weight moves each
+/// (`m2_assets::model`: one `BSHP` chunk per target of half-float
+/// position deltas; `BSHI` gives each target's place among the model's
+/// shape names, a u16 each, from samples: 0, 1, 2 ... in every head).
+/// A head's face is these: `Blink`, `Flap`, `Angry`, `Scared`
+/// ([`crate::face_expression`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PieceMorph {
+    /// Bytes per vertex, and where in it the position (four half
+    /// floats) sits.
+    stride: usize,
+    offset: usize,
+    base: Vec<[f32; 3]>,
+    /// Each shape's name hash and its deltas, one per vertex.
+    shapes: Vec<(u32, Vec<[f32; 3]>)>,
+}
+
+impl PieceMorph {
+    /// The blend shapes of `group`, a skinned group of a model whose
+    /// shape names are `names`: `None` without any, or where its
+    /// positions are not half floats (none such in the game's data).
+    fn of(group: &m2_assets::model::PrimitiveGroup<'_>, names: &[u32]) -> Option<Self> {
+        if group.morphs.is_empty() {
+            return None;
+        }
+        let position = group.decl.find(DeclUsage::Position, 0)?;
+        if position.ty != DeclType::Float16x4 {
+            return None;
+        }
+        let base: Vec<[f32; 3]> = group
+            .vertices
+            .read(position)?
+            .iter()
+            .map(|p| [p[0], p[1], p[2]])
+            .collect();
+        let index = group.morph_index.unwrap_or_default();
+        let shapes = group
+            .morphs
+            .iter()
+            .enumerate()
+            .filter_map(|(k, m)| {
+                let named = index
+                    .get(k * 2..k * 2 + 2)
+                    .map_or(k, |b| usize::from(u16::from_le_bytes([b[0], b[1]])));
+                let name = *names.get(named)?;
+                let deltas: Vec<[f32; 3]> = m
+                    .data
+                    .chunks_exact(m.stride as usize)
+                    .map(|v| {
+                        [0, 2, 4].map(|i| {
+                            m2_assets::vertex::half_to_f32(u16::from_le_bytes([v[i], v[i + 1]]))
+                        })
+                    })
+                    .collect();
+                (deltas.len() == base.len()).then_some((name, deltas))
+            })
+            .collect::<Vec<_>>();
+        (!shapes.is_empty()).then_some(Self {
+            stride: group.vertices.stride as usize,
+            offset: usize::from(position.offset),
+            base,
+            shapes,
+        })
+    }
+
+    /// Whether any of `weights` (shape name hash, weight) moves it.
+    pub fn moved_by(&self, weights: &[(u32, f32)]) -> bool {
+        weights
+            .iter()
+            .any(|w| w.1 != 0.0 && self.shapes.iter().any(|s| s.0 == w.0))
+    }
+
+    /// Writes the positions blended by `weights` into `vertices` (the
+    /// piece's vertex bytes): each rest position plus every shape's
+    /// delta times its weight.
+    pub fn apply(&self, vertices: &mut [u8], weights: &[(u32, f32)]) {
+        let active: Vec<(&[[f32; 3]], f32)> = self
+            .shapes
+            .iter()
+            .filter_map(|(name, deltas)| {
+                let w = weights.iter().find(|w| w.0 == *name)?.1;
+                (w != 0.0).then_some((&deltas[..], w))
+            })
+            .collect();
+        for (k, base) in self.base.iter().enumerate() {
+            let at = k * self.stride + self.offset;
+            let Some(out) = vertices.get_mut(at..at + 6) else {
+                return;
+            };
+            let mut p = *base;
+            for (deltas, w) in &active {
+                for a in 0..3 {
+                    p[a] += deltas[k][a] * w;
+                }
+            }
+            for a in 0..3 {
+                let h = m2_assets::vertex::f32_to_half(p[a]).to_le_bytes();
+                out[a * 2] = h[0];
+                out[a * 2 + 1] = h[1];
+            }
+        }
+    }
+}
+
+/// One person's face on the GPU: their own copies of a model's pieces
+/// with blend shapes, re-blended as their weights change. Made only
+/// once a weight is not 0, so people whose faces are at rest, and every
+/// model without blend shapes, draw from the model's shared buffers.
+#[derive(Debug, Default)]
+pub struct MorphedFace {
+    /// By piece: its buffer.
+    buffers: Vec<(usize, VertexBufferHandle)>,
+    /// The weights the buffers were last blended with.
+    last: Vec<(u32, f32)>,
+    /// The model (its hash) the buffers are copies of: a face kept for
+    /// one model is no face for another (the player's after the hero or
+    /// the outfit changes), whose pieces differ in number and size.
+    model: u32,
+}
+
+impl MorphedFace {
+    /// Whether it holds any buffer.
+    pub fn is_empty(&self) -> bool {
+        self.buffers.is_empty()
+    }
+
+    /// Makes it a face of model `model`: copies of another model's
+    /// pieces are freed first.
+    fn fit(&mut self, backend: &mut dyn RenderBackend, model: u32) -> Result<(), BackendError> {
+        if self.model != model {
+            self.destroy(backend)?;
+            self.model = model;
+        }
+        Ok(())
+    }
+
+    /// Frees its buffers.
+    pub fn destroy(&mut self, backend: &mut dyn RenderBackend) -> Result<(), BackendError> {
+        for (_, b) in self.buffers.drain(..) {
+            backend.destroy_vertex_buffer(b)?;
+        }
+        self.last.clear();
+        Ok(())
+    }
+}
+
+/// How far a weight must move before a face is blended again.
+const MORPH_STEP: f32 = 1.0 / 256.0;
 
 /// An effect a model's part state starts on entering it
 /// (`StartEmitter`): the state's name hash (`DamageState` 4aa0beed,
@@ -1184,6 +1336,10 @@ impl CpuModel {
                     },
                     node: (!skinned).then_some(segment.node),
                     at: segment.node,
+                    morph: skinned
+                        .then(|| PieceMorph::of(group, &model.blend_shapes))
+                        .flatten()
+                        .map(std::sync::Arc::new),
                 });
             }
         }
@@ -1338,6 +1494,17 @@ struct Piece {
     bones: Vec<u16>,
     node: Option<u16>,
     at: u16,
+    /// Its blend shapes, with what a person's own copy of its vertices
+    /// starts from.
+    morph: Option<PieceFace>,
+}
+
+/// What a piece with blend shapes keeps for the faces drawn from it.
+#[derive(Debug)]
+struct PieceFace {
+    morph: std::sync::Arc<PieceMorph>,
+    desc: VertexBufferDesc,
+    vertices: std::sync::Arc<Vec<u8>>,
 }
 
 /// A model's geometry on the GPU, ready to draw.
@@ -1597,6 +1764,14 @@ impl GpuModel {
                     .collect(),
                 // Kept in geometry space, so any transform places it.
                 centre: p.local.inverse().transform_point3(p.centre),
+                morph: p.morph.as_ref().map(|m| PieceFace {
+                    morph: m.clone(),
+                    desc: VertexBufferDesc {
+                        usage: m2_render::BufferUsage::Dynamic,
+                        ..p.vertex_desc.clone()
+                    },
+                    vertices: std::sync::Arc::new(p.vertices.clone()),
+                }),
                 bones: p.bones.clone(),
                 node: p.node,
                 at: p.at,
@@ -1813,6 +1988,72 @@ impl GpuModel {
         skin: &[Mat4],
         look: Option<&[bool]>,
     ) -> Result<(), BackendError> {
+        self.draw_posed_face(backend, queue, world, nodes, skin, look, None)
+    }
+
+    /// Whether any piece has blend shapes.
+    pub fn has_blend_shapes(&self) -> bool {
+        self.pieces.iter().any(|p| p.morph.is_some())
+    }
+
+    /// Brings `face`, one person's own copies of the pieces with blend
+    /// shapes, up to `weights` (shape name hash, weight). With every
+    /// weight at 0 and no copies yet nothing is made; copies are
+    /// re-blended only when a weight has moved. True if `face` is to be
+    /// drawn from ([`draw_posed_face`](Self::draw_posed_face)).
+    pub fn blend_face(
+        &self,
+        backend: &mut dyn RenderBackend,
+        face: &mut MorphedFace,
+        weights: &[(u32, f32)],
+    ) -> Result<bool, BackendError> {
+        face.fit(backend, self.hash)?;
+        let moved = self
+            .pieces
+            .iter()
+            .filter_map(|p| p.morph.as_ref())
+            .any(|m| m.morph.moved_by(weights));
+        if face.buffers.is_empty() && !moved {
+            return Ok(false);
+        }
+        let same = face.last.len() == weights.len()
+            && face
+                .last
+                .iter()
+                .zip(weights)
+                .all(|(a, b)| a.0 == b.0 && (a.1 - b.1).abs() < MORPH_STEP);
+        if same && !face.buffers.is_empty() {
+            return Ok(true);
+        }
+        for (k, piece) in self.pieces.iter().enumerate() {
+            let Some(m) = &piece.morph else { continue };
+            let mut bytes = (*m.vertices).clone();
+            m.morph.apply(&mut bytes, weights);
+            match face.buffers.iter().find(|b| b.0 == k) {
+                Some(&(_, buffer)) => backend.write_vertex_buffer(buffer, 0, &bytes)?,
+                None => {
+                    let buffer = backend.create_vertex_buffer(&m.desc, Some(&bytes))?;
+                    face.buffers.push((k, buffer));
+                }
+            }
+        }
+        face.last = weights.to_vec();
+        Ok(true)
+    }
+
+    /// As [`draw_posed_as`](Self::draw_posed_as), the pieces with blend
+    /// shapes drawn from `face`'s copies where it has them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_posed_face(
+        &self,
+        backend: &mut dyn RenderBackend,
+        queue: &mut DrawQueue,
+        world: Mat4,
+        nodes: &[Mat4],
+        skin: &[Mat4],
+        look: Option<&[bool]>,
+        face: Option<&MorphedFace>,
+    ) -> Result<(), BackendError> {
         let mut palette = Vec::new();
         let lit = self.lamp_look(look);
         let look = lit.as_deref().or(look);
@@ -1833,7 +2074,20 @@ impl GpuModel {
                 );
                 Some(backend.set_skin(&palette)?)
             };
-            self.push(queue, piece, world, handle);
+            // Their own copy of a piece with blend shapes, if they have
+            // one.
+            let own = face.filter(|_| piece.morph.is_some()).and_then(|f| {
+                let k = self.pieces.iter().position(|p| std::ptr::eq(p, piece))?;
+                f.buffers.iter().find(|b| b.0 == k).map(|b| b.1)
+            });
+            match own {
+                Some(buffer) => {
+                    self.push_ranges_from(queue, piece, buffer, world * piece.local, handle, |_| {
+                        true
+                    })
+                }
+                None => self.push(queue, piece, world, handle),
+            }
         }
         Ok(())
     }
@@ -1912,6 +2166,20 @@ impl GpuModel {
         skin: Option<SkinHandle>,
         keep: impl Fn(usize) -> bool,
     ) {
+        self.push_ranges_from(queue, piece, piece.vertex_buffer, transform, skin, keep);
+    }
+
+    /// As [`push_ranges`](Self::push_ranges), drawing from
+    /// `vertex_buffer` in place of the piece's own.
+    fn push_ranges_from(
+        &self,
+        queue: &mut DrawQueue,
+        piece: &Piece,
+        vertex_buffer: VertexBufferHandle,
+        transform: Mat4,
+        skin: Option<SkinHandle>,
+        keep: impl Fn(usize) -> bool,
+    ) {
         let origin = transform.transform_point3(piece.centre);
         for (k, &(first, count, material, translucent)) in piece.ranges.iter().enumerate() {
             if !keep(k) {
@@ -1921,7 +2189,7 @@ impl GpuModel {
                 call: DrawCall {
                     material,
                     topology: piece.topology,
-                    vertex_buffer: piece.vertex_buffer,
+                    vertex_buffer,
                     geometry: Geometry::Indexed {
                         buffer: piece.index_buffer,
                         first,
@@ -2054,6 +2322,90 @@ mod tests {
             .on(),
             [true, false, true]
         );
+    }
+
+    /// Two vertices of 12 bytes with the position (four half floats)
+    /// 2 bytes in, and two shapes: one lifts the first vertex 0.02, the
+    /// other slides the second 0.01 along x.
+    fn morph() -> (PieceMorph, Vec<u8>) {
+        let m = PieceMorph {
+            stride: 12,
+            offset: 2,
+            base: vec![[0.5, 1.0, 0.25], [0.0, 2.0, 0.0]],
+            shapes: vec![
+                (0xaaaa, vec![[0.0, 0.02, 0.0], [0.0; 3]]),
+                (0xbbbb, vec![[0.0; 3], [0.01, 0.0, 0.0]]),
+            ],
+        };
+        // Bytes around the positions that must stay as they are.
+        let mut bytes = vec![0xEEu8; 24];
+        m.apply(&mut bytes, &[]);
+        (m, bytes)
+    }
+
+    fn position(bytes: &[u8], vertex: usize) -> [f32; 3] {
+        let at = vertex * 12 + 2;
+        [0, 2, 4].map(|i| {
+            m2_assets::vertex::half_to_f32(u16::from_le_bytes([bytes[at + i], bytes[at + i + 1]]))
+        })
+    }
+
+    #[test]
+    fn blend_shapes_move_only_their_vertices_by_their_weight() {
+        let (m, rest) = morph();
+        assert_eq!(position(&rest, 0), [0.5, 1.0, 0.25]);
+        assert_eq!(position(&rest, 1), [0.0, 2.0, 0.0]);
+        assert!(!m.moved_by(&[]) && !m.moved_by(&[(0xaaaa, 0.0)]) && !m.moved_by(&[(0xcccc, 1.0)]));
+        assert!(m.moved_by(&[(0xcccc, 1.0), (0xbbbb, 0.5)]));
+        let mut bytes = rest.clone();
+        m.apply(&mut bytes, &[(0xaaaa, 0.5), (0xbbbb, 1.0), (0xcccc, 1.0)]);
+        let (a, b) = (position(&bytes, 0), position(&bytes, 1));
+        assert!(
+            (a[1] - 1.01).abs() < 1e-3 && a[0] == 0.5 && a[2] == 0.25,
+            "{a:?}"
+        );
+        assert!((b[0] - 0.01).abs() < 1e-4 && b[1] == 2.0, "{b:?}");
+        // Nothing but the three position halves of each vertex is
+        // touched: the bytes before, the fourth half and the rest.
+        for k in [0, 1] {
+            let v = &bytes[k * 12..k * 12 + 12];
+            assert_eq!(&v[..2], &[0xEE, 0xEE]);
+            assert_eq!(&v[8..], &[0xEE; 4]);
+        }
+        // Back at no weight, the rest positions exactly.
+        m.apply(&mut bytes, &[(0xaaaa, 0.0)]);
+        assert_eq!(bytes, rest);
+    }
+
+    /// A face made for one model is freed before it is used for
+    /// another (the hero's when the hero or outfit changes): the old
+    /// model's piece copies would be drawn in the new one's pieces.
+    #[test]
+    fn a_face_of_another_model_is_freed_before_use() {
+        let mut backend = NullBackend::new();
+        let desc = VertexBufferDesc {
+            layout: m2_render::VertexLayout::packed(&[(
+                m2_render::VertexSemantic::Position,
+                m2_render::VertexFormat::Float3,
+            )])
+            .unwrap(),
+            vertex_count: 2,
+            usage: m2_render::BufferUsage::Dynamic,
+        };
+        let mut face = MorphedFace::default();
+        face.fit(&mut backend, 0x15d8_9832).unwrap();
+        let b = backend.create_vertex_buffer(&desc, Some(&[0; 24])).unwrap();
+        face.buffers.push((4, b));
+        face.last = vec![(0xaaaa, 1.0)];
+        // The same model again: kept.
+        face.fit(&mut backend, 0x15d8_9832).unwrap();
+        assert!(!face.is_empty());
+        assert_eq!(backend.live_buffers().vertex, 1);
+        // Another: its copies go, and it starts afresh for the new one.
+        face.fit(&mut backend, 0x39f4_7e08).unwrap();
+        assert!(face.is_empty() && face.last.is_empty());
+        assert_eq!(face.model, 0x39f4_7e08);
+        assert_eq!(backend.live_buffers().vertex, 0);
     }
 
     #[test]

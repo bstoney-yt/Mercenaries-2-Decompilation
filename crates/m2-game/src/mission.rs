@@ -299,6 +299,10 @@ pub struct Entity {
     /// Whether it has an alarm (the `Alarm` component, its own or its
     /// template's: the alarm towers; [`crate::alarm`]).
     pub alarm: bool,
+    /// Whom its template says it belongs to (`Association`: the name of
+    /// the faction's template, `Allied`, `China`, `Guerilla`), when it
+    /// says.
+    pub association: Option<String>,
 }
 
 impl Entity {
@@ -430,6 +434,7 @@ impl GameData {
         let mut template_scripts: HashMap<u32, u32> = HashMap::new();
         let mut template_script_data: HashMap<u32, u32> = HashMap::new();
         let mut template_alarms: HashSet<u32> = HashSet::new();
+        let mut template_associations: HashMap<u32, u32> = HashMap::new();
         // Faction zones' faction templates, and every template's name.
         let mut zone_factions: Vec<(String, usize, u32)> = Vec::new();
         let mut template_names: HashMap<u32, String> = HashMap::new();
@@ -471,6 +476,7 @@ impl GameData {
                     template_scripts = db.hashes("ObjectScript");
                     template_script_data = script_data(&db);
                     template_alarms = carriers(&db, "Alarm");
+                    template_associations = db.hashes("Association");
                     template_riders = db.component("Rider").map(|c| riders(c)).unwrap_or_default();
                     (data.max_reserve, data.thrown) = crate::inventory::read(&db);
                     data.relations = m2_engine::ai::relations(&db);
@@ -540,6 +546,7 @@ impl GameData {
                             template: None,
                             crew: Vec::new(),
                             alarm: alarms.contains(&guid),
+                            association: None,
                         });
                         if let Some(r) = rides.remove(&guid) {
                             own_riders.push((name.clone(), list.len() - 1, r));
@@ -600,6 +607,10 @@ impl GameData {
                 e.crew = crew_of(r);
             }
             e.template = named(*template);
+            e.association = template_associations
+                .get(template)
+                .or_else(|| template_associations.get(&(template & !TEMPLATE_BIT)))
+                .and_then(|&a| named(a));
         }
         for (&template, records) in &template_riders {
             let driver = crew_of(records)
@@ -981,6 +992,66 @@ impl Mission {
         Ok(result?)
     }
 
+    /// Keeps the scripts' save data now as the retry save
+    /// ([`api::ScriptWorld::retry_save`]), as `Pg.SaveGame("retry")` does
+    /// at a contract's start: the fail fanfare's Retry loads it
+    /// ([`answer_retry_load`](Self::answer_retry_load)). Its size.
+    pub fn keep_retry(&mut self) -> Result<usize, MissionError> {
+        let text = self.save_data()?;
+        let n = text.len();
+        self.world.borrow_mut().retry_save = Some(text);
+        Ok(n)
+    }
+
+    /// Whether a retry save is kept ([`keep_retry`](Self::keep_retry)).
+    pub fn has_retry(&self) -> bool {
+        self.world.borrow().retry_save.is_some()
+    }
+
+    /// Loads the retry save in place if the scripts asked
+    /// (`Pg.LoadGame("retry")`): as the 360's 0x8230C880 does, its data is
+    /// compiled as `"return " .. data` and handed to the bootstrap's
+    /// `LoadSingleton` in the running scripts, `Pg.LoadIsRetry` answering
+    /// true. Not done here (unknown in the 360's 0x8230C740, which runs
+    /// first): the engine's own resets before the load. Whether it ran.
+    fn answer_retry_load(&mut self) -> bool {
+        let text = {
+            let mut w = self.world.borrow_mut();
+            if !std::mem::take(&mut w.retry_load) {
+                return false;
+            }
+            w.retry_save.clone()
+        };
+        let Some(text) = text else {
+            return false;
+        };
+        let lua = self.host.lua();
+        let loaded = lua
+            .globals()
+            .set("__m2_saved", text.as_str())
+            .and_then(|()| {
+                lua.load(format!(
+                    "Scripts[\"{BOOTSTRAP:08x}\"].LoadSingleton({LOAD_SAVED})"
+                ))
+                .set_name("=retry load")
+                .exec()
+            });
+        let _ = lua.globals().set("__m2_saved", Value::Nil);
+        match loaded {
+            Ok(()) => self.log.push(format!(
+                "t={:.1} save: the retry save loaded in place, {} bytes",
+                self.now,
+                text.len()
+            )),
+            Err(e) => self.log.push(format!(
+                "t={:.1} save: retry load: {}",
+                self.now,
+                first_lines(&e.to_string())
+            )),
+        }
+        true
+    }
+
     /// Has [`start`](Self::start) load a save: `text` is the scripts' save
     /// data as [`save_data`](Self::save_data) wrote it. The scripts then
     /// carry on from it (the contracts done and on offer, her PMC, the
@@ -1192,6 +1263,20 @@ impl Mission {
             w.pursuit.clock.step(dt as f32);
             // No time scale yet: game and real time run together.
             w.clocks.step(dt as f32, dt as f32);
+            // The score moves by itself: by its states' lengths, and by
+            // the action level from those the game says are hostile and
+            // aware of her ([`Self::set_hostile_aware`]).
+            let decay = w.sound.hostility_decay_rate;
+            let clocks = w.sys.timer_update_music.unwrap_or(true);
+            let force = std::mem::take(&mut w.sound.force_action_transition);
+            let draw = (now * 7919.0).fract() as f32;
+            let aware = w.music.aware;
+            if let Some(c) = w
+                .music
+                .update(dt as f32, decay, aware, clocks, force, || draw)
+            {
+                w.commands.push(c);
+            }
         }
         // What the scripts killed since the last tick dies as anything
         // else does: its own script's `OnDeath` hears of it.
@@ -1219,6 +1304,7 @@ impl Mission {
             w.update_hibernation();
             w.tick_raw_clips(dt as f32);
             w.tick_fades(dt as f32);
+            w.hud.step_radar(dt as f32);
             scripted = (
                 std::mem::take(&mut w.script_spawns),
                 std::mem::take(&mut w.script_removals),
@@ -1280,11 +1366,18 @@ impl Mission {
             });
         }
         let ended = crate::vo::update(&self.world, self.host.lua(), now);
-        for (cue, error) in ended {
+        for (cue, state, error) in ended {
+            // What became of the line: it ended, or was refused
+            // ("failed") or cut off ("cancel"), as its callback is told.
+            let what = match state {
+                "complete" => "ended".to_owned(),
+                "failed" => "refused (failed)".to_owned(),
+                state => format!("cut off ({state})"),
+            };
             self.log.push(match error {
-                None => format!("  t={now:.1} line {cue} ended"),
+                None => format!("  t={now:.1} line {cue} {what}"),
                 Some(e) => format!(
-                    "  t={now:.1} line {cue} ended; callback: {}",
+                    "  t={now:.1} line {cue} {what}; callback: {}",
                     first_lines(&e.to_string())
                 ),
             });
@@ -2593,6 +2686,13 @@ end
 
     /// The player is (no longer) on her grappling hook's line, for the
     /// scripts' `Human.IsGrappling`.
+    /// How many hostile characters are aware of the player now, in the
+    /// music's four groups ([`crate::music_machine::group`]): what the
+    /// score's action level is worked out from.
+    pub fn set_hostile_aware(&mut self, counts: [u32; 4]) {
+        self.world.borrow_mut().music.aware = counts;
+    }
+
     pub fn set_grappling(&mut self, on: bool) {
         self.world.borrow_mut().grappling = on;
     }
@@ -2601,11 +2701,33 @@ end
     /// (its `vo` events: the faction HQs' briefings are spoken by their
     /// clips, 806 lines over 258 clips, from samples): said as a scripted
     /// line with no callback, its subtitle up if the player has them on.
+    ///
+    /// From the 360 code: the voice manager hears the clips' voice
+    /// events only while it is in cinematic mode (`VO.SetCinematicMode`,
+    /// `0x82278118`, which joins and leaves their queue; the update
+    /// `0x82277D98` reads it only then), and cues each line at priority
+    /// 0, the one priority that mode lets play, with its subtitle. Out
+    /// of that mode the event is dropped.
     pub fn clip_line(&mut self, speaker: u32, cue: &str) {
+        if !self.world.borrow().vo.cinematic {
+            self.log.push(format!(
+                "  clip line {cue} not said: the voice is not in cinematic mode"
+            ));
+            return;
+        }
         let mut w = self.world.borrow_mut();
         let subtitled = !w.subtitles_off;
-        let say = w.vo.cue(Some(speaker), cue.to_owned(), None, subtitled);
-        w.commands.push(say);
+        let sequences = std::mem::take(&mut w.vo_sequences);
+        let say = w.vo.cue(
+            Some(speaker),
+            cue.to_owned(),
+            None,
+            subtitled,
+            0,
+            &sequences,
+        );
+        w.vo_sequences = sequences;
+        w.commands.extend(say.into_iter().flatten());
     }
 
     /// Everything the scripts asked the game to do since the last call.
@@ -2745,6 +2867,20 @@ end
                 commands.extend(self.report(&format!("{when}, {ran} modules loaded")));
             }
             let mut delivered = 0;
+            // The retry save the scripts take as a contract starts is kept
+            // now, as the 360's `Pg.SaveGame("retry")` keeps it before it
+            // returns ([`keep_retry`](Self::keep_retry)).
+            if commands
+                .iter()
+                .any(|c| matches!(c, Command::Save { slot } if slot == api::RETRY))
+            {
+                match self.keep_retry() {
+                    Ok(n) => self
+                        .log
+                        .push(format!("  save: the retry save kept, {n} bytes")),
+                    Err(e) => self.log.push(format!("  save: retry: {e}")),
+                }
+            }
             for c in &commands {
                 if let Command::Goal {
                     guid,
@@ -2772,6 +2908,10 @@ end
                 })
                 .collect();
             if requests.is_empty() {
+                if self.answer_retry_load() {
+                    commands = self.report(&format!("{when}, retry loaded"));
+                    continue;
+                }
                 if delivered > 0 {
                     commands = self.report(&format!("{when}, deliveries done"));
                     continue;
@@ -2887,7 +3027,7 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
                 w.gates.insert(e.guid);
             }
             if e.alarm {
-                w.alarms.add(e.guid, e.script);
+                w.alarms.add(e.guid, e.script, e.association.clone());
             }
             if let Some(r) = &e.region {
                 w.regions.insert(e.guid, r.clone());
@@ -3023,7 +3163,7 @@ fn seat_crew(
 /// `repairpad` is the script of the helipads and the PMC's garage
 /// (0xcd561a19): awake, its lights are on (`Vehicle.SetParts` of
 /// `LightFront`), and they go out when it dies.
-pub const OBJECT_SCRIPTS: [(&str, u32); 13] = [
+pub const OBJECT_SCRIPTS: [(&str, u32); 14] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3037,7 +3177,11 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 13] = [
     ("collectable", COLLECTABLE),
     ("pmcgate", PMC_GATE),
     ("repairpad", REPAIR_PAD),
+    ("pursuitcopter", PURSUIT_COPTER),
 ];
+
+/// `pursuitcopter`'s module hash.
+pub const PURSUIT_COPTER: u32 = 0x3e29_6216;
 
 /// `pmcgate`'s module hash.
 pub const PMC_GATE: u32 = 0xff56_2dd6;
@@ -3507,8 +3651,10 @@ mod tests {
             r#"
             local function second(state) VO.Cue(0, "B", function() heard = state end) end
             VO.Cue(0, "A", second, {}, 1, true)
-            VO.Cue(0, "C", function() cancelled = true end)
-            VO.Cancel(0, "C", true)
+            -- Less important than A, the radio's line: it may not play.
+            refused = VO.Cue(0, "D", function(state) d = state end)
+            VO.Cue(1, "C", function(state) c = state end)
+            VO.Cancel(1, "C", true)
             ordered = VO.PRIORITY_CINEMATIC < VO.PRIORITY_SCRIPTED_CONTRACT
             "#,
             "test",
@@ -3521,13 +3667,21 @@ mod tests {
         };
         assert_eq!(
             m.take_commands(),
-            [say(1, "A"), say(2, "C"), Command::Hush(2)]
+            [
+                say(1, "A"),
+                Command::Say {
+                    id: 2,
+                    speaker: Some(1),
+                    cue: "C".into()
+                },
+                Command::Hush(2)
+            ]
         );
         // The call as the scripts made it, for the log.
         assert!(
             m.take_log()
                 .iter()
-                .any(|l| l == r#"  print VO.Cancel(0, "C"): speaker None, stops lines [2]"#)
+                .any(|l| l == r#"  print VO.Cancel(1, "C"): speaker Some(1), stops lines [2]"#)
         );
         m.tick(0.1);
         m.line_length(1, 1.0);
@@ -3535,12 +3689,23 @@ mod tests {
         assert!(m.take_commands().is_empty());
         m.tick(0.6);
         assert_eq!(m.take_commands(), [say(3, "B")]);
-        for _ in 0..50 {
+        for _ in 0..60 {
             m.tick(0.1);
         }
         let g = m.host.lua().globals();
         assert_eq!(g.raw_get::<String>("heard").unwrap(), "complete");
-        assert_eq!(g.raw_get::<Option<bool>>("cancelled").unwrap(), None);
+        // The refused line and the cancelled one are told so.
+        assert!(!g.raw_get::<bool>("refused").unwrap());
+        assert_eq!(g.raw_get::<String>("d").unwrap(), "failed");
+        assert_eq!(g.raw_get::<String>("c").unwrap(), "cancel");
+        let log = m.take_log();
+        for line in [
+            "line D refused (failed)",
+            "line C cut off (cancel)",
+            "line A ended",
+        ] {
+            assert!(log.iter().any(|l| l.ends_with(line)), "{line}: {log:?}");
+        }
         assert!(g.raw_get::<bool>("ordered").unwrap());
     }
 
@@ -4038,6 +4203,39 @@ mod tests {
     }
 
     #[test]
+    fn a_pursuit_helicopter_comes_with_its_passengers_and_its_script() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        {
+            let mut w = m.world.borrow_mut();
+            w.template_drivers.insert(
+                "alouette3 transport (vz) (pursuit)".into(),
+                "VZ Soldier".into(),
+            );
+            w.template_passengers.insert(
+                "alouette3 transport (vz) (pursuit)".into(),
+                vec!["VZ Soldier".into(), "VZ Soldier".into()],
+            );
+            w.template_scripts.insert(
+                "alouette3 transport (vz) (pursuit)".into(),
+                (PURSUIT_COPTER, None),
+            );
+        }
+        let copter = m
+            .spawn("Alouette3 Transport (VZ) (Pursuit)", [0.0, 70.0, 350.0])
+            .unwrap();
+        let w = m.world.borrow();
+        let riders = w
+            .objects
+            .values()
+            .filter(|o| o.vehicle == Some(copter))
+            .count();
+        // Its pilot and its two soldiers.
+        assert_eq!(riders, 3);
+        assert_eq!(w.scripted.get(&copter), Some(&PURSUIT_COPTER));
+        assert!(OBJECT_SCRIPTS.contains(&("pursuitcopter", PURSUIT_COPTER)));
+    }
+
+    #[test]
     fn an_object_script_is_handed_its_records_data() {
         let lua = mlua::Lua::new();
         lua.load("Munitions = { OnActivate = function(g, _, n) got = n end }")
@@ -4115,6 +4313,7 @@ mod tests {
                 ("seat_driver".into(), "VZ Tank Commander".into()),
             ],
             alarm: false,
+            association: None,
         }
     }
 

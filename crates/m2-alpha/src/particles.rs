@@ -85,6 +85,9 @@ pub struct ParticleDraw {
     /// ([`m2_engine::particles::camera_fade`]): particles fade out close
     /// in front of the camera.
     pub camera_fade: [f32; 3],
+    /// `Graphics.Effect.Terrain` calls the scripts made, not yet started
+    /// ([`ParticleDraw::run_terrain`]).
+    pub terrain_asks: Vec<m2_game::script_effects::TerrainEffect>,
 }
 
 /// A light an effect lit: where, what, how old, and for a held effect
@@ -195,6 +198,7 @@ impl ParticleDraw {
             clock: 0.0,
             held_asks: HashMap::new(),
             camera_fade: m2_game::script_effects::FADE_ON,
+            terrain_asks: Vec::new(),
         })
     }
 
@@ -364,10 +368,12 @@ impl ParticleDraw {
 
     /// Swaps the ambient effects for a record's (`AmbientEffect0..4`): the
     /// last ones deleted with their particles, each new one with a
-    /// template of type 0 started about the camera, as the game does on
-    /// every change of the light (from the 360 code, 0x8224D650). Type 1
-    /// (on the ground about the camera) is left out: no record uses it.
-    /// Returns how many effects started.
+    /// template started about the camera, as the game does on every
+    /// change of the light (from the 360 code, 0x8224D650): type 0 on a
+    /// disc about it (kind 2), type 1 on the ground about it (kind 7), any
+    /// other type not at all. Of the 69 slots the records set, 68 are
+    /// type 1 and one type 0 (PC data, 2026-11-12). Returns how many
+    /// effects started.
     pub fn set_ambient(
         &mut self,
         effects: &[m2_engine::atmosphere::AmbientEffect],
@@ -375,16 +381,20 @@ impl ParticleDraw {
     ) -> usize {
         self.sim.clear_about_camera();
         let mut started = 0;
-        for a in effects.iter().filter(|a| a.template != 0 && a.kind == 0) {
+        for a in effects.iter().filter(|a| a.template != 0 && a.kind <= 1) {
             let Some(id) = self.template_by_hash(a.template, templates) else {
                 eprintln!("particles: ambient effect #{:08x}: no template", a.template);
                 continue;
             };
             for fx in self.lib.of_template(id).to_vec() {
-                if self
-                    .sim
-                    .spawn_about_camera(&self.lib, fx, a.radius, a.height)
-                {
+                let ok = if a.kind == 0 {
+                    self.sim
+                        .spawn_about_camera(&self.lib, fx, a.radius, a.height)
+                } else {
+                    self.sim
+                        .spawn_on_ground_about_camera(&self.lib, fx, a.radius, a.height, a.variance)
+                };
+                if ok {
                     started += 1;
                 }
             }
@@ -402,6 +412,34 @@ impl ParticleDraw {
                 .collect()
         });
         by_hash.get(&h).copied()
+    }
+
+    /// Starts the terrain effects the scripts asked for and puts every
+    /// running one's ground patch under it for this frame; `ground` gives
+    /// the ground's height and normal at an (x, z).
+    pub fn run_terrain(
+        &mut self,
+        templates: &Templates,
+        ground: &dyn Fn(f32, f32) -> Option<(f32, Vec3)>,
+    ) {
+        for ask in std::mem::take(&mut self.terrain_asks) {
+            let started = self
+                .template_by_hash(ask.template, templates)
+                .map_or(0, |id| {
+                    self.sim.spawn_terrain(
+                        &self.lib,
+                        id,
+                        Vec3::from(ask.at),
+                        ask.radius,
+                        ask.density,
+                    )
+                });
+            eprintln!(
+                "effects: terrain effect {:08x} at {:.0?}, radius {}, density {}: {started} started",
+                ask.template, ask.at, ask.radius, ask.density
+            );
+        }
+        self.sim.update_terrain(ground);
     }
 
     pub fn step(&mut self, dt: f32) {

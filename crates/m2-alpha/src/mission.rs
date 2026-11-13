@@ -44,6 +44,7 @@ use m2_game::events::World as _;
 use m2_game::hud::ObjectiveMessage;
 use m2_game::layers::LayerOp;
 use m2_game::mission::{GameData, Mission, PLAYER};
+use m2_game::vehicle_state::VehicleCommand;
 use m2_math::glam::Vec3;
 
 use crate::combat::{self, Weapon};
@@ -198,7 +199,24 @@ pub struct RadarView {
     pub sticky: bool,
     /// Draw order: lower over higher.
     pub sort: i64,
+    /// Its sonar rings, under its icon: their texture and colour, and
+    /// each one's width (radar units) and opacity
+    /// ([`m2_game::radar_anim::SonarAnim`]).
+    pub rings: Option<Rings>,
+    /// Half its width and height, in the radar's own units (see
+    /// [`m2_game::hud::Blip::size`]).
+    pub size: [f32; 2],
+    /// Its target's heading (yaw), when it has a target.
+    pub yaw: Option<f32>,
+    /// Turns with the map, and takes its target's heading (the scripts'
+    /// `bRotate` and `bOriented`).
+    pub rotate: bool,
+    pub oriented: bool,
 }
+
+/// A blip's sonar rings: their texture and colour, and each one's width
+/// and opacity.
+pub type Rings = (String, [u8; 3], Vec<(f32, f32)>);
 
 /// A marker the scripts put over one of their objects (`Marker.AddBlip`),
 /// as the HUD shows it.
@@ -1034,6 +1052,8 @@ pub struct MissionLink {
     /// The factions' pursuit lists of units ([`crate::gunships::Lists`]).
     pursuit_lists: Option<crate::gunships::Lists>,
     reinforcements: crate::reinforce::Reinforcements,
+    /// The scripts' drop zone tests being searched ([`crate::drop_zones`]).
+    drop_zones: crate::drop_zones::DropZones,
     /// Seconds since the scripts said the contract was completed.
     completed: Option<f32>,
     /// How many times the scripts have said a contract was completed.
@@ -1067,6 +1087,11 @@ pub struct MissionLink {
     states: HashMap<u32, &'static str>,
     /// The reverb to switch to, if the scripts changed it.
     reverb: Option<Option<m2_engine::reverb::ReverbPreset>>,
+    /// The master volume fades the scripts asked for since last taken
+    /// (`Sound.SetMasterVolume`: level, seconds), in order.
+    master_volumes: Vec<(f32, f32)>,
+    /// `Sound.LockListenerPosition`, as the scripts last set it.
+    listener_locked: bool,
     /// The ambiences the scripts cued (true) or stopped since last taken,
     /// by name hash, in order.
     ambiences: Vec<(u32, bool)>,
@@ -1090,6 +1115,8 @@ pub struct MissionLink {
     saves: Vec<String>,
     /// Steps to the next look at her support stock.
     stock_look: u32,
+    /// The counts last given to the score's action level (for the log).
+    music_aware: [u32; 4],
     /// Her support stock by item key, as last looked at.
     stock_counts: Vec<(String, u32)>,
     /// Aimed designators' marks (guid, where) waiting to settle, and the
@@ -1218,6 +1245,7 @@ impl MissionLink {
             pursuit_counts: None,
             pursuit_lists: None,
             reinforcements: crate::reinforce::Reinforcements::default(),
+            drop_zones: crate::drop_zones::DropZones::default(),
             completed: None,
             contracts: 0,
             cancelled: 0,
@@ -1233,6 +1261,8 @@ impl MissionLink {
             radio: Radio::default(),
             states: HashMap::new(),
             reverb: None,
+            master_volumes: Vec::new(),
+            listener_locked: false,
             ambiences: Vec::new(),
             music_region: None,
             support: Vec::new(),
@@ -1242,6 +1272,7 @@ impl MissionLink {
             sighted: HashMap::new(),
             saves: Vec::new(),
             stock_look: 0,
+            music_aware: [0; 4],
             stock_counts: Vec::new(),
             aimed: Vec::new(),
             landed: HashSet::new(),
@@ -1592,21 +1623,43 @@ impl MissionLink {
             .collect()
     }
 
-    /// Closes the fanfare of the mission's HUD call `seq` with no game HUD
-    /// to: what the HUD's own close does to the game (its script
-    /// `vz_da6af53d`, line 979 on: her invincibility for the fanfare off,
-    /// `MrxHqManager.UnlockAllHq`, the HQs the end sequence locked), then
-    /// the callback (Continue: no `bRetry`).
-    pub fn close_fanfare_without_hud(&mut self, seq: u64) {
-        if let State::Running(m) = &mut self.state {
-            let code = "local c = Player.GetLocalCharacter()\n\
-                 if c then Object.SetInvincible(c, false, \"Fanfare\") end\n\
-                 if MrxHqManager and MrxHqManager.UnlockAllHq then MrxHqManager.UnlockAllHq() end";
-            if let Err(e) = m.run(code, "fanfare close") {
-                self.write([format!("fanfare close {seq}: {e}")]);
-            }
+    /// Answers the failed contract's fanfare as its Retry (`retry`) or
+    /// Continue would, with no game HUD to show it: what the HUD does as
+    /// it closes (its script `vz_da6af53d`, line 979 on: her
+    /// invincibility for the fanfare off, `MrxHqManager.UnlockAllHq`),
+    /// then its callback, which for a contract's, a mission's or a wager's
+    /// fanfare is handed `bRetry` after its own data ([`FANFARE_ANSWER`];
+    /// from the scripts: the fanfare widget's delete, which reads the
+    /// flash's answer "false" as Retry). A Retry has the scripts load the
+    /// retry save (`Pg.LoadGame("retry")`).
+    pub fn answer_fanfare(&mut self, seq: u64, retry: bool) {
+        let State::Running(m) = &mut self.state else {
+            return;
+        };
+        let code = format!(
+            "local c = Player.GetLocalCharacter()
+             if c then Object.SetInvincible(c, false, \"Fanfare\") end
+             if MrxHqManager and MrxHqManager.UnlockAllHq then MrxHqManager.UnlockAllHq() end
+             local t = __m2_hud_callbacks[{seq}]
+             __m2_hud_callbacks[{seq}] = nil
+             {FANFARE_ANSWER}(t, {retry})"
+        );
+        match m.run(&code, "fanfare answer") {
+            Ok(()) => self.write([format!(
+                "fanfare {seq} answered: {}",
+                if retry { "Retry" } else { "Continue" }
+            )]),
+            Err(e) => self.write([format!("fanfare answer {seq}: {e}")]),
         }
-        self.hud_callback(seq);
+    }
+
+    /// Whether the scripts have a retry save kept (`Pg.SaveGame("retry")`
+    /// at the contract's start), for the fail fanfare's Retry to load.
+    pub fn has_retry(&self) -> bool {
+        match &self.state {
+            State::Running(m) => m.has_retry(),
+            _ => false,
+        }
     }
 
     pub fn hud_callback(&mut self, seq: u64) {
@@ -2114,7 +2167,127 @@ impl MissionLink {
         };
         // `Graphics.Effect.CameraFade`'s constants, for the particles.
         if let Some(p) = game.scene.particles.as_mut() {
-            p.camera_fade = mission.world().borrow().effects.camera_fade;
+            let mut w = mission.world().borrow_mut();
+            p.camera_fade = w.effects.camera_fade;
+            // `Graphics.Effect.Terrain`'s calls, for the particles to start.
+            p.terrain_asks.append(&mut w.effects.terrain);
+        }
+        // `Graphics.Camera.SetFocusParams` and `RestoreFocusParams` for the
+        // first view: a new call starts the focus's blend, which runs on
+        // every tick (0x824B8208).
+        let ask = mission.world().borrow().effects.focus[0];
+        if ask.calls != game.focus_calls {
+            game.focus_calls = ask.calls;
+            game.focus.ask(ask.params, ask.seconds);
+            eprintln!(
+                "camera: the scripts set the focus to {:?} over {} s",
+                ask.params, ask.seconds
+            );
+        }
+        game.focus.step(dt, m2_engine::camera_focus::OWN);
+        // `Graphics.Camera.SetFovParams`, `SetNearFar` and their restores
+        // for the first view: a new call starts that set's blend, and both
+        // run on every tick (0x824B8208).
+        {
+            use m2_engine::projection::{FAR, FOV, NEAR};
+            let (fov, near_far) = {
+                let w = mission.world().borrow();
+                (w.effects.fov[0], w.effects.near_far[0])
+            };
+            if fov.calls != game.camera_calls[0] {
+                game.camera_calls[0] = fov.calls;
+                game.fov_blend.ask(fov.params.map(|f| [f]), fov.seconds);
+                eprintln!(
+                    "camera: the scripts set the field of view to {:?} rad over {} s",
+                    fov.params, fov.seconds
+                );
+            }
+            if near_far.calls != game.camera_calls[1] {
+                game.camera_calls[1] = near_far.calls;
+                game.near_far_blend.ask(near_far.params, near_far.seconds);
+                eprintln!(
+                    "camera: the scripts set near and far to {:?} over {} s",
+                    near_far.params, near_far.seconds
+                );
+            }
+            game.fov_blend.step(dt, [FOV]);
+            game.near_far_blend.step(dt, [NEAR, FAR]);
+        }
+        // The lines that started and stopped: the speaker's mouth flaps
+        // while theirs plays, as the 360's voice manager has it
+        // (0x822782D8, 0x82278440; [`m2_engine::face_expression`]).
+        // The scripts' own expressions (`Animation.PlayFacialExpression`,
+        // 0x82316078): the same table as the engine's, by the
+        // expression's name; a name not in it does nothing (0x8241DF40).
+        let facial = std::mem::take(&mut mission.world().borrow_mut().sp.facial);
+        for f in facial {
+            let name = m2_assets::name_hash(&f.expression);
+            if m2_engine::face_expression::expression(name).is_none()
+                && name != m2_engine::face_expression::DISABLE_ALL
+            {
+                eprintln!(
+                    "face: the scripts ask {:#x} for {:?}: no such expression",
+                    f.character, f.expression
+                );
+                continue;
+            }
+            let face = if f.character == m2_game::mission::PLAYER {
+                game.scene.player.as_mut().map(|p| &mut p.face)
+            } else {
+                game.scene
+                    .people
+                    .npcs
+                    .iter_mut()
+                    .find(|n| n.spawn == Some(f.character))
+                    .map(|n| &mut n.face)
+            };
+            let Some(face) = face else { continue };
+            eprintln!(
+                "face: the scripts give {:#x} {:?} at {:.2} for {:.1} s",
+                f.character, f.expression, f.a, f.b
+            );
+            if name == m2_engine::face_expression::DISABLE_ALL {
+                face.disable_all();
+            } else {
+                face.play(name, f.a, f.b, [0.5, 0.25, 0.75, 0.5]);
+            }
+        }
+        for speech in mission.world().borrow_mut().vo.take_speech() {
+            let (on, speaker, cue) = match speech {
+                m2_game::vo::Speech::Started { speaker, cue, .. } => (true, speaker, cue),
+                m2_game::vo::Speech::Stopped { speaker, cue, .. } => (false, speaker, cue),
+            };
+            let Some(guid) = speaker else { continue };
+            // Her own lines.
+            if guid == m2_game::mission::PLAYER {
+                if let Some(p) = game.scene.player.as_mut() {
+                    eprintln!(
+                        "face: she {} speaking (line {cue:08x})",
+                        if on { "starts" } else { "stops" }
+                    );
+                    p.speak(on);
+                }
+                continue;
+            }
+            match game
+                .scene
+                .people
+                .npcs
+                .iter_mut()
+                .find(|n| n.spawn == Some(guid))
+            {
+                Some(n) => {
+                    eprintln!(
+                        "face: {guid:#x} {} speaking (line {cue:08x})",
+                        if on { "starts" } else { "stops" }
+                    );
+                    n.speak(on);
+                }
+                None if on => {
+                    eprintln!("face: line {cue:08x}'s speaker {guid:#x} is no person here")
+                }
+                None => {}
+            }
         }
         let focus = game.focus();
         let mut lap = crate::spans::Lap::new();
@@ -2140,10 +2313,33 @@ impl MissionLink {
         // pursuits' helicopters', [`crate::reinforce`]).
         let scene = &mut game.scene;
         if let Some(world) = &mut scene.world {
+            // The scripts' drop zone tests, a think a frame each
+            // ([`crate::drop_zones`]).
+            let tests = {
+                let mut w = mission.world().borrow_mut();
+                w.search_drop_zones();
+                w.drop_tests()
+            };
+            let ended = self.drop_zones.step(
+                &tests,
+                &mut crate::drop_zones::Ground {
+                    physics: &world.physics,
+                },
+            );
+            for (id, found, at) in ended {
+                eprintln!(
+                    "drop zone: test {id} {} at ({:.1}, {:.1}, {:.1})",
+                    if found { "found" } else { "failed" },
+                    at[0],
+                    at[1],
+                    at[2]
+                );
+                mission.world().borrow_mut().answer_drop_test(id, found, at);
+            }
             let releases = scene
                 .flights
                 .step(dt, &mut world.physics, &mut scene.vehicles, focus);
-            for r in self.reinforcements.take_releases(releases) {
+            for r in releases {
                 for &g in &r.dropped {
                     self.vehicles.landing.insert(g, mission.now() + LANDING);
                 }
@@ -2732,30 +2928,58 @@ impl MissionLink {
                 }
             }
             game.pursuers.call_off(faction);
-            // Where the next transport comes in, looked for only when one
-            // is due (each look takes a random number).
-            let next_in = match wanted {
-                Some((f, n)) if n > self.reinforcements.out(f) => air_unit_in(game, her),
-                _ => None,
-            };
-            let due = self.reinforcements.step(
-                wanted,
-                squads,
-                &mut game.scene.flights,
-                her,
-                &mut || next_in,
-                dt,
-            );
-            for (g, template, at) in due {
-                let model = game
-                    .scene
-                    .world
-                    .as_ref()
-                    .and_then(|w| w.index.template_db.get(&template))
-                    .and_then(|t| t.model);
-                let at = ground_under(game, at);
-                if game.scene.people.bring_scripted(g, &template, model, at) {
-                    self.reinforcements.brought(g);
+            // Its transports: those gone from the scripts' world are out
+            // no more; those called off with their passengers still aboard
+            // are taken away; each one due comes in as an air unit does
+            // and is its own script's from there (`pursuitcopter`: it
+            // finds its drop zone by her, lands, sets its passengers down
+            // and goes home; [`crate::reinforce`]).
+            self.reinforcements
+                .keep(|g| mission.world().borrow().objects.contains_key(&g));
+            for copter in self.reinforcements.take_off() {
+                let aboard: Vec<u32> = {
+                    let w = mission.world().borrow();
+                    let mut riders: Vec<u32> = w
+                        .objects
+                        .iter()
+                        .filter(|(_, o)| o.vehicle == Some(copter))
+                        .map(|(&g, _)| g)
+                        .collect();
+                    riders.sort_unstable();
+                    riders
+                };
+                // Only its pilot left: its passengers are down, it goes
+                // home by itself.
+                if aboard.len() <= 1 {
+                    continue;
+                }
+                eprintln!(
+                    "reinforcements: helicopter {copter:#x} called off with {} aboard",
+                    aboard.len()
+                );
+                for g in aboard.into_iter().chain([copter]) {
+                    if let Err(e) = mission.run(&format!("Object.Remove({g})"), "call off") {
+                        eprintln!("reinforcements: {g:#x} not taken away: {e}");
+                    }
+                }
+            }
+            for (f, template) in self.reinforcements.due(wanted, squads) {
+                // In as any air unit (0x82239DA0, 0x8223ADD0).
+                let Some(from) = air_unit_in(game, her) else {
+                    eprintln!("reinforcements: no clear place for {f}'s {template}");
+                    break;
+                };
+                match mission.spawn(&template, from.to_array()) {
+                    Some(copter) => {
+                        eprintln!(
+                            "reinforcements: {f} send their {template} from {from:.0} as {copter:#x}"
+                        );
+                        self.reinforcements.sent(f, copter);
+                    }
+                    None => {
+                        eprintln!("reinforcements: {f}'s {template} did not spawn");
+                        break;
+                    }
                 }
             }
         }
@@ -3045,6 +3269,22 @@ impl MissionLink {
             for (g, at) in told {
                 for (name, place) in at {
                     mission.set_hardpoint(g, name, place);
+                }
+            }
+            // Soldiers running to raise their alarms, and the alarms they
+            // reach raised ([`crate::npc::People::raise_alarms`]).
+            let towers = {
+                let w = mission.world().borrow();
+                alarm_towers(game, &mut self.prop_nodes, &w.alarms)
+            };
+            if !towers.is_empty() {
+                for t in game.scene.people.raise_alarms(&towers) {
+                    eprintln!("people: alarm {t:#x} raised by a soldier");
+                    mission
+                        .world()
+                        .borrow_mut()
+                        .alarms
+                        .post(t, m2_game::alarm::ON);
                 }
             }
             // The scripts' vehicles' load beds, where they count the goods
@@ -3364,6 +3604,45 @@ impl MissionLink {
             let spare = game.combat.rifle_rounds.stored;
             mission.set_player_reserve(CARBINE, spare.div_ceil(combat::RIFLE_CLIP));
             crate::spans::time("scripts: look", || look(game, mission, &mut self.sighted));
+            // The score's action level, from those hostile and aware of
+            // her, grouped as the 360 does by the seat they are in: the
+            // soldiers on foot turned on her and each vehicle gunner
+            // settled on her are the fourth group; the driver of a
+            // vehicle with such a gunner counts by its kind (inferred:
+            // the game does not say what a driver is aware of).
+            let on_foot = game
+                .scene
+                .people
+                .npcs
+                .iter()
+                .filter(|n| n.alive && n.alert)
+                .count();
+            let mut aware = [0; 4];
+            aware[m2_game::music_machine::group(0)] = on_foot as u32;
+            if let Some(world) = game.scene.world.as_ref() {
+                let mut crews = game.combat.crews_on_her();
+                aware[m2_game::music_machine::group(m2_engine::vehicle_class::TURRET)] +=
+                    crews.len() as u32;
+                crews.sort_unstable();
+                crews.dedup();
+                for i in crews {
+                    if let Some(v) = game.scene.vehicles.get(i).filter(|v| v.exhausting(false)) {
+                        let class = world
+                            .index
+                            .template_db
+                            .vehicle_class_for_model(v.spec.model);
+                        aware[m2_game::music_machine::group(class)] += 1;
+                    }
+                }
+                if aware != self.music_aware {
+                    eprintln!(
+                        "music: hostile and aware of her, by group (helicopter pilots, tank \
+                         and boat drivers, car drivers, the rest): {aware:?}"
+                    );
+                    self.music_aware = aware;
+                }
+            }
+            mission.set_hostile_aware(aware);
             crate::spans::time("scripts: lua", || mission.tick(f64::from(STEP)));
             // The scripts' own interface runs too: its animations finish
             // and their callbacks run (`MrxGuiCinematic.ShowMovie` plays
@@ -3472,6 +3751,12 @@ impl MissionLink {
                         }
                     }
                     Command::Reverb(preset) => self.reverb = Some(preset.clone()),
+                    Command::MasterVolume { volume, seconds } => {
+                        self.master_volumes.push((*volume, *seconds));
+                    }
+                    Command::Ported(m2_game::ported_player::PortedCommand::ListenerLocked(on)) => {
+                        self.listener_locked = *on;
+                    }
                     Command::Ambience { name, on } => {
                         self.ambiences.push((m2_assets::name_hash(name), *on));
                     }
@@ -3594,6 +3879,15 @@ impl MissionLink {
                     }
                     Command::DropWeapon { who, weapon } => {
                         eprintln!("mission: {who:#x} lets go of their {weapon}");
+                    }
+                    // The retry save stays in memory, kept by the scripts'
+                    // side ([`Mission::keep_retry`]): the 360 never writes
+                    // it as a user save (0x8230C4A8).
+                    Command::Save { slot } if slot == m2_game::api::RETRY => {
+                        eprintln!(
+                            "mission: the scripts take the retry save (kept in memory: {})",
+                            mission.has_retry()
+                        );
                     }
                     Command::Save { slot } => {
                         eprintln!("mission: the scripts ask for a save ({slot})");
@@ -3853,6 +4147,18 @@ impl MissionLink {
     /// carries: a radio's place and reach; `None` for the score.
     pub fn music_at(&self) -> Option<(Vec3, f32)> {
         self.music_at
+    }
+
+    /// The master volume fades the scripts asked for since last asked
+    /// (`Sound.SetMasterVolume`: level, seconds), in order.
+    pub fn take_master_volumes(&mut self) -> Vec<(f32, f32)> {
+        std::mem::take(&mut self.master_volumes)
+    }
+
+    /// Whether the scripts have the listener locked
+    /// (`Sound.LockListenerPosition`).
+    pub fn listener_locked(&self) -> bool {
+        self.listener_locked
     }
 
     /// The reverb to switch to, if the scripts changed it.
@@ -4708,12 +5014,13 @@ impl MissionLink {
         let models = self.marker_models(&w);
         let radar = radar_views(mission.lua(), &hud.radar, |g| {
             let o = w.objects.get(&g)?;
-            Some(
+            Some((
                 self.marked
                     .get(&g)
                     .copied()
                     .unwrap_or_else(|| Vec3::from(o.position)),
-            )
+                o.yaw,
+            ))
         });
         MissionView {
             status: None,
@@ -4995,6 +5302,22 @@ fn hud_calls(lua: &mlua::Lua) -> Vec<HudCall> {
 
 /// The fanfare call [`HUD_CALLS`] kept last with a callback, while that
 /// callback has not been called.
+/// Calls a fanfare's callback `t` as the fanfare widget's delete does
+/// (from the scripts: the HUD's fanfare script, `_DeleteFanfareWidget`'s
+/// target): `fCallback(unpack(tCallbackData))`, with `bRetry` added after
+/// the data for a fanfare of `sType` "contract", "mission" or "wager".
+const FANFARE_ANSWER: &str = "(function(t, bRetry)
+    if type(t) ~= 'table' or type(t.fCallback) ~= 'function' then return end
+    local a = {}
+    if type(t.tCallbackData) == 'table' then
+        for i = 1, table.getn(t.tCallbackData) do a[i] = t.tCallbackData[i] end
+    end
+    if t.sType == 'contract' or t.sType == 'mission' or t.sType == 'wager' then
+        a[table.getn(a) + 1] = bRetry
+    end
+    t.fCallback(unpack(a))
+end)";
+
 fn waiting_fanfare(lua: &mlua::Lua) -> Option<u64> {
     let g = lua.globals();
     let seq = g.get::<Option<u64>>("__m2_fanfare").ok().flatten()?;
@@ -5043,7 +5366,7 @@ fn radar_regions(lua: &mlua::Lua) -> Vec<RadarRegion> {
 fn radar_views(
     lua: &mlua::Lua,
     radar: &std::collections::BTreeMap<String, m2_game::hud::Blip>,
-    place: impl Fn(u32) -> Option<Vec3>,
+    place: impl Fn(u32) -> Option<(Vec3, f32)>,
 ) -> Vec<RadarView> {
     let name_of = lua
         .globals()
@@ -5059,9 +5382,12 @@ fn radar_views(
         .values()
         .filter_map(|b| {
             let offset = Vec3::from(b.offset);
-            let at = match b.target {
-                Some(g) => place(g)? + offset,
-                None => offset,
+            let (at, yaw) = match b.target {
+                Some(g) => {
+                    let (at, yaw) = place(g)?;
+                    (at + offset, Some(yaw))
+                }
+                None => (offset, None),
             };
             let icon = b
                 .texture
@@ -5077,9 +5403,18 @@ fn radar_views(
             Some(RadarView {
                 at,
                 icon,
-                colour: [r, g, bl, 255],
+                colour: [r, g, bl, b.alpha],
                 sticky: b.sticky,
                 sort: b.sort,
+                rings: b
+                    .anims
+                    .sonar
+                    .as_ref()
+                    .map(|s| (s.texture.clone(), s.colour, s.rings())),
+                size: b.size,
+                yaw,
+                rotate: b.rotate,
+                oriented: b.oriented,
             })
         })
         .collect()
@@ -6553,6 +6888,44 @@ fn fly(game: &mut Game, mission: &mut Mission, landed: &mut HashSet<u32>, c: &Co
 /// Carries out a script command about the player, the scripts' vehicles
 /// or the layers they stream; true when it seated her in a vehicle the
 /// island doesn't show, so she stands where it is.
+/// The scripts' turret angle ([`VehicleCommand::Turret`]) on vehicle `v`:
+/// its main turret (`main_turret`) through its physics, else the aimer
+/// whose `Turret` record the hash names. A name it has no turret of does
+/// nothing.
+fn set_turret(
+    v: &mut crate::scene::ParkedVehicle,
+    physics: Option<&mut m2_engine::Physics>,
+    turret: u32,
+    angle: f32,
+    yaw: bool,
+) {
+    let main = v.spec.tuning.turret.is_some_and(|t| t.main)
+        && turret == m2_assets::name_hash(m2_engine::tuning::MAIN_TURRET);
+    if main {
+        match (yaw, v.id, physics) {
+            (true, Some(id), Some(p)) => {
+                p.turn_turret(id, angle);
+                v.turret = p.turret_yaw(id).unwrap_or(angle);
+            }
+            (false, Some(id), Some(p)) => {
+                p.aim_gun(id, angle);
+                v.gun = p.gun_pitch(id).unwrap_or(angle);
+            }
+            (true, ..) => v.turret = angle,
+            (false, ..) => v.gun = angle,
+        }
+        return;
+    }
+    if let Some(k) = v.spec.aimers.iter().position(|a| a.record.name == turret) {
+        v.aims.resize(v.spec.aimers.len(), (0.0, 0.0));
+        if yaw {
+            v.aims[k].0 = angle;
+        } else {
+            v.aims[k].1 = angle;
+        }
+    }
+}
+
 fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> bool {
     // A person the scripts make (`Pg.Spawn` of a person's template) stands
     // as a layer's spawn would; one they take away goes.
@@ -6646,6 +7019,23 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
         }
         // `Object.SetWinchState` on one of the scripts' helicopters: its
         // winch takes that state and pays out or reels in to match.
+        // `Vehicle.SetTurretYaw` / `SetTurretPitch` (0x82347E00,
+        // 0x82347D20): the turret the name hash names takes that angle as
+        // its target, radians as the script gives it (the turret message
+        // 0x82275CD8 sets yaw +0x0C or pitch +0x10 unconverted, which the
+        // turret action turns towards, 0x82275608): the main turret
+        // through its physics, another (a seat's) as its aim.
+        Command::Vehicle(VehicleCommand::Turret {
+            vehicle,
+            turret,
+            angle,
+            yaw,
+        }) => {
+            if let Some(i) = index(vehicle) {
+                let physics = game.scene.world.as_mut().map(|w| &mut w.physics);
+                set_turret(&mut game.scene.vehicles[i], physics, *turret, *angle, *yaw);
+            }
+        }
         Command::WinchState { carrier, state } => {
             let s = [
                 WinchState::Retracted,
@@ -6858,6 +7248,20 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             if game.paths.stop(vehicle.unwrap_or(*guid)) {
                 eprintln!("mission: {guid:#x}'s goals cleared: its vehicle leaves its path");
             }
+            return false;
+        }
+        // A vehicle's door the scripts open or shut (`Vehicle.OpenDoor`:
+        // PmcCon033's targets stand up on their `pivot`; a tank's hatch):
+        // it swings as her boarding's do ([`crate::hijack::Hijacks`]).
+        Command::Door { guid, door, open } => {
+            game.door_requests.push((*guid, *door, *open));
+            return false;
+        }
+        // In or out of the living world (`Ai.LivingWorld`: `MrxFollow`
+        // takes out one following her): out, pushed off their post they
+        // stay where they end up.
+        Command::LivingWorld { guid, on } => {
+            game.scene.people.set_living_world(*guid, *on);
             return false;
         }
         // Someone following her (`Ai.Role` `Follow`: a VIP to deliver).
@@ -7966,6 +8370,56 @@ fn prop_hardpoints(
         .collect()
 }
 
+/// The alarms in play that stand as props, as their soldiers see them:
+/// where each is, its faction (its `Association`, by [`faction_of`]),
+/// whether its flag is on, and where its model's four alarm hardpoints
+/// are ([`m2_engine::alarm_goal::HARDPOINTS`]); each model's nodes are
+/// read once (`nodes`).
+///
+/// [`faction_of`]: crate::npc::faction_of
+fn alarm_towers(
+    game: &mut Game,
+    nodes: &mut HashMap<u32, Vec<(u32, Vec3)>>,
+    alarms: &m2_game::alarm::Alarms,
+) -> Vec<crate::npc::AlarmTower> {
+    let mut out = Vec::new();
+    for (&guid, &on) in &alarms.on {
+        let Some((p, _)) = game.scene.props.get(guid) else {
+            continue;
+        };
+        let (model, at) = (
+            p.model,
+            m2_math::glam::Mat4::from_rotation_translation(p.rotation, p.position),
+        );
+        let position = p.position;
+        let known = nodes.entry(model).or_insert_with(|| {
+            game.scene
+                .source
+                .as_mut()
+                .map(|s| crate::hijack::nodes(s, model))
+                .unwrap_or_default()
+        });
+        let placed = hardpoints_at(known, at);
+        let hardpoints = m2_engine::alarm_goal::HARDPOINTS
+            .iter()
+            .filter_map(|h| placed.iter().find(|(n, _)| n == h))
+            .map(|(_, p)| Vec3::from_array(*p))
+            .collect();
+        out.push(crate::npc::AlarmTower {
+            guid,
+            at: position,
+            faction: alarms
+                .factions
+                .get(&guid)
+                .and_then(|f| crate::npc::faction_of(&format!("{f} "))),
+            on,
+            hardpoints,
+        });
+    }
+    out.sort_by_key(|t| t.guid);
+    out
+}
+
 /// Where the scripts' character `guid` stands for a camera shot: the
 /// player, someone the scripts stand, or someone seated on a prop (the
 /// PMC HQ's starter), with node `hardpoint` of their posed model in the
@@ -8080,6 +8534,84 @@ fn send_pursuit_car(
 
 #[cfg(test)]
 mod tests {
+    // `Vehicle.SetTurretYaw` / `SetTurretPitch` (0x82347E00, 0x82347D20
+    // -> 0x82275CD8): the named turret's target, radians as given.
+    #[test]
+    fn the_scripts_turn_a_turret_by_its_name() {
+        use m2_engine::vehicle::Aimer;
+        use m2_engine::{Physics, seats::TurretRecord};
+        let mut spec = crate::npc::tests::tank(m2_engine::tuning::VehicleTuning {
+            turret: Some(m2_engine::tuning::TurretTuning {
+                main: true,
+                yaw_speed: 1.0,
+                yaw_accel: 1.0,
+                pitch: (-0.2, 0.5),
+                pitch_speed: 1.0,
+                pitch_accel: 1.0,
+                yaw: None,
+            }),
+            ..Default::default()
+        });
+        let cupola = m2_assets::name_hash("cupola");
+        spec.aimers = vec![Aimer {
+            record: TurretRecord {
+                name: cupola,
+                bone_yaw: None,
+                bone_pitch: None,
+                yaw: (-1.0, 1.0),
+                yaw_speed: 1.0,
+                pitch: (-0.2, 0.5),
+                pitch_speed: 1.0,
+            },
+            yaw_nodes: Vec::new(),
+            pitch_nodes: Vec::new(),
+            yaw_pivot: None,
+            pitch_pivot: None,
+        }];
+        let mut physics = Physics::new();
+        let id = physics.add_vehicle(&spec, Vec3::ZERO, 0.0);
+        let mut v = crate::scene::ParkedVehicle {
+            spec,
+            model: crate::npc::tests::empty_model(),
+            id: Some(id),
+            wrecked: false,
+            guid: Some(77),
+            spot: None,
+            crew: Vec::new(),
+            turret: 0.0,
+            hijack_nodes: Vec::new(),
+            door_turns: Vec::new(),
+            gun: 0.0,
+            aims: Vec::new(),
+            rolled: 0.0,
+            fired: 0,
+            mg_fired: 0,
+            damage: 0.0,
+            hit: 0.0,
+            parts: None,
+            loose: Vec::new(),
+            debris_thrown: false,
+        };
+        let main = m2_assets::name_hash("main_turret");
+        set_turret(&mut v, Some(&mut physics), main, 1.2, true);
+        assert!((v.turret - 1.2).abs() < 1e-5, "{}", v.turret);
+        set_turret(&mut v, Some(&mut physics), main, 0.3, false);
+        assert!((v.gun - 0.3).abs() < 1e-5, "{}", v.gun);
+        set_turret(&mut v, Some(&mut physics), cupola, -0.5, true);
+        set_turret(&mut v, Some(&mut physics), cupola, 0.25, false);
+        assert_eq!(v.aims, vec![(-0.5, 0.25)]);
+        // A name it has no turret of: nothing.
+        set_turret(
+            &mut v,
+            Some(&mut physics),
+            m2_assets::name_hash("x"),
+            2.0,
+            true,
+        );
+        assert!((v.turret - 1.2).abs() < 1e-5, "{}", v.turret);
+        assert_eq!(v.aims, vec![(-0.5, 0.25)]);
+    }
+
     // Playtest: while the scripts are still being read the screen stays
     // black (she would be seen swimming off the start before the
     // opening's movie); once they run, theirs is the fade.
@@ -8209,6 +8741,52 @@ mod tests {
         let exit_only = box_of("Display", "[Briefing.RootMenuDialog]", &["[Generic.Exit]"]);
         assert_eq!(contract_pick(&exit_only, &offered), None);
         assert_eq!(contract_pick(&menu, &[]), None);
+    }
+
+    // The fail fanfare's answer reaches a contract's callback as the
+    // fanfare widget's delete hands it: `bRetry` after the callback's own
+    // data, only for a contract's, a mission's or a wager's fanfare.
+    #[test]
+    fn the_fanfare_answer_hands_a_contract_its_retry() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            got = {}
+            function cb(self, retry) got[table.getn(got) + 1] = { self, retry } end
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let answer = |t: &str, retry: bool| {
+            lua.load(format!("{FANFARE_ANSWER}({t}, {retry})"))
+                .exec()
+                .unwrap();
+        };
+        answer(
+            "{ sType = 'contract', fCallback = cb, tCallbackData = { 'mission' } }",
+            true,
+        );
+        answer(
+            "{ sType = 'contract', fCallback = cb, tCallbackData = { 'mission' } }",
+            false,
+        );
+        answer("{ fCallback = cb, tCallbackData = { 'other' } }", true);
+        answer("{ sType = 'contract' }", true);
+        let got: Vec<(String, Option<bool>)> = lua
+            .load("local o = {} for i, g in ipairs(got) do o[i] = { g[1], g[2] } end return o")
+            .eval::<Vec<mlua::Table>>()
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.get(1).unwrap(), t.get(2).unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("mission".to_owned(), Some(true)),
+                ("mission".to_owned(), Some(false)),
+                ("other".to_owned(), None),
+            ]
+        );
     }
 
     // The HQ hides the HUD on entering (`MrxHq.GlobalEnter`: the
@@ -8768,6 +9346,7 @@ mod tests {
                 sticky: false,
             },
             lock_on: None,
+            seeker: None,
             pickup: Some(8),
             feel: Default::default(),
             hint: None,
@@ -8853,6 +9432,8 @@ mod tests {
             icon: picture,
             reticle: 1,
             crosshair: true,
+            reticle_type: 0,
+            health_type: 0,
         });
         assert_eq!(pickup(&db, ak).unwrap().icon, Some(picture));
         let records = vec![(shotgun, 3), (bullet, 3)];

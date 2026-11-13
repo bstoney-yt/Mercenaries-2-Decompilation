@@ -5,6 +5,12 @@
 //! (0x822CDB60), three rays a think, until a 3x3 patch is level enough,
 //! dry, and clear above.
 //!
+//! The scripts' `Ai.TestDropZone` (0x82312540) queues the same search
+//! with the sizes its table gives ([`DropZone`]) and hears the outcome
+//! through its `Callback`: `(found, x, y, z)`, the spot (0x822CEB80: the
+//! first value is whether the search's state is 5, found; then the
+//! window's centre, 0x822CD988).
+//!
 //! Provenance: from the 360 code, but where noted. The objects of kind 6
 //! whose records carry 0x71246D6D, which the 360 leaves out of its upper
 //! clearance check, are not told apart here (none left out).
@@ -25,6 +31,30 @@ pub enum Search {
     Found(Vec3),
     /// None within its radius (or the ground at the target too far off).
     Failed,
+}
+
+/// A drop zone test as the scripts' `Ai.TestDropZone` asks it
+/// (0x82312540): its table's fields, by where the 360 keeps them in the
+/// request (0x822CE968 copies them into the search's slot).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DropZone {
+    /// `SearchRadius` (+0xC).
+    pub search_radius: f32,
+    /// `InnerRadius` (+0x10): the cell's size.
+    pub inner_radius: f32,
+    /// `OuterRadius` (+0x14): the clear radius over the spot.
+    pub outer_radius: f32,
+    /// `InnerHeightTolerance` (+0x18): the most the patch may rise.
+    pub inner_height: f32,
+    /// `OuterHeightTolerance` (+0x1C) and `HeightMax` (+0x20): the
+    /// heights the clearance is checked between.
+    pub outer_height: f32,
+    pub height_max: f32,
+    /// `Water` (+0x2C): a spot on the water (the search's other branch,
+    /// not modelled here).
+    pub water: bool,
+    /// `NoHeightRestriction` (+0x2D): the point may be off the ground.
+    pub no_height_restriction: bool,
 }
 
 /// A landing-zone request and its search, as the manager keeps it (0x50
@@ -56,6 +86,9 @@ pub struct LandingSearch {
     ring: i32,
     side: u8,
     done: Option<Search>,
+    /// The request's `Water` or `NoHeightRestriction` (+0x2C, +0x2D):
+    /// a point off the ground doesn't fail it (0x822CDB60).
+    anywhere: bool,
 }
 
 impl LandingSearch {
@@ -88,7 +121,34 @@ impl LandingSearch {
             ring: 0,
             side: 0,
             done: None,
+            anywhere: false,
         }
+    }
+
+    /// The search for a drop zone test (`Ai.TestDropZone`) near `target`.
+    pub fn drop_zone(target: Vec3, zone: &DropZone) -> Self {
+        let step = zone.inner_radius.max(0.1);
+        Self {
+            target,
+            radius: zone.search_radius,
+            step,
+            clear: zone.outer_radius,
+            slope: zone.inner_height,
+            low: zone.outer_height,
+            high: zone.height_max,
+            centre: Vec3::new(target.x, target.y, target.z + 3.0 * step),
+            grid: [MISS; 9],
+            counter: 0,
+            ring: 0,
+            side: 0,
+            done: None,
+            anywhere: zone.water || zone.no_height_restriction,
+        }
+    }
+
+    /// Where the window stands (+0x34..+0x3C): what the callback hears.
+    pub fn centre(&self) -> Vec3 {
+        self.centre
     }
 
     /// How it stands.
@@ -119,7 +179,7 @@ impl LandingSearch {
                 (None, Some(w)) => w,
                 (None, None) => -10000.0,
             };
-            if (at.y - ground).abs() > 2.0 {
+            if !self.anywhere && (at.y - ground).abs() > 2.0 {
                 self.done = Some(Search::Failed);
                 return Search::Failed;
             }
@@ -332,5 +392,80 @@ mod tests {
         // Asked far off the ground: it fails at once.
         let mut s = search(Vec3::new(20.0, 30.0, 0.0));
         assert_eq!(s.step(&mut w), Search::Failed);
+    }
+
+    /// `pursuitcopter`'s test (its `FindLZ`): inner radius 6, outer 19,
+    /// heights 1, 2.5 and 20, searched 40 m out, dry.
+    const PURSUIT: DropZone = DropZone {
+        search_radius: 40.0,
+        inner_radius: 6.0,
+        outer_radius: 19.0,
+        inner_height: 1.0,
+        outer_height: 2.5,
+        height_max: 20.0,
+        water: false,
+        no_height_restriction: false,
+    };
+
+    // A drop zone test searches with the script's sizes: on open level
+    // ground the point itself; by a pole, a spot clear of it by the outer
+    // radius, within the search radius; asked off the ground, it fails
+    // unless the test says the height doesn't matter.
+    #[test]
+    fn a_drop_zone_test_searches_with_the_scripts_sizes() {
+        let at = Vec3::new(40.0, 0.0, 0.0);
+        let mut s = LandingSearch::drop_zone(at, &PURSUIT);
+        assert_eq!((s.radius, s.step, s.clear), (40.0, 6.0, 19.0));
+        let mut w = Field { pole: None };
+        let found = (0..3).map(|_| s.step(&mut w)).last();
+        assert_eq!(found, Some(Search::Found(at)));
+        let mut s = LandingSearch::drop_zone(at, &PURSUIT);
+        let mut w = Field { pole: Some(at) };
+        let p = (0..2000)
+            .find_map(|_| match s.step(&mut w) {
+                Search::Found(p) => Some(p),
+                _ => None,
+            })
+            .expect("a spot");
+        let off = (p - at).with_y(0.0).length();
+        assert!(off > 19.0 && off <= 40.0 + 2.0 * 6.0, "{p}");
+        let high = at + Vec3::Y * 30.0;
+        let mut w = Field { pole: None };
+        assert_eq!(
+            LandingSearch::drop_zone(high, &PURSUIT).step(&mut w),
+            Search::Failed
+        );
+        let free = DropZone {
+            no_height_restriction: true,
+            ..PURSUIT
+        };
+        assert_ne!(
+            LandingSearch::drop_zone(high, &free).step(&mut w),
+            Search::Failed
+        );
+    }
+
+    // Over open water nothing is found within the search radius: the
+    // cells under the water's surface are out of reach or not level with
+    // it.
+    #[test]
+    fn a_dry_drop_zone_test_over_deep_water_fails() {
+        struct Sea;
+        impl PilotWorld for Sea {
+            fn ground(&mut self, from: Vec3, to: Vec3) -> Option<Vec3> {
+                (from.y >= -40.0 && to.y <= -40.0).then(|| from.with_y(-40.0))
+            }
+            fn sweep(&mut self, _: Vec3, _: Quat, _: Vec3, _: Vec3, _: f32) -> f32 {
+                1.0
+            }
+            fn water(&mut self, _: Vec3) -> Option<f32> {
+                Some(0.0)
+            }
+        }
+        let mut s = LandingSearch::drop_zone(Vec3::ZERO, &PURSUIT);
+        let end = (0..5000)
+            .map(|_| s.step(&mut Sea))
+            .find(|r| *r != Search::Looking);
+        assert_eq!(end, Some(Search::Failed));
     }
 }

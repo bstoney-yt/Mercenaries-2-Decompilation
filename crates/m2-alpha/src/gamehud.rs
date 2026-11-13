@@ -25,6 +25,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Write as _};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
@@ -47,6 +48,16 @@ use m2_game::hud::ObjectiveMessage;
 use m2_game::mission::{GameData, Mission};
 use m2_math::glam::Vec3;
 use mlua::{IntoLuaMulti, Lua, Table, Value};
+
+/// An Xbox pad is taken to be playing whatever the input says (`--pad`):
+/// texts show its pictures and `Gui.ControllerInUse` answers true, for
+/// checking the pad's prompts on a machine with no pad.
+static FORCE_PAD: AtomicBool = AtomicBool::new(false);
+
+/// Takes an Xbox pad to be playing from now on, or not (`--pad`).
+pub fn force_pad(on: bool) {
+    FORCE_PAD.store(on, Ordering::Relaxed);
+}
 
 use crate::binoculars;
 use crate::combat::{Combat, Fired, Picked, Rounds, Weapon};
@@ -396,6 +407,36 @@ fn context_action(lua: &Lua, text: Option<&str>) -> mlua::Result<()> {
         .call::<()>(text)
 }
 
+/// The engine's own prompts to the HUD (`crate::action_prompt`).
+///
+/// From the 360 code: when the player's action kind or its object changes,
+/// `0x82438D10` takes the old prompt back (`0x822070E0`, by its kind) and
+/// sends the new one (`0x82207018`) with its kind as the priority; the
+/// HUD's `SetContextActionMessage(text, player, priority)` (nil to take
+/// one back) files each text under its priority, shows the newest and,
+/// when the one shown is taken back, the one left.
+const ACTION_MESSAGE: &str = r#"
+local old, kind, text = ...
+local ok, m = pcall(import, "MrxGuiHudMelee")
+if ok and type(m) == "table" and m.SetContextActionMessage then
+    local me = Sys.StringToGuid("0x1")
+    if old then m.SetContextActionMessage(nil, me, old) end
+    if kind then m.SetContextActionMessage(text, me, kind) end
+end
+"#;
+
+/// Tells the HUD's script that the engine's own prompt went from `old` to
+/// `new` ([`ACTION_MESSAGE`]).
+fn action_message(
+    lua: &Lua,
+    old: Option<&(u32, String)>,
+    new: Option<&(u32, String)>,
+) -> mlua::Result<()> {
+    lua.load(ACTION_MESSAGE)
+        .set_name("=m2-hud action prompt")
+        .call::<()>((old.map(|o| o.0), new.map(|n| n.0), new.map(|n| n.1.clone())))
+}
+
 /// The map movie's GPS destination commands ([`GPS_DEST`]): whether
 /// `command` was one, sent on to the GUI.
 fn gps_dest(lua: &Lua, command: &str, arg: &str) -> bool {
@@ -728,6 +769,9 @@ pub struct HudState {
     /// The times she asked to see her ammo (reload, a weapon switch;
     /// `Combat::ammo_shown`): each puts both ammo boxes up.
     pub ammo_shown: u32,
+    /// The requests to show every counter so far
+    /// ([`SHOW_ALL_COUNTERS`]).
+    pub counters_shown: u32,
     /// The rifle's rounds: in the clip, stored.
     pub rifle: Rounds,
     /// Rounds the gun in her hands holds a clip (the carbine's 30, the
@@ -841,10 +885,20 @@ pub struct HudState {
     pub stock: Vec<(String, u32)>,
     /// What the faction zones last told the HUD (`MissionView::trespass`).
     pub trespass: crate::mission::Trespass,
+    /// A homing launcher is up: how far its lock has come (0 to 1) and
+    /// where its target is on the screen (x right, y up, -1 to 1), while
+    /// it is locking on one in view ([`STINGER_UPDATE`]).
+    pub homing: Option<Option<(f32, [f32; 2])>>,
+    /// The homing launcher's lock cone, degrees, if its template says
+    /// ([`stinger_frame`]).
+    pub homing_cone: Option<f32>,
     /// The text of the scripts' context action in her reach
     /// (`Pg.AddContextAction`), for the game's own prompt
     /// ([`CONTEXT_ACTION`]).
     pub context_action: Option<String>,
+    /// The engine's own prompt in reach: its kind and text
+    /// ([`ACTION_MESSAGE`]).
+    pub action: Option<(u32, String)>,
     /// Whether vehicle disguises work, and her disguise while one holds:
     /// how much is left (0..=100) and whether it holds.
     pub vehicle_disguise: bool,
@@ -1063,6 +1117,11 @@ impl HudState {
             },
             fired: game.combat.fired,
             ammo_shown: game.combat.ammo_shown,
+            homing_cone: game
+                .scene
+                .arms()
+                .and_then(|a| a.lock_cones.get(&game.combat.launcher.template?).copied()),
+            counters_shown: game.combat.counters_shown,
             picked: game.combat.picked,
             launcher: game.combat.launcher_rounds,
             rifle: game.combat.rifle_rounds,
@@ -2162,12 +2221,20 @@ fn run(
 struct Told {
     /// The context action's text last given to the script.
     context_action: Option<String>,
+    /// The engine's own prompt last given to it.
+    action: Option<(u32, String)>,
     /// The save icon was asked up ([`HudState::saving`]).
     saving: bool,
     hp: Option<(i32, bool)>,
     /// The gun in her hands, whether she holds the designator, and whether
     /// she drives a vehicle with a cannon.
     weapon: Option<(Weapon, bool, bool, bool)>,
+    /// The weapon told of was a homing launcher ([`HudState::homing`]).
+    homing_up: bool,
+    /// The weapon told of was the laser designator, and the laser was
+    /// told to be on ([`LASER_STATE`]).
+    laser_up: bool,
+    lasing: bool,
     /// The template of the gun in her rifle's place ([`HudState::gun`]).
     gun: Option<u32>,
     ammo: Option<[i64; 5]>,
@@ -2175,6 +2242,8 @@ struct Told {
     explosive: bool,
     /// The ammo-box requests passed on ([`HudState::ammo_shown`]).
     ammo_shown: u32,
+    /// The all-counters requests passed on.
+    counters_shown: u32,
     /// She was in a vehicle ([`HudState::in_vehicle`]).
     in_vehicle: Option<bool>,
     /// The gun box's icon widgets as last logged ([`Thread::gun_box`]).
@@ -3850,8 +3919,7 @@ impl Thread {
         if let Some(screen) = gui_runtime::screen(lua) {
             let mut screen = screen.borrow_mut();
             screen.set_camera_heading(heading);
-            screen.set_pad(s.pad);
-            screen.set_driving(s.in_vehicle);
+            screen.set_pad(s.pad || FORCE_PAD.load(Ordering::Relaxed));
         }
         // The keys the texts' control words name, as the bindings are (and
         // again should they change): before any text this frame is set.
@@ -3975,6 +4043,10 @@ impl Thread {
             self.told.context_action = s.context_action.clone();
             context_action(lua, s.context_action.as_deref())?;
         }
+        if self.told.action != s.action {
+            let old = std::mem::replace(&mut self.told.action, s.action.clone());
+            action_message(lua, old.as_ref(), s.action.as_ref())?;
+        }
         let holding = s.support.designator.is_some();
         // In a tank, the gun chosen: its machine gun, else its cannon.
         let mg = s.in_vehicle && s.machine_gun.is_some();
@@ -3986,8 +4058,25 @@ impl Thread {
         // gun was changed after (PC playtest, 2026-10-08).
         self.told.seat(s.in_vehicle);
         let gun = s.gun.as_ref().map(|g| g.0);
-        if self.told.weapon != Some((s.weapon, holding, cannon, mg)) || self.told.gun != gun {
+        // A homing launcher in her hands (not the designator, nor a
+        // vehicle's gun): its reticle is the lock-on one.
+        let homing_up = s.homing.is_some() && !holding && !cannon && !mg;
+        // The laser designator in her hands: its reticle is the laser's.
+        let laser_up = s
+            .support
+            .designator
+            .as_deref()
+            .is_some_and(|d| d.contains("Laser"));
+        if self.told.weapon != Some((s.weapon, holding, cannon, mg))
+            || self.told.gun != gun
+            || self.told.homing_up != homing_up
+            || self.told.laser_up != laser_up
+        {
             self.told.weapon = Some((s.weapon, holding, cannon, mg));
+            self.told.homing_up = homing_up;
+            self.told.laser_up = laser_up;
+            // The switch itself puts the laser's reticle back to rest.
+            self.told.lasing = false;
             self.told.gun = gun;
             // The gun in her rifle's place shows as its `WeaponUI` says,
             // and the gun box names it (playtest 4: her pistol showed the
@@ -4063,6 +4152,18 @@ impl Thread {
                 } else {
                     (icon, guid, reticle, crosshair)
                 };
+            // The weapon's own reticle kinds, where it has a `WeaponUI`
+            // record here: the gun in her rifle's place, a tank's machine
+            // gun.
+            let ui_kind = if let Some((ui, _, _)) = s.machine_gun.filter(|_| mg) {
+                Some((ui.reticle_type, ui.health_type))
+            } else if cannon || holding || s.weapon != Weapon::Rifle {
+                None
+            } else {
+                s.gun
+                    .as_ref()
+                    .map(|(_, _, ui)| (ui.reticle_type, ui.health_type))
+            };
             // What `MrxGuiHudReticle.HandleReticleGunSwitchEvent` reads:
             // without a type it leaves the reticle as it was. No target
             // health type: that bar shows only on a target. The crosshair
@@ -4073,7 +4174,14 @@ impl Thread {
                 [
                     ("uNewCurrentGun", Value::String(lua.create_string(&icon)?)),
                     ("uNewCurrentGunGuid", guid_value(guid)),
-                    ("sReticleType", Value::String(lua.create_string("Normal")?)),
+                    (
+                        "sReticleType",
+                        Value::String(lua.create_string(reticle_type(
+                            homing_up,
+                            laser_up,
+                            ui_kind.map(|k| k.0),
+                        ))?),
+                    ),
                     (
                         "uReticleTexture",
                         Value::String(lua.create_string(&reticle)?),
@@ -4081,7 +4189,38 @@ impl Thread {
                     ("bReticleCrosshair", Value::Boolean(crosshair)),
                 ],
             )?;
+            // The lock-on frame's size, as wide as the launcher's cone.
+            if let (Value::Table(t), Some(cone)) = (&t, s.homing_cone.filter(|_| homing_up)) {
+                let [w, h] = stinger_frame(cone, s.size[0] / s.size[1].max(1.0));
+                t.raw_set("nStingerReticleWidth", w)?;
+                t.raw_set("nStingerReticleHeight", h)?;
+            }
+            // The target-health bar's shape, sent with the record's other
+            // fields (360 0x8234F458).
+            if let (Value::Table(t), Some((_, health))) = (&t, ui_kind) {
+                t.raw_set("sReticleHealthType", health_type(health))?;
+            }
             fire(lua, "GuiWeaponEquippedUpdate", t)?;
+        }
+        // The lock-on reticle's word, every tick while a lock is coming
+        // on a target in view (the script hides it after a tick without).
+        if let Some(Some((share, at))) = s.homing.filter(|_| homing_up) {
+            let [x, y] = stinger_place(at, s.size[0] / s.size[1].max(1.0));
+            let t = table(
+                lua,
+                [
+                    ("nPercent", Value::Number(share.into())),
+                    ("nX", Value::Number(x.into())),
+                    ("nY", Value::Number(y.into())),
+                ],
+            )?;
+            fire(lua, STINGER_UPDATE, t)?;
+        }
+        // The laser coming on and going off before its mark is made.
+        let lasing = laser_up && s.support.lasing;
+        if lasing != self.told.lasing {
+            self.told.lasing = lasing;
+            fire(lua, LASER_STATE, laser_state(lua, lasing)?)?;
         }
         // Her explosive, as the engine's `GuiWeaponEquippedUpdate` carries it
         // when the equipped explosive changes (360 0x8234F458: its
@@ -4095,6 +4234,7 @@ impl Thread {
         // Reload or a weapon switch pressed: both ammo boxes up, as the
         // 360's on-foot input sends it (0x824333E0: `GuiShowAmmoCounter`
         // with `bShowGun` and `bShowExplosive` true).
+        show_counters(lua, &mut self.told.counters_shown, s.counters_shown)?;
         if s.ammo_shown != self.told.ammo_shown {
             self.told.ammo_shown = s.ammo_shown;
             let t = table(
@@ -4856,6 +4996,147 @@ fn fire(lua: &Lua, event: &str, args: impl IntoLuaMulti) -> mlua::Result<()> {
     gui_runtime::fire(lua, event, args).map(|_| ())
 }
 
+/// The engine's word to the lock-on reticle (the layout's `Stinger
+/// Reticle`, `MrxGuiHudReticle.HandleStingerReticleDataUpdate`).
+///
+/// From the 360 code: the homing lock update (`0x82294318`) sends it for
+/// a local player's weapon through `0x822956C0`, with `nPercent` (how far
+/// the lock has come: 1 less the time left over the weapon's
+/// `LockOnTime`) and, when the target's place projects onto the screen
+/// (`0x821B9DE0`), `nX` and `nY`; also the player's guid, left out here
+/// (the handler does not read it).
+///
+/// From the script (data): above 0 the target box shows at (`nX`, `nY`),
+/// flashing every 0.15 s, every 0.01 s from 0.75, and steady in the
+/// lock colour with the targeting sound stopped at 1; a tick without the
+/// event hides it.
+const STINGER_UPDATE: &str = "StingerReticleUpdate";
+
+/// `GuiWeaponEquippedUpdate`'s `sReticleType`. From the 360 code
+/// (`0x8234F458`): by the weapon's `WeaponUI` `ReticleType`, 1 `Homing`,
+/// 3 `Laser`, 4 `None`, anything else `Normal`. `data` is that field
+/// where the weapon up has its record here; the laser designator and the
+/// launcher, which the HUD shows from constants, are told by `laser` and
+/// `homing` (from the data their types are 3 and, for the Stinger, 1).
+fn reticle_type(homing: bool, laser: bool, data: Option<u32>) -> &'static str {
+    match data {
+        _ if laser => "Laser",
+        _ if homing => "Homing",
+        Some(1) => "Homing",
+        Some(3) => "Laser",
+        Some(4) => "None",
+        _ => "Normal",
+    }
+}
+
+/// The engine's default camera field of view, radians (360 `0x821B6148`).
+const DEFAULT_CAMERA_FOV: f32 = 0.959_749_94;
+
+/// `GuiWeaponEquippedUpdate`'s `nStingerReticleWidth` and `...Height` for
+/// a homing weapon whose lock cone is `cone` degrees, on a screen `aspect`
+/// wide for its height.
+///
+/// From the 360 code (`0x8234F458`): the points tan(cone) x 10 to the
+/// side and above, 10 ahead, go through the default camera's projection
+/// (`0x8234EF98`: half width at distance 1 = tan(fov x 0.75 x aspect / 2)
+/// with fov 0.95975 rad, half height that over the aspect); each one's
+/// place on the screen (-1 to 1) times the screen's width or height is
+/// the size. So the frame is as wide as the cone. The script hands them
+/// to `SetStingerReticleDimensions`.
+///
+/// The 360's sizes are screen pixels: the screen's width and height in
+/// that sum are a viewport's, in pixels, and the script sets the frame
+/// with `SetCorrectedLocation` (corrected boxes are screen pixels; the
+/// widget correction `0x82390550` scales a box's size by the screen's
+/// height over 480). The port's widgets keep virtual units and scale them
+/// by that same height factor when drawing, so the sizes are given here
+/// as pixels over it: a share of the width times 480 x aspect, a share of
+/// the height times 480. The frame comes out as wide as it is high.
+fn stinger_frame(cone: f32, aspect: f32) -> [f32; 2] {
+    let half_width = (DEFAULT_CAMERA_FOV * 0.75 * aspect / 2.0).tan();
+    let half_height = half_width / aspect;
+    let reach = cone.to_radians().tan();
+    [
+        reach / half_width * 480.0 * aspect,
+        reach / half_height * 480.0,
+    ]
+}
+
+/// `GuiWeaponEquippedUpdate`'s `sReticleHealthType`, by the record's
+/// `ReticleHealthType` (the same builder): 1 the straight bar, anything
+/// else the curved one.
+fn health_type(data: u32) -> &'static str {
+    if data == 1 {
+        "straight (bottom)"
+    } else {
+        "curved"
+    }
+}
+
+/// The engine's word to the laser designator's reticle (the layout's
+/// `Laser Reticle`, `MrxGuiHudReticle.HandleLaserReticleStateChangeEvent`).
+///
+/// From the 360 code (the designator's update, `0x823911F0`): as the
+/// laser comes on it sends `bActive` true with `nTime` 1.0; as it goes
+/// off with its mark not made yet, `bActive` false; when the mark is
+/// made it sends nothing (the weapon switch that follows resets the
+/// reticle). Both carry the player's guid, left out here.
+///
+/// From the script (data): active, the reticle's four arcs play and its
+/// arrow turns once every `nTime` seconds; otherwise it snaps to rest.
+const LASER_STATE: &str = "LaserState";
+
+/// [`LASER_STATE`]'s table.
+fn laser_state(lua: &Lua, active: bool) -> mlua::Result<Value> {
+    let t = lua.create_table()?;
+    t.raw_set("bActive", active)?;
+    if active {
+        t.raw_set("nTime", 1.0)?;
+    }
+    Ok(Value::Table(t))
+}
+
+/// A screen point (x right, y up, -1 to 1) as the lock-on reticle's `nX`
+/// and `nY` on a screen `aspect` wide for its height: the script puts
+/// the target box's middle there (`SetLocation`).
+///
+/// From the 360 code: the script turns the box's resolution correction
+/// off (`SetWidgetUseResolutionCorrection`), and the widget correction
+/// (`0x82390550`) then leaves such a widget's place as it is given, in
+/// screen pixels, scaling only its size. So the engine's `nX` and `nY`
+/// are pixels. The port draws the box through its parent's centred
+/// correction (virtual units times the screen's height over 480, centred
+/// on the screen), so the same pixel is given here in those units: 320
+/// plus x times 240 times the aspect, and 240 less y times 240.
+fn stinger_place([x, y]: [f32; 2], aspect: f32) -> [f32; 2] {
+    [320.0 + x * 240.0 * aspect, (1.0 - y) * 240.0]
+}
+
+/// The engine's word to put every counter of the HUD up for a while.
+///
+/// From the 360 code: the player's input update shared by the on-foot and
+/// the vehicle controls (`0x8242E7A0`) sends an event of this type alone
+/// (no fields but the player) when either of two of its input bits (2 and
+/// 4) is newly pressed; the bit beside them (8) sends `TogglePDA`. From
+/// the data, the game's control layout gives the d-pad's up and down as
+/// "cash & fuel" in a vehicle and as the support's on foot; that these are
+/// the two bits is inferred from that, not read from the pad's table.
+///
+/// From the scripts: the health counter (`HandleShowHealthEvent`) and the
+/// others bound to it show themselves and fade as after a change.
+pub const SHOW_ALL_COUNTERS: &str = "ShowAllCounters";
+
+/// Fires [`SHOW_ALL_COUNTERS`] once if requests came since `told`
+/// (however many: one press, one event), and notes them told.
+fn show_counters(lua: &Lua, told: &mut u32, asked: u32) -> mlua::Result<()> {
+    if *told != asked {
+        *told = asked;
+        eprintln!("hud: all counters asked up ({asked})");
+        fire(lua, SHOW_ALL_COUNTERS, ())?;
+    }
+    Ok(())
+}
+
 /// The explosive half of `GuiWeaponEquippedUpdate` (360 0x8234F458, its
 /// flag 0x20): the explosive's icon alone, so the gun box and the reticle,
 /// which find no `uNewCurrentGun`, are left as they were.
@@ -4944,6 +5225,15 @@ impl MapView {
             [cx + right * k, cy - ahead * k],
             ahead.hypot(right) <= self.range,
         )
+    }
+
+    /// Which way the world direction (`dx`, `dz`) points on the map,
+    /// degrees clockwise from straight up (as [`Self::screen`] lays it).
+    fn bearing(&self, dx: f32, dz: f32) -> f32 {
+        let (s, c) = self.heading.to_radians().sin_cos();
+        let ahead = dx * s + dz * c;
+        let right = -dx * c + dz * s;
+        right.atan2(ahead).to_degrees()
     }
 
     /// The world `(x, z)` that shows at `angle` degrees clockwise from
@@ -5483,11 +5773,36 @@ fn minimap(
         let Some([x, y]) = blip_place(view, b.at, b.sticky) else {
             continue;
         };
+        // Its sonar rings first, under the icon (from the 360 code, the
+        // icon's draw 0x823871F8 runs the animators' own draws before the
+        // icon's quad): each a square half its width each way, the
+        // radar's radius being 50 of those units.
+        if let Some((texture, colour, rings)) = &b.rings {
+            let ring = name_hash(texture);
+            want.push(ring);
+            for &(width, alpha) in rings {
+                let half = width * 0.5 * r / 50.0;
+                let [cr, cg, cb] = colour.map(|v| f32::from(v) / 255.0);
+                out.push(quad(
+                    Some(ring),
+                    [x - half, y - half, x + half, y + half],
+                    full,
+                    [cr, cg, cb, alpha],
+                    0.0,
+                ));
+            }
+        }
         let hash = name_hash(&b.icon);
         want.push(hash);
-        let s = r * 0.16;
+        let [w, h] = blip_half_size(b.size).map(|v| v * r / RADAR_RADIUS);
         let c = b.colour.map(|v| f32::from(v) / 255.0);
-        out.push(quad(Some(hash), [x - s, y - s, x + s, y + s], full, c, 0.0));
+        out.push(quad(
+            Some(hash),
+            [x - w, y - h, x + w, y + h],
+            full,
+            c,
+            blip_turn(view, b),
+        ));
     }
     // Her: a white square, upright whichever way she faces (the map turns
     // with the camera, not with her).
@@ -5499,6 +5814,44 @@ fn minimap(
         white,
         0.0,
     ));
+}
+
+/// The radar's radius in its own units (the [`BORDER`]'s minimap is 100
+/// across).
+const RADAR_RADIUS: f32 = 50.0;
+
+/// A blip's half width and height in the radar's units. From the 360
+/// code: the minimap's icon draw (`0x823871F8`) makes the quad from
+/// (x - width, y - height) to (x + width, y + height), each times the
+/// screen's scale, so the scripts' `nWidth` and `nHeight` are half sizes
+/// (10.667 for an objective's, 5 for a vehicle's). A blip with no size
+/// (0) keeps the size the port drew every blip at before, 8.
+fn blip_half_size(size: [f32; 2]) -> [f32; 2] {
+    size.map(|v| if v > 0.0 { v } else { 8.0 })
+}
+
+/// How far a blip's icon is turned, degrees clockwise. From the 360 code:
+/// the minimap's objective update (`0x82388320`) keeps an angle per blip,
+/// 0 unless it is `bOriented` and has a target, when it is minus the
+/// target's heading; the renderer (`0x823879D0`) adds the map's own
+/// rotation to it when the blip is `bRotate` and hands the sum to the
+/// icon's draw. So an oriented, rotating blip (a vehicle's, a plane's)
+/// points the way its target goes on the turning map; a rotating one
+/// alone turns with the map; an oriented one alone turns as on a
+/// north-up map. Here the same angles are taken from the view's own
+/// projection, whatever way it counts headings.
+fn blip_turn(view: &MapView, b: &crate::mission::RadarView) -> f32 {
+    let north = view.bearing(0.0, 1.0);
+    let heading = b
+        .yaw
+        .filter(|_| b.oriented)
+        .map(|yaw| view.bearing(yaw.sin(), yaw.cos()) - north);
+    match (heading, b.rotate) {
+        (Some(h), true) => h + north,
+        (Some(h), false) => h,
+        (None, true) => north,
+        (None, false) => 0.0,
+    }
 }
 
 /// How far past the rim a sticky blip out of range sits: 2 of the
@@ -6529,6 +6882,131 @@ mod tests {
         assert_eq!(parse_pair("12"), None);
     }
 
+    /// The lock-on reticle's type and the place its target box is told.
+    #[test]
+    fn the_lock_on_reticle_is_told_as_the_script_reads_it() {
+        assert_eq!(reticle_type(true, false, None), "Homing");
+        assert_eq!(reticle_type(false, false, None), "Normal");
+        // The designator in her hands comes before the weapon behind it.
+        assert_eq!(reticle_type(true, true, Some(0)), "Laser");
+        // By the weapon's own record: 1, 3 and 4; the guns' 0 and the TOW
+        // launchers' 2 are the normal one.
+        let by_data = |n| reticle_type(false, false, Some(n));
+        assert_eq!(
+            [0, 1, 2, 3, 4].map(by_data),
+            ["Normal", "Homing", "Normal", "Laser", "None"]
+        );
+        // The Stinger's 10 degree cone at 16:9: as far across the screen
+        // as up it (the same share of 640 x 16 as of 480 x 9).
+        let [w, h] = stinger_frame(10.0, 16.0 / 9.0);
+        assert!(
+            (w - 202.1).abs() < 0.2 && (h - 202.1).abs() < 0.2,
+            "{w} {h}"
+        );
+        // Whatever the screen's shape: the cone is round.
+        let [w, h] = stinger_frame(10.0, 4.0 / 3.0);
+        assert!((w - h).abs() < 1e-3, "{w} {h}");
+        assert_eq!(health_type(1), "straight (bottom)");
+        assert_eq!([0, 2].map(health_type), ["curved", "curved"]);
+        let lua = Lua::new();
+        let Value::Table(on) = laser_state(&lua, true).unwrap() else {
+            panic!()
+        };
+        assert!(on.get::<bool>("bActive").unwrap());
+        assert_eq!(on.get::<f64>("nTime").unwrap(), 1.0);
+        let Value::Table(off) = laser_state(&lua, false).unwrap() else {
+            panic!()
+        };
+        assert!(!off.get::<bool>("bActive").unwrap());
+        assert!(off.get::<Value>("nTime").unwrap().is_nil());
+        // At 4:3 the virtual screen is the screen; at 16:9 its edges are
+        // 106.7 units past the virtual screen's on each side.
+        assert_eq!(stinger_place([0.0, 0.0], 16.0 / 9.0), [320.0, 240.0]);
+        assert_eq!(stinger_place([-1.0, 1.0], 4.0 / 3.0), [0.0, 0.0]);
+        assert_eq!(stinger_place([1.0, -1.0], 4.0 / 3.0), [640.0, 480.0]);
+        let [x, y] = stinger_place([1.0, -1.0], 16.0 / 9.0);
+        assert!((x - 746.67).abs() < 0.01 && y == 480.0, "{x} {y}");
+    }
+
+    /// A request to show every counter fires the event once, with no
+    /// arguments, and not again until the next request.
+    #[test]
+    fn all_counters_are_asked_up_once_a_request() {
+        let lua = Lua::new();
+        lua.load(
+            r#"
+            fired = {}
+            Event = { __m2_fire = function(...)
+                table.insert(fired, table.concat({ ... }, " "))
+                return 1
+            end }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let mut told = 0;
+        show_counters(&lua, &mut told, 0).unwrap();
+        show_counters(&lua, &mut told, 1).unwrap();
+        show_counters(&lua, &mut told, 1).unwrap();
+        show_counters(&lua, &mut told, 3).unwrap();
+        let fired: Vec<String> = lua.globals().get("fired").unwrap();
+        assert_eq!(fired, ["ShowAllCounters", "ShowAllCounters"]);
+        assert_eq!(told, 3);
+    }
+
+    /// A blip's icon is as big as the scripts say (half sizes, in the
+    /// radar's units) and turned as the 360's minimap turns it: by its
+    /// target's heading when oriented, with the map when rotating.
+    #[test]
+    fn blips_are_sized_and_turned_as_the_minimap_does() {
+        use crate::mission::RadarView;
+        assert_eq!(blip_half_size([5.0, 5.0]), [5.0, 5.0]);
+        assert_eq!(blip_half_size([10.667, 0.0]), [10.667, 8.0]);
+        let view = |heading: f32| MapView {
+            rect: [0.0, 0.0, 100.0, 100.0],
+            player: [0.0; 3],
+            heading,
+            range: 100.0,
+        };
+        let blip = |yaw: Option<f32>, rotate: bool, oriented: bool| RadarView {
+            at: Vec3::ZERO,
+            icon: String::new(),
+            colour: [255; 4],
+            sticky: false,
+            sort: 5,
+            size: [5.0, 5.0],
+            yaw,
+            rotate,
+            oriented,
+            rings: None,
+        };
+        let near = |a: f32, b: f32| ((a - b + 540.0).rem_euclid(360.0) - 180.0).abs() < 1e-3;
+        let east = std::f32::consts::FRAC_PI_2;
+        for heading in [0.0_f32, 90.0, 215.0] {
+            let v = view(heading);
+            let north = v.bearing(0.0, 1.0);
+            // Neither: upright. Rotating alone: with the map.
+            assert_eq!(blip_turn(&v, &blip(Some(east), false, false)), 0.0);
+            assert!(near(blip_turn(&v, &blip(None, true, false)), north));
+            // A vehicle's (both): the way it goes, as the map shows it:
+            // where the map puts a point ahead of it.
+            let both = blip_turn(&v, &blip(Some(east), true, true));
+            let ([x, y], _) = v.screen(1.0, 0.0);
+            let [cx, cy] = v.centre();
+            assert!(near(both, (x - cx).atan2(cy - y).to_degrees()), "{heading}");
+            // Oriented alone: its heading on a map that does not turn.
+            let alone = blip_turn(&v, &blip(Some(east), false, true));
+            assert!(near(alone, both - north), "{heading}");
+            // Oriented with no target: nothing to take a heading from.
+            assert!(near(blip_turn(&v, &blip(None, true, true)), north));
+        }
+        // Facing north on a north-up map it is upright.
+        assert!(near(
+            blip_turn(&view(0.0), &blip(Some(0.0), true, true)),
+            0.0
+        ));
+    }
+
     /// The context action in reach goes to the script's
     /// `SetContextActionMessage` as the engine calls it: the text, or nil
     /// once out of reach, and the player; nothing when the module is
@@ -6567,6 +7045,42 @@ mod tests {
         context_action(&lua, Some("[ContextAction.Talk]")).unwrap();
         let calls: Vec<String> = lua.globals().get("calls").unwrap();
         assert_eq!(calls.len(), 2);
+    }
+
+    /// The engine's own prompt goes to the same script with its kind as
+    /// the priority; a change takes the old one back by its kind first.
+    #[test]
+    fn the_engines_prompt_is_sent_with_its_kind() {
+        let lua = Lua::new();
+        lua.load(
+            r##"
+            calls = {}
+            Sys = { StringToGuid = function(s) return "guid " .. s end }
+            local melee = { SetContextActionMessage = function(...)
+                local text, player, priority = ...
+                table.insert(calls, select("#", ...) .. " " .. tostring(text) .. " "
+                    .. tostring(player) .. " " .. tostring(priority))
+            end }
+            function import(name) return melee end
+            "##,
+        )
+        .exec()
+        .unwrap();
+        let drive = (6, "[ContextAction.DriveVehicle]".to_owned());
+        let equip = (2, "[ContextAction.PickupWeapon]".to_owned());
+        action_message(&lua, None, Some(&drive)).unwrap();
+        action_message(&lua, Some(&drive), Some(&equip)).unwrap();
+        action_message(&lua, Some(&equip), None).unwrap();
+        let calls: Vec<String> = lua.globals().get("calls").unwrap();
+        assert_eq!(
+            calls,
+            [
+                "3 [ContextAction.DriveVehicle] guid 0x1 6",
+                "3 nil guid 0x1 6",
+                "3 [ContextAction.PickupWeapon] guid 0x1 2",
+                "3 nil guid 0x1 2",
+            ]
+        );
     }
 
     /// The PDA's `ControllerInput` event carries both sticks: the left

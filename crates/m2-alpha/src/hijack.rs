@@ -1296,6 +1296,7 @@ impl Hijacks {
         dress(game, &mut self.dressed, &loaded.clips);
         self.seat_riders(game, dt);
         self.seat_prop_riders(game, dt);
+        self.scripted_doors(game);
         self.swing_doors(game, dt);
         let State::Ready(loaded) = &self.state else {
             return;
@@ -1398,6 +1399,38 @@ impl Hijacks {
             if !p.seated {
                 p.seat_frame = None;
             }
+        }
+    }
+
+    /// The doors the scripts open or shut (`Vehicle.OpenDoor`,
+    /// `CloseDoor`) start to swing. From the 360 code (0x82347EE0,
+    /// 0x82347F80): the door named is sent the same open or shut message
+    /// her clips' door events send (0x82418BA0), and swings as those do.
+    fn scripted_doors(&mut self, game: &mut Game) {
+        for (guid, name, open) in std::mem::take(&mut game.door_requests) {
+            let found = game.scene.vehicles.iter().enumerate().find_map(|(i, v)| {
+                (v.guid == Some(guid))
+                    .then(|| {
+                        v.spec
+                            .seating
+                            .as_deref()?
+                            .doors
+                            .iter()
+                            .find(|d| d.name == name)
+                            .copied()
+                    })
+                    .flatten()
+                    .map(|d| (i, d))
+            });
+            let Some((i, door)) = found else {
+                eprintln!("door: the scripts' door {name:08x} of {guid:#x}: no such door here");
+                continue;
+            };
+            request_door(&mut self.doors, i, door, open);
+            eprintln!(
+                "door: the scripts {} door {name:08x} of {guid:#x}",
+                if open { "open" } else { "shut" }
+            );
         }
     }
 
@@ -3070,8 +3103,60 @@ impl Flat for Vec3 {
     }
 }
 
+/// Door `door` of vehicle `i` is sent the open (or shut) message: it
+/// starts to swing from where it stands, or as the vehicle was made if it
+/// has not swung yet ([`Swing::new`]).
+fn request_door(
+    doors: &mut HashMap<(usize, u32), (Door, Swing)>,
+    i: usize,
+    door: Door,
+    open: bool,
+) {
+    let swing = &mut doors
+        .entry((i, door.name))
+        .or_insert_with(|| (door, Swing::new(&door)))
+        .1;
+    if open {
+        swing.open();
+    } else {
+        swing.close();
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    // `Vehicle.OpenDoor(target, "pivot")` (PmcCon033's targets pop up):
+    // the door swings open over its `TimeToOpen` and stays; `CloseDoor`
+    // swings it shut again, and then it is let go.
+    #[test]
+    fn a_door_the_scripts_open_swings_open_and_shut_again() {
+        let door = Door {
+            name: m2_assets::name_hash("pivot"),
+            kind: 0,
+            bone: 1,
+            axis: Vec3::X,
+            open_angle: 90f32.to_radians(),
+            time_to_open: 0.5,
+            time_to_close: 0.5,
+            start_open: false,
+        };
+        let mut doors = HashMap::new();
+        request_door(&mut doors, 3, door, true);
+        let tick = |doors: &mut HashMap<(usize, u32), (Door, Swing)>, secs: f32| {
+            for _ in 0..(secs * 60.0) as usize {
+                for (d, s) in doors.values_mut() {
+                    s.tick(d, 1.0 / 60.0);
+                }
+            }
+        };
+        tick(&mut doors, 1.0);
+        let (d, s) = doors[&(3, door.name)];
+        assert!((s.angle(&d) - 90f32.to_radians()).abs() < 1e-3, "open");
+        request_door(&mut doors, 3, door, false);
+        tick(&mut doors, 1.0);
+        assert!(doors[&(3, door.name)].1.is_shut());
+    }
+
     use super::*;
 
     #[test]
