@@ -94,9 +94,11 @@ impl Default for GameOptions {
             pad_buttons: Vec::new(),
             brightness: 50.0,
             view_distance: 100.0,
-            sfx_volume: 100.0,
-            music_volume: 100.0,
-            dialog_volume: 100.0,
+            // The profile's default for all three (from the 360 code,
+            // 0x8239B028; m2_game::profile).
+            sfx_volume: f64::from(m2_game::profile::DEFAULT_VOLUME),
+            music_volume: f64::from(m2_game::profile::DEFAULT_VOLUME),
+            dialog_volume: f64::from(m2_game::profile::DEFAULT_VOLUME),
             video_detail: crate::pause::DETAIL,
             advanced_video: crate::pause::ADVANCED,
         }

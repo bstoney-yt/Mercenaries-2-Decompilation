@@ -188,9 +188,9 @@ impl Default for Settings {
             vsync: true,
             brightness: 50.0,
             view_distance: 100.0,
-            sfx: 100.0,
-            music: 100.0,
-            dialog: 100.0,
+            sfx: f64::from(m2_game::profile::DEFAULT_VOLUME),
+            music: f64::from(m2_game::profile::DEFAULT_VOLUME),
+            dialog: f64::from(m2_game::profile::DEFAULT_VOLUME),
             wide: true,
             video: Video::default(),
             modes: Vec::new(),
@@ -1579,7 +1579,7 @@ mod tests {
         let mut n = Native::default();
         n.calls(&Settings::default());
         assert!(n.command("audioSetMusicVolume", "20"));
-        assert_eq!(n.take_news().volumes, Some([100.0, 20.0, 100.0]));
+        assert_eq!(n.take_news().volumes, Some([75.0, 20.0, 75.0]));
         assert!(n.library("LTIPauseItemChanged", "audioMusicVolumeVar=20"));
         assert!(n.library("LTIPauseItemChanged", "controlsMouseInvertVar=true"));
         // Reported as the movie had it (its `applyChanges` at set-up),
@@ -1593,7 +1593,7 @@ mod tests {
         assert_eq!(news.unused, ["advvideoMotionblurVar=false"]);
         assert!(n.command("audioSetSFXVolume", "10"));
         assert!(n.library("LTIPauseItemChanged", "pauseCancel"));
-        assert_eq!(n.take_news().volumes, Some([100.0, 20.0, 100.0]));
+        assert_eq!(n.take_news().volumes, Some([75.0, 20.0, 75.0]));
     }
 
     #[test]

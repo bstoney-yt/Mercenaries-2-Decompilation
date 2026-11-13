@@ -1001,6 +1001,9 @@ pub struct MissionLink {
     subtitles: bool,
     /// The player has the tutorial tips on.
     tutorials: bool,
+    /// The player's inverted Y, rumble and autosave, as the scripts read
+    /// them from her profile ([`m2_game::profile`]).
+    profile_options: (bool, bool, bool),
     /// Time not yet given to the scripts.
     lag: f32,
     /// The ten-second mark at which the scripts' place for her was last
@@ -1225,6 +1228,10 @@ impl MissionLink {
             script_join: false,
             subtitles: true,
             tutorials: true,
+            profile_options: {
+                let p = m2_game::profile::ProfileOptions::default();
+                (p.invert_y != 0, p.rumble != 0, p.autosave != 0)
+            },
             lag: 0.0,
             apart_logged: -1,
             log,
@@ -1511,14 +1518,18 @@ impl MissionLink {
         }
     }
 
-    /// The player's subtitles and tutorial tips, from now on (the pause
-    /// menu's options).
-    pub fn set_options(&mut self, subtitles: bool, tutorials: bool) {
-        self.subtitles = subtitles;
-        self.tutorials = tutorials;
+    /// The player's subtitles and tutorial tips, and her inverted Y,
+    /// rumble and autosave as the scripts read them, from now on (the
+    /// pause menu's options).
+    pub fn set_options(&mut self, o: &crate::config::GameOptions) {
+        self.subtitles = o.subtitles;
+        self.tutorials = o.tutorials;
+        self.profile_options = (o.invert_pad, o.rumble, o.autosave);
         if let State::Running(m) = &mut self.state {
-            m.set_subtitles(subtitles);
-            m.set_tutorials(tutorials);
+            m.set_subtitles(o.subtitles);
+            m.set_tutorials(o.tutorials);
+            let (invert, rumble, autosave) = self.profile_options;
+            m.set_profile_options(invert, rumble, autosave);
         }
     }
 
@@ -4004,6 +4015,8 @@ impl MissionLink {
                 }
                 mission.set_subtitles(self.subtitles);
                 mission.set_tutorials(self.tutorials);
+                let (invert, rumble, autosave) = self.profile_options;
+                mission.set_profile_options(invert, rumble, autosave);
                 if let Some((to, briefing)) = &self.skip_to {
                     mission.set_skip_mission(to, *briefing);
                     self.write([format!("skip to: {to} (briefing {briefing})")]);

@@ -1327,12 +1327,12 @@ mod tests {
             window,
             &NO_MODES
         ));
-        assert_eq!(n.take_news().volumes, Some([100.0, 20.0, 100.0]));
+        assert_eq!(n.take_news().volumes, Some([75.0, 20.0, 75.0]));
         assert!(n.library("LTIPauseItemChanged", "audioCancel", window, &NO_MODES));
         let news = n.take_news();
         assert_eq!(
             (news.volumes, news.settings),
-            (Some([100.0, 100.0, 100.0]), None)
+            (Some([75.0, 75.0, 75.0]), None)
         );
         // Video: its view distance is the game's less 10; vsync by name.
         assert!(n.library("LTIVideoEnter", "", window, &NO_MODES));
