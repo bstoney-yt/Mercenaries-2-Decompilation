@@ -1463,6 +1463,18 @@ fn build_scene(
     Ok(game)
 }
 
+/// The most fail fanfares autoplay answers with Retry in a run (invented:
+/// the race scripts give more time from the 4th and 7th attempt, so this
+/// reaches the longest).
+const AUTOPLAY_RETRIES: u32 = 8;
+
+/// Whether autoplay takes Retry on a failed contract's fanfare: when a
+/// retry save is kept for it and she has retried fewer than
+/// [`AUTOPLAY_RETRIES`] times; otherwise Continue.
+fn retry_or_continue(kept: bool, retries: u32) -> bool {
+    kept && retries < AUTOPLAY_RETRIES
+}
+
 /// Free roam: the island's vehicles, people and state layers are those
 /// the game's start-up layers hold (with `--mission` the scripts' own
 /// layers are). With `save` (`--load`) the start-up carries on from its
@@ -4437,6 +4449,8 @@ fn mission_for_screenshot(
     // Contracts cancelled so far, and when she answers the last one's
     // fanfare (tick number).
     let (mut cancels_seen, mut continue_due): (u32, Option<u32>) = (0, None);
+    // The fail fanfares she has answered with Retry.
+    let mut retries = 0u32;
     // Timed fanfares waiting, by HUD call, and the tick each was first seen.
     let mut timed_seen: std::collections::HashMap<u64, u32> = Default::default();
     let mut late_hud: Option<(ui::Hud, Config)> = None;
@@ -5853,11 +5867,11 @@ fn mission_for_screenshot(
         }
         // A contract failed (the scripts' `Pg.ContractCancelled`): its
         // fanfare waits for her answer, and with no game HUD here nothing
-        // answers it. She takes Continue (the callback without `bRetry`:
-        // the contract is cancelled and goes back on offer), 3 s on, and
-        // goes to take it again as a player would. The fanfare's Retry
-        // reloads the retry save (`Pg.LoadGame("retry")`), which the alpha
-        // doesn't do yet.
+        // answers it. 3 s on she takes Retry ([`retry_or_continue`]: the
+        // scripts load the retry save taken as the contract started,
+        // `Pg.LoadGame("retry")`, and it starts again), or Continue (the
+        // contract is cancelled and goes back on offer, and she goes to
+        // take it again as a player would).
         if auto.is_some() && link.contracts_cancelled() > cancels_seen {
             cancels_seen = link.contracts_cancelled();
             failed_contract = on_contract.as_ref().map(|(c, _)| c.clone());
@@ -5872,10 +5886,18 @@ fn mission_for_screenshot(
             && let Some(seq) = link.waiting_fanfare()
         {
             continue_due = None;
-            eprintln!(
-                "autoplay: she takes Continue on the failed contract's fanfare (HUD call {seq})"
-            );
-            link.close_fanfare_without_hud(seq);
+            if retry_or_continue(link.has_retry(), retries) {
+                retries += 1;
+                eprintln!(
+                    "autoplay: she takes Retry on the failed contract's fanfare (HUD call {seq}, retry {retries})"
+                );
+                link.answer_fanfare(seq, true);
+            } else {
+                eprintln!(
+                    "autoplay: she takes Continue on the failed contract's fanfare (HUD call {seq})"
+                );
+                link.answer_fanfare(seq, false);
+            }
         }
         // A timed fanfare the scripts wait on (an outpost contact's
         // business card before her first briefing there) and no game HUD
@@ -11147,6 +11169,14 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autoplay_retries_a_failed_contract_only_with_a_retry_save_and_not_forever() {
+        assert!(retry_or_continue(true, 0));
+        assert!(retry_or_continue(true, AUTOPLAY_RETRIES - 1));
+        assert!(!retry_or_continue(true, AUTOPLAY_RETRIES));
+        assert!(!retry_or_continue(false, 0), "no retry save: Continue");
+    }
 
     #[test]
     fn the_shop_key_opens_the_vendor_named_or_the_allied_nations() {

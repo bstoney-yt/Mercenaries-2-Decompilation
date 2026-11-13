@@ -1623,21 +1623,43 @@ impl MissionLink {
             .collect()
     }
 
-    /// Closes the fanfare of the mission's HUD call `seq` with no game HUD
-    /// to: what the HUD's own close does to the game (its script
-    /// `vz_da6af53d`, line 979 on: her invincibility for the fanfare off,
-    /// `MrxHqManager.UnlockAllHq`, the HQs the end sequence locked), then
-    /// the callback (Continue: no `bRetry`).
-    pub fn close_fanfare_without_hud(&mut self, seq: u64) {
-        if let State::Running(m) = &mut self.state {
-            let code = "local c = Player.GetLocalCharacter()\n\
-                 if c then Object.SetInvincible(c, false, \"Fanfare\") end\n\
-                 if MrxHqManager and MrxHqManager.UnlockAllHq then MrxHqManager.UnlockAllHq() end";
-            if let Err(e) = m.run(code, "fanfare close") {
-                self.write([format!("fanfare close {seq}: {e}")]);
-            }
+    /// Answers the failed contract's fanfare as its Retry (`retry`) or
+    /// Continue would, with no game HUD to show it: what the HUD does as
+    /// it closes (its script `vz_da6af53d`, line 979 on: her
+    /// invincibility for the fanfare off, `MrxHqManager.UnlockAllHq`),
+    /// then its callback, which for a contract's, a mission's or a wager's
+    /// fanfare is handed `bRetry` after its own data ([`FANFARE_ANSWER`];
+    /// from the scripts: the fanfare widget's delete, which reads the
+    /// flash's answer "false" as Retry). A Retry has the scripts load the
+    /// retry save (`Pg.LoadGame("retry")`).
+    pub fn answer_fanfare(&mut self, seq: u64, retry: bool) {
+        let State::Running(m) = &mut self.state else {
+            return;
+        };
+        let code = format!(
+            "local c = Player.GetLocalCharacter()
+             if c then Object.SetInvincible(c, false, \"Fanfare\") end
+             if MrxHqManager and MrxHqManager.UnlockAllHq then MrxHqManager.UnlockAllHq() end
+             local t = __m2_hud_callbacks[{seq}]
+             __m2_hud_callbacks[{seq}] = nil
+             {FANFARE_ANSWER}(t, {retry})"
+        );
+        match m.run(&code, "fanfare answer") {
+            Ok(()) => self.write([format!(
+                "fanfare {seq} answered: {}",
+                if retry { "Retry" } else { "Continue" }
+            )]),
+            Err(e) => self.write([format!("fanfare answer {seq}: {e}")]),
         }
-        self.hud_callback(seq);
+    }
+
+    /// Whether the scripts have a retry save kept (`Pg.SaveGame("retry")`
+    /// at the contract's start), for the fail fanfare's Retry to load.
+    pub fn has_retry(&self) -> bool {
+        match &self.state {
+            State::Running(m) => m.has_retry(),
+            _ => false,
+        }
     }
 
     pub fn hud_callback(&mut self, seq: u64) {
@@ -3858,6 +3880,15 @@ impl MissionLink {
                     Command::DropWeapon { who, weapon } => {
                         eprintln!("mission: {who:#x} lets go of their {weapon}");
                     }
+                    // The retry save stays in memory, kept by the scripts'
+                    // side ([`Mission::keep_retry`]): the 360 never writes
+                    // it as a user save (0x8230C4A8).
+                    Command::Save { slot } if slot == m2_game::api::RETRY => {
+                        eprintln!(
+                            "mission: the scripts take the retry save (kept in memory: {})",
+                            mission.has_retry()
+                        );
+                    }
                     Command::Save { slot } => {
                         eprintln!("mission: the scripts ask for a save ({slot})");
                         self.saves.push(slot.clone());
@@ -5271,6 +5302,22 @@ fn hud_calls(lua: &mlua::Lua) -> Vec<HudCall> {
 
 /// The fanfare call [`HUD_CALLS`] kept last with a callback, while that
 /// callback has not been called.
+/// Calls a fanfare's callback `t` as the fanfare widget's delete does
+/// (from the scripts: the HUD's fanfare script, `_DeleteFanfareWidget`'s
+/// target): `fCallback(unpack(tCallbackData))`, with `bRetry` added after
+/// the data for a fanfare of `sType` "contract", "mission" or "wager".
+const FANFARE_ANSWER: &str = "(function(t, bRetry)
+    if type(t) ~= 'table' or type(t.fCallback) ~= 'function' then return end
+    local a = {}
+    if type(t.tCallbackData) == 'table' then
+        for i = 1, table.getn(t.tCallbackData) do a[i] = t.tCallbackData[i] end
+    end
+    if t.sType == 'contract' or t.sType == 'mission' or t.sType == 'wager' then
+        a[table.getn(a) + 1] = bRetry
+    end
+    t.fCallback(unpack(a))
+end)";
+
 fn waiting_fanfare(lua: &mlua::Lua) -> Option<u64> {
     let g = lua.globals();
     let seq = g.get::<Option<u64>>("__m2_fanfare").ok().flatten()?;
@@ -8694,6 +8741,52 @@ mod tests {
         let exit_only = box_of("Display", "[Briefing.RootMenuDialog]", &["[Generic.Exit]"]);
         assert_eq!(contract_pick(&exit_only, &offered), None);
         assert_eq!(contract_pick(&menu, &[]), None);
+    }
+
+    // The fail fanfare's answer reaches a contract's callback as the
+    // fanfare widget's delete hands it: `bRetry` after the callback's own
+    // data, only for a contract's, a mission's or a wager's fanfare.
+    #[test]
+    fn the_fanfare_answer_hands_a_contract_its_retry() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            got = {}
+            function cb(self, retry) got[table.getn(got) + 1] = { self, retry } end
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let answer = |t: &str, retry: bool| {
+            lua.load(format!("{FANFARE_ANSWER}({t}, {retry})"))
+                .exec()
+                .unwrap();
+        };
+        answer(
+            "{ sType = 'contract', fCallback = cb, tCallbackData = { 'mission' } }",
+            true,
+        );
+        answer(
+            "{ sType = 'contract', fCallback = cb, tCallbackData = { 'mission' } }",
+            false,
+        );
+        answer("{ fCallback = cb, tCallbackData = { 'other' } }", true);
+        answer("{ sType = 'contract' }", true);
+        let got: Vec<(String, Option<bool>)> = lua
+            .load("local o = {} for i, g in ipairs(got) do o[i] = { g[1], g[2] } end return o")
+            .eval::<Vec<mlua::Table>>()
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.get(1).unwrap(), t.get(2).unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("mission".to_owned(), Some(true)),
+                ("mission".to_owned(), Some(false)),
+                ("other".to_owned(), None),
+            ]
+        );
     }
 
     // The HQ hides the HUD on entering (`MrxHq.GlobalEnter`: the

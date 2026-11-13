@@ -504,8 +504,9 @@ pub enum Command {
     /// A call the game only needs to hear about:
     /// `"Pg.ContractActivated"`, `"Pg.ContractCompleted"`, ...
     Notify(String),
-    /// Save the game now, in slot `slot`: the scripts' checkpoints
-    /// (`Pg.SaveGame("retry")`), and their autosaves (`Sys.RequestAutosave`
+    /// Save the game now, in slot `slot`: the scripts' retry save as a
+    /// contract starts (`Pg.SaveGame("retry")`, kept in memory, not
+    /// written: [`ScriptWorld::retry_save`]), and their autosaves (`Sys.RequestAutosave`
     /// after a contract, `Pg.SaveGame("autosave")`) in slot [`AUTOSAVE`].
     Save {
         slot: String,
@@ -1122,6 +1123,24 @@ pub struct ScriptWorld {
     /// A save's script data to load, as Lua text ([`crate::savedata`]):
     /// while it is here `Pg.LoadGame` answers that a save is loading.
     pub saved: Option<String>,
+    /// The scripts' save data taken at a contract's start
+    /// (`Pg.SaveGame("retry")`), kept in memory for the fail fanfare's
+    /// Retry (`Pg.LoadGame("retry")`). From the 360 code: the retry slot is
+    /// never written as a user save; 0x8230C200 hands it to 0x8230C4A8,
+    /// which keeps it compressed in a buffer of the game's own (the size
+    /// at +0x473C of the block at 0x82F0EDF0) where other slots go to the
+    /// profile (0x8239ACB0). The game fills it in
+    /// ([`crate::Mission::keep_retry`]).
+    pub retry_save: Option<String>,
+    /// `Pg.LoadIsRetry`: whether the last `Pg.LoadGame` was of the retry
+    /// slot. From the 360 code: 0x8230C880 sets the byte at +0xC3D to
+    /// `slot == "retry"` on every call, and `LoadIsRetry` (0x823389F8)
+    /// answers it.
+    pub load_is_retry: bool,
+    /// The scripts asked for the retry save to be loaded
+    /// (`Pg.LoadGame("retry")` with one kept): [`crate::Mission`] loads
+    /// it once the call that asked has returned.
+    pub retry_load: bool,
     /// `Player.SetHealthClamp` and `Player.SetSurvivalMode`, as last set.
     pub health_clamp: bool,
     pub survival_mode: bool,
@@ -2412,6 +2431,11 @@ fn values<I: IntoIterator<Item = Value>>(v: I) -> mlua::Result<MultiValue> {
 
 /// The save slot of the scripts' autosaves ([`Command::Save`]).
 pub const AUTOSAVE: &str = "autosave";
+
+/// The save slot the scripts take at a contract's start and the fail
+/// fanfare's Retry loads (`Pg.SaveGame("retry")`, `Pg.LoadGame("retry")`;
+/// from the 360 code, the string at 0x820D3A34 both compare against).
+pub const RETRY: &str = "retry";
 
 /// The table of the game's own functions that hear the scripts' free
 /// support items (`AddFreebie`, `RemoveFreebie`).
@@ -4884,8 +4908,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([Value::Table(t)])
     })?;
-    add(&pg, "LoadIsRetry", |_, _, _| {
-        values([Value::Boolean(false)])
+    add(&pg, "LoadIsRetry", |w, _, _| {
+        values([Value::Boolean(w.load_is_retry)])
     })?;
     // The bootstrap's `Init` asks (`Pg.LoadGame("InitialSaveData")`)
     // whether a save is loading. Answered false, it starts a new game
@@ -4893,8 +4917,23 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // handed the save's data (`LoadSingleton(data)`) by the engine, here
     // by `Mission::start` (from the bootstrap's bytecode; the engine's
     // side is not read).
-    add(&pg, "LoadGame", |w, _, _| {
+    //
+    // From the 360 code (0x82338828 -> 0x8230C880): every call sets the
+    // retry flag `LoadIsRetry` answers to whether the slot is "retry"
+    // (0x820D3A34). The retry slot loads the save kept in memory at the
+    // contract's start, and answers false when none is kept; its data is
+    // compiled as `"return " .. data` and handed to the scripts'
+    // `LoadSingleton` (0x820D3A90) in place, without starting the scripts
+    // again. Here that load runs once this call has returned
+    // ([`crate::Mission`]'s `answer_retry_load`).
+    add(&pg, "LoadGame", |w, _, a| {
+        let retry = matches!(a.first(), Some(Value::String(s)) if s.to_string_lossy() == RETRY);
+        w.load_is_retry = retry;
         w.commands.push(Command::Notify("Pg.LoadGame".into()));
+        if retry {
+            w.retry_load = w.retry_save.is_some();
+            return values([Value::Boolean(w.retry_load)]);
+        }
         values([Value::Boolean(w.saved.is_some())])
     })?;
 
@@ -8179,6 +8218,25 @@ mod tests {
                 }
             ]
         );
+    }
+
+    // From the 360 code (0x8230C880): every `Pg.LoadGame` sets the flag
+    // `Pg.LoadIsRetry` answers to whether its slot was "retry", and the
+    // retry slot loads only the save kept in memory.
+    #[test]
+    fn load_game_retry_loads_only_a_kept_retry_save_and_sets_load_is_retry() {
+        let (host, world) = setup();
+        let eval = |code: &str| -> bool { host.lua().load(code).eval().unwrap() };
+        assert!(!eval("return Pg.LoadIsRetry()"));
+        assert!(!eval(r#"return Pg.LoadGame("retry")"#), "nothing kept yet");
+        assert!(eval("return Pg.LoadIsRetry()"));
+        assert!(!world.borrow().retry_load);
+        world.borrow_mut().retry_save = Some("{}".into());
+        assert!(eval(r#"return Pg.LoadGame("retry")"#));
+        assert!(world.borrow().retry_load, "the game is asked to load it");
+        assert!(eval("return Pg.LoadIsRetry()"));
+        assert!(!eval(r#"return Pg.LoadGame("InitialSaveData")"#));
+        assert!(!eval("return Pg.LoadIsRetry()"), "another slot clears it");
     }
 
     #[test]
