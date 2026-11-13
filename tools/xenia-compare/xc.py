@@ -32,6 +32,7 @@ Route files are one step per line (`#` comments):
     track <x> <y> <z>              follow the hero's position in guest memory (xmem.py)
     goto <x> <z> <radius> <timeout> <buttons|-> [<gain>] [max=<m/s>]  steer there by that position
     measure <buttons|-> <secs> [<ly>]  hold, logging tracked position and speed
+    look <bearing> [<timeout>]     turn the camera to face that bearing (xmem.Camera)
     trackhero                      follow the player's character by the 360 code's tables (xmem.Hero)
     trackfoot <x> <y> <z>|here     as track, for the hero on foot (here: where track was)
     walk <x> <z> <radius> <timeout> [<buttons|-> [<every_s> <name>]]  walk/sprint (ls) there
@@ -444,6 +445,30 @@ def run(args) -> int:
                         last = (now, pos)
                     time.sleep(0.25)
                 apply()
+            elif op == "look":
+                # look <bearing> [<timeout>]: turn the camera with the right stick
+                # until it faces that bearing (degrees from +z towards +x), the
+                # stick's sense learnt from the first push.
+                import xmem
+
+                cam = xmem.Camera(xmem.Guest(p.pid))
+                want, timeout = float(w[1]), float(w[2]) if len(w) > 2 else 8.0
+                end, sense = time.time() + timeout, 1.0
+                last_err = None
+                while time.time() < end:
+                    yv = cam.yaw()
+                    if yv is None:
+                        break
+                    err = (want - yv + 180) % 360 - 180
+                    if abs(err) < 5:
+                        break
+                    if last_err is not None and abs(err) > abs(last_err) + 1:
+                        sense = -sense
+                    last_err = err
+                    apply(*held[:3], held[3], held[4], max(-1.0, min(1.0, sense * -err / 45)), 0.0)
+                    time.sleep(0.15)
+                apply(*held[:3], held[3], held[4], 0.0, 0.0)
+                say(f"look: camera yaw {cam.yaw()} (wanted {want:.0f})")
             elif op == "trackhero":
                 # trackhero: follow the local player's character through the
                 # 360 code's own tables (xmem.Hero): one record, in a vehicle
@@ -494,6 +519,10 @@ def run(args) -> int:
                 name = w[7] if len(w) > 7 else f"walk{i:03d}"
                 end, yaw, a, k, next_shot = time.time() + timeout, None, 0.0, 0, time.time()
                 clicked, walk_t0 = 0.0, time.time()
+                import xmem
+
+                camera = xmem.Camera(xmem.Guest(p.pid))
+                last_say = 0.0
                 while time.time() < end:
                     pos = tracker.update() if tracker else None
                     if pos is None:
@@ -504,25 +533,11 @@ def run(args) -> int:
                         say(f"walk: at ({pos[0]:.0f}, {pos[2]:.0f}), {dist:.0f} m from the point")
                         break
                     want = math.degrees(math.atan2(tx - pos[0], tz - pos[2]))
-                    # The camera starts behind her (yaw = her facing); after that
-                    # it is measured from where she actually goes: moving at
-                    # over 1.5 m/s along `travel` with the stick at angle a to
-                    # the right of the camera means yaw = travel + a (in this
-                    # world right turns lower the bearing). Her facing alone
-                    # misleads: she backpedals and strafes without turning.
-                    face = tracker.facing() if hasattr(tracker, "facing") else tracker.heading()
-                    trail = getattr(tracker, "trail", [])
-                    travel = None
-                    if len(trail) >= 2:
-                        (t1, p1), (t2, p2) = trail[0], trail[-1]
-                        if t2 - t1 > 0.3 and math.hypot(p2[0] - p1[0], p2[2] - p1[2]) / (t2 - t1) > 1.5:
-                            travel = math.degrees(math.atan2(p2[0] - p1[0], p2[2] - p1[2]))
-                    if yaw is None and face is not None:
-                        yaw = face
-                    elif travel is not None:
-                        est = travel + a
-                        yaw = yaw + 0.3 * ((est - yaw + 180) % 360 - 180)
-                        yaw = (yaw + 180) % 360 - 180
+                    # The camera's own yaw, read from the 360 tables (xmem.Camera);
+                    # stick angle a to the right of it moves her on bearing yaw - a
+                    # (right turns lower the bearing in this world).
+                    yaw = camera.yaw() if camera else None
+                    travel = 1.0
                     target = 0.0 if yaw is None else (yaw - want + 180) % 360 - 180
                     # At most 70 deg off forward: pulled back she backpedals
                     # slowly; running at an angle she turns and the camera
@@ -530,7 +545,6 @@ def run(args) -> int:
                     target = max(-70.0, min(70.0, target))
                     step_a = (target - a + 180) % 360 - 180
                     a = (a + max(-20.0, min(20.0, step_a)) + 180) % 360 - 180
-                    travel = face
                     # ls: L3 (the game's sprint, tControlMap) latches sprint while
                     # the stick is pushed, so it is clicked once, moving, not held.
                     bb = b & ~BTN["ls"]
@@ -544,7 +558,8 @@ def run(args) -> int:
                         next_shot = time.time() + every
                         shot(f"{name}-{k:03d}")
                         k += 1
-                    elif k % 5 == 0:
+                    if time.time() - last_say > 1.0:
+                        last_say = time.time()
                         say(f"walk: ({pos[0]:.0f}, {pos[2]:.0f}) want {want:.0f} yaw {yaw if yaw is None else round(yaw)} stick {a:+.0f} deg dist {dist:.0f}")
                     time.sleep(0.15)
                 else:

@@ -256,6 +256,32 @@ class Hero:
         return self.facing()
 
 
+class Camera:
+    """The local player's camera, as Player.GetCamera (0x8233BF58) finds it:
+    0x8243C338 gives *(0x831345C8) + 0x20 + slot x 0x620 (slot 0 for the
+    first local player). In it (measured live 2026-11-13): +0x10 a 3x3
+    rotation in rows of 4 floats, row 2 its forward axis; +0x40 its position."""
+
+    def __init__(self, g: Guest, slot: int = 0) -> None:
+        self.g, self.slot = g, slot
+
+    def base(self) -> int:
+        b = self.g.read(0x831345C8, 4)
+        return struct.unpack(">I", b)[0] + 0x20 + self.slot * 0x620 if b else 0
+
+    def yaw(self) -> float | None:
+        import math
+
+        b = self.g.read(self.base() + 0x10, 0x30)
+        if not b or len(b) < 0x30:
+            return None
+        f = struct.unpack(">12f", b)
+        fx, fz = f[8], f[10]
+        if fx * fx + fz * fz < 1e-6:
+            return None
+        return math.degrees(math.atan2(fx, fz))
+
+
 def world_matrix(g: Guest, t_addr: int):
     """The row-major 4x4 world matrix whose translation row starts at t_addr:
     (rows 0..2, translation), or None if it does not look like one (unit
