@@ -299,6 +299,10 @@ pub struct Entity {
     /// Whether it has an alarm (the `Alarm` component, its own or its
     /// template's: the alarm towers; [`crate::alarm`]).
     pub alarm: bool,
+    /// Whom its template says it belongs to (`Association`: the name of
+    /// the faction's template, `Allied`, `China`, `Guerilla`), when it
+    /// says.
+    pub association: Option<String>,
 }
 
 impl Entity {
@@ -430,6 +434,7 @@ impl GameData {
         let mut template_scripts: HashMap<u32, u32> = HashMap::new();
         let mut template_script_data: HashMap<u32, u32> = HashMap::new();
         let mut template_alarms: HashSet<u32> = HashSet::new();
+        let mut template_associations: HashMap<u32, u32> = HashMap::new();
         // Faction zones' faction templates, and every template's name.
         let mut zone_factions: Vec<(String, usize, u32)> = Vec::new();
         let mut template_names: HashMap<u32, String> = HashMap::new();
@@ -471,6 +476,7 @@ impl GameData {
                     template_scripts = db.hashes("ObjectScript");
                     template_script_data = script_data(&db);
                     template_alarms = carriers(&db, "Alarm");
+                    template_associations = db.hashes("Association");
                     template_riders = db.component("Rider").map(|c| riders(c)).unwrap_or_default();
                     (data.max_reserve, data.thrown) = crate::inventory::read(&db);
                     data.relations = m2_engine::ai::relations(&db);
@@ -540,6 +546,7 @@ impl GameData {
                             template: None,
                             crew: Vec::new(),
                             alarm: alarms.contains(&guid),
+                            association: None,
                         });
                         if let Some(r) = rides.remove(&guid) {
                             own_riders.push((name.clone(), list.len() - 1, r));
@@ -600,6 +607,10 @@ impl GameData {
                 e.crew = crew_of(r);
             }
             e.template = named(*template);
+            e.association = template_associations
+                .get(template)
+                .or_else(|| template_associations.get(&(template & !TEMPLATE_BIT)))
+                .and_then(|&a| named(a));
         }
         for (&template, records) in &template_riders {
             let driver = crew_of(records)
@@ -1192,6 +1203,20 @@ impl Mission {
             w.pursuit.clock.step(dt as f32);
             // No time scale yet: game and real time run together.
             w.clocks.step(dt as f32, dt as f32);
+            // The score moves by itself: by its states' lengths, and by
+            // the action level from those the game says are hostile and
+            // aware of her ([`Self::set_hostile_aware`]).
+            let decay = w.sound.hostility_decay_rate;
+            let clocks = w.sys.timer_update_music.unwrap_or(true);
+            let force = std::mem::take(&mut w.sound.force_action_transition);
+            let draw = (now * 7919.0).fract() as f32;
+            let aware = w.music.aware;
+            if let Some(c) = w
+                .music
+                .update(dt as f32, decay, aware, clocks, force, || draw)
+            {
+                w.commands.push(c);
+            }
         }
         // What the scripts killed since the last tick dies as anything
         // else does: its own script's `OnDeath` hears of it.
@@ -1219,6 +1244,7 @@ impl Mission {
             w.update_hibernation();
             w.tick_raw_clips(dt as f32);
             w.tick_fades(dt as f32);
+            w.hud.step_radar(dt as f32);
             scripted = (
                 std::mem::take(&mut w.script_spawns),
                 std::mem::take(&mut w.script_removals),
@@ -1280,11 +1306,18 @@ impl Mission {
             });
         }
         let ended = crate::vo::update(&self.world, self.host.lua(), now);
-        for (cue, error) in ended {
+        for (cue, state, error) in ended {
+            // What became of the line: it ended, or was refused
+            // ("failed") or cut off ("cancel"), as its callback is told.
+            let what = match state {
+                "complete" => "ended".to_owned(),
+                "failed" => "refused (failed)".to_owned(),
+                state => format!("cut off ({state})"),
+            };
             self.log.push(match error {
-                None => format!("  t={now:.1} line {cue} ended"),
+                None => format!("  t={now:.1} line {cue} {what}"),
                 Some(e) => format!(
-                    "  t={now:.1} line {cue} ended; callback: {}",
+                    "  t={now:.1} line {cue} {what}; callback: {}",
                     first_lines(&e.to_string())
                 ),
             });
@@ -2593,6 +2626,13 @@ end
 
     /// The player is (no longer) on her grappling hook's line, for the
     /// scripts' `Human.IsGrappling`.
+    /// How many hostile characters are aware of the player now, in the
+    /// music's four groups ([`crate::music_machine::group`]): what the
+    /// score's action level is worked out from.
+    pub fn set_hostile_aware(&mut self, counts: [u32; 4]) {
+        self.world.borrow_mut().music.aware = counts;
+    }
+
     pub fn set_grappling(&mut self, on: bool) {
         self.world.borrow_mut().grappling = on;
     }
@@ -2601,11 +2641,33 @@ end
     /// (its `vo` events: the faction HQs' briefings are spoken by their
     /// clips, 806 lines over 258 clips, from samples): said as a scripted
     /// line with no callback, its subtitle up if the player has them on.
+    ///
+    /// From the 360 code: the voice manager hears the clips' voice
+    /// events only while it is in cinematic mode (`VO.SetCinematicMode`,
+    /// `0x82278118`, which joins and leaves their queue; the update
+    /// `0x82277D98` reads it only then), and cues each line at priority
+    /// 0, the one priority that mode lets play, with its subtitle. Out
+    /// of that mode the event is dropped.
     pub fn clip_line(&mut self, speaker: u32, cue: &str) {
+        if !self.world.borrow().vo.cinematic {
+            self.log.push(format!(
+                "  clip line {cue} not said: the voice is not in cinematic mode"
+            ));
+            return;
+        }
         let mut w = self.world.borrow_mut();
         let subtitled = !w.subtitles_off;
-        let say = w.vo.cue(Some(speaker), cue.to_owned(), None, subtitled);
-        w.commands.push(say);
+        let sequences = std::mem::take(&mut w.vo_sequences);
+        let say = w.vo.cue(
+            Some(speaker),
+            cue.to_owned(),
+            None,
+            subtitled,
+            0,
+            &sequences,
+        );
+        w.vo_sequences = sequences;
+        w.commands.extend(say.into_iter().flatten());
     }
 
     /// Everything the scripts asked the game to do since the last call.
@@ -2887,7 +2949,7 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
                 w.gates.insert(e.guid);
             }
             if e.alarm {
-                w.alarms.add(e.guid, e.script);
+                w.alarms.add(e.guid, e.script, e.association.clone());
             }
             if let Some(r) = &e.region {
                 w.regions.insert(e.guid, r.clone());
@@ -3507,8 +3569,10 @@ mod tests {
             r#"
             local function second(state) VO.Cue(0, "B", function() heard = state end) end
             VO.Cue(0, "A", second, {}, 1, true)
-            VO.Cue(0, "C", function() cancelled = true end)
-            VO.Cancel(0, "C", true)
+            -- Less important than A, the radio's line: it may not play.
+            refused = VO.Cue(0, "D", function(state) d = state end)
+            VO.Cue(1, "C", function(state) c = state end)
+            VO.Cancel(1, "C", true)
             ordered = VO.PRIORITY_CINEMATIC < VO.PRIORITY_SCRIPTED_CONTRACT
             "#,
             "test",
@@ -3521,13 +3585,21 @@ mod tests {
         };
         assert_eq!(
             m.take_commands(),
-            [say(1, "A"), say(2, "C"), Command::Hush(2)]
+            [
+                say(1, "A"),
+                Command::Say {
+                    id: 2,
+                    speaker: Some(1),
+                    cue: "C".into()
+                },
+                Command::Hush(2)
+            ]
         );
         // The call as the scripts made it, for the log.
         assert!(
             m.take_log()
                 .iter()
-                .any(|l| l == r#"  print VO.Cancel(0, "C"): speaker None, stops lines [2]"#)
+                .any(|l| l == r#"  print VO.Cancel(1, "C"): speaker Some(1), stops lines [2]"#)
         );
         m.tick(0.1);
         m.line_length(1, 1.0);
@@ -3535,12 +3607,23 @@ mod tests {
         assert!(m.take_commands().is_empty());
         m.tick(0.6);
         assert_eq!(m.take_commands(), [say(3, "B")]);
-        for _ in 0..50 {
+        for _ in 0..60 {
             m.tick(0.1);
         }
         let g = m.host.lua().globals();
         assert_eq!(g.raw_get::<String>("heard").unwrap(), "complete");
-        assert_eq!(g.raw_get::<Option<bool>>("cancelled").unwrap(), None);
+        // The refused line and the cancelled one are told so.
+        assert!(!g.raw_get::<bool>("refused").unwrap());
+        assert_eq!(g.raw_get::<String>("d").unwrap(), "failed");
+        assert_eq!(g.raw_get::<String>("c").unwrap(), "cancel");
+        let log = m.take_log();
+        for line in [
+            "line D refused (failed)",
+            "line C cut off (cancel)",
+            "line A ended",
+        ] {
+            assert!(log.iter().any(|l| l.ends_with(line)), "{line}: {log:?}");
+        }
         assert!(g.raw_get::<bool>("ordered").unwrap());
     }
 
@@ -4115,6 +4198,7 @@ mod tests {
                 ("seat_driver".into(), "VZ Tank Commander".into()),
             ],
             alarm: false,
+            association: None,
         }
     }
 

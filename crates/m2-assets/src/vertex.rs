@@ -405,6 +405,41 @@ fn decode(ty: DeclType, b: &[u8]) -> [f32; 4] {
     }
 }
 
+/// Converts to the nearest IEEE 754 binary16 value (ties to even); too
+/// large a value becomes an infinity.
+pub fn f32_to_half(f: f32) -> u16 {
+    let bits = f.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x007F_FFFF;
+    if exp == 0xFF {
+        // Infinity or NaN.
+        return sign | 0x7C00 | if mant != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1F {
+        return sign | 0x7C00;
+    }
+    if e <= 0 {
+        // Too small for a normal half: a subnormal, or zero.
+        if e < -10 {
+            return sign;
+        }
+        let m = mant | 0x0080_0000;
+        let shift = (14 - e) as u32;
+        let half = m >> shift;
+        let rest = m & ((1 << shift) - 1);
+        let mid = 1 << (shift - 1);
+        let up = rest > mid || (rest == mid && half & 1 == 1);
+        return sign | (half as u16 + u16::from(up));
+    }
+    let half = ((e as u32) << 10) | (mant >> 13);
+    let rest = mant & 0x1FFF;
+    let up = rest > 0x1000 || (rest == 0x1000 && half & 1 == 1);
+    // A carry out of the mantissa rolls into the exponent, as it should.
+    sign | (half + u32::from(up)) as u16
+}
+
 /// Converts an IEEE 754 binary16 value.
 pub fn half_to_f32(h: u16) -> f32 {
     let sign = u32::from(h >> 15) << 31;
@@ -449,6 +484,26 @@ pub(crate) mod tests {
         let exp = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
         assert!((1..31).contains(&exp), "{v} is not a normal half");
         sign | ((exp as u16) << 10) | ((bits >> 13) & 0x3FF) as u16
+    }
+
+    #[test]
+    fn f32_to_half_round_trips_every_half() {
+        for h in 0..=u16::MAX {
+            let f = half_to_f32(h);
+            if f.is_nan() {
+                continue;
+            }
+            assert_eq!(super::f32_to_half(f), h, "{h:#06x} = {f}");
+        }
+        assert_eq!(super::f32_to_half(1.0), 0x3C00);
+        assert_eq!(super::f32_to_half(-2.0), 0xC000);
+        assert_eq!(super::f32_to_half(1.0e9), 0x7C00);
+        assert_eq!(super::f32_to_half(1.0e-10), 0);
+        // Between two halves: the nearer; halfway: the even one.
+        let (a, b) = (half_to_f32(0x3C00), half_to_f32(0x3C01));
+        assert_eq!(super::f32_to_half(a + (b - a) * 0.25), 0x3C00);
+        assert_eq!(super::f32_to_half(a + (b - a) * 0.75), 0x3C01);
+        assert_eq!(super::f32_to_half(a + (b - a) * 0.5), 0x3C00);
     }
 
     #[test]
