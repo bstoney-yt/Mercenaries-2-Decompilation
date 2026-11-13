@@ -392,6 +392,9 @@ pub struct Templates {
     /// Each person template's `HumanAnimationSet` gender and character
     /// name, by id ([`crate::tuning::human_animation_sets`]).
     pub human_sets: HashMap<u32, (u32, u32)>,
+    /// Each person template's face rig (a `facefxactor` asset's name
+    /// hash), by id ([`crate::tuning::face_actors`]).
+    pub face_actors: HashMap<u32, u32>,
     /// Hand-held guns that fire rounds, by id ([`crate::tuning::hand_guns`]).
     pub guns: HashMap<u32, HandGun>,
     /// What each template's `EquipmentLink`s hand it, by id.
@@ -679,6 +682,14 @@ impl Templates {
         self.ids(name)
             .iter()
             .find_map(|id| self.human_sets.get(id).copied())
+    }
+
+    /// Template `name`'s face rig (a `facefxactor` asset's name hash),
+    /// whatever its case.
+    pub fn face_actor(&self, name: &str) -> Option<u32> {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.face_actors.get(id).copied())
     }
 
     /// The rifle template `name` (a hero: `Jen`) is handed by its
@@ -1162,6 +1173,7 @@ impl Templates {
             human_motion: crate::tuning::human_motion(&db),
             cover_hints: crate::tuning::cover_hints(&db),
             human_sets: crate::tuning::human_animation_sets(&db),
+            face_actors: crate::tuning::face_actors(&db),
             guns: crate::tuning::hand_guns(&db),
             equipment: crate::tuning::equipment(&db),
             arms: crate::weapons::read(&db),
