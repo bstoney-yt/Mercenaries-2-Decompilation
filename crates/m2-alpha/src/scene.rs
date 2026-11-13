@@ -1424,6 +1424,8 @@ pub struct Scene {
     /// frame each was last drawn in: freed once they have not been drawn
     /// for a while ([`FACE_KEPT`]).
     faces: HashMap<u64, (m2_engine::MorphedFace, u64)>,
+    /// Her face on the GPU ([`crate::player::Player::face`]).
+    hero_face: m2_engine::MorphedFace,
     /// Frames drawn.
     frame: u64,
     /// The grid, drawn when there is no island.
@@ -2258,6 +2260,7 @@ impl Scene {
         Ok(Self {
             ruins: Default::default(),
             faces: HashMap::new(),
+            hero_face: Default::default(),
             frame: 0,
             mission_crews: Default::default(),
             prop_crews: Vec::new(),
@@ -3698,7 +3701,16 @@ impl Scene {
                     (nodes, skin, player.model_matrix())
                 }
             };
-            model.draw_posed(backend, queue, body, &nodes, &skin)?;
+            // Her face: her own copy of the head's vertices, once an
+            // expression has moved it.
+            let face = if model.has_blend_shapes()
+                && model.blend_face(backend, &mut self.hero_face, player.face.weights())?
+            {
+                Some(&self.hero_face)
+            } else {
+                None
+            };
+            model.draw_posed_face(backend, queue, body, &nodes, &skin, None, face)?;
             // Throwing, her weapon is put away and the grenade is in her
             // hand until it goes; calling a support strike, the
             // designator is. Her rifle is her own or the carbine

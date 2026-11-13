@@ -2123,6 +2123,17 @@ impl MissionLink {
                 m2_game::vo::Speech::Stopped { speaker, cue, .. } => (false, speaker, cue),
             };
             let Some(guid) = speaker else { continue };
+            // Her own lines.
+            if guid == m2_game::mission::PLAYER {
+                if let Some(p) = game.scene.player.as_mut() {
+                    eprintln!(
+                        "face: she {} speaking (line {cue:08x})",
+                        if on { "starts" } else { "stops" }
+                    );
+                    p.speak(on);
+                }
+                continue;
+            }
             match game
                 .scene
                 .people

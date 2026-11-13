@@ -452,6 +452,12 @@ pub struct Player {
     /// plain `Die` has no clip and makes a person a ragdoll at once
     /// ([`crate::combat::Combat`] makes it and takes it away).
     pub ragdoll: Option<m2_engine::RagdollId>,
+    /// The expressions on her face ([`m2_engine::face_expression`]): she
+    /// blinks from the start, as everyone does (0x8241F360), her mouth
+    /// flaps while a line of hers plays, and a stagger shows `Angry`.
+    pub face: m2_engine::face_expression::Face,
+    /// The state of her face's own random numbers.
+    face_seed: u64,
     /// Seated: model to world for her body, the vehicle's whole turn
     /// (pitch and roll as well as heading) with her clip's origin on the
     /// seat ([`model_matrix`](Self::model_matrix)).
@@ -677,6 +683,17 @@ impl Player {
             fell: None,
             seated: false,
             ragdoll: None,
+            face: {
+                let mut face = m2_engine::face_expression::Face::default();
+                face.play(
+                    m2_engine::face_expression::BLINK,
+                    1.0,
+                    -1.0,
+                    [0.3, 0.7, 0.5, 0.1],
+                );
+                face
+            },
+            face_seed: 0x2545_f491_4f6c_dd1d,
             seat_frame: None,
             moves: Moves::default(),
             in_hand: InHand::default(),
@@ -995,6 +1012,16 @@ impl Player {
 
     /// One fixed tick of `dt` seconds.
     pub fn update(&mut self, physics: &Physics, intent: Intent, dt: f32) {
+        // Her face goes on while she is up; down, it stays as it was.
+        if !self.down {
+            let seed = &mut self.face_seed;
+            self.face.step(dt, || {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 7;
+                *seed ^= *seed << 17;
+                (*seed >> 40) as f32 / (1u64 << 24) as f32
+            });
+        }
         self.yaw += intent.look.x;
         self.pitch = (self.pitch + intent.look.y).clamp(-1.2, 0.9);
 
@@ -1805,6 +1832,17 @@ impl Player {
     /// clip for it. On her feet on the ground only: the state table
     /// leads to the staggers from `Upright` actions. True if she
     /// staggers.
+    /// Her mouth flapping while a line of hers plays (`on`), as the 360's
+    /// voice system has every speaker's (0x822782D8, 0x82278440).
+    pub fn speak(&mut self, on: bool) {
+        self.face.play(
+            m2_engine::face_expression::FLAP,
+            if on { 1.0 } else { 0.0 },
+            -1.0,
+            [0.2, 0.6, 0.4, 0.9],
+        );
+    }
+
     pub fn stagger(&mut self, event: &m2_engine::stagger::Event) -> bool {
         use m2_engine::stagger::{self, Person};
         if self.down || self.driving.is_some() || self.seated || !self.character.grounded {
@@ -1841,6 +1879,14 @@ impl Player {
             pick.stagger, pick.direction
         );
         self.stagger_pending = Some((clip, pick.stagger.action()));
+        // A stagger is one of the actions the 360 shows `Angry` on
+        // (0x8241FE38).
+        self.face.play(
+            m2_engine::face_expression::ANGRY,
+            1.0,
+            m2_engine::face_expression::ANGRY_SECONDS,
+            [0.5, 0.25, 0.75, 0.5],
+        );
         self.since_stagger = Some(0.0);
         true
     }
@@ -2611,6 +2657,44 @@ mod tests {
         assert_eq!(p.jump_step(false, false, 0.2, 0.02), (None, false));
         assert_eq!(p.leap, Leap::No);
         assert!(p.human.is("Upright", "Idle"));
+    }
+
+    /// She blinks from the start, flaps while her line plays, and a
+    /// stagger shows Angry.
+    #[test]
+    fn her_face_blinks_talks_and_shows_anger() {
+        use m2_engine::face_expression::{ANGRY, BLINK, FLAP};
+        let mut p = Player::new(0.0, 0.0, 0.0, None);
+        assert!(p.face.plays(BLINK) && !p.face.plays(FLAP));
+        p.speak(true);
+        assert!(p.face.plays(FLAP));
+        p.speak(false);
+        let mut seed = 1u64;
+        for _ in 0..30 {
+            p.face.step(1.0 / 60.0, || {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (seed >> 40) as f32 / (1u64 << 24) as f32
+            });
+        }
+        assert!(!p.face.plays(FLAP));
+        p.character.grounded = true;
+        let mut held = crate::held::Held {
+            class: m2_assets::animation_table::RIFLE,
+            ..Default::default()
+        };
+        held.staggers[m2_engine::stagger::Stagger::InPlace as usize]
+            [m2_engine::stagger::Direction::Front as usize] = Some(11);
+        p.moves = Moves {
+            held: vec![held],
+            ..Moves::default()
+        };
+        assert!(p.stagger(&m2_engine::stagger::Event {
+            direction: Vec3::NEG_Z,
+            direct: true,
+            melee: true,
+            key: None,
+        }));
+        assert!(p.face.plays(ANGRY));
     }
 
     #[test]
