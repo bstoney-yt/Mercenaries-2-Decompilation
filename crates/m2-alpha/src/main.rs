@@ -4635,6 +4635,7 @@ fn mission_for_screenshot(
                     delivery_key = key;
                 }
                 a.deliveries = deliveries;
+                a.race_next = link.race_next();
                 let keep = link.kept_within();
                 if keep.len() != a.keep.len() {
                     eprintln!(
