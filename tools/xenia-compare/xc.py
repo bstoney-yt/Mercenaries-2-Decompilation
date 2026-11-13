@@ -465,6 +465,7 @@ def run(args) -> int:
                 end, t0, k, next_shot, last_say = time.time() + timeout, time.time(), 0, time.time(), 0.0
                 offset, sense, rx = 0.0, 1.0, 0.0
                 last_yaw, clicked = None, 0.0
+                stall_t, stall_p, jump_t = time.time(), None, 0.0
                 while time.time() < end:
                     pos = tracker.update() if tracker else None
                     yv = cam.yaw()
@@ -492,6 +493,15 @@ def run(args) -> int:
                     err = (want - offset - yv + 180) % 360 - 180
                     rx = max(-1.0, min(1.0, sense * err / 40))
                     bb = b & ~BTN["ls"]
+                    # Stalled (under 1 m in 2 s: a bank or ledge at the water's
+                    # edge, z ~2640 on VzaCon001's beach): jump (A) while pushing on.
+                    if stall_p is None or time.time() - stall_t > 2.0:
+                        if stall_p is not None and math.hypot(pos[0] - stall_p[0], pos[2] - stall_p[2]) < 1.0:
+                            jump_t = time.time()
+                            say(f"walkcam: stalled at ({pos[0]:.0f}, {pos[2]:.0f}), jumping")
+                        stall_t, stall_p = time.time(), pos
+                    if time.time() - jump_t < 0.3:
+                        bb |= BTN["a"]
                     if b & BTN["ls"] and not clicked and time.time() - t0 > 1.0:
                         clicked = time.time()
                     if clicked and time.time() - clicked < 0.2:
