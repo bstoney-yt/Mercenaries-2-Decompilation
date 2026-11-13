@@ -10790,7 +10790,15 @@ fn world_sounds(audio: &mut sound::GameAudio, game: &mut Game, was_driving: &mut
     }
     *was_driving = driving;
     for remark in remarks {
-        audio.remark(remark);
+        // Her mouth flaps while her line plays, as every speaker's does
+        // (0x822782D8, 0x822531D8: the voice systems post `Flap` for
+        // whoever speaks, the player as anyone).
+        if let Some(seconds) = audio.remark(remark)
+            && let Some(p) = game.scene.player.as_mut()
+        {
+            eprintln!("face: she remarks ({remark:?}) for {seconds:.1} s");
+            p.speak_for(seconds);
+        }
     }
 }
 
