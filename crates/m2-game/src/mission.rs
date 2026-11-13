@@ -3085,7 +3085,7 @@ fn seat_crew(
 /// `repairpad` is the script of the helipads and the PMC's garage
 /// (0xcd561a19): awake, its lights are on (`Vehicle.SetParts` of
 /// `LightFront`), and they go out when it dies.
-pub const OBJECT_SCRIPTS: [(&str, u32); 13] = [
+pub const OBJECT_SCRIPTS: [(&str, u32); 14] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3099,7 +3099,11 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 13] = [
     ("collectable", COLLECTABLE),
     ("pmcgate", PMC_GATE),
     ("repairpad", REPAIR_PAD),
+    ("pursuitcopter", PURSUIT_COPTER),
 ];
+
+/// `pursuitcopter`'s module hash.
+pub const PURSUIT_COPTER: u32 = 0x3e29_6216;
 
 /// `pmcgate`'s module hash.
 pub const PMC_GATE: u32 = 0xff56_2dd6;
@@ -4118,6 +4122,39 @@ mod tests {
         )));
         assert!(OBJECT_SCRIPTS.contains(&("pmcgate", PMC_GATE)));
         assert!(OBJECT_SCRIPTS.contains(&("repairpad", REPAIR_PAD)));
+    }
+
+    #[test]
+    fn a_pursuit_helicopter_comes_with_its_passengers_and_its_script() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        {
+            let mut w = m.world.borrow_mut();
+            w.template_drivers.insert(
+                "alouette3 transport (vz) (pursuit)".into(),
+                "VZ Soldier".into(),
+            );
+            w.template_passengers.insert(
+                "alouette3 transport (vz) (pursuit)".into(),
+                vec!["VZ Soldier".into(), "VZ Soldier".into()],
+            );
+            w.template_scripts.insert(
+                "alouette3 transport (vz) (pursuit)".into(),
+                (PURSUIT_COPTER, None),
+            );
+        }
+        let copter = m
+            .spawn("Alouette3 Transport (VZ) (Pursuit)", [0.0, 70.0, 350.0])
+            .unwrap();
+        let w = m.world.borrow();
+        let riders = w
+            .objects
+            .values()
+            .filter(|o| o.vehicle == Some(copter))
+            .count();
+        // Its pilot and its two soldiers.
+        assert_eq!(riders, 3);
+        assert_eq!(w.scripted.get(&copter), Some(&PURSUIT_COPTER));
+        assert!(OBJECT_SCRIPTS.contains(&("pursuitcopter", PURSUIT_COPTER)));
     }
 
     #[test]

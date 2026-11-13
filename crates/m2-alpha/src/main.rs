@@ -57,6 +57,7 @@ mod coop;
 mod destruct;
 mod disguise;
 mod display;
+mod drop_zones;
 mod drops;
 mod entrance_marker;
 mod errlog;
