@@ -2995,8 +2995,16 @@ impl MissionLink {
                 }
             }
         }
-        if let Some(check) = &mut self.paradrop_check {
-            check.tick(game, mission, dt);
+        if let Some(check) = &mut self.paradrop_check
+            && check.tick(game, mission, dt) == crate::paradrop_check::Ask::Ashore
+            && game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.landed || p.swimming())
+            && go_ashore(game)
+        {
+            eprintln!("paradrop-check: she is put ashore to drop over dry ground");
         }
         // A pursuit run out: the scripts read level 0 again.
         let pursued = !game.scene.people.pursuit.is_empty();

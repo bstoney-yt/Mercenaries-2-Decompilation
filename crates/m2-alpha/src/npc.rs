@@ -9052,6 +9052,35 @@ pub(crate) mod tests {
         assert!(people.take_health_changes().is_empty());
     }
 
+    // One dropped over the sea comes down in it unhurt, however far he
+    // fell: in the water there is no landing to hurt him, so his chute is
+    // never shed (why the paradrop check drops over dry ground).
+    #[test]
+    fn a_man_dropped_into_the_sea_lands_unhurt() {
+        let mut physics = ground();
+        physics.set_water(5.0);
+        let mut rng = Rng::default();
+        let mut npc = Npc::new(
+            0,
+            &rig(),
+            Vec3::new(0.0, 60.0, 0.0),
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(8),
+        );
+        npc.dropped = true;
+        npc.character.gravity = m2_engine::on_foot::scaled_gravity(9.8, 0.2);
+        for _ in 0..60 * 12 {
+            npc.update(&physics, &mut rng, None, 1.0 / 60.0);
+        }
+        assert!(npc.landed && !npc.dropped);
+        assert!(npc.character.position.y < 5.0 + 0.5);
+        assert!(npc.alive, "no landing hurt him: {}", npc.hp);
+        let mut people = People::default();
+        people.npcs.push(npc);
+        assert!(people.take_health_changes().is_empty());
+    }
+
     // The fall rule by distance, for one walking: under 2 m nothing,
     // under 3 m 10, under 4 m 50 (a soldier's limits).
     #[test]
