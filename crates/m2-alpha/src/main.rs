@@ -57,6 +57,7 @@ mod coop;
 mod destruct;
 mod disguise;
 mod display;
+mod drop_zones;
 mod drops;
 mod entrance_marker;
 mod errlog;
@@ -71,6 +72,7 @@ mod halt;
 mod held;
 mod hero;
 mod hijack;
+mod homing;
 mod input;
 mod jobs;
 mod keytable;
@@ -289,6 +291,8 @@ struct Options {
     take: bool,
     /// With `--aim` (or `--drive --look`): fire just before the picture.
     fire: bool,
+    /// `--homing-check`: her vehicle is seen by every homing weapon.
+    homing_check: bool,
     /// With `--screenshot` on foot: hits she takes just before the
     /// picture, from these directions (degrees clockwise from where the
     /// camera looks), to see the HUD's hit arcs.
@@ -516,6 +520,10 @@ struct Options {
     /// With `--mission --screenshot`: the game's sound runs, through a
     /// mixer with no device, and logs what it plays (`--sound`).
     sound: bool,
+    /// The HUD and the scripts take an Xbox pad to be playing, with none
+    /// there (`--pad`): its button pictures in texts, the tutorials'
+    /// pad texts (`Gui.ControllerInUse`), for checking them offscreen.
+    pad: bool,
     /// With `--screenshot`: the front end alone (the shell's menus),
     /// pictured as `--shell-key`s are pressed.
     front_end: bool,
@@ -775,6 +783,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--to-front-end" => o.to_front_end = true,
             "--movies" => o.movies = true,
             "--sound" => o.sound = true,
+            "--pad" => o.pad = true,
             "--front-end" => o.front_end = true,
             "--shell-key" => o.shell_keys.push(
                 value()?
@@ -1001,6 +1010,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--riders" => o.riders = true,
             "--take" => o.take = true,
             "--fire" => o.fire = true,
+            "--homing-check" => o.homing_check = true,
             "--look-pickup" => {
                 o.look_pickup = Some(value()?.parse().context("--look-pickup expects metres")?)
             }
@@ -1222,6 +1232,7 @@ fn run(
         );
     }
     combat::use_attach_frame(!options.hands_grip);
+    gamehud::force_pad(options.pad);
     let config_path = options
         .config_path
         .clone()
@@ -2319,6 +2330,7 @@ fn screenshot(
             game.combat
                 .equip(combat::Weapon::GrenadeLauncher, 3 * combat::LAUNCHER_CLIP);
         }
+        game.combat.homing_check = options.homing_check;
         // A launcher on her back, the rifle up.
         if let Some(w) = options.slung {
             game.combat.equip(w, 3 * combat::LAUNCHER_CLIP);
@@ -10752,6 +10764,14 @@ fn world_sounds(audio: &mut sound::GameAudio, game: &mut Game, was_driving: &mut
     let sounds = game.combat.take_sounds();
     let db = game.scene.world.as_ref().map(|w| &w.index.template_db);
     audio.play_fight(&sounds, db);
+    // The locks on her vehicle she hears ([`homing::Warnings`]).
+    for (cue, stop) in game.combat.take_warning_cues() {
+        if stop {
+            audio.stop_ui_sound(cue);
+        } else {
+            audio.ui_sound(cue);
+        }
+    }
     let cues = game.scene.take_cues(ear, CUE_REACH);
     audio.play_cues(&cues);
     let engine = game.engine();
@@ -11176,6 +11196,10 @@ mod tests {
         assert_eq!(screenshot_only_ignored(&args(&["--sound"])), ["--sound"]);
         let o = parse_args(&args(&["--mission", "--screenshot", "o.ppm", "--sound"])).unwrap();
         assert!(o.sound);
+        // A pad taken to play, window or not.
+        assert!(!o.pad);
+        assert!(parse_args(&args(&["--pad"])).unwrap().pad);
+        assert!(screenshot_only_ignored(&args(&["--pad"])).is_empty());
     }
 
     #[test]

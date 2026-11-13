@@ -17,6 +17,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
+pub use m2_engine::heli_land::DropZone;
 use m2_math::glam::Vec3;
 use mlua::{Function, Lua, MultiValue, Table, Value};
 
@@ -953,9 +954,17 @@ pub struct ScriptWorld {
     pub layers: crate::layers::LayerState,
     /// Goal callbacks waiting for the AI to finish: guid, callback, data.
     goal_callbacks: Vec<(u32, Function, Option<Table>)>,
-    /// Drop and landing zone tests asked for (`Ai.TestDropZone`): the
-    /// callback to answer and the spot tested.
-    drop_tests: Vec<(Function, [f32; 3])>,
+    /// Drop zone tests asked for (`Ai.TestDropZone`) and not yet
+    /// answered: their number, callback, the point tested and the test.
+    drop_tests: Vec<(u32, Function, [f32; 3], DropZone)>,
+    /// Drop zone tests' outcomes from the game ([`ScriptWorld::answer_drop_test`]):
+    /// number, found, the spot.
+    drop_answers: Vec<(u32, bool, [f32; 3])>,
+    /// Whether the game searches the drop zones
+    /// ([`ScriptWorld::search_drop_zones`]); if not, each test is answered
+    /// found at its point.
+    drop_searcher: bool,
+    next_drop_test: u32,
     /// Assets asked for with a callback (`Pg.LoadAsset(name, type,
     /// callback, data)`): answered as loaded on the next tick
     /// ([`answer_asset_loads`]).
@@ -1473,8 +1482,10 @@ impl ScriptWorld {
         // A full one (`"Ka29b (Full)"`, a soldier delivery's) comes with its
         // passengers too, as its other `Rider` records name them
         // (inferred from the name: `MrxSoldierDelivery` takes them out with
-        // `Ai.Deploy` once it has landed).
-        if lower.contains("(full)") {
+        // `Ai.Deploy` once it has landed). So does an army's pursuit
+        // helicopter (`"MH53J (Pursuit)"`), whose own script
+        // (`pursuitcopter`) lands it and takes them out the same way.
+        if lower.contains("(full)") || lower.contains("(pursuit)") {
             for rider in self
                 .template_passengers
                 .get(&lower)
@@ -1909,14 +1920,56 @@ pub fn arrived(world: &Shared, guid: u32, at: [f32; 3]) -> Vec<mlua::Error> {
     goal_finished(world, guid)
 }
 
-/// Answers the drop zone tests asked for since the last call: each spot
-/// will do, as tested (`callback(true, x, y, z)`; the engine's own test of
-/// the ground there isn't modelled). Returns any errors.
+impl ScriptWorld {
+    /// The game searches the drop zones the scripts test from now on
+    /// ([`ScriptWorld::drop_tests`], [`ScriptWorld::answer_drop_test`]).
+    pub fn search_drop_zones(&mut self) {
+        self.drop_searcher = true;
+    }
+
+    /// The drop zone tests under way: number, point, test.
+    pub fn drop_tests(&self) -> Vec<(u32, [f32; 3], DropZone)> {
+        self.drop_tests
+            .iter()
+            .map(|(id, _, at, zone)| (*id, *at, *zone))
+            .collect()
+    }
+
+    /// Drop zone test `id` ended: `found`, and the spot (the search's
+    /// window either way, as the 360 reports it). Its callback hears so on
+    /// the next tick.
+    pub fn answer_drop_test(&mut self, id: u32, found: bool, at: [f32; 3]) {
+        self.drop_answers.push((id, found, at));
+    }
+}
+
+/// Answers the drop zone tests whose outcome is in: the game's searches'
+/// ([`ScriptWorld::answer_drop_test`]), the callback hearing `(found, x,
+/// y, z)` as the 360's does (0x822CEB80); or, with no game searching
+/// them (a run of the scripts alone), every test found at its point.
+/// Returns any errors.
 pub fn answer_drop_tests(world: &Shared) -> Vec<mlua::Error> {
-    let tests = std::mem::take(&mut world.borrow_mut().drop_tests);
+    let due: Vec<(Function, bool, [f32; 3])> = {
+        let mut w = world.borrow_mut();
+        if w.drop_searcher {
+            let answers = std::mem::take(&mut w.drop_answers);
+            answers
+                .into_iter()
+                .filter_map(|(id, found, at)| {
+                    let i = w.drop_tests.iter().position(|t| t.0 == id)?;
+                    Some((w.drop_tests.remove(i).1, found, at))
+                })
+                .collect()
+        } else {
+            std::mem::take(&mut w.drop_tests)
+                .into_iter()
+                .map(|(_, f, at, _)| (f, true, at))
+                .collect()
+        }
+    };
     let mut errors = Vec::new();
-    for (f, [x, y, z]) in tests {
-        if let Err(e) = f.call::<()>((true, x, y, z)) {
+    for (f, found, [x, y, z]) in due {
+        if let Err(e) = f.call::<()>((found, x, y, z)) {
             errors.push(e);
         }
     }
@@ -3628,7 +3681,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             Some(&s) => values([Value::String(
                 lua.create_string(WINCH_STATES[usize::from(s & 3)])?,
             )]),
-            None => Err(mlua::Error::runtime("Object.GetWinchState: no winch")),
+            // 0x823336E8: no winch (or no object), nil (0x82206F20).
+            None => values([Value::Nil]),
         }
     })?;
     add(&object, "SetWinchState", |w, _, a| {
@@ -3650,9 +3704,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 });
                 values([])
             }
-            _ => Err(mlua::Error::runtime(
-                "Object.SetWinchState: no winch or state",
-            )),
+            // 0x823337E8: no winch, or a name not among the four, is
+            // let be and answers nil (0x82206F20, which pushes nil): not
+            // an error, so the intro deliveries' callback (which sets
+            // "deployed" on a helicopter the world has no winch for)
+            // goes on to send it.
+            _ => values([Value::Nil]),
         }
     })?;
     add(&object, "IsWinching", |w, _, a| {
@@ -4339,11 +4396,32 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([Value::Number(f64::from(value))])
     })?;
     // Whether a helicopter can set a load down near `Location` (a supply
-    // drop, a vehicle): answered later through `Callback`
-    // ([`answer_drop_tests`]); true now, the test under way.
+    // drop, a vehicle, a pursuit's soldiers): the 360 (0x82312540) reads
+    // the table's sizes into a landing-zone search (0x822CE968,
+    // [`DropZone`]) and answers through `Callback` once it ends
+    // ([`answer_drop_tests`]); true now, the test under way (false: its
+    // 32 searches all busy, not modelled).
     add(&ai, "TestDropZone", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
             return values([Value::Boolean(false)]);
+        };
+        // Unset sizes are the 360's default (0x820BAF14, its value not
+        // read; taken as 0 here).
+        let size = |k: &str| -> mlua::Result<f32> {
+            Ok(num(Some(&t.raw_get::<Value>(k)?)).unwrap_or(0.0))
+        };
+        let flag = |k: &str| -> mlua::Result<bool> {
+            Ok(matches!(t.raw_get::<Value>(k)?, Value::Boolean(true)))
+        };
+        let zone = DropZone {
+            search_radius: size("SearchRadius")?,
+            inner_radius: size("InnerRadius")?,
+            outer_radius: size("OuterRadius")?,
+            inner_height: size("InnerHeightTolerance")?,
+            outer_height: size("OuterHeightTolerance")?,
+            height_max: size("HeightMax")?,
+            water: flag("Water")?,
+            no_height_restriction: flag("NoHeightRestriction")?,
         };
         let at = match t.raw_get::<Value>("Location")? {
             Value::Table(l) => {
@@ -4354,7 +4432,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         };
         match (t.raw_get::<Value>("Callback")?, at) {
             (Value::Function(f), Some(at)) => {
-                w.drop_tests.push((f, at));
+                w.next_drop_test += 1;
+                let id = w.next_drop_test;
+                w.drop_tests.push((id, f, at, zone));
                 values([Value::Boolean(true)])
             }
             _ => values([Value::Boolean(false)]),
@@ -8115,6 +8195,58 @@ mod tests {
         assert!(ask(), "a save to load");
     }
 
+    // `pursuitcopter`'s `FindLZ` test: its sizes reach the game's search
+    // (by the 360's field names, 0x82312540), and its callback hears the
+    // search's outcome, `(found, x, y, z)`, only once the game answers.
+    #[test]
+    fn a_drop_zone_test_waits_for_the_games_search_and_hears_its_outcome() {
+        let (host, world) = setup();
+        world.borrow_mut().search_drop_zones();
+        host.lua()
+            .load(
+                r#"heard = nil
+                ok = Ai.TestDropZone({ Callback = function(found, x, y, z)
+                        heard = { found, x, y, z } end,
+                    Location = { 1, 2, 3 }, InnerRadius = 6,
+                    InnerHeightTolerance = 1, OuterRadius = 19,
+                    OuterHeightTolerance = 2.5, HeightMax = 20,
+                    SearchRadius = 40, Water = false })"#,
+            )
+            .exec()
+            .unwrap();
+        let tests = world.borrow().drop_tests();
+        assert_eq!(tests.len(), 1);
+        let (id, at, zone) = tests[0];
+        assert_eq!(at, [1.0, 2.0, 3.0]);
+        assert_eq!(
+            zone,
+            DropZone {
+                search_radius: 40.0,
+                inner_radius: 6.0,
+                outer_radius: 19.0,
+                inner_height: 1.0,
+                outer_height: 2.5,
+                height_max: 20.0,
+                water: false,
+                no_height_restriction: false,
+            }
+        );
+        let heard = || -> Value { host.lua().load("return heard").eval().unwrap() };
+        assert!(answer_drop_tests(&world).is_empty());
+        assert!(matches!(heard(), Value::Nil), "not yet searched");
+        world
+            .borrow_mut()
+            .answer_drop_test(id, false, [4.0, 5.0, 6.0]);
+        assert!(answer_drop_tests(&world).is_empty());
+        let got: (bool, f32, f32, f32) = host
+            .lua()
+            .load("return heard[1], heard[2], heard[3], heard[4]")
+            .eval()
+            .unwrap();
+        assert_eq!(got, (false, 4.0, 5.0, 6.0));
+        assert!(world.borrow().drop_tests().is_empty());
+    }
+
     #[test]
     fn a_landing_on_a_target_lands_where_the_target_is() {
         let (host, world) = setup();
@@ -9110,7 +9242,19 @@ mod tests {
             .map(|n| m2_assets::name_hash(n))
             .collect();
         assert_eq!(h, [0xA62D_3A27, 0x07D7_44CF, 0x0A76_5168, 0xBB52_2D10]);
-        assert!(host.lua().load("Object.GetWinchState(50)").exec().is_err());
+        // No winch: nil from both, as the 360's natives answer (0x823336E8,
+        // 0x823337E8 fall to 0x82206F20), and the state is let be.
+        let (get, set, bad, kept): (Value, Value, Value, String) = host
+            .lua()
+            .load(
+                "return Object.GetWinchState(50), Object.SetWinchState(50, 'deployed'),
+                   Object.SetWinchState(1, 'sideways'), Object.GetWinchState(1)",
+            )
+            .eval()
+            .unwrap();
+        assert!(get.is_nil() && set.is_nil() && bad.is_nil());
+        assert_eq!(kept, "deploying");
+        assert!(!world.borrow().winches.contains_key(&50));
     }
 
     #[test]

@@ -388,11 +388,9 @@ pub struct Screen {
     /// (`l-stick up`: `T`), by word in lower case ([`Screen::set_key_names`]).
     key_names: BTreeMap<String, String>,
     /// An Xbox pad plays: control words show its pictures
-    /// ([`pad_picture`]) and `Gui.IsXboxController` answers true.
+    /// ([`pad_picture`]), and `Gui.IsXboxController` and
+    /// `Gui.ControllerInUse` answer true.
     pad: bool,
-    /// She is at the wheel: the pad's pictures are the vehicle layout's
-    /// ([`driving_pad_picture`]).
-    driving: bool,
     /// `SetPlayerPDAWidget`: the Flash widget that is the player's PDA
     /// while it is open, with the player it was given for.
     pub pda_widget: Option<(u32, u32)>,
@@ -429,12 +427,6 @@ impl Screen {
 
     pub fn pad(&self) -> bool {
         self.pad
-    }
-
-    /// She is at the wheel (or on foot again): the pad's pictures follow
-    /// the vehicle layout ([`driving_pad_picture`]).
-    pub fn set_driving(&mut self, driving: bool) {
-        self.driving = driving;
     }
 
     /// Names the keys bound to control words (`[l-stick up]`):
@@ -813,13 +805,7 @@ impl Screen {
                     colour: Some(c),
                     ..TextSpan::default()
                 });
-            } else if let Some(picture) = if self.driving {
-                driving_pad_picture(id)
-            } else {
-                pad_picture(id)
-            }
-            .filter(|_| self.pad && parts.len() == 1)
-            {
+            } else if let Some(picture) = pad_picture(id).filter(|_| self.pad && parts.len() == 1) {
                 // Inline, as the objective icons are.
                 let colour = out.last().and_then(|s| s.colour);
                 out.push(TextSpan {
@@ -1389,21 +1375,6 @@ pub fn pad_picture(word: &str) -> Option<&'static str> {
     })
 }
 
-/// [`pad_picture`] while she is at the wheel. The vehicles' hints name the
-/// handbrake by the jump's word (`[jump] Handbrake`, the PC's Space), but
-/// on the pad the jump's A is the accelerator: the pause screen's car and
-/// boat layouts (`tControlMap.car`, `.boat`, vz.wad) put
-/// `[SHELL.Controls.Handbrake]` on `Joystick.BUTTON_ALT1_1`, 17, the left
-/// trigger (`Forward` on A, `Reverse` on X, `Call_Allies` on B). From the
-/// game's data; the helicopter's and the jet's layouts put `Lower` there.
-/// Playtest 8: the prompt showed A.
-pub fn driving_pad_picture(word: &str) -> Option<&'static str> {
-    match word.to_ascii_lowercase().as_str() {
-        "jump" => Some("button_trigger_l"),
-        _ => pad_picture(word),
-    }
-}
-
 /// The texture an inline icon word stands for (`MrxUtil.tInlineIcons`:
 /// `[objdeliver]`, and `[objdeliver2]` for secondary objectives), by the
 /// objective icon textures' names (`HUD_objective_deliverable`...).
@@ -1799,6 +1770,18 @@ pub fn install(lua: &Lua) -> mlua::Result<ScreenRef> {
     let s = Rc::clone(&screen);
     gui.raw_set(
         "IsXboxController",
+        safe_function(lua, move |lua, _| ret(lua, s.borrow().pad))?,
+    )?;
+    // `Gui.ControllerInUse()`: the same, as the PC's own scripts ask it
+    // (the 360 registers no such native: its scripts find it missing).
+    // The vehicle and handbrake tutorials (`WifTutorialBoat`,
+    // `WifTutorialWheeledVehicleBasic`, the handbrake hint) call it when
+    // it is there and pick the pad's texts by it, `[Tutorial.Boat]`'s
+    // `[jump] Accelerate [reload] Brake/Reverse` over the PC's `[left
+    // stick up] Accelerate`.
+    let s = Rc::clone(&screen);
+    gui.raw_set(
+        "ControllerInUse",
         safe_function(lua, move |lua, _| ret(lua, s.borrow().pad))?,
     )?;
     // `Player.GetCameraXZHeading(owner)`, likewise in `Player`.
@@ -3294,13 +3277,21 @@ mod tests {
         let spans = s.spans("[green][reload] Reload[n][jump] Handbrake");
         let icons: Vec<_> = spans.iter().filter_map(|s| s.icon.as_deref()).collect();
         assert_eq!(icons, ["button_x", "button_a"]);
-        // At the wheel the handbrake is the car layout's left trigger, not
-        // the A that drives her forward (playtest 8); on foot again, A.
-        s.set_driving(true);
-        let at_wheel = s.spans("[green][reload] Reload[n][jump] Handbrake");
-        let icons: Vec<_> = at_wheel.iter().filter_map(|s| s.icon.as_deref()).collect();
-        assert_eq!(icons, ["button_x", "button_trigger_l"]);
-        s.set_driving(false);
+        // The pad's own texts at the wheel: the car's and the boat's
+        // (`[Tutorial.WheeledVehicleBasic]`, `[Tutorial.Boat]`) and the
+        // handbrake's (`[Tutorial.Handbrake]`), as the pause screen's car
+        // layout has them: A forward, X reverse, the left trigger the
+        // handbrake.
+        let car = s.spans("[move] Steer [confirm] Accelerate[n][reload] Brake/Reverse");
+        let boat = s.spans("[move] Steer [jump] Accelerate[n][reload] Brake/Reverse");
+        let brake = s.spans("[crouch] Handbrake");
+        let icons =
+            |t: &[TextSpan]| -> Vec<String> { t.iter().filter_map(|s| s.icon.clone()).collect() };
+        let joy = "button_joystick_l".to_owned();
+        let (a, x) = ("button_a".to_owned(), "button_x".to_owned());
+        assert_eq!(icons(&car), [joy.clone(), a.clone(), x.clone()]);
+        assert_eq!(icons(&boat), [joy, a, x]);
+        assert_eq!(icons(&brake), ["button_trigger_l"]);
         // In the colour so far, and the text goes on after each.
         assert!(spans.iter().all(|s| s.colour == colour_name("green")));
         assert_eq!(s.display_text("[reload] Reload"), " Reload");
@@ -3368,6 +3359,22 @@ mod tests {
         screen.borrow_mut().set_pad(true);
         run(&host, "b = Gui.IsXboxController()");
         assert!(host.lua().globals().get::<bool>("b").unwrap());
+    }
+
+    /// The vehicle tutorials pick the pad's text while a pad plays, as
+    /// `WifTutorialBoat` does: `Gui.ControllerInUse and
+    /// Gui.ControllerInUse()`.
+    #[test]
+    fn the_vehicle_tutorials_take_the_pads_text_while_a_pad_plays() {
+        let (host, screen) = host();
+        let pick = "t = (Gui.ControllerInUse and Gui.ControllerInUse())                     and '[Tutorial.Boat]' or '[SHELL.PCShell.Tutorial_Boat_PC]'";
+        run(&host, pick);
+        let t: String = host.lua().globals().get("t").unwrap();
+        assert_eq!(t, "[SHELL.PCShell.Tutorial_Boat_PC]");
+        screen.borrow_mut().set_pad(true);
+        run(&host, pick);
+        let t: String = host.lua().globals().get("t").unwrap();
+        assert_eq!(t, "[Tutorial.Boat]");
     }
 
     #[test]

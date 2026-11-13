@@ -3314,6 +3314,7 @@ mod tests {
                 sticky: false,
             },
             lock_on: None,
+            seeker: None,
             pickup: None,
             feel: Default::default(),
             hint: None,
