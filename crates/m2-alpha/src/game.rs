@@ -177,6 +177,8 @@ pub struct Game {
     spray_wait: f32,
     /// The light of the atmosphere region the player is in.
     pub sky: AtmosphereMix,
+    /// How far the light's screen overlay has scrolled.
+    screen_scroll: m2_engine::atmosphere::ScreenScroll,
     /// Lights blasts' scripts set, seconds before each comes in
     /// ([`m2_game::atmosphere_script`]).
     script_lights: Vec<(f32, ScriptAtmosphere)>,
@@ -498,6 +500,7 @@ impl Game {
             halts: crate::halt::Halts::default(),
             spray_wait: 0.0,
             sky: AtmosphereMix::default(),
+            screen_scroll: Default::default(),
             script_lights: Vec::new(),
             fov_blend: m2_engine::camera_blend::Blend::new([m2_engine::projection::FOV]),
             near_far_blend: m2_engine::camera_blend::Blend::new([
@@ -3445,7 +3448,10 @@ impl Game {
             }
         }
         self.script_lights.retain(|(left, _)| *left > 0.0);
-        if let Some(now) = self.sky.update(default, regions, focus, dt) {
+        let changed = self.sky.update(default, regions, focus, dt);
+        self.screen_scroll
+            .step(&self.sky.current(default).screen, dt);
+        if let Some(now) = changed {
             match now {
                 Some((r, s)) => {
                     let (region, (_, a)) = (&regions[r], &regions[r].settings[s]);
@@ -3575,6 +3581,19 @@ impl Game {
             }
             view.lighting.clouds.noise = world.cloud_noise;
             view.lighting.flare_map = world.sun_flare;
+            // The light's screen overlay. The records name one texture,
+            // `global_rain`, which is the one loaded: another is not drawn.
+            if let (Some(a), Some(map)) = (world.index.atmosphere, world.screen_rain) {
+                let s = self.sky.current(&a).screen;
+                if s.texture == m2_assets::name_hash("global_rain") {
+                    view.lighting.screen_overlay = Some(m2_render::ScreenOverlay {
+                        map,
+                        velocity: self.screen_scroll.velocity(&s),
+                        colour: s.colour_rgba(),
+                        blend: m2_render::OverlayBlend::from_type(s.kind),
+                    });
+                }
+            }
         }
         finish(&mut view.lighting);
         post_override(&mut view.lighting);

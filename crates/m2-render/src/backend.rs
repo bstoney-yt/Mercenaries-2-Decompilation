@@ -92,6 +92,46 @@ pub struct PointLight {
     pub outer: f32,
 }
 
+/// The game's screen overlay (its "rain" quad: `PgRainVP`/`PgRainFP`, the
+/// PC's shaders 421 and 420), drawn over the finished frame: a texture
+/// laid out by view direction, scrolled, tinted, and added to the frame,
+/// taken from it, or blended over it. See `gpu::post` for the maths.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScreenOverlay {
+    /// The texture (`global_rain` in every record), sampled as stored.
+    pub map: crate::TextureHandle,
+    /// The shader's `rainVelocity`: the unit direction it scrolls along,
+    /// how far it has scrolled, and its density (the strength).
+    pub velocity: [f32; 4],
+    /// The shader's `rainColor`.
+    pub colour: [f32; 4],
+    pub blend: OverlayBlend,
+}
+
+/// How the overlay meets the frame, by the record's type (from the 360
+/// code, 0x821BF628 and the blend tables at 0x82B74CBC; the operation and
+/// factor numbers read by the 360's Direct3D values).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverlayBlend {
+    /// Type 0 and any other: added, weighed by its alpha.
+    #[default]
+    Add,
+    /// Type 1: taken from the frame, weighed by its alpha.
+    Subtract,
+    /// Type 2: blended over the frame by its alpha.
+    Alpha,
+}
+
+impl OverlayBlend {
+    pub fn from_type(kind: u32) -> Self {
+        match kind {
+            1 => Self::Subtract,
+            2 => Self::Alpha,
+            _ => Self::Add,
+        }
+    }
+}
+
 /// Light and atmosphere for a frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Lighting {
@@ -106,6 +146,8 @@ pub struct Lighting {
     pub sun_disc: Vec3,
     /// The sun flare's texture (`radial_flare`); `None` draws no flare.
     pub flare_map: Option<crate::TextureHandle>,
+    /// The atmosphere record's screen overlay; `None` draws none.
+    pub screen_overlay: Option<ScreenOverlay>,
     /// Linear RGB (see [`gamma_light`](Self::gamma_light)).
     pub sun_color: Vec3,
     /// Linear RGB light reaching surfaces from every side, by the way they
@@ -343,6 +385,7 @@ impl Default for Lighting {
             shadow_direction: None,
             sun_disc: Vec3::ZERO,
             flare_map: None,
+            screen_overlay: None,
             sun_color: Vec3::new(1.0, 0.95, 0.85),
             // Sky above, warm bounce from the ground below.
             ambient_cube: [
