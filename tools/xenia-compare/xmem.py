@@ -193,7 +193,7 @@ class MatrixTracker:
         self.trail: list[tuple[float, tuple]] = []
 
     @classmethod
-    def find(cls, g: Guest, start, press, tol: float = 15.0):
+    def find(cls, g: Guest, start, press, tol: float = 15.0, lo: int = 0xA000_0000, hi: int = 0xC000_0000):
         """The world matrices within tol of start that move forward along
         their own row 2 while `press()` runs (e.g. the throttle)."""
         cands = []
@@ -201,7 +201,7 @@ class MatrixTracker:
         # there were refreshed every frame on the speedboat, while those at
         # 0x7..., 0x8.../0x9... (other views of the same pages) froze or were
         # reused for other things (measured 2026-11-13).
-        for h in g.scan_vec3(start, tol, lo=0xA000_0000, hi=0xC000_0000, limit=100000):
+        for h in g.scan_vec3(start, tol, lo=lo, hi=hi, limit=100000):
             m = world_matrix(g, h)
             if m:
                 cands.append((h, m))

@@ -27,9 +27,10 @@ Route files are one step per line (`#` comments):
     seek <rrggbb> <timeout_s> <buttons|-> <text> [<gain>]  steer the left stick at
                                    the HUD marker of that colour until text seen
     ocr <name>                     screenshot and log its OCR text
+    if_text <text> <step...>       run the step only if the screen's OCR holds the text
     mark <label>                   log a timestamped label
     track <x> <y> <z>              follow the hero's position in guest memory (xmem.py)
-    goto <x> <z> <radius> <timeout> <buttons|-> [<gain>]  steer there by that position
+    goto <x> <z> <radius> <timeout> <buttons|-> [<gain>] [max=<m/s>]  steer there by that position
     measure <buttons|-> <secs> [<ly>]  hold, logging tracked position and speed
     trackfoot <x> <y> <z>|here     as track, for the hero on foot (here: where track was)
     walk <x> <z> <radius> <timeout> [<buttons|-> [<every_s> <name>]]  walk/sprint (ls) there
@@ -290,7 +291,15 @@ def run(args) -> int:
                                 yield cmd
                     time.sleep(0.3)
 
-        for i, line in enumerate(lines()):
+        pending: list[str] = []
+
+        def all_lines():
+            for st in lines():
+                yield st
+                while pending:
+                    yield pending.pop(0)
+
+        for i, line in enumerate(all_lines()):
             w = line.split()
             op = w[0]
             if op == "wait":
@@ -447,7 +456,15 @@ def run(args) -> int:
                     apply()
 
                 start = tracker.pos if w[1] == "here" and tracker else tuple(float(v) for v in w[1:4])
-                tracker, n_m, moved = xmem.MatrixTracker.find(g, start, forward)
+                found = None
+                for tol in (15.0, 40.0, 40.0):  # out of a boat she can be a few metres off
+                    # The hero's matrices were found over the whole range (run 16),
+                    # not only in the boat's 0xA0000000 view.
+                    found, n_m, moved = xmem.MatrixTracker.find(g, start, forward, tol=tol, lo=0x4000_0000, hi=0xFFFF_0000)
+                    if found is not None:
+                        break
+                    say(f"trackfoot: none moving among {n_m} within {tol:.0f} m, again")
+                tracker = found
                 if tracker is None:
                     say(f"trackfoot: no moving world matrix among {n_m}")
                 else:
@@ -510,6 +527,8 @@ def run(args) -> int:
                 # bearing atan2(dx, dz) goes down), so the stick is -error.
                 import math
 
+                vmax = next((float(t[4:]) for t in w if t.startswith("max=")), None)
+                w = [t for t in w if not t.startswith("max=")]
                 tx, tz, radius, timeout = (float(v) for v in w[1:5])
                 b, lt, rt = parse_buttons(w[5])
                 gain = float(w[6]) if len(w) > 6 else 60.0
@@ -551,6 +570,11 @@ def run(args) -> int:
                         gas = abs(err) < 45
                         cap = 0.6 if gas else 1.0
                         lx = max(-cap, min(cap, -err / gain))
+                    # max=<m/s>: no throttle over that speed (from the tracked trail).
+                    if vmax is not None and len(getattr(tracker, "trail", [])) >= 2:
+                        (t1, p1), (t2, p2) = tracker.trail[0], tracker.trail[-1]
+                        if t2 > t1 and math.hypot(p2[0] - p1[0], p2[2] - p1[2]) / (t2 - t1) > vmax:
+                            gas = False
                     apply(b if gas else 0, lt if gas else 0, rt if gas else 0, lx, 0.0, 0.0, 0.0)
                     if time.time() - last_log > 1.0:
                         last_log = time.time()
@@ -559,6 +583,14 @@ def run(args) -> int:
                 else:
                     say(f"goto ({tx:.0f}, {tz:.0f}) TIMED OUT")
                 apply()
+            elif op == "if_text":
+                # if_text <text> <step...>: run the step only if a fresh
+                # screenshot's OCR holds the text (_ for spaces).
+                if text_seen(w[1].replace("_", " "), f"if-{i:03d}"):
+                    pending.append(" ".join(w[2:]))
+                    say(f"if_text '{w[1]}' seen: {' '.join(w[2:])}")
+                else:
+                    say(f"if_text '{w[1]}' not seen")
             elif op == "mark":
                 say("mark " + " ".join(w[1:]))
             else:
