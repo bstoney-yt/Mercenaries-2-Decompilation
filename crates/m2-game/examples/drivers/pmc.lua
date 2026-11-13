@@ -89,7 +89,7 @@ Pg.RemoveContextAction = prompts('Remove', Pg.RemoveContextAction)
 -- (SEAT lines).
 local lastSeat
 local function seat()
-  local ok, v = pcall(function() return Vehicle.GetFromRider(Player.GetAnyCharacter()) end)
+  local ok, v = pcall(function() return Vehicle.GetFromRider(Player.GetLocalCharacter()) end)
   local s = tostring(ok and v)
   if s ~= lastSeat then
     say('>>> SEAT ' .. s)

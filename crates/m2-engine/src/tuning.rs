@@ -31,6 +31,11 @@ pub struct VehicleTuning {
     /// Its armour class (`ObjectHint`'s `Armor`): 1 none (cars, boats),
     /// 2 light (helicopters), 3 medium (the LAV III), 4 heavy (tanks).
     pub armour: Option<u32>,
+    /// `ObjectHint`'s first two words (fields 28e10525 and a0d7b32a, not
+    /// named): its kind (2 for every vehicle, 3 for `human`) and domain
+    /// (2 ground, 3 the helicopters), as
+    /// [`crate::ai_target::Hint`] reads them.
+    pub kind: Option<(u32, u32)>,
     /// `Stimulus` `Visibility`: from how far it can be seen, metres
     /// (0x822E89B0; `M151 .50Cal (VZ) (Full)` 200).
     pub visibility: Option<f32>,
@@ -1542,20 +1547,7 @@ pub fn human_speeds(db: &Layer<'_>) -> HashMap<u32, [f32; 3]> {
 pub fn human_motion(db: &Layer<'_>) -> HashMap<u32, crate::on_foot::HumanMotion> {
     use crate::on_foot::{FIELDS, HumanMotion};
     let physics = Table::new(db, "_HumanPhysics");
-    let d = HumanMotion::default();
-    let defaults = [
-        d.jump_height,
-        d.gravity,
-        d.max_rotation,
-        d.max_air_speed,
-        d.paces[0],
-        d.paces[1],
-        d.paces[2],
-        d.paces[3],
-        d.crouch_walk,
-        d.capsule_radius,
-        d.capsule_height,
-    ];
+    let defaults = HumanMotion::default().to_fields();
     physics
         .records
         .keys()
@@ -1785,6 +1777,10 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                     .and_then(|r| hint.word(r, name_hash("Armor")))
                     .map(|a| a & 0xff)
                     .filter(|a| (1..=4).contains(a)),
+                kind: hint
+                    .of_template(id)
+                    .first()
+                    .and_then(|r| Some((hint.word(r, 0x28e1_0525)?, hint.word(r, 0xa0d7_b32a)?))),
                 visibility: stimulus.get(id, "Visibility"),
                 audibility: stimulus.get(id, "Audibility"),
                 blast_scale: fudge.number(id, BLAST_SCALE),

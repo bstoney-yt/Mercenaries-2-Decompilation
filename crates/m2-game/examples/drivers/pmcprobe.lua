@@ -65,7 +65,7 @@ Event.CreatePersistent(Event.TimerRelative, { 5 }, function()
   local p = Player.GetLocalCharacter()
   local px, py, pz = Object.GetPosition(p)
   say(string.format('t%d her %s any %s at %s, %s, %s', n * 5, tostring(p),
-    tostring(Player.GetAnyCharacter()), tostring(px), tostring(py), tostring(pz)))
+    tostring(Player.GetLocalCharacter()), tostring(px), tostring(py), tostring(pz)))
   for _, nm in ipairs(names) do
     local g = Pg.GetGuidByName(nm)
     local x, y, z

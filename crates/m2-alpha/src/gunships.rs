@@ -188,6 +188,34 @@ struct Gunship {
     velocity: Vec3,
     /// Leaving: the pursuit over.
     leaving: bool,
+    /// Its watch on her: her record's +0x8C.
+    watch: Watch,
+}
+
+/// How long a pilot has gone without sensing her: her record's +0x8C,
+/// which `HeliAttack` reads (0x822B0338 into [`AttackTarget::unseen`]).
+/// The record's tick (0x822DE240) adds the think's length; a sensing of
+/// her (0x822D5468, 0x822D6030) sets it to 0. Inferred, as for the
+/// pursuers' drivers and gunners: sensed is a sight line to her clear,
+/// tried once a second (0x822C9250's rate for gunners).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Watch {
+    wait: f32,
+    sees: bool,
+    pub unseen: f32,
+}
+
+impl Watch {
+    /// One think of `dt`; `look` tries the sight lines when they are due.
+    pub fn tick(&mut self, dt: f32, look: impl FnOnce() -> bool) -> f32 {
+        self.wait -= dt;
+        if self.wait <= 0.0 {
+            self.wait = 1.0;
+            self.sees = look();
+        }
+        self.unseen = if self.sees { 0.0 } else { self.unseen + dt };
+        self.unseen
+    }
 }
 
 /// What a gunner aims by ([`Shot::lead`]).
@@ -269,6 +297,7 @@ impl Gunships {
             at,
             velocity: toward * COMING + Vec3::Y * COMING_UP,
             leaving: false,
+            watch: Watch::default(),
         });
         self.sent += 1;
         entity
@@ -362,6 +391,19 @@ impl Gunships {
                 let (lo, hi) = v.spec.hull;
                 (hi.y - lo.y, (hi.x - lo.x).max(hi.z - lo.z))
             };
+            // Its sight lines to her, as the pursuers' (0x822C9250):
+            // stopping 1 m short, she or her vehicle no block.
+            let unseen = g.watch.tick(dt, || {
+                let (lo, hi) = v.spec.hull;
+                let eye = at + Vec3::Y * ((lo.y + hi.y) * 0.5);
+                let half = (hi.x - lo.x).min(hi.z - lo.z) * 0.5;
+                m2_engine::gunner_aim::sight_lines(eye, her + Vec3::Y, half, 0.25)
+                    .iter()
+                    .any(|&(a, b)| {
+                        let end = b - (b - a).normalize_or_zero();
+                        physics.line_clear(a, end, Some(id))
+                    })
+            });
             let round_speed = v
                 .spec
                 .armed
@@ -378,7 +420,7 @@ impl Gunships {
                     let target = AttackTarget {
                         at: her,
                         velocity: her_velocity,
-                        unseen: 0.0,
+                        unseen,
                         round_speed,
                     };
                     let (stick, gun) = pilot.attack(&target, size, &mut sight, rand(), dt);
@@ -412,6 +454,26 @@ impl Gunships {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Her record's +0x8C: looked for once a second, 0 while a look found
+    // her, counting up by the think while none has.
+    #[test]
+    fn a_pilot_counts_the_time_since_it_last_saw_her() {
+        let mut w = Watch::default();
+        let see = |seen: bool| move || seen;
+        assert_eq!(w.tick(0.1, see(true)), 0.0);
+        // Not due again for a second: still seen, though she has gone.
+        for _ in 0..9 {
+            assert_eq!(w.tick(0.1, || panic!("looked early")), 0.0);
+        }
+        let mut t = w.tick(0.1, see(false));
+        assert!((t - 0.1).abs() < 1e-6);
+        for _ in 0..9 {
+            t = w.tick(0.1, || panic!("looked early"));
+        }
+        assert!((t - 1.0).abs() < 1e-5);
+        assert_eq!(w.tick(0.1, see(true)), 0.0);
+    }
 
     // A list is taken round and round (0x82235E08), by level.
     #[test]

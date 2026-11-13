@@ -316,6 +316,10 @@ pub struct Templates {
     pub spawn_sounds: HashMap<u32, crate::spawn_sound::SpawnSound>,
     /// Each template's exhausts, by id ([`crate::vehicle_parts`]).
     pub exhausts: HashMap<u32, Vec<crate::vehicle_parts::Exhaust>>,
+    /// Each template's `Winch`, by id ([`crate::winch`]).
+    pub winches: HashMap<u32, crate::winch::WinchParams>,
+    /// Each template's `ConnectPoint`s, by id ([`crate::winch`]).
+    pub connect_points: HashMap<u32, Vec<crate::winch::ConnectPoint>>,
     /// The emitter each `EffectModel` template draws as a model, by its
     /// name hash.
     pub effect_models: HashMap<u32, crate::vehicle_parts::ModelEmitter>,
@@ -394,6 +398,9 @@ pub struct Templates {
     /// Each template's `_PropPhysics`, by id: the props that move when
     /// hit ([`crate::durability::prop_physics`]).
     pub prop_physics: HashMap<u32, crate::durability::PropPhysics>,
+    /// The collision preset of each template whose objects aren't
+    /// buildings, by id ([`crate::durability::presets`]).
+    pub presets: HashMap<u32, crate::collision_layers::Preset>,
     /// Each template's gravity scale where it gives one, by id
     /// ([`crate::durability::gravity_scales`]).
     pub gravity_scales: HashMap<u32, f32>,
@@ -723,6 +730,42 @@ impl Templates {
             .scale(name_hash(target), name_hash(damage))
     }
 
+    /// The `Winch` of template `name` (a vehicle's own), else of the
+    /// lowest id of `model`'s templates that have one (its variants:
+    /// drivers, factions).
+    pub fn winch_for(&self, name: &str, model: u32) -> Option<crate::winch::WinchParams> {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.winches.get(id).copied())
+            .or_else(|| {
+                self.infos
+                    .iter()
+                    .filter(|(id, t)| t.model == Some(model) && self.winches.contains_key(id))
+                    .map(|(&id, _)| id)
+                    .min()
+                    .and_then(|id| self.winches.get(&id).copied())
+            })
+    }
+
+    /// The `ConnectPoint`s of template `name` (an object's own), else of
+    /// the lowest id of `model`'s templates that have them.
+    pub fn connect_points_for(&self, name: &str, model: u32) -> &[crate::winch::ConnectPoint] {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.connect_points.get(id))
+            .or_else(|| {
+                self.infos
+                    .iter()
+                    .filter(|(id, t)| {
+                        t.model == Some(model) && self.connect_points.contains_key(id)
+                    })
+                    .map(|(&id, _)| id)
+                    .min()
+                    .and_then(|id| self.connect_points.get(&id))
+            })
+            .map_or(&[], Vec::as_slice)
+    }
+
     /// The tuning of template `name` (a vehicle's own, `AMX30 (Full)`),
     /// else of a template of its `model`
     /// ([`tuning_for_model`](Self::tuning_for_model)).
@@ -1047,6 +1090,8 @@ impl Templates {
             music_sources: crate::music_source::read(&db),
             spawn_sounds: crate::spawn_sound::read(&db),
             exhausts: crate::vehicle_parts::read(&db),
+            winches: crate::winch::read(&db),
+            connect_points: crate::winch::connect_points(&db),
             effect_models: crate::vehicle_parts::effect_models(&db)
                 .into_iter()
                 .filter_map(|(name, model, emitter, fx)| {
@@ -1076,6 +1121,7 @@ impl Templates {
             crash_parts: crate::durability::crash_parts(&db),
             sound_keys: crate::durability::sound_keys(&db),
             prop_physics: crate::durability::prop_physics(&db),
+            presets: crate::durability::presets(&db),
             gravity_scales: crate::durability::gravity_scales(&db),
             projectiles: crate::durability::projectiles(&db),
             modifiers: crate::durability::modifier_keys(&db),
@@ -1317,6 +1363,12 @@ pub struct WorldIndex {
     pub objects: Vec<ObjectPlacement>,
     /// People the layers place, all layers.
     pub spawns: Vec<SpawnPoint>,
+    /// Where each spawner's spawn entity stands with the scripts' changes
+    /// to an object's attached spawners: its owner, group, state and
+    /// chance ([`crate::population::SpawnerSlot`]), for the layers' own
+    /// spawner records. An entity's second and later records have spawn
+    /// entities of their own ([`crate::population::EXTRA_SPAWNERS`]).
+    pub spawner_slots: HashMap<u32, crate::population::SpawnerSlot>,
     /// Every placed entity of the static layers by id: the buildings of
     /// the merged town batches are among them (see
     /// [`Model::tiny_members`](m2_assets::Model::tiny_members)).
@@ -1435,6 +1487,18 @@ impl Road {
         match &self.lanes {
             Some(l) => l.traffic(self.width / 2.0),
             None if self.named_road => vec![self.width / 4.0],
+            None => Vec::new(),
+        }
+    }
+
+    /// How far right of its line each lane of traffic runs, from and to,
+    /// metres, inner first ([`lane_offsets`](Self::lane_offsets)'
+    /// lanes); a road with no `LaneData` but a road's name, its right
+    /// half.
+    pub fn lane_strips(&self) -> Vec<(f32, f32)> {
+        match &self.lanes {
+            Some(l) => l.traffic_strips(self.width / 2.0),
+            None if self.named_road => vec![(0.0, self.width / 2.0)],
             None => Vec::new(),
         }
     }
@@ -1917,10 +1981,74 @@ impl WorldIndex {
         }
         let names = layer.names();
         let mut seen: HashSet<u32> = HashSet::new();
-        let own_spawners = layer
+        // Every spawner record the layer's entities carry: an entity's
+        // first is the entity's own spawner, its later ones spawners with
+        // spawn entities of their own (they were dropped before: a guard
+        // tower's second sentry, a building's balcony and rooftop).
+        let own_list = layer
             .component("PopulationSimpleSpawner")
-            .map(crate::population::spawners)
+            .map(crate::population::spawner_records)
             .unwrap_or_default();
+        // An entity's own records, then its template's that none of its
+        // own share a name with (`population::entity_spawners`): every
+        // placed entity whose template carries spawner records.
+        let mut own_by_entity: HashMap<u32, Vec<_>> = HashMap::new();
+        for record in &own_list {
+            own_by_entity
+                .entry(record.1.owner)
+                .or_default()
+                .push(*record);
+        }
+        let mut owners: Vec<u32> = placements
+            .iter()
+            .filter(|(id, p)| {
+                own_by_entity.contains_key(*id)
+                    || templates.population.spawner_records.contains_key(&p.parent)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        owners.sort_unstable();
+        let own_records: Vec<(crate::population::Spawner, crate::population::SpawnerSlot)> = owners
+            .iter()
+            .flat_map(|id| {
+                let own = own_by_entity.get(id).map_or(&[][..], Vec::as_slice);
+                let template = placements
+                    .get(id)
+                    .and_then(|p| templates.population.spawner_records.get(&p.parent))
+                    .map_or(&[][..], Vec::as_slice);
+                crate::population::entity_spawners(*id, own, template)
+            })
+            .collect();
+        let record_entities = crate::population::spawn_entities(
+            &own_records.iter().map(|(_, s)| s.owner).collect::<Vec<_>>(),
+            self.spawner_slots
+                .keys()
+                .filter(|&&e| e >= crate::population::EXTRA_SPAWNERS)
+                .count() as u32,
+        );
+        let own_spawners: HashMap<u32, crate::population::Spawner> = own_records
+            .iter()
+            .zip(&record_entities)
+            .filter(|((_, slot), entity)| slot.owner == **entity && !slot.template)
+            .map(|((spawner, slot), _)| (slot.owner, *spawner))
+            .collect();
+        let people_from = |spawner: &crate::population::Spawner| -> Vec<(String, u32, f32)> {
+            let population = &templates.population;
+            population
+                .lists
+                .get(&spawner.list)
+                .or_else(|| population.lists.get(&(spawner.list | TEMPLATE_BIT)))
+                .into_iter()
+                .flatten()
+                .filter_map(|&(t, w)| {
+                    let (name, info) = templates
+                        .by_id(t)
+                        .or_else(|| templates.by_id(t | TEMPLATE_BIT))?;
+                    let model = info.model.filter(|_| info.human)?;
+                    Some((name.to_owned(), model, w))
+                })
+                .collect()
+        };
         let people_of = |id: u32, p: &Placement| -> Vec<(String, u32, f32)> {
             let population = &templates.population;
             let Some(spawner) = own_spawners
@@ -1998,6 +2126,26 @@ impl WorldIndex {
                     continue;
                 }
                 self.spawns.push(spawn(id, p));
+            }
+        }
+        // The layer's spawner records: where each stands with the
+        // scripts' changes, and a spawn point for each record after an
+        // entity's first.
+        for ((spawner, slot), &entity) in own_records.iter().zip(&record_entities) {
+            let Some(p) = placements.get(&slot.owner) else {
+                continue;
+            };
+            self.spawner_slots.insert(entity, *slot);
+            if entity != slot.owner {
+                let list = people_from(spawner);
+                if !list.is_empty() {
+                    self.spawns.push(SpawnPoint {
+                        entity,
+                        list,
+                        cycle: Some(spawner.seconds_per_cycle),
+                        ..spawn(slot.owner, p)
+                    });
+                }
             }
         }
         // Entities spawning people by their template's spawner alone (the
@@ -3061,6 +3209,39 @@ pub fn low_res_tile<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_vehicle_s_winch_is_its_own_template_s_else_its_model_s() {
+        let info = |model| TemplateInfo {
+            model: Some(model),
+            vehicle: None,
+            engine: None,
+            person: false,
+            human: false,
+        };
+        let w = |length| crate::winch::WinchParams {
+            length,
+            ..Default::default()
+        };
+        let db = Templates {
+            names: HashMap::from([
+                (0x8000_0001, "Mi35 (base)".to_owned()),
+                (0x8000_0002, "Mi35 (Driver)".to_owned()),
+                (0x8000_0003, "Mi35 (Full)".to_owned()),
+            ]),
+            infos: HashMap::from([
+                (0x8000_0001, info(7)),
+                (0x8000_0002, info(7)),
+                (0x8000_0003, info(7)),
+            ]),
+            winches: HashMap::from([(0x8000_0002, w(8.0)), (0x8000_0003, w(9.0))]),
+            ..Templates::default()
+        };
+        assert_eq!(db.winch_for("Mi35 (Full)", 7).map(|p| p.length), Some(9.0));
+        // No winch of its own: its model's lowest id's.
+        assert_eq!(db.winch_for("Mi35 (base)", 7).map(|p| p.length), Some(8.0));
+        assert_eq!(db.winch_for("Other", 8), None);
+    }
 
     fn gun(template: u32, semi: bool, blast: bool) -> crate::weapons::WeaponSpec {
         let b = crate::weapons::Blast {

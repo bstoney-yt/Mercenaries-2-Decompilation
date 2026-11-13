@@ -91,6 +91,9 @@ struct Frame {
     lights: array<vec4<f32>, 16>,
     // x: how many of them
     light_info: vec4<f32>,
+    // The sun's disc: rgb its colour (display values, 0 for none), w the
+    // cosine of its angular radius
+    sun_disc: vec4<f32>,
 };
 
 // The point lights' light on a surface at `p` facing `n`, summed as the
@@ -167,8 +170,11 @@ struct Draw {
     // x: first palette matrix, y: palette length (0: not skinned),
     // z: first instance matrix, w: instance count (0: not instanced)
     skin: vec4<u32>,
-    // xy: added to the texture coordinates (scrolling textures)
+    // xy: added to the texture coordinates (scrolling textures), z: its
+    // beams shine whatever the hour
     uv: vec4<f32>,
+    // Multiplies the surface's colour and alpha (a marker model's colour)
+    tint: vec4<f32>,
 };
 
 struct Material {
@@ -205,7 +211,14 @@ struct Material {
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var shadow_map: texture_depth_2d_array;
 @group(0) @binding(2) var shadow_sampler: sampler_comparison;
-@group(1) @binding(0) var<uniform> draw: Draw;
+// Every draw's uniforms, one after another, and per instance drawn, the
+// draw it belongs to and which of its instances it is: a draw is drawn
+// with its first slot as its first instance, so the instance index finds
+// its slot, and no bind group changes between draws.
+@group(1) @binding(0) var<storage, read> draws: array<Draw>;
+@group(1) @binding(4) var<storage, read> slots: array<vec2<u32>>;
+// The draw the vertex belongs to (set by the entry points).
+var<private> draw: Draw;
 @group(1) @binding(1) var<storage, read> palette: array<mat4x4<f32>>;
 @group(2) @binding(0) var<uniform> material: Material;
 @group(2) @binding(1) var base_map: texture_2d<f32>;
@@ -233,6 +246,10 @@ struct Varyings {
     // The air between eye and vertex, as the game computes it per vertex:
     // rgb light it adds, a: fraction of the surface's light it keeps
     @location(5) haze: vec4<f32>,
+    // The draw's tint (see `Draw`)
+    @location(6) tint: vec4<f32>,
+    // Its beams shine whatever the hour (see `Draw`)
+    @location(7) @interpolate(flat) beams_lit: f32,
 };
 "#;
 
@@ -271,12 +288,21 @@ fn layer_density(a: f32, b: f32, k: f32) -> f32 {
     return (hi - lo) / dh * (1.0 - (lo + hi) * 0.5);
 }
 
+// The air's Mie scattering towards the eye per unit of its scattering
+// (frame.mie), for red, green and blue: the game's code hands its
+// shaders a table of its own, (1.3337875e-3, 1.7344574e-3, 2.4976188e-3)
+// against its Mie scattering (5.740597e-3, 7.3996866e-3, 1.0514312e-2),
+// rather than 1 / (4 pi). From the 360 code (0x821B51F0, 0x821B5728).
+const MIE_ANGULAR: vec3<f32> = vec3<f32>(0.232343, 0.234396, 0.237544);
+
 // The air between the eye and p as the game's vertex shaders have it: the
 // light it adds (rgb), in display values, and the share of p's light it
 // keeps (a). Both layers scatter with the same coefficients, weighted by
 // their force times mean density over the straight path; the sun's colour
-// lights it, through a Rayleigh phase and a Cornette-Shanks Mie phase
-// whose angle is held at 90 degrees or less from the sun.
+// lights it, through a Rayleigh phase and the code's Mie phase,
+// (1 - g^2) (1 + g + 2 g mu)^-1.5, mu the cosine between the ways to
+// the eye and to the sun,
+// held at 0 or below (constants from the 360 code, 0x821B587C..A0).
 fn game_air(p: vec3<f32>) -> vec4<f32> {
     let eye = frame.eye.xyz;
     let d = distance(p, eye);
@@ -288,29 +314,37 @@ fn game_air(p: vec3<f32>) -> vec4<f32> {
     let mu = min(dot(v, -normalize(frame.sun_dir.xyz)), 0.0);
     let g = frame.rayleigh.a;
     let phase = frame.rayleigh.rgb * (0.0596831 * (1.0 + mu * mu))
-        + frame.mie.rgb * (0.0795775 * (1.0 - g) * (1.0 - g)
-            / pow(max(1.0 + g * g + 2.0 * g * mu, 1e-4), 1.5));
+        + frame.mie.rgb * MIE_ANGULAR * ((1.0 - g * g)
+            / pow(max(1.0 + g + 2.0 * g * mu, 1e-4), 1.5));
     let add = phase / beta * (1.0 - e) * light_to_display(frame.sun_color.rgb) * frame.mie.a;
     return vec4<f32>(add, dot(e, vec3<f32>(1.0 / 3.0)) * frame.scatter.x);
 }
 
-// How far the sky's haze is reckoned along a ray that never leaves the
-// air (metres). Invented: the game's sky is the haze at its cloud quad's
-// corners, which come from code.
-const SKY_FAR: f32 = 20000.0;
+// The game's sky dome: a unit sphere stretched to these half-sizes
+// (metres, x y z) about the eye (from the 360 code: the sky object's
+// constant `Matrix_`, set to (20000, 10000, 20000) at 0x821D0A28; its
+// 65 x 65 sphere is built at 0x821CDD70).
+const SKY_DOME: vec3<f32> = vec3<f32>(20000.0, 10000.0, 20000.0);
 
-// The game's haze looking along the unit ray r, out to the top of its
-// layers (or SKY_FAR), in display values.
+// The sky along the unit ray r, in display values, as the game's sky
+// shaders colour the dome: the install's vertex shader 417 (the only one
+// with the sky's `Matrix` constant) hands its pixel shader the sunlight
+// the air keeps (E * dirLightColor * ScatteringTermMultiplier.x) and the
+// air's in-scattering; pixel shader 416 adds half the first to the
+// second, held within 1e-5 and 30000. Inferred: that 416 is the sky's
+// pixel shader. The other reading of the pair, 482, keeps the in-scattering
+// alone (and may be the sun's or the reflected sky's); footage of an
+// in-scattering-only sky ran darker than the game's.
 fn game_sky(r: vec3<f32>) -> vec3<f32> {
-    let l = frame.haze_layers;
-    let top = max(select(0.0, 1.0 / l.y, l.y > 0.0), select(0.0, 1.0 / l.w, l.w > 0.0));
     let eye = frame.eye.xyz;
-    var d = SKY_FAR;
-    if r.y > 1e-3 {
-        d = min(max(top - eye.y, 0.0) / r.y, SKY_FAR);
-    }
-    let along = normalize(vec3<f32>(r.x, max(r.y, 0.0), r.z));
-    return game_air(eye + along * d).rgb;
+    let p = eye + r / max(length(r / SKY_DOME), 1e-6);
+    let d = distance(p, eye);
+    let l = frame.haze_layers;
+    let rho = l.x * layer_density(p.y, eye.y, l.y) + l.z * layer_density(p.y, eye.y, l.w);
+    let beta = max(frame.rayleigh.rgb + frame.mie.rgb, vec3<f32>(1e-12));
+    let e = exp(-rho * beta * d);
+    let keep = 0.5 * e * light_to_display(frame.sun_color.rgb) * frame.scatter.x;
+    return clamp(keep + game_air(p).rgb, vec3<f32>(1e-5), vec3<f32>(30000.0));
 }
 
 // The air in front of the cloud deck along the unit ray r as the game's
@@ -360,7 +394,7 @@ fn through_air(rgb: vec3<f32>, h: vec4<f32>) -> vec3<f32> {
 fn inscatter(c: f32, tr: vec3<f32>, tm: vec3<f32>) -> vec3<f32> {
     let g = frame.rayleigh.a;
     let rayleigh = 0.0596831 * (1.0 + c * c);
-    let mie = 0.0795775 * (1.0 - g) * (1.0 - g) / pow(max(1.0 + g * g - 2.0 * g * c, 1e-4), 1.5);
+    let mie = MIE_ANGULAR * ((1.0 - g * g) / pow(max(1.0 + g - 2.0 * g * c, 1e-4), 1.5));
     let t = max(tr + tm, vec3<f32>(1e-9));
     return (tr * rayleigh + tm * mie) / t * frame.sun_color.rgb * frame.mie.a;
 }
@@ -922,10 +956,11 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
         let facing = abs(dot(normalize(v.normal), normalize(frame.eye.xyz - v.world_pos)));
         alpha = alpha * facing * facing;
     }
-    if material.direct.w > 0.5 {
+    if material.direct.w > 0.5 && v.beams_lit < 0.5 {
         alpha = alpha * frame.surface.y;
     }
-    return vec4<f32>(rgb, alpha);
+    // The draw's tint over all of it, its own light too.
+    return vec4<f32>(rgb, alpha) * v.tint;
 }
 
 @fragment
@@ -956,7 +991,7 @@ fn fs_glow(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
     var rgb = pow(max(s.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
     if material.params.y < 0.5 && material.params.z > 0.5 {
         let t = textureSample(base_map, base_sampler, v.uv);
-        rgb = srgb_encode(t.rgb) * material.color.rgb * v.color.rgb;
+        rgb = srgb_encode(t.rgb) * material.color.rgb * v.color.rgb * v.tint.rgb;
     }
     if material.params.w > 0.5 {
         var keep = vec3<f32>(v.haze.a);
@@ -1029,12 +1064,13 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
     // A point on the near plane, then the ray from the eye through it.
     let p = frame.inv_view_proj * vec4<f32>(v.ndc, 1.0, 1.0);
     let r = normalize(p.xyz / p.w - frame.eye.xyz);
+    // The game's sky dome (`game_sky`), drawn before its clouds.
     var rgb = sky(r);
-    if quad_sky() && r.y > 0.0 {
-        // Above the horizon the sky is the quad's haze, meeting the far
-        // air that land fades into at the horizon.
-        let quad = light_from_display(quad_air(r).rgb);
-        rgb = mix(rgb, quad, smoothstep(0.0, 4.0 * HORIZON_UP, r.y));
+    // Then its sun disc, a flat colour (the material's emissive, shader
+    // 484), before the clouds (0x821D0A28).
+    let disc = frame.sun_disc;
+    if max(disc.r, max(disc.g, disc.b)) > 0.0 && dot(r, -normalize(frame.sun_dir.xyz)) > disc.w {
+        rgb = light_from_display(disc.rgb);
     }
     // Where the ray meets the cloud deck, the deck moving with the eye so
     // clouds stay overhead; sampled before any branch for mip selection.
@@ -1194,20 +1230,26 @@ fn place(v: VertexIn, instance: u32) -> Varyings {{
     out.color = {color};
     out.tangent = vec4<f32>((model * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w);
     out.haze = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    out.tint = draw.tint;
+    out.beams_lit = draw.uv.z;
     return out;
 }}
 
 @vertex
-fn vs_main(v: VertexIn, @builtin(instance_index) instance: u32) -> Varyings {{
-    var out = place(v, instance);
+fn vs_main(v: VertexIn, @builtin(instance_index) slot: u32) -> Varyings {{
+    let s = slots[slot];
+    draw = draws[s.x];
+    var out = place(v, s.y);
     out.haze = haze_terms(out.world_pos);
     return out;
 }}
 
 // Shadow casters need no haze.
 @vertex
-fn vs_shadow(v: VertexIn, @builtin(instance_index) instance: u32) -> Varyings {{
-    return place(v, instance);
+fn vs_shadow(v: VertexIn, @builtin(instance_index) slot: u32) -> Varyings {{
+    let s = slots[slot];
+    draw = draws[s.x];
+    return place(v, s.y);
 }}
 "#
     );
@@ -1238,14 +1280,26 @@ mod tests {
     }
 
     #[test]
-    fn sky_takes_the_cloud_quads_haze() {
-        // The sky above the horizon and the clouds' air both come from the
-        // quad's corners when its size is set, as the game's vertex shader
-        // reckons them.
+    fn clouds_take_the_quads_haze_and_the_sky_the_dome() {
+        // The clouds' air comes from the quad's corners when its size is
+        // set, as the game's cloud vertex shader reckons it; the sky
+        // between is the game's dome (0x821D0A28, shaders 417/416).
         let sky = sky_source();
         assert!(sky.contains("fn quad_air("));
-        assert_eq!(sky.matches("quad_air(r)").count(), 2);
-        assert!(sky.contains("frame.deck_fit.z > 0.0"));
+        assert_eq!(sky.matches("quad_air(r)").count(), 1);
+        assert!(sky.contains("vec3<f32>(20000.0, 10000.0, 20000.0)"));
+        assert!(sky.contains("0.5 * e * light_to_display(frame.sun_color.rgb) * frame.scatter.x"));
+        assert!(!sky.contains("SKY_FAR"));
+    }
+
+    #[test]
+    fn haze_takes_the_codes_mie_phase() {
+        // 0x821B587C..A0 hand the shaders (1 - g^2, 1 + g, 2g) and
+        // 0x821B51F0 its own table of Mie scattering towards the eye.
+        let sky = sky_source();
+        assert!(sky.contains("MIE_ANGULAR * ((1.0 - g * g)"));
+        assert!(sky.contains("pow(max(1.0 + g + 2.0 * g * mu, 1e-4), 1.5)"));
+        assert!(!sky.contains("0.0795775"));
     }
 
     #[test]
@@ -1307,7 +1361,11 @@ mod tests {
                 .unwrap();
         let src = source(&layout);
         validate(&src);
-        assert!(src.contains("rgb = srgb_encode(t.rgb) * material.color.rgb * v.color.rgb;"));
+        assert!(
+            src.contains(
+                "rgb = srgb_encode(t.rgb) * material.color.rgb * v.color.rgb * v.tint.rgb;"
+            )
+        );
         assert!(src.contains("var keep = vec3<f32>(v.haze.a);"));
         assert!(src.contains("return vec4<f32>(0.0, 0.0, 0.0, surface(v, front).a);"));
         let glow = src.split("fn fs_glow").nth(1).unwrap();

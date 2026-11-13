@@ -362,6 +362,40 @@ else
 end
 "#;
 
+/// The engine's word to the HUD on the context action in reach.
+///
+/// From the 360 code: the context action update (`0x82207538`) looks up
+/// the function `SetContextActionMessage` of the script module
+/// `0xb8984dbc` (`MrxGuiHudMelee`) once, and for each local player whose
+/// nearest action in reach changed calls it with two arguments: the
+/// action's text (the one `Pg.AddContextAction` gave), or nil when none
+/// is in reach, and the player's guid. It passes no priority, so the
+/// script files the text under its default, 1. The script shows it in
+/// the layout's `Context Action Text` after the `[action]` button, with
+/// its own alert sound, and fades it out when told nil.
+///
+/// Not done here: with no action in reach the 360 code can pass
+/// `[ContextAction.Grapple]` (or `[neut][ContextAction.Grapple]`) in
+/// place of nil, by two fields of the player (`+0x14c`, `+0x148`) the
+/// port does not keep.
+///
+/// The HUD's widgets belong to player `0x1` here, as its other calls
+/// name her.
+const CONTEXT_ACTION: &str = r#"
+local text = ...
+local ok, m = pcall(import, "MrxGuiHudMelee")
+if ok and type(m) == "table" and m.SetContextActionMessage then
+    m.SetContextActionMessage(text, Sys.StringToGuid("0x1"))
+end
+"#;
+
+/// Tells the HUD's script the context action in reach ([`CONTEXT_ACTION`]).
+fn context_action(lua: &Lua, text: Option<&str>) -> mlua::Result<()> {
+    lua.load(CONTEXT_ACTION)
+        .set_name("=m2-hud context action")
+        .call::<()>(text)
+}
+
 /// The map movie's GPS destination commands ([`GPS_DEST`]): whether
 /// `command` was one, sent on to the GUI.
 fn gps_dest(lua: &Lua, command: &str, arg: &str) -> bool {
@@ -807,6 +841,10 @@ pub struct HudState {
     pub stock: Vec<(String, u32)>,
     /// What the faction zones last told the HUD (`MissionView::trespass`).
     pub trespass: crate::mission::Trespass,
+    /// The text of the scripts' context action in her reach
+    /// (`Pg.AddContextAction`), for the game's own prompt
+    /// ([`CONTEXT_ACTION`]).
+    pub context_action: Option<String>,
     /// Whether vehicle disguises work, and her disguise while one holds:
     /// how much is left (0..=100) and whether it holds.
     pub vehicle_disguise: bool,
@@ -2122,6 +2160,8 @@ fn run(
 /// What the HUD has been told, to fire only what changed.
 #[derive(Default)]
 struct Told {
+    /// The context action's text last given to the script.
+    context_action: Option<String>,
     /// The save icon was asked up ([`HudState::saving`]).
     saving: bool,
     hp: Option<(i32, bool)>,
@@ -3473,6 +3513,24 @@ impl Thread {
             log.push(format!("flash {}: {name}({} args)", m.swf, args.len()));
             m.rt.call(&name, &args);
         }
+        // The keys the scripts send a movie themselves (`SendFlashInput`:
+        // the store's stick pushes): a press goes down and comes up, a
+        // hold stays down until its release. That a press is both is
+        // inferred from its name; the 360's own handling of the queue was
+        // not read.
+        let inputs = screen.borrow_mut().take_flash_inputs();
+        for (id, code, what) in inputs {
+            let Some(m) = self.flash.get_mut(&id) else {
+                continue;
+            };
+            log.push(format!("flash {}: input {code} {what:?}", m.swf));
+            if what != gui_runtime::FlashInput::Release {
+                m.rt.key_down(code);
+            }
+            if what != gui_runtime::FlashInput::Hold {
+                m.rt.key_up(code);
+            }
+        }
         for (code, down) in std::mem::take(&mut self.keys) {
             log.push(format!(
                 "flash: key {code} {}",
@@ -3910,6 +3968,12 @@ impl Thread {
             lua.load(TRESPASS_EVENT)
                 .set_name("=m2-hud trespass")
                 .call::<()>((s.trespass.inside, s.trespass.faction.clone()))?;
+        }
+        // The context action in reach, told when it changes, as the engine
+        // tells the script.
+        if self.told.context_action != s.context_action {
+            self.told.context_action = s.context_action.clone();
+            context_action(lua, s.context_action.as_deref())?;
         }
         let holding = s.support.designator.is_some();
         // In a tank, the gun chosen: its machine gun, else its cannon.
@@ -6463,6 +6527,46 @@ mod tests {
         );
         assert_eq!(parse_pair(" 12.7,-3x"), Some([12, -3]));
         assert_eq!(parse_pair("12"), None);
+    }
+
+    /// The context action in reach goes to the script's
+    /// `SetContextActionMessage` as the engine calls it: the text, or nil
+    /// once out of reach, and the player; nothing when the module is
+    /// missing.
+    #[test]
+    fn the_context_action_reaches_the_scripts_prompt() {
+        let lua = Lua::new();
+        lua.load(
+            r##"
+            calls = {}
+            Sys = { StringToGuid = function(s) return "guid " .. s end }
+            local melee = { SetContextActionMessage = function(...)
+                local text, player = ...
+                table.insert(calls, select("#", ...) .. " " .. tostring(text) .. " "
+                    .. tostring(player))
+            end }
+            function import(name)
+                if name ~= "MrxGuiHudMelee" then error("no module " .. name) end
+                return melee
+            end
+            "##,
+        )
+        .exec()
+        .unwrap();
+        context_action(&lua, Some("[ContextAction.UseAlarm]")).unwrap();
+        context_action(&lua, None).unwrap();
+        let calls: Vec<String> = lua.globals().get("calls").unwrap();
+        assert_eq!(
+            calls,
+            ["2 [ContextAction.UseAlarm] guid 0x1", "2 nil guid 0x1"]
+        );
+        // Without the module (the shell's scripts) it is left alone.
+        lua.load("function import(name) error('no module ' .. name) end")
+            .exec()
+            .unwrap();
+        context_action(&lua, Some("[ContextAction.Talk]")).unwrap();
+        let calls: Vec<String> = lua.globals().get("calls").unwrap();
+        assert_eq!(calls.len(), 2);
     }
 
     /// The PDA's `ControllerInput` event carries both sticks: the left

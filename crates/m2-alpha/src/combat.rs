@@ -193,6 +193,8 @@ pub struct Rifle {
     pub camera: Option<m2_engine::weapons::CameraFeel>,
     /// Its scope's least and most magnification (`WeaponScope`).
     pub scope: Option<(f32, f32)>,
+    /// How soldiers rate it, carried (`WeaponHint`), if its template says.
+    pub hint: Option<m2_engine::weapons::FireHint>,
 }
 
 impl Default for Rifle {
@@ -217,6 +219,7 @@ impl Default for Rifle {
             assist: None,
             camera: None,
             scope: None,
+            hint: None,
         }
     }
 }
@@ -272,6 +275,7 @@ impl Rifle {
             assist: spec.assist,
             camera: spec.camera,
             scope: spec.scope,
+            hint: spec.hint,
         }
     }
 
@@ -2247,6 +2251,14 @@ pub fn explosives(index: &m2_engine::WorldIndex) -> Vec<Explosive> {
 }
 
 impl Combat {
+    /// The `WeaponHint`s of the guns she carries: her rifle's, and the
+    /// launcher's while she has one. Soldiers rate her threat by every
+    /// weapon in her inventory, carried or in her hands (0x822EC1B8 walks
+    /// the holder's items), not only the one she holds.
+    pub fn carried_hints(&self) -> [Option<m2_engine::weapons::FireHint>; 2] {
+        [self.rifle.hint, self.second.and(self.launcher.hint)]
+    }
+
     /// Rockets, grenades and rounds in flight: what, where, velocity.
     pub fn projectiles(&self) -> impl Iterator<Item = (Flying, Vec3, Vec3)> + '_ {
         self.projectiles.iter().filter_map(|p| match *p {
@@ -2910,8 +2922,20 @@ impl Combat {
     /// One fixed tick: her weapons, the soldiers' shots, projectiles,
     /// health and effects.
     pub fn step(&mut self, f: &mut Field<'_>, trigger: Trigger, dt: f32) {
+        // A fall that hurt her ([`m2_engine::on_foot::fall_impact`]).
+        if let Some(fell) = f.player.fell.take() {
+            self.hurt_player(f, fell.damage, None);
+        }
         self.went_off.clear();
         self.struck.clear();
+        // Up again (revived, respawned, or put on her feet by a script):
+        // her limp body goes. The state table's `Resurrect` leads from
+        // `Die` and `Dead` straight to `Upright` `Idle`.
+        if !f.player.down
+            && let Some(id) = f.player.ragdoll.take()
+        {
+            f.physics.remove_ragdoll(id);
+        }
         for e in &mut self.effects {
             e.1 -= dt;
         }
@@ -3334,8 +3358,15 @@ impl Combat {
                 kind: round_kind(ammo.key),
             });
         }
-        if let Some((_, Some(j))) = hit
-            && self.round_on_person(f.people, j, (damage, ammo.hero), ammo.key, aim * SHOT_PUSH)
+        if let Some((d, Some(j))) = hit
+            && self.round_on_person(
+                f.people,
+                j,
+                (damage, ammo.hero),
+                ammo.key,
+                aim * SHOT_PUSH,
+                Some(from + aim * d),
+            )
         {
             self.remarks.push(Remark::Kill);
         }
@@ -3405,10 +3436,17 @@ impl Combat {
             // What it does to people: its `Damage` times the damage
             // table's cell for their `ModifierKey` and its `DamageKey`,
             // against their template's `Health`.
-            if let Some((_, Some(i))) = hit {
+            if let Some((d, Some(i))) = hit {
                 let key = ammo.and_then(|a| a.key);
                 let hero = ammo.map_or(1.0, |a| a.hero);
-                killed |= self.round_on_person(f.people, i, (damage, hero), key, dir * SHOT_PUSH);
+                killed |= self.round_on_person(
+                    f.people,
+                    i,
+                    (damage, hero),
+                    key,
+                    dir * SHOT_PUSH,
+                    Some(eye + dir * d),
+                );
             }
             if self.rifle.pellets > 1 {
                 self.effect(Effect::Tracer { from, to }, 0.05);
@@ -3697,6 +3735,21 @@ impl Combat {
     }
 
     /// `damage` done to her from `from`: the health she lost.
+    /// A blast at `at` of `DamageKey` `key` reached her: alive after it,
+    /// she staggers as the 360 has area damage do
+    /// ([`m2_engine::stagger`]: the long stagger, for the explosion keys
+    /// only). The way it travelled is taken as from the blast to her
+    /// (inferred).
+    fn blast_staggers_her(f: &mut Field<'_>, at: Vec3, key: Option<u32>) {
+        let direction = (f.player.character.position - at).with_y(0.0);
+        f.player.stagger(&m2_engine::stagger::Event {
+            direction,
+            direct: false,
+            melee: false,
+            key,
+        });
+    }
+
     fn hurt_player(&mut self, f: &mut Field<'_>, damage: f32, from: Option<Vec3>) -> f32 {
         if self.down > 0.0 || self.invincible {
             return 0.0;
@@ -3717,10 +3770,31 @@ impl Combat {
             self.down = DOWN_TIME;
             f.player.down = true;
             f.player.aiming = false;
-            if let (Some(die), Some((_, rig))) = (f.player.clips.die, &mut f.player.model) {
+            // On foot the 360 posts her `Die` (0x82287F98, when no hit's
+            // direction is picked), whose action has no clip and the mode
+            // `FULL`: she goes limp where she stands. The beta does not
+            // record where a hit landed on her, so it is always the plain
+            // death; the clip played here before (479c4a51) is `Upright`
+            // `ProneTransition`'s by the tables, not a death. In a
+            // vehicle the 360 goes by a mode of the seat, not traced:
+            // there the old clip still plays.
+            let on_foot = f.player.driving.is_none() && !f.player.seated;
+            let body = f.player.model_matrix();
+            if let Some((_, rig)) = &mut f.player.model {
                 rig.animator.set_upper(None);
                 rig.two_handed = false;
-                rig.animator.play_once(die);
+                if on_foot {
+                    let (nodes, _) = rig.posed();
+                    let world: Vec<Mat4> = nodes.iter().map(|m| body * *m).collect();
+                    // Limp from rest: what shove the 360 gives the body
+                    // was not traced.
+                    let id = f
+                        .physics
+                        .add_ragdoll(&rig.skeleton.parents, &world, Vec3::ZERO);
+                    f.player.ragdoll = Some(id);
+                } else if let Some(die) = f.player.clips.die {
+                    rig.animator.play_once(die);
+                }
             }
             f.people.stand_down();
         } else {
@@ -4027,13 +4101,14 @@ impl Combat {
                     self.effect(Effect::Tracer { from, to }, 0.07);
                     let damage = ammo.damage_at(hit.map_or(MG_RANGE, |h| h.0));
                     let on_props = RIFLE_DAMAGE * damage / CARBINE_ROUND;
-                    if let Some((_, Some(j))) = hit
+                    if let Some((d, Some(j))) = hit
                         && self.round_on_person(
                             f.people,
                             j,
                             (damage, ammo.hero),
                             ammo.key,
                             aim * SHOT_PUSH,
+                            Some(from + aim * d),
                         )
                     {
                         self.remarks.push(Remark::Kill);
@@ -4329,7 +4404,9 @@ impl Combat {
                             // How well seen (0x822E89B0); what each carries is not
                             // rated against a vehicle here yet, so no threat.
                             let seen = m2_engine::ai_target::visible(d, reach);
-                            let score = m2_engine::ai_target::score(d, current, in_slot, 0.0, seen);
+                            let worth = m2_engine::ai_target::worth(0.0, false);
+                            let score =
+                                m2_engine::ai_target::score(d, current, in_slot, worth, seen);
                             best.offer(who, score);
                             if best.who == Some(who) {
                                 gun.at = Some(at);
@@ -4640,8 +4717,15 @@ impl Combat {
             let to = hit.map_or(from + aim * MG_RANGE, |h| from + aim * h.0);
             self.effect(Effect::Tracer { from, to }, 0.07);
             let damage = ammo.damage_at(hit.map_or(MG_RANGE, |h| h.0));
-            if let Some((_, Some(j))) = hit
-                && self.round_on_person(f.people, j, (damage, ammo.hero), ammo.key, aim * SHOT_PUSH)
+            if let Some((d, Some(j))) = hit
+                && self.round_on_person(
+                    f.people,
+                    j,
+                    (damage, ammo.hero),
+                    ammo.key,
+                    aim * SHOT_PUSH,
+                    Some(from + aim * d),
+                )
             {
                 self.remarks.push(Remark::Kill);
             }
@@ -5498,9 +5582,9 @@ impl Combat {
             // `Explosion`, `HumanArmor` 0.5).
             let own = self.on_person(n, key);
             if d < KILL {
-                killed |= n.hurt(1000.0 * own, push) && n.soldier;
+                killed |= n.hurt_by_blast(1000.0 * own, push, key, at) && n.soldier;
             } else if d < REACH {
-                killed |= n.hurt(100.0 * near * own, push) && n.soldier;
+                killed |= n.hurt_by_blast(100.0 * near * own, push, key, at) && n.soldier;
                 n.panic(at);
             } else if d < REACH * 3.0 {
                 n.panic(at);
@@ -5520,6 +5604,7 @@ impl Combat {
                 let damage = 100.0 * (1.0 - d / REACH).max(0.0);
                 self.tally.taken_blasts +=
                     self.hurt_player(f, damage * self.hero_damage.explosion, Some(at));
+                Self::blast_staggers_her(f, at, key);
             }
         }
         for (i, v) in f.vehicles.iter_mut().enumerate() {
@@ -5617,7 +5702,9 @@ impl Combat {
     /// Her round of `damage` (its `Damage` at that range) and `DamageKey`
     /// `key` striking person `j`, shoving the body `push` if it kills:
     /// they take what [`on_person`](Self::on_person) gives of it. True if
-    /// it killed a soldier.
+    /// it killed a soldier. `at` is where it struck them, where the shot
+    /// knows: the hit a death's direction is read from
+    /// ([`m2_engine::death`]).
     fn round_on_person(
         &mut self,
         people: &mut People,
@@ -5625,8 +5712,10 @@ impl Combat {
         (damage, hero): (f32, f32),
         key: Option<u32>,
         push: Vec3,
+        at: Option<Vec3>,
     ) -> bool {
         let taken = damage * hero * self.on_person(&people.npcs[j], key);
+        people.npcs[j].last_hit = at.map(|p| (p, push));
         if self.crew_firing {
             let killed = people.npcs[j].shot_by_army(taken, push, 0);
             people.war_tally.1 += 1;
@@ -5712,6 +5801,15 @@ impl Combat {
             "melee: a soldier's blow lands on her: {damage:.1} ({lost:.1} lost), shake {}",
             m2_engine::melee::SHAKE_HIT
         );
+        // Bashed and alive, she staggers (the 360's picker: a player's
+        // character by a melee bash).
+        let direction = (f.player.character.position - from).with_y(0.0);
+        f.player.stagger(&m2_engine::stagger::Event {
+            direction,
+            direct: true,
+            melee: true,
+            key: None,
+        });
     }
 
     fn npc_round(&self, gun: Option<m2_engine::tuning::HandGun>) -> f32 {
@@ -5794,7 +5892,7 @@ impl Combat {
                 let away = (n.chest() - at).with_y(0.0).normalize_or(Vec3::X);
                 let push =
                     away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
-                killed |= n.hurt(b.damage_at(d) * scale, push) && n.soldier;
+                killed |= n.hurt_by_blast(b.damage_at(d) * scale, push, b.key, at) && n.soldier;
                 n.panic(at);
             } else if d < reach * 3.0 {
                 n.panic(at);
@@ -5805,6 +5903,7 @@ impl Combat {
             let d = (f.player.character.position + Vec3::Y).distance(at);
             if d < reach {
                 self.tally.taken_blasts += self.hurt_player(f, b.damage_at(d) * hers, Some(at));
+                Self::blast_staggers_her(f, at, b.key);
             }
         }
         for (i, v) in f.vehicles.iter_mut().enumerate() {
@@ -6041,7 +6140,7 @@ impl Combat {
             let away = (chest - at).with_y(0.0).normalize_or(Vec3::X);
             let push = away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
             let own = self.on_person(n, key);
-            killed |= n.hurt(damage * near * own, push) && n.soldier;
+            killed |= n.hurt_by_blast(damage * near * own, push, key, at) && n.soldier;
         }
         let her = (f.player.driving.is_none() && f.player.landed)
             .then(|| f.player.character.position + Vec3::Y)
@@ -6089,6 +6188,7 @@ impl Combat {
             // For checking what hurts her (autoplay logs).
             eprintln!("blast: at {at:.1}, she takes {d:.0}");
             self.tally.taken_blasts += self.hurt_player(f, d, Some(at));
+            Self::blast_staggers_her(f, at, key);
         }
         if killed {
             self.remarks.push(Remark::Kill);
@@ -6997,18 +7097,9 @@ mod tests {
 
     #[test]
     fn a_tank_fires_no_more_shells_than_its_cannon_carries() {
-        use m2_engine::VehicleSpec;
         use m2_engine::tuning::{GunTuning, RoundScale, VehicleTuning};
-        use m2_engine::vehicle::WheelSpec;
         let mut physics = ground();
         let dt = 1.0 / 60.0;
-        let wheel = |x: f32, z: f32| WheelSpec {
-            centre: Vec3::new(x, 0.4, z),
-            radius: 0.4,
-            width: 0.4,
-            steers: false,
-        };
-        let hull = (Vec3::new(-1.5, 0.0, -3.0), Vec3::new(1.5, 2.0, 3.0));
         // Its cannon carries two shells and could fire ten a second.
         let gun = GunTuning {
             weapon: 1,
@@ -7020,56 +7111,10 @@ mod tests {
             flash: None,
             sound_bank: None,
         };
-        let spec = VehicleSpec {
-            model: 1,
-            kind: "tank".into(),
-            label: "test".into(),
-            node_names: Vec::new(),
-            armed: Vec::new(),
-            wheels: vec![
-                wheel(-1.3, 2.0),
-                wheel(1.3, 2.0),
-                wheel(-1.3, -2.0),
-                wheel(1.3, -2.0),
-            ],
-            bounds: hull,
-            seat: None,
-            door: None,
-            seating: None,
-            entrances: Vec::new(),
-            tracked: true,
-            road_wheels: Vec::new(),
-            rest: Vec::new(),
-            node_wheel: Vec::new(),
-            node_rolls: Vec::new(),
-            mass: 32_000.0,
-            turret: Vec::new(),
-            pivot: None,
-            muzzle: Some(Vec3::new(0.0, 2.2, 5.0)),
-            gun: Vec::new(),
-            gun_pivot: None,
-            muzzle_on_gun: false,
-            elevation: (0.0, 0.0),
-            hull,
-            turret_box: None,
-            rotors: Vec::new(),
-            tilts: Vec::new(),
-            bomb_bay: None,
-            node_parents: Vec::new(),
-            aimers: Vec::new(),
-            damage: None,
-            chassis: None,
-            shapes: Default::default(),
-            material: None,
-            turret_shapes: Default::default(),
-            turret_mass: None,
-            gun_body: None,
-            wreck: None,
-            tuning: VehicleTuning {
-                gun: Some(gun),
-                ..VehicleTuning::default()
-            },
-        };
+        let spec = crate::npc::tests::tank(VehicleTuning {
+            gun: Some(gun),
+            ..VehicleTuning::default()
+        });
         let id = physics.add_vehicle(&spec, Vec3::new(0.0, 0.1, 0.0), 0.0);
         physics.step(dt);
         let mut vehicles = vec![ParkedVehicle {
@@ -7186,6 +7231,61 @@ mod tests {
         vehicles[0].spec.kind = "car".into();
         vehicles[0].spec.tuning.gun = None;
         assert_eq!(vehicles[0].rounds(), None);
+    }
+
+    /// Her limp body lasts while she is down and goes when she is up
+    /// again, whatever put her back on her feet.
+    #[test]
+    fn her_limp_body_goes_when_she_is_up_again() {
+        let mut physics = ground();
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        let mut vehicles = Vec::new();
+        let mut explosives = [];
+        let mut combat = Combat::default();
+        let doll = physics.add_ragdoll(&[None], &[Mat4::IDENTITY], Vec3::ZERO);
+        player.ragdoll = Some(doll);
+        player.down = true;
+        let mut field = Field {
+            physics: &mut physics,
+            player: &mut player,
+            people: &mut people,
+            vehicles: &mut vehicles,
+            arsenal: &arsenal,
+            explosives: &mut explosives,
+        };
+        combat.step(&mut field, Trigger::default(), 1.0 / 60.0);
+        assert_eq!(field.player.ragdoll, Some(doll), "kept while she is down");
+        assert!(field.physics.ragdoll_nodes(doll).is_some());
+        field.player.down = false;
+        combat.step(&mut field, Trigger::default(), 1.0 / 60.0);
+        assert_eq!(field.player.ragdoll, None);
+        assert!(field.physics.ragdoll_nodes(doll).is_none());
+    }
+
+    /// Killed on foot with no body loaded there is nothing to go limp;
+    /// she is down all the same.
+    #[test]
+    fn a_death_without_a_body_is_still_a_death() {
+        let mut physics = ground();
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        let mut vehicles = Vec::new();
+        let mut explosives = [];
+        let mut combat = Combat::default();
+        let mut field = Field {
+            physics: &mut physics,
+            player: &mut player,
+            people: &mut people,
+            vehicles: &mut vehicles,
+            arsenal: &arsenal,
+            explosives: &mut explosives,
+        };
+        combat.hurt_player(&mut field, 1.0e6, None);
+        assert!(field.player.down);
+        assert_eq!(field.player.ragdoll, None);
     }
 
     #[test]
@@ -7467,11 +7567,11 @@ mod tests {
         // The carbine's round (6 to 15 m, `HeroMultiplier` 3): a deathsquad
         // mook's 75 health goes in 5 hits.
         let kills: Vec<bool> = (0..5)
-            .map(|_| combat.round_on_person(&mut people, 0, (6.0, 3.0), None, Vec3::ZERO))
+            .map(|_| combat.round_on_person(&mut people, 0, (6.0, 3.0), None, Vec3::ZERO, None))
             .collect();
         assert_eq!(kills.iter().filter(|k| **k).count(), 1);
         assert!(kills[4]);
-        combat.round_on_person(&mut people, 1, (6.0, 3.0), None, Vec3::ZERO);
+        combat.round_on_person(&mut people, 1, (6.0, 3.0), None, Vec3::ZERO, None);
         assert!((people.npcs[1].hp - (75.0 - 6.0 * 3.0 * 0.25)).abs() < 1e-4);
         assert_eq!((combat.tally.hits, combat.tally.kills), (6, 1));
     }
@@ -8030,6 +8130,40 @@ mod tests {
                 at,
                 template: 0x8000_a286
             }]
+        );
+    }
+
+    // Soldiers rate her by her own guns' `WeaponHint`s, the launcher's
+    // only while she carries one (0x822EC1B8 walks her items).
+    #[test]
+    fn her_threat_comes_from_the_guns_she_carries() {
+        use m2_engine::ai_target::{HUMAN, threat};
+        let hint = |range: f32, against: [u32; 4]| m2_engine::weapons::FireHint {
+            min_range: 1.0,
+            range,
+            angle: 2,
+            on: 0.8,
+            off: 1.0,
+            on_close: 0.8,
+            off_close: 1.0,
+            against,
+            kinds: [3, 1],
+            single: false,
+        };
+        let mut combat = Combat::default();
+        combat.rifle.hint = Some(hint(50.0, [3, 1, 0, 0]));
+        combat.launcher.hint = Some(hint(150.0, [1, 3, 0, 0]));
+        combat.second = None;
+        let rate = |c: &Combat, d: f32| threat(c.carried_hints().iter().flatten(), HUMAN, d, false);
+        assert!(rate(&combat, 30.0) > 0.0, "her rifle in its range");
+        assert_eq!(rate(&combat, 100.0), 0.0, "beyond it, and no launcher");
+        combat.second = Some(Weapon::GrenadeLauncher);
+        assert!(rate(&combat, 100.0) > 0.0, "the launcher reaches");
+        combat.rifle.hint = None;
+        assert_eq!(
+            rate(&combat, 30.0),
+            rate(&combat, 100.0),
+            "a gun with no hint adds nothing"
         );
     }
 }

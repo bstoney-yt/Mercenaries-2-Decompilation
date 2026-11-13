@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use m2_engine::ambience::{AmbiencePlan, Layers};
+use m2_engine::ambience_stack::{AmbienceStack, Change, Entry, Inside};
 use m2_engine::audio::{
     EngineCue, EngineSounds, Falloff, KeySounds, Play, SoundLibrary, VoiceBank,
 };
@@ -202,6 +203,10 @@ pub struct GameAudio {
     horns_loading: Option<Receiver<SpareHorns>>,
     /// The rotors heard, by helicopter: a voice per loop.
     rotors: HashMap<u32, Vec<VoiceId>>,
+    /// The strike aircraft in the air whose fly-past cue has been asked
+    /// for, by guid, and its voice (`None`: its set has no cue, or the
+    /// cue no sound).
+    flybys: HashMap<u32, Option<VoiceId>>,
     /// Others' engines heard: their cue and a voice per track.
     others: HashMap<usize, (Arc<EngineCue>, Vec<VoiceId>)>,
     /// Banks read and found to have no engine sounds.
@@ -216,6 +221,10 @@ pub struct GameAudio {
     /// it plays.
     zone_cue: Option<u32>,
     zone: Option<Zone>,
+    /// The ambiences asked for (by the scripts and the regions the
+    /// listener is in), and the regions they are in.
+    ambiences: AmbienceStack,
+    ambience_regions: Inside,
     /// Beds fading: voice, its gain now and where it goes (out: 0, then
     /// stopped).
     zone_fades: Vec<(VoiceId, f32, f32)>,
@@ -519,6 +528,7 @@ fn radio_falloff(reach: f32) -> Falloff {
     Falloff {
         near: (reach * 0.25).max(1.0),
         far: reach.max(2.0),
+        exponent: None,
     }
 }
 
@@ -533,6 +543,7 @@ const CUE_GAIN: f32 = 0.55;
 const CUE_FALLOFF: Falloff = Falloff {
     near: 2.0,
     far: 35.0,
+    exponent: None,
 };
 /// Most clip sounds started in one tick.
 const CUES_AT_ONCE: usize = 6;
@@ -983,6 +994,7 @@ const ROTOR_WHINE: f32 = 0.3;
 const ROTOR_FALLOFF: Falloff = Falloff {
     near: 20.0,
     far: 800.0,
+    exponent: None,
 };
 
 /// A tank's main gun: the loudest of its bank's sounds 0.4 to 4 s long.
@@ -1268,6 +1280,7 @@ impl GameAudio {
                 rx
             }),
             rotors: HashMap::new(),
+            flybys: HashMap::new(),
             others: HashMap::new(),
             silent: HashSet::new(),
             ambient_wait: 3.0,
@@ -1294,6 +1307,8 @@ impl GameAudio {
                 rx
             }),
             zone_cue: None,
+            ambiences: AmbienceStack::new(),
+            ambience_regions: Inside::default(),
             zone: None,
             zone_fades: Vec::new(),
             seed: 0x9e37_79b9_7f4a_7c15,
@@ -1637,6 +1652,7 @@ impl GameAudio {
         let falloff = Falloff {
             near: line.min_distance.max(1.0),
             far: line.max_distance.max(line.min_distance + 1.0),
+            exponent: None,
         };
         self.speak(voices, line.stream, at, falloff, line.volume, None);
     }
@@ -1723,6 +1739,7 @@ impl GameAudio {
         let falloff = Falloff {
             near: near.max(1.0),
             far: far.max(near + 1.0),
+            exponent: None,
         };
         // Jennifer keeps quiet while she is spoken to.
         let now = Instant::now();
@@ -1776,6 +1793,7 @@ impl GameAudio {
         let falloff = Falloff {
             near: near.max(1.0),
             far: far.max(near + 1.0),
+            exponent: None,
         };
         let _ = self.said.0.send((
             buffer,
@@ -1879,6 +1897,61 @@ impl GameAudio {
         self.seed ^= self.seed >> 7;
         self.seed ^= self.seed << 17;
         (self.seed >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    /// A script cues (`Sound.CueAmbience`) or stops (`Sound.StopAmbience`)
+    /// the ambience of cue `cue`, a name hash. Anything else that wants
+    /// an ambience heard (an alarm, an interior) asks the same way, with
+    /// its own [`Entry`], through [`Self::cue_ambience`].
+    pub fn script_ambience(&mut self, cue: u32, on: bool) {
+        if on {
+            self.cue_ambience(Entry::script(cue));
+        } else {
+            self.stop_ambience(cue, 0);
+        }
+    }
+
+    /// Asks for an ambience; the list ([`AmbienceStack`]) decides which
+    /// of those asked for plays.
+    pub fn cue_ambience(&mut self, entry: Entry) {
+        if !self.ambiences.cue(entry) {
+            eprintln!("ambience: cue {:08x} dropped, the list is full", entry.cue);
+        }
+    }
+
+    /// Takes back an ambience asked for, by its cue and overlay.
+    pub fn stop_ambience(&mut self, cue: u32, overlay: u32) {
+        self.ambiences.stop(cue, overlay);
+    }
+
+    /// `Sound.SilenceAmbience`: the ambience stops, or plays again.
+    pub fn silence_ambience(&mut self, on: bool) {
+        let change = self.ambiences.silence(on);
+        self.ambience_changed(&change);
+    }
+
+    /// The listener is inside the ambience regions `inside` (each one's
+    /// entity and ambience). Answers the cue to play now
+    /// ([`Self::zone_ambience`]): the list's pick, none while silenced.
+    pub fn ambience_heard(&mut self, inside: &[(u32, Entry)]) -> Option<u32> {
+        self.ambience_regions.listen(&mut self.ambiences, inside);
+        let change = self.ambiences.update();
+        self.ambience_changed(&change);
+        self.ambiences.heard()
+    }
+
+    /// Notes what a change of ambience asks for beyond the cue played:
+    /// its bank (the regions' banks are all read at the start, so none
+    /// is loaded here), its overlay cue and its reverb preset, which are
+    /// not acted on (no region or script sets either).
+    fn ambience_changed(&self, change: &Change) {
+        if change.is_empty() {
+            return;
+        }
+        eprintln!(
+            "ambience: stop {:08x?}, bank {:08x?}, start {:08x?}, reverb {:08x?}",
+            change.stop, change.bank, change.start, change.reverb
+        );
     }
 
     /// The regions' ambience, once read: plays region cue `cue` (`None`:
@@ -1987,7 +2060,8 @@ impl GameAudio {
             let distance = 10.0 + self.random() * 30.0;
             let at = listener + Vec3::new(angle.cos() * distance, 2.0, angle.sin() * distance);
             let falloff =
-                Falloff::of_record(layer.min_distance, layer.max_distance).unwrap_or_default();
+                Falloff::of_record(layer.min_distance, layer.max_distance, layer.exponent)
+                    .unwrap_or_default();
             let play = Play::at(buffer, at).gain(layer.volume).falloff(falloff);
             self.out.with(|m| m.play(play));
         }
@@ -2987,6 +3061,85 @@ impl GameAudio {
         }
     }
 
+    /// Keeps the strike aircraft in the air (`flying`: each one's guid,
+    /// where it is and its sound set) heard where they are: each plays
+    /// the cue the `Sounds` table gives its set for a fly-past
+    /// ([`m2_engine::spawn_sound::FLYBY_EVENT`]) once, from when it is
+    /// first seen, and the sound stays on it. One gone from the list
+    /// falls silent, as an entity's sounds stop when it goes. A set with
+    /// no such row, or a cue nothing answers, is silent: nothing stands
+    /// in for it.
+    ///
+    /// The cue's own record gives its level and how far it carries. That
+    /// it plays once through (rather than looping) is inferred: the 360
+    /// starts it again at each leg of the flight, and the port's flights
+    /// have one leg.
+    pub fn flybys(&mut self, flying: &[(u32, Vec3, u32)]) {
+        let gone: Vec<u32> = self
+            .flybys
+            .keys()
+            .filter(|g| !flying.iter().any(|f| f.0 == **g))
+            .copied()
+            .collect();
+        for guid in gone {
+            if let Some(Some(voice)) = self.flybys.remove(&guid) {
+                self.out.with(|m| m.stop(voice));
+            }
+        }
+        for &(guid, at, set) in flying {
+            match self.flybys.get(&guid) {
+                Some(Some(voice)) => {
+                    let voice = *voice;
+                    self.out.with(|m| m.set_position(voice, at));
+                    continue;
+                }
+                Some(None) => continue,
+                None => {}
+            }
+            let cue = self
+                .gun_cues
+                .cue_of(set, m2_engine::spawn_sound::FLYBY_EVENT);
+            let Some(cue) = cue.filter(|_| set != 0) else {
+                eprintln!("sound: fly-past, set {set:08x}: no Sounds row, silent");
+                self.flybys.insert(guid, None);
+                continue;
+            };
+            match self.keys.get(&cue) {
+                Some(Some(found)) => {
+                    let found = found.clone();
+                    let pick = self.random();
+                    let voice = found.pick(pick).cloned().map(|buffer| {
+                        eprintln!(
+                            "sound: fly-past, set {set:08x}, cue {cue:08x}: sound {:08x} \
+                             ({:.2} s) at {at:.0}",
+                            buffer.hash,
+                            buffer.seconds()
+                        );
+                        let play = Play::at(buffer, at).gain(found.volume);
+                        let play = match found.falloff {
+                            Some(f) => play.falloff(f),
+                            None => play,
+                        };
+                        self.out.with(|m| m.play(play))
+                    });
+                    self.flybys.insert(guid, voice);
+                }
+                Some(None) => {
+                    eprintln!("sound: fly-past, cue {cue:08x}: nothing found for it, silent");
+                    self.flybys.insert(guid, None);
+                }
+                // Not read yet: asked for, and tried again next tick.
+                None => {
+                    if self.install.is_none() {
+                        self.keys.insert(cue, None);
+                    } else {
+                        self.ask_key(cue);
+                    }
+                }
+            }
+        }
+    }
+
     /// Keeps the rotors of the helicopters in the air (`flying`: each
     /// one's guid, where it is and the sound bank its template names)
     /// heard where they are: the bank's lowest steady loop (the blades'
@@ -3366,6 +3519,8 @@ mod tests {
             volume: 1.0,
             min_distance: 10.0,
             max_distance: 1000.0,
+            positional: false,
+            exponent: 1.0,
             variants: vec![(table, stream, 1.0)],
         };
         m2_assets::CueTable {

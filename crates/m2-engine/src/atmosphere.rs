@@ -48,12 +48,20 @@
 //! The time of day is each record's `LightTime` (`LightTimeSpeed` is 0 in
 //! every record, so the sun stands still): 0.05 to 0.1 in the records of
 //! the islands, whose reference footage is at sunset and dusk, 0.2 in the
-//! default, 0.3 for the scripts' `afternoon`, 0.9 in Cumana's. The sun is
-//! taken to cross the sky on a half circle as `LightTime` goes from 0 to
-//! 1, at the horizon at 0 and 1 and overhead at 0.5 ([`SUN_SETS`] says
-//! which way): inferred from those values and the footage, not confirmed.
+//! default, 0.3 for the scripts' `afternoon`, 0.9 in Cumana's. The sun
+//! crosses the sky on a half circle as `LightTime` goes from 0 to 1, at
+//! the horizon at 0 and 1 and overhead at 0.5 ([`SUN_SETS`] says which
+//! way): from the 360 code (0x821B5608), with its shadows cast from a
+//! sun at `0.8 LightTime + 0.1`.
 //!
 //! # Provenance
+//!
+//! From the 360 code: the sunlight's colour ([`Atmosphere::sun_light`],
+//! 0x821B5000: the air's toll on sunlight at the sun's height times
+//! `LightMultiplier` and `LightIntensity`) and the air's Rayleigh and Mie
+//! scattering with their multipliers (0x821B51F0). The record fields
+//! behind the code's light state were matched through the game's blend
+//! between two records (0x8224C398) and its record layout (0x823F6088).
 //!
 //! The field names come from matching name hashes; what each one does is
 //! read from its name and from the game's pixel shaders (ambient cube
@@ -97,6 +105,12 @@ pub struct Atmosphere {
     pub inscattering: f32,
     pub extinction: f32,
     pub mie: f32,
+    /// `ScatterBetaRayMultiplier`: the scale on the air's Rayleigh
+    /// scattering ([`RAYLEIGH`]; 0.04 to 0.3 in the records).
+    pub ray: f32,
+    /// `ScatterTurbinity` (the game's spelling): the haze in the
+    /// sunlight's path ([`Atmosphere::sun_light`]); 0 in every record but one.
+    pub turbidity: f32,
     pub hg_g: f32,
     /// `AtmosphereForce`, `AtmosphereLimit`, `HazeForce` and `HazeLimit`:
     /// the haze's two layers of air, each as thick as its limit (metres)
@@ -126,6 +140,9 @@ pub struct Atmosphere {
     /// `LightMultiplier_X`..`_Z`: the sunlight's colour (1, 0.85, 0.8 in
     /// the islands' evening records).
     pub light_color: Vec3,
+    /// `SunEmissiveColor_X`..`_Z`: the sun disc's colour, before the code
+    /// scales it by the sunlight and 32 ([`Atmosphere::sun_disc`]).
+    pub sun_emissive: Vec3,
     /// `InterpolateTime`: seconds the change to these settings takes.
     pub interpolate_time: f32,
     /// `Water0`..`2_Color1`/`Color2`: the water's colour and opacity by
@@ -145,6 +162,78 @@ pub struct Atmosphere {
     /// 1 for the record named `night`, else 0, blended between records:
     /// how far the searchlights' beams show (see [`BEAMS_FULL_RAMP`]).
     pub night: f32,
+    /// `AmbientEffect0`..`4`: the particle effects the record keeps about
+    /// the camera ([`AmbientEffect`]); unused slots have no template.
+    pub ambient: [AmbientEffect; 5],
+    /// `ScreenEffect0...`: the record's screen overlay ([`ScreenEffect`]).
+    pub screen: ScreenEffect,
+}
+
+/// A record's screen overlay (`ScreenEffect0Speed`, `...Density`,
+/// `...DirX`, `...DirY`, `...Texture`, `...Color`, `...Type`): rain and the
+/// like, drawn over the whole screen while `density` is above 0.
+///
+/// From the 360 code (0x8224C398): of the record's seven slots only slot 0
+/// is read; slots 1..6 have no reader. Between two records the speed,
+/// density and direction blend, the colour blends byte by byte, and the
+/// texture and type switch halfway. They go to the "rain" object
+/// (0x821BF458), which scrolls by `speed` along `dir` and draws one
+/// full-screen quad with `PgRainVP`/`PgRainFP` (0x821BF628). The port
+/// reads the fields and doesn't draw the overlay yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScreenEffect {
+    pub speed: f32,
+    pub density: f32,
+    /// `DirX`, `DirY`.
+    pub dir: [f32; 2],
+    /// The texture's name hash; 0 for none.
+    pub texture: u32,
+    /// The colour word as stored.
+    pub colour: u32,
+    /// `ScreenEffect0Type`: picks the blend (1, 2 or other; meanings not
+    /// read).
+    pub kind: u32,
+}
+
+impl ScreenEffect {
+    /// `t` of the way from `self` to `to`, as 0x8224C398 blends them.
+    pub fn lerp(&self, to: &Self, t: f32) -> Self {
+        let f = |a: f32, b: f32| a + (b - a) * t;
+        // Each byte on its own, truncated as the game's integer convert.
+        let byte = |shift: u32| {
+            let a = (self.colour >> shift & 0xff) as f32;
+            let b = (to.colour >> shift & 0xff) as f32;
+            ((a + (b - a) * t) as u32 & 0xff) << shift
+        };
+        let late = if t > 0.5 { to } else { self };
+        Self {
+            speed: f(self.speed, to.speed),
+            density: f(self.density, to.density),
+            dir: [f(self.dir[0], to.dir[0]), f(self.dir[1], to.dir[1])],
+            texture: late.texture,
+            colour: byte(24) | byte(16) | byte(8) | byte(0),
+            kind: late.kind,
+        }
+    }
+}
+
+/// One of a record's ambient effects (`AmbientEffectN...`): on every
+/// change of the light the game deletes the last record's and spawns the
+/// new one's, each with a template (from the 360 code, 0x8224D650): type
+/// 0 keeps the effect's particles about the camera (`kind` 2, 0x821DA518),
+/// type 1 on the ground about it (`kind` 7, 0x821DA768; no record uses
+/// it). The templates are the `global_particle_flotsum` family (papers,
+/// dust, bugs, birds, smoke).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AmbientEffect {
+    /// `AmbientEffectNType`.
+    pub kind: u32,
+    /// `AmbientEffectNName`: the effect template's name hash; 0 for none.
+    pub template: u32,
+    /// `AmbientEffectNRadius`, `...Height`, `...Variance`.
+    pub radius: f32,
+    pub height: f32,
+    pub variance: f32,
 }
 
 /// A value a script sets on the light ([`Atmosphere::edited`]).
@@ -184,12 +273,36 @@ pub struct ScriptAtmosphere {
     pub restore: Option<f32>,
 }
 
-/// Which way the sun stands at `LightTime` 0 (and 0.1, low in the
-/// evening), over the horizon: 60 degrees from `+z` towards `+x`, so
-/// that from the start of `VzaCon001` it stands behind the island 20 to
-/// 25 degrees left of its searchlights, as the footage of the boat ride
-/// has it. Inferred from the footage.
-pub const SUN_SETS: Vec3 = Vec3::new(0.87, 0.0, 0.49);
+/// Which way the sun stands at `LightTime` 0 to 0.5 (morning), at the
+/// horizon: the code's light angle, -150 degrees, turned half a circle
+/// (from the 360 code, 0x821B5608 and 0x821B4EE0: `(cos a, 0, sin a)`
+/// for the angle `a`, plus 3.141 before noon). It lands 30 degrees from
+/// `+x` towards `+z`, where footage of the boat ride had put it.
+pub const SUN_SETS: Vec3 = Vec3::new(0.866_025_4, 0.0, 0.5);
+
+/// The light angle the game's code starts with (degrees, 0x821B4C08,
+/// constant at 0x820F8E24). No record holds one and no script calls
+/// `Graphics.Atmosphere.SetLightAngle`, so it is the angle throughout.
+const LIGHT_ANGLE: f32 = -150.0;
+
+/// The game's own pi where it turns `LightTime` into the sun's place
+/// (0x821B5608, constant at 0x820F8C7C).
+#[allow(clippy::approx_constant)]
+const HALF_TURN: f32 = 3.141;
+
+/// The unit way towards the sun at `LightTime` `t`, as the game's code
+/// reckons it (from the 360 code, 0x821B5608 calling 0x821B4EE0): its
+/// angle from overhead is `|t - 0.5|` half turns, its compass angle
+/// [`LIGHT_ANGLE`] in degrees (times 0.01745), plus a half turn before
+/// noon; the way is `(sin z cos a, cos z, sin z sin a)`.
+fn towards_sun(t: f32) -> Vec3 {
+    let z = (t - 0.5).abs() * HALF_TURN;
+    let mut a = LIGHT_ANGLE * 0.017_45;
+    if t < 0.5 {
+        a += HALF_TURN;
+    }
+    Vec3::new(z.sin() * a.cos(), z.cos(), z.sin() * a.sin())
+}
 
 /// How much of the night's monochrome ramp (its weight, 0.36 there) shows
 /// the searchlights' beams in full; below it they fade out (inferred).
@@ -201,10 +314,6 @@ const BEAMS_FULL_RAMP: f32 = 0.3;
 /// alpha (inferred); with the day contrast gone (round V) the landing cores
 /// fell to L119-122 at 0.28, so it is raised to 0.5.
 const BEAM_NIGHT_ALPHA: f32 = 0.5;
-
-/// The lowest the sun is drawn, in radians over the horizon, so that low
-/// `LightTime`s still light the ground a little.
-const SUN_LOWEST: f32 = 0.05;
 
 /// The cloud shader's darkness per unit of `DarknessK` (`c` in
 /// [`Atmosphere::cloud_darkness`]). The proportion is inferred from the
@@ -329,6 +438,8 @@ impl Atmosphere {
             inscattering: float("ScatterInscatteringMultiplier").unwrap_or(0.0),
             extinction: float("ScatterExtinctionMultiplier").unwrap_or(0.0),
             mie: float("ScatterBetaMieMultiplier").unwrap_or(0.0),
+            ray: float("ScatterBetaRayMultiplier").unwrap_or(0.0),
+            turbidity: float("ScatterTurbinity").unwrap_or(0.0),
             hg_g: float("ScatterHgG").unwrap_or(0.0),
             haze_layers: (|| {
                 Some([
@@ -361,6 +472,11 @@ impl Atmosphere {
                 float("LightMultiplier_Y").unwrap_or(1.0),
                 float("LightMultiplier_Z").unwrap_or(1.0),
             ),
+            sun_emissive: Vec3::new(
+                float("SunEmissiveColor_X").unwrap_or(0.0),
+                float("SunEmissiveColor_Y").unwrap_or(0.0),
+                float("SunEmissiveColor_Z").unwrap_or(0.0),
+            ),
             interpolate_time: float("InterpolateTime").unwrap_or(0.0),
             // Every record's ramp is taken, as the game's composite shader
             // always blends the frame towards its monochrome map. Earlier
@@ -378,6 +494,24 @@ impl Atmosphere {
                     _ => true,
                 })
                 .map(|v| Vec4::from_array(channels(v, Lit::Post))),
+            ambient: std::array::from_fn(|i| AmbientEffect {
+                kind: field(&format!("AmbientEffect{i}Type")).unwrap_or(0),
+                template: field(&format!("AmbientEffect{i}Name")).unwrap_or(0),
+                radius: float(&format!("AmbientEffect{i}Radius")).unwrap_or(0.0),
+                height: float(&format!("AmbientEffect{i}Height")).unwrap_or(0.0),
+                variance: float(&format!("AmbientEffect{i}Variance")).unwrap_or(0.0),
+            }),
+            screen: ScreenEffect {
+                speed: float("ScreenEffect0Speed").unwrap_or(0.0),
+                density: float("ScreenEffect0Density").unwrap_or(0.0),
+                dir: [
+                    float("ScreenEffect0DirX").unwrap_or(0.0),
+                    float("ScreenEffect0DirY").unwrap_or(0.0),
+                ],
+                texture: field("ScreenEffect0Texture").unwrap_or(0),
+                colour: field("ScreenEffect0Color").unwrap_or(0),
+                kind: field("ScreenEffect0Type").unwrap_or(0),
+            },
             night: if field("Name") == Some(name_hash("night")) {
                 1.0
             } else {
@@ -388,6 +522,7 @@ impl Atmosphere {
                 Some(ToneMap {
                     target: f(&["BloomTargetLuminance"])?,
                     retention: f(&["BloomAdaptiveLuminancePercent"])?,
+                    speed: f(&["BloomAdaptiveLuminanceScale"])?,
                     min: f(&["BloomAdaptiveLuminanceMin", "AdaptiveLuminanceMin"])?,
                     max: f(&["BloomAdaptiveLuminanceMax", "AdaptiveLuminanceMax"])?,
                     min_key: f(&[
@@ -455,6 +590,8 @@ impl Atmosphere {
             inscattering: f(self.inscattering, to.inscattering),
             extinction: f(self.extinction, to.extinction),
             mie: f(self.mie, to.mie),
+            ray: f(self.ray, to.ray),
+            turbidity: f(self.turbidity, to.turbidity),
             hg_g: f(self.hg_g, to.hg_g),
             haze_layers: match (self.haze_layers, to.haze_layers) {
                 (Some(a), Some(b)) => Some(std::array::from_fn(|i| f(a[i], b[i]))),
@@ -468,6 +605,7 @@ impl Atmosphere {
             cloud_scales: std::array::from_fn(|i| f(self.cloud_scales[i], to.cloud_scales[i])),
             wind: std::array::from_fn(|i| f(self.wind[i], to.wind[i])),
             light_color: v(self.light_color, to.light_color),
+            sun_emissive: v(self.sun_emissive, to.sun_emissive),
             interpolate_time: to.interpolate_time,
             tone_map: match (self.tone_map, to.tone_map) {
                 (Some(a), Some(b)) => Some(ToneMap {
@@ -477,6 +615,7 @@ impl Atmosphere {
                     min_key: f(a.min_key, b.min_key),
                     max_key: f(a.max_key, b.max_key),
                     retention: f(a.retention, b.retention),
+                    speed: f(a.speed, b.speed),
                     contrast_limit: f(a.contrast_limit, b.contrast_limit),
                     contrast: f(a.contrast, b.contrast),
                     log_average: b.log_average,
@@ -492,6 +631,9 @@ impl Atmosphere {
                 (None, None) => None,
             },
             night: f(self.night, to.night),
+            // The game swaps them whole on a change ([`AmbientEffect`]).
+            ambient: to.ambient,
+            screen: self.screen.lerp(&to.screen, t),
             water_ramp: match (self.water_ramp, to.water_ramp) {
                 (Some(a), Some(b)) => Some(std::array::from_fn(|i| a[i].lerp(b[i], t))),
                 (_, b) => b,
@@ -600,12 +742,28 @@ impl Atmosphere {
         (a, unused)
     }
 
-    /// The way the sunlight travels at this `LightTime`: from a sun on
-    /// a half circle over [`SUN_SETS`] (see the module's notes).
+    /// The way the sunlight travels at this `LightTime` ([`towards_sun`]
+    /// turned round): the sun reaches the horizon at 0 and 1.
     pub fn sun_direction(&self) -> Vec3 {
-        let half = std::f32::consts::PI * self.light_time[0].clamp(0.0, 1.0);
-        let up = half.sin().max(SUN_LOWEST.sin());
-        -(SUN_SETS.normalize() * half.cos() + Vec3::Y * up)
+        -towards_sun(self.light_time[0])
+    }
+
+    /// The sun disc's colour (display values): `SunEmissiveColor` times
+    /// the sunlight ([`Atmosphere::sun_light`]) times 32, which the code
+    /// puts in the disc's material as its emissive colour each frame
+    /// (from the 360 code, 0x821CDCA0, constant at 0x820F8BE8) and the
+    /// disc's pixel shader draws flat (the install's shader 484).
+    pub fn sun_disc(&self) -> Vec3 {
+        (self.sun_emissive * self.sun_light() * 32.0).max(Vec3::ZERO)
+    }
+
+    /// The way the sun's shadows are cast: the game reckons a second sun
+    /// at `0.8 LightTime + 0.1`, never lower than a tenth of a half turn
+    /// (18 degrees), and hands its way to the shadow maps (from the 360
+    /// code: 0x821B5608 into the light state's +0x20, which 0x821B67F8
+    /// passes to 0x821C0150).
+    pub fn shadow_direction(&self) -> Vec3 {
+        -towards_sun(self.light_time[0] * 0.8 + 0.1)
     }
 
     /// Puts the ambient cube, sunlight strength, rim light, haze, bloom,
@@ -617,20 +775,16 @@ impl Atmosphere {
         lighting.rim_color = decode(self.rim);
         lighting.rim_threshold = self.rim_threshold;
         lighting.sun_direction = self.sun_direction();
+        lighting.shadow_direction = Some(self.shadow_direction());
+        lighting.sun_disc = self.sun_disc();
         // `M2_LIGHTING=linear` sums the light in linear light, with the
         // sun's colour taken as linear, as before, for comparison.
         lighting.gamma_light = gamma_light();
-        // `LightIntensity` dims the sky's haze, but not the sun on
-        // surfaces or clouds: in the sun's colour, at Guanare's 0.3
-        // the town's sunlit road was 1.2 times as bright as its shadow
-        // against 1.4 to 2.8 in footage, and without it 1.5; left out of
-        // the sky too, the night sky was half as bright again as footage
-        // (PC rounds A and W). Inferred. `M2_SUN=li` puts it in the sun's
-        // colour throughout, `M2_SUN=full` nowhere.
-        let mode = std::env::var("M2_SUN").unwrap_or_default();
-        let full = mode != "li";
-        let intensity = if full { 1.0 } else { self.light_intensity };
-        let sun = self.light_color * intensity;
+        // The sun's colour as the game's code reckons it (from the 360
+        // code, 0x821B5000): `LightMultiplier` times `LightIntensity`
+        // times what the air leaves of sunlight at the sun's height. The
+        // shaders take it as it is, a display value.
+        let sun = self.sun_light();
         lighting.sun_color = if lighting.gamma_light {
             decode(sun)
         } else {
@@ -638,14 +792,10 @@ impl Atmosphere {
         };
         lighting.haze = self.haze();
         lighting.clouds.tone = self.tone;
-        // The game's haze shaders take the sun's colour and nothing of
-        // LightIntensity (PC round R); `M2_HAZE_LI=on` dims it by that in
-        // display values all the same.
-        if lighting.haze.layers.is_some() {
-            if env_is("M2_HAZE_LI", "on") {
-                lighting.haze.inscattering *= self.light_intensity.max(0.0);
-            }
-        } else if mode != "li" && mode != "full" {
+        // The game's haze shaders take the sun's colour, which holds
+        // `LightIntensity` (above); every record has haze layers. Without
+        // them (no record), the older haze is dimmed by it as before.
+        if lighting.haze.layers.is_none() {
             let li = self.light_intensity.max(0.0);
             // `M2_SKY_LI=linear` dims the haze by the intensity itself
             // rather than its decoded value (0.3 rather than 0.07 at
@@ -664,9 +814,14 @@ impl Atmosphere {
                 lighting.clouds.tone *= sky;
             }
         }
-        // `BloomAmount` times `BloomMultiplier` above `BloomThreshold`
-        // (inferred from the names).
-        lighting.bloom = self.bloom[0] * self.bloom[1];
+        // `BloomAmount` alone: the record blend hands the post pass the
+        // amount (its `imageParams.x`), the radius and the tone settings,
+        // and never `BloomMultiplier` or `BloomThreshold`, which the
+        // scripts' setters for them only store (from the 360 code: 0x8224C398,
+        // 0x821BD348, `Graphics.Bloom.SetMultiplier`/`SetThreshold`). The
+        // fitted bright pass still uses the threshold.
+        lighting.bloom = self.bloom[0];
+        lighting.bloom_radius = self.bloom[3];
         lighting.bloom_threshold = self.bloom[2];
         // Clouds are lit by the game's formula; `M2_CLOUDS=old` lights
         // them as before.
@@ -738,18 +893,17 @@ impl Atmosphere {
         });
     }
 
-    /// The haze these settings describe: Hoffman and Preetham's standard
-    /// Rayleigh and Mie scattering (Mie for a turbidity of 2), scaled by
-    /// the `Scatter...` multipliers. That the game's multipliers apply to
-    /// these standard coefficients is inferred: its shaders take the
-    /// products from code. On their own they haze land a few percent per
-    /// kilometre; [`HAZE_DENSITY`] thickens that to match footage.
+    /// The haze these settings describe: the game's Rayleigh and Mie
+    /// scattering ([`RAYLEIGH`], [`MIE`]) times `ScatterBetaRayMultiplier`
+    /// and `ScatterBetaMieMultiplier`, as its code hands them to the
+    /// shaders (from the 360 code, 0x821B51F0 and 0x821B5728).
+    /// [`HAZE_DENSITY`] applies only to the older haze without layers.
     pub fn haze(&self) -> Haze {
         if self.inscattering <= 0.0 {
             return Haze::default();
         }
         Haze {
-            rayleigh: RAYLEIGH,
+            rayleigh: RAYLEIGH * self.ray,
             // `M2_MIE=<x>` scales the haze's Mie scattering alone, to test
             // the sunset's glow about the sun (PC round Q: ours has none).
             mie: MIE
@@ -1071,12 +1225,47 @@ impl AtmosphereMix {
 /// 2 km away is about half haze, as in PC footage of the game (the game's
 /// own density comes from code).
 const HAZE_DENSITY: f32 = 4.0;
-/// Rayleigh scattering of air per metre at 650, 570 and 475 nm.
-const RAYLEIGH: Vec3 = Vec3::new(6.95e-6, 1.18e-5, 2.44e-5);
-/// Mie scattering per metre at the same wavelengths for a turbidity of 2,
-/// before the game's multiplier: `0.434 c pi (2 pi / lambda)^2 K` with
-/// `c = (0.6544 T - 0.6510) 1e-16`.
-const MIE: Vec3 = Vec3::new(5.75e-3, 7.39e-3, 1.045e-2);
+/// The air's Rayleigh scattering at 650, 570 and 475 nm before
+/// `ScatterBetaRayMultiplier` scales it. From the 360 code (0x821B51F0,
+/// constants at 0x820F9300..08).
+const RAYLEIGH: Vec3 = Vec3::new(6.971_528e-4, 1.178_913_7e-3, 2.444_595_8e-3);
+/// The air's Mie scattering at the same wavelengths before
+/// `ScatterBetaMieMultiplier` scales it. From the 360 code (0x821B51F0,
+/// constants at 0x820F92DC..E4).
+const MIE: Vec3 = Vec3::new(5.740_597e-3, 7.399_686_6e-3, 1.051_431_2e-2);
+
+/// The wavelengths (micrometres) of the sunlight's red, green and blue,
+/// as the game reckons what the air leaves of it. From the 360 code
+/// (0x821B5000, constants at 0x820F8DF0..F8).
+const SUN_WAVELENGTHS: [f32; 3] = [0.65, 0.57, 0.475];
+
+impl Atmosphere {
+    /// The sunlight's colour, as the game's code reckons it each frame
+    /// (from the 360 code, 0x821B5000, called from 0x821B5608): what the
+    /// air leaves of sunlight at the sun's height, per wavelength `l`,
+    /// `exp(-0.008735 m l^-2.255) * exp(-b m l^-1.9125)`, with
+    /// `b = 0.04608366 T - 0.04586026` for `ScatterTurbinity` `T` and the
+    /// optical mass `m = 1 / (cos z + 0.15 (93.885 - z)^-1.9066249)` for
+    /// the sun's angle `z` from overhead (degrees in the second term),
+    /// times `LightMultiplier` and `LightIntensity`, each channel at
+    /// least 0. `ScatterTurbinity` is 0 in all records but one, which
+    /// makes `b` below 0: the light comes out a little stronger and bluer
+    /// than `LightMultiplier` as the sun sinks, as the code has it.
+    pub fn sun_light(&self) -> Vec3 {
+        // The sun's angle from overhead, as in `sun_direction`'s source
+        // (0x821B5608): |LightTime - 0.5| times 3.141.
+        let z = (self.light_time[0] - 0.5).abs() * HALF_TURN;
+        let b = 0.046_083_66 * self.turbidity - 0.045_860_26;
+        let deg = z * 57.295_83;
+        let m = 1.0 / (z.cos() + 0.15 * (93.885 - deg).max(1e-3).powf(-1.906_625));
+        let left = SUN_WAVELENGTHS.map(|l| {
+            let rayleigh = (-0.008_735 * m * l.powf(-2.255)).exp();
+            let haze = (-b * m * l.powf(-1.9125)).exp();
+            rayleigh * haze
+        });
+        (Vec3::from_array(left) * self.light_color * self.light_intensity).max(Vec3::ZERO)
+    }
+}
 
 /// What a record colour is for: light on surfaces (ambient, rim) or the
 /// water and post pass (depth colour map, monochrome ramp).
@@ -1182,6 +1371,8 @@ mod tests {
             inscattering: 0.0,
             extinction: 0.0,
             mie: 0.0,
+            ray: 0.0,
+            turbidity: 0.0,
             hg_g: 0.0,
             haze_layers: None,
             tone: Vec3::ONE,
@@ -1192,11 +1383,14 @@ mod tests {
             cloud_scales: [1.0; 3],
             wind: [0.0; 2],
             light_color: Vec3::ONE,
+            sun_emissive: Vec3::ZERO,
             interpolate_time,
             water_ramp: None,
             tone_map: None,
             monochrome: None,
             night: 0.0,
+            ambient: [AmbientEffect::default(); 5],
+            screen: ScreenEffect::default(),
         }
     }
 
@@ -1221,6 +1415,159 @@ mod tests {
         assert!(low.y < 0.0 && high.y < 0.0);
         assert!(low.normalize().dot(-SUN_SETS.normalize()) > 0.9);
         assert!(high.normalize().y < -0.99);
+    }
+
+    #[test]
+    fn sunlight_is_the_codes_colour_times_light_intensity() {
+        // The island's default record: LightTime 0.2, LightIntensity 1.15,
+        // white LightMultiplier, ScatterTurbinity 0 (0x821B5000 by hand:
+        // optical mass 1.70 at 54 degrees from overhead).
+        let default = Atmosphere {
+            light_intensity: 1.15,
+            ..plain(0.2, 0.0)
+        };
+        let sun = default.sun_light();
+        let want = Vec3::new(1.320, 1.371, 1.468);
+        assert!((sun - want).abs().max_element() < 0.01, "{sun}");
+        // With no turbidity the sun overhead is a little over white and
+        // grows stronger and bluer as it sinks.
+        let noon = Atmosphere {
+            light_intensity: 1.15,
+            ..plain(0.5, 0.0)
+        }
+        .sun_light()
+            / 1.15;
+        assert!(
+            (noon - Vec3::new(1.085, 1.11, 1.154)).abs().max_element() < 0.01,
+            "{noon}"
+        );
+        assert!(sun.z / 1.15 > noon.z && sun.z > sun.x);
+        // It scales with LightIntensity and LightMultiplier.
+        let dim = Atmosphere {
+            light_intensity: 0.3,
+            light_color: Vec3::new(1.05, 0.9, 0.7),
+            ..plain(0.2, 0.0)
+        };
+        let ratio = dim.sun_light() / sun;
+        assert!(
+            (ratio - Vec3::new(1.05, 0.9, 0.7) * 0.3 / 1.15)
+                .abs()
+                .max_element()
+                < 1e-4
+        );
+        // A haze in the sun's path (ScatterTurbinity) reddens a low sun.
+        let hazy = Atmosphere {
+            light_intensity: 1.0,
+            turbidity: 4.0,
+            ..plain(0.05, 0.0)
+        };
+        let s = hazy.sun_light();
+        assert!(s.x > s.z && s.z < 0.5, "{s}");
+    }
+
+    #[test]
+    fn rayleigh_scattering_follows_its_multiplier() {
+        let a = Atmosphere {
+            inscattering: 15.0,
+            ray: 0.0832,
+            mie: 0.01,
+            ..plain(0.2, 0.0)
+        };
+        let h = a.haze();
+        assert!((h.rayleigh - RAYLEIGH * 0.0832).abs().max_element() < 1e-9);
+        assert!((h.mie - MIE * 0.01).abs().max_element() < 1e-9);
+        // About as much Rayleigh as Mie in red at the island's default,
+        // two and a half times as much in blue.
+        assert!((h.rayleigh.x / h.mie.x - 1.01).abs() < 0.02);
+        assert!(h.rayleigh.z / h.mie.z > 1.9);
+    }
+
+    #[test]
+    fn the_sun_disc_is_its_emissive_colour_times_sunlight_times_32() {
+        let a = Atmosphere {
+            light_intensity: 1.15,
+            sun_emissive: Vec3::splat(0.06),
+            ..plain(0.2, 0.0)
+        };
+        let want = Vec3::splat(0.06) * a.sun_light() * 32.0;
+        assert!((a.sun_disc() - want).abs().max_element() < 1e-5);
+        // The island's default: about 2.5 to 2.8 in each channel.
+        assert!(a.sun_disc().min_element() > 2.4 && a.sun_disc().max_element() < 2.9);
+        let mut lighting = Lighting::default();
+        a.apply(&mut lighting);
+        assert_eq!(lighting.sun_disc, a.sun_disc());
+    }
+    #[test]
+    fn the_screen_effect_blends_as_the_game_does() {
+        // 0x8224C398: numbers and colour bytes blend, texture and type
+        // switch past halfway.
+        let rain = ScreenEffect {
+            speed: 2.0,
+            density: 1.0,
+            dir: [0.5, -1.0],
+            texture: 0x1234,
+            colour: 0x80ff_4000,
+            kind: 1,
+        };
+        let none = ScreenEffect::default();
+        let early = none.lerp(&rain, 0.25);
+        assert_eq!(early.speed, 0.5);
+        assert_eq!(early.density, 0.25);
+        assert_eq!(early.dir, [0.125, -0.25]);
+        assert_eq!((early.texture, early.kind), (0, 0));
+        assert_eq!(early.colour, 0x203f_1000);
+        let half = none.lerp(&rain, 0.5);
+        assert_eq!((half.texture, half.kind), (0, 0));
+        let late = none.lerp(&rain, 0.75);
+        assert_eq!((late.texture, late.kind), (0x1234, 1));
+        assert_eq!(none.lerp(&rain, 1.0), rain);
+    }
+
+    #[test]
+    fn a_change_takes_the_new_records_ambient_effects_whole() {
+        // 0x8224D650 deletes the last record's and spawns the new one's.
+        let papers = AmbientEffect {
+            kind: 0,
+            template: name_hash("global_particle_flotsum_papers"),
+            radius: 25.0,
+            height: 3.0,
+            variance: 0.0,
+        };
+        let mut to = plain(0.2, 0.0);
+        to.ambient[0] = papers;
+        let from = plain(0.2, 0.0);
+        assert_eq!(from.lerp(&to, 0.1).ambient[0], papers);
+        assert_eq!(to.lerp(&from, 0.9).ambient[0], AmbientEffect::default());
+    }
+
+    #[test]
+    fn the_sun_takes_the_codes_path() {
+        // At LightTime 0 the sun is on the horizon over SUN_SETS; at 1 on
+        // the horizon opposite (0x821B5608, light angle -150 degrees).
+        let dawn = -plain(0.0, 0.0).sun_direction();
+        assert!(
+            dawn.y.abs() < 1e-3 && (dawn - SUN_SETS).length() < 1e-3,
+            "{dawn}"
+        );
+        let dusk = -plain(1.0, 0.0).sun_direction();
+        assert!(
+            dusk.y.abs() < 1e-3 && (dusk + SUN_SETS).length() < 1e-3,
+            "{dusk}"
+        );
+        // LightTime 0.25: 45 degrees up, on the morning side.
+        let morning = -plain(0.25, 0.0).sun_direction();
+        assert!((morning.y - 0.707).abs() < 1e-3 && morning.x > 0.0);
+        // The shadows' sun never sinks below 18 degrees.
+        for t in [0.0, 0.05, 0.95, 1.0] {
+            let s = -plain(t, 0.0).shadow_direction();
+            assert!(s.y >= 0.309 - 1e-3, "{t}: {s}");
+        }
+        let mut lighting = Lighting::default();
+        plain(0.05, 0.0).apply(&mut lighting);
+        assert_eq!(
+            lighting.shadow_direction,
+            Some(plain(0.05, 0.0).shadow_direction())
+        );
     }
 
     #[test]

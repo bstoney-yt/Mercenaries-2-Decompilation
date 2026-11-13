@@ -300,7 +300,12 @@ pub struct VehicleSpec {
     /// `m2_assets::vehicle::rolls_with_wheel`. Empty, or a node past
     /// its end: every such node spins.
     pub node_rolls: Vec<bool>,
-    /// Mass, kg (by kind; invented).
+    /// Mass, kg: its template's `Mass` ([`VehicleSpec::tuned`]), else by
+    /// kind, invented. A car's body takes its `PHY2` chassis record's
+    /// before the invented one (`Physics::add_vehicle`); measured, the
+    /// invented one is left only on the eight catalogue models with
+    /// neither (five boats, two helicopters and a tank whose models no
+    /// physics template names).
     pub mass: f32,
     /// The nodes that turn with the turret (its mount, every node under
     /// it), if it has one.
@@ -357,6 +362,13 @@ pub struct VehicleSpec {
     /// convex radius included. The 360 code builds its body from them
     /// (0x8216A290). Empty without them.
     pub shapes: std::sync::Arc<[Vec<Vec3>]>,
+    /// Which of [`shapes`](Self::shapes) a path search doesn't see (their
+    /// index): by its flags, a shape takes a vehicle's layer (0x8216C308,
+    /// [`crate::collision_layers::VEHICLE`]) and the sweeps see layer 8
+    /// but not 9 or 11 ([`crate::collision_layers::PATH_MASK`]). 164 of
+    /// the 534 vehicle templates with a hull set have a flags 0x28 shape
+    /// in it (layer 11), a HMMWV's or a motorbike's.
+    pub path_unseen: std::sync::Arc<[usize]>,
     /// What the game makes of its intact chassis body's record
     /// ([`VehicleSpec::with_chassis`]): its friction and damping (the 360
     /// body builder's, [`crate::physics::BodyMaterial::of`]). `None`
@@ -456,7 +468,11 @@ pub struct Chassis {
 fn chassis_shapes(
     model: &Model<'_>,
     base: &[u8],
-) -> (Vec<Vec<Vec3>>, bool, Option<crate::physics::BodyMaterial>) {
+) -> (
+    Vec<(Vec<Vec3>, bool)>,
+    bool,
+    Option<crate::physics::BodyMaterial>,
+) {
     let Some(p) = Ucfx::parse(base)
         .ok()
         .and_then(|u| u.top_level(*b"PHY2").map(<[u8]>::to_vec))
@@ -471,7 +487,7 @@ fn chassis_shapes(
         .map_or_else(
             || (Vec::new(), false, None),
             |body| {
-                let (shapes, hull) = crate::physics::body_shapes(model, &p, body);
+                let (shapes, hull) = crate::physics::body_shapes_seen(model, &p, body, false);
                 let material = p.bodies.get(body).map(crate::physics::BodyMaterial::of);
                 (shapes, hull, material)
             },
@@ -997,6 +1013,7 @@ impl VehicleSpec {
             chassis: None,
             shapes: Default::default(),
             material: None,
+            path_unseen: Default::default(),
             turret_shapes: Default::default(),
             turret_mass: None,
             gun_body: None,
@@ -1299,7 +1316,13 @@ impl VehicleSpec {
         // all of them (a trailer's wheels' shapes too). No record field
         // changes that.
         let _ = hull;
-        self.shapes = shapes.into();
+        self.path_unseen = shapes
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, seen))| !seen)
+            .map(|(i, _)| i)
+            .collect();
+        self.shapes = shapes.into_iter().map(|(v, _)| v).collect();
         self
     }
 
@@ -1789,6 +1812,7 @@ mod tests {
             chassis: None,
             shapes: Default::default(),
             material: None,
+            path_unseen: Default::default(),
             turret_shapes: Default::default(),
             turret_mass: None,
             gun_body: None,
@@ -1828,6 +1852,7 @@ mod tests {
             rows: Vec::new(),
             links: Vec::new(),
             turret,
+            flags: Default::default(),
         };
         let r = |d: f32| d.to_radians();
         let seating = VehicleSeats {

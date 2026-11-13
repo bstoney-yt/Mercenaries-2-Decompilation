@@ -133,6 +133,8 @@ pub struct Game {
     /// The scripts' vehicles whose load bed's goods were logged (taken up,
     /// or what stood near and why not), by index.
     beds_told: HashSet<usize>,
+    /// The helicopters' winches ([`crate::winches`]).
+    pub winches: crate::winches::Winches,
     /// Layer entities of the island's vehicles asked for so far.
     fetched: HashSet<u32>,
     /// The island's traffic spawners and what they have out.
@@ -264,6 +266,10 @@ pub struct Game {
     /// The scripts' camera shot for a scene (the HQ's briefings), while
     /// it lasts: the frame is seen from it ([`Shot::view`]).
     pub shot: Option<Shot>,
+    /// The scripts' camera's view (eye, forward) while a scene's script
+    /// directs it (`Camera.SetPosition`, `SetLookAt`, `Follow`, `Hold`,
+    /// `Blend`: [`m2_game::script_camera`]); a shot comes first.
+    pub script_view: Option<(Vec3, Vec3)>,
     /// Seconds the HUD's save icon has left up after the game was saved
     /// ([`SAVE_ICON_SECONDS`]).
     pub save_icon: f32,
@@ -460,6 +466,7 @@ impl Game {
             beds: HashMap::new(),
             bed_shapes: HashMap::new(),
             beds_told: HashSet::new(),
+            winches: Default::default(),
             fetched: HashSet::new(),
             traffic: crate::traffic::Traffic::default(),
             gunships: crate::gunships::Gunships::default(),
@@ -507,6 +514,7 @@ impl Game {
             context_taken: None,
             aboard: None,
             shot: None,
+            script_view: None,
             save_icon: 0.0,
             raw: crate::raw::RawClips::default(),
             outfit_wanted: None,
@@ -648,6 +656,7 @@ impl Game {
     /// vehicle catalogue is known, and places the ones that have loaded
     /// where the layers park them.
     fn fetch_world_vehicles(&mut self, dt: f32) {
+        let roads = &self.roads;
         let scene = &mut self.scene;
         let (Some(world), Some(player)) = (&mut scene.world, &scene.player) else {
             return;
@@ -656,8 +665,9 @@ impl Game {
             // A gunship is put in the air where it comes in
             // ([`crate::gunships::Gunships::fly`]), a pursuit's car on the
             // road ([`crate::pursuers::Pursuers::drive`]), or is gone.
+            // Nor is road traffic taken away ([`RoadTraffic::resting`]).
             if v.spot
-                .is_some_and(|(e, _, _)| e >= crate::pursuers::FIRST_ENTITY)
+                .is_some_and(|(e, _, _)| e >= crate::pursuers::FIRST_ENTITY || roads.resting(e))
             {
                 continue;
             }
@@ -1033,12 +1043,24 @@ impl Game {
                 self.scene
                     .people
                     .set_authored_relations(&world.index.template_db.relations);
+                if self.scene.people.spawner_slots.len() != world.index.spawner_slots.len() {
+                    self.scene.people.spawner_slots = world.index.spawner_slots.clone();
+                }
                 let zones = world.index.zones.iter().filter(|z| layer_in(z.layer));
                 self.scene.people.walker_cap =
                     m2_engine::population::zone_at(zones, focus.x, focus.z)
                         .map_or(0, |z| z.people as usize);
             }
-            self.roads.spawn(&mut self.scene, focus, layer_in, dt);
+            // Her camera, as the upkeep measures and sees from it.
+            let (fov, aspect) = self.lens;
+            let view = self.view(fov, aspect);
+            let viewer = m2_engine::road_population::Viewer {
+                at: view.eye(),
+                look: (-view.view.inverse().z_axis.truncate()).normalize_or(Vec3::Z),
+                view_proj: view.projection * view.view,
+            };
+            self.roads
+                .spawn(&mut self.scene, focus, Some(viewer), layer_in, dt);
         }
         let intent = self.call_support(intent, dt);
         split("game: arrival");
@@ -1541,7 +1563,7 @@ impl Game {
                         physics.right_vehicle(id);
                     }
                 }
-                physics.step(dt);
+                physics.step_frame(dt);
                 match id.and_then(|(id, v)| Some((physics.vehicle_transform(id)?, v, id))) {
                     Some((at, v, id)) => {
                         let speed = physics.vehicle_speed(id);
@@ -1648,7 +1670,7 @@ impl Game {
                 }
             } else {
                 self.halts.clear();
-                physics.step(dt);
+                physics.step_frame(dt);
             }
         }
         split("game: player and physics");
@@ -1666,6 +1688,58 @@ impl Game {
                         .entry(v.spec.model)
                         .or_insert_with(|| bed_shape(source, v.spec.model));
                 }
+            }
+        }
+        // The helicopters with a `Winch` get theirs, hung from their
+        // `WinchBone` hardpoint; then each winch's update for the frame's
+        // steps.
+        if let (Some(source), Some(world)) = (self.scene.source.as_mut(), self.scene.world.as_mut())
+        {
+            for v in &self.scene.vehicles {
+                let Some(id) = v.id else { continue };
+                if !self.winches.unseen(id) {
+                    continue;
+                }
+                let Some(p) = world
+                    .index
+                    .template_db
+                    .winch_for(&v.spec.label, v.spec.model)
+                else {
+                    continue;
+                };
+                // The hardpoint `WinchBone` names, a node of its model; with
+                // none so named, its origin (0x82198568: 0x8241E478 finding
+                // nothing leaves the point at 0, 0, 0).
+                let found = p.bone.and_then(|bone| {
+                    crate::hijack::nodes(source, v.spec.model)
+                        .into_iter()
+                        .find(|(n, _)| *n == bone)
+                        .map(|(_, at)| at)
+                });
+                eprintln!(
+                    "winch: {} has one, {} m of cable at {}",
+                    v.spec.label,
+                    p.length,
+                    found.map_or("its origin (no WinchBone node)".to_owned(), |at| format!(
+                        "{at:.2?}"
+                    ))
+                );
+                self.winches.add(id, p, found.unwrap_or(Vec3::ZERO));
+            }
+        }
+        // What a magnet might take, gathered only while one could: each
+        // vehicle with its `ConnectPoint`s' nodes.
+        let cargo = if self.winches.magnet_ready() {
+            self.winch_cargo()
+        } else {
+            Vec::new()
+        };
+        if let Some(world) = self.scene.world.as_mut() {
+            let physics = &mut world.physics;
+            self.winches
+                .retain(|id| physics.vehicle_transform(id).is_some());
+            for (carrier, taken) in self.winches.step(physics, dt, &cargo) {
+                eprintln!("winch: {carrier:?}'s magnet took {taken:?}");
             }
         }
         // Each one's own collision goes on it for the goods on its bed.
@@ -1810,6 +1884,7 @@ impl Game {
                 &self.scene.vehicles,
                 driven,
                 &self.assaults,
+                dt,
             );
             // A pursuit's gunships, at her.
             if let Some(p) = self.scene.player.as_ref() {
@@ -2079,19 +2154,47 @@ impl Game {
                     visibility: v.spec.tuning.visibility.unwrap_or(200.0),
                     armour: v.spec.tuning.armour.unwrap_or(1),
                     threat: vehicle_threat(&v.spec),
+                    priority: v
+                        .guid
+                        .is_some_and(|g| self.scene.people.priority.contains(&g)),
+                    vehicle: v.id,
+                    hint: vehicle_hint(&v.spec.tuning),
+                    speed: v
+                        .id
+                        .map_or(0.0, |id| physics.map_or(0.0, |p| p.vehicle_speed(id))),
+                    row: v.spec.tuning.key,
                 })
             })
             .collect();
         self.scene.people.vehicle_subjects = subjects;
+        // Her row of the damage table, and the table, for what soldiers'
+        // weapons are worth against her and the armies' vehicles.
+        self.scene.people.her_row = Some(
+            self.scene
+                .player
+                .as_ref()
+                .and_then(|p| p.driving)
+                .and_then(|i| self.scene.vehicles.get(i))
+                .and_then(|v| v.spec.tuning.key)
+                .unwrap_or_else(|| m2_assets::name_hash("Hero")),
+        );
+        if self.scene.people.damage_table.is_none() {
+            self.scene.people.damage_table = self.combat.damage_table.clone();
+        }
         // What she carries, for her threat to soldiers: a vehicle's mounts
-        // when she drives one.
-        self.scene.people.her_arms = self
+        // when she drives one, else her guns' own `WeaponHint`s.
+        let driven = self
             .scene
             .player
             .as_ref()
             .and_then(|p| p.driving)
             .and_then(|i| self.scene.vehicles.get(i))
-            .map(|v| crate::npc::Arms::Vehicle(vehicle_threat(&v.spec)));
+            .map(|v| crate::npc::Arms::Vehicle {
+                threat: vehicle_threat(&v.spec),
+                priority: false,
+            });
+        self.scene.people.her_arms =
+            Some(driven.unwrap_or(crate::npc::Arms::Person(self.combat.carried_hints())));
         if let Some(world) = &mut self.scene.world
             && (!self.on_foot || self.scene.player.as_ref().is_none_or(|p| p.landed))
         {
@@ -2371,7 +2474,15 @@ impl Game {
             state_effects(world, &mut self.combat);
         }
         let asked = std::mem::take(&mut self.combat.game_fx);
+        // The camera the ambient effects are kept about (taken level: the
+        // camera has no roll).
+        let (eye, forward) = self.listener();
+        let right = forward.cross(Vec3::Y).normalize_or(Vec3::X);
+        let up = right.cross(forward).normalize_or(Vec3::Y);
         let scene = &mut self.scene;
+        if let Some(p) = scene.particles.as_mut() {
+            p.set_camera(eye, right, up, forward);
+        }
         let (Some(p), Some(world)) = (scene.particles.as_mut(), scene.world.as_ref()) else {
             return;
         };
@@ -3000,6 +3111,12 @@ impl Game {
                 .map(|(_, text)| text.clone())
                 .or(prompt)
                 .filter(|_| !self.support.busy()),
+            context_action: self
+                .context
+                .as_ref()
+                .filter(|_| self.on_foot && !self.input_locked && !self.cinematic)
+                .filter(|_| !self.support.busy())
+                .map(|(_, text)| text.clone()),
             hijack_keys: None,
             driving,
             crosshair: crosshair.filter(|_| self.support.looking().is_none()),
@@ -3278,6 +3395,15 @@ impl Game {
                 }
                 None => eprintln!("atmosphere: the island's default"),
             }
+            // The new record's ambient effects replace the last's.
+            let ambient = match now {
+                Some((r, s)) => regions[r].settings[s].1.ambient,
+                None => default.ambient,
+            };
+            if let Some(p) = self.scene.particles.as_mut() {
+                let started = p.set_ambient(&ambient, &world.index.template_db);
+                eprintln!("atmosphere: {started} ambient effects started");
+            }
         }
     }
 
@@ -3314,7 +3440,11 @@ impl Game {
     /// Where the frame is seen from: her camera (shaken by a bomb close
     /// by), the satellite's while she looks through it, or the free one.
     pub fn view(&self, fov: f32, aspect: f32) -> View {
-        let shot = self.shot.as_ref().and_then(|s| s.view);
+        let shot = self
+            .shot
+            .as_ref()
+            .and_then(|s| s.view)
+            .or(self.script_view.map(|(eye, forward)| (eye, eye + forward)));
         let mut view = match (self.walking(), shot) {
             // A scene's shot of the scripts' (the HQ's briefings).
             (Some(_), Some((eye, at))) => FlyCamera::looking_at(eye, at).view(fov, aspect),
@@ -3363,6 +3493,7 @@ impl Game {
                 }
             }
             view.lighting.clouds.noise = world.cloud_noise;
+            view.lighting.flare_map = world.sun_flare;
         }
         finish(&mut view.lighting);
         post_override(&mut view.lighting);
@@ -3421,12 +3552,20 @@ impl Default for Picture {
 }
 
 impl Picture {
-    /// Brightness scales the finished frame's light, a stop down at 0 and
-    /// up at 100 (invented: the game's gamma curve is not known); shadows
-    /// off, the sun casts none.
+    /// Brightness scales the tone-mapped frame's light by `0.5 +
+    /// brightness / 100`: half at 0, as lit at 50, half as much again at
+    /// 100. Shadows off, the sun casts none.
+    ///
+    /// From the 360 code: the saved `videoBrightness` byte times 0.01
+    /// (0x8239E338; 0.5 at start-up, 0x8256D1B0) becomes the composite's
+    /// `imageParams.z = (1 - b) * 0.5 + b * 1.5`, which its shader (the
+    /// PC's 526) multiplies the luminance by after the tone map's
+    /// compression, where our composite multiplies by the grade. Not
+    /// established: the slider's range (the byte could hold more than
+    /// 100; our menu runs the game's own script, which gives 0 to 100).
     pub fn apply(&self, lighting: &mut m2_render::Lighting) {
-        let stops = (self.brightness.clamp(0.0, 100.0) - 50.0) / 50.0;
-        lighting.grade *= 2f32.powf(stops as f32);
+        let b = (self.brightness.clamp(0.0, 100.0) / 100.0) as f32;
+        lighting.grade *= 0.5 + b;
         if !self.shadows {
             lighting.shadow_distance = 0.0;
         }
@@ -3851,6 +3990,41 @@ impl Game {
         );
         self.combat.struck.clear();
         self.combat.went_off.clear();
+    }
+
+    /// The vehicles in play as a winch's cargo ([`crate::winches::Cargo`]):
+    /// each one's `ConnectPoint`s with their nodes' places on its model.
+    pub fn winch_cargo(&mut self) -> Vec<crate::winches::Cargo> {
+        let (Some(source), Some(world)) = (self.scene.source.as_mut(), self.scene.world.as_ref())
+        else {
+            return Vec::new();
+        };
+        let db = &world.index.template_db;
+        self.scene
+            .vehicles
+            .iter()
+            .filter_map(|v| {
+                let id = v.id?;
+                let points = db.connect_points_for(&v.spec.label, v.spec.model);
+                let nodes = if points.is_empty() {
+                    &[][..]
+                } else {
+                    self.winches
+                        .nodes(v.spec.model, || crate::hijack::nodes(source, v.spec.model))
+                };
+                Some(crate::winches::Cargo {
+                    id,
+                    points: points
+                        .iter()
+                        .map(|&p| {
+                            let at = nodes.iter().find(|(n, _)| *n == p.bone).map(|(_, a)| *a);
+                            (p, at)
+                        })
+                        .collect(),
+                    carriable: v.spec.kind != m2_engine::vehicle::HELICOPTER,
+                })
+            })
+            .collect()
     }
 
     /// The load bed of vehicle model `model` (its `HP_Truckbed` node),
@@ -5771,7 +5945,7 @@ mod picture_tests {
     }
 
     #[test]
-    fn brightness_is_a_stop_either_way_and_shadows_can_go() {
+    fn brightness_runs_from_half_to_one_and_a_half_and_shadows_can_go() {
         let lit = |p: Picture| {
             let mut l = m2_render::Lighting {
                 shadow_distance: 120.0,
@@ -5785,7 +5959,15 @@ mod picture_tests {
             brightness: 100.0,
             ..Picture::default()
         };
-        assert_eq!(lit(bright).0, 2.0);
+        assert_eq!(lit(bright).0, 1.5);
+        // A straight line between: 0.75 and 1.25 at the quarters.
+        for (b, k) in [(25.0, 0.75), (75.0, 1.25)] {
+            let p = Picture {
+                brightness: b,
+                ..Picture::default()
+            };
+            assert_eq!(lit(p).0, k);
+        }
         let dark = Picture {
             brightness: 0.0,
             shadows: false,
@@ -5866,6 +6048,17 @@ fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
                 cands.len()
             );
         }
+    }
+}
+
+/// What a vehicle is, as its `ObjectHint` has it
+/// ([`crate::npc::VEHICLE_HINT`] for any word it lacks).
+fn vehicle_hint(t: &m2_engine::tuning::VehicleTuning) -> m2_engine::ai_target::Hint {
+    let d = crate::npc::VEHICLE_HINT;
+    m2_engine::ai_target::Hint {
+        kind: t.kind.map_or(d.kind, |k| k.0),
+        domain: t.kind.map_or(d.domain, |k| k.1),
+        armour: t.armour.unwrap_or(d.armour),
     }
 }
 

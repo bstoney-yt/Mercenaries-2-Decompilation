@@ -10,11 +10,19 @@
 //! mind's attack slot (0x822C0318): the one in it keeps its place with
 //! its own new weight, and a challenger needs a weight above that.
 //!
-//! The score is how much of a threat the subject is to the mind (the
-//! perception record's +0xC8, [`threat`]) plus [`BASE`], times how well
-//! the mind can see it (+0x68, [`visible`]). Then the distance: within
+//! The score is what the subject is worth ([`worth`]: how much of a
+//! threat it is to the mind, the perception record's +0xC8, [`threat`],
+//! plus [`BASE`]; or [`PRIORITY`] for one the scripts made a priority
+//! target), times how well the mind can see it (+0x68, [`visible`]) and
+//! by the mind's own [`Heat`] (+0x804). Then the distance: within
 //! [`NEAR`] (or [`HOLD`] for the one in the slot) a subject counts double,
 //! and one nearer than the one in the slot gains [`CLOSER`].
+//!
+//! Not traced yet: 0x822E0988 also puts 1.2 in place of the worth for
+//! vehicles of two kinds (their object's +0x170 at 4 or 5), 9.8 for people
+//! of one class (0x823F7B88 at 0x80008240), and lifts the score to
+//! `0.2 x + 0.8` for the subject in the mind's +0xC58 order while that
+//! order weighs more than 0.3.
 //!
 //! What a mind holds of a subject is not the relation itself but its own
 //! attitude ([`Attitude`], the record's +0xE4), which follows the
@@ -116,6 +124,86 @@ pub fn weapon_threat(w: &crate::weapons::FireHint, to: Hint) -> f32 {
     base * domain * kind
 }
 
+/// Of a weapon's rate of fire (a minute), where its worth is a half
+/// (0x82B7D884).
+const RATE_HALF: f32 = 60.0;
+/// The least a weapon's expected damage is taken as (0x820F8BE4).
+const LEAST_DAMAGE: f32 = 0.001;
+/// The most a weapon's worth comes to before its aim and threat
+/// (0x820BB2F0).
+const MOST_WORTH: f32 = 16.0;
+/// What a weapon's worth is divided by, with its aim (0x820B7B6C).
+const AIM_SHARE: f32 = 4.0;
+/// What a weapon's threat rating is counted by in its worth (0x820BAEEC).
+const THREAT_WEIGHT: f32 = 10.0;
+/// The most a weapon is worth outside its fire ranges (0x820B7AE0).
+const OUT_OF_RANGE: f32 = 0.01;
+/// What the weapon in hand counts by (0x820C7A20).
+const IN_HAND: f32 = 3.0;
+/// Seconds between a mind's weapon choices while it has one up
+/// (0x820C7A20, 0x822BE240); [`NO_WEAPON_WAIT`] after it found none.
+pub const WEAPON_EVERY: f32 = 3.0;
+/// See [`WEAPON_EVERY`] (0x820BAF84, 0x822EF4C0).
+pub const NO_WEAPON_WAIT: f32 = 5.0;
+
+/// What a weapon is worth to a mind against a target `distance` metres
+/// off (0x822EF4C0 by 0x822EF200): its `damage` to the target (its round's
+/// damage times what the target takes of its kind, at least
+/// [`LEAST_DAMAGE`]) times its rate's share (`1 - 60 / (rate + 60)`),
+/// at most [`MOST_WORTH`], over [`AIM_SHARE`], times its threat to the
+/// target ([`weapon_threat`], times [`THREAT_WEIGHT`]). Outside its fire
+/// ranges it is worth at most [`OUT_OF_RANGE`]; the one in hand counts
+/// [`IN_HAND`] times.
+///
+/// So a weapon for another kind of target (a rifle's `WeaponHint` is
+/// for people, against a vehicle) is worth nothing, and one rated 0
+/// against the target's armour is still worth a tenth of a rating of 3:
+/// the rating weighs the choice, it does not forbid it.
+///
+/// Not ported: 0x822EF040's aim term, which scales the divisor by the
+/// target's motion across the line of fire and two of the weapon's
+/// fields not yet named (taken as 1); 0x822EF128's weapons that need a
+/// property of their target (flags 0x8000 and 0x4000, none named), and a
+/// half again for flag 0x2000 (not named); and the nearest the weapon is
+/// used at (its slot's +0x14, not named).
+pub fn weapon_worth(
+    damage: f32,
+    rate_of_fire: f32,
+    hint: &crate::weapons::FireHint,
+    to: Hint,
+    distance: f32,
+    in_hand: bool,
+) -> f32 {
+    let rate = 1.0 - RATE_HALF / (rate_of_fire.max(0.0) + RATE_HALF);
+    let worth = (damage.max(LEAST_DAMAGE) * rate).min(MOST_WORTH) / AIM_SHARE
+        * weapon_threat(hint, to)
+        * THREAT_WEIGHT;
+    let ranged = if distance < hint.min_range || distance > hint.range {
+        worth.min(OUT_OF_RANGE)
+    } else {
+        worth
+    };
+    if in_hand { ranged * IN_HAND } else { ranged }
+}
+
+/// The weapon a mind takes up of those `worths` ([`weapon_worth`]), by
+/// `roll` (0 to 1): each as likely as its share of their sum; none when
+/// none is worth anything (0x822EF4C0).
+pub fn pick_weapon(worths: &[f32], roll: f32) -> Option<usize> {
+    let sum: f32 = worths.iter().sum();
+    if sum <= 0.0 {
+        return None;
+    }
+    let mut left = roll * (sum - 1e-4);
+    for (i, w) in worths.iter().enumerate() {
+        left -= w;
+        if left <= 0.0 {
+            return Some(i);
+        }
+    }
+    Some(worths.len() - 1)
+}
+
 /// A subject's threat to `to` from the weapons it carries `distance`
 /// metres off (0x822EC430 by 0x822EC1B8): the most any rates, of those
 /// whose `FireRange` reaches; a vehicle's (`vehicle`) reach anywhere, and
@@ -148,6 +236,55 @@ pub fn visible(distance: f32, reach: f32) -> f32 {
     }
     r * r / (r * r + distance * distance)
 }
+/// What a priority target is worth, in place of its threat (0x820F9560):
+/// enough that the score is at its [`MOST`] whenever it is seen at all
+/// well.
+pub const PRIORITY: f32 = 9.8;
+/// The object property that makes one a priority target, by its name
+/// hash: `"PriorityTarget"`, set by the scripts' `Ai.SetPriorityTarget`
+/// (0x82311B98) and read by 0x822E0988 through the property lookup
+/// 0x823DA3C8.
+pub const PRIORITY_PROPERTY: u32 = 0xe60c_6ca2;
+
+/// What a subject is worth to a mind before how well it is seen: its
+/// `threat` ([`threat`]) plus [`BASE`], or [`PRIORITY`] in its place for a
+/// priority target.
+pub fn worth(threat: f32, priority: bool) -> f32 {
+    if priority { PRIORITY } else { threat + BASE }
+}
+
+/// A mind's heat (+0x1730, 0x822D9C10): up 1 each update it has someone
+/// in its attack slot, to 10; down 0.5 each update it has none, to 0.
+/// While any is left its scores count half again ([`Heat::factor`], the
+/// mind's +0x804). Counted per update, not per second, as the 360 does.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Heat(pub f32);
+
+/// How far a mind's heat climbs while it has a target (0x820BAEEC).
+const HEAT_UP_TO: f32 = 10.0;
+/// What a mind's scores count by while it is hot (0x820BB6AC).
+const HOT: f32 = 1.5;
+
+impl Heat {
+    /// One update, `engaged` if the mind has someone in its attack slot.
+    /// (The 360 also holds the heat in one mind state, 0x17, not named
+    /// yet; that is left out.)
+    pub fn tick(&mut self, engaged: bool) {
+        if !engaged {
+            self.0 -= 0.5;
+        } else if self.0 < HEAT_UP_TO {
+            self.0 += 1.0;
+        }
+        self.0 = self.0.clamp(0.0, 500.0);
+    }
+
+    /// What the mind's scores count by: [`HOT`] while any heat is left
+    /// (above 0.0001), else 1.
+    pub fn factor(&self) -> f32 {
+        if self.0 > 1e-4 { HOT } else { 1.0 }
+    }
+}
+
 /// Within this a subject counts double, metres (0x820BB1F8).
 const NEAR: f32 = 30.0;
 /// As [`NEAR`], for the one already in the slot (0x820B7FB8).
@@ -165,13 +302,13 @@ pub fn attacks(relation: f32) -> bool {
     relation < ATTACK_BELOW
 }
 
-/// Score of a subject `distance` metres away, of this `threat`
-/// ([`threat`]) and seen this well ([`visible`]); `current` is the
-/// distance to the one in the slot, if there is one, and `held` that this
-/// is it.
-pub fn score(distance: f32, current: Option<f32>, held: bool, threat: f32, seen: f32) -> f32 {
+/// Score of a subject `distance` metres away, `worth` this much
+/// ([`worth`]) and seen this well ([`visible`], times the mind's
+/// [`Heat::factor`]); `current` is the distance to the one in the slot, if
+/// there is one, and `held` that this is it.
+pub fn score(distance: f32, current: Option<f32>, held: bool, worth: f32, seen: f32) -> f32 {
     let near = if held { HOLD } else { NEAR };
-    let base = (threat + BASE) * seen;
+    let base = worth * seen;
     let doubled = if distance < near { base * 2.0 } else { base };
     let closer = current.is_some_and(|c| distance < c);
     doubled.min(MOST) + if closer { CLOSER } else { 0.0 }
@@ -199,6 +336,86 @@ impl Slot {
     /// Empties the slot.
     pub fn clear(&mut self) {
         *self = Self::default();
+    }
+}
+
+/// How often a mind looks again at what is in each perception lane,
+/// seconds (0x822DB5A8): lane 0 at each think, the others when their
+/// timer (the mind's +0xC48..) passes these.
+pub const LANE_EVERY: [f32; 4] = [0.0, 0.09, 1.8, 8.0];
+
+/// Below this speed a subject is in the slowest lane, m/s (its speed
+/// squared at most 2.25, 0x822F1198).
+pub const LANE_SLOW: f32 = 1.5;
+
+/// Above this speed a subject is in the fastest timed lane, m/s (squared
+/// above 81).
+pub const LANE_FAST: f32 = 9.0;
+
+/// A subject newer than this, seconds, is in lane 1 at the slowest.
+pub const LANE_NEW: f32 = 0.3;
+
+/// The most sight checks queued in one frame across all minds (0x800,
+/// 0x822E8DF8): past them a subject goes unseen that frame.
+pub const LOOKS_PER_FRAME: usize = 0x800;
+
+/// A subject's perception lane (0x822F1198): by its speed, 3 when
+/// slow, 2 between [`LANE_SLOW`] and [`LANE_FAST`], 1 above; one
+/// faster when `urgent` (the record's flags 0x18000000, or the caller's
+/// own urgency) and not already 1; 1 at the slowest while `age` is under
+/// [`LANE_NEW`]; 0 when `every_think` (the record's flags 0x80000000 or
+/// 0x4000000000, or one being forgotten).
+pub fn lane(speed: f32, age: f32, urgent: bool, every_think: bool) -> usize {
+    if every_think {
+        return 0;
+    }
+    let sq = speed * speed;
+    let mut lane = if sq <= LANE_SLOW * LANE_SLOW {
+        3
+    } else if sq <= LANE_FAST * LANE_FAST {
+        2
+    } else {
+        1
+    };
+    if urgent && lane > 1 {
+        lane -= 1;
+    }
+    if age < LANE_NEW && lane > 1 {
+        lane = 1;
+    }
+    lane
+}
+
+/// A mind's lane timers (+0xC48 to +0xC54). A new mind looks over every
+/// lane at its first think (invented: where the 360 starts them is not
+/// traced).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Lanes {
+    waited: [f32; 4],
+}
+
+impl Default for Lanes {
+    fn default() -> Self {
+        Self {
+            waited: [f32::INFINITY; 4],
+        }
+    }
+}
+
+impl Lanes {
+    /// Moves the timers on by `dt` and says which lanes it looks over
+    /// now: each whose timer passes its [`LANE_EVERY`], which then starts
+    /// again from 0.
+    pub fn tick(&mut self, dt: f32) -> [bool; 4] {
+        let mut due = [false; 4];
+        for (k, w) in self.waited.iter_mut().enumerate() {
+            *w += dt;
+            if LANE_EVERY[k] < *w {
+                due[k] = true;
+                *w = 0.0;
+            }
+        }
+        due
     }
 }
 
@@ -264,8 +481,8 @@ mod tests {
         assert!(visible(300.0, 100.0) < 0.06);
         assert_eq!(visible(10.0, 0.0), 0.0);
         // An armed man near outscores an unarmed one; neither tops 0.9.
-        let armed = score(20.0, None, false, 0.9, visible(20.0, 90.0));
-        let unarmed = score(20.0, None, false, 0.0, visible(20.0, 90.0));
+        let armed = score(20.0, None, false, worth(0.9, false), visible(20.0, 90.0));
+        let unarmed = score(20.0, None, false, worth(0.0, false), visible(20.0, 90.0));
         assert!(armed > unarmed && armed <= 0.9, "{armed} {unarmed}");
     }
 
@@ -300,23 +517,130 @@ mod tests {
 
     #[test]
     fn near_counts_double_and_the_held_one_longer() {
-        assert_eq!(score(20.0, None, false, 0.0, 1.0), 0.2);
-        assert_eq!(score(40.0, None, false, 0.0, 1.0), 0.1);
-        assert_eq!(score(40.0, Some(40.0), true, 0.0, 1.0), 0.2);
-        assert!(score(35.0, Some(40.0), false, 0.0, 1.0) > score(40.0, None, false, 0.0, 1.0));
+        assert_eq!(score(20.0, None, false, worth(0.0, false), 1.0), 0.2);
+        assert_eq!(score(40.0, None, false, worth(0.0, false), 1.0), 0.1);
+        assert_eq!(score(40.0, Some(40.0), true, worth(0.0, false), 1.0), 0.2);
+        assert!(
+            score(35.0, Some(40.0), false, worth(0.0, false), 1.0)
+                > score(40.0, None, false, worth(0.0, false), 1.0)
+        );
     }
 
     #[test]
     fn a_challenger_needs_more_weight_than_the_one_held() {
         let mut slot = Slot::default();
-        slot.offer(1, score(40.0, None, false, 0.0, 1.0));
-        slot.offer(2, score(45.0, Some(40.0), false, 0.0, 1.0));
+        slot.offer(1, score(40.0, None, false, worth(0.0, false), 1.0));
+        slot.offer(2, score(45.0, Some(40.0), false, worth(0.0, false), 1.0));
         assert_eq!(slot.who, Some(1));
-        slot.offer(3, score(35.0, Some(40.0), false, 0.0, 1.0));
+        slot.offer(3, score(35.0, Some(40.0), false, worth(0.0, false), 1.0));
         assert_eq!(slot.who, Some(3));
-        slot.offer(1, score(10.0, Some(35.0), false, 0.0, 1.0));
+        slot.offer(1, score(10.0, Some(35.0), false, worth(0.0, false), 1.0));
         assert_eq!(slot.who, Some(1));
         slot.clear();
         assert_eq!(slot.who, None);
+    }
+
+    // A priority target is worth 9.8: seen at all well, it scores the most
+    // there is, over the nearest rifleman.
+    #[test]
+    fn a_priority_target_outscores_anyone() {
+        let seen = visible(150.0, 200.0);
+        let heli = score(150.0, None, false, worth(VEHICLE_THREAT, true), seen);
+        let rifleman = score(10.0, None, false, worth(0.9, false), 1.0);
+        assert_eq!(heli, MOST);
+        assert!(heli >= rifleman, "{heli} vs {rifleman}");
+        assert!((worth(0.9, false) - 1.0).abs() < 1e-6);
+        assert_eq!(
+            PRIORITY_PROPERTY,
+            m2_assets::hash::name_hash("PriorityTarget")
+        );
+    }
+
+    // Heat: up 1 an update with a target, to 10; down 0.5 without. Hot,
+    // scores count 1.5 times; cold, once.
+    #[test]
+    fn a_mind_with_a_target_runs_hot_and_cools_after() {
+        let mut heat = Heat::default();
+        assert_eq!(heat.factor(), 1.0);
+        for _ in 0..30 {
+            heat.tick(true);
+        }
+        assert_eq!(heat.0, 10.0);
+        assert_eq!(heat.factor(), 1.5);
+        for _ in 0..19 {
+            heat.tick(false);
+        }
+        assert_eq!(heat.factor(), 1.5, "0.5 left");
+        heat.tick(false);
+        assert_eq!(heat.0, 0.0);
+        assert_eq!(heat.factor(), 1.0);
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-4
+    }
+
+    // A rifle (a `WeaponHint` for people) is worth nothing against a tank;
+    // an RPG (any kind) is. Rated 0 against the armour, a weapon is still
+    // worth a tenth of one rated 3.
+    #[test]
+    fn a_weapon_is_worth_what_it_can_do_to_its_target() {
+        let tank = Hint {
+            kind: 2,
+            domain: 2,
+            armour: 4,
+        };
+        let rifle = hint([3, 1], [3, 1, 0, 0], 100.0);
+        let rpg = hint([1, 1], [1, 1, 1, 1], 150.0);
+        assert_eq!(weapon_worth(9.0, 450.0, &rifle, tank, 50.0, false), 0.0);
+        assert!(weapon_worth(9.0, 450.0, &rifle, HUMAN, 50.0, false) > 1.0);
+        assert!(weapon_worth(100.0, 30.0, &rpg, tank, 50.0, false) > 1.0);
+        let none = hint([1, 1], [1, 1, 1, 0], 150.0);
+        let three = hint([1, 1], [1, 1, 1, 3], 150.0);
+        let w = |h| weapon_worth(9.0, 450.0, h, tank, 50.0, false);
+        assert!(w(&none) > 0.0, "rated 0 still worth something");
+        assert!(close(w(&none) / w(&three), 0.1), "a tenth of a 3");
+        // Out of its range: a hundredth at most; in hand: three times.
+        assert!(weapon_worth(9.0, 450.0, &rifle, HUMAN, 200.0, false) <= 0.01);
+        let held = weapon_worth(9.0, 450.0, &rifle, HUMAN, 50.0, true);
+        assert!(close(
+            held,
+            3.0 * weapon_worth(9.0, 450.0, &rifle, HUMAN, 50.0, false)
+        ));
+    }
+
+    #[test]
+    fn a_mind_takes_up_a_weapon_by_its_share_of_their_worth() {
+        assert_eq!(pick_weapon(&[0.0, 0.0], 0.5), None);
+        assert_eq!(pick_weapon(&[0.0, 2.0], 0.1), Some(1));
+        assert_eq!(pick_weapon(&[1.0, 3.0], 0.2), Some(0));
+        assert_eq!(pick_weapon(&[1.0, 3.0], 0.3), Some(1));
+        assert_eq!(pick_weapon(&[1.0, 3.0], 1.0), Some(1));
+    }
+    // Fast, walking and still subjects fall in lanes 1, 2 and 3; urgency
+    // and youth bring them forward; the timers run each lane at its rate.
+    #[test]
+    fn subjects_are_looked_at_by_how_fast_they_move() {
+        assert_eq!(lane(0.0, 10.0, false, false), 3);
+        assert_eq!(lane(1.5, 10.0, false, false), 3);
+        assert_eq!(lane(4.0, 10.0, false, false), 2);
+        assert_eq!(lane(9.0, 10.0, false, false), 2);
+        assert_eq!(lane(20.0, 10.0, false, false), 1);
+        assert_eq!(lane(0.0, 10.0, true, false), 2);
+        assert_eq!(lane(20.0, 10.0, true, false), 1);
+        assert_eq!(lane(0.0, 0.1, false, false), 1);
+        assert_eq!(lane(20.0, 10.0, false, true), 0);
+        let mut lanes = Lanes::default();
+        let dt = 1.0 / 30.0;
+        let mut counts = [0; 4];
+        for _ in 0..30 * 16 {
+            for (k, d) in lanes.tick(dt).into_iter().enumerate() {
+                counts[k] += usize::from(d);
+            }
+        }
+        assert_eq!(counts[0], 480, "each think");
+        assert!((150..=170).contains(&counts[1]), "{}", counts[1]);
+        assert!((9..=10).contains(&counts[2]), "{}", counts[2]);
+        assert_eq!(counts[3], 2, "at the first think and 8 s on");
     }
 }

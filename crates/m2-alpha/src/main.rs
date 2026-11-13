@@ -43,6 +43,7 @@ mod aim;
 #[cfg(target_os = "android")]
 mod android;
 mod autoplay;
+mod bench;
 mod binoculars;
 mod boarding;
 mod breakables;
@@ -57,8 +58,10 @@ mod disguise;
 mod display;
 mod drops;
 mod entrance_marker;
+mod errlog;
 mod flights;
 mod flow;
+mod frametimes;
 mod game;
 mod gamehud;
 mod grapple;
@@ -72,6 +75,7 @@ mod jobs;
 mod keytable;
 mod ladders;
 mod loading;
+mod marker_models;
 mod mission;
 mod movie;
 mod moving;
@@ -108,6 +112,7 @@ mod support;
 mod touch;
 mod traffic;
 mod ui;
+mod winches;
 
 use crate::hero::Hero;
 use std::collections::{HashMap, HashSet};
@@ -168,6 +173,9 @@ struct Options {
     guns: Vec<String>,
     gait: Option<Gait>,
     double_sided: bool,
+    /// `--bench <seconds>`: fly the [`bench::Route`] headless for so long
+    /// and log the frame rate and where the time goes.
+    bench: Option<f32>,
     fly: bool,
     /// The developer's keys in the whole game's launch too (`--dev`): the
     /// free camera, quick save and load, culling, the gait cycle.
@@ -178,6 +186,11 @@ struct Options {
     /// skips the fade before the villa's closing movie and the move into
     /// the PMC HQ, and Fiona's Talk never comes.
     skip_mode_off: bool,
+    /// The scripts' "player joined" callback is called for her
+    /// (`--script-join`; [`m2_game::mission::Mission::set_script_join`]).
+    /// Off by default: with it on the scripts make her interface and
+    /// watch for her death themselves.
+    script_join: bool,
     /// With `--mission`: the story skipped to this contract the game's
     /// developer way, and whether to its briefing (`--skip-to <id>[,briefing]`).
     skip_to: Option<(String, bool)>,
@@ -384,6 +397,21 @@ struct Options {
     /// With `--screenshot` on foot and `--gait`: she goes on this long
     /// (seconds, default 3), logging where she is each second.
     walk_seconds: Option<f32>,
+    /// `--knock-nearest <s>` with `--screenshot` on foot: that many
+    /// seconds in, she is put 1.2 m from the nearest person, facing
+    /// them, and bashes them a fifth of a second after; then each second
+    /// what that person does is logged (knock-check lines). With `r`
+    /// after the seconds (`4r`) they are run into instead, by a car that
+    /// is not there (1.5 t at 6 m/s, as the vehicles' ram is taken): for
+    /// checking a knockdown without playing a contract.
+    knock_nearest: Option<(f32, bool)>,
+    /// `--check-shots <s>,<s>...` with `--screenshot` on foot: the scene
+    /// is pictured at those seconds in too (`<out>-at<s>.ppm`).
+    check_shots: Vec<f32>,
+    /// `--people-watch` with `--screenshot` on foot: each second, how
+    /// many people are in play by what they are doing, and the nearest
+    /// five's state, clip and distance (people-watch lines).
+    people_watch: bool,
     /// In play (the window, not `--screenshot`): open the pause menu as
     /// Escape would, this many seconds after play begins. For testing what
     /// pausing asks of the sound (the pause music).
@@ -503,6 +531,10 @@ struct Options {
     /// With `--screenshot`: bring down the mission's gates as the bomb
     /// does, logging where their pieces go ([`gates_for_screenshot`]).
     gates: bool,
+    /// With `--screenshot`: stands a race's markers (a tripwire, a ring,
+    /// a finish and a pin) in front of the camera and pictures them
+    /// ([`marker_test`]).
+    marker_test: bool,
     sea: Option<f32>,
     size: Option<(u32, u32)>,
     vsync: Option<bool>,
@@ -649,10 +681,19 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--refresh" => o.refresh = Some(value()?.parse().context("--refresh expects hertz")?),
             "--double-sided" => o.double_sided = true,
             "--fly" => o.fly = true,
+            "--bench" => {
+                o.bench = Some(
+                    value()?
+                        .parse()
+                        .context("--bench expects seconds of flight")?,
+                );
+                o.fly = true;
+            }
             "--dev" => o.dev = true,
             // The default since round 25; kept so old launch lines work.
             "--skip-mode-off" => o.skip_mode_off = true,
             "--skip-mode-on" => o.skip_mode_off = false,
+            "--script-join" => o.script_join = true,
             "--skip-to" => {
                 let v = value()?;
                 o.skip_to = Some(match v.split_once(',') {
@@ -956,7 +997,28 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.honk_every = Some(value()?.parse().context("--honk-every expects seconds")?)
             }
             "--gates" => o.gates = true,
+            "--marker-test" => o.marker_test = true,
             "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
+            "--knock-nearest" => {
+                let v = value()?;
+                let (seconds, ram) = match v.strip_suffix('r') {
+                    Some(s) => (s, true),
+                    None => (v.as_str(), false),
+                };
+                o.knock_nearest = Some((
+                    seconds
+                        .parse()
+                        .context("--knock-nearest expects seconds, or seconds and r")?,
+                    ram,
+                ));
+            }
+            "--check-shots" => {
+                for s in value()?.split(',') {
+                    o.check_shots
+                        .push(s.trim().parse().context("--check-shots expects seconds")?);
+                }
+            }
+            "--people-watch" => o.people_watch = true,
             "--pause-at" => o.pause_at = Some(value()?.parse()?),
             "--contracts" => {
                 o.contracts = value()?.parse().context("--contracts expects a count")?
@@ -981,7 +1043,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
     }
     // Launched plainly (only where the game is, the window and settings
     // named): the whole game, as `--alpha`.
-    const PLAIN: [&str; 17] = [
+    const PLAIN: [&str; 18] = [
         "--install",
         "--config",
         "--size",
@@ -995,6 +1057,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
         "--dev",
         "--skip-mode-off",
         "--skip-mode-on",
+        "--script-join",
         // Co-op plays the whole game too.
         "--host",
         "--join",
@@ -1075,6 +1138,8 @@ fn keep_crash_reports() {
         if std::fs::write(&path, report).is_ok() {
             eprintln!("crash report written to {}", path.display());
         }
+        // The process ends here (panics abort): the log's last lines out.
+        errlog::finish();
     }));
 }
 
@@ -1104,8 +1169,11 @@ const PROPS_CHECK_AFTER: f32 = 20.0;
 #[cfg_attr(target_os = "android", allow(dead_code))]
 fn main() -> anyhow::Result<()> {
     keep_crash_reports();
+    errlog::start();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    run(&args, EventLoop::new)
+    let out = run(&args, EventLoop::new);
+    errlog::finish();
+    out
 }
 
 /// The game, given its arguments and how to make its event loop (the
@@ -1114,6 +1182,7 @@ fn run(
     args: &[String],
     event_loop: impl FnOnce() -> Result<EventLoop<()>, winit::error::EventLoopError>,
 ) -> anyhow::Result<()> {
+    spans::start_profiler();
     let mut options = parse_args(args)?;
     let ignored = screenshot_only_ignored(args);
     if !ignored.is_empty() {
@@ -1245,6 +1314,7 @@ fn run(
         no_boot: options.no_boot,
         to_front_end: options.to_front_end,
         skip_mode_off: options.skip_mode_off,
+        script_join: options.script_join,
         skip_to: options.skip_to.clone(),
         guns: options.guns.clone(),
         load: options.load.clone(),
@@ -1442,7 +1512,7 @@ fn loading_screen(install: Option<&Install>) -> Option<loading::LoadingScreen> {
                 "loading screen: {} read, {} of {} hints",
                 loading::MOVIE,
                 screen.hints_read(),
-                loading::HINTS.len()
+                loading::HINTS
             );
             Some(screen)
         }
@@ -1643,6 +1713,38 @@ fn hud_info(
     info
 }
 
+/// How often the GPU memory line is logged, seconds of wall clock.
+const GPU_LOG_EVERY: u64 = 60;
+
+/// Logs what the backend holds on the GPU (`WgpuBackend::memory`) and
+/// what the island has streamed in, every [`GPU_LOG_EVERY`] seconds, to
+/// follow video memory over a long run.
+fn log_gpu_memory(backend: &WgpuBackend, game: &Game) {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    if last.is_some_and(|t| now.duration_since(t).as_secs() < GPU_LOG_EVERY) {
+        return;
+    }
+    *last = Some(now);
+    let m = backend.memory();
+    let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+    eprintln!(
+        "gpu memory: {} textures {:.0} MB, {} vertex buffers {:.0} MB, {} index buffers {:.0} MB,          {} materials; world {:?}",
+        m.textures,
+        mb(m.texture_bytes),
+        m.vertex_buffers,
+        mb(m.vertex_bytes),
+        m.index_buffers,
+        mb(m.index_bytes),
+        m.materials,
+        game.scene.world.as_ref().map(|w| w.stats())
+    );
+}
+
 /// Streams around the player (or camera) and draws a frame.
 fn render(
     backend: &mut WgpuBackend,
@@ -1658,6 +1760,7 @@ fn render(
     }
     let focus = game.focus();
     spans::time("stream", || game.scene.update(backend, focus))?;
+    log_gpu_memory(backend, game);
     let mut queue = DrawQueue::new();
     spans::time("draw", || -> anyhow::Result<()> {
         backend.begin_frame(&view)?;
@@ -1887,6 +1990,13 @@ fn screenshot(
     if options.fly {
         game.on_foot = false;
     }
+    let route = options
+        .bench
+        .and(game.scene.world.as_ref())
+        .map(|w| bench::Route::new(&w.index));
+    if let Some(r) = &route {
+        game.camera = r.pose(0.0);
+    }
     let fov = config.camera.fov;
     let mut aspect = w as f32 / h as f32;
     let tick = TICK.as_secs_f32();
@@ -1968,6 +2078,11 @@ fn screenshot(
             aspect,
             out,
         );
+    }
+    if let (Some(seconds), Some(route)) = (options.bench, &route) {
+        run_bench(&mut backend, &mut game, route, seconds, fov, aspect)?;
+        write_ppm(&backend, out)?;
+        return Ok(());
     }
     // The last frames are timed: the frame rate here, for checking.
     // Where the time goes: the tick, streaming, building the draws, and
@@ -2190,7 +2305,24 @@ fn screenshot(
             .map_or(180, |s| (s * 60.0).round() as usize);
         // `--npc-swim`: the soldier put in the water.
         let (mut swimmer, mut swim_gave_up): (Option<u32>, bool) = (None, false);
+        // `--knock-nearest`: the person picked (index into the people).
+        let mut knocked: Option<usize> = None;
+        let knock_tick = options
+            .knock_nearest
+            .map(|(s, ram)| ((s * 60.0).round() as usize, ram));
         for i in 0..ticks {
+            if let Some((at, _)) = knock_tick
+                && i == at
+            {
+                knocked = knock_pick(&mut game);
+            }
+            if let (Some((at, true)), Some(k)) = (knock_tick, knocked)
+                && i == at + 12
+            {
+                knock_ram(&mut game, k);
+            }
+            let knock_bash =
+                matches!(knock_tick, Some((at, false)) if i == at + 12) && knocked.is_some();
             if let (Some(face), Some(p)) = (options.face, game.scene.player.as_mut()) {
                 p.yaw = face;
                 if i == 0 {
@@ -2249,7 +2381,7 @@ fn screenshot(
                 // The last shot's flash is still up for the picture.
                 fire: options.fire && i + 3 == ticks,
                 throw: options.throw && i == ticks - lead,
-                melee: options.bash && i == ticks - lead,
+                melee: (options.bash && i == ticks - lead) || knock_bash,
                 reload: options.reload && i == ticks - lead,
                 select: options.weapon.filter(|_| i == 0).or_else(|| {
                     (options.switch && i == ticks - lead).then_some(match game.combat.weapon {
@@ -2407,6 +2539,29 @@ fn screenshot(
                     at.distance(p.character.position)
                 );
             }
+            if i % 60 == 59 {
+                let second = (i + 1) / 60;
+                if let Some(k) = knocked {
+                    knock_log(&game, k, second);
+                }
+                if options.people_watch {
+                    people_watch(&game, second);
+                }
+            }
+            let t = (i + 1) as f32 / 60.0;
+            for &s in options
+                .check_shots
+                .iter()
+                .filter(|&&s| t >= s && t - 1.0 / 60.0 < s)
+            {
+                render(&mut backend, &mut game, fov, aspect, None)?;
+                let stem = out
+                    .file_stem()
+                    .map_or("shot".into(), |n| n.to_string_lossy().into_owned());
+                let path = out.with_file_name(format!("{stem}-at{s}.ppm"));
+                write_ppm(&backend, &path)?;
+                eprintln!("check-shot: {s} s in: {}", path.display());
+            }
             if i % 30 == 0 {
                 // Keep streaming around her as she goes.
                 render(&mut backend, &mut game, fov, aspect, None)?;
@@ -2469,6 +2624,9 @@ fn screenshot(
     }
     if let Some(reach) = options.look_pickup {
         look_at_pickup(&mut game, reach);
+    }
+    if options.marker_test {
+        marker_test(&mut backend, &mut game, fov, aspect)?;
     }
     if let Some(p) = game.scene.player.as_ref().filter(|_| game.on_foot) {
         // Hits from around her, as the camera sees it: 0 ahead, 90 right.
@@ -2682,6 +2840,134 @@ fn screenshot(
 /// Puts the camera `reach` metres off the pickup lying nearest her, a
 /// little above it and looking at it, and says which it is and whether
 /// its model has loaded.
+/// Seconds of flight between `bench:` lines.
+const BENCH_EVERY: f32 = 10.0;
+
+/// Flies `route` for `seconds` (one tick a frame, no more than two frames
+/// on the GPU at once), logging a `bench:` line every [`BENCH_EVERY`]
+/// seconds of flight and a `bench summary:` at the end: the frame rate
+/// and its 1% low, the frame time's median and 99th percentile, the CPU's
+/// milliseconds a frame in the tick, streaming, building the draws,
+/// submitting and waiting for the GPU, the GPU's in each stage, and draws
+/// a frame.
+fn run_bench(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    route: &bench::Route,
+    seconds: f32,
+    fov: f32,
+    aspect: f32,
+) -> anyhow::Result<()> {
+    const PARTS: [&str; 5] = ["tick", "stream", "draws", "submit", "wait"];
+    let tick = TICK.as_secs_f32();
+    let frames = (seconds / tick).ceil().max(1.0) as u32;
+    eprintln!(
+        "bench: flying {:.0} m round the loop for {seconds:.0} s ({frames} frames)",
+        route.length()
+    );
+    let _ = backend.take_gpu_times();
+    let (mut all, mut span) = (
+        frametimes::FrameTimes::default(),
+        frametimes::FrameTimes::default(),
+    );
+    let (mut cpu_all, mut cpu_span) = ([0.0f64; 5], [0.0f64; 5]);
+    let (mut gpu_all, mut draws_all, mut draws_span) =
+        (m2_render::gpu::timer::GpuTimes::default(), 0u64, 0u64);
+    let mut next_line = BENCH_EVERY;
+    for k in 1..=frames {
+        let t = k as f32 * tick;
+        let start = Instant::now();
+        let mut lap = start;
+        let part = |i: usize, lap: &mut Instant, cpu: &mut [f64; 5]| {
+            cpu[i] += lap.elapsed().as_secs_f64() * 1000.0;
+            *lap = Instant::now();
+        };
+        let mut cpu = [0.0f64; 5];
+        game.camera = route.pose(t);
+        game.step(Intent::default(), tick);
+        part(0, &mut lap, &mut cpu);
+        let mut view = game.view(fov, aspect);
+        view.lighting.fog_density = 0.00025;
+        let focus = game.focus();
+        game.scene.update(backend, focus)?;
+        part(1, &mut lap, &mut cpu);
+        let mut queue = DrawQueue::new();
+        backend.begin_frame(&view)?;
+        game.scene.draw(backend, &mut queue, &view, &game.combat)?;
+        let drawn = queue.flush(&view, backend)?.draws as u64;
+        part(2, &mut lap, &mut cpu);
+        backend.end_frame()?;
+        part(3, &mut lap, &mut cpu);
+        backend.wait_for_frame_before_last()?;
+        part(4, &mut lap, &mut cpu);
+        let ms = start.elapsed().as_secs_f32() * 1000.0;
+        all.push(ms);
+        span.push(ms);
+        for i in 0..5 {
+            cpu_all[i] += cpu[i];
+            cpu_span[i] += cpu[i];
+        }
+        draws_all += drawn;
+        draws_span += drawn;
+        if t >= next_line || k == frames {
+            next_line += BENCH_EVERY;
+            let gpu = backend.take_gpu_times().unwrap_or_default();
+            gpu_all.frames += gpu.frames;
+            gpu_all.cpu_frames += gpu.cpu_frames;
+            for (a, b) in gpu_all.stages.iter_mut().zip(gpu.stages) {
+                *a += b;
+            }
+            for (a, b) in gpu_all.cpu.iter_mut().zip(gpu.cpu) {
+                *a += b;
+            }
+            let n = span.summary().frames.max(1) as f64;
+            let s = span.summary();
+            let p = game.camera.position;
+            eprintln!(
+                "bench: {t:.0} s at ({:.0}, {:.0}, {:.0}): {:.1} fps, 1% low {:.1}, p50 {:.1} p99 {:.1} ms;                  cpu ms a frame {}; gpu {}; {} draws a frame",
+                p.x,
+                p.y,
+                p.z,
+                s.fps,
+                s.low1,
+                s.p50,
+                s.p99,
+                PARTS
+                    .iter()
+                    .zip(cpu_span)
+                    .map(|(name, v)| format!("{name} {:.2}", v / n))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                gpu_line(&gpu),
+                draws_span / n as u64,
+            );
+            span = frametimes::FrameTimes::default();
+            cpu_span = [0.0; 5];
+            draws_span = 0;
+        }
+    }
+    let s = all.summary();
+    let n = s.frames.max(1) as f64;
+    eprintln!(
+        "bench summary: {} frames, {:.1} fps, 1% low {:.1} fps, p50 {:.1} p99 {:.1} slowest {:.1} ms;          cpu ms a frame {}; gpu {}; {} draws a frame",
+        s.frames,
+        s.fps,
+        s.low1,
+        s.p50,
+        s.p99,
+        s.slowest,
+        PARTS
+            .iter()
+            .zip(cpu_all)
+            .map(|(name, v)| format!("{name} {:.2}", v / n))
+            .collect::<Vec<_>>()
+            .join(", "),
+        gpu_line(&gpu_all),
+        draws_all / n as u64,
+    );
+    Ok(())
+}
+
 fn look_at_pickup(game: &mut Game, reach: f32) {
     let Some(her) = game.scene.player.as_ref().map(|p| p.character.position) else {
         return;
@@ -3347,12 +3633,18 @@ fn look_at_marker(
 ) -> anyhow::Result<()> {
     use m2_math::glam::Vec3;
     let here = game.focus();
-    let Some((at, label)) = link
-        .view()
+    let view = link.view();
+    // The icon markers and those drawn as models (a race's gates).
+    let models = view
+        .models
+        .iter()
+        .map(|m| (m.at, format!("model {:08x}", m.model)));
+    let Some((at, label)) = view
         .markers
-        .into_iter()
-        .min_by(|a, b| a.at.distance(here).total_cmp(&b.at.distance(here)))
+        .iter()
         .map(|m| (m.at, m.label()))
+        .chain(models)
+        .min_by(|a, b| a.0.distance(here).total_cmp(&b.0.distance(here)))
     else {
         eprintln!("mission look: no markers");
         return Ok(());
@@ -3371,6 +3663,86 @@ fn look_at_marker(
         }
         let pending = game.scene.world.as_ref().map_or(0, |w| w.stats().pending);
         if (i > 120 && pending == 0) || started.elapsed() > Duration::from_secs(60) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// With `--marker-test`: a tripwire 20 m wide in red, a ring and a
+/// finish in yellow and a pin in white, 25 m ahead of the camera, the
+/// camera looking at them from 1.5 m up, once their models have loaded.
+fn marker_test(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+) -> anyhow::Result<()> {
+    use crate::marker_models::{MarkerModel, PIN_MODEL, TRIPWIRE_MODEL};
+    use m2_math::glam::Vec3;
+    let ground = game.focus();
+    let ahead = game.camera.forward().with_y(0.0).normalize_or(Vec3::Z);
+    let at = ground + ahead * 25.0;
+    let yaw = ahead.x.atan2(ahead.z);
+    let side = Vec3::new(ahead.z, 0.0, -ahead.x);
+    let model = |model, at, yaw, scale, width, colour| MarkerModel {
+        model,
+        at,
+        yaw,
+        scale,
+        width,
+        colour,
+    };
+    game.scene.marker_models = vec![
+        model(TRIPWIRE_MODEL, at, Some(yaw), 1.0, Some(20.0), [255, 0, 0]),
+        model(
+            m2_assets::name_hash("global_airring"),
+            at + side * 14.0 + Vec3::Y * 4.0,
+            // Its one face is its +z side: turned to the camera.
+            Some(yaw + std::f32::consts::PI),
+            6.0,
+            None,
+            [255, 255, 0],
+        ),
+        model(
+            m2_assets::name_hash("global_tripwirefinish"),
+            at - side * 14.0,
+            Some(yaw),
+            1.0,
+            None,
+            [255, 255, 0],
+        ),
+        model(
+            PIN_MODEL,
+            at + ahead * 4.0 + Vec3::Y * 2.0,
+            None,
+            0.25,
+            None,
+            [255; 3],
+        ),
+    ];
+    game.on_foot = false;
+    game.camera = FlyCamera::looking_at(ground + Vec3::Y * 2.0 + ahead * 6.0, at + Vec3::Y * 2.0);
+    // `M2_MARKER_TEST_ONLY=<n>` keeps the nth alone, in the middle.
+    if let Some(n) = std::env::var("M2_MARKER_TEST_ONLY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        let mut m = game.scene.marker_models.swap_remove(n);
+        m.at = at + Vec3::Y * 2.0;
+        game.scene.marker_models = vec![m];
+    }
+    for m in &game.scene.marker_models {
+        eprintln!("marker test: {:08x} at {:.1}", m.model, m.at);
+    }
+    let tick = TICK.as_secs_f32();
+    let started = Instant::now();
+    for i in 0.. {
+        game.step(Intent::default(), tick);
+        if i % 10 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+        if (i > 240) || started.elapsed() > Duration::from_secs(60) {
             break;
         }
     }
@@ -3924,6 +4296,7 @@ fn mission_for_screenshot(
         .with_support(options.support.clone())
         .with_movies(options.movies)
         .with_skip_mode_off(options.skip_mode_off)
+        .with_script_join(options.script_join)
         .with_skip_to(options.skip_to.clone())
         .with_job_near(options.job_near);
     let started = Instant::now();
@@ -3996,6 +4369,10 @@ fn mission_for_screenshot(
     let mut screen_cycle = loading::Cycle::default();
     let played = Instant::now();
     let every = if auto.is_some() { 10 } else { 30 };
+    // The wall clock at the last `pace:` line, and the spans from before
+    // play dropped.
+    let mut pace_since = Instant::now();
+    let _ = spans::take();
     // With --autoplay, a picture of each delivery as its helicopter
     // hovers over the drop point (`<out>-delivery1.ppm`, ...), and one
     // from the same place once the load has come down (`-down`).
@@ -4076,7 +4453,9 @@ fn mission_for_screenshot(
     // Message box calls with a callback, while the game's HUD isn't
     // running: when each is due back, by call number; the last seen.
     let (mut boxed, mut boxed_seen): (Vec<(f32, u64)>, u64) = (Vec::new(), 0);
+    let mut lap = spans::Lap::new();
     for i in 0..(seconds / tick).round() as u32 {
+        lap.mark("loop: pictures and checks");
         let intent = match auto.as_mut().filter(|_| play_done.is_none()) {
             Some(a) => {
                 let contract = link.contract();
@@ -4166,11 +4545,14 @@ fn mission_for_screenshot(
                 a.in_hq = link.in_hq();
                 a.exits = link.exit_offers();
                 a.enters = link.enter_offers_for(failed_contract.as_deref());
-                let objectives = link.view().objectives;
-                a.step(game, &marks, &objectives, &link.awaited(), tick)
+                let objectives = link.objectives();
+                spans::time("autoplay", || {
+                    a.step(game, &marks, &objectives, &link.awaited(), tick)
+                })
             }
             None => Intent::default(),
         };
+        lap.mark("loop: autoplay and what it reads");
         if let Some(hp) = options.hurt
             && i == (HURT_AT / tick).round() as u32
         {
@@ -4446,8 +4828,10 @@ fn mission_for_screenshot(
                 _ => {}
             }
         }
-        game.step(intent, tick);
-        link.tick(game, tick);
+        lap.mark("loop: before the step");
+        spans::time("game", || game.step(intent, tick));
+        spans::time("scripts", || link.tick(game, tick));
+        lap.mark("loop: step and scripts");
         // In a starter's box (her menu, then a contract's terms), autoplay
         // picks after a moment the contract on offer and then Accept, as a
         // player taking it would; the game's HUD answers the scripts' box
@@ -4521,7 +4905,9 @@ fn mission_for_screenshot(
                 None => transit_up = 0.0,
             }
         }
+        lap.mark("loop: autoplay picks");
         game.dress(backend);
+        lap.mark("loop: dress");
         // `--context exit,enter,talk`: each in turn, once the last is done.
         if let Some(want) = options
             .context
@@ -4701,6 +5087,7 @@ fn mission_for_screenshot(
         if options.movies {
             movies_offscreen(&mut link, install, out);
         }
+        lap.mark("loop: saves, checks and hijacks");
         // Until the contract is done the game's HUD doesn't run here, so
         // its message box can't call back as each message ends: an
         // objective's added message, which the objective waits on before
@@ -4709,7 +5096,7 @@ fn mission_for_screenshot(
         // (inferred: the box shows one at a time, which isn't kept).
         if late_hud.is_none() {
             let now = i as f32 * tick;
-            for c in link.view().hud_calls {
+            for c in link.hud_calls_after(boxed_seen) {
                 if c.seq <= boxed_seen {
                     continue;
                 }
@@ -4756,6 +5143,7 @@ fn mission_for_screenshot(
                 eprintln!("shop-key: shop open 3 s after: {}", link.shop_open());
             }
         }
+        lap.mark("loop: late hud");
         // After the contract (--after-contract) the game's HUD runs too:
         // the flow waits on its fanfare closing.
         let boxed_now = options.dialog_shots && (late_hud.is_some() || link.dialog_open());
@@ -4921,6 +5309,7 @@ fn mission_for_screenshot(
                 }
             }
         }
+        lap.mark("loop: dialog and done");
         // `--visit-faction <abbrev>`: 30 s after the contract, she is put
         // 25 m from the nearest soldier spawn of that faction whose layer
         // is in; 15 s on, she hurts the nearest of them; who stands with
@@ -5063,6 +5452,7 @@ fn mission_for_screenshot(
                 }
             }
         }
+        lap.mark("loop: visits and medevac");
         // After the contract (--after-contract), where she is every five
         // seconds.
         if contract_done.is_some() && i % (5.0 / tick).round() as u32 == 0 {
@@ -5113,7 +5503,7 @@ fn mission_for_screenshot(
             }
         }
         if auto.is_some() {
-            let shown = link.view().tutorial;
+            let shown = link.tutorial();
             if shown != tutorial_shown {
                 eprintln!(
                     "autoplay: the tutorial box reads {shown:?} at {:.1} s",
@@ -5138,8 +5528,28 @@ fn mission_for_screenshot(
             );
             break;
         }
+        lap.mark("loop: after the scripts");
         if i % every == 0 {
             render(backend, game, fov, aspect, None)?;
+        }
+        lap.mark("loop: frame");
+        // Each minute of play, where the wall clock went (`pace: autoplay`):
+        // the play it got through for each second, and the parts of a tick
+        // ([`spans`]: the game's steps, the scripts, and the frames drawn
+        // every `every` ticks) in milliseconds a tick, longest first.
+        let ticks_a_minute = (60.0 / tick).round() as u32;
+        if i > 0 && i % ticks_a_minute == 0 {
+            let wall = pace_since.elapsed().as_secs_f32();
+            eprintln!(
+                "pace: autoplay {:.0} s of play: {:.2} s of play a second, {:.1} ms a tick, {} people, {} vehicles; ms a tick: {}",
+                i as f32 * tick,
+                60.0 / wall.max(1e-3),
+                wall * 1000.0 / ticks_a_minute as f32,
+                game.scene.people.npcs.len(),
+                game.scene.vehicles.len(),
+                spans::describe(&spans::take(), ticks_a_minute as f32, 20)
+            );
+            pace_since = Instant::now();
         }
         if auto.is_some() {
             for (copter, at, to) in game.scene.flights.hovering() {
@@ -5520,6 +5930,145 @@ fn look_at_story_character(game: &mut Game) {
 /// forward for four seconds (backing out first if it is parked close
 /// behind something, and steering round what it meets), printing how it
 /// went.
+/// `--knock-nearest`: puts her 1.2 m from the nearest person on their
+/// feet, facing them. Their index into the people, if anyone is about.
+fn knock_pick(game: &mut Game) -> Option<usize> {
+    let her = game.scene.player.as_ref()?.character.position;
+    let (k, there) = game
+        .scene
+        .people
+        .npcs
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.alive && n.landed && !n.held && n.down.is_none())
+        .map(|(k, n)| (k, n.character.position))
+        .min_by(|a, b| a.1.distance(her).total_cmp(&b.1.distance(her)))
+        .or_else(|| {
+            eprintln!("knock-check: nobody on their feet in play to knock down");
+            None
+        })?;
+    let back = (her - there)
+        .with_y(0.0)
+        .normalize_or(m2_math::glam::Vec3::X);
+    let p = game.scene.player.as_mut()?;
+    p.drop_at(there + back * 1.2);
+    p.facing = (-back.x).atan2(-back.z);
+    p.yaw = p.facing;
+    let n = &game.scene.people.npcs[k];
+    eprintln!(
+        "knock-check: person {k} ({:08x}, {}) at {there:.1}, {:.0} m off; she is put 1.2 m from them",
+        n.spawn.unwrap_or(0),
+        if n.soldier { "soldier" } else { "civilian" },
+        there.distance(her)
+    );
+    Some(k)
+}
+
+/// `--knock-nearest <s>r`: person `k` is run into by a car that is not
+/// there, coming from behind her at 6 m/s (1.5 t, a box 2 m wide and
+/// 4 m long), as [`npc::People::traffic`] takes a vehicle's ram.
+fn knock_ram(game: &mut Game, k: usize) {
+    use m2_math::glam::{Mat4, Quat, Vec3};
+    let Some(n) = game.scene.people.npcs.get(k) else {
+        return;
+    };
+    let there = n.character.position;
+    let her = game
+        .scene
+        .player
+        .as_ref()
+        .map_or(there - Vec3::Z, |p| p.character.position);
+    let way = (there - her).with_y(0.0).normalize_or(Vec3::Z);
+    let at = Mat4::from_rotation_translation(
+        Quat::from_rotation_y(way.x.atan2(way.z)),
+        there - way * 1.0,
+    );
+    let hp = n.hp;
+    let bounds = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.5, 2.0));
+    let killed = game.scene.people.traffic(
+        &[(at, way * 6.0, bounds, 1500.0)],
+        game.combat.damage_table.as_ref(),
+    );
+    let n = &game.scene.people.npcs[k];
+    eprintln!(
+        "knock-check: person {k} run into at 6 m/s: health {hp:.0} to {:.0}, {}, killed {killed}",
+        n.hp,
+        n.human_state()
+    );
+}
+
+/// `--knock-nearest`: what person `k` is doing, `second` seconds in.
+fn knock_log(game: &Game, k: usize, second: usize) {
+    let Some(n) = game.scene.people.npcs.get(k) else {
+        return;
+    };
+    let her = game
+        .scene
+        .player
+        .as_ref()
+        .map_or(n.character.position, |p| p.character.position);
+    let limp = n
+        .ragdoll
+        .and_then(|d| game.scene.world.as_ref()?.physics.ragdoll_nodes(d))
+        .and_then(|nodes| nodes.first().map(|m| m.w_axis.truncate()));
+    eprintln!(
+        "knock-check: {second} s: person {k} {}, {}, health {:.0}, at {:.1} ({:.1} m from her), clip {:08x}, limp body {}",
+        if n.alive { "alive" } else { "dead" },
+        n.human_state(),
+        n.hp,
+        n.character.position,
+        n.character.position.distance(her),
+        n.rig
+            .animator
+            .current()
+            .map_or(0, |(c, _)| n.rig.clips[c].hash),
+        limp.map_or("none".to_owned(), |p| format!("at {p:.1}")),
+    );
+}
+
+/// `--people-watch`: how many people are in play by what they are
+/// doing, and the nearest five to her, `second` seconds in.
+fn people_watch(game: &Game, second: usize) {
+    let Some(her) = game.scene.player.as_ref().map(|p| p.character.position) else {
+        return;
+    };
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    let mut near: Vec<(f32, usize)> = Vec::new();
+    for (k, n) in game.scene.people.npcs.iter().enumerate() {
+        if !n.alive || !n.landed {
+            continue;
+        }
+        let state = n.human_state();
+        match counts.iter_mut().find(|c| c.0 == state) {
+            Some(c) => c.1 += 1,
+            None => counts.push((state, 1)),
+        }
+        near.push((n.character.position.distance(her), k));
+    }
+    near.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let counts: Vec<String> = counts.iter().map(|(s, n)| format!("{n} {s}")).collect();
+    let near: Vec<String> = near
+        .iter()
+        .take(5)
+        .map(|&(d, k)| {
+            let n = &game.scene.people.npcs[k];
+            format!(
+                "{k}: {} {:08x} {d:.0} m",
+                n.human_state(),
+                n.rig
+                    .animator
+                    .current()
+                    .map_or(0, |(c, _)| n.rig.clips[c].hash)
+            )
+        })
+        .collect();
+    eprintln!(
+        "people-watch: {second} s: {}; nearest {}",
+        counts.join(", "),
+        near.join("; ")
+    );
+}
+
 /// With `--screenshot --drive --hijack`: puts her beside the nearest
 /// hijackable vehicle (`--vehicle`'s, if given), starts the hijack and
 /// answers its prompts at once ([`hijack::Autopad`]), and leaves her in the
@@ -8484,6 +9033,8 @@ struct Pace {
     frames: u32,
     slowest: Duration,
     slow: u32,
+    /// The span's frame times, for its 1% low and percentiles.
+    times: frametimes::FrameTimes,
 }
 
 impl Pace {
@@ -8498,6 +9049,7 @@ impl Pace {
         };
         let took = now - last;
         self.frames += 1;
+        self.times.push(took.as_secs_f32() * 1000.0);
         self.slowest = self.slowest.max(took);
         if took > Duration::from_millis(50) {
             self.slow += 1;
@@ -8507,13 +9059,18 @@ impl Pace {
         if span < PACE_EVERY {
             return None;
         }
+        let t = self.times.summary();
         let line = format!(
-            "pace: {:.0} fps over {span:.0} s, slowest frame {:.0} ms, {} over 50 ms, {}x{}",
+            "pace: {:.0} fps over {span:.0} s, slowest frame {:.0} ms, {} over 50 ms, {}x{}, \
+             1% low {:.0} fps, frame ms p50 {:.1} p99 {:.1}",
             self.frames as f32 / span,
             self.slowest.as_secs_f32() * 1000.0,
             self.slow,
             size.0,
-            size.1
+            size.1,
+            t.low1,
+            t.p50,
+            t.p99
         );
         *self = Self {
             since: Some((now, now)),
@@ -8521,6 +9078,32 @@ impl Pace {
         };
         Some((line, span))
     }
+}
+
+/// GPU milliseconds a frame, all stages and each
+/// ([`m2_render::gpu::timer::STAGES`]), over the frames timed, then the
+/// CPU's milliseconds encoding each stage and finishing the submit.
+fn gpu_line(g: &m2_render::gpu::timer::GpuTimes) -> String {
+    let n = f64::from(g.frames.max(1));
+    let stages: Vec<String> = m2_render::gpu::timer::STAGES
+        .iter()
+        .zip(g.stages)
+        .map(|(name, ms)| format!("{name} {:.2}", ms / n))
+        .collect();
+    let c = f64::from(g.cpu_frames.max(1));
+    let cpu: Vec<String> = m2_render::gpu::timer::STAGES
+        .iter()
+        .chain(&["finish", "submit"])
+        .zip(g.cpu)
+        .map(|(name, ms)| format!("{name} {:.2}", ms / c))
+        .collect();
+    format!(
+        "ms a frame {:.2} over {} frames ({}); encode cpu ms a frame ({})",
+        g.per_frame(),
+        g.frames,
+        stages.join(", "),
+        cpu.join(", ")
+    )
 }
 
 struct Running {
@@ -8634,6 +9217,9 @@ struct App {
     /// End the scripts' skip mode after their start (unless
     /// `--skip-mode-on`).
     skip_mode_off: bool,
+    /// The scripts' "player joined" callback is called for her
+    /// (`--script-join`).
+    script_join: bool,
     /// The story skipped to this contract (`--skip-to`).
     skip_to: Option<(String, bool)>,
     /// Weapons to start with (`--gun`).
@@ -8763,6 +9349,7 @@ impl App {
                         .with_support(self.support.clone())
                         .with_movies(self.alpha)
                         .with_skip_mode_off(self.skip_mode_off)
+                        .with_script_join(self.script_join)
                         .with_skip_to(self.skip_to.clone())
                         .with_subtitles(self.config.options.subtitles),
                 ),
@@ -8889,6 +9476,7 @@ impl Running {
         if self.background {
             return Ok(());
         }
+        spans::frame_mark();
         let now = Instant::now();
         let dt = (now - self.last).min(MAX_FRAME).as_secs_f64();
         self.read_pad(dt);
@@ -9091,8 +9679,13 @@ impl Running {
                 Some(kb) => format!("; lua {kb} KB"),
                 None => String::new(),
             };
+            let gpu = self
+                .backend
+                .take_gpu_times()
+                .map(|g| format!("; gpu {}", gpu_line(&g)))
+                .unwrap_or_default();
             eprintln!(
-                "{line}; at ({:.0}, {:.0}), {} vehicles, {} people, {} riders{objects}, {} draws a frame; ms a second: {}{lua}",
+                "{line}; at ({:.0}, {:.0}), {} vehicles, {} people, {} riders{objects}, {} draws a frame; ms a second: {}{lua}{gpu}",
                 p.x,
                 p.z,
                 s.vehicles.len(),
@@ -9861,16 +10454,23 @@ impl Running {
             if let Some(preset) = m.take_reverb() {
                 self.audio.set_reverb(preset);
             }
+            for (cue, on) in m.take_ambiences() {
+                self.audio.script_ambience(cue, on);
+            }
+            self.audio.silence_ambience(m.ambience_silenced());
         }
         self.answer_saves(config.options.autosave);
         let (ear, facing) = self.game.listener();
         self.audio.update(ear, facing);
-        // The ambience region the listener is in plays its own bed and
-        // one-shots; until they are read, the town's or jungle's stand in.
-        let zone = self.game.scene.world.as_ref().and_then(|w| {
-            m2_engine::sound_regions::ambience_at(&w.index.sound_regions, ear.x, ear.z)
-                .and_then(|r| r.ambience)
+        // Every ambience region the listener is in asks for its ambience,
+        // as the scripts do; the one the list picks plays its bed and
+        // one-shots. Until they are read, the town's or jungle's stand in.
+        let inside: Vec<_> = self.game.scene.world.as_ref().map_or_else(Vec::new, |w| {
+            m2_engine::sound_regions::ambiences_at(&w.index.sound_regions, ear.x, ear.z)
+                .filter_map(|r| Some((r.entity, r.ambience?)))
+                .collect()
         });
+        let zone = self.audio.ambience_heard(&inside);
         if !self.audio.zone_ambience(zone, ear, TICK.as_secs_f32())
             && self.audio.ambient_due(TICK.as_secs_f32())
         {
@@ -9893,6 +10493,7 @@ impl Running {
         let engine = self.game.engine();
         self.audio.engine(engine, TICK.as_secs_f32());
         self.audio.rotors(&self.game.scene.flights.sounding());
+        self.audio.flybys(&self.game.scene.strikes.sounding());
         let others = self.game.others_engines(ear);
         self.audio.others_engines(&others, ear);
         let driving = self.game.driving().is_some();

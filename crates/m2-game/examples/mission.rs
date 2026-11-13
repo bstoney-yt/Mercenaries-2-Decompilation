@@ -34,8 +34,12 @@
 //!                      with it
 //!   --flying           the hijacked vehicle is in the air (helicopters
 //!                      are hijacked only in flight)
-//!   --tap-rate n       presses a second when the prompt is to tap or
+//!   --script-join      have the game call the scripts' "player joined"
+//!                      callback for her (`Mission::set_script_join`)
+//!   --tap-rate n      presses a second when the prompt is to tap or
 //!                      alternate (default 9)
+//!   --skip-to m[,briefing]  start at mission m (`PmcCon004`), as
+//!                      m2-alpha's `--skip-to` does
 //! ```
 //!
 //! Every module some script loads is imported first, then every other
@@ -73,6 +77,10 @@ struct Options {
     action_seconds: f64,
     tap_rate: f64,
     flying: bool,
+    script_join: bool,
+    /// `--skip-to`: the mission the scripts' skip starts, and whether with
+    /// its briefing.
+    skip_to: Option<(String, bool)>,
 }
 
 fn main() -> ExitCode {
@@ -154,6 +162,14 @@ fn options() -> Result<Options> {
             "--action-seconds" => o.action_seconds = value()?.parse()?,
             "--tap-rate" => o.tap_rate = value()?.parse()?,
             "--flying" => o.flying = true,
+            "--script-join" => o.script_join = true,
+            "--skip-to" => {
+                let v = value()?;
+                o.skip_to = Some(match v.split_once(',') {
+                    Some((m, b)) => (m.to_owned(), b == "briefing"),
+                    None => (v, false),
+                });
+            }
             _ if o.wad.is_empty() && !a.starts_with("--") => o.wad = a,
             _ => return Err(format!("unknown argument {a}").into()),
         }
@@ -192,6 +208,7 @@ fn run(o: &Options) -> Result<()> {
         ClipTimes::default()
     };
     let mut mission = Mission::new(data, &o.hero, o.at)?;
+    mission.set_script_join(o.script_join);
     for part in &o.layers {
         println!("preloaded {}", mission.preload(part).join(", "));
     }
@@ -209,6 +226,10 @@ fn run(o: &Options) -> Result<()> {
             .ok_or_else(|| format!("{path} has no scripts' data"))?;
         println!("loading {path}: the scripts' data, {} bytes", text.len());
         mission.load_save(text);
+    }
+    if let Some((to, briefing)) = &o.skip_to {
+        mission.set_skip_mission(to, *briefing);
+        println!("skip to: {to} (briefing {briefing})");
     }
     if o.start {
         println!();

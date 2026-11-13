@@ -138,6 +138,8 @@ fn draw(vb: VertexBufferHandle, ib: IndexBufferHandle, material: u32, world: Mat
         skin: None,
         instances: None,
         uv_offset: [0.0; 2],
+        tint: [1.0; 4],
+        beams_lit: false,
     }
 }
 
@@ -212,6 +214,8 @@ fn draws_a_textured_unlit_quad() {
     b.begin_frame(&view()).unwrap();
     b.draw(&DrawCall {
         uv_offset: [0.5, 0.0],
+        tint: [1.0; 4],
+        beams_lit: false,
         ..draw(vb, ib, 1, Mat4::IDENTITY)
     })
     .unwrap();
@@ -427,6 +431,8 @@ fn instanced_draws_repeat_the_geometry() {
     b.draw(&DrawCall {
         instances: Some(instances),
         uv_offset: [0.0; 2],
+        tint: [1.0; 4],
+        beams_lit: false,
         ..draw(vb, ib, 1, Mat4::IDENTITY)
     })
     .unwrap();
@@ -436,6 +442,140 @@ fn instanced_draws_repeat_the_geometry() {
     assert_eq!(pixel(&rgba, 32, 32), sky, "middle");
     assert_eq!(pixel(&rgba, 14, 32), white, "left");
     assert_eq!(pixel(&rgba, 50, 32), white, "right");
+}
+
+/// A blended, two-sided strip with no normals (a race's ring) draws.
+#[test]
+fn blended_strips_without_normals_draw() {
+    use VertexFormat::*;
+    use VertexSemantic::*;
+    let Some(mut b) = backend() else { return };
+    let layout = VertexLayout::packed(&[(Position, Float3), (TexCoord(0), Float2)]).unwrap();
+    #[rustfmt::skip]
+    let vertices: [f32; 20] = [
+        -1.0,  1.0, 0.0,  0.0, 0.0,
+        -1.0, -1.0, 0.0,  0.0, 1.0,
+         1.0,  1.0, 0.0,  1.0, 0.0,
+         1.0, -1.0, 0.0,  1.0, 1.0,
+    ];
+    let vb = b
+        .create_vertex_buffer(
+            &VertexBufferDesc {
+                layout,
+                vertex_count: 4,
+                usage: BufferUsage::Static,
+            },
+            Some(bytemuck_bytes(&vertices)),
+        )
+        .unwrap();
+    let indices: Vec<u8> = [0u16, 1, 2, 3]
+        .iter()
+        .flat_map(|i| i.to_le_bytes())
+        .collect();
+    let ib = b
+        .create_index_buffer(
+            &IndexBufferDesc {
+                format: IndexFormat::U16,
+                index_count: 4,
+                usage: BufferUsage::Static,
+            },
+            Some(&indices),
+        )
+        .unwrap();
+    b.set_material(
+        MaterialId(1),
+        &MaterialDesc {
+            blend: BlendMode::Translucent,
+            double_sided: true,
+            ..MaterialDesc::default()
+        },
+    )
+    .unwrap();
+    b.begin_frame(&view()).unwrap();
+    b.draw(&DrawCall {
+        topology: Topology::TriangleStrip,
+        geometry: Geometry::Indexed {
+            buffer: ib,
+            first: 0,
+            count: 4,
+            base_vertex: 0,
+        },
+        ..draw(vb, ib, 1, Mat4::from_scale(Vec3::splat(0.5)))
+    })
+    .unwrap();
+    b.end_frame().unwrap();
+    let rgba = b.read_pixels().unwrap();
+    assert_ne!(
+        pixel(&rgba, 32, 32),
+        [0, 0, 255, 255],
+        "middle is still sky"
+    );
+}
+
+/// A draw's tint multiplies its surface's colour.
+#[test]
+fn a_tint_colours_the_draw() {
+    let Some(mut b) = backend() else { return };
+    let (vb, ib) = quad(&mut b);
+    b.set_material(
+        MaterialId(1),
+        &MaterialDesc {
+            lit: false,
+            ..MaterialDesc::default()
+        },
+    )
+    .unwrap();
+    b.begin_frame(&view()).unwrap();
+    b.draw(&DrawCall {
+        tint: [1.0, 0.0, 0.0, 1.0],
+        ..draw(vb, ib, 1, Mat4::from_scale(Vec3::splat(0.2)))
+    })
+    .unwrap();
+    b.end_frame().unwrap();
+    let rgba = b.read_pixels().unwrap();
+    assert_eq!(pixel(&rgba, 32, 32), [255, 0, 0, 255]);
+}
+
+/// Draws share one bind group and find their uniforms by instance: a
+/// plain draw after an instanced one still gets its own matrix, and the
+/// instanced one each of its instances.
+#[test]
+fn draws_after_instanced_ones_keep_their_own_uniforms() {
+    let Some(mut b) = backend() else { return };
+    let (vb, ib) = quad(&mut b);
+    b.set_material(
+        MaterialId(1),
+        &MaterialDesc {
+            lit: false,
+            ..MaterialDesc::default()
+        },
+    )
+    .unwrap();
+    b.begin_frame(&view()).unwrap();
+    let small = Mat4::from_scale(Vec3::splat(0.2));
+    let instances = b
+        .set_skin(&[
+            Mat4::from_translation(Vec3::new(-1.0, 0.0, 0.0)) * small,
+            Mat4::from_translation(Vec3::new(1.0, 0.0, 0.0)) * small,
+        ])
+        .unwrap();
+    b.draw(&DrawCall {
+        instances: Some(instances),
+        uv_offset: [0.0; 2],
+        tint: [1.0; 4],
+        beams_lit: false,
+        ..draw(vb, ib, 1, Mat4::IDENTITY)
+    })
+    .unwrap();
+    // A small quad in the middle, drawn on its own after them.
+    b.draw(&draw(vb, ib, 1, small)).unwrap();
+    b.end_frame().unwrap();
+    let rgba = b.read_pixels().unwrap();
+    let (white, sky) = ([255; 4], [0, 0, 255, 255]);
+    assert_eq!(pixel(&rgba, 32, 32), white, "middle");
+    assert_eq!(pixel(&rgba, 14, 32), white, "left");
+    assert_eq!(pixel(&rgba, 50, 32), white, "right");
+    assert_eq!(pixel(&rgba, 23, 32), sky, "between left and middle");
 }
 
 #[test]
@@ -675,6 +815,7 @@ fn the_game_tone_map_adapts_to_its_own_average() {
         max_key: 0.85,
         // None of the last frame kept: each frame adapts all the way.
         retention: 0.0,
+        speed: 30.0,
         contrast_limit: 0.145,
         contrast: 1.95,
         log_average: false,

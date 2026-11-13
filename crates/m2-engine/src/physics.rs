@@ -31,13 +31,16 @@ use rapier3d::control::{
     KinematicCharacterController, WheelTuning,
 };
 
-use crate::collision_layers::{self, layer_of, seen_by};
+use crate::collision_layers::{self, Preset, layer_of, seen_by};
 use crate::tuning::{
     BikeTuning, BoatFloat, BoatTuning, EngineTuning, FlightTuning, Gearbox, Handling, Springs,
     TankTuning, Tyres,
 };
 use crate::vehicle::VehicleSpec;
 use rapier3d::prelude as r;
+
+mod winch_cable;
+pub use winch_cable::{CARGO_TILT, CableId, HALF_LINK, LINK_MASS, LINK_RADIUS, MIN_LINKS_TO_HOOK};
 
 /// Highest step a character walks up without jumping, metres.
 pub const STEP_HEIGHT: f32 = 0.5;
@@ -177,6 +180,34 @@ pub struct CollisionShape {
     pub path: PathSolid,
     /// Its shapes no vehicle meets ([`Ghost`]), if it has both kinds.
     pub ghost: Option<Ghost>,
+    /// The box round all its `PHY2` shapes on parts it shows intact,
+    /// leaves and shapes nothing meets included (model space), as a path
+    /// search sizes it up. From the 360 code: an obstacle's box is its
+    /// entity's (0x821861B0), the union of each of its live bodies' shape
+    /// boxes (0x82182E90: every body with a world body, +0x38; bodies on
+    /// hidden parts are dropped when it is rebuilt, 0x82152780). `None`
+    /// without `PHY2` shapes.
+    pub entity_box: Option<(Vec3, Vec3)>,
+    /// Its standing shapes as laid out, to split them by another preset
+    /// ([`CollisionShape::as_preset`]); `None` without `PHY2` shapes.
+    pub source: Option<Arc<ShapeSource>>,
+    /// Its leaves, as the world's queries meet them, if it shows any. From
+    /// the 360 code: a `PHY2` leaf shape (its class [`FOLIAGE`](m2_assets::physics::FOLIAGE);
+    /// flags bit 3 on a shape that isn't a mesh) takes its preset's seventh
+    /// layer (0x8216C308): 19 for a building or a prop, which the path
+    /// search's sweeps ([`PATH_MASK`](collision_layers::PATH_MASK),
+    /// 0x822E6FD8) and the gunners' sight lines
+    /// ([`SIGHT_MASK`](collision_layers::SIGHT_MASK), 0x822C95D8) both see.
+    /// So an AI's path goes round a bush and its gunner doesn't see through
+    /// one.
+    ///
+    /// In the alpha they stand as a sensor that only those two kinds of query
+    /// meet (its `LEAVES` group): no body bumps into them, people walk through them,
+    /// shots pass. (The 360's filter has layer 19 meet a vehicle's layers 8, 9
+    /// and 11; what a vehicle then does in a bush isn't traced, and the alpha
+    /// keeps driving through it.) A loose prop's leaves would take layer 18
+    /// (its preset has no seventh layer); they are left out.
+    pub leaves: Option<r::SharedShape>,
 }
 
 /// Shapes of a model that no vehicle meets and the world's queries still
@@ -231,10 +262,84 @@ impl PathSolid {
     }
 }
 
-/// Whether a vehicle meets `PHY2` shape `s` of a building's model
-/// ([`Ghost`]).
-fn meets_vehicles(s: &m2_assets::physics::Shape) -> bool {
-    collision_layers::meets_vehicles(layer_of(&collision_layers::BUILDING, s.flags(), s.kind()))
+/// One standing `PHY2` shape of a model ([`ShapeSource`]): its flags and
+/// kind, which give its layer, and its run of the triangles.
+#[derive(Clone, Debug, PartialEq)]
+struct ShapeRun {
+    flags: u32,
+    kind: u32,
+    triangles: std::ops::Range<u32>,
+}
+
+/// A model's standing `PHY2` shapes as [`CollisionShape::for_model`] laid
+/// them out, kept to split them again by another preset
+/// ([`CollisionShape::as_preset`]): their points (model space), triangles
+/// and runs.
+#[derive(Clone, Debug)]
+pub struct ShapeSource {
+    vertices: Vec<Vec3>,
+    triangles: Vec<[u32; 3]>,
+    runs: Vec<ShapeRun>,
+}
+
+impl ShapeSource {
+    /// Bytes it keeps (its points, triangles and runs).
+    pub fn bytes(&self) -> usize {
+        self.vertices.len() * std::mem::size_of::<Vec3>()
+            + self.triangles.len() * 12
+            + self.runs.len() * std::mem::size_of::<ShapeRun>()
+    }
+}
+
+/// A model's shapes split by what meets them under a preset.
+#[derive(Default)]
+struct Split {
+    /// What vehicles meet, and of it what a path search meets (and
+    /// whether some is left out).
+    solid: Vec<[u32; 3]>,
+    path: Vec<[u32; 3]>,
+    path_part: bool,
+    /// What no vehicle meets ([`Ghost`]), and of it what a path search
+    /// meets.
+    ghost: Vec<[u32; 3]>,
+    ghost_path: Vec<[u32; 3]>,
+    ghost_part: bool,
+}
+
+/// Splits `runs` of `triangles` by `preset`'s layers: a shape on a layer
+/// a vehicle meets is solid, the rest ghosts; each is in a path search's
+/// way when [`PATH_MASK`](collision_layers::PATH_MASK) has its layer. A
+/// model of no shape a vehicle meets keeps them all solid (none such is
+/// known among the buildings; kept as before).
+fn split_shapes(runs: &[ShapeRun], triangles: &[[u32; 3]], preset: Preset) -> Split {
+    let mut out = Split::default();
+    for r in runs {
+        let layer = layer_of(preset.layers(), r.flags, r.kind);
+        let tris = &triangles[r.triangles.start as usize..r.triangles.end as usize];
+        let seen = seen_by(collision_layers::PATH_MASK, layer);
+        if collision_layers::meets_vehicles(layer) {
+            if seen {
+                out.path.extend_from_slice(tris);
+            } else {
+                out.path_part = true;
+            }
+            out.solid.extend_from_slice(tris);
+        } else {
+            if seen {
+                out.ghost_path.extend_from_slice(tris);
+            } else {
+                out.ghost_part = true;
+            }
+            out.ghost.extend_from_slice(tris);
+        }
+    }
+    if out.solid.is_empty() {
+        out.solid = std::mem::take(&mut out.ghost);
+        out.path_part |= out.ghost_part;
+        out.path = std::mem::take(&mut out.ghost_path);
+        out.ghost_part = false;
+    }
+    out
 }
 
 /// Whether a path search meets `PHY2` shape `s` of a building's model.
@@ -787,6 +892,20 @@ pub(crate) fn body_shapes_showing(
     body: usize,
     wrecked: bool,
 ) -> (Vec<Vec<Vec3>>, bool) {
+    let (shapes, hull) = body_shapes_seen(model, p, body, wrecked);
+    (shapes.into_iter().map(|(v, _)| v).collect(), hull)
+}
+
+/// [`body_shapes_showing`], each shape with whether a path search sees
+/// it: its layer as a vehicle's ([`collision_layers::VEHICLE`], by its
+/// flags, 0x8216C308) in [`PATH_MASK`](collision_layers::PATH_MASK). A
+/// car's flags 0x28 hull shape (layer 11) isn't.
+pub(crate) fn body_shapes_seen(
+    model: &Model<'_>,
+    p: &Phy2,
+    body: usize,
+    wrecked: bool,
+) -> (Vec<(Vec<Vec3>, bool)>, bool) {
     let hidden = model
         .states
         .as_ref()
@@ -808,11 +927,17 @@ pub(crate) fn body_shapes_showing(
                 .unwrap_or(Mat4::IDENTITY)
                 * p.shape_place(k).map_or(Mat4::IDENTITY, place);
             let (v, _) = s.geometry.triangles(s.radius);
-            v.iter()
+            let seen = seen_by(
+                collision_layers::PATH_MASK,
+                layer_of(&collision_layers::VEHICLE, s.flags(), s.kind()),
+            );
+            let points: Vec<Vec3> = v
+                .iter()
                 .map(|&x| to_model.transform_point3(Vec3::from(x)))
-                .collect()
+                .collect();
+            (points, seen)
         })
-        .filter(|v: &Vec<Vec3>| v.len() >= 4)
+        .filter(|(v, _)| v.len() >= 4)
         .collect();
     (shapes, hull)
 }
@@ -856,6 +981,9 @@ impl CollisionShape {
             surfaces: Arc::new([]),
             path: PathSolid::All,
             ghost: None,
+            entity_box: None,
+            source: None,
+            leaves: None,
         }
     }
 
@@ -900,6 +1028,9 @@ impl CollisionShape {
             surfaces: runs.into(),
             path: PathSolid::All,
             ghost: None,
+            entity_box: None,
+            source: None,
+            leaves: None,
         })
     }
 
@@ -923,6 +1054,45 @@ impl CollisionShape {
     pub fn bounds(&self) -> (Vec3, Vec3) {
         let b = self.shape.compute_local_aabb();
         (vec3(b.mins), vec3(b.maxs))
+    }
+
+    /// This model's collision as a body of `preset` takes it: its standing
+    /// shapes split again by that preset's layers (what vehicles meet,
+    /// what a path search meets; [`split_shapes`]), all else as it is.
+    /// `None` when it is the same: the building preset (which
+    /// [`for_model`](Self::for_model) splits by), or no `PHY2` shapes.
+    pub fn as_preset(&self, preset: Preset) -> Option<Self> {
+        let src = self
+            .source
+            .as_ref()
+            .filter(|_| preset != Preset::Building)?;
+        let split = split_shapes(&src.runs, &src.triangles, preset);
+        let surface = self.surfaces.first().map_or(0, |r| r.1);
+        let surfaces = vec![surface; split.solid.len()];
+        let mut shape = Self::mesh_of(&src.vertices, &split.solid, &surfaces)?;
+        if split.path_part {
+            shape.path = PathSolid::of(&src.vertices, &split.path);
+        }
+        if let Some(g) = Self::mesh(&src.vertices, &split.ghost) {
+            shape.ghost = Some(Ghost {
+                shape: g.shape,
+                path: if split.ghost_part {
+                    PathSolid::of(&src.vertices, &split.ghost_path)
+                } else {
+                    PathSolid::All
+                },
+            });
+        }
+        Some(Self {
+            stand_in: self.stand_in,
+            loose: self.loose.clone(),
+            whole: self.whole.clone(),
+            material: self.material,
+            entity_box: self.entity_box,
+            source: self.source.clone(),
+            leaves: self.leaves.clone().filter(|_| preset != Preset::LooseProp),
+            ..shape
+        })
     }
 
     /// A model's collision in model space: its `PHY2` shapes if `phy2` is
@@ -992,6 +1162,13 @@ impl CollisionShape {
         let mut ghost_triangles = Vec::new();
         let mut ghost_path = Vec::new();
         let mut ghost_part = false;
+        let mut entity_box: Option<(Vec3, Vec3)> = None;
+        // Each standing shape's flags, kind and triangles, kept for the
+        // other presets ([CollisionShape::as_preset]).
+        let mut runs: Vec<ShapeRun> = Vec::new();
+        let mut shape_triangles: Vec<[u32; 3]> = Vec::new();
+        // Its leaves' triangles ([`CollisionShape::leaves`]).
+        let mut leaf_triangles: Vec<[u32; 3]> = Vec::new();
         let mut loose = None;
         let mut material = None;
         // Shapes of its own, whether or not any stands in the way: no
@@ -1011,7 +1188,11 @@ impl CollisionShape {
                 .map(|s| s.hidden(&model.nodes, false))
                 .unwrap_or_default();
             for (k, s) in p.shapes.iter().enumerate() {
-                if !standing(&p, k, &hidden) {
+                let shown = p
+                    .parts
+                    .get(s.part)
+                    .is_some_and(|q| !hidden.get(q.node as usize).copied().unwrap_or(false));
+                if !shown {
                     continue;
                 }
                 // A shape sits at its part's place in its body node's
@@ -1023,32 +1204,39 @@ impl CollisionShape {
                     .unwrap_or(Mat4::IDENTITY);
                 let to_model = node * p.shape_place(k).map_or(Mat4::IDENTITY, place);
                 let (v, t) = s.geometry.triangles(s.radius);
-                let first = vertices.len() as u32;
-                vertices.extend(v.iter().map(|&x| to_model.transform_point3(Vec3::from(x))));
-                let placed = t.iter().map(|t| t.map(|i| first + i));
-                if !meets_vehicles(s) {
-                    if in_ais_way(s) {
-                        ghost_path.extend(placed.clone());
-                    } else {
-                        ghost_part = true;
+                for &x in &v {
+                    let x = to_model.transform_point3(Vec3::from(x));
+                    let (lo, hi) = entity_box.get_or_insert((x, x));
+                    *lo = lo.min(x);
+                    *hi = hi.max(x);
+                }
+                if !standing(&p, k, &hidden) {
+                    // Shown but not standing: leaves ([`CollisionShape::leaves`]).
+                    if s.is_foliage() {
+                        let first = vertices.len() as u32;
+                        vertices
+                            .extend(v.iter().map(|&x| to_model.transform_point3(Vec3::from(x))));
+                        leaf_triangles.extend(t.iter().map(|t| t.map(|i| first + i)));
                     }
-                    ghost_triangles.extend(placed);
                     continue;
                 }
-                if in_ais_way(s) {
-                    path_triangles.extend(placed.clone());
-                } else {
-                    path_part = true;
-                }
-                triangles.extend(placed);
+                let first = vertices.len() as u32;
+                vertices.extend(v.iter().map(|&x| to_model.transform_point3(Vec3::from(x))));
+                let from = shape_triangles.len() as u32;
+                shape_triangles.extend(t.iter().map(|t| t.map(|i| first + i)));
+                runs.push(ShapeRun {
+                    flags: s.flags(),
+                    kind: s.kind(),
+                    triangles: from..shape_triangles.len() as u32,
+                });
             }
-            // A model of no shape a vehicle meets keeps them all solid
-            // (none such is known; kept as before).
-            if triangles.is_empty() {
-                triangles.append(&mut ghost_triangles);
-                path_part |= ghost_part;
-                path_triangles.append(&mut ghost_path);
-            }
+            let split = split_shapes(&runs, &shape_triangles, Preset::Building);
+            triangles = split.solid;
+            path_triangles = split.path;
+            path_part = split.path_part;
+            ghost_triangles = split.ghost;
+            ghost_path = split.ghost_path;
+            ghost_part = split.ghost_part;
         }
         let stand_in = !shaped && triangles.is_empty();
         if stand_in {
@@ -1126,6 +1314,7 @@ impl CollisionShape {
         if path_part {
             shape.path = PathSolid::of(&vertices, &path_triangles);
         }
+        shape.entity_box = entity_box.filter(|(lo, hi)| lo.is_finite() && hi.is_finite());
         if let Some(g) = Self::mesh(&vertices, &ghost_triangles) {
             shape.ghost = Some(Ghost {
                 shape: g.shape,
@@ -1135,6 +1324,14 @@ impl CollisionShape {
                     PathSolid::All
                 },
             });
+        }
+        shape.leaves = Self::mesh(&vertices, &leaf_triangles).map(|m| m.shape);
+        if !runs.is_empty() {
+            shape.source = Some(Arc::new(ShapeSource {
+                vertices,
+                triangles: shape_triangles,
+                runs,
+            }));
         }
         let whole = match (&loose, sub_object) {
             (None, None) => Loose::whole(model, shape.bounds()).map(Arc::new),
@@ -1870,6 +2067,19 @@ struct BikeFooting {
     brake: f32,
 }
 
+/// How many physics steps a frame of `dt` seconds takes, and how long
+/// each is (from the 360 code, 0x82152E20): none for a frame under 1 ms
+/// (0x820F8BE4), else `dt x 59.999996 + 0.99` (0x820F8BAC, 0x82B7D824)
+/// truncated and held to 1..=3, sharing the frame equally. So up to
+/// 1/60 s a frame takes one step; 1/30 s, two of 1/60; longer, three.
+pub fn frame_steps(dt: f32) -> (usize, f32) {
+    if dt.is_nan() || dt < 0.001 {
+        return (0, 0.0);
+    }
+    let n = ((dt * 59.999_996 + 0.99) as i32).clamp(1, 3) as usize;
+    (n, dt / n as f32)
+}
+
 /// A turret's own body and the hinge it turns on, as the 360 code builds
 /// them (0x82273F90, from the turret update 0x82275608): a hinge between
 /// the turret part's body and its parent's about the turret's up, its
@@ -2047,6 +2257,10 @@ const BED: r::Group = r::Group::GROUP_7;
 /// The collision group of a model's shapes no vehicle meets ([`Ghost`]):
 /// sensors, which every query sees but a wheel's look for the ground.
 const GHOST: r::Group = r::Group::GROUP_8;
+
+/// The collision group of a model's leaves ([`CollisionShape::leaves`]):
+/// sensors that only a path search's queries and AI sight lines see.
+const LEAVES: r::Group = r::Group::GROUP_9;
 
 /// A tracked vehicle's push at `s` of its top speed, of its most: its
 /// curve's points (of its top speed, of its most) in a line between, as
@@ -3000,6 +3214,22 @@ fn solid<'a>() -> r::QueryFilter<'a> {
         r::Group::ALL
             .difference(RAGDOLL)
             .difference(RUBBLE)
+            .difference(BED)
+            .difference(LEAVES),
+        r::InteractionTestMode::And,
+    ))
+}
+
+/// What a path search's queries and AI sight lines see: what [`solid`]
+/// does, and leaves ([`CollisionShape::leaves`]: layer 19 is in
+/// [`PATH_MASK`](collision_layers::PATH_MASK) and
+/// [`SIGHT_MASK`](collision_layers::SIGHT_MASK)).
+fn paths<'a>() -> r::QueryFilter<'a> {
+    r::QueryFilter::default().groups(r::InteractionGroups::new(
+        r::Group::ALL,
+        r::Group::ALL
+            .difference(RAGDOLL)
+            .difference(RUBBLE)
             .difference(BED),
         r::InteractionTestMode::And,
     ))
@@ -3016,7 +3246,8 @@ fn ground<'a>() -> r::QueryFilter<'a> {
             .difference(RUBBLE)
             .difference(CARGO)
             .difference(BED)
-            .difference(GHOST),
+            .difference(GHOST)
+            .difference(LEAVES),
         r::InteractionTestMode::And,
     ))
 }
@@ -3057,6 +3288,16 @@ pub struct Physics {
     path_solid: HashMap<r::ColliderHandle, PathSolid>,
     /// Each static's shapes no vehicle meets ([Ghost]).
     ghosts: HashMap<StaticKey, r::ColliderHandle>,
+    /// Each static's box as a path search sizes it up ([CollisionShape::entity_box]).
+    boxes: HashMap<StaticKey, (Vec3, Vec3)>,
+    /// The pieces of one broken model ([`Physics::group_debris`]): each
+    /// piece's body to the model's place and all its pieces' bodies.
+    debris_groups: HashMap<r::RigidBodyHandle, (r::Pose, Arc<[r::RigidBodyHandle]>)>,
+    /// Each static's leaves ([`CollisionShape::leaves`]).
+    leaf_colliders: HashMap<StaticKey, r::ColliderHandle>,
+    /// Models' collision split by a preset other than the building's
+    /// ([`Physics::add_static_as`]), by their source and preset.
+    preset_shapes: HashMap<(usize, Preset), Option<CollisionShape>>,
     controller: KinematicCharacterController,
     vehicles: Vec<Option<VehicleBody>>,
     ragdolls: Vec<Option<Ragdoll>>,
@@ -3070,6 +3311,8 @@ pub struct Physics {
     /// How long it has run, seconds: the game's clock its helicopters'
     /// turbulence reads ([`turbulence`]).
     time: f32,
+    /// Winches' cables ([`winch_cable`]).
+    cables: Vec<Option<winch_cable::Cable>>,
 }
 
 /// A loose prop's piece in the physics world ([`Physics::add_debris`]).
@@ -3121,6 +3364,10 @@ impl Physics {
             surfaces: HashMap::new(),
             path_solid: HashMap::new(),
             ghosts: HashMap::new(),
+            boxes: HashMap::new(),
+            debris_groups: HashMap::new(),
+            preset_shapes: HashMap::new(),
+            leaf_colliders: HashMap::new(),
             controller,
             vehicles: Vec::new(),
             ragdolls: Vec::new(),
@@ -3128,6 +3375,7 @@ impl Physics {
             water: None,
             inland: None,
             time: 0.0,
+            cables: Vec::new(),
         }
     }
 
@@ -3184,6 +3432,9 @@ impl Physics {
         if !matches!(shape.path, PathSolid::All) {
             self.path_solid.insert(handle, shape.path.clone());
         }
+        if let Some(b) = shape.entity_box {
+            self.boxes.insert(key, b);
+        }
         if let Some(g) = &shape.ghost {
             let collider = r::ColliderBuilder::new(g.shape.clone())
                 .position(pose(position, rotation))
@@ -3201,12 +3452,55 @@ impl Physics {
                 self.path_solid.insert(h, g.path.clone());
             }
         }
+        if let Some(leaves) = &shape.leaves {
+            let collider = r::ColliderBuilder::new(leaves.clone())
+                .position(pose(position, rotation))
+                .sensor(true)
+                .collision_groups(r::InteractionGroups::new(
+                    LEAVES,
+                    r::Group::ALL,
+                    r::InteractionTestMode::And,
+                ))
+                .build();
+            let h = insert_collider(&mut self.world, collider, None);
+            self.leaf_colliders.insert(key, h);
+            self.keys.insert(h, key);
+        }
+    }
+
+    /// [`add_static`](Self::add_static) for a body of `preset` (its
+    /// template's, [`Preset`]): `shape` split by that preset's layers
+    /// ([`CollisionShape::as_preset`]), made once for each model and
+    /// preset and kept.
+    pub fn add_static_as(
+        &mut self,
+        key: StaticKey,
+        shape: &CollisionShape,
+        position: Vec3,
+        rotation: Quat,
+        preset: Preset,
+    ) {
+        let Some(src) = shape.source.as_ref().filter(|_| preset != Preset::Building) else {
+            return self.add_static(key, shape, position, rotation);
+        };
+        let id = (Arc::as_ptr(src) as usize, preset);
+        let made = self
+            .preset_shapes
+            .entry(id)
+            .or_insert_with(|| shape.as_preset(preset))
+            .clone();
+        match made {
+            Some(s) => self.add_static(key, &s, position, rotation),
+            None => self.add_static(key, shape, position, rotation),
+        }
     }
 
     pub fn remove_static(&mut self, key: StaticKey) {
         let ghost = self.ghosts.remove(&key);
+        let leaves = self.leaf_colliders.remove(&key);
+        self.boxes.remove(&key);
         if let Some(h) = self.statics.remove(&key) {
-            for h in std::iter::once(h).chain(ghost) {
+            for h in std::iter::once(h).chain(ghost).chain(leaves) {
                 self.keys.remove(&h);
                 self.surfaces.remove(&h);
                 self.path_solid.remove(&h);
@@ -3221,6 +3515,16 @@ impl Physics {
 
     pub fn static_count(&self) -> usize {
         self.statics.len()
+    }
+
+    /// Advances the simulation by a frame of `dt` seconds as the 360 does
+    /// (0x82152E20): in [`frame_steps`] steps of equal length, none for a
+    /// frame under a millisecond.
+    pub fn step_frame(&mut self, dt: f32) {
+        let (n, each) = frame_steps(dt);
+        for _ in 0..n {
+            self.step(each);
+        }
     }
 
     /// Advances the simulation by `dt` seconds (and brings colliders added
@@ -3709,7 +4013,52 @@ impl Physics {
         b.set_angvel(vector(Vec3::ZERO), true);
     }
 
+    /// Marks `pieces` as one broken model placed at `at` (world space;
+    /// scale ignored). From the 360 code: a model whose state changes has
+    /// its physics rebuilt for the parts it now shows (0x8222D2F0 sets the
+    /// state, 0x821C7648, and queues 0x82182CE8; 0x82152780 tears it down
+    /// and sets it up again, 0x821831B0), so its pieces stay bodies of its
+    /// entity, and a path search sizes any of them up by the box round all
+    /// of them in the entity's frame (0x821861B0, 0x82182E90).
+    pub fn group_debris(&mut self, pieces: &[DebrisId], at: Mat4) {
+        let (_, rotation, translation) = at.to_scale_rotation_translation();
+        let place = pose(translation, rotation.normalize());
+        let bodies: Arc<[r::RigidBodyHandle]> = pieces
+            .iter()
+            .filter_map(|d| self.debris.get(d.0).copied().flatten())
+            .collect();
+        for &b in bodies.iter() {
+            self.debris_groups.insert(b, (place, bodies.clone()));
+        }
+    }
+
+    /// The box round the pieces of the broken model `body` is one of
+    /// ([`group_debris`](Self::group_debris)), in its frame, and its place.
+    fn debris_box(&self, body: r::RigidBodyHandle) -> Option<(r::Pose, r::Aabb)> {
+        let (place, bodies) = self.debris_groups.get(&body)?;
+        let mut out: Option<r::Aabb> = None;
+        for &b in bodies.iter() {
+            let Some(rb) = self.world.bodies.get(b) else {
+                continue;
+            };
+            for &h in rb.colliders() {
+                let Some(c) = self.world.colliders.get(h) else {
+                    continue;
+                };
+                let a = c.shape().compute_aabb(&place.inv_mul(c.position()));
+                out = Some(match out {
+                    Some(o) => rapier3d::geometry::BoundingVolume::merged(&o, &a),
+                    None => a,
+                });
+            }
+        }
+        Some((*place, out?))
+    }
+
     pub fn remove_debris(&mut self, id: DebrisId) {
+        if let Some(h) = self.debris.get(id.0).copied().flatten() {
+            self.debris_groups.remove(&h);
+        }
         if let Some(h) = self.debris.get_mut(id.0).and_then(Option::take) {
             self.world.remove_body_with_colliders(h, true);
         }
@@ -3881,15 +4230,22 @@ impl Physics {
                 .ccd_enabled(true),
         );
         // A tank's, boat's or helicopter's: its chassis body's, as the 360
-        // code sets it (see [`chassis_mass`]). Without one (a model with no
-        // `PHY2` chassis, a car with no template): mass low in the hull and
-        // inertia a little above a solid box's, invented.
+        // code sets it (see [`chassis_mass`]). A car's is its template's
+        // `Mass`, else its `PHY2` chassis record's: the body builder keeps
+        // the record's mass when handed none above 0 (0x82182848). Only a
+        // model with neither (no template, no `PHY2` chassis) keeps the
+        // invented mass by kind. Its inertia, without a chassis body: a
+        // little above a solid box's, invented.
         let chassis = spec
             .chassis
             .as_ref()
             .filter(|_| spec.tracked || spec.wheels.is_empty())
             .map(|c| chassis_mass(c, spec.tuning.mass));
-        let m = chassis.map_or(spec.mass, |c| c.0);
+        let m = chassis
+            .map(|c| c.0)
+            .or(spec.tuning.mass)
+            .or(spec.chassis.map(|c| c.mass).filter(|m| *m > 0.0))
+            .unwrap_or(spec.mass);
         let size = half * 2.0;
         let inertia = Vec3::new(
             size.y * size.y + size.z * size.z,
@@ -3966,12 +4322,15 @@ impl Physics {
         // its points' convex hull (Havok's are convex but for a mesh one,
         // whose hull covers a little more). A model without them keeps the
         // invented box.
-        let shapes: Vec<r::SharedShape> = spec
+        // Each with whether a path search sees it
+        // ([`VehicleSpec::path_unseen`]).
+        let shapes: Vec<(r::SharedShape, bool)> = spec
             .shapes
             .iter()
-            .filter_map(|v| {
+            .enumerate()
+            .filter_map(|(k, v)| {
                 let points: Vec<_> = v.iter().map(|&p| vector(p)).collect();
-                r::SharedShape::convex_hull(&points)
+                r::SharedShape::convex_hull(&points).map(|s| (s, !spec.path_unseen.contains(&k)))
             })
             .collect();
         if shapes.is_empty() {
@@ -3983,7 +4342,7 @@ impl Physics {
                 .collision_groups(hull);
             insert_collider(&mut self.world, collider, Some(body));
         }
-        for (i, shape) in shapes.into_iter().enumerate() {
+        for (i, (shape, seen)) in shapes.into_iter().enumerate() {
             let collider = r::ColliderBuilder::new(shape)
                 .friction(hull_friction)
                 .friction_combine_rule(combine)
@@ -3997,7 +4356,10 @@ impl Physics {
             } else {
                 collider.density(0.0)
             };
-            insert_collider(&mut self.world, collider, Some(body));
+            let h = insert_collider(&mut self.world, collider, Some(body));
+            if !seen {
+                self.path_solid.insert(h, PathSolid::Nothing);
+            }
         }
         // The turret: a body of its own on a hinge about the up through
         // its mount when its parts have a mass ([`VehicleSpec::turret_mass`];
@@ -4300,6 +4662,11 @@ impl Physics {
                 self.world.remove_body_with_colliders(h.body, true);
                 if let Some(g) = &h.gun {
                     self.world.remove_body_with_colliders(g.body, true);
+                }
+            }
+            if let Some(b) = self.world.bodies.get(v.controller.chassis) {
+                for h in b.colliders() {
+                    self.path_solid.remove(h);
                 }
             }
             self.world
@@ -4854,6 +5221,44 @@ impl Physics {
     pub fn helicopter_airborne(&self, id: VehicleId) -> Option<bool> {
         let v = self.vehicles.get(id.0).and_then(Option::as_ref)?;
         v.rotor.as_ref().map(|r| r.state.ground <= 0.5)
+    }
+
+    /// Whether a vehicle stands on the ground as the 360's
+    /// `ObjectIsGrounded` test has it (0x82354AE8, by its physics kind):
+    /// a helicopter once on something over half a second (its rotor's
+    /// ground time, the 360's +0x140 object's +0x4C, over 0.5); a car
+    /// (`_CarPhysicsV2`, kind 2: its vtable +0x134, 0x82189A68) when a
+    /// wheel touches this step (0x8219C338 counts the wheels whose contact
+    /// timer, +0x0, 0x8219F510 just set back to 0.4 for a wheel with
+    /// contacts, +0x34; here a wheel's ray in contact); anything else
+    /// (tanks, boats, jets) always. `None` for no vehicle.
+    pub fn vehicle_grounded(&self, id: VehicleId, car: bool) -> Option<bool> {
+        let v = self.vehicles.get(id.0).and_then(Option::as_ref)?;
+        if let Some(r) = v.rotor.as_ref() {
+            return Some(r.state.ground > 0.5);
+        }
+        if !car {
+            return Some(true);
+        }
+        Some(
+            v.controller
+                .wheels()
+                .iter()
+                .any(|w| w.raycast_info().is_in_contact),
+        )
+    }
+
+    /// `Vehicle.IsFlipped` (0x82348358, the physics object's vtable
+    /// +0x9C): only a car flips (0x82189A00: its up axis's world height
+    /// under 0.5, 0x820D9EDC, and no wheel touching, as
+    /// [`vehicle_grounded`](Self::vehicle_grounded)); boats, helicopters
+    /// and tanks never (0x828280B0). `None` for no vehicle.
+    pub fn vehicle_flipped(&self, id: VehicleId, car: bool) -> Option<bool> {
+        let up = self
+            .vehicle_transform(id)?
+            .transform_vector3(Vec3::Y)
+            .normalize_or_zero();
+        Some(car && up.y < 0.5 && !self.vehicle_grounded(id, true)?)
     }
 
     /// Hands a helicopter's stick to an AI (`true`) or back to the
@@ -5495,6 +5900,49 @@ impl Physics {
         }
     }
 
+    /// Shoves a vehicle through its centre of mass: `impulse` (kg m/s),
+    /// world space, on its chassis body.
+    ///
+    /// From the 360 code: a vehicle's physics (car, tank, helicopter and
+    /// boat alike, vtable +0x10 0x82181818) hands the push to its first
+    /// body (0x8216DCC8), which takes it as a linear impulse with no turn
+    /// (0x8262AB60); [`push_vehicle`](Self::push_vehicle) is the same at a
+    /// point (+0x14 0x82181858, 0x8216DD38). Its first body is its
+    /// chassis ([`crate::vehicle::CHASSIS`]).
+    pub fn impulse_vehicle(&mut self, id: VehicleId, impulse: Vec3) {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
+            body.apply_impulse(vector(impulse), true);
+        }
+    }
+
+    /// A vehicle's mass as its physics reports it (`Object.GetMass`), kg:
+    /// its bodies' masses together (chassis, turret and gun), or 0 while
+    /// any of them does not move (held, [`hold_vehicle`](Self::hold_vehicle)).
+    ///
+    /// From the 360 code: a vehicle's physics (car, tank, helicopter and
+    /// boat alike, vtable +0x60 0x82182418) sums its bodies' masses, each
+    /// one over its inverse mass (0x8262C120), and answers 0 at the first
+    /// body whose inverse mass is 0.
+    pub fn vehicle_mass(&self, id: VehicleId) -> Option<f32> {
+        let v = self.vehicles.get(id.0)?.as_ref()?;
+        let hinge = v.hinge.as_ref();
+        let bodies = std::iter::once(v.controller.chassis)
+            .chain(hinge.map(|h| h.body))
+            .chain(hinge.and_then(|h| h.gun.as_ref()).map(|g| g.body));
+        let mut sum = 0.0;
+        for handle in bodies {
+            let body = self.world.bodies.get(handle)?;
+            if !body.is_dynamic() || body.mass() <= 0.0 {
+                return Some(0.0);
+            }
+            sum += body.mass();
+        }
+        Some(sum)
+    }
+
     /// Lets a skeleton go limp: `parents` and `nodes` (world space, as
     /// posed when it went) give its bones, and every limb starts moving at
     /// `velocity`. Limbs are capsules along bones from
@@ -5928,7 +6376,37 @@ impl Physics {
                 && !matches!(self.path_solid.get(&h), Some(PathSolid::Nothing))
                 && !past.contains(&h)
         };
-        f(solid().predicate(&keep))
+        f(paths().predicate(&keep))
+    }
+
+    /// Whether nothing that keeps a road vehicle from coming out is in the
+    /// box from `lo` to `hi` ([`crate::road_population::spawn_box`]): no
+    /// moving body but debris (sensors aside), and no static `blocks` says
+    /// is a prop. From the 360 code: 0x82153B30 asks its world's
+    /// broadphase and goes by each owner's kind (its vtable's +0xE0): a
+    /// `_PropPhysics` (0, 0x828280B0, fixed or loose alike), a human (1,
+    /// 0x822A2F80), a car (2, 0x82225D30), a tank (3, 0x82799AA0), a
+    /// helicopter (4, 0x823B4D18), a jet (8, 0x82225AA8) or a boat (10,
+    /// 0x824258B8) keeps it; a `_BuildingPhysics` (6, 0x822F64D8), an
+    /// `EffectAiOccluder`'s stand-in box (7), a `Winch` (9) or kind 5 (not
+    /// identified) lets it by, and so does what falls outside its switch:
+    /// a `_DebrisPhysics` piece (14, 0x8218B648) and the ground (13).
+    pub fn box_clear(&self, lo: Vec3, hi: Vec3, blocks: impl Fn(StaticKey) -> bool) -> bool {
+        let middle = (lo + hi) * 0.5;
+        let cube = r::Cuboid::new(vector(((hi - lo) * 0.5).max(Vec3::splat(1e-3))));
+        let debris: Vec<r::RigidBodyHandle> = self.debris.iter().flatten().copied().collect();
+        let moves = |h: r::ColliderHandle, c: &r::Collider| match self.keys.get(&h) {
+            Some(&k) => blocks(k),
+            None => c.parent().is_none_or(|b| !debris.contains(&b)),
+        };
+        self.world
+            .intersect_shape(
+                pose(middle, Quat::IDENTITY),
+                &cube,
+                solid().exclude_sensors().predicate(&moves),
+            )
+            .next()
+            .is_none()
     }
 
     /// What stands fixed in the box from `lo` to `hi` (0x822ED248's
@@ -5998,6 +6476,27 @@ impl Physics {
             Some(PathSolid::Part(part)) => part.compute_local_aabb(),
             _ => c.shape().compute_local_aabb(),
         };
+        // A static's whole entity's box ([`CollisionShape::entity_box`]).
+        let b = match self.keys.get(&handle).and_then(|k| self.boxes.get(k)) {
+            Some(&(lo, hi)) => r::Aabb::new(vector(lo), vector(hi)),
+            None => b,
+        };
+        // A vehicle's: round all its bodies (hull, turret, gun), in its
+        // hull's frame, as the 360's entity box is (0x82182E90).
+        if let Some((p, b)) = c
+            .parent()
+            .and_then(|body| self.vehicle_box(body).or_else(|| self.debris_box(body)))
+        {
+            let (i, g) = handle.into_raw_parts();
+            return Some(crate::path_search::Obstacle {
+                point: vec3(p.translation),
+                id: (u64::from(g) << 32) | u64::from(i),
+                ground: false,
+                pose: (vec3(p.translation), Quat::from_array(p.rotation.to_array())),
+                min: vec3(b.mins),
+                max: vec3(b.maxs),
+            });
+        }
         let p = c.position();
         let (i, g) = handle.into_raw_parts();
         Some(crate::path_search::Obstacle {
@@ -6008,6 +6507,78 @@ impl Physics {
             min: vec3(b.mins),
             max: vec3(b.maxs),
         })
+    }
+
+    /// The vehicle whose body `body` is: its hull's pose, and the box round
+    /// all its bodies' colliders in the hull's frame.
+    fn vehicle_box(&self, body: r::RigidBodyHandle) -> Option<(r::Pose, r::Aabb)> {
+        let v = (0..self.vehicles.len())
+            .map(VehicleId)
+            .find(|&v| self.bodies_of(Some(v)).contains(&body))?;
+        let chassis = self.vehicles.get(v.0)?.as_ref()?.controller.chassis;
+        let pose = *self.world.bodies.get(chassis)?.position();
+        let mut out: Option<r::Aabb> = None;
+        for b in self.bodies_of(Some(v)) {
+            for &h in self.world.bodies.get(b)?.colliders() {
+                let c = self.world.colliders.get(h)?;
+                let local = pose.inv_mul(c.position());
+                let a = c.shape().compute_aabb(&local);
+                out = Some(match out {
+                    Some(o) => rapier3d::geometry::BoundingVolume::merged(&o, &a),
+                    None => a,
+                });
+            }
+        }
+        Some((pose, out?))
+    }
+
+    /// Whether the line from `from` to `to` is clear of what a path search
+    /// sees ([`PATH_MASK`](collision_layers::PATH_MASK)): `CarAttack`'s
+    /// check on its line to her (0x822ACB28 sweeps 0x82166958 with that
+    /// mask). As [`sweep_obstacle`](Self::sweep_obstacle) sees (leaves and
+    /// AI-only shapes, not a chain fence or a loose prop's solid shapes),
+    /// and the terrain. A line, where the 360 sweeps a thin box (its
+    /// size not ported).
+    pub fn path_line_clear(&self, from: Vec3, to: Vec3, skip: Option<VehicleId>) -> bool {
+        let d = to - from;
+        let len = d.length();
+        if len < 1e-4 {
+            return true;
+        }
+        if self
+            .sweep_obstacle(from, to, Vec3::splat(0.01), skip)
+            .is_some()
+        {
+            return false;
+        }
+        let ray = r::Ray::new(vector(from), vector(d / len));
+        let cell = |h: r::ColliderHandle, _: &r::Collider| {
+            matches!(self.keys.get(&h), Some(StaticKey::Cell(_)))
+        };
+        self.world
+            .query_pipeline_with_filter(solid().predicate(&cell))
+            .cast_ray(&ray, len, true)
+            .is_none()
+    }
+
+    /// Whether an AI gunner's sight line from `from` to `to` is clear
+    /// (0x822C95D8's rays, [`SIGHT_MASK`](collision_layers::SIGHT_MASK)):
+    /// as [`line_clear`](Self::line_clear), and leaves block it too
+    /// ([`CollisionShape::leaves`]).
+    pub fn sight_clear(&self, from: Vec3, to: Vec3, skip: Option<VehicleId>) -> bool {
+        let d = to - from;
+        let len = d.length();
+        if len < 1e-4 {
+            return true;
+        }
+        let ray = r::Ray::new(vector(from), vector(d / len));
+        let own = self.bodies_of(skip);
+        let keep =
+            |_: r::ColliderHandle, c: &r::Collider| c.parent().is_none_or(|p| !own.contains(&p));
+        self.world
+            .query_pipeline_with_filter(paths().predicate(&keep))
+            .cast_ray(&ray, len, true)
+            .is_none()
     }
 
     /// Whether the line from `from` to `to` meets nothing solid, passing
@@ -6116,6 +6687,25 @@ impl Physics {
         let (handle, hit) = self
             .world
             .query_pipeline_with_filter(solid())
+            .cast_ray_and_get_normal(&ray, max, true)?;
+        let key = self.keys.get(&handle).copied();
+        Some((hit.time_of_impact, vec3(hit.normal), key))
+    }
+
+    /// [`cast_ray_keyed`](Self::cast_ray_keyed) as an AI's line of fire
+    /// sees ([`SIGHT_MASK`](collision_layers::SIGHT_MASK): 0x822C95D8's
+    /// rays carry 0x223F6FDA): leaves block it too
+    /// ([`CollisionShape::leaves`]).
+    pub fn cast_ray_sight_keyed(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        max: f32,
+    ) -> Option<(f32, Vec3, Option<StaticKey>)> {
+        let ray = r::Ray::new(vector(origin), vector(direction.normalize_or_zero()));
+        let (handle, hit) = self
+            .world
+            .query_pipeline_with_filter(paths())
             .cast_ray_and_get_normal(&ray, max, true)?;
         let key = self.keys.get(&handle).copied();
         Some((hit.time_of_impact, vec3(hit.normal), key))
@@ -6313,6 +6903,32 @@ mod tests {
         assert_eq!(ai_wobble(3.0, 0.6), [0.0; 3]);
     }
 
+    // 0x82153B30: a building, the ground or debris lets a road vehicle
+    // come out in its box; a prop there doesn't.
+    #[test]
+    fn a_spawn_box_is_kept_by_props_not_by_buildings() {
+        let mut p = Physics::new();
+        let block = CollisionShape::cuboid(Vec3::new(3.0, 4.0, 3.0));
+        p.add_static(StaticKey::Cell(1), &block, Vec3::ZERO, Quat::IDENTITY);
+        for (k, x) in [(2, 20.0), (3, 60.0)] {
+            let at = Vec3::new(x, 0.0, 0.0);
+            p.add_static(StaticKey::Object(k), &block, at, Quat::IDENTITY);
+        }
+        let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.5), 30.0);
+        let at = Mat4::from_translation(Vec3::new(40.0, 1.0, 0.0));
+        p.add_debris(&piece, at, Vec3::ZERO, Vec3::ZERO);
+        p.step(DT);
+        // Object 3 is a fixed prop, object 2 a building.
+        let clear = |x: f32| {
+            let (lo, hi) = (Vec3::new(x - 2.0, 0.2, -1.0), Vec3::new(x + 2.0, 3.0, 1.0));
+            p.box_clear(lo, hi, |k| k == StaticKey::Object(3))
+        };
+        assert!(clear(0.0));
+        assert!(clear(20.0));
+        assert!(clear(40.0));
+        assert!(!clear(60.0));
+    }
+
     // What stands fixed in a boat's area, without the terrain.
     #[test]
     fn fixed_near_gives_placed_things_not_the_ground() {
@@ -6494,22 +7110,9 @@ mod tests {
         assert!((a - a1 * 0.5).abs() < 1e-6 && (b - b1 * 0.5).abs() < 1e-6);
     }
 
-    // A turret on its own body follows the angle asked on its hinge's
-    // motor (20 x the angle to go, a second; 0x82273F90): asked to move at
-    // 1 rad/s it keeps up a twentieth of a second behind, and turns the
-    // hull it sits on hardly at all.
-    #[test]
-    fn a_sleeping_gun_wakes_only_when_its_pitch_asked_moves_fast_enough() {
-        // 0x82275608: a sleeping gun's body is woken only when its pitch
-        // speed squared is over 0.005 (about 0.07 radians a second).
-        let mut p = Physics::new();
-        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
-        p.add_static(
-            StaticKey::Cell(1),
-            &ground,
-            Vec3::new(0.0, -1.0, 0.0),
-            Quat::IDENTITY,
-        );
+    /// A car with a turret and a gun on bodies of their own: chassis
+    /// 30 t, turret 3 t, gun 80 kg.
+    fn gun_tank() -> VehicleSpec {
         let cube = |lo: Vec3, hi: Vec3| {
             let mut v = Vec::new();
             for x in [lo.x, hi.x] {
@@ -6521,7 +7124,8 @@ mod tests {
             }
             v
         };
-        let spec = VehicleSpec {
+        VehicleSpec {
+            path_unseen: Default::default(),
             turret_shapes: vec![cube(Vec3::new(-1.0, 1.6, -1.0), Vec3::new(1.0, 2.4, 1.0))].into(),
             turret_mass: Some(crate::vehicle::Chassis {
                 mass: 3000.0,
@@ -6552,7 +7156,64 @@ mod tests {
                 ..car().tuning
             },
             ..car()
-        };
+        }
+    }
+
+    // A turret on its own body follows the angle asked on its hinge's
+    // motor (20 x the angle to go, a second; 0x82273F90): asked to move at
+    // 1 rad/s it keeps up a twentieth of a second behind, and turns the
+    // hull it sits on hardly at all.
+    #[test]
+    fn a_vehicle_s_mass_is_its_bodies_together_and_none_while_held() {
+        // 0x82182418: every body's mass summed; 0 once one does not move.
+        let mut p = Physics::new();
+        let id = p.add_vehicle(&gun_tank(), Vec3::new(0.0, 0.5, 0.0), 0.0);
+        let m = p.vehicle_mass(id).unwrap();
+        assert!((m - 33_080.0).abs() < 1.0, "{m}");
+        p.hold_vehicle(id, true);
+        assert_eq!(p.vehicle_mass(id), Some(0.0));
+        p.hold_vehicle(id, false);
+        assert!((p.vehicle_mass(id).unwrap() - 33_080.0).abs() < 1.0);
+        // A car alone: its chassis.
+        let alone = p.add_vehicle(&car(), Vec3::new(10.0, 0.5, 0.0), 0.0);
+        assert!((p.vehicle_mass(alone).unwrap() - car().mass).abs() < 1.0);
+        assert_eq!(p.vehicle_mass(VehicleId(99)), None);
+    }
+
+    #[test]
+    fn a_vehicle_shoved_through_its_centre_moves_without_turning() {
+        // 0x8216DCC8 -> 0x8262AB60: a linear impulse on the chassis body.
+        let mut p = Physics::new();
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 5.0, 0.0), 0.0);
+        let mass = p.vehicle_mass(id).unwrap();
+        let before = p.vehicle_velocity(id);
+        p.impulse_vehicle(id, Vec3::new(mass * 2.0, 0.0, 0.0));
+        let gained = p.vehicle_velocity(id) - before;
+        assert!((gained.x - 2.0).abs() < 1e-3, "{gained:?}");
+        assert!(p.vehicle_spin(id).length() < 1e-4);
+        // At a point off its centre it also turns.
+        let m = p.vehicle_transform(id).unwrap();
+        p.push_vehicle(
+            id,
+            Vec3::new(mass, 0.0, 0.0),
+            m.transform_point3(Vec3::new(0.0, 0.0, 2.0)),
+        );
+        assert!(p.vehicle_spin(id).length() > 1e-3);
+    }
+
+    #[test]
+    fn a_sleeping_gun_wakes_only_when_its_pitch_asked_moves_fast_enough() {
+        // 0x82275608: a sleeping gun's body is woken only when its pitch
+        // speed squared is over 0.005 (about 0.07 radians a second).
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let spec = gun_tank();
         let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.5, 0.0), 0.0);
         for _ in 0..60 {
             p.drive(id, VehicleControls::default());
@@ -6614,6 +7275,7 @@ mod tests {
             v
         };
         let spec = VehicleSpec {
+            path_unseen: Default::default(),
             turret_shapes: vec![cube(Vec3::new(-1.0, 1.6, -1.0), Vec3::new(1.0, 2.4, 1.0))].into(),
             turret_mass: Some(crate::vehicle::Chassis {
                 mass: 3000.0,
@@ -6707,6 +7369,7 @@ mod tests {
             }
         }
         let spec = VehicleSpec {
+            path_unseen: Default::default(),
             turret_shapes: vec![block].into(),
             turret_mass: Some(crate::vehicle::Chassis {
                 mass: 3000.0,
@@ -6759,6 +7422,35 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_is_stepped_as_the_360_steps_it() {
+        // 0x82152E20: n = trunc(dt x 59.999996 + 0.99) held to 1..=3.
+        assert_eq!(frame_steps(0.0005), (0, 0.0));
+        assert_eq!(frame_steps(1.0 / 60.0).0, 1);
+        assert_eq!(frame_steps(1.0 / 120.0), (1, 1.0 / 120.0));
+        let (n, each) = frame_steps(1.0 / 30.0);
+        assert_eq!(n, 2);
+        assert!((each - 1.0 / 60.0).abs() < 1e-7);
+        assert_eq!(frame_steps(0.02).0, 2);
+        assert_eq!(frame_steps(0.04).0, 3);
+        assert_eq!(frame_steps(0.2).0, 3);
+        // A frame of 1/30 s moves a falling body as two steps of 1/60 do.
+        let fall = |frame: bool| {
+            let mut p = Physics::new();
+            let id = p.add_vehicle(&car(), Vec3::new(0.0, 100.0, 0.0), 0.0);
+            for _ in 0..30 {
+                if frame {
+                    p.step_frame(1.0 / 30.0);
+                } else {
+                    p.step(1.0 / 60.0);
+                    p.step(1.0 / 60.0);
+                }
+            }
+            p.vehicle_transform(id).unwrap().w_axis.y
+        };
+        assert_eq!(fall(true), fall(false));
+    }
+
+    #[test]
     fn a_turret_on_its_own_body_turns_as_the_360_action_turns_it() {
         let mut p = Physics::new();
         let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
@@ -6777,6 +7469,7 @@ mod tests {
             }
         }
         let spec = VehicleSpec {
+            path_unseen: Default::default(),
             turret_shapes: vec![block].into(),
             turret_mass: Some(crate::vehicle::Chassis {
                 mass: 3000.0,
@@ -6830,6 +7523,92 @@ mod tests {
         assert!((heading(&p) - before).abs() < 0.05, "hull turned");
     }
 
+    // A vehicle's flags 0x28 hull shape (layer 11) is no path obstacle
+    // (0x822E6FD8's mask), its others are; the car still bumps into both.
+    #[test]
+    fn a_path_sweep_misses_a_vehicles_shape_on_a_layer_it_doesnt_see() {
+        let block = |x: f32| {
+            let mut v = Vec::new();
+            for dx in [-0.5, 0.5] {
+                for y in [0.5, 1.5] {
+                    for z in [-1.0, 1.0] {
+                        v.push(Vec3::new(x + dx, y, z));
+                    }
+                }
+            }
+            v
+        };
+        let spec = VehicleSpec {
+            shapes: vec![block(0.0), block(6.0)].into(),
+            path_unseen: vec![1].into(),
+            ..car()
+        };
+        let mut p = Physics::new();
+        let id = p.add_vehicle(&spec, Vec3::ZERO, 0.0);
+        p.hold_vehicle(id, true);
+        p.step(DT);
+        let at = p.vehicle_transform(id).unwrap();
+        let across = |x: f32| {
+            let x = at.transform_point3(Vec3::new(x, 1.0, 0.0));
+            p.sweep_obstacle(
+                x - Vec3::Z * 5.0,
+                x + Vec3::Z * 5.0,
+                Vec3::new(0.1, 0.1, 0.05),
+                None,
+            )
+        };
+        assert!(across(0.0).is_some(), "the seen shape is met");
+        assert!(across(6.0).is_none(), "the unseen one isn't");
+        let ray = |x: f32| {
+            let x = at.transform_point3(Vec3::new(x, 1.0, 0.0));
+            p.cast_ray(x - Vec3::Z * 5.0, Vec3::Z, 10.0)
+        };
+        assert!(ray(6.0).is_some(), "but it is still solid");
+    }
+
+    // A path search sizes a vehicle up by all its bodies (0x82182E90): a
+    // sweep low past the hull meets it, and the box takes in the turret's
+    // block up to 4 m, turned a quarter left out to its left.
+    #[test]
+    fn a_vehicles_path_box_takes_in_its_turret() {
+        let mut p = Physics::new();
+        let mut block = Vec::new();
+        for x in [-0.5, 0.5] {
+            for y in [3.0, 4.0] {
+                for z in [1.0, 3.0] {
+                    block.push(Vec3::new(x, y, z));
+                }
+            }
+        }
+        let spec = VehicleSpec {
+            path_unseen: Default::default(),
+            turret_shapes: vec![block].into(),
+            pivot: Some(Vec3::new(0.0, 3.0, 0.0)),
+            ..car()
+        };
+        let id = p.add_vehicle(&spec, Vec3::ZERO, 0.0);
+        p.hold_vehicle(id, true);
+        p.turn_turret(id, std::f32::consts::FRAC_PI_2);
+        p.step(DT);
+        let hull = p.vehicle_transform(id).unwrap();
+        let low = hull.transform_point3(Vec3::Y * 0.5).y;
+        let o = p
+            .sweep_obstacle(
+                Vec3::new(-10.0, low, 0.0),
+                Vec3::new(10.0, low, 0.0),
+                Vec3::new(0.2, 0.2, 0.05),
+                None,
+            )
+            .expect("meets the hull");
+        assert!(o.max.y > 3.9, "box top {}", o.max.y);
+        assert!(
+            o.max.x > 2.9 || o.min.x < -2.9,
+            "box {} .. {}",
+            o.min,
+            o.max
+        );
+    }
+
     // A turret's colliders turn with it ([`Physics::turn_turret`]): a
     // block on its front, turned a quarter left, is hit from above on its
     // left and no longer ahead.
@@ -6845,6 +7624,7 @@ mod tests {
             }
         }
         let spec = VehicleSpec {
+            path_unseen: Default::default(),
             turret_shapes: vec![block].into(),
             pivot: Some(Vec3::new(0.0, 3.0, 0.0)),
             ..car()
@@ -7225,7 +8005,39 @@ mod tests {
         assert!(ramp(65.0) < 1.5, "65 degrees should not be");
     }
 
-    fn car() -> VehicleSpec {
+    #[test]
+    fn a_car_on_its_wheels_is_grounded_and_on_its_roof_flipped() {
+        // 0x82189A68 / 0x82189A00: grounded with a wheel touching; flipped
+        // with its up axis under 0.5 high and none touching.
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let upright = p.add_vehicle(&car(), Vec3::new(0.0, 0.5, 0.0), 0.0);
+        let roof = p.add_vehicle_turned(
+            &car(),
+            Vec3::new(20.0, 2.0, 0.0),
+            Quat::from_rotation_z(std::f32::consts::PI),
+        );
+        let high = p.add_vehicle(&car(), Vec3::new(-20.0, 50.0, 0.0), 0.0);
+        for _ in 0..30 {
+            p.step(1.0 / 60.0);
+        }
+        assert_eq!(p.vehicle_grounded(upright, true), Some(true));
+        assert_eq!(p.vehicle_flipped(upright, true), Some(false));
+        assert_eq!(p.vehicle_grounded(roof, true), Some(false));
+        assert_eq!(p.vehicle_flipped(roof, true), Some(true));
+        assert_eq!(p.vehicle_grounded(high, true), Some(false));
+        // Anything not a car stands on the ground and never flips.
+        assert_eq!(p.vehicle_grounded(high, false), Some(true));
+        assert_eq!(p.vehicle_flipped(roof, false), Some(false));
+    }
+
+    pub(super) fn car() -> VehicleSpec {
         use crate::vehicle::WheelSpec;
         let wheel = |x: f32, z: f32| WheelSpec {
             centre: Vec3::new(x, 0.35, z),
@@ -7274,12 +8086,40 @@ mod tests {
             chassis: None,
             shapes: Default::default(),
             material: None,
+            path_unseen: Default::default(),
             turret_shapes: Default::default(),
             turret_mass: None,
             gun_body: None,
             wreck: None,
             tuning: crate::VehicleTuning::default(),
         }
+    }
+
+    #[test]
+    fn a_car_without_a_template_mass_keeps_its_chassis_record_s() {
+        // 0x82182848: a body builder handed no mass above 0 keeps its
+        // `PHY2` record's; a template's `Mass` replaces it.
+        let mass = |p: &Physics, id: VehicleId| p.vehicles[id.0].as_ref().unwrap().mass;
+        let record = crate::vehicle::Chassis {
+            mass: 5000.0,
+            inertia: Mat3::from_diagonal(Vec3::new(4000.0, 5000.0, 2000.0)),
+            centre_of_mass: Vec3::new(0.0, 0.5, 0.0),
+        };
+        let mut p = Physics::new();
+        let bare = VehicleSpec {
+            chassis: Some(record),
+            ..car()
+        };
+        let id = p.add_vehicle(&bare, Vec3::ZERO, 0.0);
+        assert_eq!(mass(&p, id), 5000.0);
+        let mut tuned = bare.clone();
+        tuned.tuning.mass = Some(1500.0);
+        tuned.mass = 1500.0;
+        let id = p.add_vehicle(&tuned, Vec3::new(10.0, 0.0, 0.0), 0.0);
+        assert_eq!(mass(&p, id), 1500.0);
+        // Neither: the mass by kind it was made with.
+        let id = p.add_vehicle(&car(), Vec3::new(20.0, 0.0, 0.0), 0.0);
+        assert_eq!(mass(&p, id), car().mass);
     }
 
     fn boat() -> VehicleSpec {
@@ -9681,6 +10521,35 @@ mod tests {
         assert!(ghost_z > 20.0, "drove through the AI box to {ghost_z}");
     }
 
+    // A tree: a trunk 1 m across stands in the way, its leaves 12 m across
+    // don't; a path search sizes it up by all of it (0x821861B0).
+    #[test]
+    fn a_path_obstacles_box_is_its_whole_entitys() {
+        let mut p = Physics::new();
+        let mut tree = CollisionShape::cuboid(Vec3::new(0.5, 7.0, 0.5));
+        tree.entity_box = Some((Vec3::new(-6.0, -7.0, -6.0), Vec3::new(6.0, 13.0, 6.0)));
+        p.add_static(
+            StaticKey::Object(9),
+            &tree,
+            Vec3::new(0.0, 7.0, 10.0),
+            Quat::IDENTITY,
+        );
+        p.step(DT);
+        let o = p
+            .sweep_obstacle(
+                Vec3::new(0.0, 2.0, 0.0),
+                Vec3::new(0.0, 2.0, 20.0),
+                Vec3::new(1.0, 1.0, 0.05),
+                None,
+            )
+            .expect("meets the trunk");
+        assert_eq!(o.min, Vec3::new(-6.0, -7.0, -6.0));
+        assert_eq!(o.max, Vec3::new(6.0, 13.0, 6.0));
+        // Gone with it.
+        p.remove_static(StaticKey::Object(9));
+        assert!(p.boxes.is_empty());
+    }
+
     #[test]
     fn only_some_layers_are_met_by_vehicles() {
         use crate::collision_layers::{BUILDING, meets_vehicles};
@@ -9693,6 +10562,241 @@ mod tests {
         assert!(meets_vehicles(layer(0x27)));
         assert!(!meets_vehicles(layer(0x60)));
         assert!(!meets_vehicles(layer(0x05)));
+    }
+
+    /// A model of two 2 m boxes 10 m apart along x: one of flags 0x27 (a
+    /// solid shape), one of 0x25 (an AI-only box), as its source.
+    fn two_box_model() -> CollisionShape {
+        let mut vertices = Vec::new();
+        let mut triangles = Vec::new();
+        let mut runs = Vec::new();
+        for (x, flags) in [(0.0f32, 0x27u32), (10.0, 0x25)] {
+            let lo = Vec3::new(x - 1.0, 0.0, -1.0);
+            let hi = Vec3::new(x + 1.0, 2.0, 1.0);
+            let first = vertices.len() as u32;
+            let (v, t) = m2_assets::physics::Geometry::Box {
+                half_extents: [1.0, 1.0, 1.0],
+            }
+            .triangles(0.0);
+            vertices.extend(v.iter().map(|&p| (lo + hi) * 0.5 + Vec3::from(p)));
+            let from = triangles.len() as u32;
+            triangles.extend(t.iter().map(|t| t.map(|i| first + i)));
+            runs.push(ShapeRun {
+                flags,
+                kind: 3,
+                triangles: from..triangles.len() as u32,
+            });
+        }
+        let mut shape = CollisionShape::cuboid(Vec3::ONE);
+        shape.source = Some(Arc::new(ShapeSource {
+            vertices,
+            triangles,
+            runs,
+        }));
+        shape
+    }
+
+    // A loose prop's solid shapes are on layer 18 (0x82155328, 0x8218EBF8),
+    // which no path search sees; a fixed prop's are on 13, which it does.
+    // Its AI-only box (layer 14) is seen either way and no vehicle meets it.
+    #[test]
+    fn a_loose_props_solid_shapes_are_in_no_paths_way() {
+        let model = two_box_model();
+        for (preset, solid_seen) in [(Preset::Prop, true), (Preset::LooseProp, false)] {
+            let mut p = Physics::new();
+            p.add_static_as(
+                StaticKey::Entity(1),
+                &model,
+                Vec3::ZERO,
+                Quat::IDENTITY,
+                preset,
+            );
+            p.step(DT);
+            let sweep = |x: f32| {
+                p.sweep_obstacle(
+                    Vec3::new(x, 1.0, -5.0),
+                    Vec3::new(x, 1.0, 5.0),
+                    Vec3::new(0.2, 0.2, 0.05),
+                    None,
+                )
+                .is_some()
+            };
+            assert_eq!(sweep(0.0), solid_seen, "{preset:?} solid box");
+            assert!(sweep(10.0), "{preset:?} AI box");
+            // The solid box is solid; the AI box is a sensor.
+            let ray = |x: f32| {
+                let ray = r::Ray::new(vector(Vec3::new(x, 5.0, 0.0)), vector(Vec3::NEG_Y));
+                p.world
+                    .query_pipeline_with_filter(ground())
+                    .cast_ray(&ray, 10.0, true)
+                    .is_some()
+            };
+            assert!(ray(0.0), "{preset:?} stands on the solid box");
+            assert!(!ray(10.0), "{preset:?} not on the AI box");
+        }
+    }
+
+    // A bush: a trunk 0.4 m across and leaves 4 m across round it, 12 m
+    // ahead. A path sweep and an AI's sight line meet the leaves (layer 19
+    // in both masks); a shot's line, a wheel's look for the ground and the
+    // car itself go through them.
+    #[test]
+    fn leaves_stand_in_paths_and_sight_lines_alone() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
+        let mut bush = CollisionShape::cuboid(Vec3::new(0.2, 1.5, 0.2));
+        bush.leaves = Some(r::SharedShape::cuboid(2.0, 1.0, 2.0));
+        p.add_static(
+            StaticKey::Object(4),
+            &bush,
+            Vec3::new(3.0, 1.5, 12.0),
+            Quat::IDENTITY,
+        );
+        p.step(DT);
+        // Past the trunk, through the leaves.
+        let (a, b) = (Vec3::new(4.5, 1.5, 0.0), Vec3::new(4.5, 1.5, 24.0));
+        assert!(
+            p.sweep_obstacle(a, b, Vec3::new(0.1, 0.1, 0.05), None)
+                .is_some(),
+            "a path sweep meets the leaves"
+        );
+        assert!(!p.sight_clear(a, b, None), "an AI doesn't see through them");
+        assert!(p.line_clear(a, b, None), "a shot's line goes through them");
+        let ray = r::Ray::new(vector(Vec3::new(4.5, 5.0, 12.0)), vector(Vec3::NEG_Y));
+        let (_, toi) = p
+            .world
+            .query_pipeline_with_filter(ground())
+            .cast_ray(&ray, 10.0, true)
+            .expect("the floor");
+        assert!(
+            (toi - 5.0).abs() < 0.01,
+            "a wheel stands on the floor, not the leaves: {toi}"
+        );
+        // A car drives through them.
+        let id = p.add_vehicle(&car(), Vec3::new(4.5, 0.1, 0.0), 0.0);
+        for _ in 0..360 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        let z = p.vehicle_transform(id).unwrap().w_axis.z;
+        assert!(z > 20.0, "drove through the leaves to {z}");
+        // Gone with it.
+        p.remove_static(StaticKey::Object(4));
+        assert!(p.sight_clear(a, b, None));
+    }
+
+    // CarAttack's line to her (0x82166958, the path mask) passes a loose
+    // prop's solid shape (layer 18) and stops at leaves (19); a soldier's
+    // line of fire (0x822C95D8, the sight mask) stops at both.
+    #[test]
+    fn ai_lines_see_loose_props_and_leaves_by_their_masks() {
+        let mut p = Physics::new();
+        let model = two_box_model();
+        p.add_static_as(
+            StaticKey::Entity(1),
+            &model,
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            Preset::LooseProp,
+        );
+        let mut bush = CollisionShape::cuboid(Vec3::new(0.05, 0.05, 0.05));
+        bush.leaves = Some(r::SharedShape::cuboid(1.0, 1.0, 1.0));
+        p.add_static(
+            StaticKey::Object(2),
+            &bush,
+            Vec3::new(20.0, 5.0, 0.0),
+            Quat::IDENTITY,
+        );
+        p.step(DT);
+        let across = |x: f32, y: f32| (Vec3::new(x, y, -5.0), Vec3::new(x, y, 5.0));
+        let (a, b) = across(0.0, 1.0);
+        assert!(
+            p.path_line_clear(a, b, None),
+            "a loose prop is in no CarAttack line's way"
+        );
+        assert!(
+            p.cast_ray_sight_keyed(a, b - a, 10.0).is_some(),
+            "a soldier's line meets it"
+        );
+        let (a, b) = across(20.5, 5.0);
+        assert!(
+            !p.path_line_clear(a, b, None),
+            "leaves stop CarAttack's line"
+        );
+        assert!(
+            p.cast_ray_sight_keyed(a, b - a, 10.0).is_some(),
+            "and a soldier's"
+        );
+        assert!(p.cast_ray_keyed(a, b - a, 10.0).is_none(), "but not a shot");
+    }
+
+    // A broken fence's planks stay its entity's bodies on the 360: a path
+    // sweep meeting one plank sizes it up by the box round both, in the
+    // fence's frame; a lone piece by its own.
+    #[test]
+    fn a_broken_models_pieces_share_its_path_box() {
+        let mut p = Physics::new();
+        let plank = LoosePiece {
+            node: None,
+            shape: r::SharedShape::cuboid(2.0, 0.5, 0.2),
+            mass: 20.0,
+            material: BodyMaterial::DEBRIS,
+            from_model: Mat4::IDENTITY,
+        };
+        let fence = Mat4::from_translation(Vec3::new(0.0, 0.0, 10.0));
+        let a = p.add_debris(
+            &plank,
+            fence * Mat4::from_translation(Vec3::new(-3.0, 0.5, 0.0)),
+            Vec3::ZERO,
+            Vec3::ZERO,
+        );
+        let b = p.add_debris(
+            &plank,
+            fence * Mat4::from_translation(Vec3::new(4.0, 0.5, 0.0)),
+            Vec3::ZERO,
+            Vec3::ZERO,
+        );
+        p.add_debris(
+            &plank,
+            Mat4::from_translation(Vec3::new(30.0, 0.5, 10.0)),
+            Vec3::ZERO,
+            Vec3::ZERO,
+        );
+        p.group_debris(&[a, b], fence);
+        p.step(DT);
+        let sweep = |p: &Physics, x: f32| {
+            p.sweep_obstacle(
+                Vec3::new(x, 0.5, 0.0),
+                Vec3::new(x, 0.5, 20.0),
+                Vec3::new(0.1, 0.1, 0.05),
+                None,
+            )
+        };
+        let o = sweep(&p, -3.0).expect("meets the first plank");
+        assert!(
+            (o.min.x + 5.0).abs() < 0.1 && (o.max.x - 6.0).abs() < 0.1,
+            "{} .. {}",
+            o.min,
+            o.max
+        );
+        assert!((o.pose.0 - Vec3::new(0.0, 0.0, 10.0)).length() < 1e-3);
+        let o = sweep(&p, 30.0).expect("meets the lone piece");
+        assert!(
+            (o.max.x - o.min.x - 4.0).abs() < 0.1,
+            "{} .. {}",
+            o.min,
+            o.max
+        );
+        // Gone with its pieces.
+        p.remove_debris(a);
+        p.remove_debris(b);
+        assert!(p.debris_groups.is_empty());
     }
 
     #[test]
@@ -9723,6 +10827,9 @@ mod tests {
             surfaces: Arc::new([]),
             path: PathSolid::All,
             ghost: None,
+            entity_box: None,
+            source: None,
+            leaves: None,
         };
         let base = Vec3::new(0.0, 0.0, 12.0);
         p.add_static(StaticKey::Object(7), &pole, base, Quat::IDENTITY);

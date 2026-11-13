@@ -73,7 +73,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use m2_assets::{Font, StringTable, name_hash};
+use m2_assets::{Font, StringTable};
 use mlua::{Function, IntoLuaMulti, Lua, MultiValue, Table, Value};
 
 use crate::gui::{Anchor, Correction, VIRTUAL_SIZE};
@@ -183,6 +183,17 @@ pub struct Widget {
     /// ([`Screen::take_flash_calls`]): the movie's function and its
     /// arguments.
     pub flash_calls: Vec<(String, Vec<FlashArg>)>,
+    /// `SendFlashInput` inputs not yet taken by the host
+    /// ([`Screen::take_flash_inputs`]): the key's code and what is done
+    /// with it.
+    pub flash_inputs: Vec<(i32, FlashInput)>,
+    /// `SetFlashPlaySpeed`: the movie's play speed, as given (1 until
+    /// set: inferred, the 360's start value was not read).
+    pub flash_speed: f32,
+    /// `SetWidgetIgnoresPause` and `SetWidgetUseResolutionCorrection`, as
+    /// last set (the correction is on until turned off).
+    pub ignores_pause: bool,
+    pub resolution_correction: bool,
     /// `SetFlashCallback`: the movie's `fscommand` names and the callbacks
     /// they call ([`flash_command`]).
     flash_handlers: BTreeMap<String, u32>,
@@ -243,6 +254,10 @@ impl Widget {
             wraps: false,
             swf: None,
             flash_calls: Vec::new(),
+            flash_inputs: Vec::new(),
+            flash_speed: 1.0,
+            ignores_pause: false,
+            resolution_correction: true,
             flash_handlers: BTreeMap::new(),
             flash_paused: false,
             flash_restarts: 0,
@@ -378,6 +393,29 @@ pub struct Screen {
     /// She is at the wheel: the pad's pictures are the vehicle layout's
     /// ([`driving_pad_picture`]).
     driving: bool,
+    /// `SetPlayerPDAWidget`: the Flash widget that is the player's PDA
+    /// while it is open, with the player it was given for.
+    pub pda_widget: Option<(u32, u32)>,
+    /// `RegisterForPdaUpdate`: the widgets that asked for the PDA's
+    /// updates.
+    pub pda_updates: BTreeSet<u32>,
+    /// `SetFlashPauseMenu`: the pause menu's movie as last set.
+    pub pause_menu: Option<FlashPauseMenu>,
+    /// The frame each playing movie widget is on, as the host says
+    /// ([`Screen::set_movie_frame`]), for `GetMovieCurrentFrameNumber`.
+    movie_frames: BTreeMap<u32, u32>,
+}
+
+/// What `SetFlashPauseMenu` keeps (360 `0x82322D50`): the Flash widget,
+/// its flag and name (31 characters at most), a number, and a share kept
+/// as a whole percent (0 to 100, rounded, from a number 0 to 1).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FlashPauseMenu {
+    pub widget: u32,
+    pub on: bool,
+    pub name: String,
+    pub value: f32,
+    pub percent: u8,
 }
 
 impl Screen {
@@ -438,6 +476,27 @@ impl Screen {
     /// Natives the scripts called that this does not implement.
     pub fn unknown(&self) -> &BTreeSet<String> {
         &self.unknown
+    }
+
+    /// The host says which frame a playing movie widget is on (`None`:
+    /// not playing), for `GetMovieCurrentFrameNumber`.
+    pub fn set_movie_frame(&mut self, id: u32, frame: Option<u32>) {
+        match frame {
+            Some(f) => self.movie_frames.insert(id, f),
+            None => self.movie_frames.remove(&id),
+        };
+    }
+
+    /// The Flash inputs the scripts sent since the last call
+    /// (`SendFlashInput`), by widget, in the order sent.
+    pub fn take_flash_inputs(&mut self) -> Vec<(u32, i32, FlashInput)> {
+        let mut inputs = Vec::new();
+        for (&id, w) in &mut self.widgets {
+            for (code, what) in w.flash_inputs.drain(..) {
+                inputs.push((id, code, what));
+            }
+        }
+        inputs
     }
 
     /// The Flash calls the scripts made since the last call, by widget, in
@@ -1759,8 +1818,7 @@ pub fn install(lua: &Lua) -> mlua::Result<ScreenRef> {
     // `String.GetHash(name)`, likewise in `String`: the support scripts
     // key their recruits by it (`MrxSupportManager.IsRecruitAvailable`;
     // the support menu greys out an item whose recruit it can't find).
-    // The archive's name hash: what the scripts compare are their own
-    // hashes, so any consistent hash would do.
+    // The engine's hash, as light userdata (`crate::script_hash`).
     let string = match lua.globals().raw_get::<Value>("String")? {
         Value::Table(t) if t.metatable().is_none() => t,
         _ => {
@@ -1771,9 +1829,9 @@ pub fn install(lua: &Lua) -> mlua::Result<ScreenRef> {
     };
     string.raw_set(
         "GetHash",
-        safe_function(lua, |lua, args| match args.front() {
-            Some(Value::String(s)) => ret(lua, name_hash(&s.to_string_lossy())),
-            _ => ret(lua, Value::Nil),
+        safe_function(lua, |_, args| {
+            let args: Vec<Value> = args.into_iter().collect();
+            Ok(crate::script_hash::get_hash_native(&args))
         })?,
     )?;
     lua.set_app_data(Rc::clone(&screen));
@@ -1856,6 +1914,20 @@ pub fn fire(lua: &Lua, event: &str, args: impl IntoLuaMulti) -> mlua::Result<usi
     call.extend(args);
     fire.call::<usize>(MultiValue::from_vec(call))
 }
+
+/// What `SendFlashInput` asks done with a key. From the 360 code
+/// (`0x823223F8`): its third argument's first letter picks it, `h` hold
+/// (2), `r` release (3), anything else or nothing press (1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlashInput {
+    Press,
+    Hold,
+    Release,
+}
+
+/// How many inputs a Flash widget keeps till its next update (the 360's
+/// queue holds 32; more are dropped).
+const FLASH_INPUTS: usize = 32;
 
 /// `SendFlash...AnalogInput(widget, x, y)`: the movie's `function(x, y)`.
 fn analog(s: &mut Screen, a: &Args, function: &str) -> mlua::Result<MultiValue> {
@@ -2224,7 +2296,123 @@ natives! {
     "GetImageClockElapsed" => |_, l, _| ret(l, 0),
     // Settings with nothing to draw differently here.
     "SetWidgetViewport" => |_, _, _| Ok(MultiValue::new()),
-    "SetWidgetIgnoresPause" => |_, _, _| Ok(MultiValue::new()),
+    // (widget, flag): the widget's ignores-pause flag; read back by
+    // `GetWidgetIgnoresPause` (0x8231D3A8: a boolean for a widget, nothing
+    // without one).
+    "SetWidgetIgnoresPause" => |s, _, a| {
+        if let Some(w) = s.widgets.get_mut(&a.id(0)) {
+            w.ignores_pause = a.truthy(1);
+        }
+        Ok(MultiValue::new())
+    },
+    // (widget) (0x8231DF60): the viewport the widget is drawn in, a
+    // number; there is one viewport here, 0. Nothing without a widget.
+    "GetWidgetViewport" => |s, l, a| match s.widgets.get(&a.id(0)) {
+        Some(_) => ret(l, 0),
+        None => Ok(MultiValue::new()),
+    },
+    // (movie widget) (0x82323A78): the frame its movie is on while it
+    // plays, else -1. Nothing for other widgets.
+    "GetMovieCurrentFrameNumber" => |s, l, a| {
+        let id = a.id(0);
+        match s.widgets.get(&id) {
+            Some(w) if w.kind == Kind::Movie => {
+                let frame = s.movie_frames.get(&id).filter(|_| w.movie_playing);
+                ret(l, frame.map_or(-1, |&f| i64::from(f)))
+            }
+            _ => Ok(MultiValue::new()),
+        }
+    },
+    // (player, flash widget or 0) (0x82321D40): the player's PDA is that
+    // widget (the engine then enters its PDA state), or with 0 no widget
+    // (it leaves the state). Any other widget kind: nothing kept.
+    "SetPlayerPDAWidget" => |s, _, a| {
+        let player = a.get(0).and_then(crate::events::as_guid).unwrap_or(0);
+        let id = a.id(1);
+        if id == 0 {
+            s.pda_widget = None;
+        } else if s.widgets.get(&id).is_some_and(|w| w.kind == Kind::Flash) {
+            s.pda_widget = Some((player, id));
+        }
+        Ok(MultiValue::new())
+    },
+    // (widget, flag) (0x82323CA0): the widget is told of the PDA's
+    // updates, or no longer.
+    "RegisterForPdaUpdate" => |s, _, a| {
+        let id = a.id(0);
+        if let (true, Some(Value::Boolean(on))) = (s.widgets.contains_key(&id), a.get(1)) {
+            if *on {
+                s.pda_updates.insert(id);
+            } else {
+                s.pda_updates.remove(&id);
+            }
+        }
+        Ok(MultiValue::new())
+    },
+    // (flash widget, flag, name, number[, share]) (0x82322D50): the
+    // pause menu's movie and what it was set with.
+    "SetFlashPauseMenu" => |s, _, a| {
+        let id = a.id(0);
+        let (true, Some(Value::Boolean(on)), Some(name), Some(value)) = (
+            s.widgets.get(&id).is_some_and(|w| w.kind == Kind::Flash),
+            a.get(1),
+            a.text(2),
+            a.f(3),
+        ) else {
+            return Ok(MultiValue::new());
+        };
+        let share = a.f(4).unwrap_or(0.0).clamp(0.0, 1.0);
+        s.pause_menu = Some(FlashPauseMenu {
+            widget: id,
+            on: *on,
+            name: name.chars().take(31).collect(),
+            value,
+            percent: ((share * 100.0 + 0.5) as u8).min(100),
+        });
+        Ok(MultiValue::new())
+    },
+    "GetWidgetIgnoresPause" => |s, l, a| match s.widgets.get(&a.id(0)) {
+        Some(w) => ret(l, w.ignores_pause),
+        None => Ok(MultiValue::new()),
+    },
+    // (widget, flag) (0x8231E780): whether the widget is corrected for the
+    // screen's shape; the lock-on reticle's target box turns it off.
+    "SetWidgetUseResolutionCorrection" => |s, _, a| {
+        if let (Some(w), Some(Value::Boolean(on))) = (s.widgets.get_mut(&a.id(0)), a.get(1)) {
+            w.resolution_correction = *on;
+        }
+        Ok(MultiValue::new())
+    },
+    // (flash widget, key code[, "p" | "h" | "r"]) (0x823223F8): queues a
+    // key for the movie's next update, pressed, held or released.
+    "SendFlashInput" => |s, _, a| {
+        let (Some(w), Some(code)) = (s.widgets.get_mut(&a.id(0)), a.num(1)) else {
+            return Ok(MultiValue::new());
+        };
+        if w.kind == Kind::Flash && w.flash_inputs.len() < FLASH_INPUTS {
+            let what = match a.text(2).as_deref().and_then(|t| t.chars().next()) {
+                Some('h') => FlashInput::Hold,
+                Some('r') => FlashInput::Release,
+                _ => FlashInput::Press,
+            };
+            w.flash_inputs.push((code as i32, what));
+        }
+        Ok(MultiValue::new())
+    },
+    // (flash widget, speed) and (flash widget) (0x82322020, 0x823220F0):
+    // the movie's play speed, kept and read back as given.
+    "SetFlashPlaySpeed" => |s, _, a| {
+        if let (Some(w), Some(speed)) = (s.widgets.get_mut(&a.id(0)), a.f(1))
+            && w.kind == Kind::Flash
+        {
+            w.flash_speed = speed;
+        }
+        Ok(MultiValue::new())
+    },
+    "GetFlashPlaySpeed" => |s, l, a| match s.widgets.get(&a.id(0)) {
+        Some(w) if w.kind == Kind::Flash => ret(l, w.flash_speed),
+        _ => Ok(MultiValue::new()),
+    },
     "SetWidgetFullscreen" => |s, _, a| {
         if let Some(w) = s.widgets.get_mut(&a.id(0)) {
             w.fullscreen = a.truthy(1);
@@ -3295,6 +3483,137 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// The Flash input, play speed and flag natives keep what the scripts
+    /// give them, for Flash widgets only where the 360 asks for one.
+    #[test]
+    fn flash_inputs_speeds_and_flags_are_kept() {
+        let host = ScriptHost::new().unwrap();
+        let screen = install(host.lua()).unwrap();
+        host.lua()
+            .load(
+                r##"
+                local g = _GuiInternal
+                movie = g.CreateFlashWidget()
+                plain = g.CreateWidget()
+                g.SendFlashInput(movie, 9, "p")
+                g.SendFlashInput(movie, 13)
+                g.SendFlashInput(movie, 37, "hold")
+                g.SendFlashInput(movie, 37, "r")
+                g.SendFlashInput(plain, 9, "p")
+                assert(g.GetFlashPlaySpeed(movie) == 1)
+                g.SetFlashPlaySpeed(movie, 2.5)
+                g.SetFlashPlaySpeed(plain, 9)
+                assert(g.GetFlashPlaySpeed(movie) == 2.5)
+                assert(select("#", g.GetFlashPlaySpeed(plain)) == 0)
+                assert(g.GetWidgetIgnoresPause(plain) == false)
+                g.SetWidgetIgnoresPause(plain, true)
+                assert(g.GetWidgetIgnoresPause(plain) == true)
+                assert(select("#", g.GetWidgetIgnoresPause(9999)) == 0)
+                g.SetWidgetUseResolutionCorrection(plain, false)
+                for i = 1, 40 do g.SendFlashInput(plain, i) end
+                "##,
+            )
+            .exec()
+            .unwrap();
+        let (movie, plain): (u32, u32) = host.lua().load("return movie, plain").eval().unwrap();
+        let mut s = screen.borrow_mut();
+        assert!(!s.widgets[&plain].resolution_correction);
+        assert!(s.widgets[&movie].resolution_correction);
+        assert_eq!(
+            s.take_flash_inputs(),
+            [
+                (movie, 9, FlashInput::Press),
+                (movie, 13, FlashInput::Press),
+                (movie, 37, FlashInput::Hold),
+                (movie, 37, FlashInput::Release),
+            ]
+        );
+        assert!(s.take_flash_inputs().is_empty());
+        // No more than 32 wait at once.
+        drop(s);
+        host.lua()
+            .load("for i = 1, 40 do _GuiInternal.SendFlashInput(movie, i) end")
+            .exec()
+            .unwrap();
+        assert_eq!(screen.borrow_mut().take_flash_inputs().len(), 32);
+    }
+
+    /// The PDA widget, the PDA's listeners, the pause menu's movie, the
+    /// viewport and a movie's frame, as the scripts set and ask them.
+    #[test]
+    fn pda_pause_viewport_and_movie_frame_natives() {
+        let host = ScriptHost::new().unwrap();
+        let screen = install(host.lua()).unwrap();
+        host.lua()
+            .load(
+                r##"
+                local g = _GuiInternal
+                flash = g.CreateFlashWidget()
+                plain = g.CreateWidget()
+                film = g.CreateMovieWidget()
+                g.SetPlayerPDAWidget(1, plain)
+                assert(g.GetWidgetViewport(plain) == 0)
+                assert(select("#", g.GetWidgetViewport(9999)) == 0)
+                assert(g.GetMovieCurrentFrameNumber(film) == -1)
+                assert(select("#", g.GetMovieCurrentFrameNumber(plain)) == 0)
+                g.RegisterForPdaUpdate(flash, true)
+                g.RegisterForPdaUpdate(plain, true)
+                g.RegisterForPdaUpdate(plain, false)
+                g.RegisterForPdaUpdate(9999, true)
+                g.SetFlashPauseMenu(plain, true, "pause_menu", 2, 0.5)
+                "##,
+            )
+            .exec()
+            .unwrap();
+        let (flash, film): (u32, u32) = host.lua().load("return flash, film").eval().unwrap();
+        {
+            let s = screen.borrow();
+            // Only a Flash widget can be the PDA, or the pause menu.
+            assert_eq!(s.pda_widget, None);
+            assert_eq!(s.pause_menu, None);
+            assert_eq!(s.pda_updates.iter().copied().collect::<Vec<_>>(), [flash]);
+        }
+        host.lua()
+            .load(
+                r#"
+                local g = _GuiInternal
+                g.SetPlayerPDAWidget(1, flash)
+                g.SetFlashPauseMenu(flash, true, "pause_menu", 2, 0.756)
+                g.PlayMovie(film)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        {
+            let mut s = screen.borrow_mut();
+            assert_eq!(s.pda_widget.map(|p| p.1), Some(flash));
+            let p = s.pause_menu.clone().unwrap();
+            assert_eq!(
+                (p.widget, p.on, p.name.as_str()),
+                (flash, true, "pause_menu")
+            );
+            assert_eq!((p.value, p.percent), (2.0, 76));
+            s.set_movie_frame(film, Some(42));
+        }
+        let (frame, closed): (i64, bool) = host
+            .lua()
+            .load(
+                r#"
+                local g = _GuiInternal
+                local frame = g.GetMovieCurrentFrameNumber(film)
+                g.SetPlayerPDAWidget(1, 0)
+                return frame, true
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(closed);
+        // Its frame only while it plays.
+        let playing = screen.borrow().widgets[&film].movie_playing;
+        assert_eq!(frame, if playing { 42 } else { -1 });
+        assert_eq!(screen.borrow().pda_widget, None);
     }
 
     #[test]

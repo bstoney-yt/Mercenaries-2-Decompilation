@@ -19,6 +19,7 @@
 mod post;
 mod shader;
 mod shadow;
+pub mod timer;
 
 use std::collections::HashMap;
 
@@ -39,8 +40,15 @@ pub use ::wgpu;
 
 /// Bytes of a draw's uniforms: its world matrix, then the first palette
 /// matrix and the palette length, then the same for its instances, then
-/// its texture coordinate offset.
-const DRAW_UNIFORM_SIZE: u64 = 96;
+/// its texture coordinate offset, then its tint. The frame's draws lie one after another
+/// in one storage buffer, and each instance drawn has a slot (the draw's
+/// index and its instance's) in another: a draw is drawn with its first
+/// slot as its first instance, so its vertices find their uniforms from
+/// the instance index, and no bind group changes between draws. Binding
+/// one per draw cost the CPU about 8 ms a frame of 10,000 draws.
+const DRAW_UNIFORM_SIZE: u64 = 112;
+/// Bytes of an instance's slot: its draw's index and its own.
+const SLOT_SIZE: u64 = 8;
 /// Bone matrices the palette buffer starts with.
 const INITIAL_PALETTE: u64 = 1024;
 /// Metres from the camera by which a detail map has faded out.
@@ -90,9 +98,12 @@ const SEA_MIRROR_REACH: f32 = 600.0;
 /// 256 and 1,000 km), and its blue matches PC footage (B/R 1.32 against
 /// 1.27-1.35).
 const SKY_QUAD: f32 = 64000.0;
-/// Per-draw uniforms are packed at this stride (wgpu's minimum dynamic
-/// offset alignment on every backend).
-const DRAW_STRIDE: u64 = 256;
+
+/// The cosine of the sun disc's angular radius: the game draws a 64-sided
+/// disc of radius 0.8 at 16 m along the sun's way (from the 360 code: the
+/// disc built at 0x821D0538, placed and scaled at 0x821D0A28), about
+/// 2.86 degrees. Taken as a circle (its sides lie within 0.12% of it).
+const SUN_DISC_COS: f32 = 0.998_752_3;
 
 /// A generational slot map, as in the null backend.
 #[derive(Debug)]
@@ -183,6 +194,8 @@ struct IndexBuffer {
 #[derive(Debug)]
 struct Texture {
     view: wgpu::TextureView,
+    /// Its mips' bytes, as uploaded.
+    bytes: u64,
 }
 
 #[derive(Debug)]
@@ -280,6 +293,9 @@ struct FrameUniforms {
     lights: [[f32; 4]; 2 * POINT_LIGHTS],
     /// x: how many of them.
     light_info: [f32; 4],
+    /// The sun's disc: rgb its colour (display values, black for none),
+    /// w the cosine of its angular radius ([`SUN_DISC_COS`]).
+    sun_disc: [f32; 4],
 }
 
 /// What a shadow pipeline depends on.
@@ -356,8 +372,10 @@ fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 struct OpenFrame {
     view: View,
     draws: Vec<RecordedDraw>,
-    /// Per-draw uniforms at `DRAW_STRIDE`.
+    /// Per-draw uniforms, [`DRAW_UNIFORM_SIZE`] bytes each.
     uniforms: Vec<u8>,
+    /// Per instance drawn: its draw's index and its own.
+    slots: Vec<[u32; 2]>,
     /// Bone matrices set with `set_skin`, column-major.
     palette: Vec<[f32; 16]>,
 }
@@ -370,6 +388,9 @@ struct RecordedDraw {
     material: MaterialId,
     /// Instances drawn (1 when not instanced).
     instances: u32,
+    /// Its first instance's slot in the frame's slots: the first instance
+    /// it is drawn with.
+    first_slot: u32,
     caster: Option<Caster>,
 }
 
@@ -440,6 +461,7 @@ pub struct WgpuBackend {
     shadow_layers: Vec<(wgpu::TextureView, wgpu::Buffer, wgpu::BindGroup)>,
     draw_buffer: wgpu::Buffer,
     palette_buffer: wgpu::Buffer,
+    slot_buffer: wgpu::Buffer,
     draw_group: wgpu::BindGroup,
     /// Repeating, then clamping.
     samplers: [wgpu::Sampler; 2],
@@ -467,6 +489,11 @@ pub struct WgpuBackend {
     frame: Option<OpenFrame>,
     /// Frames ended so far, which is also the number of the open frame.
     frames: u64,
+    /// The GPU time of each frame's stages, where the device can tell.
+    timer: Option<timer::GpuTimer>,
+    /// The last two offscreen frames' submissions, newest last
+    /// ([`wait_for_frame_before_last`](Self::wait_for_frame_before_last)).
+    submitted: [Option<wgpu::SubmissionIndex>; 2],
 }
 
 fn device_error(e: impl std::fmt::Display) -> BackendError {
@@ -653,6 +680,7 @@ impl WgpuBackend {
         width: u32,
         height: u32,
     ) -> Self {
+        let timer = timer::GpuTimer::new(&device, &queue);
         let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame"),
             entries: &[
@@ -685,9 +713,28 @@ impl WgpuBackend {
         let draw_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("draw"),
             entries: &[
-                uniform_entry(0, true),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
                     visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -911,7 +958,14 @@ impl WgpuBackend {
         });
         let draw_buffer = Self::draw_uniforms(&device, 1024);
         let palette_buffer = Self::palette(&device, INITIAL_PALETTE);
-        let draw_group = Self::draw_group(&device, &draw_layout, &draw_buffer, &palette_buffer);
+        let slot_buffer = Self::slots(&device, 1024);
+        let draw_group = Self::draw_group(
+            &device,
+            &draw_layout,
+            &draw_buffer,
+            &palette_buffer,
+            &slot_buffer,
+        );
         // `M2_WRAP=mirror` flips every second repeat (to see whether model
         // texture seams, not the data, make the cliff bands).
         let repeat = if std::env::var("M2_WRAP").is_ok_and(|v| v == "mirror") {
@@ -958,7 +1012,7 @@ impl WgpuBackend {
             Target::Window { config, .. } => config.format,
             Target::Offscreen { format, .. } => *format,
         };
-        let post = post::Post::new(&device, output, width, height);
+        let post = post::Post::new(&device, output, width, height, &depth.view);
         Self {
             default_material: Self::material_group(
                 &device,
@@ -992,6 +1046,7 @@ impl WgpuBackend {
             shadow_layers,
             draw_buffer,
             palette_buffer,
+            slot_buffer,
             draw_group,
             samplers,
             white,
@@ -1010,14 +1065,25 @@ impl WgpuBackend {
             materials: HashMap::new(),
             frame: None,
             frames: 0,
+            timer,
+            submitted: [None, None],
         }
     }
 
     fn draw_uniforms(device: &wgpu::Device, draws: u64) -> wgpu::Buffer {
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("draw uniforms"),
-            size: draws * DRAW_STRIDE,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            size: draws * DRAW_UNIFORM_SIZE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    fn slots(device: &wgpu::Device, slots: u64) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("draw slots"),
+            size: slots * SLOT_SIZE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })
     }
@@ -1036,6 +1102,7 @@ impl WgpuBackend {
         layout: &wgpu::BindGroupLayout,
         uniforms: &wgpu::Buffer,
         palette: &wgpu::Buffer,
+        slots: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("draw"),
@@ -1043,15 +1110,15 @@ impl WgpuBackend {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: uniforms,
-                        offset: 0,
-                        size: wgpu::BufferSize::new(DRAW_UNIFORM_SIZE),
-                    }),
+                    resource: uniforms.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: palette.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: slots.as_entire_binding(),
                 },
             ],
         })
@@ -1083,7 +1150,9 @@ impl WgpuBackend {
         };
         let depth = texture(
             "depth",
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
         );
         let scene = texture(
             "scene depth",
@@ -1388,7 +1457,7 @@ impl WgpuBackend {
     fn size_world(&mut self) {
         let (w, h) = self.world_size();
         self.depth = Self::depth_targets(&self.device, &self.scene_layout, w, h);
-        self.post.resize(&self.device, w, h);
+        self.post.resize(&self.device, w, h, &self.depth.view);
     }
 
     /// Switches vertical sync (window targets only).
@@ -1774,11 +1843,12 @@ impl WgpuBackend {
                 multiview_mask: None,
             });
             pass.set_bind_group(0, group, &[]);
+            pass.set_bind_group(1, &self.draw_group, &[]);
             let mut pipeline_now: Option<&ShadowKey> = None;
             let mut material_now = None;
             let mut vertices_now = None;
             let mut indices_now = None;
-            for (k, d) in draws.iter().enumerate() {
+            for d in draws {
                 let Some(caster) = &d.caster else {
                     continue;
                 };
@@ -1792,7 +1862,6 @@ impl WgpuBackend {
                     pass.set_pipeline(&self.shadow_pipelines[&caster.pipeline]);
                     pipeline_now = Some(&caster.pipeline);
                 }
-                pass.set_bind_group(1, &self.draw_group, &[(k as u64 * DRAW_STRIDE) as u32]);
                 if caster.pipeline.masked && material_now != Some(d.material) {
                     let material = self
                         .materials
@@ -1813,7 +1882,10 @@ impl WgpuBackend {
                 }
                 match d.geometry {
                     Geometry::Vertices { first, count } => {
-                        pass.draw(first..first + count, 0..d.instances);
+                        pass.draw(
+                            first..first + count,
+                            d.first_slot..d.first_slot + d.instances,
+                        );
                     }
                     Geometry::Indexed {
                         buffer,
@@ -1829,7 +1901,11 @@ impl WgpuBackend {
                             );
                             indices_now = Some(buffer.0);
                         }
-                        pass.draw_indexed(first..first + count, base_vertex, 0..d.instances);
+                        pass.draw_indexed(
+                            first..first + count,
+                            base_vertex,
+                            d.first_slot..d.first_slot + d.instances,
+                        );
                     }
                 }
             }
@@ -1905,12 +1981,13 @@ impl WgpuBackend {
             return Ok(());
         }
         pass.set_bind_group(0, &self.frame_group, &[]);
+        pass.set_bind_group(1, &self.draw_group, &[]);
         pass.set_bind_group(3, &self.depth.group, &[]);
         let mut pipeline_now: Option<&PipelineKey> = None;
         let mut material_now = None;
         let mut vertices_now = None;
         let mut indices_now = None;
-        for (i, d) in draws.iter().enumerate() {
+        for d in draws {
             let Some(pipeline) = self.glow_pipelines.get(&d.pipeline) else {
                 continue;
             };
@@ -1918,7 +1995,6 @@ impl WgpuBackend {
                 pass.set_pipeline(pipeline);
                 pipeline_now = Some(&d.pipeline);
             }
-            pass.set_bind_group(1, &self.draw_group, &[(i as u64 * DRAW_STRIDE) as u32]);
             if material_now != Some(d.material) {
                 let material = self
                     .materials
@@ -1934,7 +2010,10 @@ impl WgpuBackend {
             }
             match d.geometry {
                 Geometry::Vertices { first, count } => {
-                    pass.draw(first..first + count, 0..d.instances);
+                    pass.draw(
+                        first..first + count,
+                        d.first_slot..d.first_slot + d.instances,
+                    );
                 }
                 Geometry::Indexed {
                     buffer,
@@ -1950,7 +2029,11 @@ impl WgpuBackend {
                         );
                         indices_now = Some(buffer.0);
                     }
-                    pass.draw_indexed(first..first + count, base_vertex, 0..d.instances);
+                    pass.draw_indexed(
+                        first..first + count,
+                        base_vertex,
+                        d.first_slot..d.first_slot + d.instances,
+                    );
                 }
             }
         }
@@ -1965,7 +2048,6 @@ impl WgpuBackend {
         sky: Vec3,
         clouds: Option<TextureHandle>,
         draws: &[RecordedDraw],
-        first: usize,
         clear: bool,
     ) -> Result<(), BackendError> {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2014,6 +2096,7 @@ impl WgpuBackend {
             pass.set_bind_group(1, &self.cloud_group(clouds), &[]);
             pass.draw(0..3, 0..1);
         }
+        pass.set_bind_group(1, &self.draw_group, &[]);
         pass.set_bind_group(3, &self.depth.group, &[]);
         // State is set only when it changes: the queue has sorted the
         // draws so neighbours share pipelines, materials and buffers, and
@@ -2022,7 +2105,7 @@ impl WgpuBackend {
         let mut material_now = None;
         let mut vertices_now = None;
         let mut indices_now = None;
-        for (i, d) in draws.iter().enumerate() {
+        for d in draws {
             // Glows draw into the glow layer instead (`encode_glows`).
             if d.pipeline.blend == BlendKind::Additive {
                 continue;
@@ -2031,8 +2114,6 @@ impl WgpuBackend {
                 pass.set_pipeline(&self.pipelines[&d.pipeline]);
                 pipeline_now = Some(&d.pipeline);
             }
-            let offset = ((first + i) as u64 * DRAW_STRIDE) as u32;
-            pass.set_bind_group(1, &self.draw_group, &[offset]);
             if material_now != Some(d.material) {
                 let material = self
                     .materials
@@ -2048,7 +2129,10 @@ impl WgpuBackend {
             }
             match d.geometry {
                 Geometry::Vertices { first, count } => {
-                    pass.draw(first..first + count, 0..d.instances);
+                    pass.draw(
+                        first..first + count,
+                        d.first_slot..d.first_slot + d.instances,
+                    );
                 }
                 Geometry::Indexed {
                     buffer,
@@ -2064,7 +2148,11 @@ impl WgpuBackend {
                         );
                         indices_now = Some(buffer.0);
                     }
-                    pass.draw_indexed(first..first + count, base_vertex, 0..d.instances);
+                    pass.draw_indexed(
+                        first..first + count,
+                        base_vertex,
+                        d.first_slot..d.first_slot + d.instances,
+                    );
                 }
             }
         }
@@ -2078,7 +2166,11 @@ impl WgpuBackend {
         target: &wgpu::TextureView,
     ) -> Result<wgpu::CommandBuffer, BackendError> {
         let l = &view.lighting;
-        let mut cascades = shadow::Cascades::new(view, l.sun_direction, l.shadow_distance);
+        let mut cascades = shadow::Cascades::new(
+            view,
+            l.shadow_direction.unwrap_or(l.sun_direction),
+            l.shadow_distance,
+        );
         // Far cascades are redrawn every few frames only, each keeping the
         // matrix it was drawn with meanwhile: they cost as much as the near
         // ones and change little.
@@ -2250,14 +2342,25 @@ impl WgpuBackend {
                 0.0,
                 0.0,
             ],
+            sun_disc: l.sun_disc.extend(SUN_DISC_COS).to_array(),
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
+        let timer = self.timer.as_ref();
+        if let Some(t) = timer {
+            t.begin(&mut encoder);
+        }
         if let Some(cascades) = &cascades {
             self.encode_shadows(&mut encoder, &frame, cascades, refresh, draws)?;
         }
+        let mark = |encoder: &mut wgpu::CommandEncoder, stage: usize| {
+            if let Some(t) = timer {
+                t.mark(encoder, stage);
+            }
+        };
+        mark(&mut encoder, 0);
         // Water reads the depth of what lies beneath it, and water and
         // refracting surfaces the colour behind them, so the world is
         // drawn in two passes split at the first such draw, with the
@@ -2275,9 +2378,9 @@ impl WgpuBackend {
             l.sky_color,
             l.clouds.noise,
             &draws[..split],
-            0,
             true,
         )?;
+        mark(&mut encoder, 1);
         if split < draws.len() {
             encoder.copy_texture_to_texture(
                 self.depth.depth.as_image_copy(),
@@ -2289,18 +2392,48 @@ impl WgpuBackend {
                 self.depth.color.as_image_copy(),
                 self.depth.color.size(),
             );
-            self.encode_world(
-                &mut encoder,
-                l.sky_color,
-                None,
-                &draws[split..],
-                split,
-                false,
-            )?;
+            self.encode_world(&mut encoder, l.sky_color, None, &draws[split..], false)?;
         }
+        mark(&mut encoder, 2);
         self.encode_glows(&mut encoder, draws)?;
-        self.post.encode(&self.queue, &mut encoder, l, target);
-        Ok(encoder.finish())
+        mark(&mut encoder, 3);
+        // The sun flare: its texture, and where its point (the sun's way
+        // times SUN_FLARE_DISTANCE, as the game's code places it) lands
+        // on screen, when in front and its square overlaps the screen.
+        if let Some(h) = l.flare_map
+            && let Ok(t) = self.textures.get(h.0)
+        {
+            self.post.set_flare_map(&self.device, h, &t.view);
+        }
+        let sun = {
+            let point = -l.sun_direction.normalize_or_zero() * post::SUN_FLARE_DISTANCE;
+            let clip = view.projection * view.view * point.extend(1.0);
+            (clip.w > 0.0 && l.flare_map.is_some())
+                .then(|| {
+                    let ndc = clip.truncate().truncate() / clip.w;
+                    [(ndc.x + 1.0) * 0.5, 0.5 - 0.5 * ndc.y]
+                })
+                .filter(|[x, y]| {
+                    let (w, h) = self.size();
+                    let (w, h) = (w as f32, h as f32);
+                    let half = 0.41 * h;
+                    x * w + half >= 0.0
+                        && x * w - half <= w
+                        && y * h + half >= 0.0
+                        && y * h - half <= h
+                })
+        };
+        self.post.set_projection(&view.projection);
+        self.post.encode(&self.queue, &mut encoder, l, target, sun);
+        mark(&mut encoder, 4);
+        if let Some(t) = timer {
+            t.end(&mut encoder);
+        }
+        let commands = encoder.finish();
+        if let Some(t) = timer {
+            t.finished();
+        }
+        Ok(commands)
     }
 }
 
@@ -2320,7 +2453,8 @@ async fn open(
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("m2"),
-            required_features: wgpu::Features::empty(),
+            // Timestamps for the frame timer, where the adapter has them.
+            required_features: adapter.features() & timer::features(),
             required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
             ..Default::default()
         })
@@ -2505,12 +2639,18 @@ impl RenderBackend for WgpuBackend {
             );
         }
         let view = texture.create_view(&Default::default());
-        Ok(TextureHandle(self.textures.insert(Texture { view })))
+        let bytes = mips.iter().map(|m| m.len() as u64).sum();
+        Ok(TextureHandle(self.textures.insert(Texture { view, bytes })))
     }
 
     fn destroy_texture(&mut self, texture: TextureHandle) -> Result<(), BackendError> {
         // The GPU texture is freed once no material bind group holds it.
         self.textures.remove(texture.0).map(drop)
+    }
+
+    fn remove_material(&mut self, id: MaterialId) -> Result<(), BackendError> {
+        self.materials.remove(&id);
+        Ok(())
     }
 
     fn set_material(&mut self, id: MaterialId, desc: &MaterialDesc) -> Result<(), BackendError> {
@@ -2569,6 +2709,7 @@ impl RenderBackend for WgpuBackend {
             view: *view,
             draws: Vec::new(),
             uniforms: Vec::new(),
+            slots: Vec::new(),
             palette: Vec::new(),
         });
         Ok(())
@@ -2656,16 +2797,22 @@ impl RenderBackend for WgpuBackend {
         uniforms.extend_from_slice(bytemuck::cast_slice(&[
             call.uv_offset[0],
             call.uv_offset[1],
-            0.0,
+            if call.beams_lit { 1.0 } else { 0.0 },
             0.0,
         ]));
-        uniforms.resize(uniforms.len().next_multiple_of(DRAW_STRIDE as usize), 0);
+        uniforms.extend_from_slice(bytemuck::cast_slice(&call.tint));
+        let index = frame.draws.len() as u32;
+        let first_slot = frame.slots.len() as u32;
+        frame
+            .slots
+            .extend((0..instances.max(1)).map(|i| [index, i]));
         frame.draws.push(RecordedDraw {
             pipeline: key,
             vertex_buffer: call.vertex_buffer,
             geometry: call.geometry,
             material: call.material,
             instances: instances.max(1),
+            first_slot,
             caster,
         });
         Ok(())
@@ -2695,7 +2842,62 @@ pub struct OverlayTarget<'a> {
     pub size: (u32, u32),
 }
 
+/// What the backend holds on the GPU of what it was given
+/// ([`WgpuBackend::memory`]): its live buffers' and textures' bytes, and
+/// how many materials it keeps (each holds its textures' views, so a
+/// texture destroyed while a material still names it stays in memory).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuMemory {
+    pub vertex_buffers: usize,
+    pub vertex_bytes: u64,
+    pub index_buffers: usize,
+    pub index_bytes: u64,
+    pub textures: usize,
+    pub texture_bytes: u64,
+    pub materials: usize,
+}
+
 impl WgpuBackend {
+    /// What it holds on the GPU of what it was given, for the log.
+    pub fn memory(&self) -> GpuMemory {
+        fn live<T>(p: &Slots<T>) -> impl Iterator<Item = &T> {
+            p.slots.iter().filter_map(|s| s.1.as_ref())
+        }
+        GpuMemory {
+            vertex_buffers: self.vertex_buffers.live,
+            vertex_bytes: live(&self.vertex_buffers).map(|b| b.buffer.size()).sum(),
+            index_buffers: self.index_buffers.live,
+            index_bytes: live(&self.index_buffers).map(|b| b.buffer.size()).sum(),
+            textures: self.textures.live,
+            texture_bytes: live(&self.textures).map(|t| t.bytes).sum(),
+            materials: self.materials.len(),
+        }
+    }
+}
+
+impl WgpuBackend {
+    /// Waits for the GPU to finish the offscreen frame before the last one
+    /// ended, so no more than two are in flight, as a window's swap chain
+    /// keeps them: a headless run's frame time is then the CPU's or the
+    /// GPU's, whichever is slower, and its frames don't pile up.
+    pub fn wait_for_frame_before_last(&self) -> Result<(), BackendError> {
+        if let Some(index) = self.submitted[0].clone() {
+            self.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(index),
+                    timeout: None,
+                })
+                .map_err(device_error)?;
+        }
+        Ok(())
+    }
+
+    /// The GPU time of each frame stage summed since last taken
+    /// ([`timer::STAGES`]); `None` where the device has no timestamps.
+    pub fn take_gpu_times(&self) -> Option<timer::GpuTimes> {
+        self.timer.as_ref().map(timer::GpuTimer::take)
+    }
+
     /// Ends the frame as [`RenderBackend::end_frame`] does, letting
     /// `overlay` draw over the world first.
     pub fn end_frame_with(
@@ -2713,6 +2915,7 @@ impl WgpuBackend {
             view,
             draws,
             uniforms,
+            slots,
             palette,
         } = self
             .frame
@@ -2723,8 +2926,12 @@ impl WgpuBackend {
         self.frames += 1;
         let mut regroup = false;
         if uniforms.len() as u64 > self.draw_buffer.size() {
-            let draws = (uniforms.len() as u64 / DRAW_STRIDE).next_power_of_two();
+            let draws = (uniforms.len() as u64 / DRAW_UNIFORM_SIZE).next_power_of_two();
             self.draw_buffer = Self::draw_uniforms(&self.device, draws);
+            regroup = true;
+        }
+        if slots.len() as u64 * SLOT_SIZE > self.slot_buffer.size() {
+            self.slot_buffer = Self::slots(&self.device, (slots.len() as u64).next_power_of_two());
             regroup = true;
         }
         if palette.len() as u64 * 64 > self.palette_buffer.size() {
@@ -2738,10 +2945,13 @@ impl WgpuBackend {
                 &self.draw_layout,
                 &self.draw_buffer,
                 &self.palette_buffer,
+                &self.slot_buffer,
             );
         }
         if !uniforms.is_empty() {
             self.queue.write_buffer(&self.draw_buffer, 0, &uniforms);
+            self.queue
+                .write_buffer(&self.slot_buffer, 0, bytemuck::cast_slice(&slots));
         }
         if !palette.is_empty() {
             self.queue
@@ -2770,7 +2980,11 @@ impl WgpuBackend {
                 let commands = self.encode(&view, &draws, &target)?;
                 let gamma = overlay_view(texture, format);
                 let overlay = over(&gamma, &mut overlay);
-                self.queue.submit(std::iter::once(commands).chain(overlay));
+                let index = self.queue.submit(std::iter::once(commands).chain(overlay));
+                self.submitted = [self.submitted[1].take(), Some(index)];
+                if let Some(t) = &self.timer {
+                    t.after_submit(&self.device);
+                }
             }
             // In the background: nothing to draw to.
             Target::Window { surface: None, .. } => {}
@@ -2797,6 +3011,9 @@ impl WgpuBackend {
                 let overlay = over(&gamma, &mut overlay);
                 self.queue.submit(std::iter::once(commands).chain(overlay));
                 self.queue.present(frame);
+                if let Some(t) = &self.timer {
+                    t.after_submit(&self.device);
+                }
             }
         }
         Ok(())

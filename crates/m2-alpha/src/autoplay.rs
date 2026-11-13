@@ -477,6 +477,10 @@ fn way_in_of(
     });
     into.or(door)
 }
+/// A soldier whose foe is within this of someone following her (metres)
+/// is going for them (invented: `foe_at` is where that foe stood when the
+/// soldier last looked).
+const LED_NEAR: f32 = 2.0;
 /// Within this of a crewed vehicle's middle she starts its hijack,
 /// metres (invented; m2-alpha's `HIJACK_REACH` is 6).
 const HIJACK_NEAR: f32 = 5.0;
@@ -2053,6 +2057,7 @@ impl Autoplay {
                 || self
                     .delivered
                     .is_some_and(|t| self.clock - t < DESIGNATOR_WAIT));
+        let led = game.scene.people.followers();
         // Nor with her rifle empty: she can't (PmcCon001 round r3 aimed at one
         // for 2,170 s with no rounds left); she restocks first.
         if driving.is_none()
@@ -2062,7 +2067,17 @@ impl Autoplay {
             && let Some((i, d)) = npcs
                 .iter()
                 .enumerate()
-                .filter(|(_, n)| n.alive && n.soldier && n.alert)
+                // One going for someone following her as well (the
+                // contract sweep's ChiCon001: an Allied soldier 6 m off
+                // shot the VIP behind her, 14 s after she freed them, while
+                // she walked on; the contract was cancelled).
+                .filter(|(_, n)| {
+                    n.alive
+                        && n.soldier
+                        && (n.alert
+                            || n.foe_at
+                                .is_some_and(|f| led.iter().any(|l| l.distance(f) < LED_NEAR)))
+                })
                 .filter(|(_, n)| {
                     !self.unseen.iter().any(|&(at, until)| {
                         until > self.clock && at.distance(n.character.position) < UNSEEN_NEAR
@@ -2124,6 +2139,14 @@ impl Autoplay {
             .any(|m| m.kind == "deliverable" && !SAVE_FOR_LAST.contains(&m.name.as_str()))
         {
             live.retain(|m| !SAVE_FOR_LAST.contains(&m.name.as_str()));
+        }
+        // Someone following her to a place to deliver them goes there
+        // first: the rest waits (the contract sweep's ChiCon001 got out
+        // with the VIP aboard to bomb a building on the way, and the
+        // scripts sent the VIP to stand).
+        if !game.scene.people.followers().is_empty() && live.iter().any(|m| m.kind == "deliverable")
+        {
+            live.retain(|m| m.kind == "deliverable");
         }
         // Every munition marked for her tagged (JetCon001's three bunker
         // busters, `Munitions.ActionTarget`): the pickup the tagging
@@ -2877,9 +2900,15 @@ impl Autoplay {
             })
             .find(|&i| near(i, RIDE_FRESH))
             .or_else(|| {
+                // With someone following her, not one to take from its
+                // crew: the contract sweep's ChiCon001 went for a crewed
+                // Allied M1A2 with the VIP behind her, was run over by it
+                // and lay 48 s by it; the contract was cancelled 14 s on.
+                let led = !game.scene.people.followers().is_empty();
                 self.ride
                     .into_iter()
                     .chain((0..vehicles.len()).filter(|&i| vehicles[i].guid.is_some()))
+                    .filter(|&i| !led || vehicles[i].crew.is_empty())
                     .find(|&i| near(i, RIDE_NEAR))
             })
     }
@@ -6517,6 +6546,7 @@ mod tests {
             ],
             links: Vec::new(),
             turret: None,
+            flags: Default::default(),
         };
         let entrance = |name: u32| Entrance {
             name,
@@ -7295,6 +7325,7 @@ mod tests {
             chassis: None,
             shapes: Default::default(),
             material: None,
+            path_unseen: Default::default(),
             turret_shapes: Default::default(),
             turret_mass: None,
             gun_body: None,

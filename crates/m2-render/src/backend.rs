@@ -67,6 +67,13 @@ pub struct DrawCall {
     /// Added to the texture coordinates: a scrolling texture, such as a
     /// tank's moving tracks.
     pub uv_offset: [f32; 2],
+    /// Multiplies the surface's colour and alpha (`[1.0; 4]`: as it is):
+    /// a marker model's colour, as the scripts give it.
+    pub tint: [f32; 4],
+    /// A beam material on it shines whatever the hour: the searchlights'
+    /// beams follow the night ([`Lighting::beam_gain`]), and a race's ring,
+    /// drawn with the same kind of material, must not.
+    pub beams_lit: bool,
 }
 
 /// How many [`PointLight`]s a frame draws (the game's shaders take 8).
@@ -91,6 +98,14 @@ pub struct Lighting {
     /// Direction the sunlight travels (from the sun towards the ground),
     /// world space. Need not be normalised.
     pub sun_direction: Vec3,
+    /// Direction the sun's shadows are cast along, when not the
+    /// sunlight's own (the game casts them from a sun never lower than
+    /// about 18 degrees: see `m2_engine::atmosphere`).
+    pub shadow_direction: Option<Vec3>,
+    /// The sun's disc in the sky, display values (black: none drawn).
+    pub sun_disc: Vec3,
+    /// The sun flare's texture (`radial_flare`); `None` draws no flare.
+    pub flare_map: Option<crate::TextureHandle>,
     /// Linear RGB (see [`gamma_light`](Self::gamma_light)).
     pub sun_color: Vec3,
     /// Linear RGB light reaching surfaces from every side, by the way they
@@ -115,6 +130,9 @@ pub struct Lighting {
     /// into its surroundings; 0 turns bloom off.
     pub bloom: f32,
     pub bloom_threshold: f32,
+    /// `BloomBlurRadius`: how far apart the game's blur taps stand in its
+    /// first two blurred levels (see the post pass's `blur_spread`).
+    pub bloom_radius: f32,
     /// Per-channel scale on the finished frame: a colour grade.
     pub grade: Vec3,
     /// Power on the frame's luminance about mid grey (0.18): above 1
@@ -175,6 +193,11 @@ pub struct ToneMap {
     pub min_key: f32,
     pub max_key: f32,
     pub retention: f32,
+    /// `BloomAdaptiveLuminanceScale`: how fast the eye follows. Each
+    /// frame it keeps `retention ^ (speed * dt)` of the luminance it had,
+    /// `dt` held within 1/120 and 0.1 s (from the 360 code, 0x821BD348:
+    /// its `adaptiveParams`, which the game's adaptation shader takes).
+    pub speed: f32,
     pub contrast_limit: f32,
     pub contrast: f32,
     /// Adapt to the frame's geometric mean luminance (of display values)
@@ -317,6 +340,9 @@ impl Default for Lighting {
     fn default() -> Self {
         Self {
             sun_direction: Vec3::new(-0.4, -1.0, 0.3),
+            shadow_direction: None,
+            sun_disc: Vec3::ZERO,
+            flare_map: None,
             sun_color: Vec3::new(1.0, 0.95, 0.85),
             // Sky above, warm bounce from the ground below.
             ambient_cube: [
@@ -334,6 +360,7 @@ impl Default for Lighting {
             shadow_distance: 200.0,
             exposure: 1.0,
             bloom: 0.0,
+            bloom_radius: 0.0,
             bloom_threshold: 1.0,
             grade: Vec3::ONE,
             contrast: 1.0,
@@ -508,6 +535,11 @@ pub trait RenderBackend {
     /// material that was never defined use [`MaterialDesc::default`]. The
     /// material's texture must be live when it is drawn.
     fn set_material(&mut self, id: MaterialId, desc: &MaterialDesc) -> Result<(), BackendError>;
+
+    /// Forgets material `id`: draws with it use [`MaterialDesc::default`]
+    /// again, and it no longer holds its textures (a texture destroyed
+    /// while a material names it is only freed once the material goes).
+    fn remove_material(&mut self, id: MaterialId) -> Result<(), BackendError>;
 
     fn live_buffers(&self) -> LiveBuffers;
 

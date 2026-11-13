@@ -38,6 +38,7 @@ pub const JENNIFER: HumanMotion = HumanMotion {
     crouch_walk: 1.5,
     capsule_radius: 0.4,
     capsule_height: 1.8,
+    falls: on_foot::HERO_FALLS,
 };
 /// Seconds after take-off before touching the ground counts as landing.
 const MIN_AIR: f32 = 0.15;
@@ -291,10 +292,19 @@ pub struct Bash {
 }
 
 /// Where she is in a jump.
+/// Over this speed over the ground she counts as on the move for the
+/// stagger picked, m/s (invented, as for the people: the 360 reads a
+/// field of the movement record whose meaning is not established).
+const STAGGER_MOVING: f32 = 0.5;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Leap {
     /// On the ground.
     No,
+    /// On the ground in the take-off (`Upright` `JumpTakeoffMoving` or
+    /// `JumpTakeoffStationary`): seconds into its clip, the clip, and when
+    /// in it its `jump` event launches her.
+    Windup(f32, usize, f32),
     /// In the air, this many seconds after taking off.
     Air(f32),
     /// Landed this many seconds ago, playing the landing clip.
@@ -405,8 +415,24 @@ pub struct Player {
     /// Jump was pressed while she was landing: she jumps again as the
     /// landing ends.
     jump_queued: bool,
+    /// The stance and action the state table has her in through a jump
+    /// ([`m2_engine::human_state`]), and whether the air's loop plays.
+    human: m2_engine::human_state::HumanState,
+    air_looped: bool,
+    /// A stagger picked for her, to start on her rig this step (its clip
+    /// and action), and the seconds since her last began
+    /// ([`m2_engine::stagger`]).
+    stagger_pending: Option<(usize, u32)>,
+    since_stagger: Option<f32>,
+    /// Whether she carries someone (a subdued prisoner): her gaits are
+    /// then the `Carrying` stance's ([`crate::held::Moves::carrying`]; from
+    /// the 360 code, the stance's own locomotion node).
+    pub carrying: bool,
     /// Seconds into a grenade throw, while she throws.
     pub throwing: Option<f32>,
+    /// The throw's clip and when in it the grenade leaves her hand, picked
+    /// as it starts ([`Player::start_throw`]).
+    throw_clip: Option<(usize, f32)>,
     /// A melee bash, while she bashes: she stands, facing the camera's
     /// way.
     pub bashing: Option<Bash>,
@@ -414,9 +440,18 @@ pub struct Player {
     pub launcher: bool,
     /// Down (out of health): she lies where she fell.
     pub down: bool,
+    /// How far she falls, from leaving the ground to coming down
+    /// ([`on_foot::FallWatch`]), and a fall that hurt her this step, for
+    /// the fight to take from her health.
+    fall: on_foot::FallWatch,
+    pub fell: Option<on_foot::Fell>,
     /// Sitting in the seat of the vehicle she drives, posed and placed
     /// there (`hijack::Hijacks::seat`): drawn though driving.
     pub seated: bool,
+    /// Her limp body, while she is down from a death on foot: the 360's
+    /// plain `Die` has no clip and makes a person a ragdoll at once
+    /// ([`crate::combat::Combat`] makes it and takes it away).
+    pub ragdoll: Option<m2_engine::RagdollId>,
     /// Seated: model to world for her body, the vehicle's whole turn
     /// (pitch and roll as well as heading) with her clip's origin on the
     /// seat ([`model_matrix`](Self::model_matrix)).
@@ -430,6 +465,11 @@ pub struct Player {
     shown: InHand,
     /// A weapon switch, while it plays over her upper body.
     pub switching: Option<Switch>,
+    /// Standing still: the idle, the second idle or the fidget, as the
+    /// 360's standing mode times them ([`m2_engine::stand_idle`]), and
+    /// the seconds the fidget has played.
+    stand: m2_engine::stand_idle::StandIdle,
+    fidgeted: f32,
     /// Her binoculars, while they are up ([`crate::binoculars`]): the
     /// frame is seen through them and her body is left out.
     pub binoculars: Option<Binoculars>,
@@ -623,16 +663,27 @@ impl Player {
             last_yaw: yaw,
             leap: Leap::No,
             jump_queued: false,
+            human: m2_engine::human_state::HumanState::default(),
+            air_looped: false,
+            stagger_pending: None,
+            since_stagger: None,
+            carrying: false,
             throwing: None,
+            throw_clip: None,
             bashing: None,
             launcher: false,
             down: false,
+            fall: on_foot::FallWatch::default(),
+            fell: None,
             seated: false,
+            ragdoll: None,
             seat_frame: None,
             moves: Moves::default(),
             in_hand: InHand::default(),
             shown: InHand::default(),
             switching: None,
+            stand: m2_engine::stand_idle::StandIdle::new(0.5),
+            fidgeted: 0.0,
             picking: None,
             reloading: None,
             binoculars: None,
@@ -669,9 +720,6 @@ impl Player {
     pub fn set_body(&mut self, model: Option<(GpuModel, Rig)>, clips: FightClips, moves: Moves) {
         self.model = model;
         self.clips = clips;
-        if let Some((_, rig)) = &self.model {
-            self.clips.sprint = crate::npc::two_handed_sprint(rig, self.clips.run_low);
-        }
         self.moves = moves;
         self.leap = Leap::No;
         self.jump_queued = false;
@@ -715,9 +763,6 @@ impl Player {
             l.clips.extend(set.gaits.iter().copied());
             let gait = rig.gait;
             rig.set_gait(gait);
-        }
-        if let Some((_, rig)) = &self.model {
-            self.clips.sprint = crate::npc::two_handed_sprint(rig, self.clips.run_low);
         }
     }
 
@@ -775,12 +820,39 @@ impl Player {
     /// Starts throwing a grenade, if she has a throw to play and isn't
     /// throwing already: the seconds until it leaves her hand. `None`
     /// without the clip (the grenade goes at once).
+    ///
+    /// From the 360 code ([`m2_engine::hero_action`]): the throw is
+    /// `ThrowGrenadeRun` on the move and `ThrowGrenadeIdle` standing, to
+    /// the front, back, left or right by the angle from the way she faces
+    /// to the way she throws (the camera's), and the tables give the clip
+    /// for what she holds ([`crate::held::Held::throws`]). On the move is
+    /// her gait above a walk (inferred: the program tests its pace bits
+    /// above 1, whose values were not traced). Where the tables give her
+    /// none, the throw found by name plays as before.
     pub fn start_throw(&mut self) -> Option<f32> {
         if self.throwing.is_some() {
             return None;
         }
-        let (_, release) = self.clips.throw?;
-        self.model.as_ref()?;
+        let (_, rig) = self.model.as_ref()?;
+        let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
+        let moving = !matches!(
+            crate::scene::loco_gait(self.motion.paces, moved),
+            Gait::Idle | Gait::Walk
+        );
+        let way = m2_engine::hero_action::throw_way(self.facing - self.yaw);
+        let tabled = self
+            .moves
+            .of(self.shown.class)
+            .and_then(|h| h.throws.get(&(moving, way)).copied());
+        let (clip, release) = tabled.or(self.clips.throw)?;
+        eprintln!(
+            "anim: throw {:08x} ({}, {}{})",
+            rig.clips[clip].hash,
+            m2_engine::hero_action::throw_action(moving),
+            way.name(),
+            if tabled.is_some() { "" } else { "; by name" }
+        );
+        self.throw_clip = Some((clip, release));
         self.throwing = Some(0.0);
         Some(release)
     }
@@ -1021,6 +1093,11 @@ impl Player {
             direction
         };
         if self.update_swim(physics, swim_push, self.swim_speeds[pace], dt) {
+            // In the water no fall is being measured (inferred: the 360
+            // does not send the fall's distance under two flags of the
+            // physics object that were not traced; a dive must not cost
+            // her health when she walks out).
+            self.fall = on_foot::FallWatch::default();
             self.camera(physics);
             return;
         }
@@ -1103,10 +1180,31 @@ impl Player {
             )
         };
         let wanted = Vec3::new(ground.x, 0.0, ground.y);
-        let jump = self
-            .takes_off(intent.jump, bashing)
-            .then(|| self.motion.jump_speed());
+        use m2_engine::human_state::{self, HumanState};
+        if let Some(s) = &mut self.since_stagger {
+            *s += dt;
+        }
+        let (windup_started, launch) =
+            self.jump_step(intent.jump, bashing, walking.length_squared(), dt);
+        let jump = launch.then(|| self.motion.jump_speed());
         physics.move_character(&mut self.character, wanted, jump, dt);
+        // A fall that hurts: the 360 measures it from where she left the
+        // ground, and by her template's limits it costs her health and
+        // posts `FallImpactLight` or `FallImpactHeavy`.
+        let fallen = self
+            .fall
+            .step(!self.character.grounded, self.character.position.y)
+            .and_then(|d| on_foot::fall_impact(&self.motion.falls, d).map(|f| (d, f)));
+        if let Some((distance, fell)) = fallen {
+            eprintln!(
+                "fall: {distance:.1} m, {} damage{}",
+                fell.damage,
+                fell.impact
+                    .map_or(String::new(), |i| format!(", {}", i.name()))
+            );
+            self.fell = Some(fell);
+        }
+        let impact = fallen.and_then(|(_, f)| f.impact);
 
         // Aiming, throwing or bashing, she turns the camera's way.
         let aimed = self.aiming || self.throwing.is_some() || bashing;
@@ -1226,9 +1324,37 @@ impl Player {
                     h.crouch.iter().find(|(g, b, _)| *g == gait && *b == back)
                 })
                 .map(|&(_, _, c)| c);
+            // Carrying someone she is `Carrying`: its gait's clip, whole.
+            let carried = (self.carrying && !self.aiming)
+                .then(|| self.moves.carry_clip(gait))
+                .flatten();
             // The jump: a take-off (on the run or standing), the air,
             // and a landing.
-            if jump.is_some() {
+            if let Some(clip) = windup_started {
+                use m2_engine::blend::action;
+                let act = if self.human.is("Upright", "JumpTakeoffMoving") {
+                    action::JUMP_TAKEOFF_MOVING
+                } else {
+                    action::JUMP_TAKEOFF_STATIONARY
+                };
+                eprintln!(
+                    "jump: wind-up {:08x} ({}.{}), launch at {:.2} s",
+                    rig.clips[clip].hash,
+                    self.human.stance,
+                    self.human.action,
+                    match self.leap {
+                        Leap::Windup(_, _, at) => at,
+                        _ => 0.0,
+                    }
+                );
+                let hips = rig
+                    .gait_clip(Gait::Idle)
+                    .map_or(1.0, |i| rig.clips[i].info.hips);
+                rig.animator.play_leveled(clip, hips, act);
+            } else if jump.is_some() {
+                // Out of a take-off the rise is the `Jump` action's.
+                let risen = matches!(self.leap, Leap::Windup(..));
+                self.air_looped = false;
                 let takeoff = if moved > RUNNING_JUMP {
                     clips.takeoff.or(clips.takeoff_still)
                 } else {
@@ -1239,6 +1365,7 @@ impl Player {
                 let was = match self.leap {
                     Leap::No => "on her feet".to_owned(),
                     Leap::Air(t) => format!("in the air {t:.2} s"),
+                    Leap::Windup(t, ..) => format!("{t:.2} s into the take-off"),
                     Leap::Land(t, c) => {
                         format!("landing {t:.2} of {:.2} s", rig.clips[c].info.duration)
                     }
@@ -1249,6 +1376,7 @@ impl Player {
                 // take-off blends in, the air `Jump` snaps.
                 use m2_engine::blend::action;
                 let played = match takeoff {
+                    Some(c) if risen => Some((c, action::JUMP)),
                     Some(c) if Some(c) == clips.takeoff => Some((c, action::JUMP_TAKEOFF_MOVING)),
                     Some(c) => Some((c, action::JUMP_TAKEOFF_STATIONARY)),
                     None => clips.jump.map(|c| (c, action::JUMP)),
@@ -1262,9 +1390,26 @@ impl Player {
                     rig.animator.play_leveled(clip, hips, act);
                 }
             } else {
+                let states = self.moves.states.clone();
+                let was_landing = matches!(self.leap, Leap::Land(..));
                 self.leap = match self.leap {
+                    Leap::Windup(..) => self.leap,
                     Leap::Air(t) if t > MIN_AIR && self.character.grounded => {
-                        let land = if moved > RUNNING_LAND {
+                        // The physics' message on touching down picks the
+                        // landing by the state table; without it, by her
+                        // speed as before.
+                        let (fs, fc) = self.facing.sin_cos();
+                        let v = self.character.velocity;
+                        let message = human_state::ground_message(v.x * fs + v.z * fc);
+                        let posted = states
+                            .as_deref()
+                            .is_some_and(|t| self.human.post(t, message));
+                        let running = if posted {
+                            self.human.is("Upright", "JumpLandMoving")
+                        } else {
+                            moved > RUNNING_LAND
+                        };
+                        let land = if running {
                             clips.land.or(clips.land_still)
                         } else {
                             clips.land_still.or(clips.land)
@@ -1285,7 +1430,28 @@ impl Player {
                             None => Leap::No,
                         }
                     }
-                    Leap::Air(t) => Leap::Air(t + dt),
+                    Leap::Air(t) => {
+                        // The rise's clip over, `Complete` takes her to
+                        // `InAir` `Jump`, the air's loop.
+                        let over = rig
+                            .animator
+                            .current()
+                            .is_some_and(|(c, at)| at + 1e-3 >= rig.clips[c].info.duration);
+                        if !self.air_looped
+                            && over
+                            && self.human.is("Upright", "Jump")
+                            && let Some(t) = states.as_deref()
+                            && self.human.post(t, human_state::message::COMPLETE)
+                            && self.human.is("InAir", "Jump")
+                            && let Some(air) = clips.jump
+                        {
+                            self.air_looped = true;
+                            eprintln!("jump: the air's loop {:08x}", rig.clips[air].hash);
+                            rig.animator
+                                .play_action(air, false, m2_engine::blend::action::JUMP);
+                        }
+                        Leap::Air(t + dt)
+                    }
                     // A standing landing gives way when she sets off.
                     Leap::Land(t, clip)
                         if t + LAND_FADE < rig.clips[clip].info.duration
@@ -1295,6 +1461,30 @@ impl Player {
                     }
                     Leap::Land(..) | Leap::No => Leap::No,
                 };
+                // The landing's clip over: `Complete`, back to the idle.
+                if self.leap == Leap::No {
+                    if was_landing && let Some(t) = states.as_deref() {
+                        self.human.post(t, human_state::message::COMPLETE);
+                    }
+                    self.human = HumanState::default();
+                }
+            }
+            // A fall that hurt plays its impact in the landing's place.
+            if let Some(i) = impact
+                && let Some(clip) =
+                    self.moves.fall_impacts[usize::from(i == on_foot::FallImpact::Heavy)]
+            {
+                rig.animator
+                    .play_action(clip, true, m2_assets::name_hash(i.name()));
+                self.leap = Leap::Land(0.0, clip);
+            }
+            // A stagger plays whole in the same way (a whole-body action
+            // of the `Upright` stance).
+            if let Some((clip, action)) = self.stagger_pending.take() {
+                eprintln!("stagger: she plays {:08x}", rig.clips[clip].hash);
+                rig.animator.set_upper(None);
+                rig.animator.play_action(clip, true, action);
+                self.leap = Leap::Land(0.0, clip);
             }
             let leaping = self.leap != Leap::No;
             // The launcher rides on her shoulder, as when she aims it.
@@ -1374,11 +1564,81 @@ impl Player {
                 let upper = (gait != Gait::Idle).then_some(clips.aim).flatten();
                 rig.animator.set_upper(upper.zip(rig.upper.clone()));
                 rig.two_handed = rig.barrel;
+            } else if let Some(c) = carried {
+                rig.gait = gait;
+                rig.play_gait(c);
+                rig.animator.set_upper(None);
+                rig.two_handed = false;
             } else {
-                rig.hold_rifle(gait, clips, carry);
-                // A pistol is held in the right hand alone.
-                if !rig.barrel {
-                    rig.two_handed = false;
+                // Standing still and not aiming she is in the 360's
+                // standing mode: its second idle after a while and its
+                // fidget now and then ([`m2_engine::stand_idle`]), for
+                // what she holds. Anything else she does starts the waits
+                // again (inferred: the 360 leaves the standing mode, or
+                // the action, for those).
+                use m2_engine::stand_idle::{Person, StandIdle, Standing};
+                let held = self.moves.of(self.shown.class);
+                let (settled, fidget) = held.map_or((None, None), |h| (h.settled, h.fidget));
+                let still = gait == Gait::Idle
+                    && !self.aiming
+                    && self.bashing.is_none()
+                    && self.picking.is_none()
+                    && self.throwing.is_none()
+                    && self.switching.is_none()
+                    && self.reloading.is_none()
+                    && self.stopping.is_none();
+                // The wait's random part, from where she stands (the
+                // 360's is its random number; which she gets is invented).
+                let at = self.character.position;
+                let roll = ((at.x * 12.9898 + at.z * 78.233).sin() * 43_758.547)
+                    .fract()
+                    .abs();
+                if still {
+                    let fidget_length = fidget.map_or(0.0, |c| rig.clips[c].info.duration);
+                    let person = Person {
+                        aiming: false,
+                        held: false,
+                        has_settled: settled.is_some(),
+                        // Not aiming, her aim rests ahead of her (inferred).
+                        aim_yaw: 0.0,
+                        fidget_done: fidget.is_none() || self.fidgeted >= fidget_length,
+                    };
+                    if let Some(to) = self.stand.step(dt, person, roll) {
+                        self.fidgeted = 0.0;
+                        eprintln!("anim: standing {to:?}");
+                    }
+                    if self.stand.state == Standing::Fidget {
+                        self.fidgeted += dt;
+                    }
+                } else {
+                    self.stand = StandIdle::new(roll);
+                    self.fidgeted = 0.0;
+                }
+                let clip = match self.stand.state {
+                    Standing::Settled => settled,
+                    Standing::Fidget => fidget,
+                    Standing::Idle => None,
+                };
+                match clip.filter(|_| still) {
+                    Some(c) => {
+                        // A clip of the locomotion node's, as its gaits
+                        // are: faded over the node's 0.3 s, from its start.
+                        let fresh = rig.animator.current().is_none_or(|(i, _)| i != c);
+                        rig.gait = gait;
+                        rig.play_gait(c);
+                        if fresh {
+                            rig.animator.restart();
+                        }
+                        rig.animator.set_upper(None);
+                        rig.two_handed = rig.barrel;
+                    }
+                    None => {
+                        rig.hold_rifle(gait, clips, carry);
+                        // A pistol is held in the right hand alone.
+                        if !rig.barrel {
+                            rig.two_handed = false;
+                        }
+                    }
                 }
             }
             // A weapon switch: what she holds goes away over her upper
@@ -1416,7 +1676,7 @@ impl Player {
                 }
             }
             // A throw plays over the upper body, whatever the legs do.
-            match (self.throwing, clips.throw, rig.upper.clone()) {
+            match (self.throwing, self.throw_clip, rig.upper.clone()) {
                 (Some(t), Some((clip, _)), Some(mask)) if t < rig.clips[clip].info.duration => {
                     rig.animator.upper_at(clip, mask, t);
                     rig.two_handed = false;
@@ -1452,8 +1712,9 @@ impl Player {
             } else if leaping || self.stopping.is_some() {
                 1.0
             } else {
-                match crouched.map(|c| rig.clips[c].info.speed) {
-                    // Crouched and moving, its stride to her speed.
+                match crouched.or(carried).map(|c| rig.clips[c].info.speed) {
+                    // Crouched (or carrying) and moving, its stride to
+                    // her speed.
                     Some(s) if gait != Gait::Idle && s > 0.1 => moved / s,
                     Some(_) => 1.0,
                     None => rig.play_rate(gait, moved, 0),
@@ -1470,6 +1731,66 @@ impl Player {
         self.camera(physics);
     }
 
+    /// One step of the jump's start, as the 360 runs it
+    /// ([`m2_engine::human_state`]): the press posts `JumpMoving` or
+    /// `JumpStationary` (by `stick_sq`, the squared length of the stick's
+    /// move), the state table answers with the take-off, and its clip's
+    /// `jump` event launches her. Returns the take-off's clip on the step
+    /// it starts, and whether she leaves the ground this step. Without
+    /// the table or the take-off's clip she leaves on the press, as
+    /// before.
+    fn jump_step(
+        &mut self,
+        pressed: bool,
+        bashing: bool,
+        stick_sq: f32,
+        dt: f32,
+    ) -> (Option<usize>, bool) {
+        use m2_engine::human_state::{self, HumanState};
+        let mut windup_started = None;
+        let mut launch = false;
+        if self.takes_off(pressed, bashing) {
+            // Whatever cut the last jump short, she starts from the idle.
+            self.human = HumanState::default();
+            let message = human_state::jump_message(stick_sq);
+            let states = self.moves.states.clone();
+            let posted = states
+                .as_deref()
+                .is_some_and(|t| self.human.post(t, message));
+            let windup = posted
+                .then(|| {
+                    let moving = self.human.is("Upright", "JumpTakeoffMoving");
+                    self.moves
+                        .of(self.shown.class)
+                        .and_then(|h| h.windup[usize::from(moving)])
+                })
+                .flatten();
+            match windup {
+                Some((clip, at)) => {
+                    self.leap = Leap::Windup(0.0, clip, at);
+                    windup_started = Some(clip);
+                }
+                None => launch = true,
+            }
+        } else if let Leap::Windup(t, clip, at) = self.leap {
+            if !self.character.grounded || bashing {
+                // The ground went from under her: no jump (invented; the
+                // 360's take-off then goes on `Falling` to `InAir` `Fall`).
+                self.leap = Leap::No;
+                self.human = HumanState::default();
+            } else if t + dt >= at {
+                launch = true;
+            } else {
+                self.leap = Leap::Windup(t + dt, clip, at);
+            }
+        }
+        if launch && let Some(t) = self.moves.states.clone() {
+            // What the physics posts as she leaves the ground.
+            self.human.post(&t, human_state::message::JUMP_IN_AIR);
+        }
+        (windup_started, launch)
+    }
+
     /// Whether she takes off now, jump `pressed` this tick. A jump is a
     /// whole-body action (the action table's `Upright` `JUMP` row is
     /// `FullBody`): she takes off again only once the last one is over,
@@ -1478,6 +1799,52 @@ impl Player {
     /// the run), or a moment after touching down, cutting the landing
     /// short (playtest 8). A press while she lands is kept for its end.
     /// Inferred from the table and the clips; the 360 code was not read.
+    /// The damage `event` reached her and she lives: the stagger the 360
+    /// picks for a player's character ([`m2_engine::stagger::pick`]: by
+    /// a melee bash, or the long one by an explosion), if she holds a
+    /// clip for it. On her feet on the ground only: the state table
+    /// leads to the staggers from `Upright` actions. True if she
+    /// staggers.
+    pub fn stagger(&mut self, event: &m2_engine::stagger::Event) -> bool {
+        use m2_engine::stagger::{self, Person};
+        if self.down || self.driving.is_some() || self.seated || !self.character.grounded {
+            return false;
+        }
+        if !matches!(self.leap, Leap::No | Leap::Land(..)) {
+            return false;
+        }
+        let v = self.character.velocity;
+        let Some(pick) = stagger::pick(
+            &Person {
+                facing: self.facing,
+                player: true,
+                immune: false,
+                crouched: false,
+                moving: v.x.hypot(v.z) > STAGGER_MOVING,
+                since: self.since_stagger,
+                cooldown: stagger::COOLDOWN,
+                reset: stagger::RESET,
+            },
+            event,
+        ) else {
+            return false;
+        };
+        let Some(clip) = self
+            .moves
+            .of(self.shown.class)
+            .and_then(|h| h.staggers[pick.stagger as usize][pick.direction as usize])
+        else {
+            return false;
+        };
+        eprintln!(
+            "stagger: she staggers {:?} {:?}",
+            pick.stagger, pick.direction
+        );
+        self.stagger_pending = Some((clip, pick.stagger.action()));
+        self.since_stagger = Some(0.0);
+        true
+    }
+
     fn takes_off(&mut self, pressed: bool, bashing: bool) -> bool {
         if pressed && matches!(self.leap, Leap::Land(..)) {
             self.jump_queued = true;
@@ -1728,6 +2095,7 @@ mod tests {
             chassis: None,
             shapes: Default::default(),
             material: None,
+            path_unseen: Default::default(),
             turret_shapes: Default::default(),
             turret_mass: None,
             gun_body: None,
@@ -2163,6 +2531,141 @@ mod tests {
         p.driving = None;
         let up = p.model_matrix().transform_vector3(Vec3::Y);
         assert!((up - Vec3::Y).length() < 1e-5, "{up}");
+    }
+
+    /// A state table with the jump's rows, and a rifle whose take-offs
+    /// are clips 7 and 8, launching just under 0.10 s in.
+    fn jump_moves() -> Moves {
+        use m2_assets::human_states::{Action, HumanStates, Stance, Transition};
+        let action = |name: &str, to: &[[&str; 3]]| Action {
+            name: name.to_owned(),
+            transitions: to
+                .iter()
+                .map(|t| Transition {
+                    message: t[0].to_owned(),
+                    stance: t[1].to_owned(),
+                    action: t[2].to_owned(),
+                    unk_0x0c: 0,
+                })
+                .collect(),
+            ..Action::default()
+        };
+        let rise = [["JumpInAir", "Upright", "Jump"]];
+        let states = HumanStates {
+            unk_0x00: 5,
+            stances: vec![Stance {
+                name: "Upright".to_owned(),
+                actions: vec![
+                    action(
+                        "Idle",
+                        &[
+                            ["JumpMoving", "Upright", "JumpTakeoffMoving"],
+                            ["JumpStationary", "Upright", "JumpTakeoffStationary"],
+                        ],
+                    ),
+                    action("JumpTakeoffMoving", &rise),
+                    action("JumpTakeoffStationary", &rise),
+                    action("Jump", &[]),
+                ],
+            }],
+        };
+        Moves {
+            held: vec![crate::held::Held {
+                class: m2_assets::animation_table::RIFLE,
+                windup: [Some((7, 0.095)), Some((8, 0.095))],
+                ..Default::default()
+            }],
+            states: Some(std::sync::Arc::new(states)),
+            ..Moves::default()
+        }
+    }
+
+    #[test]
+    fn a_jump_winds_up_and_leaves_the_ground_on_the_clips_event() {
+        let mut p = Player::new(0.0, 0.0, 0.0, None);
+        p.character.grounded = true;
+        p.moves = jump_moves();
+        // Pressed with the stick pushed: the moving take-off starts, and
+        // she stays down.
+        assert_eq!(p.jump_step(true, false, 1.0, 0.02), (Some(8), false));
+        assert!(p.human.is("Upright", "JumpTakeoffMoving"));
+        assert!(matches!(p.leap, Leap::Windup(..)));
+        // A press in the take-off does nothing; four steps on (0.08 s) she
+        // is still down, the fifth reaches the event and launches.
+        for _ in 0..4 {
+            assert_eq!(p.jump_step(true, false, 1.0, 0.02), (None, false));
+        }
+        assert_eq!(p.jump_step(false, false, 1.0, 0.02), (None, true));
+        assert!(p.human.is("Upright", "Jump"));
+    }
+
+    #[test]
+    fn a_standing_jump_takes_the_stationary_take_off() {
+        let mut p = Player::new(0.0, 0.0, 0.0, None);
+        p.character.grounded = true;
+        p.moves = jump_moves();
+        assert_eq!(p.jump_step(true, false, 0.2, 0.02), (Some(7), false));
+        assert!(p.human.is("Upright", "JumpTakeoffStationary"));
+        // The ground gone from under her in the take-off: no jump.
+        p.character.grounded = false;
+        assert_eq!(p.jump_step(false, false, 0.2, 0.02), (None, false));
+        assert_eq!(p.leap, Leap::No);
+        assert!(p.human.is("Upright", "Idle"));
+    }
+
+    #[test]
+    fn she_staggers_by_a_bash_and_a_blast_but_not_a_bullet() {
+        use m2_engine::stagger::{Direction, EXPLOSION, Event, Stagger};
+        let mut p = Player::new(0.0, 0.0, 0.0, None);
+        p.character.grounded = true;
+        let mut held = crate::held::Held {
+            class: m2_assets::animation_table::RIFLE,
+            ..Default::default()
+        };
+        held.staggers[Stagger::InPlace as usize][Direction::Front as usize] = Some(11);
+        held.staggers[Stagger::Long as usize][Direction::Back as usize] = Some(12);
+        p.moves = Moves {
+            held: vec![held],
+            ..Moves::default()
+        };
+        let hit = |direction, direct, melee, key| Event {
+            direction,
+            direct,
+            melee,
+            key,
+        };
+        // Facing +z: a bullet does nothing, a bash from ahead staggers.
+        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, false, None)));
+        assert!(p.stagger(&hit(Vec3::NEG_Z, true, true, None)));
+        assert_eq!(
+            p.stagger_pending,
+            Some((11, m2_engine::blend::action::STAGGER_IN_PLACE))
+        );
+        // Not again within a quarter of a second.
+        p.since_stagger = Some(0.1);
+        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None)));
+        // A blast behind her: the long one. Without its clip, nothing.
+        p.since_stagger = Some(2.0);
+        assert!(p.stagger(&hit(Vec3::Z, false, false, Some(EXPLOSION))));
+        assert_eq!(p.stagger_pending.map(|s| s.0), Some(12));
+        p.since_stagger = Some(2.0);
+        assert!(!p.stagger(&hit(Vec3::X, false, false, Some(EXPLOSION))));
+        // In the air, never.
+        p.character.grounded = false;
+        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None)));
+    }
+
+    #[test]
+    fn without_the_state_table_she_jumps_on_the_press() {
+        let mut p = Player::new(0.0, 0.0, 0.0, None);
+        p.character.grounded = true;
+        assert_eq!(p.jump_step(true, false, 1.0, 0.02), (None, true));
+        // With the table but no take-off clip for what she holds, too.
+        let mut q = Player::new(0.0, 0.0, 0.0, None);
+        q.character.grounded = true;
+        q.moves = jump_moves();
+        q.moves.held[0].windup = [None, None];
+        assert_eq!(q.jump_step(true, false, 1.0, 0.02), (None, true));
     }
 
     #[test]

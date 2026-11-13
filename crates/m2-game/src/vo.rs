@@ -43,9 +43,48 @@ struct Line {
     seconds: Option<f64>,
 }
 
+/// A line of a speaker's starting or stopping, for what goes with their
+/// voice: their face.
+///
+/// From the 360 code: as a line's sound starts the voice manager posts
+/// the speaker a face animation or a talking expression (`0x822782D8`),
+/// and as the line is taken out, however it ends, it ends it
+/// (`0x82278440`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Speech {
+    /// Line `id` of `cue` (its name's hash) started; `speaker` is `None`
+    /// over the radio.
+    Started {
+        id: u32,
+        speaker: Option<u32>,
+        cue: u32,
+    },
+    /// The line stopped: it ended, was cut off or was cancelled.
+    Stopped {
+        id: u32,
+        speaker: Option<u32>,
+        cue: u32,
+    },
+}
+
+/// A line being said, and how far into it the voice is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Speaking {
+    pub id: u32,
+    pub speaker: Option<u32>,
+    /// The cue's name hash.
+    pub cue: u32,
+    /// Seconds since the line started.
+    pub clock: f64,
+    /// How long the line lasts, once the game has said.
+    pub seconds: Option<f64>,
+}
+
 /// The lines playing.
 #[derive(Debug, Default)]
 pub struct Lines {
+    /// Starts and stops since last taken ([`Lines::take_speech`]).
+    speech: Vec<Speech>,
     playing: Vec<Line>,
     next: u32,
     /// Lines whose text is to go up (by id), waiting for their length.
@@ -87,7 +126,50 @@ impl Lines {
                 l.speaker == speaker && cue.is_none_or(|c| l.cue.eq_ignore_ascii_case(c))
             });
         self.playing = keep;
-        gone.into_iter().map(|l| Command::Hush(l.id)).collect()
+        gone.into_iter().map(|l| self.hush(&l)).collect()
+    }
+
+    /// Stops every line (`VO.CancelAll`), without callbacks.
+    pub fn cancel_all(&mut self) -> Vec<Command> {
+        std::mem::take(&mut self.playing)
+            .into_iter()
+            .map(|l| self.hush(&l))
+            .collect()
+    }
+
+    /// The command that stops `line`; a line that had started is told
+    /// as stopped.
+    fn hush(&mut self, line: &Line) -> Command {
+        if line.started.is_some() {
+            self.speech.push(Speech::Stopped {
+                id: line.id,
+                speaker: line.speaker,
+                cue: m2_assets::name_hash(&line.cue),
+            });
+        }
+        Command::Hush(line.id)
+    }
+
+    /// The lines that started or stopped since last asked, in order: a
+    /// queue for the game to drain each tick.
+    pub fn take_speech(&mut self) -> Vec<Speech> {
+        std::mem::take(&mut self.speech)
+    }
+
+    /// The lines being said at `now`, each with its voice's clock.
+    pub fn speaking(&self, now: f64) -> Vec<Speaking> {
+        self.playing
+            .iter()
+            .filter_map(|l| {
+                Some(Speaking {
+                    id: l.id,
+                    speaker: l.speaker,
+                    cue: m2_assets::name_hash(&l.cue),
+                    clock: now - l.started?,
+                    seconds: l.seconds,
+                })
+            })
+            .collect()
     }
 
     /// The subtitles to go up now, each with how long its line lasts: the
@@ -122,7 +204,14 @@ impl Lines {
     /// Starts the clock on new lines and takes those that have ended.
     fn ended(&mut self, now: f64) -> Vec<Line> {
         for l in &mut self.playing {
-            l.started.get_or_insert(now);
+            if l.started.is_none() {
+                l.started = Some(now);
+                self.speech.push(Speech::Started {
+                    id: l.id,
+                    speaker: l.speaker,
+                    cue: m2_assets::name_hash(&l.cue),
+                });
+            }
         }
         let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.playing)
             .into_iter()
@@ -131,6 +220,13 @@ impl Lines {
                     .is_some_and(|s| now - s >= l.seconds.unwrap_or(UNHEARD_SECONDS))
             });
         self.playing = keep;
+        for l in &done {
+            self.speech.push(Speech::Stopped {
+                id: l.id,
+                speaker: l.speaker,
+                cue: m2_assets::name_hash(&l.cue),
+            });
+        }
         done
     }
 }
@@ -199,6 +295,53 @@ pub fn update(world: &Shared, lua: &Lua, now: f64) -> Vec<(String, Option<mlua::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_s_start_and_stop_are_told_with_its_clock() {
+        let mut v = Lines::default();
+        let id = |c: Command| match c {
+            Command::Say { id, .. } => id,
+            _ => unreachable!(),
+        };
+        let cue = m2_assets::name_hash("a");
+        let a = id(v.cue(Some(7), "a".into(), None, false));
+        // Cued, not yet started: nothing to tell.
+        assert!(v.take_speech().is_empty());
+        assert!(v.speaking(0.0).is_empty());
+        v.ended(10.0);
+        let started = Speech::Started {
+            id: a,
+            speaker: Some(7),
+            cue,
+        };
+        assert_eq!(v.take_speech(), [started]);
+        v.set_length(a, 2.0);
+        let now = v.speaking(10.5);
+        assert_eq!(now.len(), 1);
+        assert_eq!(
+            (now[0].speaker, now[0].cue, now[0].clock, now[0].seconds),
+            (Some(7), cue, 0.5, Some(2.0))
+        );
+        // It runs out: stopped, once.
+        v.ended(12.0);
+        let stopped = |id| Speech::Stopped {
+            id,
+            speaker: Some(7),
+            cue,
+        };
+        assert_eq!(v.take_speech(), [stopped(a)]);
+        assert!(v.take_speech().is_empty() && v.speaking(12.0).is_empty());
+        // A started line that is cancelled stops too; one cancelled
+        // before it started tells nothing.
+        let b = id(v.cue(Some(7), "a".into(), None, false));
+        v.ended(13.0);
+        v.take_speech();
+        v.cancel(Some(7), None);
+        assert_eq!(v.take_speech(), [stopped(b)]);
+        v.cue(Some(7), "a".into(), None, false);
+        v.cancel_all();
+        assert!(v.take_speech().is_empty());
+    }
 
     #[test]
     fn subtitles_wait_for_their_line_length() {

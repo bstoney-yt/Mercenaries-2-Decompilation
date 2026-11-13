@@ -180,7 +180,15 @@ fn flyby(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiValue> 
     let from = [n(1), altitude, n(2)];
     let to = [n(3), altitude, n(4)];
     let guid = w.spawn_guid();
-    w.insert(guid, Object::new(&what, from));
+    // The plane is an object of its template: its labels (its script
+    // picks its radar icon by them) and its object script.
+    let lower = what.to_ascii_lowercase();
+    let mut plane = Object::new(&what, from);
+    if let Some(l) = w.template_labels.get(&lower) {
+        plane.label_hashes.clone_from(l);
+    }
+    w.insert(guid, plane);
+    w.note_script(guid, &lower);
     w.commands.push(Command::Flyby {
         guid,
         what,
@@ -366,7 +374,9 @@ fn carpet_line(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiV
     let Some(at) = point(a, 0) else {
         return values([]);
     };
-    let heading = num(a.get(3)).unwrap_or(0.0);
+    // Degrees, as every angle the scripts pass (the 360 multiplies by
+    // 0.01745, 0x820f8c74).
+    let heading = num(a.get(3)).unwrap_or(0.0).to_radians();
     let owner = id(a.get(4));
     let count = num(a.get(6)).unwrap_or(1.0).max(0.0) as u32;
     let spacing = num(a.get(7)).unwrap_or(0.0);
@@ -486,6 +496,58 @@ fn values<I: IntoIterator<Item = Value>>(v: I) -> mlua::Result<MultiValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the scripts spawn or fly over is an object of its template:
+    /// its object script is noted for the mission to run on it (and
+    /// again as it is removed), and a flyby's plane has its template's
+    /// labels, which its script picks its radar icon by.
+    #[test]
+    fn spawned_objects_get_their_templates_script() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let host = crate::script::ScriptHost::new().unwrap();
+        let world: crate::api::Shared = Rc::new(RefCell::new(ScriptWorld::default()));
+        crate::api::install(host.lua(), &world).unwrap();
+        {
+            let mut w = world.borrow_mut();
+            w.template_scripts
+                .insert("support vehicle (mig27)".into(), (0x1e47_a21c, None));
+            w.template_scripts
+                .insert("m1a2".into(), (0xc686_ae99, Some(7)));
+            w.template_labels
+                .insert("support vehicle (mig27)".into(), vec![0xabcd]);
+        }
+        host.lua()
+            .load(
+                r#"
+                tank = Pg.Spawn("M1A2", 1, 2, 3, 0)
+                crate_ = Pg.Spawn("Crate", 1, 2, 3, 0)
+                jet = Airstrike.Flyby("Support Vehicle (Mig27)", 0, 0, 100, 100, 150, 80)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let ids = |name: &str| {
+            crate::events::as_guid(&host.lua().globals().get::<Value>(name).unwrap()).unwrap()
+        };
+        let (tank, jet) = (ids("tank"), ids("jet"));
+        {
+            let mut w = world.borrow_mut();
+            assert_eq!(
+                std::mem::take(&mut w.script_spawns),
+                [(tank, 0xc686_ae99, Some(7)), (jet, 0x1e47_a21c, None)]
+            );
+            assert_eq!(w.objects[&jet].label_hashes, [0xabcd]);
+            assert!(w.script_removals.is_empty());
+        }
+        host.lua()
+            .load("Object.Remove(jet) Object.Remove(crate_)")
+            .exec()
+            .unwrap();
+        let w = world.borrow();
+        assert_eq!(w.script_removals, [(jet, 0x1e47_a21c)]);
+        assert!(w.scripted.contains_key(&tank) && !w.scripted.contains_key(&jet));
+    }
 
     #[test]
     fn fuses_read_as_the_scripts_write_them() {

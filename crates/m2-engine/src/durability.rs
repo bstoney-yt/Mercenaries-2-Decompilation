@@ -420,6 +420,34 @@ pub fn prop_physics(db: &Layer<'_>) -> HashMap<u32, PropPhysics> {
         .collect()
 }
 
+/// The collision preset of each template whose objects aren't buildings,
+/// by id ([`Preset`](crate::collision_layers::Preset)): a `_PropPhysics`
+/// one's by its record's `Mass` and heavy flag
+/// ([`Preset::of_prop`](crate::collision_layers::Preset::of_prop); a `Mass`
+/// it doesn't give reads 0), a `_DebrisPhysics` one's the prop preset
+/// (whether 0x82155328 makes one loose is not traced: it has no
+/// `_PropPhysics` record, so its answer then rests on the object's own
+/// state, 0x82187CA0). The rest are buildings.
+pub fn presets(db: &Layer<'_>) -> HashMap<u32, crate::collision_layers::Preset> {
+    use crate::collision_layers::Preset;
+    let mut out = HashMap::new();
+    let debris = Table::new(db, "_DebrisPhysics");
+    for id in debris.templates() {
+        out.insert(id, Preset::Prop);
+    }
+    let t = Table::new(db, "_PropPhysics");
+    let mass = name_hash("Mass");
+    for id in t.templates() {
+        let Some(r) = t.of_template(id).first() else {
+            continue;
+        };
+        let m = t.float(r, mass).unwrap_or(0.0);
+        let heavy = t.word(r, PROP_HEAVY) == Some(1);
+        out.insert(id, Preset::of_prop(m, heavy));
+    }
+    out
+}
+
 /// Each template's `PhysicsPropertyGravityScaler` `Scale`, by id: how
 /// many times gravity pulls its objects (1.5 on the weapons and grenades
 /// that lie to be taken: the `Assault Rifle`, the `Grenade`; PC data,
@@ -500,6 +528,25 @@ pub fn crash_base(size: f32) -> f32 {
 /// the damage table's column every vehicle template that names a
 /// `DamageKey` of its own names (survey `runover`).
 pub const RAM_KIND: &str = "Car";
+
+/// A living person hit by a vehicle for at least this much is knocked
+/// down, for about [`KNOCKDOWN_SECONDS`]
+/// ([`crate::melee::knockdown_seconds`] spreads it a fifth either way).
+///
+/// From the 360 code: the animation driver's damage handler (0x824203F0)
+/// tries the knockdown (0x82422480) before any stagger when the damage
+/// event's amount is at least the float at 0x82DE887C, 2.0 in the image.
+/// The knockdown happens when the attacker is an object of kind 2, 3, 4,
+/// 8 or 10 (2 is `_CarPhysicsV2`, 10 the boats) and the person is not
+/// player-kind; it posts `KnockDown` (0x9C9F3F13) and sets the time down
+/// by 0x82423848 from 5.0 (the float at 0x820BAF84).
+///
+/// **Inferred**: kinds 3, 4 and 8 read as the other vehicles (not
+/// established); the amount as the damage after the table's cell. The
+/// float at 0x82DE887C is a variable: what may change it was not looked
+/// for.
+pub const KNOCKDOWN_DAMAGE: f32 = 2.0;
+pub const KNOCKDOWN_SECONDS: f32 = 5.0;
 
 /// What a vehicle of `mass` (kg) whose ram is of kind `key` (a name hash:
 /// `Car`, `Tank`) does to a person whose `ModifierKey` row is `row`

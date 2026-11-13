@@ -81,6 +81,10 @@ pub struct ParticleDraw {
     /// ([`fresh_hold`]).
     clock: f32,
     held_asks: HashMap<u64, f32>,
+    /// The three constants `Graphics.Effect.CameraFade` last set
+    /// ([`m2_engine::particles::camera_fade`]): particles fade out close
+    /// in front of the camera.
+    pub camera_fade: [f32; 3],
 }
 
 /// A light an effect lit: where, what, how old, and for a held effect
@@ -190,6 +194,7 @@ impl ParticleDraw {
             flashes: Vec::new(),
             clock: 0.0,
             held_asks: HashMap::new(),
+            camera_fade: m2_game::script_effects::FADE_ON,
         })
     }
 
@@ -344,6 +349,53 @@ impl ParticleDraw {
         created
     }
 
+    /// The camera the effects kept about it follow.
+    pub fn set_camera(&mut self, eye: Vec3, right: Vec3, up: Vec3, forward: Vec3) {
+        self.sim.set_camera(eye, right, up, forward);
+    }
+
+    /// Swaps the ambient effects for a record's (`AmbientEffect0..4`): the
+    /// last ones deleted with their particles, each new one with a
+    /// template of type 0 started about the camera, as the game does on
+    /// every change of the light (from the 360 code, 0x8224D650). Type 1
+    /// (on the ground about the camera) is left out: no record uses it.
+    /// Returns how many effects started.
+    pub fn set_ambient(
+        &mut self,
+        effects: &[m2_engine::atmosphere::AmbientEffect],
+        templates: &Templates,
+    ) -> usize {
+        self.sim.clear_about_camera();
+        let mut started = 0;
+        for a in effects.iter().filter(|a| a.template != 0 && a.kind == 0) {
+            let Some(id) = self.template_by_hash(a.template, templates) else {
+                eprintln!("particles: ambient effect #{:08x}: no template", a.template);
+                continue;
+            };
+            for fx in self.lib.of_template(id).to_vec() {
+                if self
+                    .sim
+                    .spawn_about_camera(&self.lib, fx, a.radius, a.height)
+                {
+                    started += 1;
+                }
+            }
+        }
+        started
+    }
+
+    /// The template whose name hashes to `h` (of twins, the lowest id).
+    fn template_by_hash(&mut self, h: u32, templates: &Templates) -> Option<u32> {
+        let by_hash = self.by_hash.get_or_insert_with(|| {
+            let mut ids: Vec<(&u32, &String)> = templates.names.iter().collect();
+            ids.sort_unstable_by_key(|&(&id, _)| std::cmp::Reverse(id));
+            ids.into_iter()
+                .map(|(&id, n)| (m2_assets::name_hash(n), id))
+                .collect()
+        });
+        by_hash.get(&h).copied()
+    }
+
     pub fn step(&mut self, dt: f32) {
         self.sim.step(&self.lib, dt);
         self.clock += dt;
@@ -448,7 +500,12 @@ impl ParticleDraw {
             } else {
                 sprite_light(&lights, s.at)
             };
-            quad(&mut self.vertices, s, right, up, light);
+            // The view looks down -z: the particle's depth along the
+            // camera's forward. Both blends weigh colour by alpha.
+            let depth = -v.transform_point3(s.at).z;
+            let mut s = *s;
+            s.colour[3] *= m2_engine::particles::camera_fade(depth, self.camera_fade);
+            quad(&mut self.vertices, &s, right, up, light);
         }
         let bytes: Vec<u8> = self.vertices.iter().flat_map(|f| f.to_le_bytes()).collect();
         backend.write_vertex_buffer(self.vb, 0, &bytes)?;
@@ -474,6 +531,8 @@ impl ParticleDraw {
                     skin: None,
                     instances: None,
                     uv_offset: [0.0; 2],
+                    tint: [1.0; 4],
+                    beams_lit: false,
                 },
                 layer: Layer::WORLD,
                 translucent: true,

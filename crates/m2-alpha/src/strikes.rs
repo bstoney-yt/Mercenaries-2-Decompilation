@@ -29,6 +29,9 @@ const LIFETIME: f32 = 30.0;
 struct Jet {
     guid: u32,
     model: Option<u32>,
+    /// Its template's sound set (0: none), whose fly-past cue is heard
+    /// from it ([`m2_engine::spawn_sound::FLYBY_EVENT`]).
+    sound_set: u32,
     at: Vec3,
     /// Its heading, level, and speed (m/s).
     dir: Vec3,
@@ -65,6 +68,8 @@ pub struct Strikes {
     shells: Vec<Shell>,
     /// Aircraft over their mark since the last take (guid, where).
     pub arrived: Vec<(u32, Vec3)>,
+    /// Aircraft flown on out of play since the last take.
+    pub gone: Vec<u32>,
     /// Ordnance gone off since the last take (guid, template, where).
     pub burst: Vec<(u32, Option<u32>, Vec3)>,
     /// Ordnance gone off in all, and where the first went off.
@@ -87,11 +92,16 @@ impl Strikes {
             } => {
                 let (from, to) = (Vec3::from(*from), Vec3::from(*to));
                 let model = templates.get(what).and_then(|t| t.model);
+                let sound_set = templates
+                    .id(what)
+                    .and_then(|id| templates.spawn_sounds.get(&id))
+                    .map_or(0, |s| s.set);
                 self.wanted.extend(model);
                 eprintln!("strike: {what} flies from {from:.0} over {to:.0} at {speed} m/s");
                 self.jets.push(Jet {
                     guid: *guid,
                     model,
+                    sound_set,
                     at: from,
                     dir: (to - from).with_y(0.0).normalize_or(Vec3::Z),
                     speed: speed.max(1.0),
@@ -141,6 +151,23 @@ impl Strikes {
         }
     }
 
+    /// The aircraft in the air, to be heard: each one's guid, where it
+    /// is and its sound set (0: none).
+    pub fn sounding(&self) -> Vec<(u32, Vec3, u32)> {
+        self.jets
+            .iter()
+            .map(|j| (j.guid, j.at, j.sound_set))
+            .collect()
+    }
+
+    /// The aircraft in the air: each one's guid, place and heading (yaw),
+    /// for the scripts' world (their radar blips follow them).
+    pub fn jets(&self) -> impl Iterator<Item = (u32, Vec3, f32)> + '_ {
+        self.jets
+            .iter()
+            .map(|j| (j.guid, j.at, j.dir.x.atan2(j.dir.z)))
+    }
+
     /// Flies everything on by `dt` seconds.
     pub fn step(&mut self, physics: &Physics, dt: f32) {
         for j in &mut self.jets {
@@ -154,7 +181,14 @@ impl Strikes {
                 None => {}
             }
         }
-        self.jets.retain(|j| j.past.is_none_or(|p| p < FLY_ON));
+        let gone = &mut self.gone;
+        self.jets.retain(|j| {
+            let stays = j.past.is_none_or(|p| p < FLY_ON);
+            if !stays {
+                gone.push(j.guid);
+            }
+            stays
+        });
         let mut burst = Vec::new();
         self.shells.retain_mut(|s| {
             s.age += dt;
@@ -278,6 +312,20 @@ mod tests {
             s.step(&physics, 0.1);
         }
         assert_eq!(s.arrived, vec![(7, Vec3::new(0.0, 0.0, 200.0))]);
+        // In the air it is where it has flown to, heading north; gone,
+        // it says so once.
+        let (guid, at, yaw) = s.jets().next().unwrap();
+        assert_eq!((guid, yaw), (7, 0.0));
+        assert!((at.z - 300.0).abs() < 1.0 && s.gone.is_empty(), "{at}");
         assert_eq!(s.jets.len(), 1);
+        // It is heard from where it is for as long as it flies (no
+        // template database here: no sound set).
+        assert_eq!(s.sounding(), vec![(7, Vec3::new(0.0, 100.0, 300.0), 0)]);
+        for _ in 0..200 {
+            s.step(&physics, 0.1);
+        }
+        assert!(s.sounding().is_empty());
+        assert!(s.jets().next().is_none());
+        assert_eq!(s.gone, vec![7]);
     }
 }
