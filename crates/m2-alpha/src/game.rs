@@ -2354,6 +2354,7 @@ impl Game {
                         template: combat::FxTemplate::Hash(effect),
                         at: p.at,
                         hold: None,
+                        turn: None,
                     });
                 }
                 // Heard as its own sound set says it is taken (the ammo
@@ -3942,6 +3943,7 @@ fn hit_world(
                 template: combat::FxTemplate::Hash(effect),
                 at,
                 hold: None,
+                turn: None,
             });
         }
     }
@@ -4620,6 +4622,7 @@ fn state_effects(world: &World, combat: &mut Combat) {
                 template: combat::FxTemplate::Hash(fx.effect),
                 at: fx.at.map_or(o.position, |at| placed.transform_point3(at)),
                 hold: None,
+                turn: None,
             });
         }
     }
@@ -4658,6 +4661,7 @@ fn exhaust_smoke(
                 template: combat::FxTemplate::Hash(effect),
                 at: (at * *rest).w_axis.truncate(),
                 hold: Some(0xe000_0000_0000_0000 | (i as u64) << 8 | k as u64),
+                turn: None,
             });
         }
     }

@@ -212,6 +212,8 @@ impl ParticleDraw {
     pub fn take(&mut self, asked: Vec<GameFx>, templates: &Templates) -> Vec<(u32, Vec3)> {
         let mut created = Vec::new();
         for fx in asked {
+            // The effects this one starts, to be turned to its frame.
+            let started_from = self.sim.running();
             let (label, id) = match &fx.template {
                 FxTemplate::Id(id) => (format!("{id:08x}"), Some(*id)),
                 FxTemplate::Name(n) => {
@@ -303,7 +305,7 @@ impl ParticleDraw {
                 eprintln!("links: {label} sets off {}", named.join(", "));
             }
             for (k, &(child, offset)) in tree.iter().enumerate() {
-                let at = fx.at + offset;
+                let at = fx.at + fx.turn.map_or(offset, |t| t * offset);
                 if k > 0 {
                     for &h in self.lib.of_template(child) {
                         match fx.hold {
@@ -343,6 +345,12 @@ impl ParticleDraw {
                         key,
                         since_call: 0.0,
                     }),
+                }
+            }
+            if let Some(turn) = fx.turn {
+                self.sim.turn_from(started_from, turn);
+                if let Some(key) = fx.hold {
+                    self.sim.turn_held(key, turn);
                 }
             }
         }
