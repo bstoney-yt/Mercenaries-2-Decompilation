@@ -34,22 +34,30 @@
 //! (0x82239DA0 -> 0x8223ADD0, [`crate::gunships::coming_in`]): 350 m off
 //! about the way she faces, 70 m over the ground there, facing her.
 //!
-//! Not yet sent: the tables' cars, tanks, boats and men, and their
-//! helicopters other than the transport (gunships at higher levels).
-//! Inferred: that a helicopter is "out" until its soldiers are all down
-//! (the 360 counts its units alive); that on its way it makes for her
-//! where she is now (the 360 spawns it moving at her and leaves the rest
-//! to its AI, not traced). Invented: how far from her it sets them down
-//! ([`SET_DOWN`]), and that its soldiers are simply put down on the
-//! ground under it as it hovers (no rope or landing).
+//! From the scripts: once in, the helicopter is its own script's
+//! (`pursuitcopter`, the `ObjectScript` of every `(Pursuit)` template):
+//! as it wakes it asks for a drop zone by her (`Ai.TestDropZone`), lands
+//! there (`Ai.Goal` of `HeliLand`), has its passengers get out
+//! (`Ai.Deploy`) and goes home (`MrxSupport.GoHome`); with no drop zone
+//! it comes 50 m over her and asks again 3 s on, three times, then goes
+//! home. So this module only decides when one is due and spawns it into
+//! the scripts' world ([`m2_game::mission::Mission::spawn`]); the game
+//! searches its drop zone as the 360 does ([`crate::drop_zones`]: the
+//! landing-zone search of `HeliLand`, with the script's sizes, so none is
+//! found out at sea) and flies its landing as it does a soldier
+//! delivery's.
+//!
+//! Not yet sent: the tables' men, and their helicopters other than the
+//! transport and the gunships.
+//! Inferred: that a helicopter is "out" while it is in the scripts' world
+//! (the 360 counts its units alive). Invented: that a contract's end
+//! takes away the helicopters whose passengers are still aboard
+//! ([`Reinforcements::call_off`]).
 
 use std::collections::HashMap;
 
 use m2_assets::animation_table::AnimationTable;
 use m2_assets::name_hash;
-use m2_math::glam::Vec3;
-
-use crate::flights::{Copter, Flights, Release};
 
 /// The pursuit unit counts' table (`Faction`, `Player Is`, `Spawn Type`,
 /// `Threat1..3`), in the resident block.
@@ -168,15 +176,6 @@ impl Counts {
     }
 }
 
-/// How far from her it sets its soldiers down, metres (invented).
-pub const SET_DOWN: f32 = 35.0;
-/// Seconds its soldiers wait to come into play (their models loading)
-/// before they are given up.
-const BRING_FOR: f32 = 30.0;
-
-/// The pilots' and soldiers' guids, out of the scripts' way.
-const FIRST_GUID: u32 = 0xfe00_0000;
-
 /// One army's pursuit helicopter, as the data gives it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Squad {
@@ -228,19 +227,13 @@ pub fn squads(
     out
 }
 
-/// One on its way, or whose soldiers are coming into play.
+/// One in the scripts' world.
 #[derive(Clone, Debug, PartialEq)]
 struct Sent {
-    pilot: u32,
+    copter: u32,
     faction: &'static str,
-    soldiers: Vec<(u32, String)>,
-    /// The side of her it came in from (flat, unit): it sets them down
-    /// [`SET_DOWN`] off her that way.
-    way: Vec3,
-    /// Where they are set down, once it hovers there, and seconds since.
-    down: Option<(Vec3, f32)>,
-    /// Called off in flight ([`Reinforcements::call_off`]): it sets
-    /// nobody down.
+    /// Called off ([`Reinforcements::call_off`]): no longer counted, and
+    /// to be taken away if its passengers are still aboard.
     called_off: bool,
 }
 
@@ -248,15 +241,14 @@ struct Sent {
 #[derive(Debug, Default)]
 pub struct Reinforcements {
     sent: Vec<Sent>,
-    next: u32,
-    /// Helicopters sent and soldiers brought, for the log's tally.
+    /// Called off and not yet looked at ([`Reinforcements::take_off`]).
+    off: Vec<u32>,
+    /// Helicopters sent, for the log's tally.
     pub flown: usize,
-    pub brought: usize,
 }
 
 impl Reinforcements {
-    /// The helicopters `faction` has out (on their way, or their soldiers
-    /// still coming into play).
+    /// The helicopters `faction` has out.
     pub fn out(&self, faction: &str) -> usize {
         self.sent
             .iter()
@@ -264,150 +256,57 @@ impl Reinforcements {
             .count()
     }
 
-    /// Runs on by `dt`: `wanted`, the pursuing faction and how many
-    /// helicopters its pursuit wants out now (none without a pursuit),
-    /// `her` where she is, `come_in` where the next helicopter comes in
-    /// ([`crate::gunships::coming_in`]; `None`, nowhere clear). Starts the
-    /// helicopters due in `flights` (those wanted beyond those out), keeps
-    /// those on their way making for her where she is now, and returns the
-    /// soldiers due in play (guid, template, where).
-    pub fn step(
-        &mut self,
+    /// The helicopters due now: for `wanted`, the pursuing faction and
+    /// how many helicopters its pursuit wants out (none without a
+    /// pursuit), its pursuit helicopter's template once for each wanted
+    /// beyond those out.
+    pub fn due(
+        &self,
         wanted: Option<(&'static str, usize)>,
         squads: &HashMap<&'static str, Squad>,
-        flights: &mut Flights,
-        her: Vec3,
-        come_in: &mut dyn FnMut() -> Option<Vec3>,
-        dt: f32,
-    ) -> Vec<(u32, String, Vec3)> {
-        let due = wanted
-            .filter(|(f, _)| squads.contains_key(f))
-            .map_or(0, |(f, n)| n.saturating_sub(self.out(f)));
-        for _ in 0..due {
-            let Some((f, _)) = wanted else { break };
-            let squad = &squads[f];
-            // In as any air unit (0x82239DA0, 0x8223ADD0).
-            let Some(from) = come_in() else {
-                eprintln!(
-                    "reinforcements: no clear place for {f}'s {}",
-                    squad.template
-                );
-                break;
-            };
-            let way = (from - her).with_y(0.0).normalize_or(Vec3::Z);
-            let to = her + way * SET_DOWN;
-            let pilot = FIRST_GUID + self.next;
-            self.next += 1;
-            let soldiers = squad
-                .soldiers
-                .iter()
-                .map(|s| {
-                    self.next += 1;
-                    (FIRST_GUID + self.next, s.clone())
-                })
-                .collect();
-            flights.start(
-                Copter {
-                    guid: pilot,
-                    pilot,
-                    model: squad.model,
-                    bank: squad.bank,
-                },
-                Vec::new(),
-                from,
-                to,
-            );
-            eprintln!(
-                "reinforcements: {f} send their {} from {from:.0} with {:?}",
-                squad.template, squad.soldiers
-            );
-            self.flown += 1;
-            self.sent.push(Sent {
-                pilot,
-                faction: f,
-                soldiers,
-                way,
-                down: None,
-                called_off: false,
-            });
-        }
-        // On its way, it makes for her where she is now, not where she was
-        // when it set out (the sweep's PirCon004 set two soldiers down
-        // 800 m behind her truck).
-        for s in self
-            .sent
-            .iter()
-            .filter(|s| s.down.is_none() && !s.called_off)
-        {
-            flights.retarget(s.pilot, her + s.way * SET_DOWN);
-        }
-        let mut out = Vec::new();
-        for s in &mut self.sent {
-            let Some((at, since)) = &mut s.down else {
-                continue;
-            };
-            *since += dt;
-            for (k, (g, t)) in s.soldiers.iter().enumerate() {
-                let a = k as f32 * 1.9;
-                out.push((*g, t.clone(), *at + Vec3::new(a.sin(), 0.0, a.cos()) * 2.5));
-            }
-        }
-        // One called off stays till its release is taken (it is not the
-        // scripts' to hear of).
-        self.sent.retain(|s| {
-            if s.called_off {
-                s.down.is_none()
-            } else {
-                s.down.is_none_or(|(_, t)| t < BRING_FOR) && !s.soldiers.is_empty()
-            }
-        });
-        out
-    }
-
-    /// The contract is over: the helicopters still flying set nobody
-    /// down. Invented (ours landed soldiers in the villa she had just
-    /// taken).
-    pub fn call_off(&mut self) {
-        for s in self.sent.iter_mut().filter(|s| s.down.is_none()) {
-            s.called_off = true;
-            s.soldiers.clear();
-        }
-    }
-
-    /// Takes the releases that are its helicopters' (their soldiers are
-    /// set down there), leaving the rest for the scripts.
-    pub fn take_releases(&mut self, releases: Vec<Release>) -> Vec<Release> {
-        releases
-            .into_iter()
-            .filter(|r| {
-                let Some(s) = self.sent.iter_mut().find(|s| s.pilot == r.pilot) else {
-                    return true;
-                };
-                if s.called_off {
-                    eprintln!(
-                        "reinforcements: the {} helicopter was called off",
-                        s.faction
-                    );
-                    s.down = Some((r.to, BRING_FOR));
-                    return false;
-                }
-                eprintln!(
-                    "reinforcements: the {} helicopter sets its soldiers down at {:.1}",
-                    s.faction, r.to
-                );
-                s.down = Some((r.to, 0.0));
-                false
-            })
+    ) -> Vec<(&'static str, String)> {
+        let Some((f, n)) = wanted else {
+            return Vec::new();
+        };
+        let Some(squad) = squads.get(f) else {
+            return Vec::new();
+        };
+        (self.out(f)..n)
+            .map(|_| (f, squad.template.clone()))
             .collect()
     }
 
-    /// Soldier `guid` came into play.
-    pub fn brought(&mut self, guid: u32) {
-        for s in &mut self.sent {
-            let before = s.soldiers.len();
-            s.soldiers.retain(|(g, _)| *g != guid);
-            self.brought += before - s.soldiers.len();
+    /// `faction`'s helicopter was spawned into the scripts' world as
+    /// `copter`.
+    pub fn sent(&mut self, faction: &'static str, copter: u32) {
+        self.flown += 1;
+        self.sent.push(Sent {
+            copter,
+            faction,
+            called_off: false,
+        });
+    }
+
+    /// Forgets the helicopters no longer in the scripts' world (`there`:
+    /// whether a guid still is): gone home, or taken away.
+    pub fn keep(&mut self, there: impl Fn(u32) -> bool) {
+        self.sent.retain(|s| there(s.copter));
+    }
+
+    /// The contract is over: its helicopters count no more, and are to be
+    /// taken away if their passengers are still aboard
+    /// ([`Reinforcements::take_off`]). Invented (ours landed soldiers in
+    /// the villa she had just taken).
+    pub fn call_off(&mut self) {
+        for s in self.sent.iter_mut().filter(|s| !s.called_off) {
+            s.called_off = true;
+            self.off.push(s.copter);
         }
+    }
+
+    /// The helicopters called off since the last look.
+    pub fn take_off(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.off)
     }
 }
 
@@ -470,86 +369,43 @@ mod tests {
     fn a_pursuit_sends_the_helicopters_it_wants_out_and_no_more() {
         let squads = squads_of_two();
         let mut r = Reinforcements::default();
-        let mut flights = Flights::default();
-        let her = Vec3::new(100.0, 5.0, 100.0);
-        let mut come = || Some(her + Vec3::new(0.0, 70.0, 350.0));
         // None without a pursuit, nor for a faction without a helicopter.
-        assert!(
-            r.step(None, &squads, &mut flights, her, &mut come, 1.0)
-                .is_empty()
+        assert!(r.due(None, &squads).is_empty());
+        assert!(r.due(Some(("Oil", 1)), &squads).is_empty());
+        // One wanted: its army's own helicopter, once.
+        let due = r.due(Some(("Vza", 1)), &squads);
+        assert_eq!(
+            due,
+            [("Vza", "alouette3 transport (vz) (pursuit)".to_owned())]
         );
-        r.step(Some(("Oil", 1)), &squads, &mut flights, her, &mut come, 1.0);
-        assert_eq!(r.flown, 0);
-        // One wanted: one sent, however long the pursuit wants it.
-        r.step(Some(("Vza", 1)), &squads, &mut flights, her, &mut come, 0.1);
+        r.sent("Vza", 0x4000_0001);
         assert_eq!(r.flown, 1);
-        for _ in 0..100 {
-            r.step(Some(("Vza", 1)), &squads, &mut flights, her, &mut come, 1.0);
-        }
-        assert_eq!(r.flown, 1);
-        // Its release is its own; another's goes to the scripts.
-        let pilot = r.sent[0].pilot;
-        let at = her + Vec3::X * SET_DOWN;
-        let mine = Release {
-            pilot,
-            to: at,
-            dropped: Vec::new(),
-        };
-        let theirs = Release {
-            pilot: 7,
-            to: at,
-            dropped: Vec::new(),
-        };
-        let left = r.take_releases(vec![mine, theirs]);
-        assert_eq!(left.iter().map(|r| r.pilot).collect::<Vec<_>>(), [7]);
-        let due = r.step(None, &squads, &mut flights, her, &mut come, 0.1);
-        assert_eq!(due.len(), 2);
-        assert!(
-            due.iter()
-                .all(|(_, t, p)| t == "VZ Soldier" && p.distance(at) < 3.0)
-        );
-        for (g, _, _) in &due {
-            r.brought(*g);
-        }
-        assert_eq!(r.brought, 2);
-        assert!(
-            r.step(None, &squads, &mut flights, her, &mut come, 0.1)
-                .is_empty()
-        );
+        assert_eq!(r.out("Vza"), 1);
+        // However long the pursuit wants it, no second while it is out.
+        assert!(r.due(Some(("Vza", 1)), &squads).is_empty());
+        // Two wanted: one more.
+        assert_eq!(r.due(Some(("Vza", 2)), &squads).len(), 1);
+        // Gone from the scripts' world (home), a pursuit still wanting one
+        // sends another.
+        r.keep(|g| g != 0x4000_0001);
         assert_eq!(r.out("Vza"), 0);
-        // Its soldiers down, a pursuit still wanting one sends another.
-        r.step(Some(("Vza", 1)), &squads, &mut flights, her, &mut come, 0.1);
-        assert_eq!(r.flown, 2);
+        assert_eq!(r.due(Some(("Vza", 1)), &squads).len(), 1);
     }
 
     #[test]
-    fn one_called_off_in_flight_sets_nobody_down_and_keeps_its_release() {
+    fn one_called_off_counts_no_more_and_is_named_once() {
         let squads = squads_of_two();
         let mut r = Reinforcements::default();
-        let mut flights = Flights::default();
-        let her = Vec3::new(100.0, 5.0, 100.0);
-        let mut come = || Some(her + Vec3::new(0.0, 70.0, 350.0));
-        r.step(Some(("Vza", 1)), &squads, &mut flights, her, &mut come, 0.5);
-        assert_eq!(r.flown, 1);
-        let pilot = r.sent[0].pilot;
+        r.sent("Vza", 7);
         r.call_off();
-        // Still about till it hovers, so its release is not the scripts'.
-        assert!(
-            r.step(None, &squads, &mut flights, her, &mut come, 0.1)
-                .is_empty()
-        );
-        let left = r.take_releases(vec![Release {
-            pilot,
-            to: her,
-            dropped: Vec::new(),
-        }]);
-        assert!(left.is_empty());
-        assert!(
-            r.step(None, &squads, &mut flights, her, &mut come, 0.1)
-                .is_empty()
-        );
+        assert_eq!(r.out("Vza"), 0);
+        // Named once, and forgotten when it is gone.
+        r.call_off();
+        assert_eq!(r.take_off(), [7]);
+        assert!(r.take_off().is_empty());
+        assert_eq!(r.due(Some(("Vza", 1)), &squads).len(), 1);
+        r.keep(|_| false);
         assert!(r.sent.is_empty());
-        assert_eq!(r.brought, 0);
     }
 
     // The table's counts: the Venezuelans send one helicopter at the
