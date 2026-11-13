@@ -34,6 +34,7 @@ use crate::library::{KNOWN_MODULES, LOADERS, Library};
 use crate::object_hooks::{ON_DEATH, ON_STATE_CHANGE, death_args, state_change_args};
 use crate::script::{ScriptError, ScriptHost};
 
+mod ammo;
 mod homing;
 pub use homing::{ANTI_AIR, HOMING_MISSILE, HomingKind, HomingPost};
 
@@ -357,6 +358,10 @@ pub struct GameData {
     /// The layers' `PhysicalLink` records by parent entity: (link name
     /// hash, child entity) ([`crate::links::physical_links`]).
     pub physical_links: HashMap<u32, Vec<(u32, u32)>>,
+    /// The child templates spawned with a template, by its name in lower
+    /// case: (link name hash, child template)
+    /// ([`crate::links::template_children`]).
+    pub template_children: HashMap<String, Vec<(u32, String)>>,
     /// Templates' `CashValue` (`Object.GetCashValue`) by the template's
     /// name in lower case.
     pub template_cash: HashMap<String, i32>,
@@ -476,6 +481,7 @@ impl GameData {
                 {
                     template_labels = labels_of(db.component("Label"));
                     data.template_cash = crate::cash::template_cash(&db);
+                    data.template_children = crate::links::template_children(&db);
                     template_scripts = db.hashes("ObjectScript");
                     template_script_data = script_data(&db);
                     template_alarms = carriers(&db, "Alarm");
@@ -744,6 +750,7 @@ impl Mission {
             template_labels,
             template_scripts,
             physical_links,
+            template_children,
             template_cash,
             template_names,
             template_drivers,
@@ -774,6 +781,7 @@ impl Mission {
                 .map(|(a, b, r)| ((a.to_ascii_lowercase(), b.to_ascii_lowercase()), r))
                 .collect();
             w.physical_links = physical_links;
+            w.template_children = template_children;
             w.template_cash = template_cash;
             w.template_names = template_names;
             w.template_drivers = template_drivers;
@@ -2035,6 +2043,8 @@ impl Mission {
             g
         };
         self.call_manager("OnActivate", guid, owner);
+        // What its template spawns with it: the beacon's light.
+        self.spawn_children(guid, what, at);
         guid
     }
 
@@ -2050,6 +2060,7 @@ impl Mission {
             }
             w.strikes.designators.get(&guid).copied()
         };
+        self.ammo_moved(guid, at);
         if let Some(owner) = owner {
             self.call_manager("OnTimer", guid, owner);
         }
@@ -3164,7 +3175,11 @@ fn seat_crew(
 /// `repairpad` is the script of the helipads and the PMC's garage
 /// (0xcd561a19): awake, its lights are on (`Vehicle.SetParts` of
 /// `LightFront`), and they go out when it dies.
-pub const OBJECT_SCRIPTS: [(&str, u32); 16] = [
+///
+/// `C4` and `beacon` are the scripts of her stuck C4 and of the Beacon
+/// Designator's beacon light: they blink and, a second on, beep until
+/// they go ([`Mission::ammo_spawned`]).
+pub const OBJECT_SCRIPTS: [(&str, u32); 18] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3181,6 +3196,8 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 16] = [
     ("pursuitcopter", PURSUIT_COPTER),
     ("AntiAir", homing::ANTI_AIR),
     ("HomingMissile", homing::HOMING_MISSILE),
+    ("C4", ammo::C4),
+    ("beacon", ammo::BEACON),
 ];
 
 /// `pursuitcopter`'s module hash.
