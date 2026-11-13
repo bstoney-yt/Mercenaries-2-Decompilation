@@ -30,6 +30,7 @@ Route files are one step per line (`#` comments):
     mark <label>                   log a timestamped label
     track <x> <y> <z>              follow the hero's position in guest memory (xmem.py)
     goto <x> <z> <radius> <timeout> <buttons|-> [<gain>]  steer there by that position
+    measure <buttons|-> <secs> [<ly>]  hold, logging tracked position and speed
     trackfoot <x> <y> <z>|here     as track, for the hero on foot (here: where track was)
     walk <x> <z> <radius> <timeout> [<buttons|-> [<every_s> <name>]]  walk/sprint (ls) there
     listen <file>                  then run steps appended to <file> live, until `end`
@@ -413,6 +414,26 @@ def run(args) -> int:
                     tracker = xmem.Tracker(g, tuple(float(v) for v in w[1:4]))
                 else:
                     say(f"track: {len(tracker.addrs)} moving world matrices of {n_m} (first {tracker.addr:#x}, {moved:.1f} m forward); at {tracker.update()}")
+            elif op == "measure":
+                # measure <buttons|-> <secs> [<ly>]: hold the buttons (and the
+                # left stick at ly) and log the tracked position and speed
+                # every 0.25 s (for braking, coasting, sprint speeds).
+                import math
+
+                b, lt, rt = parse_buttons(w[1])
+                secs = float(w[2])
+                ly = float(w[3]) if len(w) > 3 else 0.0
+                apply(b, lt, rt, 0.0, ly, 0.0, 0.0)
+                t0, last = time.time(), None
+                while time.time() - t0 < secs:
+                    pos = tracker.update() if tracker else None
+                    now = time.time()
+                    if pos is not None:
+                        v = None if last is None else math.hypot(pos[0] - last[1][0], pos[2] - last[1][2]) / (now - last[0])
+                        say(f"measure {w[1]} t={now - t0:5.2f} pos=({pos[0]:.1f}, {pos[2]:.1f}) v={'-' if v is None else f'{v:.2f}'} m/s")
+                        last = (now, pos)
+                    time.sleep(0.25)
+                apply()
             elif op == "trackfoot":
                 # trackfoot <x> <y> <z>: as track, for the hero on foot (found
                 # by walking forward for a moment instead of the throttle).
