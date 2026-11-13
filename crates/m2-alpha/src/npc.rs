@@ -2158,6 +2158,9 @@ impl Npc {
 
     /// The threat reaction left: `Scared` at weight 0 (0x8241FE38).
     fn stop_scared(&mut self) {
+        if self.scared.is_some() {
+            eprintln!("face: person {} no longer scared", self.uid);
+        }
         self.scared = None;
         self.face
             .play(m2_engine::face_expression::SCARED, 0.0, -1.0, [0.0; 4]);
@@ -5478,6 +5481,12 @@ impl People {
                     // `Scared` shows while it lasts (0x8241FE38).
                     if calm && n.flee.is_some() {
                         n.threat_reaction(self.threat_seconds);
+                        eprintln!(
+                            "face: person {} scared by a vehicle for {}",
+                            n.uid,
+                            self.threat_seconds
+                                .map_or("? s (until settled)".to_owned(), |s| format!("{s:.2} s"))
+                        );
                     }
                 }
             }
