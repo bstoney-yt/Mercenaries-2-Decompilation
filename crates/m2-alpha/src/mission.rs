@@ -144,8 +144,6 @@ pub struct MissionView {
     /// The radar's objective blips (`Hud.Radar.AddObjective`), what the
     /// minimap shows.
     pub radar: Vec<RadarView>,
-    /// Discs on the ground (`Marker.AddDisc`): centre, radius, colour.
-    pub discs: Vec<(Vec3, f32, [u8; 3])>,
     /// The markers drawn as models: tripwires, `Marker.Add3D`'s and
     /// `Marker.Add`'s ([`crate::marker_models`]).
     pub models: Vec<crate::marker_models::MarkerModel>,
@@ -4975,7 +4973,7 @@ impl MissionLink {
         &self,
         w: &m2_game::api::ScriptWorld,
     ) -> Vec<crate::marker_models::MarkerModel> {
-        use crate::marker_models::{MarkerModel, PIN_MODEL, TRIPWIRE_MODEL};
+        use crate::marker_models::{DISC_MODEL, MarkerModel, PIN_MODEL, TRIPWIRE_MODEL};
         let hud = &w.hud;
         let place = |g: u32| -> Option<(Vec3, f32)> {
             let o = w.objects.get(&g)?;
@@ -5022,7 +5020,23 @@ impl MissionLink {
                 colour: p.colour,
             })
         });
-        wires.chain(models).chain(pins).collect()
+        // A disc: at its point, else where its target stands, lifted.
+        let discs = hud.discs.values().filter_map(|d| {
+            let at = match (d.at, d.target) {
+                (Some(p), _) => Vec3::from(p),
+                (None, Some(g)) => place(g)?.0,
+                (None, None) => return None,
+            };
+            Some(MarkerModel {
+                model: DISC_MODEL,
+                at: at + Vec3::Y * d.lift,
+                yaw: None,
+                scale: d.radius,
+                width: None,
+                colour: d.colour,
+            })
+        });
+        wires.chain(models).chain(pins).chain(discs).collect()
     }
 
     pub fn view(&self) -> MissionView {
@@ -5056,18 +5070,6 @@ impl MissionLink {
         let w = mission.world().borrow();
         let hud = &w.hud;
         let objectives = objective_texts(mission, hud);
-        let discs = hud
-            .discs
-            .values()
-            .filter_map(|d| {
-                let at = match (d.at, d.target.and_then(|g| w.objects.get(&g))) {
-                    (Some(p), _) => Vec3::from(p),
-                    (None, Some(o)) => Vec3::from(o.position),
-                    (None, None) => return None,
-                };
-                Some((at + Vec3::Y * d.lift, d.radius, d.colour))
-            })
-            .collect();
         let markers = hud
             .markers
             .values()
@@ -5113,7 +5115,6 @@ impl MissionLink {
             objectives,
             markers,
             radar,
-            discs,
             models,
             message,
             game_message,
