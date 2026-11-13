@@ -300,6 +300,13 @@ const STUCK: f32 = 3.0;
 const SIDESTEP: f32 = 1.2;
 const HOP_AFTER: f32 = 25.0;
 const HOP_AFTER_BOAT: f32 = 8.0;
+/// Racing, she hops after this long without headway (seconds), and backs
+/// out of what she ran into after this long stalled against it. A race
+/// leg gives 10 s (MecCon001's `nAddTime`, from the scripts); MecCon001
+/// r2 lost 4 to 9 s a leg at each of its stalls and was cancelled at
+/// checkpoint 5 of 28. Invented.
+const RACE_HOP_AFTER: f32 = 5.0;
+const RACE_STALL: f32 = 1.0;
 /// On foot this near the place she is after (metres), she hops as soon as
 /// a boat does (invented).
 const HOP_NEAR: f32 = 40.0;
@@ -932,6 +939,10 @@ pub struct Autoplay {
     /// The current contract's active deliveries (set each tick:
     /// [`crate::mission::MissionLink::deliveries`]).
     pub deliveries: Vec<Delivery>,
+    /// The checkpoint after the one up in the contract's race, where the
+    /// course has one (set each tick:
+    /// [`crate::mission::MissionLink::race_next`]).
+    pub race_next: Option<Vec3>,
     /// The delivery she last got out at, and when: getting back into a
     /// vehicle while it still stands is a failed delivery, logged.
     pub delivery_exit: Option<(u32, f32)>,
@@ -1982,12 +1993,13 @@ impl Autoplay {
                         .total_cmp(&b.at.distance(game.focus()))
                 })
         {
+            let at = race_aim(m.at, self.race_next);
             return Some((
                 Goal::Reach {
                     target: m.target,
-                    at: m.at,
+                    at,
                 },
-                format!("racing to {} ({:#x})", m.name, m.target),
+                format!("racing to {} ({:#x}), aiming at {at:.0}", m.name, m.target),
             ));
         }
         // A race on and her out of the ride she got out of to reach its
@@ -3312,7 +3324,7 @@ impl Autoplay {
         } else {
             self.stalled = 0.0;
         }
-        if self.stalled > STALL {
+        if self.stalled > if racing { RACE_STALL } else { STALL } {
             self.stalled = 0.0;
             // Each stall logged, with what holds it (round 7 counts the
             // tank's over its jungle drive).
@@ -5110,13 +5122,14 @@ impl Autoplay {
             && self
                 .goal_at()
                 .is_some_and(|at| at.distance(game.focus()) < HOP_NEAR);
-        if still
-            > if afloat || near {
-                HOP_AFTER_BOAT
-            } else {
-                HOP_AFTER
-            }
-        {
+        // Racing, at the wheel: the race's seconds are what she has.
+        let racing = self.racing()
+            && game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.driving.is_some());
+        if still > hop_after(afloat, near, racing) {
             // Stuck driving close to the place, or stuck driving a second
             // time on the way there (round 26: a truck hopped a few metres
             // at a time for 370 s, 165 m off): on foot from here. Not
@@ -5127,9 +5140,12 @@ impl Autoplay {
             let near = (at - game.focus()).with_y(0.0).length() < RIDE_FOR;
             // Nor in a boat: off it she is in the sea, and a race is lost
             // (PirCon001 round 98 got off her jetski 58 m from a gate).
+            // Nor in a race: on foot it is lost (the next leg's seconds
+            // run out while she walks).
             if let Some(i) = driving
                 && (near || self.drive_hops > 0)
                 && !afloat
+                && !racing
                 && !game.scene.props.carrying(i)
                 && game
                     .scene
@@ -5866,6 +5882,28 @@ fn visible_part(game: &Game, g: u32, at: Vec3, eye: Vec3) -> Option<Vec3> {
     })
 }
 
+/// Where she aims for checkpoint `gate`: [`RACE_CUT`] metres toward the
+/// checkpoint after it (`next`), on the flat; the middle when there is
+/// none (the finish) or it stands on the same spot.
+fn race_aim(gate: Vec3, next: Option<Vec3>) -> Vec3 {
+    let toward = next.map_or(Vec3::ZERO, |n| (n - gate).with_y(0.0).normalize_or_zero());
+    gate + toward * RACE_CUT
+}
+
+/// How long (seconds) she goes without headway before she hops: in a
+/// boat or on foot close by, [`HOP_AFTER_BOAT`]; racing at the wheel,
+/// [`RACE_HOP_AFTER`] (the sooner of the two); else [`HOP_AFTER`].
+fn hop_after(afloat: bool, near: bool, racing: bool) -> f32 {
+    let mut after = HOP_AFTER;
+    if afloat || near {
+        after = after.min(HOP_AFTER_BOAT);
+    }
+    if racing {
+        after = after.min(RACE_HOP_AFTER);
+    }
+    after
+}
+
 fn vehicle_at(game: &Game, i: usize) -> Option<Mat4> {
     let id = game.scene.vehicles.get(i)?.id?;
     game.scene.world.as_ref()?.physics.vehicle_transform(id)
@@ -6018,8 +6056,15 @@ fn afloat_near(
 /// Racing, she looks this far ahead for what stands in her way: as far as
 /// she goes in [`RACE_LOOK`] seconds, at least [`RACE_LOOK_LEAST`] metres
 /// (and never past the checkpoint), with a box her vehicle's width,
-/// [`RACE_LOOK_HEIGHT`] metres over its bottom. Invented.
-const RACE_LOOK: f32 = 1.5;
+/// [`RACE_LOOK_HEIGHT`] metres over its bottom. Invented (was 1.5 s:
+/// MecCon001 r2 found boulders 25 m off at 25 m/s, too late to go round
+/// them, and ran into them).
+const RACE_LOOK: f32 = 3.0;
+/// Racing, she aims this far (metres) from the checkpoint's middle toward
+/// the checkpoint after it, so the turn onto the next leg starts inside
+/// the gate (`MrxTaskRace` passes it within its `fWidth`, 10 m: from the
+/// scripts). Invented.
+const RACE_CUT: f32 = 4.0;
 /// Seconds between her logs of something solid ahead in a race.
 const LOG_ROCK: f32 = 2.0;
 const RACE_LOOK_LEAST: f32 = 15.0;
@@ -7346,6 +7391,34 @@ mod tests {
         p.step(1.0 / 60.0);
         let (want, _) = heading_to(m, Vec3::new(8.0, 0.0, 40.0));
         assert_eq!(clear_way(&p, id, m, hull, want, 5.0), want);
+    }
+
+    // Racing she hops after 5 s stuck, sooner than a boat's 8 s and the
+    // 25 s otherwise (a race's leg gives 10 s).
+    #[test]
+    fn a_race_hops_sooner() {
+        assert_eq!(hop_after(false, false, false), HOP_AFTER);
+        assert_eq!(hop_after(true, false, false), HOP_AFTER_BOAT);
+        assert_eq!(hop_after(false, true, false), HOP_AFTER_BOAT);
+        assert_eq!(hop_after(false, false, true), RACE_HOP_AFTER);
+        assert_eq!(hop_after(true, false, true), RACE_HOP_AFTER);
+        const { assert!(RACE_HOP_AFTER < 10.0 && RACE_STALL < STALL) };
+    }
+
+    // She aims inside the gate on the side of the next checkpoint, on the
+    // flat, and at the middle of the last.
+    #[test]
+    fn a_race_aims_toward_the_next_checkpoint() {
+        let gate = Vec3::new(10.0, 2.0, 0.0);
+        let at = race_aim(gate, Some(Vec3::new(10.0, 30.0, 100.0)));
+        assert!(
+            (at - Vec3::new(10.0, 2.0, RACE_CUT)).length() < 1e-4,
+            "{at}"
+        );
+        assert_eq!(race_aim(gate, None), gate);
+        assert_eq!(race_aim(gate, Some(gate)), gate);
+        // Within the gate's 10 m (`fWidth`).
+        const { assert!(RACE_CUT < 10.0) };
     }
 
     #[test]

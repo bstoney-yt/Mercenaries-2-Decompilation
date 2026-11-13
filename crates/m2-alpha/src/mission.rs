@@ -4780,6 +4780,23 @@ impl MissionLink {
         m2_game::events::as_guid(&g)
     }
 
+    /// Where the checkpoint after the one up in the current contract's
+    /// race stands ([`CONTRACT_RACE_NEXT`]), if the race has one.
+    pub fn race_next(&self) -> Option<Vec3> {
+        let State::Running(mission) = &self.state else {
+            return None;
+        };
+        let g = mission
+            .lua()
+            .load(CONTRACT_RACE_NEXT)
+            .set_name("=contract race next")
+            .eval::<mlua::Value>()
+            .ok()?;
+        let g = m2_game::events::as_guid(&g)?;
+        let w = mission.world().borrow();
+        w.objects.get(&g).map(|o| Vec3::from(o.position))
+    }
+
     /// The current contract's active deliveries, each with whether what
     /// it waits for is at its destination now ([`CONTRACT_DELIVERIES`]):
     /// by its region where it has one (the scripts' own test,
@@ -5882,6 +5899,63 @@ local function walk(t, depth)
                     return d
                 end
             end
+        end
+        local g = walk(c, depth + 1)
+        if g then return g end
+    end
+    return nil
+end
+return walk(m, 0)
+"#;
+
+/// The checkpoint after the one up in the current contract's running
+/// race: the course (`_tCourseLocs`, names or guids, a place listed more
+/// than once where the course comes back by it, as MecCon001's warm-up
+/// does: from the scripts) is searched for the gate up, as
+/// [`CONTRACT_RACE`] finds it, nearest the race's `iCurLoc` (one ahead of
+/// the gate up), and the entry after it returned. Nil at the finish.
+const CONTRACT_RACE_NEXT: &str = r#"
+local ps = rawget(_G, "MrxPlayState")
+if type(ps) ~= "table" or not ps.GetCurrentMission then return nil end
+local m = ps.GetCurrentMission()
+if type(m) ~= "table" then return nil end
+local function guid(v)
+    if type(v) == "table" then v = rawget(v, "vDestLoc") or v[1] end
+    if type(v) == "string" then return Pg.GetGuidByName(v) end
+    return v
+end
+local function walk(t, depth)
+    if depth > 6 or type(t) ~= "table" then return nil end
+    local ok, kids = pcall(function() return t:GetChildren() end)
+    if not ok or type(kids) ~= "table" then return nil end
+    for _, c in pairs(kids) do
+        local okActive, active = pcall(function() return c:IsActive() end)
+        local locs = rawget(c, "_tCourseLocs")
+        if okActive and active and type(locs) == "table" then
+            local up
+            local okGates, gates = pcall(function() return c:GetChildren() end)
+            for _, gate in pairs(okGates and gates or {}) do
+                local okUp, isUp = pcall(function() return gate:IsActive() end)
+                local gc = type(gate.GetConfig) == "function" and gate:GetConfig() or {}
+                if okUp and isUp and type(gc) == "table" and gc.vDestLoc then
+                    up = guid(gc.vDestLoc)
+                    break
+                end
+            end
+            if up == nil then return nil end
+            local cur = tonumber(rawget(c, "iCurLoc")) or 1
+            local best, bestOff
+            for i = 1, #locs do
+                local okG, g = pcall(guid, locs[i])
+                if okG and g == up then
+                    local off = math.abs(i - (cur - 1))
+                    if bestOff == nil or off < bestOff then best, bestOff = i, off end
+                end
+            end
+            if best == nil or best >= #locs then return nil end
+            local okN, n = pcall(guid, locs[best + 1])
+            if okN then return n end
+            return nil
         end
         local g = walk(c, depth + 1)
         if g then return g end
@@ -8965,6 +9039,45 @@ mod tests {
         let exit_only = box_of("Display", "[Briefing.RootMenuDialog]", &["[Generic.Exit]"]);
         assert_eq!(contract_pick(&exit_only, &offered), None);
         assert_eq!(contract_pick(&menu, &[]), None);
+    }
+
+    // The race's next checkpoint: the course entry after the gate up,
+    // the repeat nearest `iCurLoc` where the course comes back by a place
+    // (MecCon001's warm-up: 001 002 003 004 001 005), nil at the finish.
+    #[test]
+    fn the_race_reads_its_next_checkpoint() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            local ids = { a = 1, b = 2, c = 3, d = 4, e = 5 }
+            Pg = { GetGuidByName = function(n) return ids[n] end }
+            local function node(t, kids)
+                t.GetChildren = function() return kids end
+                t.IsActive = function() return t.active end
+                return t
+            end
+            gate = node({ active = true, GetConfig = function() return { vDestLoc = up } end }, {})
+            race = node({ active = true, _tCourseLocs = { "a", "b", "c", "d", "a", "e" } }, { gate })
+            local mission = node({ active = true }, { race })
+            MrxPlayState = { GetCurrentMission = function() return mission end }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let next = |up: &str, cur: u32| -> Option<u32> {
+            lua.load(format!("up = '{up}'; race.iCurLoc = {cur}"))
+                .exec()
+                .unwrap();
+            lua.load(CONTRACT_RACE_NEXT).eval::<Option<u32>>().unwrap()
+        };
+        assert_eq!(next("a", 2), Some(2));
+        assert_eq!(next("b", 3), Some(3));
+        // The second time by "a": on to the finish, not to "b" again.
+        assert_eq!(next("a", 6), Some(5));
+        assert_eq!(next("e", 7), None);
+        // No race running: nothing.
+        lua.load("race.active = false").exec().unwrap();
+        assert_eq!(next("a", 2), None);
     }
 
     // The fail fanfare's answer reaches a contract's callback as the
