@@ -291,6 +291,12 @@ m2-alpha [options]
   --check-node-damage <s> with --mission: <s> seconds into play, the scripts'
                          vehicle nearest her with node health has a node sent
                          ObjectState.SendDamage(o, node, 1) (nodedamage lines)
+  --check-building-damage <s>
+                         with --mission: <s> seconds into play, the scripts'
+                         object nearest her (not a vehicle) with node health
+                         has every node sent ObjectState.SendDamage(o, node,
+                         1), one at a time (buildingdamage lines: node and
+                         object health, and whether it was destroyed)
   --honk-every <s>       with --mission: driving, hold the horn half a second
                          every <s> seconds (horn, gate and disguise lines)
   --bash-target <s>      with --mission --after-contract: this long after the

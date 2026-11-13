@@ -421,6 +421,12 @@ struct Options {
     /// `ObjectState.SendDamage`; `nodedamage` lines log its health before
     /// and after and the message the node took.
     check_node_damage: Option<f32>,
+    /// `--check-building-damage <s>` with `--screenshot`: that many
+    /// seconds into play, the scripts' object nearest her (not a vehicle)
+    /// whose template gives node health has every node sent a share of 1,
+    /// one at a time, until it is destroyed; `buildingdamage` lines log
+    /// its node and object health and whether it was.
+    check_building_damage: Option<f32>,
     /// `--check-shots <s>,<s>...` with `--screenshot` on foot: the scene
     /// is pictured at those seconds in too (`<out>-at<s>.ppm`).
     check_shots: Vec<f32>,
@@ -1036,6 +1042,13 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--gates" => o.gates = true,
             "--marker-test" => o.marker_test = true,
             "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
+            "--check-building-damage" => {
+                o.check_building_damage = Some(
+                    value()?
+                        .parse()
+                        .context("--check-building-damage expects seconds")?,
+                )
+            }
             "--check-node-damage" => {
                 o.check_node_damage = Some(
                     value()?
@@ -4407,6 +4420,7 @@ fn mission_for_screenshot(
         .with_skip_to(options.skip_to.clone())
         .with_job_near(options.job_near);
     link.check_node_damage = options.check_node_damage;
+    link.check_building_damage = options.check_building_damage;
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);

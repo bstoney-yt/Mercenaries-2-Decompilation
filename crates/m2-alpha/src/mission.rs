@@ -981,6 +981,10 @@ pub struct MissionLink {
     /// vehicle with node health has a node sent damage by the scripts'
     /// `ObjectState.SendDamage` ([`check_node_damage`]).
     pub check_node_damage: Option<f32>,
+    /// `--check-building-damage <s>`: seconds of play left before the
+    /// nearest object (not a vehicle) with node health has its nodes sent
+    /// damage ([`check_building_damage`]).
+    pub check_building_damage: Option<f32>,
     /// The nodes of the models of props with hardpoints the scripts use,
     /// by model: name hash and place in the model ([`prop_hardpoints`]).
     prop_nodes: HashMap<u32, Vec<(u32, Vec3)>>,
@@ -1220,6 +1224,7 @@ impl MissionLink {
         Self {
             state: State::Loading(rx),
             check_node_damage: None,
+            check_building_damage: None,
             prop_nodes: HashMap::new(),
             movies: false,
             acts_logged: Default::default(),
@@ -3402,6 +3407,13 @@ impl MissionLink {
                     check_node_damage(mission, game);
                 }
             }
+            if let Some(left) = &mut self.check_building_damage {
+                *left -= dt;
+                if *left <= 0.0 {
+                    self.check_building_damage = None;
+                    check_building_damage(mission, game);
+                }
+            }
             // Targets to destroy: soldiers stand at those that are spawns,
             // and blasts close to the rest (gates, buildings) destroy them.
             // Those the contract's destroy objectives name with no marker
@@ -3910,8 +3922,15 @@ impl MissionLink {
                 support_item(game, &c);
                 strike(game, &c);
                 fly(game, mission, &mut self.landed, &c);
+                let changed = part_state_change(game, &c);
                 if obey(game, mission, &mut self.vehicles, &c) {
                     self.ashore = ASHORE_TRIES;
+                }
+                if let Some((g, machine, state)) = changed {
+                    eprintln!(
+                        "nodedamage: {g:#x} part {machine:#x} to state {state:#x}: OnStateChange"
+                    );
+                    mission.object_state_changed(g, machine, state);
                 }
                 // A bunker buster's blasts (`MrxBunkerBuster` spawns
                 // "Explosion (Bunker Buster Stage 1)" and "Stage 2" where
@@ -6227,6 +6246,87 @@ fn check_node_damage(mission: &mut Mission, game: &Game) {
     eprintln!("nodedamage check: no vehicle with node health on a damage part near");
 }
 
+/// `--check-building-damage`: the scripts' object nearest her that is
+/// not a vehicle and whose template gives node health (a building: the
+/// island fortress, a bridge) has each node with health left sent a share
+/// of 1 (`ObjectState.SendDamage`), one at a time, until it dies. Logs
+/// each node's health and the object's after it, and at the end whether
+/// the whole object was destroyed and by which node.
+fn check_building_damage(mission: &mut Mission, game: &Game) {
+    let at = game.focus();
+    let mut near: Vec<(f32, u32, String)> = {
+        let w = mission.world().borrow();
+        w.objects
+            .iter()
+            .filter(|(g, o)| o.alive && !game.scene.vehicles.iter().any(|v| v.guid == Some(**g)))
+            .map(|(g, o)| (Vec3::from(o.position).distance(at), *g, o.name.clone()))
+            .collect()
+    };
+    near.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (d, guid, name) in near {
+        let nodes: Vec<u32> = {
+            let mut w = mission.world().borrow_mut();
+            let Some(t) = w.node_table(guid) else {
+                continue;
+            };
+            t.entries().iter().map(|e| e.node).collect()
+        };
+        let (most, before) = {
+            let w = mission.world().borrow();
+            w.objects
+                .get(&guid)
+                .map_or((0.0, 0.0), |o| (o.max_health, o.health))
+        };
+        eprintln!(
+            "buildingdamage check: {guid:#x} {name} at {d:.1} m, {} nodes, object health              {before:.1}/{most:.1}",
+            nodes.len()
+        );
+        let mut by = None;
+        for (i, n) in nodes.iter().enumerate() {
+            let left = mission
+                .world()
+                .borrow_mut()
+                .node_table(guid)
+                .map_or(0.0, |t| t.health(*n));
+            if left <= 0.0 {
+                continue;
+            }
+            let code = format!(
+                "ObjectState.SendDamage(Sys.StringToGuid('{guid:#x}'), Sys.StringToGuid('{n:#x}'), 1)"
+            );
+            let ran = mission.run(&code, "building damage check");
+            let w = mission.world().borrow();
+            let (health, alive) = w
+                .objects
+                .get(&guid)
+                .map_or((0.0, false), |o| (o.health, o.alive));
+            eprintln!(
+                "buildingdamage: node {i} {n:#x} health {left} -> 0, object health {health:.1},                  alive {alive} ({})",
+                if ran.is_ok() { "ran" } else { "script error" }
+            );
+            if !alive {
+                by = Some(*n);
+                break;
+            }
+        }
+        let w = mission.world().borrow();
+        let (health, alive) = w
+            .objects
+            .get(&guid)
+            .map_or((0.0, false), |o| (o.health, o.alive));
+        eprintln!(
+            "buildingdamage check: {guid:#x} {name}: object health {before:.1} -> {health:.1}, {}",
+            match by {
+                Some(n) if !alive => format!("destroyed (node {n:#x} was its last)"),
+                _ if !alive => "destroyed".to_owned(),
+                _ => "not destroyed".to_owned(),
+            }
+        );
+        return;
+    }
+    eprintln!("buildingdamage check: no object with node health near");
+}
+
 fn report_speeds(mission: &mut Mission, moving: impl Iterator<Item = (u32, Vec3)>) {
     let known: Vec<(u32, f32)> = {
         let w = mission.world().borrow();
@@ -7130,6 +7230,35 @@ fn set_turret(
     }
 }
 
+/// A node's message that sends a standing part of a prop (a building's)
+/// to another state, by the handlers of the part's intact state: (the
+/// object, the part's node name hash, the state's name hash), for its
+/// object script's `OnStateChange` (0x82231380: the island fortress's
+/// hears its part `cf37044a` go to `694683eb`). Asked before the part
+/// breaks. From the 360 code: the hook is called only on a real change of
+/// state, with the machine and state as name hashes
+/// ([`m2_game::object_hooks`]). Inferred: a prop's part is taken to stand
+/// in its intact state until it breaks (props keep no part states).
+fn part_state_change(game: &Game, c: &Command) -> Option<(u32, u32, u32)> {
+    let Command::NodeDamage {
+        guid,
+        node,
+        message: Some(msg),
+        ..
+    } = c
+    else {
+        return None;
+    };
+    let props = &game.scene.props;
+    let parts = props.model_parts(*guid)?;
+    let k = parts.part_named(*node)?;
+    if props.part_down(*guid, k) {
+        return None;
+    }
+    let (machine, state) = parts.on_message(k, *msg)?;
+    Some((*guid, machine, state))
+}
+
 fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> bool {
     // A person the scripts make (`Pg.Spawn` of a person's template) stands
     // as a layer's spawn would; one they take away goes.
@@ -7689,10 +7818,14 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
-        // `ObjectState.SendDamage`: the node's message goes to its part's
-        // state machine, as a vehicle's parts take theirs
-        // (`m2_engine::node_health`). Not yet: props' part states, and the
-        // object's share of the damage (logged).
+        // A node's damage (`ObjectState.SendDamage`, or its object's death
+        // destroying it): its message goes to its part's state machine, as
+        // a vehicle's parts take theirs (`m2_engine::node_health`). A
+        // prop's part (a building's slice) a destroying message reaches
+        // breaks alone (`Props::wreck_part`; inferred: its state's own
+        // wreck shown as a vehicle's crash shows it). The object's share
+        // is already off its health (`m2_game::node_damage`); its death
+        // follows as `Kill`.
         Command::NodeDamage {
             guid,
             node,
@@ -7700,6 +7833,7 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             health,
             message,
             pass_through,
+            object_health,
         } => {
             let mut to = "no part";
             if let (Some(i), Some(msg)) = (index(guid), message) {
@@ -7710,10 +7844,47 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                     parts.send(dm, k, *msg);
                     to = "vehicle part";
                 }
+            } else if let Some(msg) = message
+                && (*msg == m2_assets::model::DESTROY_MSG
+                    || *msg == m2_engine::node_health::DESTROY_OTHER_MSG)
+                && let Some(k) = game
+                    .scene
+                    .props
+                    .model_parts(*guid)
+                    .and_then(|p| p.part_named(*node))
+                && let Some(world) = game.scene.world.as_mut()
+            {
+                let hides = game
+                    .scene
+                    .props
+                    .model_parts(*guid)
+                    .map(|p| p.hidden_by(k))
+                    .unwrap_or_default();
+                let broke = game
+                    .scene
+                    .props
+                    .wreck_part(&mut world.physics, *guid, k, |_| (Vec3::ZERO, Vec3::ZERO));
+                // Its pieces, and what hangs under them, no longer keep
+                // the object alive (0x82289020's shown-piece test).
+                if broke {
+                    mission
+                        .world()
+                        .borrow_mut()
+                        .hidden_nodes
+                        .entry(*guid)
+                        .or_default()
+                        .extend(hides);
+                }
+                to = if broke {
+                    "prop part"
+                } else {
+                    "prop part (down)"
+                };
             }
             eprintln!(
                 "nodedamage: {guid:#x} node {node:#x} took {damage:.1}, health {health:?}, \
-                 message {message:x?} to {to}, object's share {pass_through:.1}"
+                 message {message:x?} to {to}, object's share {pass_through:.1}, object health \
+                 {object_health:.1}"
             );
             return false;
         }
