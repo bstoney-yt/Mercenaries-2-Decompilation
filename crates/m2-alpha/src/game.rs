@@ -188,6 +188,9 @@ pub struct Game {
     pub fov_blend: m2_engine::camera_blend::Blend<1>,
     pub near_far_blend: m2_engine::camera_blend::Blend<2>,
     pub camera_calls: [u32; 2],
+    /// What each template's script does to the light when its object
+    /// comes into being, once asked ([`template_light`]).
+    object_lights: std::collections::HashMap<u32, Option<(f32, ScriptAtmosphere)>>,
     /// Props that move on their own.
     moving: MovingProps,
     /// Her support: the items she holds and the call under way; her
@@ -508,6 +511,7 @@ impl Game {
                 m2_engine::projection::FAR,
             ]),
             camera_calls: [0; 2],
+            object_lights: Default::default(),
             moving: MovingProps::default(),
             support: Support::default(),
             earned: Vec::new(),
@@ -2511,6 +2515,21 @@ impl Game {
             return;
         };
         let created = p.take(asked, &world.index.template_db);
+        // An object whose script sets the light when it activates (a
+        // blast's, an air strike's effect) sets it as the satellite bomb's
+        // does: the game runs every spawned object's `OnActivate`. One
+        // already waiting with the same light isn't doubled.
+        for &(template, _) in &created {
+            let light = self
+                .object_lights
+                .entry(template)
+                .or_insert_with(|| template_light(&world.index.template_db, template));
+            if let Some(light) = light
+                && !self.script_lights.contains(light)
+            {
+                self.script_lights.push(light.clone());
+            }
+        }
         // What came into being is heard as its template's `SoundEffect`
         // says.
         self.combat.created(created);
@@ -4470,15 +4489,27 @@ fn blast_light(db: &Templates, name: &str) -> Option<(f32, ScriptAtmosphere)> {
     if std::env::var("M2_BLAST_LIGHT").is_ok_and(|v| v == "off") {
         return None;
     }
-    let bytes = db.blast_scripts.get(&db.id(name)?)?;
+    template_light(db, db.id(name)?)
+}
+
+/// What the script of template `id` does to the light when its object
+/// comes into being, if it does ([`m2_game::atmosphere_script`]): seconds
+/// until, and the light. A script the light's runner can't run (most
+/// objects' scripts need the game's other libraries) reads as none.
+fn template_light(db: &Templates, id: u32) -> Option<(f32, ScriptAtmosphere)> {
+    let bytes = db.blast_scripts.get(&id)?;
     let chunk = m2_assets::lua::Chunk::from_asset(bytes).ok()?;
-    match m2_game::atmosphere_script::activation_light(&chunk) {
-        Ok(light) => light,
-        Err(e) => {
-            eprintln!("atmosphere: {name}'s script did not run: {e}");
-            None
-        }
+    let light = m2_game::atmosphere_script::activation_light(&chunk)
+        .ok()
+        .flatten();
+    if let Some((after, l)) = &light {
+        eprintln!(
+            "atmosphere: template {id:08x}'s script sets the light after {after} s ({} values, restored over {:?} s)",
+            l.edits.len(),
+            l.restore
+        );
     }
+    light
 }
 
 /// The first of `names` the template database gives a blast.

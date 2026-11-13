@@ -302,9 +302,10 @@ pub struct Templates {
     pub durability: HashMap<u32, crate::durability::Durability>,
     /// The blasts of those with `Explosive`, by id.
     pub explosions: HashMap<u32, crate::durability::Explosion>,
-    /// The compiled script (`ObjectScript`) of those blasts that run one,
-    /// by id, as the archive holds it (the satellite bomb's sets the
-    /// light: `m2_game::atmosphere_script`).
+    /// The compiled script (`ObjectScript`) of every template that runs
+    /// one, by id, as the archive holds it. Six of them set the light when
+    /// their object comes into being (`m2_game::atmosphere_script`): blasts
+    /// and the air strikes' effect templates (PC data, 2026-11-12).
     pub blast_scripts: HashMap<u32, Vec<u8>>,
     /// How the templates that can be hijacked are, by id.
     pub hijack: HashMap<u32, Vec<crate::hijack::HijackEntrance>>,
@@ -1162,9 +1163,7 @@ impl Templates {
             blast_scripts: HashMap::new(),
         };
         for (id, script) in db.hashes("ObjectScript") {
-            if templates.explosions.contains_key(&id)
-                && let Ok(chunk) = source.asset(script, SCRIPT_TYPE)
-            {
+            if let Ok(chunk) = source.asset(script, SCRIPT_TYPE) {
                 templates.blast_scripts.insert(id, chunk);
             }
         }
