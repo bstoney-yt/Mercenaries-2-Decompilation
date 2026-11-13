@@ -3164,7 +3164,7 @@ fn seat_crew(
 /// `repairpad` is the script of the helipads and the PMC's garage
 /// (0xcd561a19): awake, its lights are on (`Vehicle.SetParts` of
 /// `LightFront`), and they go out when it dies.
-pub const OBJECT_SCRIPTS: [(&str, u32); 16] = [
+pub const OBJECT_SCRIPTS: [(&str, u32); 17] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3181,7 +3181,13 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 16] = [
     ("pursuitcopter", PURSUIT_COPTER),
     ("AntiAir", homing::ANTI_AIR),
     ("HomingMissile", homing::HOMING_MISSILE),
+    ("autogunship", AUTOGUNSHIP),
 ];
+
+/// `autogunship`'s module hash: the script of `Support Vehicle
+/// (Autogunship)`, the gunship AllCon003 flies over her
+/// (`Airstrike.Flyby`). Its name is from the hash (`autogunship`).
+pub const AUTOGUNSHIP: u32 = 0x9ae4_b2ec;
 
 /// `pursuitcopter`'s module hash.
 pub const PURSUIT_COPTER: u32 = 0x3e29_6216;
@@ -3359,6 +3365,18 @@ pub(crate) fn is_exclusion(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // `autogunship` is run, under the name its hash is of: the scripts'
+    // globals are the module's name.
+    #[test]
+    fn the_autogunship_is_run_by_its_name() {
+        assert_eq!(m2_assets::name_hash("autogunship"), super::AUTOGUNSHIP);
+        assert!(
+            super::OBJECT_SCRIPTS
+                .iter()
+                .any(|&(n, h)| n == "autogunship" && h == super::AUTOGUNSHIP)
+        );
+    }
+
     use super::*;
 
     // A key set only in tables reads nil as a global unless some script

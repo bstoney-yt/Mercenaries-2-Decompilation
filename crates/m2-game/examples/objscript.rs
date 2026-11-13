@@ -14,8 +14,10 @@
 //! what they ask of the first one. For `AntiAir` it spawns a crewed
 //! `M113 AA (VZ) (Driver)` where the first stands, comes near it, has it
 //! lock on her and fire, and counts the radar calls the scripts make
-//! (`antiair:` lines). Prints names, counts and the scripts'
-//! errors only.
+//! (`antiair:` lines). For `autogunship` it flies the gunship over her
+//! with a hostile vehicle near her and prints the shells it fires
+//! (`gunship:` lines). Prints names, counts and the scripts' errors
+//! only.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -200,7 +202,83 @@ fn main() -> Result<()> {
             println!("{s}");
         }
     }
+    if name.eq_ignore_ascii_case("autogunship") {
+        autogunship(&mut mission, args.get(2).map(String::as_str))?;
+    }
     println!("{name} lines logged: {failures}");
+    Ok(())
+}
+
+/// `autogunship`: she stands at (100, 0, 100) with a hostile vehicle
+/// (`target`, default `M113 AA (VZ) (Driver)`) 60 m off; the gunship is
+/// flown over her
+/// as AllCon003 flies it (`Airstrike.Flyby` from 300 m north of her to
+/// her, 100 m up, at 40 m/s, and on past her), and 15 s pass. Prints each
+/// `Gunship Shell` it fires (`gunship:` lines: when, from, which way)
+/// and the scripts' errors.
+fn autogunship(mission: &mut Mission, target: Option<&str>) -> Result<()> {
+    let target = target.unwrap_or("M113 AA (VZ) (Driver)");
+    mission.put_player([100.0, 0.0, 100.0]);
+    let tank = mission.spawn(target, [160.0, 0.0, 100.0]);
+    let labels: String = mission
+        .lua()
+        .load(
+            "local t = ... local s = ''              for _, l in ipairs({'Vehicle', 'VZ', 'China', 'Guerilla'}) do                if Object.HasLabel(t, l) then s = s .. l .. ' ' end end              return s .. #Pg.FastCollectGroundVehicles(100, 0, 100, 200) .. ' near her'",
+        )
+        .call(tank.map(m2_game::events::guid_value))
+        .unwrap_or_default();
+    println!("gunship: target {target} {tank:?}: {labels}");
+    mission.take_commands();
+    mission.take_log();
+    let start = mission.now();
+    // AllCon003's call: from 50 m west and 300 m north of her to her, 100
+    // m over her, at 40 m/s.
+    mission.run(
+        "local x, y, z = Object.GetPosition(Player.GetLocalCharacter())          __gunship = Airstrike.Flyby('Support Vehicle (Autogunship)',          x - 50, z + 300, x, z, y + 100, 40)",
+        "gunship-check",
+    )?;
+    let gunship: Option<u32> = mission
+        .lua()
+        .load("return __gunship")
+        .eval::<mlua::Value>()
+        .ok()
+        .and_then(|v| m2_game::events::as_guid(&v));
+    let (from, to) = ([50.0_f32, 100.0, 400.0], [100.0_f32, 100.0, 100.0]);
+    let len = ((to[0] - from[0]).powi(2) + (to[2] - from[2]).powi(2)).sqrt();
+    let mut shells = 0;
+    while mission.now() < start + 15.0 {
+        // Flown on its line at 40 m/s, on past her (as m2-alpha flies it).
+        if let Some(g) = gunship {
+            let k = 40.0 * (mission.now() - start) as f32 / len;
+            let at = [
+                from[0] + (to[0] - from[0]) * k,
+                100.0,
+                from[2] + (to[2] - from[2]) * k,
+            ];
+            mission.place(g, at, 0.0);
+        }
+        mission.tick(0.25);
+        for c in mission.take_commands() {
+            if let Command::Ordnance {
+                what, at, launch, ..
+            } = &c
+            {
+                shells += 1;
+                if shells <= 12 {
+                    println!(
+                        "gunship: t={:.2} {what} at {at:?} {launch:?}",
+                        mission.now() - start
+                    );
+                }
+            }
+        }
+        for l in mission.take_log() {
+            if l.contains("rror") || l.contains("SALVO") || l.contains("target") {
+                println!("gunship: log {}", l.chars().take(160).collect::<String>());
+            }
+        }
+    }
+    println!("gunship: {shells} shells in 15 s");
     Ok(())
 }
 
