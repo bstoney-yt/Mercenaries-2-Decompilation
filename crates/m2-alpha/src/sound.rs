@@ -67,6 +67,16 @@ impl AudioOut {
         }
     }
 
+    /// A mixer with no device: what the offscreen runs hear through
+    /// ([`GameAudio::silent`]), mixed by hand ([`GameAudio::run_silent`]).
+    pub fn silent() -> Self {
+        Self {
+            mixer: Arc::new(Mutex::new(Mixer::new(48_000))),
+            #[cfg(any(windows, target_os = "android"))]
+            _stream: None,
+        }
+    }
+
     /// Stops the device playing (`paused`) or starts it again, as the app
     /// goes to the background and comes back. Nothing without a device.
     pub fn set_paused(&self, paused: bool) {
@@ -207,6 +217,8 @@ pub struct GameAudio {
     /// for, by guid, and its voice (`None`: its set has no cue, or the
     /// cue no sound).
     flybys: HashMap<u32, Option<VoiceId>>,
+    /// Where [`Self::run_silent`] mixes to.
+    silent_buffer: Vec<f32>,
     /// Others' engines heard: their cue and a voice per track.
     others: HashMap<usize, (Arc<EngineCue>, Vec<VoiceId>)>,
     /// Banks read and found to have no engine sounds.
@@ -1240,7 +1252,31 @@ type Decoded = (&'static str, SoundBuffer);
 impl GameAudio {
     /// Opens the output and, with an install, starts the ambience.
     pub fn start(install: Option<&Install>) -> Self {
-        let out = AudioOut::start();
+        Self::start_with(AudioOut::start(), install)
+    }
+
+    /// As [`Self::start`], with no device: everything the game asks for
+    /// is read, started and logged as in the window, and the mixer is run
+    /// by [`Self::run_silent`] so that sounds end when they would. For
+    /// the offscreen runs (`--screenshot --sound`), whose logs are how
+    /// the sound is checked.
+    pub fn silent(install: Option<&Install>) -> Self {
+        eprintln!("sound: offscreen, mixed silently");
+        Self::start_with(AudioOut::silent(), install)
+    }
+
+    /// Mixes `seconds` of sound into nothing: what the device would have
+    /// pulled ([`Self::silent`]).
+    pub fn run_silent(&mut self, seconds: f32) {
+        let rate = self.out.with(|m| m.rate());
+        let frames = (seconds * rate as f32).round() as usize;
+        self.silent_buffer.resize(frames * 2, 0.0);
+        let mut buffer = std::mem::take(&mut self.silent_buffer);
+        self.out.with(|m| m.mix(&mut buffer));
+        self.silent_buffer = buffer;
+    }
+
+    fn start_with(out: AudioOut, install: Option<&Install>) -> Self {
         let streams = install.and_then(|install| {
             let loaded = install
                 .open_world()
@@ -1283,6 +1319,7 @@ impl GameAudio {
             }),
             rotors: HashMap::new(),
             flybys: HashMap::new(),
+            silent_buffer: Vec::new(),
             others: HashMap::new(),
             silent: HashSet::new(),
             ambient_wait: 3.0,
