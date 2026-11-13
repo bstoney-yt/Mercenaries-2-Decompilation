@@ -401,8 +401,10 @@ pub enum Command {
         at: Option<[f32; 3]>,
     },
     /// An object fades from sight over `seconds` (`Object.FadeOut(object,
-    /// seconds, flag)`); what the flag asks isn't known (OilCon001 passes
-    /// true as its executive leaves).
+    /// seconds, flag)`): from the 360 code (0x821B8630) its alpha goes
+    /// from 1 to 0 over them; with `flag` it then goes (the scripts' world
+    /// removes it and sends [`Command::Remove`]). OilCon001's executive
+    /// leaves this way.
     FadeOut {
         guid: u32,
         seconds: f32,
@@ -913,6 +915,9 @@ pub struct ScriptWorld {
     /// left once the game has said its length ([`ScriptWorld::raw_clip_length`]),
     /// `None` until then.
     pub raw_clips: HashMap<u32, Option<f32>>,
+    /// Objects fading from sight (`Object.FadeOut`): seconds left, and
+    /// whether the object goes once faded ([`ScriptWorld::tick_fades`]).
+    pub fades: HashMap<u32, (f32, bool)>,
     /// The player's character.
     pub player: Option<u32>,
     pub commands: Vec<Command>,
@@ -1600,6 +1605,42 @@ impl ScriptWorld {
     /// runs out from now.
     pub fn raw_clip_length(&mut self, guid: u32, seconds: f32) {
         self.raw_clips.insert(guid, Some(seconds));
+    }
+
+    /// Takes object `guid` out of the world, as `Object.Remove` does: its
+    /// object script hears it went, and the game is told.
+    pub fn remove_object(&mut self, guid: u32) {
+        if self.objects.remove(&guid).is_some_and(|o| o.alive) {
+            self.removed_alive.insert(guid);
+        }
+        if let Some(script) = self.scripted.remove(&guid) {
+            self.script_removals.push((guid, script));
+        }
+        self.inventory.drop(guid);
+        self.fades.remove(&guid);
+        self.commands.push(Command::Remove(guid));
+    }
+
+    /// Moves the fades on by `dt` seconds. From the 360 code (0x821B8630):
+    /// a fade's time left runs down; once it is below 0, an object faded
+    /// with the flag goes, by the queue `Object.Remove` uses (0x822567D0
+    /// on 0x8357F9B8); without it, it stays.
+    pub fn tick_fades(&mut self, dt: f32) {
+        let mut gone = Vec::new();
+        self.fades.retain(|&g, (left, remove)| {
+            *left -= dt;
+            if *left < 0.0 {
+                if *remove {
+                    gone.push(g);
+                }
+                return false;
+            }
+            true
+        });
+        gone.sort_unstable();
+        for g in gone {
+            self.remove_object(g);
+        }
     }
 
     /// Moves the raw clips on by `dt` seconds.
@@ -3027,10 +3068,23 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Object.FadeOut(object, seconds, flag): the object fades from sight
     // over the seconds; gives true. From the 360 code (8232FDB0): the
     // object and the seconds are needed, the flag is false when left out.
+    // The fade (0x821B8768, 0x821B8630) takes its alpha from 1 to 0 over
+    // the seconds; with the flag the object then goes, as `Object.Remove`
+    // has it go ([`ScriptWorld::tick_fades`]). OilCon001's executive
+    // leaves this way.
     add(&object, "FadeOut", |w, _, a| {
         let (Some(guid), Some(seconds)) = (id(a.first()), num(a.get(1))) else {
             return values([]);
         };
+        let remove = matches!(a.get(2), Some(Value::Boolean(true)));
+        if seconds < 0.0 {
+            // Done already (0x821B8768): gone at once with the flag.
+            if remove {
+                w.remove_object(guid);
+            }
+        } else {
+            w.fades.insert(guid, (seconds, remove));
+        }
         w.commands.push(Command::FadeOut {
             guid,
             seconds,
@@ -3131,14 +3185,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     add(&object, "Remove", |w, _, a| {
         if let Some(guid) = id(a.first()) {
-            if w.objects.remove(&guid).is_some_and(|o| o.alive) {
-                w.removed_alive.insert(guid);
-            }
-            if let Some(script) = w.scripted.remove(&guid) {
-                w.script_removals.push((guid, script));
-            }
-            w.inventory.drop(guid);
-            w.commands.push(Command::Remove(guid));
+            w.remove_object(guid);
         }
         values([])
     })?;
@@ -8108,6 +8155,32 @@ mod tests {
                 }
             ]
         );
+    }
+
+    // `Object.FadeOut(object, seconds, true)` (OilCon001's executive): it
+    // goes once faded, as `Object.Remove` has it go; without the flag it
+    // stays (0x821B8630).
+    #[test]
+    fn an_object_faded_out_with_the_flag_goes_once_faded() {
+        let (host, world) = setup();
+        world
+            .borrow_mut()
+            .insert(51, Object::new("_global_veh_jeep 0x0002", [5.0, 0.0, 0.0]));
+        host.lua()
+            .load(
+                "Object.FadeOut(Sys.StringToGuid('0x32'), 2, true)                  Object.FadeOut(Sys.StringToGuid('0x33'), 2)",
+            )
+            .exec()
+            .unwrap();
+        world.borrow_mut().tick_fades(1.0);
+        assert!(world.borrow().objects.contains_key(&50), "fading");
+        world.borrow_mut().tick_fades(1.5);
+        let w = world.borrow();
+        assert!(!w.objects.contains_key(&50), "gone");
+        assert!(w.commands.contains(&Command::Remove(50)));
+        assert!(w.objects.contains_key(&51), "no flag: it stays");
+        assert!(!w.commands.contains(&Command::Remove(51)));
+        assert!(w.fades.is_empty());
     }
 
     #[test]
