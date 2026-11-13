@@ -5105,10 +5105,22 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => None,
         };
         let subtitled = subtitled && !w.subtitles_off;
-        let say =
-            w.vo.cue(speaker, cue.to_string_lossy(), callback, subtitled);
-        w.commands.push(say);
-        values([Value::Boolean(true)])
+        // The callback takes two places (the function and its values),
+        // so the priority is the fifth argument (0x82349000).
+        let priority = num(a.get(4)).map_or(crate::vo::DEFAULT_PRIORITY, |p| p as i32);
+        let sequences = std::mem::take(&mut w.vo_sequences);
+        let say = w.vo.cue(
+            speaker,
+            cue.to_string_lossy(),
+            callback,
+            subtitled,
+            priority,
+            &sequences,
+        );
+        w.vo_sequences = sequences;
+        let played = say.is_some();
+        w.commands.extend(say.into_iter().flatten());
+        values([Value::Boolean(played)])
     }
     add(&vo, "Cue", |w, _, a| cue(w, a, true))?;
     add(&vo, "CueWithoutSubtitles", |w, _, a| cue(w, a, false))?;
