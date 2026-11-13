@@ -1841,6 +1841,9 @@ impl Player {
             pick.stagger, pick.direction
         );
         self.stagger_pending = Some((clip, pick.stagger.action()));
+        // Turned at once to the picker's heading, as the people are
+        // (0x8241FE38).
+        self.facing = pick.turn_to;
         self.since_stagger = Some(0.0);
         true
     }
@@ -2645,11 +2648,15 @@ mod tests {
         };
         // Facing +z: a bullet does nothing, a bash from ahead staggers.
         assert!(!p.stagger(&hit(Vec3::NEG_Z, true, false, None)));
+        p.facing = 0.3;
         assert!(p.stagger(&hit(Vec3::NEG_Z, true, true, None)));
         assert_eq!(
             p.stagger_pending,
             Some((11, m2_engine::blend::action::STAGGER_IN_PLACE))
         );
+        // A bash travelling -z from ahead: she is turned to face where
+        // it came from, +z (heading 0).
+        assert!(p.facing.abs() < 1e-5, "{}", p.facing);
         // Not again within a quarter of a second.
         p.since_stagger = Some(0.1);
         assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None)));

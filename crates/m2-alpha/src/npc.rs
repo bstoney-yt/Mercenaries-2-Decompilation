@@ -1861,6 +1861,10 @@ impl Npc {
         self.rig
             .animator
             .play_action(clip, true, pick.stagger.action());
+        // As the stagger starts they are turned at once to the heading
+        // the picker chose (0x8241FE38: the heading is set, not turned
+        // to).
+        self.facing = pick.turn_to;
         self.stagger = Some(clip);
         self.since_stagger = Some(0.0);
     }
