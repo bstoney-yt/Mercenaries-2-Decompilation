@@ -708,6 +708,10 @@ struct Instance {
     /// Each emitter's fraction of a particle owed.
     owed: Vec<f32>,
     particles: Vec<Particle>,
+    /// Its turn in the world: the frame of what set it off (a launcher's
+    /// muzzle, a rocket in flight), which its emitters' places and ways
+    /// follow ([`Particles::turn_from`]); none for most.
+    turn: Quat,
     /// Where its particles start: on its emitters' shapes, or about the
     /// camera for a record's ambient effect.
     placement: Placement,
@@ -978,10 +982,32 @@ impl Particles {
             until,
             owed: vec![0.0; spec.emitters.len()],
             particles: Vec::new(),
+            turn: Quat::IDENTITY,
             placement: Placement::Shape,
             patch: None,
         });
         true
+    }
+
+    /// Turns the effects started since index `first` ([`running`]) to
+    /// `turn`, the frame of what set them off: their emitters' places and
+    /// ways are the effect's own, in that frame (a launcher's flash along
+    /// its barrel, a rocket's smoke out of its tail). Left unturned, an
+    /// effect's frame is the world's.
+    ///
+    /// [`running`]: Self::running
+    pub fn turn_from(&mut self, first: usize, turn: Quat) {
+        for i in self.instances.iter_mut().skip(first) {
+            i.turn = turn;
+        }
+    }
+
+    /// Turns held effect `key` (as [`hold`](Self::hold) keeps it) to
+    /// `turn`, as its source turns.
+    pub fn turn_held(&mut self, key: u64, turn: Quat) {
+        for i in self.instances.iter_mut().filter(|i| i.key == Some(key)) {
+            i.turn = turn;
+        }
     }
 
     /// Keeps `effect` going at `at` for source `key` (a fire, a smoking
@@ -1221,8 +1247,14 @@ impl Particles {
                             .min(EMITTER_BUDGET)
                             .min(BUDGET.saturating_sub(total));
                         for _ in 0..n {
-                            let mut p =
-                                self.emit(e, k as u16, inst.at, inst.scale, frame, inst.placement);
+                            let mut p = self.emit(
+                                e,
+                                k as u16,
+                                (inst.at, inst.turn),
+                                inst.scale,
+                                frame,
+                                inst.placement,
+                            );
                             if let Some(patch) = &inst.patch {
                                 let (pick, u, v) = (self.random(), self.random(), self.random());
                                 let (at, normal) = patch.start(pick, u, v);
@@ -1274,8 +1306,14 @@ impl Particles {
                                 break 'giving;
                             }
                         };
-                        let mut p =
-                            self.emit(e, k as u16, inst.at, inst.scale, frame, inst.placement);
+                        let mut p = self.emit(
+                            e,
+                            k as u16,
+                            (inst.at, inst.turn),
+                            inst.scale,
+                            frame,
+                            inst.placement,
+                        );
                         self.onto_ground(&mut p, e, at + Vec3::Y * lift, normal);
                         inst.particles.push(p);
                         total += 1;
@@ -1289,7 +1327,14 @@ impl Particles {
                         continue;
                     }
                     given += 1;
-                    let p = self.emit(e, k as u16, inst.at, inst.scale, frame, inst.placement);
+                    let p = self.emit(
+                        e,
+                        k as u16,
+                        (inst.at, inst.turn),
+                        inst.scale,
+                        frame,
+                        inst.placement,
+                    );
                     inst.particles.push(p);
                     total += 1;
                 }
@@ -1318,7 +1363,7 @@ impl Particles {
         &mut self,
         e: &EmitterSpec,
         emitter: u16,
-        at: Vec3,
+        (at, turn): (Vec3, Quat),
         scale: f32,
         frame: f32,
         placement: Placement,
@@ -1351,14 +1396,21 @@ impl Particles {
             (None, Some((p, n))) => (e.pose * p, e.pose * n),
             (None, None) => (Vec3::ZERO, e.axis),
         };
-        let dir = Quat::from_rotation_arc(Vec3::Y, axis.normalize_or(Vec3::Y)) * local;
+        // An effect set off in its source's frame is turned with it (not
+        // one about the camera, whose start is the world's).
+        let turn = if about.is_some() {
+            Quat::IDENTITY
+        } else {
+            turn
+        };
+        let dir = turn * Quat::from_rotation_arc(Vec3::Y, axis.normalize_or(Vec3::Y)) * local;
         // Each a fresh draw on its spread, a speed not held above zero, a
         // life held at or above zero (from the 360 code: 0x821DF920,
         // 0x821DAE60).
         let speed = e.speed.at(frame) + self.spread(e.speed_var);
         let life = (e.life.at(frame) + self.spread(e.life_var)).max(0.0);
         Particle {
-            at: about.unwrap_or(at + (e.offset + start) * scale),
+            at: about.unwrap_or(at + turn * (e.offset + start) * scale),
             velocity: dir * speed * scale,
             age: 0.0,
             life,
@@ -1916,9 +1968,16 @@ mod tests {
         let n = 4000;
         let mean: f32 = (0..n)
             .map(|_| {
-                p.emit(&e, 0, Vec3::ZERO, 1.0, 0.0, Placement::Shape)
-                    .velocity
-                    .angle_between(Vec3::Y)
+                p.emit(
+                    &e,
+                    0,
+                    (Vec3::ZERO, Quat::IDENTITY),
+                    1.0,
+                    0.0,
+                    Placement::Shape,
+                )
+                .velocity
+                .angle_between(Vec3::Y)
             })
             .sum::<f32>()
             / n as f32;
@@ -2124,6 +2183,48 @@ mod tests {
         assert_eq!(p.running(), 1);
         p.clear_about_camera();
         assert_eq!((p.running(), p.live()), (0, 0));
+    }
+
+    /// An effect turned to its source's frame gives off along the turned
+    /// axis, from its turned offset: one pointing up (+Y, 1 m up),
+    /// turned a quarter about X so its +Y lies along the world's +Z,
+    /// flies along +Z from 1 m along +Z; a held one turns with its
+    /// source. Unturned, it keeps the world's frame.
+    #[test]
+    fn a_turned_effect_gives_off_in_its_sources_frame() {
+        let mut e = burst();
+        e.speed = plain(5.0);
+        let lib = library(e);
+        let quarter = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+        let ways = |p: &Particles| -> Vec<(Vec3, Vec3)> {
+            p.instances
+                .iter()
+                .flat_map(|i| &i.particles)
+                .map(|q| (q.at, q.velocity.normalize()))
+                .collect()
+        };
+        let mut p = Particles::default();
+        let first = p.running();
+        assert!(p.spawn(&lib, 7, Vec3::ZERO, 0.0, 1.0));
+        p.turn_from(first, quarter);
+        p.step(&lib, 0.01);
+        let given = ways(&p);
+        assert!(!given.is_empty());
+        for (at, way) in given {
+            assert!(way.distance(Vec3::Z) < 1e-3, "{way}");
+            assert!(at.z > 0.9 && at.y.abs() < 0.2, "{at}");
+        }
+        // Unturned: up, from 1 m up.
+        let mut p = Particles::default();
+        assert!(p.spawn(&lib, 7, Vec3::ZERO, 0.0, 1.0));
+        p.step(&lib, 0.01);
+        assert!(ways(&p).iter().all(|(_, w)| w.distance(Vec3::Y) < 1e-3));
+        // Held, turned as its source turns.
+        let mut p = Particles::default();
+        assert!(p.hold(&lib, 3, 7, Vec3::ZERO, 1.0));
+        p.turn_held(3, quarter);
+        p.step(&lib, 0.01);
+        assert!(ways(&p).iter().all(|(_, w)| w.distance(Vec3::Z) < 1e-3));
     }
 
     #[test]
