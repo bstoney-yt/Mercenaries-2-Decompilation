@@ -44,6 +44,7 @@ use m2_game::events::World as _;
 use m2_game::hud::ObjectiveMessage;
 use m2_game::layers::LayerOp;
 use m2_game::mission::{GameData, Mission, PLAYER};
+use m2_game::vehicle_state::VehicleCommand;
 use m2_math::glam::Vec3;
 
 use crate::combat::{self, Weapon};
@@ -6611,6 +6612,44 @@ fn fly(game: &mut Game, mission: &mut Mission, landed: &mut HashSet<u32>, c: &Co
 /// Carries out a script command about the player, the scripts' vehicles
 /// or the layers they stream; true when it seated her in a vehicle the
 /// island doesn't show, so she stands where it is.
+/// The scripts' turret angle ([`VehicleCommand::Turret`]) on vehicle `v`:
+/// its main turret (`main_turret`) through its physics, else the aimer
+/// whose `Turret` record the hash names. A name it has no turret of does
+/// nothing.
+fn set_turret(
+    v: &mut crate::scene::ParkedVehicle,
+    physics: Option<&mut m2_engine::Physics>,
+    turret: u32,
+    angle: f32,
+    yaw: bool,
+) {
+    let main = v.spec.tuning.turret.is_some_and(|t| t.main)
+        && turret == m2_assets::name_hash(m2_engine::tuning::MAIN_TURRET);
+    if main {
+        match (yaw, v.id, physics) {
+            (true, Some(id), Some(p)) => {
+                p.turn_turret(id, angle);
+                v.turret = p.turret_yaw(id).unwrap_or(angle);
+            }
+            (false, Some(id), Some(p)) => {
+                p.aim_gun(id, angle);
+                v.gun = p.gun_pitch(id).unwrap_or(angle);
+            }
+            (true, ..) => v.turret = angle,
+            (false, ..) => v.gun = angle,
+        }
+        return;
+    }
+    if let Some(k) = v.spec.aimers.iter().position(|a| a.record.name == turret) {
+        v.aims.resize(v.spec.aimers.len(), (0.0, 0.0));
+        if yaw {
+            v.aims[k].0 = angle;
+        } else {
+            v.aims[k].1 = angle;
+        }
+    }
+}
+
 fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> bool {
     // A person the scripts make (`Pg.Spawn` of a person's template) stands
     // as a layer's spawn would; one they take away goes.
@@ -6704,6 +6743,23 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
         }
         // `Object.SetWinchState` on one of the scripts' helicopters: its
         // winch takes that state and pays out or reels in to match.
+        // `Vehicle.SetTurretYaw` / `SetTurretPitch` (0x82347E00,
+        // 0x82347D20): the turret the name hash names takes that angle as
+        // its target, radians as the script gives it (the turret message
+        // 0x82275CD8 sets yaw +0x0C or pitch +0x10 unconverted, which the
+        // turret action turns towards, 0x82275608): the main turret
+        // through its physics, another (a seat's) as its aim.
+        Command::Vehicle(VehicleCommand::Turret {
+            vehicle,
+            turret,
+            angle,
+            yaw,
+        }) => {
+            if let Some(i) = index(vehicle) {
+                let physics = game.scene.world.as_mut().map(|w| &mut w.physics);
+                set_turret(&mut game.scene.vehicles[i], physics, *turret, *angle, *yaw);
+            }
+        }
         Command::WinchState { carrier, state } => {
             let s = [
                 WinchState::Retracted,
@@ -8195,6 +8251,84 @@ fn send_pursuit_car(
 
 #[cfg(test)]
 mod tests {
+    // `Vehicle.SetTurretYaw` / `SetTurretPitch` (0x82347E00, 0x82347D20
+    // -> 0x82275CD8): the named turret's target, radians as given.
+    #[test]
+    fn the_scripts_turn_a_turret_by_its_name() {
+        use m2_engine::vehicle::Aimer;
+        use m2_engine::{Physics, seats::TurretRecord};
+        let mut spec = crate::npc::tests::tank(m2_engine::tuning::VehicleTuning {
+            turret: Some(m2_engine::tuning::TurretTuning {
+                main: true,
+                yaw_speed: 1.0,
+                yaw_accel: 1.0,
+                pitch: (-0.2, 0.5),
+                pitch_speed: 1.0,
+                pitch_accel: 1.0,
+                yaw: None,
+            }),
+            ..Default::default()
+        });
+        let cupola = m2_assets::name_hash("cupola");
+        spec.aimers = vec![Aimer {
+            record: TurretRecord {
+                name: cupola,
+                bone_yaw: None,
+                bone_pitch: None,
+                yaw: (-1.0, 1.0),
+                yaw_speed: 1.0,
+                pitch: (-0.2, 0.5),
+                pitch_speed: 1.0,
+            },
+            yaw_nodes: Vec::new(),
+            pitch_nodes: Vec::new(),
+            yaw_pivot: None,
+            pitch_pivot: None,
+        }];
+        let mut physics = Physics::new();
+        let id = physics.add_vehicle(&spec, Vec3::ZERO, 0.0);
+        let mut v = crate::scene::ParkedVehicle {
+            spec,
+            model: crate::npc::tests::empty_model(),
+            id: Some(id),
+            wrecked: false,
+            guid: Some(77),
+            spot: None,
+            crew: Vec::new(),
+            turret: 0.0,
+            hijack_nodes: Vec::new(),
+            door_turns: Vec::new(),
+            gun: 0.0,
+            aims: Vec::new(),
+            rolled: 0.0,
+            fired: 0,
+            mg_fired: 0,
+            damage: 0.0,
+            hit: 0.0,
+            parts: None,
+            loose: Vec::new(),
+            debris_thrown: false,
+        };
+        let main = m2_assets::name_hash("main_turret");
+        set_turret(&mut v, Some(&mut physics), main, 1.2, true);
+        assert!((v.turret - 1.2).abs() < 1e-5, "{}", v.turret);
+        set_turret(&mut v, Some(&mut physics), main, 0.3, false);
+        assert!((v.gun - 0.3).abs() < 1e-5, "{}", v.gun);
+        set_turret(&mut v, Some(&mut physics), cupola, -0.5, true);
+        set_turret(&mut v, Some(&mut physics), cupola, 0.25, false);
+        assert_eq!(v.aims, vec![(-0.5, 0.25)]);
+        // A name it has no turret of: nothing.
+        set_turret(
+            &mut v,
+            Some(&mut physics),
+            m2_assets::name_hash("x"),
+            2.0,
+            true,
+        );
+        assert!((v.turret - 1.2).abs() < 1e-5, "{}", v.turret);
+        assert_eq!(v.aims, vec![(-0.5, 0.25)]);
+    }
+
     // Playtest: while the scripts are still being read the screen stays
     // black (she would be seen swimming off the start before the
     // opening's movie); once they run, theirs is the fade.
