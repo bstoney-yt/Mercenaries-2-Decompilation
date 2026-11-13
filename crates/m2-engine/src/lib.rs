@@ -22,6 +22,7 @@ pub mod ai_plan;
 pub mod ai_sense;
 pub mod ai_target;
 pub mod aim_sweep;
+pub mod alarm_goal;
 pub mod ambience;
 pub mod ambience_stack;
 pub mod anim;
@@ -30,11 +31,14 @@ pub mod atmosphere;
 pub mod audio;
 pub mod blend;
 pub mod boat_attack;
+pub mod camera_blend;
 pub mod car_attack;
 pub mod car_driver;
 pub mod collision_layers;
 pub mod death;
 pub mod durability;
+pub mod face_expression;
+pub mod face_graph;
 pub mod grapple;
 pub mod gun_sounds;
 pub mod gunner_aim;
@@ -60,6 +64,7 @@ pub mod path_search;
 pub mod physics;
 pub mod pickup;
 pub mod population;
+pub mod projection;
 pub mod reverb;
 pub mod road_driver;
 pub mod road_graph;
@@ -76,9 +81,11 @@ pub mod standin;
 pub mod stream;
 pub mod surface;
 pub mod tank_attack;
+pub mod target_record;
 pub mod technique;
 pub mod tuning;
 pub mod vehicle;
+pub mod vehicle_class;
 pub mod vehicle_damage;
 pub mod vehicle_disguise;
 pub mod vehicle_door;
@@ -92,7 +99,10 @@ pub use anim::{Animator, BoundClip, Gait, Locomotion, Pose, Skeleton};
 pub use assets::{AssetError, AssetSource, DecodedTexture, Install, ModelData};
 pub use atmosphere::Atmosphere;
 pub use audio::{Category, Mixer, Play, SoundBuffer, SoundLibrary, Streams, VoiceId, Voices};
-pub use model::{CpuModel, GpuModel, Looks, MaterialCache, ModelParts, StateFx, StateMessage};
+pub use model::{
+    CpuModel, GpuModel, Looks, MaterialCache, ModelParts, MorphedFace, PieceMorph, StateFx,
+    StateMessage,
+};
 pub use physics::{
     Breakup, Character, CollisionShape, DebrisId, Loose, LoosePiece, Physics, RagdollId, StaticKey,
     VehicleControls, VehicleId,

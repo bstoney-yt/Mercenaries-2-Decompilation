@@ -56,14 +56,18 @@ impl FlyCamera {
         self.position += motion.normalize_or_zero() * speed * dt;
     }
 
+    /// The view through it: `fov_degrees` is the game's field of view
+    /// (the picture's width at 4:3), which with the screen's shape gives
+    /// the picture's height, between the game's near and far distances
+    /// ([`m2_engine::projection`]).
     pub fn view(&self, fov_degrees: f32, aspect: f32) -> View {
         View::perspective(
             self.position,
             self.forward(),
-            fov_degrees.to_radians(),
+            m2_engine::projection::fov_y(fov_degrees.to_radians(), aspect),
             aspect,
-            0.1,
-            10_000.0,
+            m2_engine::projection::NEAR,
+            m2_engine::projection::FAR,
         )
     }
 }

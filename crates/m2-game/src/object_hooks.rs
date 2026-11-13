@@ -35,8 +35,9 @@
 //! `QueryActiveUse`, `OnUse`, `OnDesignate`, `OnTimer`,
 //! `DisableGrappleTriggered`) are not dispatched from here.
 //!
-//! **Invented:** nothing. Only entities placed in layers have a record
-//! here; objects spawned in play do not.
+//! **Invented:** nothing. An entity placed in a layer has its own record;
+//! an object spawned in play has its template's
+//! ([`crate::api::ScriptWorld::note_script`]).
 
 use mlua::{Function, IntoLua, Lua, MultiValue, Table, Value};
 
@@ -202,6 +203,7 @@ mod tests {
             path: Vec::new(),
             template: None,
             alarm: false,
+            association: None,
             crew: Vec::new(),
         };
         // No script, no record, whatever its data.

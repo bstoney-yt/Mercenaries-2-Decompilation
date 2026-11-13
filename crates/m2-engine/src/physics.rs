@@ -6106,6 +6106,19 @@ impl Physics {
         Some(out)
     }
 
+    /// The speed of a ragdoll's fastest limb, m/s; `None` once removed.
+    pub fn ragdoll_speed(&self, id: RagdollId) -> Option<f32> {
+        let doll = self.ragdolls.get(id.0)?.as_ref()?;
+        Some(
+            doll.bodies
+                .iter()
+                .flatten()
+                .filter_map(|h| self.world.bodies.get(*h))
+                .map(|b| vec3(b.linvel()).length())
+                .fold(0.0, f32::max),
+        )
+    }
+
     /// Shoves every limb of a ragdoll by `velocity` (m/s).
     pub fn push_ragdoll(&mut self, id: RagdollId, velocity: Vec3) {
         let Some(doll) = self.ragdolls.get(id.0).and_then(Option::as_ref) else {

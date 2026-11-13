@@ -8,6 +8,7 @@
 //! cargo run -p m2-assets --example wad -- textures <archive.wad>
 //! cargo run -p m2-assets --example wad -- dds     <archive.wad> <texture name> <out.dds>
 //! cargo run -p m2-assets --example wad -- models  <archive.wad>
+//! cargo run -p m2-assets --example wad -- blendshapes <archive.wad>
 //! cargo run -p m2-assets --example wad -- obj     <archive.wad> <model hash> <out.obj> [lod]
 //! cargo run -p m2-assets --example wad -- nodes   <archive.wad> <model name or hash>
 //! cargo run -p m2-assets --example wad -- material <archive.wad> <material hash>
@@ -232,6 +233,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             println!("wrote {} bytes to {out}", dds.len());
         }
         ("models", []) => models(&mut wad)?,
+        ("blendshapes", []) => blend_shapes(&mut wad)?,
         ("material", [hash]) => material_users(&mut wad, u32::from_str_radix(hash, 16)?)?,
         ("anims", []) => anims(&mut wad)?,
         ("world", []) => world(&mut wad)?,
@@ -689,6 +691,82 @@ fn models<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
         "{} models, {chunks} streamed chunks, {groups} primitive groups, {errors} errors, {warnings} warnings",
         all.len()
     );
+    Ok(())
+}
+
+/// Lists the models with blend shapes (morph targets): each one's shape
+/// names (hashes) and, per skinned group that carries them, its vertices,
+/// how many of them each shape moves, the farthest it moves one, and the
+/// length of the group's `BSHI` data.
+fn blend_shapes<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
+    let mut all: HashMap<u32, ModelBytes> = HashMap::new();
+    for block in 0..wad.index().blocks().len() {
+        let _ = collect_models(wad, block, None, &mut all);
+    }
+    let mut hashes: Vec<u32> = all.keys().copied().collect();
+    hashes.sort_unstable();
+    let (mut with, mut sets) = (0, HashMap::<Vec<u32>, usize>::new());
+    for hash in hashes {
+        let Some(bytes) = all.get_mut(&hash) else {
+            continue;
+        };
+        let path = bytes.path.clone();
+        let Ok(model) = bytes.assemble() else {
+            continue;
+        };
+        if model.blend_shapes.is_empty() {
+            continue;
+        }
+        with += 1;
+        *sets.entry(model.blend_shapes.clone()).or_default() += 1;
+        let names: Vec<String> = model
+            .blend_shapes
+            .iter()
+            .map(|h| format!("{h:08x}"))
+            .collect();
+        println!("{hash:08x} shapes [{}] {path}", names.join(" "));
+        for slot in 0..model.info.slot_count as u8 {
+            let Some(g) = model.geometry(slot) else {
+                continue;
+            };
+            for (k, group) in g.groups.iter().enumerate() {
+                if group.morphs.is_empty() {
+                    continue;
+                }
+                let moved: Vec<String> = group
+                    .morphs
+                    .iter()
+                    .map(|m| {
+                        let (mut n, mut far) = (0, 0.0f32);
+                        for v in m.data.chunks_exact(m.stride as usize) {
+                            let d = [0, 2, 4].map(|i| {
+                                m2_assets::vertex::half_to_f32(u16::from_le_bytes([v[i], v[i + 1]]))
+                            });
+                            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                            if len > 0.0 {
+                                n += 1;
+                                far = far.max(len);
+                            }
+                        }
+                        format!("{n} to {far:.4}")
+                    })
+                    .collect();
+                println!(
+                    "  slot {slot} group {k}: {} vertices, moved [{}], BSHI {} bytes",
+                    group.vertices.count,
+                    moved.join(", "),
+                    group.morph_index.map_or(0, <[u8]>::len)
+                );
+            }
+        }
+    }
+    let mut sets: Vec<_> = sets.into_iter().collect();
+    sets.sort_by_key(|s| std::cmp::Reverse(s.1));
+    eprintln!("{with} of {} models have blend shapes", all.len());
+    for (names, n) in sets {
+        let names: Vec<String> = names.iter().map(|h| format!("{h:08x}")).collect();
+        eprintln!("  {n} models: [{}]", names.join(" "));
+    }
     Ok(())
 }
 

@@ -242,6 +242,7 @@ mod tests {
             template: None,
             crew: Vec::new(),
             alarm: false,
+            association: None,
         };
         let snap = |n: &str| m2_assets::name_hash(n);
         let mut data = GameData::default();

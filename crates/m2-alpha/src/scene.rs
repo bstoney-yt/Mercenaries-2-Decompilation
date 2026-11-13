@@ -1414,8 +1414,20 @@ const MAX_TWIST: f32 = 1.3;
 /// And bends up or down.
 const MAX_BEND: f32 = 0.9;
 
+/// A person's face is kept on the GPU this many frames after they were
+/// last drawn.
+const FACE_KEPT: u64 = 600;
+
 #[derive(Debug)]
 pub struct Scene {
+    /// People's faces on the GPU, by the person's own number, with the
+    /// frame each was last drawn in: freed once they have not been drawn
+    /// for a while ([`FACE_KEPT`]).
+    faces: HashMap<u64, (m2_engine::MorphedFace, u64)>,
+    /// Her face on the GPU ([`crate::player::Player::face`]).
+    hero_face: m2_engine::MorphedFace,
+    /// Frames drawn.
+    frame: u64,
     /// The grid, drawn when there is no island.
     ground: (VertexBufferHandle, IndexBufferHandle, MaterialId),
     /// The vehicles (the mission scripts' objects, the island's entities)
@@ -2247,6 +2259,9 @@ impl Scene {
         let effects = Effects::new(backend, &mut materials)?;
         Ok(Self {
             ruins: Default::default(),
+            faces: HashMap::new(),
+            hero_face: Default::default(),
+            frame: 0,
             mission_crews: Default::default(),
             prop_crews: Vec::new(),
             prop_rider_spots: Vec::new(),
@@ -3526,6 +3541,22 @@ impl Scene {
         fight: &combat::Combat,
     ) -> anyhow::Result<()> {
         let eye = view.eye();
+        // Faces of people not drawn for a while are let go.
+        self.frame += 1;
+        if self.frame.is_multiple_of(FACE_KEPT) {
+            let frame = self.frame;
+            let mut stale = Vec::new();
+            self.faces.retain(|_, f| {
+                let keep = frame - f.1 < FACE_KEPT;
+                if !keep {
+                    stale.push(std::mem::take(&mut f.0));
+                }
+                keep
+            });
+            for mut f in stale {
+                f.destroy(backend)?;
+            }
+        }
         if let Some(world) = &mut self.world {
             let frustum = Frustum::from_view_proj(view.projection * view.view);
             world.draw(backend, queue, eye, &frustum)?;
@@ -3670,7 +3701,16 @@ impl Scene {
                     (nodes, skin, player.model_matrix())
                 }
             };
-            model.draw_posed(backend, queue, body, &nodes, &skin)?;
+            // Her face: her own copy of the head's vertices, once an
+            // expression has moved it.
+            let face = if model.has_blend_shapes()
+                && model.blend_face(backend, &mut self.hero_face, player.face.weights())?
+            {
+                Some(&self.hero_face)
+            } else {
+                None
+            };
+            model.draw_posed_face(backend, queue, body, &nodes, &skin, None, face)?;
             // Throwing, her weapon is put away and the grenade is in her
             // hand until it goes; calling a support strike, the
             // designator is. Her rifle is her own or the carbine
@@ -3750,7 +3790,17 @@ impl Scene {
             }
             let (nodes, skin) = n.rig.posed();
             let body = n.model_matrix();
-            model.draw_posed_as(backend, queue, body, &nodes, &skin, outfit)?;
+            // Their face: their own copy of the head's vertices, once an
+            // expression has moved it ([`m2_engine::face_expression`]).
+            let mut face = None;
+            if model.has_blend_shapes() {
+                let slot = self.faces.entry(n.uid).or_default();
+                slot.1 = self.frame;
+                if model.blend_face(backend, &mut slot.0, n.face.weights())? {
+                    face = Some(&slot.0);
+                }
+            }
+            model.draw_posed_face(backend, queue, body, &nodes, &skin, outfit, face)?;
             // Swimming, their gun is away (as hers is).
             if (n.soldier || n.faction.is_some())
                 && n.alive
