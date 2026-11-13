@@ -977,6 +977,10 @@ enum State {
 /// The mission scripts and what they want shown.
 pub struct MissionLink {
     state: State,
+    /// `--check-node-damage <s>`: seconds of play left before the nearest
+    /// vehicle with node health has a node sent damage by the scripts'
+    /// `ObjectState.SendDamage` ([`check_node_damage`]).
+    pub check_node_damage: Option<f32>,
     /// The nodes of the models of props with hardpoints the scripts use,
     /// by model: name hash and place in the model ([`prop_hardpoints`]).
     prop_nodes: HashMap<u32, Vec<(u32, Vec3)>>,
@@ -1215,6 +1219,7 @@ impl MissionLink {
         };
         Self {
             state: State::Loading(rx),
+            check_node_damage: None,
             prop_nodes: HashMap::new(),
             movies: false,
             acts_logged: Default::default(),
@@ -3389,6 +3394,13 @@ impl MissionLink {
                     .filter(|n| n.alive)
                     .filter_map(|n| Some((n.spawn?, n.character.velocity)));
                 report_speeds(mission, vehicles.chain(people));
+            }
+            if let Some(left) = &mut self.check_node_damage {
+                *left -= dt;
+                if *left <= 0.0 {
+                    self.check_node_damage = None;
+                    check_node_damage(mission, game);
+                }
             }
             // Targets to destroy: soldiers stand at those that are spawns,
             // and blasts close to the rest (gates, buildings) destroy them.
@@ -6150,6 +6162,57 @@ fn is_spawn(world: &m2_engine::World, guid: u32) -> bool {
 /// Tells the scripts how fast each of their objects among `moving` goes
 /// (`Mission::set_speed`): the length of its velocity, m/s. Those the
 /// scripts hold no object for are left out.
+/// `--check-node-damage`: the scripts' vehicle nearest her whose template
+/// gives node health has its first node with health left sent a share
+/// of 1 (`ObjectState.SendDamage`, as the island fortress's script sends
+/// its slices). Logs the node's health before and after; the message it
+/// takes is logged as the command is carried out (`nodedamage:`).
+fn check_node_damage(mission: &mut Mission, game: &Game) {
+    let at = game.focus();
+    let mut near: Vec<(f32, u32)> = {
+        let w = mission.world().borrow();
+        game.scene
+            .vehicles
+            .iter()
+            .filter(|v| v.parts.is_some())
+            .filter_map(|v| {
+                let g = v.guid?;
+                let o = w.objects.get(&g)?;
+                Some((Vec3::from(o.position).distance(at), g))
+            })
+            .collect()
+    };
+    near.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (d, guid) in near {
+        let node = {
+            let mut w = mission.world().borrow_mut();
+            let Some(t) = w.node_table(guid) else {
+                continue;
+            };
+            let Some(e) = t.entries().iter().find(|e| e.health > 0) else {
+                continue;
+            };
+            (e.node, e.health, e.most, t.entries().len())
+        };
+        let (n, before, most, count) = node;
+        let code = format!(
+            "ObjectState.SendDamage(Sys.StringToGuid('{guid:#x}'), Sys.StringToGuid('{n:#x}'), 1)"
+        );
+        let ran = mission.run(&code, "node damage check");
+        let after = mission
+            .world()
+            .borrow_mut()
+            .node_table(guid)
+            .map(|t| t.health(n));
+        eprintln!(
+            "nodedamage check: {guid:#x} at {d:.1} m, {count} nodes; node {n:#x} health {before}/{most} -> {after:?} ({})",
+            if ran.is_ok() { "ran" } else { "script error" }
+        );
+        return;
+    }
+    eprintln!("nodedamage check: no vehicle with node health near");
+}
+
 fn report_speeds(mission: &mut Mission, moving: impl Iterator<Item = (u32, Vec3)>) {
     let known: Vec<(u32, f32)> = {
         let w = mission.world().borrow();
@@ -7610,6 +7673,34 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                     route.len()
                 ),
             }
+            return false;
+        }
+        // `ObjectState.SendDamage`: the node's message goes to its part's
+        // state machine, as a vehicle's parts take theirs
+        // (`m2_engine::node_health`). Not yet: props' part states, and the
+        // object's share of the damage (logged).
+        Command::NodeDamage {
+            guid,
+            node,
+            damage,
+            health,
+            message,
+            pass_through,
+        } => {
+            let mut to = "no part";
+            if let (Some(i), Some(msg)) = (index(guid), message) {
+                let v = &mut game.scene.vehicles[i];
+                if let (Some(parts), Some(dm)) = (v.parts.as_mut(), v.spec.damage.as_deref())
+                    && let Some(k) = dm.part_named(*node)
+                {
+                    parts.send(dm, k, *msg);
+                    to = "vehicle part";
+                }
+            }
+            eprintln!(
+                "nodedamage: {guid:#x} node {node:#x} took {damage:.1}, health {health:?}, \
+                 message {message:x?} to {to}, object's share {pass_through:.1}"
+            );
             return false;
         }
         Command::Kill(guid) => {

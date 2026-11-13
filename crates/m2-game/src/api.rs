@@ -259,6 +259,18 @@ pub enum Command {
     Ported(crate::ported_player::PortedCommand),
     Remove(u32),
     Kill(u32),
+    /// `ObjectState.SendDamage` dealt `damage` to `guid`'s node `node`
+    /// (0: the whole object), leaving it `health` (`None` for the whole
+    /// object); the node takes `message`, if any, and the object itself
+    /// `pass_through` of the damage ([`crate::node_damage`]).
+    NodeDamage {
+        guid: u32,
+        node: u32,
+        damage: f32,
+        health: Option<u16>,
+        message: Option<u32>,
+        pass_through: f32,
+    },
     /// `Object.Revive(object, fraction)`: back in play, at that share of
     /// its most health.
     Revive {
@@ -1095,6 +1107,10 @@ pub struct ScriptWorld {
     pub script_removals: Vec<(u32, u32)>,
     /// Templates' cash values by name in lower case ([`crate::cash`]).
     pub template_cash: HashMap<String, i32>,
+    /// Templates' `NodeHealth` records by name in lower case, and the
+    /// node tables built from them, by object ([`crate::node_damage`]).
+    pub template_nodes: HashMap<String, Vec<m2_engine::node_health::NodeRecord>>,
+    pub node_tables: HashMap<u32, m2_engine::node_health::NodeTable>,
     /// Every template the template database names, in lower case: the
     /// names `Pg.GetGuidByName` answers with a template's guid
     /// ([`ScriptWorld::is_template`]).
@@ -2258,6 +2274,11 @@ fn install_ported(
         let health = (o.max_health * fraction).min(o.max_health).max(0.0);
         o.health = health;
         o.alive = true;
+        // From the 360 code (0x8222C9B8, which the native calls): every
+        // node's health back to its most.
+        if let Some(t) = w.node_tables.get_mut(&guid) {
+            t.restore();
+        }
         w.commands.push(Command::Revive { guid, health });
         values([Value::Boolean(true)])
     })?;
@@ -2517,6 +2538,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     crate::pda_map::install(&lib, &add)?;
     crate::ported_sys::install(&lib, &add)?;
     crate::cash::install(&lib, &add)?;
+    crate::node_damage::install(&lib, &add)?;
 
     // A string's hash, as the scripts key tables by name (their recruits'
     // states). The archive's name hash: the scripts only compare hashes

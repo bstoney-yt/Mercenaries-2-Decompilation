@@ -21,6 +21,7 @@ pub mod links;
 pub mod mission;
 pub mod music;
 pub mod music_machine;
+pub mod node_damage;
 pub mod object_hooks;
 pub mod path_order;
 pub mod pda_map;

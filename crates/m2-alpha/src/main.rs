@@ -415,6 +415,12 @@ struct Options {
     /// from her that leaves them alive (for a stagger). The nearest
     /// soldier is picked if there is one, else the nearest person.
     knock_nearest: Option<(f32, KnockHow)>,
+    /// `--check-node-damage <s>` with `--screenshot`: that many seconds
+    /// into play, the scripts' vehicle nearest her whose template gives
+    /// node health has a node sent a share of 1 by
+    /// `ObjectState.SendDamage`; `nodedamage` lines log its health before
+    /// and after and the message the node took.
+    check_node_damage: Option<f32>,
     /// `--check-shots <s>,<s>...` with `--screenshot` on foot: the scene
     /// is pictured at those seconds in too (`<out>-at<s>.ppm`).
     check_shots: Vec<f32>,
@@ -1030,6 +1036,13 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--gates" => o.gates = true,
             "--marker-test" => o.marker_test = true,
             "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
+            "--check-node-damage" => {
+                o.check_node_damage = Some(
+                    value()?
+                        .parse()
+                        .context("--check-node-damage expects seconds")?,
+                )
+            }
             "--knock-nearest" => {
                 let v = value()?;
                 let (seconds, how) = match v.chars().last() {
@@ -4393,6 +4406,7 @@ fn mission_for_screenshot(
         .with_script_join(options.script_join)
         .with_skip_to(options.skip_to.clone())
         .with_job_near(options.job_near);
+    link.check_node_damage = options.check_node_damage;
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
