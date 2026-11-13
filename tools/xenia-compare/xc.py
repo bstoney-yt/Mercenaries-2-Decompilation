@@ -32,6 +32,7 @@ Route files are one step per line (`#` comments):
     track <x> <y> <z>              follow the hero's position in guest memory (xmem.py)
     goto <x> <z> <radius> <timeout> <buttons|-> [<gain>] [max=<m/s>]  steer there by that position
     measure <buttons|-> <secs> [<ly>]  hold, logging tracked position and speed
+    trackhero                      follow the player's character by the 360 code's tables (xmem.Hero)
     trackfoot <x> <y> <z>|here     as track, for the hero on foot (here: where track was)
     walk <x> <z> <radius> <timeout> [<buttons|-> [<every_s> <name>]]  walk/sprint (ls) there
     listen <file>                  then run steps appended to <file> live, until `end`
@@ -443,6 +444,14 @@ def run(args) -> int:
                         last = (now, pos)
                     time.sleep(0.25)
                 apply()
+            elif op == "trackhero":
+                # trackhero: follow the local player's character through the
+                # 360 code's own tables (xmem.Hero): one record, in a vehicle
+                # or on foot, position and facing.
+                import xmem
+
+                tracker = xmem.Hero(xmem.Guest(p.pid))
+                say(f"trackhero: character {tracker.character()} at {tracker.update()}, facing {tracker.facing()}")
             elif op == "trackfoot":
                 # trackfoot <x> <y> <z>: as track, for the hero on foot (found
                 # by walking forward for a moment instead of the throttle).
@@ -495,16 +504,30 @@ def run(args) -> int:
                         say(f"walk: at ({pos[0]:.0f}, {pos[2]:.0f}), {dist:.0f} m from the point")
                         break
                     want = math.degrees(math.atan2(tx - pos[0], tz - pos[2]))
-                    # She turns to run where the stick points: her facing (her
-                    # matrix's row 2, steady even when slow) settles at the
-                    # camera's yaw - a. So yaw = facing + a, smoothed, and the
-                    # stick turned towards the point by at most 20 deg a step.
+                    # The camera starts behind her (yaw = her facing); after that
+                    # it is measured from where she actually goes: moving at
+                    # over 1.5 m/s along `travel` with the stick at angle a to
+                    # the right of the camera means yaw = travel + a (in this
+                    # world right turns lower the bearing). Her facing alone
+                    # misleads: she backpedals and strafes without turning.
                     face = tracker.facing() if hasattr(tracker, "facing") else tracker.heading()
-                    if face is not None:
-                        est = face + a
-                        yaw = est if yaw is None else yaw + 0.3 * ((est - yaw + 180) % 360 - 180)
+                    trail = getattr(tracker, "trail", [])
+                    travel = None
+                    if len(trail) >= 2:
+                        (t1, p1), (t2, p2) = trail[0], trail[-1]
+                        if t2 - t1 > 0.3 and math.hypot(p2[0] - p1[0], p2[2] - p1[2]) / (t2 - t1) > 1.5:
+                            travel = math.degrees(math.atan2(p2[0] - p1[0], p2[2] - p1[2]))
+                    if yaw is None and face is not None:
+                        yaw = face
+                    elif travel is not None:
+                        est = travel + a
+                        yaw = yaw + 0.3 * ((est - yaw + 180) % 360 - 180)
                         yaw = (yaw + 180) % 360 - 180
                     target = 0.0 if yaw is None else (yaw - want + 180) % 360 - 180
+                    # At most 70 deg off forward: pulled back she backpedals
+                    # slowly; running at an angle she turns and the camera
+                    # swings round behind her.
+                    target = max(-70.0, min(70.0, target))
                     step_a = (target - a + 180) % 360 - 180
                     a = (a + max(-20.0, min(20.0, step_a)) + 180) % 360 - 180
                     travel = face

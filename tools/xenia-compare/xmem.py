@@ -162,6 +162,100 @@ class Tracker:
         return math.degrees(math.atan2(self.vel[0], self.vel[2]))
 
 
+class Hero:
+    """The local player's character, followed the way the 360 code finds it
+    (Lua natives Player.GetLocalCharacter 0x8233E830 and Object.GetPosition
+    0x8232EB58, traced read-only 2026-11-13):
+
+    - players: a paged pool at 0x83657FA8 (count +0x18, slot mask +0x20,
+      slot size +0x24 (s16), page shift +0x26 (s16), pages +0x70); each slot
+      points at a player whose +0x20 is its local index, +0x24 is not -1 and
+      +0x3C is 0 when it plays (0x82467778, 0x82467AB0); +0x14 is the
+      handle of its character.
+    - states: a handle table at 0x83658140 (0x823DA2A0): an open-addressed
+      map at +0x34 (size +0x8, multiplier +0xC, keys +0x10, buckets +0x14;
+      bucket = multiplier x handle mod size, linear probing, 0x823D9740)
+      gives an entry, paged as above (+0x20, +0x24, +0x26, +0x70); the entry
+      is position x, y, z, a counter and a rotation quaternion
+      (0x823F8370 copies it, 0x82855E08)."""
+
+    PLAYERS, STATES = 0x83657FA8, 0x83658140
+
+    def __init__(self, g: Guest, index: int = 0) -> None:
+        self.g, self.index = g, index
+        self.pos = None
+        self.quat = None
+        self.trail: list[tuple[float, tuple]] = []
+
+    def _u32(self, a: int) -> int:
+        b = self.g.read(a, 4)
+        return struct.unpack(">I", b)[0] if b else 0
+
+    def _s16(self, a: int) -> int:
+        b = self.g.read(a, 2)
+        return struct.unpack(">h", b)[0] if b else 0
+
+    def _slot(self, pool: int, i: int) -> int:
+        page = self._u32(self._u32(pool + 0x70) + (i >> self._s16(pool + 0x26)) * 4)
+        return page + (i & (self._u32(pool + 0x20) - 1)) * self._s16(pool + 0x24)
+
+    def character(self) -> int | None:
+        pool = self.PLAYERS
+        for i in range(min(self._u32(pool + 0x18), 64)):
+            obj = self._u32(self._slot(pool, i))
+            if not obj:
+                continue
+            if self._u32(obj + 0x24) == 0xFFFFFFFF or self.g.read(obj + 0x3C, 1) != b"\x00":
+                continue
+            if self._u32(obj + 0x20) == self.index:
+                return self._u32(obj + 0x14)
+        return None
+
+    def state_addr(self, handle: int) -> int | None:
+        t, m = self.STATES, self.STATES + 0x34
+        if not self._u32(m):
+            return None
+        size, mult = self._u32(m + 8), self._u32(m + 0xC)
+        keys, buckets = self._u32(m + 0x10), self._u32(m + 0x14)
+        if not size:
+            return None
+        b = ((mult * handle) & 0xFFFFFFFF) % size
+        for _ in range(size):
+            e = self._u32(buckets + b * 4)
+            if e == 0xFFFFFFFF:
+                return None
+            if self._u32(keys + e * 4) == handle:
+                return self._slot(t, e)
+            b = b + 1 if b + 1 < size else 0
+        return None
+
+    def update(self):
+        h = self.character()
+        a = self.state_addr(h) if h is not None else None
+        b = self.g.read(a, 32) if a else None
+        if not b or len(b) < 32:
+            return None
+        f = struct.unpack(">3fI4f", b)
+        self.pos, self.quat = f[0:3], f[4:8]
+        now = time.time()
+        self.trail = [(t, p) for t, p in self.trail if now - t < 1.0] + [(now, self.pos)]
+        return self.pos
+
+    def facing(self) -> float | None:
+        """Degrees from +z towards +x of the quaternion's +z axis (x, y, z, w
+        order assumed: unverified, checked against travel in play)."""
+        import math
+
+        if not self.quat:
+            return None
+        x, y, z, w = self.quat
+        fx, fz = 2 * (x * z + w * y), 1 - 2 * (x * x + y * y)
+        return math.degrees(math.atan2(fx, fz))
+
+    def heading(self) -> float | None:
+        return self.facing()
+
+
 def world_matrix(g: Guest, t_addr: int):
     """The row-major 4x4 world matrix whose translation row starts at t_addr:
     (rows 0..2, translation), or None if it does not look like one (unit
@@ -276,12 +370,22 @@ def main() -> int:
     s.add_argument("xyz", nargs=3, type=float)
     s.add_argument("--tol", type=float, default=3.0)
     s.add_argument("--pid", type=int)
+    hz = sub.add_parser("hero")
+    hz.add_argument("--n", type=int, default=10)
+    hz.add_argument("--pid", type=int)
     w = sub.add_parser("watch")
     w.add_argument("addr", nargs="+")
     w.add_argument("--pid", type=int)
     w.add_argument("--n", type=int, default=20)
     a = ap.parse_args()
     g = Guest(a.pid or xenia_pid())
+    if a.cmd == "hero":
+        h = Hero(g)
+        for _ in range(a.n):
+            p = h.update()
+            print(f"char {h.character()} pos {None if p is None else tuple(round(v, 2) for v in p)} quat {None if h.quat is None else tuple(round(v, 3) for v in h.quat)} facing {h.facing()}", flush=True)
+            time.sleep(0.5)
+        return 0
     if a.cmd == "scan":
         t = time.time()
         hits = g.scan_vec3(a.xyz, a.tol)
