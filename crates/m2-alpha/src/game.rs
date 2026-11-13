@@ -258,6 +258,8 @@ pub struct Game {
     pub ride: Option<(usize, u32)>,
     /// Her getting in or out by the clips, under way ([`crate::boarding`]).
     pub boarding: Option<crate::boarding::Boarding>,
+    /// A helicopter's bail-out prompt ([`crate::action_prompt::ExitConfirm`]).
+    pub exit_confirm: crate::action_prompt::ExitConfirm,
     /// Got in by a boarding entrance (`EntranceParameters` `bBoarding`, a
     /// boat's from the water): the vehicle, and the seat it gave her,
     /// which she is put out of onto the deck once in
@@ -541,6 +543,7 @@ impl Game {
             climb: None,
             ride: None,
             boarding: None,
+            exit_confirm: Default::default(),
             onto_deck: None,
             support_hp: 0.0,
             lens: (60.0, 16.0 / 9.0),
@@ -1231,6 +1234,13 @@ impl Game {
                         None => player.ladder = Some(c.pose()),
                     }
                 }
+                // The bail-out prompt's clock (0x8242E7A0), and gone
+                // once she is out (0x8242E730).
+                if player.driving.is_none() {
+                    self.exit_confirm.clear();
+                } else if self.exit_confirm.tick(dt) {
+                    eprintln!("exit prompt: taken back");
+                }
                 if intent.use_pressed && !climbing {
                     // The emplaced gun she would man, if nothing nearer
                     // takes the key.
@@ -1321,6 +1331,18 @@ impl Game {
                     let picked = picked.filter(|&(i, _)| i != EMPLACED);
                     match player.driving {
                         // Out over deep water she swims (`Player::update_swim`).
+                        // A helicopter up high asks first (0x8242FA70).
+                        Some(i)
+                            if !self.exit_confirm.press(
+                                scene.vehicles[i].spec.is_helicopter(),
+                                height_above(physics, &scene.vehicles[i]),
+                            ) =>
+                        {
+                            eprintln!(
+                                "exit prompt: the {} is up high: press again to bail out",
+                                scene.vehicles[i].spec.label
+                            );
+                        }
                         Some(i) => {
                             let seat = self.ride.filter(|r| r.0 == i).map(|r| r.1);
                             match animated_exit(physics, &scene.vehicles[i], seat) {
@@ -3222,6 +3244,12 @@ impl Game {
             action: prompt
                 .map(|(_, a, key)| (a.kind(), a.text(key)))
                 .or_else(|| can_enter.as_ref().map(|c| (c.1, c.2.clone())))
+                // In a helicopter up high, its bail-out prompt (plain).
+                .or_else(|| {
+                    use crate::action_prompt::Action as Prompt;
+                    (self.exit_confirm.shown() && player.is_some_and(|p| p.driving.is_some()))
+                        .then(|| (Prompt::Exit.kind(), Prompt::Exit.text(None)))
+                })
                 .filter(|_| self.on_foot && self.context.is_none())
                 .filter(|_| !self.input_locked && !self.cinematic && !self.support.busy()),
             context_action: self
@@ -5517,6 +5545,22 @@ fn door_out(at: Mat4, spec: &VehicleSpec) -> Vec3 {
 /// over water
 /// deeper than she can stand in ([`WADE`]); the autoplay waits for it
 /// (the player may get out anywhere, and swims).
+/// How far down from `v` the first thing under it lies, metres; `None`
+/// past [`HEIGHT_REACH`] or with `v` not in the world. Stands in for the
+/// two heights the 360's helicopter physics keeps (`+0x158`, `+0x160`),
+/// which were not traced (inferred).
+fn height_above(physics: &Physics, v: &ParkedVehicle) -> Option<f32> {
+    let id = v.id?;
+    let at = physics.vehicle_transform(id)?.w_axis.truncate();
+    physics
+        .cast_ray_past(at, Vec3::NEG_Y, HEIGHT_REACH, id)
+        .map(|(d, _)| d)
+}
+
+/// How far down [`height_above`] looks, metres (Invented: well past the
+/// 5 m the bail-out prompt asks at).
+const HEIGHT_REACH: f32 = 50.0;
+
 pub(crate) fn can_get_out(physics: &Physics, v: &ParkedVehicle) -> bool {
     let (Some(water), Some(id)) = (physics.water(), v.id.filter(|_| v.spec.is_boat())) else {
         return true;
