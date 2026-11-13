@@ -62,6 +62,11 @@ const CLASS: u32 = 0xd641_1a49;
 /// off its nose it keeps a target in (degrees).
 const TURN_SPEED: u32 = 0xcefb_c415;
 const MAX_ANGLE: u32 = 0xa10e_79fa;
+/// `HomingProjectile`'s third field (@8, name unknown): the radius within
+/// which the missile bursts on nearing its goal (360 0x82293280 compares
+/// its square with the distance's; the Vehicle AT Missile's 0.5, the
+/// Grapple Hook's 1, the rest 0).
+const PROXIMITY: u32 = 0xda65_39b3;
 /// `HomingWeapon`'s lock cone, degrees (its name not found; the 360's
 /// weapon-equipped event sizes the lock-on frame by it, `0x8234F458`).
 const LOCK_CONE: u32 = 0x6749_c828;
@@ -327,8 +332,11 @@ pub struct Ammo {
     /// if it is an explosion (a grenade's, C4's).
     pub timer: Option<(f32, Option<u32>)>,
     pub timer_blast: Option<Blast>,
-    /// A homing round's turn rate and widest angle, degrees.
-    pub homing: Option<(f32, f32)>,
+    /// A homing round's `HomingProjectile`: turn rate (degrees a second),
+    /// widest angle (degrees) and the proximity radius it bursts within
+    /// of its goal (metres; 0 for none). Read by 0x82293660 into the
+    /// missile's record +0x20, +0x28, +0x24.
+    pub homing: Option<(f32, f32, f32)>,
     /// Its model, if it has one of its own.
     pub model: Option<u32>,
     /// It sticks where it lands (`Sticky`).
@@ -1343,6 +1351,7 @@ impl Parts<'_> {
             Some((
                 self.homing.float(r, TURN_SPEED)?,
                 self.homing.float(r, MAX_ANGLE)?,
+                self.homing.float(r, PROXIMITY).unwrap_or(0.0),
             ))
         })();
         Ammo {

@@ -283,25 +283,51 @@ pub struct Homing<T> {
     pub turn: f32,
     /// Radians.
     pub widest: f32,
+    /// Within this of its goal it bursts, metres (0: never).
+    pub proximity: f32,
     pub age: f32,
+}
+
+/// A missile's frame of homing ([`Homing::steer`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Steer {
+    /// It flies on at this velocity.
+    Fly(Vec3),
+    /// It lost its target: it flies on as it was, unguided.
+    Lost,
+    /// It came within its proximity radius of its goal: it bursts
+    /// there (0x82293280 posts it to the object-death queue 0x831AD128,
+    /// handled by 0x82289F40).
+    Burst,
 }
 
 impl<T: Copy> Homing<T> {
     /// On `target`, from its round's `HomingProjectile` (turn rate,
-    /// widest angle; degrees).
-    pub fn new(target: T, (turn, widest): (f32, f32)) -> Self {
+    /// widest angle, degrees; proximity radius, metres).
+    pub fn new(target: T, (turn, widest, proximity): (f32, f32, f32)) -> Self {
         Self {
             target,
             turn: turn.to_radians(),
             widest: widest.to_radians(),
+            proximity,
             age: 0.0,
         }
     }
 
     /// One frame's steering of a missile at `at` flying `velocity` after
-    /// its target at `goal`: its new velocity, or `None` once it has lost
-    /// the target (it flies on as it was).
-    pub fn steer(&mut self, at: Vec3, velocity: Vec3, goal: Vec3, dt: f32) -> Option<Vec3> {
+    /// its target at `goal` (0x82293280). Once armed, within its
+    /// proximity radius of the goal it bursts (checked before the turn,
+    /// as the 360 does).
+    pub fn steer(&mut self, at: Vec3, velocity: Vec3, goal: Vec3, dt: f32) -> Steer {
+        let turned = self.turn_to(at, velocity, goal, dt);
+        if self.age >= ARMING && goal.distance_squared(at) < self.proximity * self.proximity {
+            return Steer::Burst;
+        }
+        turned.map_or(Steer::Lost, Steer::Fly)
+    }
+
+    /// The turn alone: the new velocity, `None` once lost.
+    fn turn_to(&mut self, at: Vec3, velocity: Vec3, goal: Vec3, dt: f32) -> Option<Vec3> {
         self.age += dt;
         if self.age < ARMING {
             return Some(velocity);
@@ -768,25 +794,60 @@ mod tests {
     #[test]
     fn a_missile_arms_turns_at_its_rate_and_loses_wide_targets() {
         // The AA missile's 90 degrees a second and 180 widest.
-        let mut h = Homing::new(1u32, (90.0, 180.0));
+        let mut h = Homing::new(1u32, (90.0, 180.0, 0.0));
         let v = Vec3::Z * 50.0;
         let goal = Vec3::new(100.0, 0.0, 0.0);
-        assert_eq!(h.steer(Vec3::ZERO, v, goal, 0.05), Some(v));
-        let turned = h.steer(Vec3::ZERO, v, goal, 0.1).unwrap();
+        assert_eq!(h.steer(Vec3::ZERO, v, goal, 0.05), Steer::Fly(v));
+        let Steer::Fly(turned) = h.steer(Vec3::ZERO, v, goal, 0.1) else {
+            panic!("lost")
+        };
         assert!((turned.length() - 50.0).abs() < 1e-3);
         let angle = turned.angle_between(v).to_degrees();
         assert!((angle - 9.0).abs() < 1e-3, "{angle}");
         // Nearly on: straight at it.
         let near = Vec3::new(1.0, 0.0, 100.0);
-        let on = h.steer(Vec3::ZERO, v, near, 0.1).unwrap();
+        let Steer::Fly(on) = h.steer(Vec3::ZERO, v, near, 0.1) else {
+            panic!("lost")
+        };
         assert!(on.normalize().dot(near.normalize()) > 0.9999);
         // The AT missile's 60 widest: a target behind is lost.
-        let mut at = Homing::new(1u32, (30.0, 60.0));
+        let mut at = Homing::new(1u32, (30.0, 60.0, 0.0));
         at.age = 1.0;
         assert_eq!(
             at.steer(Vec3::ZERO, v, Vec3::new(0.0, 0.0, -10.0), DT),
-            None
+            Steer::Lost
         );
+    }
+
+    // The Vehicle AT Missile (proximity 0.5 m) bursts once armed and
+    // within half a metre of its goal, even past its widest angle; before
+    // arming it does not, and a radius of 0 never bursts.
+    #[test]
+    fn a_missile_bursts_within_its_proximity_radius() {
+        let v = Vec3::Z * 50.0;
+        let mut at = Homing::new(1u32, (90.0, 300.0, 0.5));
+        let close = Vec3::new(0.0, 0.3, 0.2);
+        assert!(matches!(
+            at.steer(Vec3::ZERO, v, close, 0.05),
+            Steer::Fly(_)
+        ));
+        assert_eq!(at.steer(Vec3::ZERO, v, close, 0.1), Steer::Burst);
+        assert!(matches!(
+            at.steer(Vec3::ZERO, v, Vec3::new(0.0, 0.0, 0.6), DT),
+            Steer::Fly(_)
+        ));
+        let mut narrow = Homing::new(1u32, (30.0, 60.0, 0.5));
+        narrow.age = 1.0;
+        assert_eq!(
+            narrow.steer(Vec3::ZERO, v, Vec3::new(0.0, 0.0, -0.4), DT),
+            Steer::Burst
+        );
+        let mut none = Homing::new(1u32, (90.0, 180.0, 0.0));
+        none.age = 1.0;
+        assert!(matches!(
+            none.steer(Vec3::ZERO, v, Vec3::ZERO, DT),
+            Steer::Fly(_)
+        ));
     }
 
     // The warnings: a lock coming on starts the targeting cue and the
