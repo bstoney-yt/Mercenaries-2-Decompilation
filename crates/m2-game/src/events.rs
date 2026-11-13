@@ -1128,10 +1128,19 @@ fn as_id(v: &Value) -> Option<u32> {
     as_guid(v)
 }
 
+/// A number parameter, a numeric string too (`paratrooper`'s
+/// `ObjectHealth{ self, "<", "100" }`).
+///
+/// From the 360 code: the natives' number reader (0x823082B8) takes a
+/// number as it is and anything else through Lua's conversion
+/// (0x827DF1F0 / 0x827DF3C0 calling 0x827EB1F8, `luaV_tonumber`), which
+/// reads a string holding a number; `ObjectHealth`'s setup (0x82351050)
+/// reads its figure with it.
 fn number(t: &Table, i: i64) -> Option<f64> {
     match t.raw_get::<Value>(i).ok()? {
         Value::Integer(n) => Some(n as f64),
         Value::Number(n) => Some(n),
+        Value::String(s) => s.to_str().ok()?.trim().parse().ok(),
         _ => None,
     }
 }

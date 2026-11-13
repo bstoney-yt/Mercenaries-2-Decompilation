@@ -86,6 +86,7 @@ mod multiply;
 mod npc;
 mod pad;
 mod padtable;
+mod paradrop_check;
 mod particles;
 mod path_hints;
 mod paths;
@@ -293,6 +294,9 @@ struct Options {
     fire: bool,
     /// `--homing-check`: her vehicle is seen by every homing weapon.
     homing_check: bool,
+    /// `--paradrop-check`: with `--mission`, the Allied paradrop plane is
+    /// put 100 m over her and its drop followed to PASS or FAIL.
+    paradrop_check: bool,
     /// With `--screenshot` on foot: hits she takes just before the
     /// picture, from these directions (degrees clockwise from where the
     /// camera looks), to see the HUD's hit arcs.
@@ -1011,6 +1015,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--take" => o.take = true,
             "--fire" => o.fire = true,
             "--homing-check" => o.homing_check = true,
+            "--paradrop-check" => o.paradrop_check = true,
             "--look-pickup" => {
                 o.look_pickup = Some(value()?.parse().context("--look-pickup expects metres")?)
             }
@@ -4392,7 +4397,8 @@ fn mission_for_screenshot(
         .with_skip_mode_off(options.skip_mode_off)
         .with_script_join(options.script_join)
         .with_skip_to(options.skip_to.clone())
-        .with_job_near(options.job_near);
+        .with_job_near(options.job_near)
+        .with_paradrop_check(options.paradrop_check);
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);

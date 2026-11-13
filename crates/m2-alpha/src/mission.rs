@@ -1052,6 +1052,8 @@ pub struct MissionLink {
     /// The factions' pursuit lists of units ([`crate::gunships::Lists`]).
     pursuit_lists: Option<crate::gunships::Lists>,
     reinforcements: crate::reinforce::Reinforcements,
+    /// `--paradrop-check` ([`crate::paradrop_check`]).
+    paradrop_check: Option<crate::paradrop_check::Check>,
     /// The scripts' drop zone tests being searched ([`crate::drop_zones`]).
     drop_zones: crate::drop_zones::DropZones,
     /// Seconds since the scripts said the contract was completed.
@@ -1245,6 +1247,7 @@ impl MissionLink {
             pursuit_counts: None,
             pursuit_lists: None,
             reinforcements: crate::reinforce::Reinforcements::default(),
+            paradrop_check: None,
             drop_zones: crate::drop_zones::DropZones::default(),
             completed: None,
             contracts: 0,
@@ -1544,6 +1547,15 @@ impl MissionLink {
             job.near = near;
         }
         self
+    }
+
+    /// With `--paradrop-check`: the paradrop plane put over her and its
+    /// drop followed ([`crate::paradrop_check`]).
+    pub fn with_paradrop_check(self, on: bool) -> Self {
+        Self {
+            paradrop_check: on.then(Default::default),
+            ..self
+        }
     }
 
     /// Stocks and calls in these support items once the scripts run.
@@ -2983,6 +2995,9 @@ impl MissionLink {
                 }
             }
         }
+        if let Some(check) = &mut self.paradrop_check {
+            check.tick(game, mission, dt);
+        }
         // A pursuit run out: the scripts read level 0 again.
         let pursued = !game.scene.people.pursuit.is_empty();
         if game.pursued && !pursued {
@@ -3352,6 +3367,11 @@ impl MissionLink {
             // counts them.
             let hero = mission.world().borrow().player;
             let hers = game.scene.people.her_kills();
+            // Their health as it changes (a fall, a round), for the scripts
+            // watching it: the paratrooper's chute comes off below 100.
+            for (guid, hp) in game.scene.people.take_health_changes() {
+                mission.set_health(guid, hp);
+            }
             for guid in game.scene.people.all_killed() {
                 match hero.filter(|_| hers.contains(&guid)) {
                     Some(h) => mission.kill_by(guid, h),
@@ -6936,12 +6956,18 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             position,
             yaw,
         } => {
-            if let Some(s) = game.scene.world.as_ref().and_then(|w| {
-                w.index
-                    .template_db
-                    .scripted_spawn(*guid, what, Vec3::from(*position), *yaw)
+            // One whose template scales gravity (a paratrooper) falls from
+            // where it was made.
+            if let Some((s, scale)) = game.scene.world.as_ref().and_then(|w| {
+                let db = &w.index.template_db;
+                let s = db.scripted_spawn(*guid, what, Vec3::from(*position), *yaw)?;
+                let scale = db
+                    .ids(what)
+                    .first()
+                    .and_then(|id| db.gravity_scales.get(id).copied());
+                Some((s, scale))
             }) {
-                game.scene.people.scripted_spawn(s);
+                game.scene.people.scripted_spawn(s, scale);
             }
             // A prop of theirs (PirCon004's organ boxes) stands as a
             // layer's would.
@@ -6966,7 +6992,9 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
         }
         Command::Remove(guid) => {
             game.scene.people.priority.remove(guid);
-            game.scene.people.scripted_gone(*guid);
+            game.scene
+                .people
+                .scripted_gone(game.scene.world.as_mut().map(|w| &mut w.physics), *guid);
             if let Some(w) = game.scene.world.as_mut() {
                 game.scene.props.hide(&mut w.physics, [*guid]);
             }

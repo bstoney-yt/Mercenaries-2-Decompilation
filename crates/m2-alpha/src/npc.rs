@@ -142,6 +142,10 @@ pub const VEHICLES: u32 = 0x4000_0000;
 pub const HER: u32 = u32::MAX;
 
 /// Soldiers come and go within these distances of the player, metres.
+/// Metres: one dropped from the air (a paratrooper) who falls below this
+/// height without meeting ground is taken as down where they are
+/// (invented: a catch for a drop over a hole in the collision).
+const LOWEST: f32 = -50.0;
 const ACTIVE: f32 = 450.0;
 const INACTIVE: f32 = 500.0;
 /// Most soldiers about at once, and most passers-by on the roads
@@ -1145,6 +1149,16 @@ pub struct Npc {
     pub rig: Rig,
     /// False until there is ground under them to stand on.
     pub landed: bool,
+    /// Made in the air by the scripts with their template's gravity scale
+    /// (a paratrooper under his chute): until [`landed`](Self::landed) they
+    /// fall from where they were made rather than being set on the ground.
+    pub dropped: bool,
+    /// Whether they are off the ground and where they left it: a fall
+    /// that hurts as they come down ([`m2_engine::on_foot::fall_impact`]).
+    pub fall: m2_engine::on_foot::FallWatch,
+    /// Their health as the scripts last heard it
+    /// ([`People::take_health_changes`]).
+    reported_hp: Option<f32>,
     /// The layer entity that placed them (soldiers).
     pub spawn: Option<u32>,
     /// The layer that placed them (a state layer or a static sub-layer):
@@ -1569,6 +1583,9 @@ impl Npc {
             facing,
             rig,
             landed: false,
+            dropped: false,
+            fall: m2_engine::on_foot::FallWatch::default(),
+            reported_hp: None,
             spawn,
             layer: None,
             held: false,
@@ -1815,6 +1832,38 @@ impl Npc {
             self.rig.clips.iter().position(|c| c.hash == hash)
         })?;
         Some((direction, clip))
+    }
+
+    /// Came down from a fall of `distance` metres: what it costs by their
+    /// template's limits ([`m2_engine::on_foot::fall_impact`]), taken as
+    /// the fall's damage (no shooter's: not hers, and no fight comes of
+    /// it). True if it killed.
+    ///
+    /// From the 360 code (0x82205F20, fed by the landing 0x8217C410 as a
+    /// physics event of kind 7): the same rule for every person; the skip
+    /// it makes by a record found through 0x82467B70 (+0x40 of 1 or 2) is
+    /// the players' (its other callers are `Player.*` natives), so nobody
+    /// here is skipped. Not ported: the `FallImpactLight`/`Heavy` actions
+    /// on the people's rigs, and the camera message for each.
+    pub fn land(&mut self, distance: f32) -> bool {
+        let Some(fell) = m2_engine::on_foot::fall_impact(&self.motion.falls, distance) else {
+            return false;
+        };
+        if !self.alive {
+            return false;
+        }
+        eprintln!(
+            "people: {:08x} falls {distance:.1} m and takes {} damage",
+            self.spawn.unwrap_or(0),
+            fell.damage
+        );
+        let (by_her, killed_by_her, alert) = (self.hurt_by_her, self.killed_by_her, self.alert);
+        self.last_hit = None;
+        let killed = self.hurt(fell.damage, Vec3::ZERO);
+        self.hurt_by_her = by_her;
+        self.killed_by_her = killed_by_her;
+        self.alert = alert;
+        killed
     }
 
     /// Takes `damage`; at no health left, falls: true if it killed.
@@ -2415,6 +2464,10 @@ impl Npc {
         let before = self.character.position;
         physics.move_character(&mut self.character, wanted, None, dt);
         let now = self.character.position;
+        // Off an edge and down again: the fall hurts as hers does.
+        if let Some(d) = self.fall.step(!self.character.grounded, now.y) {
+            self.land(d);
+        }
         // In it deeper than a wade, or over ground that is (stepping off a
         // dock or a bank): back where they were, unless they were in it
         // already (then they may walk out). Well above the water (no ground
@@ -3260,6 +3313,26 @@ impl Npc {
                 (*seed >> 40) as f32 / (1u64 << 24) as f32
             });
         }
+        if !self.landed && self.dropped {
+            // Made in the air with their template's gravity scale: they
+            // fall as anyone falls, slowly, and the landing hurts as any
+            // fall does.
+            physics.move_character(&mut self.character, Vec3::ZERO, None, dt);
+            let p = self.character.position;
+            let fell = self.fall.step(!self.character.grounded, p.y);
+            // Into the sea, or under the island: down where they are.
+            let wet = physics.water_at(p.x, p.z).is_some_and(|w| p.y < w);
+            if self.character.grounded || wet || p.y < LOWEST {
+                self.landed = true;
+                self.dropped = false;
+                self.fall = m2_engine::on_foot::FallWatch::default();
+                if let Some(d) = fell {
+                    self.land(d);
+                }
+            }
+            self.rig.advance(dt);
+            return;
+        }
         if !self.landed {
             // Onto the ground (or the roof or floor of their post) under
             // where they were placed.
@@ -3672,6 +3745,11 @@ pub struct People {
     /// People the scripts made (`Pg.Spawn`: GurCon002's Mendez), standing
     /// as a layer's would ([`People::scripted_spawn`]).
     scripted: Vec<SpawnPoint>,
+    /// Of those, the ones made in the air whose template scales gravity
+    /// (`PhysicsPropertyGravityScaler`: the paratroopers' 0.2), by spawn
+    /// entity: they fall from where they were made, pulled that much
+    /// ([`Npc::dropped`]).
+    drops: HashMap<u32, f32>,
     /// Those the scripts have following her, by spawn entity, and how near
     /// they keep ([`People::follow`]).
     following: HashMap<u32, f32>,
@@ -5554,18 +5632,69 @@ impl People {
 
     /// The scripts made a person (`Pg.Spawn` of a person's template): they
     /// come into play as a layer's spawn does, once she is near.
-    pub fn scripted_spawn(&mut self, spawn: SpawnPoint) {
+    ///
+    /// `gravity_scale` is their template's `PhysicsPropertyGravityScaler`
+    /// if it has one: then they come into play where they were made, in
+    /// the air or not, and fall from there pulled that much
+    /// ([`m2_engine::on_foot::scaled_gravity`]), as the 360 has every
+    /// object fall. Those without one are set on the ground under where
+    /// they were made, as a layer's are (the port's way; invented).
+    pub fn scripted_spawn(&mut self, spawn: SpawnPoint, gravity_scale: Option<f32>) {
         eprintln!(
-            "people: the scripts make {:?} ({:08x}) at {:.1}",
-            spawn.name, spawn.entity, spawn.position
+            "people: the scripts make {:?} ({:08x}) at {:.1}{}",
+            spawn.name,
+            spawn.entity,
+            spawn.position,
+            gravity_scale.map_or(String::new(), |g| format!(", falling at {g} x gravity"))
         );
+        match gravity_scale {
+            Some(g) => self.drops.insert(spawn.entity, g),
+            None => self.drops.remove(&spawn.entity),
+        };
         self.scripted.retain(|s| s.entity != spawn.entity);
         self.scripted.push(spawn);
     }
 
-    /// The scripts took away a person they made: they don't come again.
-    pub fn scripted_gone(&mut self, entity: u32) {
+    /// The scripts took away a person they made (`Object.Remove`): they
+    /// go, and don't come again.
+    pub fn scripted_gone(&mut self, physics: Option<&mut Physics>, entity: u32) {
         self.scripted.retain(|s| s.entity != entity);
+        self.drops.remove(&entity);
+        let gone: Vec<Option<RagdollId>> = self
+            .npcs
+            .iter()
+            .filter(|n| n.spawn == Some(entity))
+            .map(|n| n.ragdoll)
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        if let Some(physics) = physics {
+            for doll in gone.into_iter().flatten() {
+                physics.remove_ragdoll(doll);
+            }
+        }
+        self.npcs.retain(|n| n.spawn != Some(entity));
+        self.active.remove(&entity);
+    }
+
+    /// The people whose health changed since the scripts last heard it,
+    /// by spawn entity, with their health now: the scripts read it
+    /// (`Object.GetHealth`) and watch it (`Event.ObjectHealth`: the
+    /// paratrooper sheds his chute below 100). Each is told once a change.
+    pub fn take_health_changes(&mut self) -> Vec<(u32, f32)> {
+        self.npcs
+            .iter_mut()
+            .filter_map(|n| {
+                let entity = n.spawn?;
+                let hp = n.hp.max(0.0);
+                if n.reported_hp == Some(hp) || (n.reported_hp.is_none() && hp >= n.most_hp) {
+                    return None;
+                }
+                n.reported_hp = Some(hp);
+                Some((entity, hp))
+            })
+            .collect()
     }
 
     /// The people who got to the end of a route the scripts sent them
@@ -6173,6 +6302,16 @@ impl People {
                         radius: SPAWNER_RADIUS,
                     })
             });
+            // Made in the air with a gravity scale (a paratrooper): falling
+            // from where they were made, pulled that much of their
+            // template's `Gravity`.
+            if let Some(&scale) = self.drops.get(&s.entity) {
+                let gravity = self.kinds[kind]
+                    .motion
+                    .map_or(m2_engine::physics::GRAVITY, |m| m.gravity);
+                npc.dropped = true;
+                npc.character.gravity = m2_engine::on_foot::scaled_gravity(gravity, scale);
+            }
             self.tell(s, &npc);
             self.npcs.push(npc);
         }
@@ -8873,6 +9012,129 @@ pub(crate) mod tests {
             .filter(|&e| e < 100)
             .collect();
         assert_eq!(came, [1]);
+    }
+
+    // A paratrooper (gravity x 0.2) made 20 m up falls from there, slower
+    // than a man would, and the landing takes the deadly fall's damage
+    // (a soldier's limits: 4 m or more), which the scripts hear.
+    #[test]
+    fn a_dropped_man_falls_slowly_and_the_landing_hurts() {
+        let physics = ground();
+        let mut rng = Rng::default();
+        let mut npc = Npc::new(
+            0,
+            &rig(),
+            Vec3::new(0.0, 20.0, 0.0),
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(7),
+        );
+        npc.hp = 150.0;
+        npc.most_hp = 150.0;
+        npc.dropped = true;
+        npc.character.gravity = m2_engine::on_foot::scaled_gravity(9.8, 0.2);
+        // One second in: 1.96 m/s² takes about a metre, not five.
+        for _ in 0..60 {
+            npc.update(&physics, &mut rng, None, 1.0 / 60.0);
+        }
+        let y = npc.character.position.y;
+        assert!(!npc.landed && (18.5..19.5).contains(&y), "{y}");
+        for _ in 0..60 * 10 {
+            npc.update(&physics, &mut rng, None, 1.0 / 60.0);
+        }
+        assert!(npc.landed && !npc.dropped);
+        assert!(!npc.alive && npc.hp <= 0.0, "{}", npc.hp);
+        // The fall's doing, not hers.
+        assert!(!npc.killed_by_her && !npc.hurt_by_her);
+        let mut people = People::default();
+        people.npcs.push(npc);
+        assert_eq!(people.take_health_changes(), [(7, 0.0)]);
+        assert!(people.take_health_changes().is_empty());
+    }
+
+    // The fall rule by distance, for one walking: under 2 m nothing,
+    // under 3 m 10, under 4 m 50 (a soldier's limits).
+    #[test]
+    fn a_fall_costs_a_soldier_by_how_far_it_was() {
+        let mut npc = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(1),
+        );
+        npc.hp = 100.0;
+        assert!(!npc.land(1.9));
+        assert_eq!(npc.hp, 100.0);
+        assert!(!npc.land(2.5));
+        assert_eq!(npc.hp, 90.0);
+        assert!(!npc.land(3.5));
+        assert_eq!(npc.hp, 40.0);
+        assert!(npc.land(4.0));
+        assert!(!npc.alive);
+    }
+
+    // Shot below his full health he is reported; one never hurt is not.
+    #[test]
+    fn the_scripts_hear_health_only_as_it_changes() {
+        let mut people = People::default();
+        for e in [1, 2] {
+            let mut n = Npc::new(
+                0,
+                &rig(),
+                Vec3::ZERO,
+                0.0,
+                Brain::Post { facing: 0.0 },
+                Some(e),
+            );
+            n.hp = 150.0;
+            n.most_hp = 150.0;
+            people.npcs.push(n);
+        }
+        assert!(people.take_health_changes().is_empty());
+        people.npcs[1].hurt(30.0, Vec3::ZERO);
+        assert_eq!(people.take_health_changes(), [(2, 120.0)]);
+        assert!(people.take_health_changes().is_empty());
+    }
+
+    // `Object.Remove` of a person the scripts made (the paratrooper
+    // shedding his chute): he goes from play and does not come again.
+    #[test]
+    fn a_person_the_scripts_remove_goes() {
+        let mut people = People::default();
+        people.scripted_spawn(
+            SpawnPoint {
+                entity: 9,
+                name: "Allied Paratrooper".into(),
+                template: None,
+                position: Vec3::new(0.0, 100.0, 0.0),
+                rotation: Quat::IDENTITY,
+                route: Vec::new(),
+                layer: None,
+                static_layer: false,
+                model: None,
+                list: Vec::new(),
+                ai: None,
+                gun: None,
+                launcher: None,
+                cycle: None,
+            },
+            Some(0.2),
+        );
+        assert_eq!(people.drops.get(&9), Some(&0.2));
+        people.npcs.push(Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(9),
+        ));
+        people.active.insert(9);
+        people.scripted_gone(None, 9);
+        assert!(people.npcs.is_empty() && people.scripted.is_empty());
+        assert!(!people.active.contains(&9) && people.drops.is_empty());
     }
 
     // Playtest 8: soldiers stood under the sea. Placed over water whose

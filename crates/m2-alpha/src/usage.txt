@@ -226,6 +226,9 @@ m2-alpha [options]
                          air target (signatures 1, 1) for enemy homing
                          weapons, so any army SAM/AA/AT gun or homing
                          launcher within range locks on it (log: homing:)
+  --paradrop-check       debug, with --mission: the Allied paradrop plane is
+                         put 100 m over her; its paratroopers fall, land and
+                         become soldiers (log: paradrop-check: PASS / FAIL)
   --grip attach|hands    draw weapons on the hand's attach node as posed
                          (attach, the default), or held as worked out from
                          the hands (hands)
