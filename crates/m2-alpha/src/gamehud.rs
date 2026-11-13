@@ -885,6 +885,13 @@ pub struct HudState {
     pub stock: Vec<(String, u32)>,
     /// What the faction zones last told the HUD (`MissionView::trespass`).
     pub trespass: crate::mission::Trespass,
+    /// A homing launcher is up: how far its lock has come (0 to 1) and
+    /// where its target is on the screen (x right, y up, -1 to 1), while
+    /// it is locking on one in view ([`STINGER_UPDATE`]).
+    pub homing: Option<Option<(f32, [f32; 2])>>,
+    /// The homing launcher's lock cone, degrees, if its template says
+    /// ([`stinger_frame`]).
+    pub homing_cone: Option<f32>,
     /// The text of the scripts' context action in her reach
     /// (`Pg.AddContextAction`), for the game's own prompt
     /// ([`CONTEXT_ACTION`]).
@@ -1110,6 +1117,10 @@ impl HudState {
             },
             fired: game.combat.fired,
             ammo_shown: game.combat.ammo_shown,
+            homing_cone: game
+                .scene
+                .arms()
+                .and_then(|a| a.lock_cones.get(&game.combat.launcher.template?).copied()),
             counters_shown: game.combat.counters_shown,
             picked: game.combat.picked,
             launcher: game.combat.launcher_rounds,
@@ -2218,6 +2229,12 @@ struct Told {
     /// The gun in her hands, whether she holds the designator, and whether
     /// she drives a vehicle with a cannon.
     weapon: Option<(Weapon, bool, bool, bool)>,
+    /// The weapon told of was a homing launcher ([`HudState::homing`]).
+    homing_up: bool,
+    /// The weapon told of was the laser designator, and the laser was
+    /// told to be on ([`LASER_STATE`]).
+    laser_up: bool,
+    lasing: bool,
     /// The template of the gun in her rifle's place ([`HudState::gun`]).
     gun: Option<u32>,
     ammo: Option<[i64; 5]>,
@@ -4041,8 +4058,25 @@ impl Thread {
         // gun was changed after (PC playtest, 2026-10-08).
         self.told.seat(s.in_vehicle);
         let gun = s.gun.as_ref().map(|g| g.0);
-        if self.told.weapon != Some((s.weapon, holding, cannon, mg)) || self.told.gun != gun {
+        // A homing launcher in her hands (not the designator, nor a
+        // vehicle's gun): its reticle is the lock-on one.
+        let homing_up = s.homing.is_some() && !holding && !cannon && !mg;
+        // The laser designator in her hands: its reticle is the laser's.
+        let laser_up = s
+            .support
+            .designator
+            .as_deref()
+            .is_some_and(|d| d.contains("Laser"));
+        if self.told.weapon != Some((s.weapon, holding, cannon, mg))
+            || self.told.gun != gun
+            || self.told.homing_up != homing_up
+            || self.told.laser_up != laser_up
+        {
             self.told.weapon = Some((s.weapon, holding, cannon, mg));
+            self.told.homing_up = homing_up;
+            self.told.laser_up = laser_up;
+            // The switch itself puts the laser's reticle back to rest.
+            self.told.lasing = false;
             self.told.gun = gun;
             // The gun in her rifle's place shows as its `WeaponUI` says,
             // and the gun box names it (playtest 4: her pistol showed the
@@ -4118,6 +4152,18 @@ impl Thread {
                 } else {
                     (icon, guid, reticle, crosshair)
                 };
+            // The weapon's own reticle kinds, where it has a `WeaponUI`
+            // record here: the gun in her rifle's place, a tank's machine
+            // gun.
+            let ui_kind = if let Some((ui, _, _)) = s.machine_gun.filter(|_| mg) {
+                Some((ui.reticle_type, ui.health_type))
+            } else if cannon || holding || s.weapon != Weapon::Rifle {
+                None
+            } else {
+                s.gun
+                    .as_ref()
+                    .map(|(_, _, ui)| (ui.reticle_type, ui.health_type))
+            };
             // What `MrxGuiHudReticle.HandleReticleGunSwitchEvent` reads:
             // without a type it leaves the reticle as it was. No target
             // health type: that bar shows only on a target. The crosshair
@@ -4128,7 +4174,14 @@ impl Thread {
                 [
                     ("uNewCurrentGun", Value::String(lua.create_string(&icon)?)),
                     ("uNewCurrentGunGuid", guid_value(guid)),
-                    ("sReticleType", Value::String(lua.create_string("Normal")?)),
+                    (
+                        "sReticleType",
+                        Value::String(lua.create_string(reticle_type(
+                            homing_up,
+                            laser_up,
+                            ui_kind.map(|k| k.0),
+                        ))?),
+                    ),
                     (
                         "uReticleTexture",
                         Value::String(lua.create_string(&reticle)?),
@@ -4136,7 +4189,38 @@ impl Thread {
                     ("bReticleCrosshair", Value::Boolean(crosshair)),
                 ],
             )?;
+            // The lock-on frame's size, as wide as the launcher's cone.
+            if let (Value::Table(t), Some(cone)) = (&t, s.homing_cone.filter(|_| homing_up)) {
+                let [w, h] = stinger_frame(cone, s.size[0] / s.size[1].max(1.0));
+                t.raw_set("nStingerReticleWidth", w)?;
+                t.raw_set("nStingerReticleHeight", h)?;
+            }
+            // The target-health bar's shape, sent with the record's other
+            // fields (360 0x8234F458).
+            if let (Value::Table(t), Some((_, health))) = (&t, ui_kind) {
+                t.raw_set("sReticleHealthType", health_type(health))?;
+            }
             fire(lua, "GuiWeaponEquippedUpdate", t)?;
+        }
+        // The lock-on reticle's word, every tick while a lock is coming
+        // on a target in view (the script hides it after a tick without).
+        if let Some(Some((share, at))) = s.homing.filter(|_| homing_up) {
+            let [x, y] = stinger_place(at, s.size[0] / s.size[1].max(1.0));
+            let t = table(
+                lua,
+                [
+                    ("nPercent", Value::Number(share.into())),
+                    ("nX", Value::Number(x.into())),
+                    ("nY", Value::Number(y.into())),
+                ],
+            )?;
+            fire(lua, STINGER_UPDATE, t)?;
+        }
+        // The laser coming on and going off before its mark is made.
+        let lasing = laser_up && s.support.lasing;
+        if lasing != self.told.lasing {
+            self.told.lasing = lasing;
+            fire(lua, LASER_STATE, laser_state(lua, lasing)?)?;
         }
         // Her explosive, as the engine's `GuiWeaponEquippedUpdate` carries it
         // when the equipped explosive changes (360 0x8234F458: its
@@ -4910,6 +4994,122 @@ fn ammo(
 
 fn fire(lua: &Lua, event: &str, args: impl IntoLuaMulti) -> mlua::Result<()> {
     gui_runtime::fire(lua, event, args).map(|_| ())
+}
+
+/// The engine's word to the lock-on reticle (the layout's `Stinger
+/// Reticle`, `MrxGuiHudReticle.HandleStingerReticleDataUpdate`).
+///
+/// From the 360 code: the homing lock update (`0x82294318`) sends it for
+/// a local player's weapon through `0x822956C0`, with `nPercent` (how far
+/// the lock has come: 1 less the time left over the weapon's
+/// `LockOnTime`) and, when the target's place projects onto the screen
+/// (`0x821B9DE0`), `nX` and `nY`; also the player's guid, left out here
+/// (the handler does not read it).
+///
+/// From the script (data): above 0 the target box shows at (`nX`, `nY`),
+/// flashing every 0.15 s, every 0.01 s from 0.75, and steady in the
+/// lock colour with the targeting sound stopped at 1; a tick without the
+/// event hides it.
+const STINGER_UPDATE: &str = "StingerReticleUpdate";
+
+/// `GuiWeaponEquippedUpdate`'s `sReticleType`. From the 360 code
+/// (`0x8234F458`): by the weapon's `WeaponUI` `ReticleType`, 1 `Homing`,
+/// 3 `Laser`, 4 `None`, anything else `Normal`. `data` is that field
+/// where the weapon up has its record here; the laser designator and the
+/// launcher, which the HUD shows from constants, are told by `laser` and
+/// `homing` (from the data their types are 3 and, for the Stinger, 1).
+fn reticle_type(homing: bool, laser: bool, data: Option<u32>) -> &'static str {
+    match data {
+        _ if laser => "Laser",
+        _ if homing => "Homing",
+        Some(1) => "Homing",
+        Some(3) => "Laser",
+        Some(4) => "None",
+        _ => "Normal",
+    }
+}
+
+/// The engine's default camera field of view, radians (360 `0x821B6148`).
+const DEFAULT_CAMERA_FOV: f32 = 0.959_749_94;
+
+/// `GuiWeaponEquippedUpdate`'s `nStingerReticleWidth` and `...Height` for
+/// a homing weapon whose lock cone is `cone` degrees, on a screen `aspect`
+/// wide for its height.
+///
+/// From the 360 code (`0x8234F458`): the points tan(cone) x 10 to the
+/// side and above, 10 ahead, go through the default camera's projection
+/// (`0x8234EF98`: half width at distance 1 = tan(fov x 0.75 x aspect / 2)
+/// with fov 0.95975 rad, half height that over the aspect); each one's
+/// place on the screen (-1 to 1) times the screen's width or height is
+/// the size. So the frame is as wide as the cone. The script hands them
+/// to `SetStingerReticleDimensions`.
+///
+/// The 360's sizes are screen pixels: the screen's width and height in
+/// that sum are a viewport's, in pixels, and the script sets the frame
+/// with `SetCorrectedLocation` (corrected boxes are screen pixels; the
+/// widget correction `0x82390550` scales a box's size by the screen's
+/// height over 480). The port's widgets keep virtual units and scale them
+/// by that same height factor when drawing, so the sizes are given here
+/// as pixels over it: a share of the width times 480 x aspect, a share of
+/// the height times 480. The frame comes out as wide as it is high.
+fn stinger_frame(cone: f32, aspect: f32) -> [f32; 2] {
+    let half_width = (DEFAULT_CAMERA_FOV * 0.75 * aspect / 2.0).tan();
+    let half_height = half_width / aspect;
+    let reach = cone.to_radians().tan();
+    [
+        reach / half_width * 480.0 * aspect,
+        reach / half_height * 480.0,
+    ]
+}
+
+/// `GuiWeaponEquippedUpdate`'s `sReticleHealthType`, by the record's
+/// `ReticleHealthType` (the same builder): 1 the straight bar, anything
+/// else the curved one.
+fn health_type(data: u32) -> &'static str {
+    if data == 1 {
+        "straight (bottom)"
+    } else {
+        "curved"
+    }
+}
+
+/// The engine's word to the laser designator's reticle (the layout's
+/// `Laser Reticle`, `MrxGuiHudReticle.HandleLaserReticleStateChangeEvent`).
+///
+/// From the 360 code (the designator's update, `0x823911F0`): as the
+/// laser comes on it sends `bActive` true with `nTime` 1.0; as it goes
+/// off with its mark not made yet, `bActive` false; when the mark is
+/// made it sends nothing (the weapon switch that follows resets the
+/// reticle). Both carry the player's guid, left out here.
+///
+/// From the script (data): active, the reticle's four arcs play and its
+/// arrow turns once every `nTime` seconds; otherwise it snaps to rest.
+const LASER_STATE: &str = "LaserState";
+
+/// [`LASER_STATE`]'s table.
+fn laser_state(lua: &Lua, active: bool) -> mlua::Result<Value> {
+    let t = lua.create_table()?;
+    t.raw_set("bActive", active)?;
+    if active {
+        t.raw_set("nTime", 1.0)?;
+    }
+    Ok(Value::Table(t))
+}
+
+/// A screen point (x right, y up, -1 to 1) as the lock-on reticle's `nX`
+/// and `nY` on a screen `aspect` wide for its height: the script puts
+/// the target box's middle there (`SetLocation`).
+///
+/// From the 360 code: the script turns the box's resolution correction
+/// off (`SetWidgetUseResolutionCorrection`), and the widget correction
+/// (`0x82390550`) then leaves such a widget's place as it is given, in
+/// screen pixels, scaling only its size. So the engine's `nX` and `nY`
+/// are pixels. The port draws the box through its parent's centred
+/// correction (virtual units times the screen's height over 480, centred
+/// on the screen), so the same pixel is given here in those units: 320
+/// plus x times 240 times the aspect, and 240 less y times 240.
+fn stinger_place([x, y]: [f32; 2], aspect: f32) -> [f32; 2] {
+    [320.0 + x * 240.0 * aspect, (1.0 - y) * 240.0]
 }
 
 /// The engine's word to put every counter of the HUD up for a while.
@@ -6680,6 +6880,52 @@ mod tests {
         );
         assert_eq!(parse_pair(" 12.7,-3x"), Some([12, -3]));
         assert_eq!(parse_pair("12"), None);
+    }
+
+    /// The lock-on reticle's type and the place its target box is told.
+    #[test]
+    fn the_lock_on_reticle_is_told_as_the_script_reads_it() {
+        assert_eq!(reticle_type(true, false, None), "Homing");
+        assert_eq!(reticle_type(false, false, None), "Normal");
+        // The designator in her hands comes before the weapon behind it.
+        assert_eq!(reticle_type(true, true, Some(0)), "Laser");
+        // By the weapon's own record: 1, 3 and 4; the guns' 0 and the TOW
+        // launchers' 2 are the normal one.
+        let by_data = |n| reticle_type(false, false, Some(n));
+        assert_eq!(
+            [0, 1, 2, 3, 4].map(by_data),
+            ["Normal", "Homing", "Normal", "Laser", "None"]
+        );
+        // The Stinger's 10 degree cone at 16:9: as far across the screen
+        // as up it (the same share of 640 x 16 as of 480 x 9).
+        let [w, h] = stinger_frame(10.0, 16.0 / 9.0);
+        assert!(
+            (w - 202.1).abs() < 0.2 && (h - 202.1).abs() < 0.2,
+            "{w} {h}"
+        );
+        // Whatever the screen's shape: the cone is round.
+        let [w, h] = stinger_frame(10.0, 4.0 / 3.0);
+        assert!((w - h).abs() < 1e-3, "{w} {h}");
+        assert_eq!(health_type(1), "straight (bottom)");
+        assert_eq!([0, 2].map(health_type), ["curved", "curved"]);
+        let lua = Lua::new();
+        let Value::Table(on) = laser_state(&lua, true).unwrap() else {
+            panic!()
+        };
+        assert!(on.get::<bool>("bActive").unwrap());
+        assert_eq!(on.get::<f64>("nTime").unwrap(), 1.0);
+        let Value::Table(off) = laser_state(&lua, false).unwrap() else {
+            panic!()
+        };
+        assert!(!off.get::<bool>("bActive").unwrap());
+        assert!(off.get::<Value>("nTime").unwrap().is_nil());
+        // At 4:3 the virtual screen is the screen; at 16:9 its edges are
+        // 106.7 units past the virtual screen's on each side.
+        assert_eq!(stinger_place([0.0, 0.0], 16.0 / 9.0), [320.0, 240.0]);
+        assert_eq!(stinger_place([-1.0, 1.0], 4.0 / 3.0), [0.0, 0.0]);
+        assert_eq!(stinger_place([1.0, -1.0], 4.0 / 3.0), [640.0, 480.0]);
+        let [x, y] = stinger_place([1.0, -1.0], 16.0 / 9.0);
+        assert!((x - 746.67).abs() < 0.01 && y == 480.0, "{x} {y}");
     }
 
     /// A request to show every counter fires the event once, with no

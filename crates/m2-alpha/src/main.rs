@@ -71,6 +71,7 @@ mod halt;
 mod held;
 mod hero;
 mod hijack;
+mod homing;
 mod input;
 mod jobs;
 mod keytable;
@@ -104,6 +105,7 @@ mod save;
 mod scene;
 mod shell;
 mod shopcheck;
+mod social;
 mod sound;
 mod spans;
 mod startup;
@@ -288,6 +290,8 @@ struct Options {
     take: bool,
     /// With `--aim` (or `--drive --look`): fire just before the picture.
     fire: bool,
+    /// `--homing-check`: her vehicle is seen by every homing weapon.
+    homing_check: bool,
     /// With `--screenshot` on foot: hits she takes just before the
     /// picture, from these directions (degrees clockwise from where the
     /// camera looks), to see the HUD's hit arcs.
@@ -413,6 +417,12 @@ struct Options {
     /// `--check-shots <s>,<s>...` with `--screenshot` on foot: the scene
     /// is pictured at those seconds in too (`<out>-at<s>.ppm`).
     check_shots: Vec<f32>,
+    /// `--use-nearest <s>` with `--screenshot` on foot: that many seconds
+    /// in, the usable thing with seats nearest her calls the person
+    /// nearest it over at once (whatever its timer and the candidate
+    /// rules say); then each second where that person is at (use-check
+    /// lines).
+    use_nearest: Option<f32>,
     /// `--face-test <s>` with `--screenshot` on foot: that many seconds
     /// in, the nearest person (and she) says a line for 3 s, then shows
     /// `Angry`; their face's weights are logged every tenth of a second
@@ -999,6 +1009,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--riders" => o.riders = true,
             "--take" => o.take = true,
             "--fire" => o.fire = true,
+            "--homing-check" => o.homing_check = true,
             "--look-pickup" => {
                 o.look_pickup = Some(value()?.parse().context("--look-pickup expects metres")?)
             }
@@ -1040,6 +1051,9 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 }
             }
             "--people-watch" => o.people_watch = true,
+            "--use-nearest" => {
+                o.use_nearest = Some(value()?.parse().context("--use-nearest expects seconds")?)
+            }
             "--face-test" => {
                 o.face_test = Some(value()?.parse().context("--face-test expects seconds")?)
             }
@@ -2315,6 +2329,7 @@ fn screenshot(
             game.combat
                 .equip(combat::Weapon::GrenadeLauncher, 3 * combat::LAUNCHER_CLIP);
         }
+        game.combat.homing_check = options.homing_check;
         // A launcher on her back, the rifle up.
         if let Some(w) = options.slung {
             game.combat.equip(w, 3 * combat::LAUNCHER_CLIP);
@@ -2345,12 +2360,37 @@ fn screenshot(
                 if off > 50.0 { " (NOT where asked)" } else { "" }
             );
         }
+        // `--use-nearest`: the tick, and the person called over.
+        let use_tick = options.use_nearest.map(|s| (s * 60.0).round() as usize);
+        let mut user: Option<usize> = None;
         // `--face-test`: the person picked, and the tick it starts.
         let face_tick = options.face_test.map(|s| (s * 60.0).round() as usize);
         let mut face_who: Option<usize> = None;
         for i in 0..ticks {
             if let Some(at) = face_tick {
                 face_test_step(&mut game, &mut face_who, i, at);
+            }
+            if use_tick == Some(i) {
+                user = use_pick(&mut game);
+            }
+            if let (Some(at), Some(k)) = (use_tick, user)
+                && i > at
+                && (i - at).is_multiple_of(60)
+                && let Some(n) = game.scene.people.npcs.get(k)
+            {
+                eprintln!(
+                    "use-check: {} s: person {k} {} ({:?}), at {:.1}",
+                    (i - at) / 60,
+                    if n.seated_at_use() {
+                        "seated"
+                    } else if n.using().is_some() {
+                        "on the way"
+                    } else {
+                        "not using it"
+                    },
+                    n.using(),
+                    n.character.position
+                );
             }
             if let Some((at, _)) = knock_tick
                 && i == at
@@ -6128,6 +6168,22 @@ fn knock_log(game: &Game, k: usize, second: usize) {
     );
 }
 
+/// `--use-nearest`: the nearest usable thing calls the person nearest
+/// it over. That person's index into the people, if it took.
+fn use_pick(game: &mut Game) -> Option<usize> {
+    let her = game.scene.player.as_ref()?.character.position;
+    let world = game.scene.world.as_ref()?;
+    game.social
+        .force_call(
+            &world.index,
+            &world.destroyed,
+            game.scene.source.as_mut(),
+            &mut game.scene.people,
+            her,
+        )
+        .map(|(_, who)| who)
+}
+
 /// `--face-test`: at tick `at` the nearest person to her and she start
 /// saying a line; 3 s on they stop and the person shows `Angry`; every
 /// tenth of a second for 8 s both faces' weights are logged.
@@ -6225,8 +6281,15 @@ fn people_watch(game: &Game, second: usize) {
             let n = &game.scene.people.npcs[k];
             use m2_engine::face_expression::{ANGRY, BLINK, FLAP};
             format!(
-                "{k}: {} {:08x} {d:.0} m, face blink {:.2} flap {:.2} angry {:.2}",
+                "{k}: {}{} {:08x} {d:.0} m, face blink {:.2} flap {:.2} angry {:.2}",
                 n.human_state(),
+                if n.seated_at_use() {
+                    " seated"
+                } else if n.using().is_some() {
+                    " to-seat"
+                } else {
+                    ""
+                },
                 n.rig
                     .animator
                     .current()
@@ -10700,6 +10763,14 @@ fn world_sounds(audio: &mut sound::GameAudio, game: &mut Game, was_driving: &mut
     let sounds = game.combat.take_sounds();
     let db = game.scene.world.as_ref().map(|w| &w.index.template_db);
     audio.play_fight(&sounds, db);
+    // The locks on her vehicle she hears ([`homing::Warnings`]).
+    for (cue, stop) in game.combat.take_warning_cues() {
+        if stop {
+            audio.stop_ui_sound(cue);
+        } else {
+            audio.ui_sound(cue);
+        }
+    }
     let cues = game.scene.take_cues(ear, CUE_REACH);
     audio.play_cues(&cues);
     let engine = game.engine();
