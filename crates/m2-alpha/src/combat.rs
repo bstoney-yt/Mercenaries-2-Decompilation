@@ -1495,6 +1495,9 @@ enum Projectile {
         key: Option<u32>,
         /// A soldier's: what it does isn't to her account.
         army: bool,
+        /// A homing missile fired on a lock on her vehicle: its number
+        /// for the scripts ([`crate::homing::ScriptSide`]).
+        round: Option<u32>,
     },
     Grenade {
         at: Vec3,
@@ -1823,6 +1826,8 @@ pub struct Combat {
     /// The locks on her vehicle as she hears them, the vehicle they are
     /// for, and lockers numbered so far ([`crate::homing`]).
     warnings: crate::homing::Warnings,
+    /// What the scripts hear of those locks ([`crate::homing::ScriptSide`]).
+    pub scripts: crate::homing::ScriptSide,
     warned: Option<VehicleId>,
     lockers: u32,
     /// What homing weapons see of each template (`HomingTarget`).
@@ -2100,6 +2105,7 @@ impl Default for Combat {
             crew_firing: false,
             crew_homing: None,
             warnings: Default::default(),
+            scripts: Default::default(),
             warned: None,
             lockers: 0,
             homing_targets: Vec::new(),
@@ -3391,6 +3397,7 @@ impl Combat {
                     homing: None,
                     key: ammo.key,
                     army: false,
+                    round: None,
                 });
                 self.effect(
                     Effect::Flash {
@@ -3579,6 +3586,24 @@ impl Combat {
         self.warnings.tick(dt);
     }
 
+    /// The homing missiles fired on her vehicle still flying: their
+    /// rounds ([`crate::homing::ScriptSide`]), where they are and their
+    /// heading (yaw, radians).
+    pub fn rounds_flying(&self) -> Vec<(u32, Vec3, f32)> {
+        self.projectiles
+            .iter()
+            .filter_map(|p| match p {
+                Projectile::Rocket {
+                    at,
+                    velocity,
+                    round: Some(r),
+                    ..
+                } => Some((*r, *at, velocity.x.atan2(velocity.z))),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The warning cues to play (`false`) or stop (`true`) since last
     /// asked ([`crate::homing::Warnings`]).
     pub fn take_warning_cues(&mut self) -> Vec<(&'static str, bool)> {
@@ -3619,8 +3644,10 @@ impl Combat {
         let event = n.seeking.tick(dt, &s, from, mark, |o, d, r| {
             physics.cast_ray_vehicle(o, d, r, None).and_then(|h| h.1)
         });
+        let locker = crate::homing::Locker::soldier(n.spawn, n.seeking.owner);
         if let Some(e) = event {
             self.warnings.hear(n.seeking.owner, e);
+            self.scripts.post(e, locker);
         }
         if mark.is_none() || !up {
             return Seek::Unguided;
@@ -3636,6 +3663,7 @@ impl Combat {
         for (e, t) in events {
             if mark.map(|m| m.id) == Some(t) {
                 self.warnings.hear(n.seeking.owner, e);
+                self.scripts.post(e, locker);
             }
         }
         eprintln!(
@@ -3677,6 +3705,11 @@ impl Combat {
             "rocket: a soldier fires his {:#x} at {distance:.0} m",
             l.template
         );
+        let round = if homing.is_some() {
+            self.scripts.fired(l.ammo.template, from)
+        } else {
+            None
+        };
         self.projectiles.push(Projectile::Rocket {
             at: from,
             velocity: dir * speed,
@@ -3687,6 +3720,7 @@ impl Combat {
             homing,
             key: l.ammo.key,
             army: true,
+            round,
         });
         self.effect(
             Effect::Flash {
@@ -4092,6 +4126,7 @@ impl Combat {
             homing,
             key: self.launcher.ammo.and_then(|a| a.key),
             army: false,
+            round: None,
         });
         self.effect(
             Effect::Flash {
@@ -4355,6 +4390,12 @@ impl Combat {
                 });
             }
             _ => {
+                let homing = self.crew_homing.take();
+                let round = if homing.is_some() {
+                    self.scripts.fired(ammo.template, from)
+                } else {
+                    None
+                };
                 self.projectiles.push(Projectile::Rocket {
                     at: from,
                     velocity: aim * ammo.velocity.max(1.0),
@@ -4362,9 +4403,10 @@ impl Combat {
                     shell: false,
                     owner: Some(id),
                     blast: ammo.burst(),
-                    homing: self.crew_homing.take(),
+                    homing,
                     key: ammo.key,
                     army: self.crew_firing,
+                    round,
                 });
                 self.effect(
                     Effect::Flash {
@@ -4649,6 +4691,8 @@ impl Combat {
                 // A homing gun names her vehicle while it goes for her, and
                 // its lock runs (360 0x822AE598, 0x82294B70).
                 let on_her = gun.slot.who == Some(crate::npc::HER) && mark.is_some();
+                // The vehicle as the scripts know it, if theirs.
+                let theirs = f.vehicles[i].guid.or(f.vehicles[i].spot.map(|s| s.0));
                 if let Some(s) = seeker {
                     if gun.seeking.owner == 0 {
                         self.lockers += 1;
@@ -4663,6 +4707,8 @@ impl Combat {
                     });
                     if let Some(e) = event {
                         self.warnings.hear(gun.seeking.owner, e);
+                        self.scripts
+                            .post(e, crate::homing::Locker::crew(theirs, gun.seeking.owner));
                     }
                 }
                 let Some(at) = gun.at else { continue };
@@ -4693,6 +4739,7 @@ impl Combat {
                 // ... and it holds its fire until locked, each missile
                 // locked afresh (0x822AE598, 0x82293660).
                 self.crew_homing = None;
+                self.scripts.disarm();
                 if seeker.is_some() && on_her {
                     let gun = self.crews.entry((i, seat)).or_default();
                     if gun.seeking.lock.locked().is_none() {
@@ -4702,6 +4749,8 @@ impl Combat {
                     for (e, t) in events {
                         if mark.map(|m| m.id) == Some(t) {
                             self.warnings.hear(gun.seeking.owner, e);
+                            let locker = crate::homing::Locker::crew(theirs, gun.seeking.owner);
+                            self.scripts.post(e, locker);
                         }
                     }
                     self.crew_homing = target
@@ -4914,6 +4963,7 @@ impl Combat {
                 homing: None,
                 key,
                 army: self.crew_firing,
+                round: None,
             });
             if let Some(v) = f.vehicles.get_mut(i) {
                 v.fired += 1;
@@ -5666,6 +5716,7 @@ impl Combat {
                 homing,
                 key,
                 army,
+                round: _,
             } => {
                 // Turning after the vehicle it locked on, no faster than its
                 // turn rate; one gone, or too far off its nose, is lost and
