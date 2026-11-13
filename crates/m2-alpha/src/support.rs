@@ -28,6 +28,10 @@
 //! never give one while a gate stands, one is given anyway after a while
 //! ([`Support::fallback`]).
 //!
+//! From the 360 code: the view's field of view is the engine's default
+//! camera's ([`default_fov_y`]: 142 m of ground from top to bottom at 16:9
+//! from 170 m up, where the video below was read as about 110 m).
+//!
 //! Measured in the Xbox 360 video (round 94): the view shows about 110 m
 //! of ground from top to bottom, moves about 5 m/s and opens over where
 //! she stands; the view goes back to her a fifth of a second after the
@@ -46,10 +50,31 @@ use m2_math::glam::{Mat4, Vec2, Vec3};
 use m2_render::View;
 
 /// The satellite looks down from this high over the ground she stands on
-/// (metres), showing this much ground from the screen's top to its bottom
 /// (metres); near and far planes (metres).
 const SAT_HEIGHT: f32 = 170.0;
-const SAT_SPAN: f32 = 110.0;
+
+/// The engine's default camera field of view, radians (55 degrees): the
+/// width of the view on a 4:3 screen. From the 360 code: the default
+/// camera settings (`0x821B6148`: near 0.2, far 2400, this), which the map
+/// mode's camera copies and never changes.
+pub const DEFAULT_FOV: f32 = 0.959_749_94;
+
+/// The default camera's vertical field of view on a screen `aspect` wide
+/// for its height, radians.
+///
+/// From the 360 code, the projection the engine builds from the default
+/// settings (`0x8234EF98`, into the matrix builder `0x82569080`): the
+/// half angle is the field of view times 0.75 times the screen's aspect
+/// (4/3 or 16/9), halved; the view's half width at distance 1 is that
+/// angle's tangent, and its half height the tangent over the aspect. So
+/// the 55 degrees are the width at 4:3 (42.7 up and down); at 16:9 the
+/// angle itself is widened to 73.3 degrees across, 45.4 up and down. The
+/// 360 has those two aspects only; here any aspect goes through the same
+/// rule.
+pub fn default_fov_y(aspect: f32) -> f32 {
+    let half = DEFAULT_FOV * 0.75 * aspect / 2.0;
+    2.0 * (half.tan() / aspect).atan()
+}
 const SAT_NEAR: f32 = 5.0;
 const SAT_FAR: f32 = 3000.0;
 /// The view moves this fast with the keys or the stick (m/s), and no
@@ -449,7 +474,7 @@ pub fn needle(turned: f32) -> Option<(u32, f32)> {
 /// ground about `ground` high, north (+z) up the screen.
 pub fn satellite_view(at: Vec2, ground: f32, aspect: f32) -> View {
     let eye = Vec3::new(at.x, ground + SAT_HEIGHT, at.y);
-    let fov = 2.0 * (SAT_SPAN / 2.0 / SAT_HEIGHT).atan();
+    let fov = default_fov_y(aspect);
     View {
         view: Mat4::look_to_rh(eye, Vec3::NEG_Y, Vec3::Z),
         // Reversed depth, as `View::perspective`.
@@ -1303,8 +1328,14 @@ mod tests {
         assert!(middle.x.abs() < 1e-4 && middle.y.abs() < 1e-4);
         assert!(clip(Vec3::new(100.0, 10.0, 230.0)).y > 0.1);
         assert!(clip(Vec3::new(70.0, 10.0, 200.0)).x > 0.1);
-        // 110 m of ground from the top of the screen to the bottom.
-        assert!((clip(Vec3::new(100.0, 10.0, 255.0)).y - 1.0).abs() < 1e-3);
+        // At 16:9 the default camera shows 45.4 degrees up and down: 142 m
+        // of ground from the top of the screen to the bottom, 170 m up.
+        assert!((default_fov_y(16.0 / 9.0).to_degrees() - 45.43).abs() < 0.02);
+        assert!((clip(Vec3::new(100.0, 10.0, 271.18)).y - 1.0).abs() < 2e-3);
+        // At 4:3 the 55 degrees are its width, 42.65 its height.
+        let x = (default_fov_y(4.0 / 3.0) / 2.0).tan() * 4.0 / 3.0;
+        assert!((2.0 * x.atan() - DEFAULT_FOV).abs() < 1e-5);
+        assert!((default_fov_y(4.0 / 3.0).to_degrees() - 42.65).abs() < 0.02);
         // In front of the camera, within depth.
         assert!((0.0..=1.0).contains(&middle.z));
     }
