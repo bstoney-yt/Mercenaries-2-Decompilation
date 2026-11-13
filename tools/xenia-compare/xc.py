@@ -28,6 +28,8 @@ Route files are one step per line (`#` comments):
                                    the HUD marker of that colour until text seen
     ocr <name>                     screenshot and log its OCR text
     mark <label>                   log a timestamped label
+    track <x> <y> <z>              follow the hero's position in guest memory (xmem.py)
+    goto <x> <z> <radius> <timeout> <buttons|-> [<gain>]  steer there by that position
     listen <file>                  then run steps appended to <file> live, until `end`
 """
 
@@ -44,6 +46,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # xmem.py (python -I leaves it out)
 
 BTN = {
     "up": 0x0001, "down": 0x0002, "left": 0x0004, "right": 0x0008,
@@ -223,6 +227,7 @@ def run(args) -> int:
     say(f"window {xe.hwnd:#x} screenshot menu item {xe.shot_id}")
     n = 0
     held = (0, 0, 0, 0.0, 0.0, 0.0, 0.0)
+    tracker = None
 
     def shot(name: str) -> Path | None:
         nonlocal n
@@ -231,8 +236,14 @@ def run(args) -> int:
             raise SystemExit(f"xenia exited {p.returncode}")
         d = out / f"{name}.png"
         if xe.screenshot(d):
-            say(f"shot {d.name} {stats(d)}")
-            return d
+            for _ in range(10):  # the writer may still be finishing the PNG
+                try:
+                    say(f"shot {d.name} {stats(d)}")
+                    return d
+                except OSError:
+                    time.sleep(0.3)
+            say(f"shot {name} unreadable")
+            return None
         say(f"shot {name} FAILED")
         return None
 
@@ -380,6 +391,82 @@ def run(args) -> int:
                     time.sleep(0.9)
                 else:
                     say(f"seek '{text}' TIMED OUT")
+                apply()
+            elif op == "track":
+                # track <x> <y> <z>: find the vehicle's world matrix near there
+                # in guest memory (the one that moves forward on A) and follow
+                # it (xmem.MatrixTracker), for goto.
+                import xmem
+
+                g = xmem.Guest(p.pid)
+
+                def throttle():
+                    apply(BTN["a"])
+                    time.sleep(1.2)
+                    apply()
+
+                tracker, n_m, moved = xmem.MatrixTracker.find(g, tuple(float(v) for v in w[1:4]), throttle)
+                if tracker is None:
+                    say(f"track: no moving world matrix among {n_m}; falling back to the buffer tracker")
+                    tracker = xmem.Tracker(g, tuple(float(v) for v in w[1:4]))
+                else:
+                    say(f"track: {len(tracker.addrs)} moving world matrices of {n_m} (first {tracker.addr:#x}, {moved:.1f} m forward); at {tracker.update()}")
+            elif op == "goto":
+                # goto <x> <z> <radius_m> <timeout_s> <buttons|-> [<gain_deg>]:
+                # hold the buttons (the boat's throttle is A) and steer the left
+                # stick at the point by the tracked heading, until within radius.
+                # Measured: stick right turns the boat from +z towards -x (the
+                # bearing atan2(dx, dz) goes down), so the stick is -error.
+                import math
+
+                tx, tz, radius, timeout = (float(v) for v in w[1:5])
+                b, lt, rt = parse_buttons(w[5])
+                gain = float(w[6]) if len(w) > 6 else 60.0
+                end, last_log, misses, lx = time.time() + timeout, 0.0, 0, 0.0
+                # Stalled (under 3 m in 4 s, say aground): back off with X (the
+                # boat's brake/reverse) and the stick the other way for 2 s.
+                stall_t, stall_p = time.time(), None
+                while time.time() < end:
+                    pos = tracker.update()
+                    if pos is None:
+                        misses += 1
+                        if misses > 10:
+                            say("goto: lost the track")
+                            break
+                        time.sleep(0.1)
+                        continue
+                    misses = 0
+                    if stall_p is None:
+                        stall_p = pos
+                    if time.time() - stall_t > 4.0:
+                        if math.hypot(pos[0] - stall_p[0], pos[2] - stall_p[2]) < 3.0:
+                            say(f"goto: stalled at ({pos[0]:.0f}, {pos[2]:.0f}), backing off")
+                            apply(BTN["x"], 0, 0, -lx if lx else 1.0, 0.0, 0.0, 0.0)
+                            time.sleep(2.0)
+                            tracker.update()
+                        stall_t, stall_p = time.time(), None
+                    dist = math.hypot(tx - pos[0], tz - pos[2])
+                    if dist <= radius:
+                        say(f"goto: at ({pos[0]:.0f}, {pos[2]:.0f}), {dist:.0f} m from the point")
+                        break
+                    hdg = tracker.heading()
+                    want = math.degrees(math.atan2(tx - pos[0], tz - pos[2]))
+                    # Well off course: let the throttle go and turn on full lock
+                    # (at speed the turning circle is ~100 m and full lock spins
+                    # the boat); lined up: throttle with gentle corrections.
+                    gas = True
+                    if hdg is not None:
+                        err = (want - hdg + 180) % 360 - 180
+                        gas = abs(err) < 45
+                        cap = 0.6 if gas else 1.0
+                        lx = max(-cap, min(cap, -err / gain))
+                    apply(b if gas else 0, lt if gas else 0, rt if gas else 0, lx, 0.0, 0.0, 0.0)
+                    if time.time() - last_log > 1.0:
+                        last_log = time.time()
+                        say(f"goto: ({pos[0]:.0f}, {pos[2]:.0f}) heading {hdg if hdg is None else round(hdg)} want {want:.0f} dist {dist:.0f} stick {lx:+.2f}")
+                    time.sleep(0.15)
+                else:
+                    say(f"goto ({tx:.0f}, {tz:.0f}) TIMED OUT")
                 apply()
             elif op == "mark":
                 say("mark " + " ".join(w[1:]))
