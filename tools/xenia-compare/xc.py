@@ -484,7 +484,7 @@ def run(args) -> int:
                 every = float(w[6]) if len(w) > 6 else 0.0
                 name = w[7] if len(w) > 7 else f"walk{i:03d}"
                 end, yaw, a, k, next_shot = time.time() + timeout, None, 0.0, 0, time.time()
-                clicked = 0.0
+                clicked, walk_t0 = 0.0, time.time()
                 while time.time() < end:
                     pos = tracker.update() if tracker else None
                     if pos is None:
@@ -495,15 +495,23 @@ def run(args) -> int:
                         say(f"walk: at ({pos[0]:.0f}, {pos[2]:.0f}), {dist:.0f} m from the point")
                         break
                     want = math.degrees(math.atan2(tx - pos[0], tz - pos[2]))
-                    travel = tracker.heading() if len(tracker.trail) >= 2 else None
-                    if travel is not None:
-                        est = (travel + a + 180) % 360 - 180
-                        yaw = est if yaw is None else yaw + 0.5 * ((est - yaw + 180) % 360 - 180)
-                    a = 0.0 if yaw is None else (yaw - want + 180) % 360 - 180
+                    # She turns to run where the stick points: her facing (her
+                    # matrix's row 2, steady even when slow) settles at the
+                    # camera's yaw - a. So yaw = facing + a, smoothed, and the
+                    # stick turned towards the point by at most 20 deg a step.
+                    face = tracker.facing() if hasattr(tracker, "facing") else tracker.heading()
+                    if face is not None:
+                        est = face + a
+                        yaw = est if yaw is None else yaw + 0.3 * ((est - yaw + 180) % 360 - 180)
+                        yaw = (yaw + 180) % 360 - 180
+                    target = 0.0 if yaw is None else (yaw - want + 180) % 360 - 180
+                    step_a = (target - a + 180) % 360 - 180
+                    a = (a + max(-20.0, min(20.0, step_a)) + 180) % 360 - 180
+                    travel = face
                     # ls: L3 (the game's sprint, tControlMap) latches sprint while
                     # the stick is pushed, so it is clicked once, moving, not held.
                     bb = b & ~BTN["ls"]
-                    if b & BTN["ls"] and not clicked and travel is not None:
+                    if b & BTN["ls"] and not clicked and time.time() - walk_t0 > 1.0:
                         bb |= BTN["ls"]
                         clicked = time.time()
                     elif clicked and time.time() - clicked < 0.2:

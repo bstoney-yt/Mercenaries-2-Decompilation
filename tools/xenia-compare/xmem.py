@@ -244,6 +244,15 @@ class MatrixTracker:
         self.trail = [(ts, p) for ts, p in self.trail if now - ts < 1.0] + [(now, t)]
         return t
 
+    def facing(self) -> float | None:
+        """Row 2 of the matrix only: where it faces (degrees from +z towards +x)."""
+        import math
+
+        if not self.rows:
+            return None
+        f = self.rows[2]
+        return math.degrees(math.atan2(f[0], f[2]))
+
     def heading(self) -> float | None:
         """From the last second's travel when that is over 2 m (some copies'
         rotation goes stale while their position still updates), else from
