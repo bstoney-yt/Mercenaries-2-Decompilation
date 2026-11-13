@@ -876,12 +876,26 @@ pub struct MorphedFace {
     buffers: Vec<(usize, VertexBufferHandle)>,
     /// The weights the buffers were last blended with.
     last: Vec<(u32, f32)>,
+    /// The model (its hash) the buffers are copies of: a face kept for
+    /// one model is no face for another (the player's after the hero or
+    /// the outfit changes), whose pieces differ in number and size.
+    model: u32,
 }
 
 impl MorphedFace {
     /// Whether it holds any buffer.
     pub fn is_empty(&self) -> bool {
         self.buffers.is_empty()
+    }
+
+    /// Makes it a face of model `model`: copies of another model's
+    /// pieces are freed first.
+    fn fit(&mut self, backend: &mut dyn RenderBackend, model: u32) -> Result<(), BackendError> {
+        if self.model != model {
+            self.destroy(backend)?;
+            self.model = model;
+        }
+        Ok(())
     }
 
     /// Frees its buffers.
@@ -1993,6 +2007,7 @@ impl GpuModel {
         face: &mut MorphedFace,
         weights: &[(u32, f32)],
     ) -> Result<bool, BackendError> {
+        face.fit(backend, self.hash)?;
         let moved = self
             .pieces
             .iter()
@@ -2360,6 +2375,37 @@ mod tests {
         // Back at no weight, the rest positions exactly.
         m.apply(&mut bytes, &[(0xaaaa, 0.0)]);
         assert_eq!(bytes, rest);
+    }
+
+    /// A face made for one model is freed before it is used for
+    /// another (the hero's when the hero or outfit changes): the old
+    /// model's piece copies would be drawn in the new one's pieces.
+    #[test]
+    fn a_face_of_another_model_is_freed_before_use() {
+        let mut backend = NullBackend::new();
+        let desc = VertexBufferDesc {
+            layout: m2_render::VertexLayout::packed(&[(
+                m2_render::VertexSemantic::Position,
+                m2_render::VertexFormat::Float3,
+            )])
+            .unwrap(),
+            vertex_count: 2,
+            usage: m2_render::BufferUsage::Dynamic,
+        };
+        let mut face = MorphedFace::default();
+        face.fit(&mut backend, 0x15d8_9832).unwrap();
+        let b = backend.create_vertex_buffer(&desc, Some(&[0; 24])).unwrap();
+        face.buffers.push((4, b));
+        face.last = vec![(0xaaaa, 1.0)];
+        // The same model again: kept.
+        face.fit(&mut backend, 0x15d8_9832).unwrap();
+        assert!(!face.is_empty());
+        assert_eq!(backend.live_buffers().vertex, 1);
+        // Another: its copies go, and it starts afresh for the new one.
+        face.fit(&mut backend, 0x39f4_7e08).unwrap();
+        assert!(face.is_empty() && face.last.is_empty());
+        assert_eq!(face.model, 0x39f4_7e08);
+        assert_eq!(backend.live_buffers().vertex, 0);
     }
 
     #[test]

@@ -1701,20 +1701,18 @@ impl GameAudio {
 
     /// The hero says something about `remark`, now and then: a cue from
     /// [`hero_cues`] (one of a group's variants), flat, as their own.
-    pub fn remark(&mut self, remark: Remark) {
+    /// Returns how long the line lasts, seconds, if one is said (their
+    /// mouth flaps for as long, [`crate::player::Player::speak_for`]).
+    pub fn remark(&mut self, remark: Remark) -> Option<f32> {
         let now = Instant::now();
         // Going down cuts in; anything else waits its turn.
         if (now < self.quiet_until && remark != Remark::Down)
             || self.random() >= remark_chance(remark)
         {
-            return;
+            return None;
         }
-        let Some(voices) = self.voices.clone() else {
-            return;
-        };
-        let Some(table) = voices.set(self.hero.voice_set()) else {
-            return;
-        };
+        let voices = self.voices.clone()?;
+        let table = voices.set(self.hero.voice_set())?;
         let streams: Vec<(u32, f32)> = hero_cues(self.hero, remark)
             .iter()
             .filter_map(|&cue| {
@@ -1729,7 +1727,7 @@ impl GameAudio {
             .flat_map(|(streams, volume)| streams.into_iter().map(move |s| (s, volume)))
             .collect();
         if streams.is_empty() {
-            return;
+            return None;
         }
         let pick = ((self.random() * streams.len() as f32) as usize).min(streams.len() - 1);
         let (stream, volume) = streams[pick];
@@ -1741,6 +1739,7 @@ impl GameAudio {
         self.quiet_until = now + Duration::from_secs_f32(seconds + REMARK_GAP);
         eprintln!("voice: {}, {remark:?}, stream {stream}", self.hero);
         self.speak(voices, stream, None, Falloff::default(), volume, None);
+        Some(seconds)
     }
 
     /// Plays the scripts' line `cue` (`Fiona-In-Mission-Contract-Vz01-146`,

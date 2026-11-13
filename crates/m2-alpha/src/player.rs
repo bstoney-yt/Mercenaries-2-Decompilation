@@ -1843,6 +1843,22 @@ impl Player {
         );
     }
 
+    /// Her mouth flapping for `seconds`, the length of a line she says
+    /// unasked (a remark in a fight, [`crate::sound::GameAudio::remark`]):
+    /// on as the line starts, off as it ends, as the 360's voice system
+    /// has it for every speaker, the player included (0x822782D8 on,
+    /// 0x82278440 off; the chatter's 0x822531D8 the same).
+    pub fn speak_for(&mut self, seconds: f32) {
+        if seconds > 0.0 {
+            self.face.play(
+                m2_engine::face_expression::FLAP,
+                1.0,
+                seconds,
+                [0.2, 0.6, 0.4, 0.9],
+            );
+        }
+    }
+
     pub fn stagger(&mut self, event: &m2_engine::stagger::Event) -> bool {
         use m2_engine::stagger::{self, Person};
         if self.down || self.driving.is_some() || self.seated || !self.character.grounded {
@@ -2707,6 +2723,38 @@ mod tests {
             key: None,
         }));
         assert!(p.face.plays(ANGRY));
+    }
+
+    /// A remark of hers flaps her mouth for the line's length and no
+    /// longer; a line of no length does nothing.
+    #[test]
+    fn her_mouth_flaps_for_as_long_as_her_remark() {
+        use m2_engine::face_expression::FLAP;
+        let mut p = Player::new(0.0, 0.0, 0.0, None);
+        p.speak_for(0.0);
+        assert!(!p.face.plays(FLAP));
+        p.speak_for(1.5);
+        assert!(p.face.plays(FLAP));
+        let mut seed = 7u64;
+        let mut step = |p: &mut Player, frames: usize| {
+            for _ in 0..frames {
+                p.face.step(1.0 / 60.0, || {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    (seed >> 40) as f32 / (1u64 << 24) as f32
+                });
+            }
+        };
+        // Talking a second in: the mouth moves.
+        let mut moved = 0.0f32;
+        for _ in 0..60 {
+            step(&mut p, 1);
+            moved = moved.max(p.face.weight(FLAP));
+        }
+        assert!(p.face.plays(FLAP) && moved > 0.5, "{moved}");
+        // The line over (and its blend out): shut.
+        step(&mut p, 60);
+        assert!(!p.face.plays(FLAP));
+        assert_eq!(p.face.weight(FLAP), 0.0);
     }
 
     #[test]
