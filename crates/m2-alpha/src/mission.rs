@@ -203,6 +203,15 @@ pub struct RadarView {
     /// each one's width (radar units) and opacity
     /// ([`m2_game::radar_anim::SonarAnim`]).
     pub rings: Option<Rings>,
+    /// Half its width and height, in the radar's own units (see
+    /// [`m2_game::hud::Blip::size`]).
+    pub size: [f32; 2],
+    /// Its target's heading (yaw), when it has a target.
+    pub yaw: Option<f32>,
+    /// Turns with the map, and takes its target's heading (the scripts'
+    /// `bRotate` and `bOriented`).
+    pub rotate: bool,
+    pub oriented: bool,
 }
 
 /// A blip's sonar rings: their texture and colour, and each one's width
@@ -4803,12 +4812,13 @@ impl MissionLink {
         let models = self.marker_models(&w);
         let radar = radar_views(mission.lua(), &hud.radar, |g| {
             let o = w.objects.get(&g)?;
-            Some(
+            Some((
                 self.marked
                     .get(&g)
                     .copied()
                     .unwrap_or_else(|| Vec3::from(o.position)),
-            )
+                o.yaw,
+            ))
         });
         MissionView {
             status: None,
@@ -5138,7 +5148,7 @@ fn radar_regions(lua: &mlua::Lua) -> Vec<RadarRegion> {
 fn radar_views(
     lua: &mlua::Lua,
     radar: &std::collections::BTreeMap<String, m2_game::hud::Blip>,
-    place: impl Fn(u32) -> Option<Vec3>,
+    place: impl Fn(u32) -> Option<(Vec3, f32)>,
 ) -> Vec<RadarView> {
     let name_of = lua
         .globals()
@@ -5154,9 +5164,12 @@ fn radar_views(
         .values()
         .filter_map(|b| {
             let offset = Vec3::from(b.offset);
-            let at = match b.target {
-                Some(g) => place(g)? + offset,
-                None => offset,
+            let (at, yaw) = match b.target {
+                Some(g) => {
+                    let (at, yaw) = place(g)?;
+                    (at + offset, Some(yaw))
+                }
+                None => (offset, None),
             };
             let icon = b
                 .texture
@@ -5180,6 +5193,10 @@ fn radar_views(
                     .sonar
                     .as_ref()
                     .map(|s| (s.texture.clone(), s.colour, s.rings())),
+                size: b.size,
+                yaw,
+                rotate: b.rotate,
+                oriented: b.oriented,
             })
         })
         .collect()
