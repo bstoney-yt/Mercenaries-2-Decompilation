@@ -734,7 +734,7 @@ fn faction_relations(m: &Mission) -> Option<HashMap<(&'static str, &'static str)
              if type(m) ~= 'table' or type(m.GetRelation) ~= 'function' then return nil end \
              local out = {} \
              for _, a in ipairs({ 'All', 'Chi', 'Gur', 'Oil', 'Pir', 'Vza' }) do \
-                 for _, b in ipairs({ 'All', 'Chi', 'Gur', 'Oil', 'Pir', 'Vza' }) do \
+                 for _, b in ipairs({ 'All', 'Chi', 'Gur', 'Oil', 'Pir', 'Vza', 'Pmc' }) do \
                      local ok, r = pcall(m.GetRelation, a, b) \
                      if ok and type(r) == 'number' then out[a .. b] = r end \
                  end \
@@ -747,7 +747,9 @@ fn faction_relations(m: &Mission) -> Option<HashMap<(&'static str, &'static str)
     let got = got?;
     let mut relations = HashMap::new();
     for a in ARMIES {
-        for b in ARMIES {
+        // And how each regards her PMC, for their attitudes to her
+        // ([`crate::npc::People::add_infraction`]).
+        for b in ARMIES.into_iter().chain([crate::npc::PMC]) {
             if a != b
                 && let Ok(Some(r)) = got.get::<Option<f32>>(format!("{a}{b}"))
             {
@@ -7118,6 +7120,33 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                     "mission: Object.OpenGate {name} ({guid:#x}): no model of it up to open"
                 ),
             }
+            return false;
+        }
+        // An infraction the scripts add against her (`Ai.AddInfraction`:
+        // AllCon003 turns China on her, a munitions pickup of another's
+        // crate by 5): those of the faction (every one, for 0) who sense
+        // her now turn on her.
+        Command::Infraction {
+            who,
+            faction,
+            amount,
+        } if *who == PLAYER => {
+            let army = if *faction == 0 {
+                None
+            } else {
+                let w = mission.world().borrow();
+                match w
+                    .template_name(*faction)
+                    .and_then(crate::npc::faction_by_label)
+                {
+                    Some(f) => Some(f),
+                    None => {
+                        eprintln!("mission: an infraction for {faction:#x}, not an army here");
+                        return false;
+                    }
+                }
+            };
+            game.scene.people.add_infraction(army, *amount);
             return false;
         }
         // The scripts' pursuit: that army's soldiers fight her for a while,

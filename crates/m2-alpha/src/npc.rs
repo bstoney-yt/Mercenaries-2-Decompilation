@@ -1120,6 +1120,11 @@ pub struct Npc {
     heard: Option<u32>,
     /// She hurt them: they fight her while her pursuit lasts.
     pub provoked: bool,
+    /// Their attitude to her from an infraction the scripts added
+    /// (`Ai.AddInfraction`: their record of her's +0xE4): they fight her
+    /// while it is low enough to attack, as it calms back to their
+    /// faction's relation to the PMC ([`People::add_infraction`]).
+    pub her_attitude: Option<m2_engine::ai_target::Attitude>,
     /// Their death was taken as an infraction already.
     pub reported_dead: bool,
     /// Hurt since the last look ([`People::pursue`]).
@@ -1436,6 +1441,7 @@ impl Npc {
             shot_by: None,
             heard: None,
             provoked: false,
+            her_attitude: None,
             hurt_by_her: false,
             killed_by_her: false,
             reported_dead: false,
@@ -3623,6 +3629,17 @@ pub fn faction_by_label(label: &str) -> Option<&'static str> {
     })
 }
 
+/// What one unit of an infraction (`Ai.AddInfraction`'s amount, kind 6)
+/// takes from an attitude to her, before the faction's multiplier: the
+/// 360's 80 (0x820BAF98, 0x822DD4D8).
+pub const INFRACTION_COST: f32 = 80.0;
+/// How recently a person must have sensed her to note an infraction the
+/// scripts add, seconds (their record's +0x8C below 0.5: 0x820D9EDC,
+/// 0x822F6FB8).
+pub const INFRACTION_SEEN_WITHIN: f32 = 0.5;
+/// Her army as the faction manager names it (`GetRelation(f, "Pmc")`).
+pub const PMC: &str = "Pmc";
+
 /// Seconds the soldiers of a faction she provoked fight her: the first of
 /// the pursuit level times the faction manager sets
 /// (`Pg.SetPursuitLevelTimes(120, 300)`, from the scripts; which level is
@@ -3923,9 +3940,66 @@ impl People {
         }
     }
 
+    /// The scripts add an infraction against her (`Ai.AddInfraction(her,
+    /// faction, amount)`): from the 360 code (0x823137C8, 0x822F6FB8), each
+    /// person of `faction` (any, for `None`) whose record of her was
+    /// merged under [`INFRACTION_SEEN_WITHIN`] seconds ago notes it (kind
+    /// 6), and their attitude to her drops by `amount` times
+    /// [`INFRACTION_COST`] (0x822DD4D8, with the faction's multiplier,
+    /// 1 unless set), kept within -100..100 (0x822D52E0). How many noted
+    /// it. AllCon003 turns China on her this way (100); a munitions
+    /// pickup of another faction's crate, by 5 (`MrxMunitionsPickup`).
+    pub fn add_infraction(&mut self, faction: Option<&str>, amount: f32) -> usize {
+        let mut noted = 0;
+        for i in 0..self.npcs.len() {
+            let n = &self.npcs[i];
+            let Some(side) = n.faction else { continue };
+            if !n.alive
+                || faction.is_some_and(|f| f != side)
+                || !n
+                    .senses
+                    .get(HER)
+                    .is_some_and(|r| r.since_update < INFRACTION_SEEN_WITHIN)
+            {
+                continue;
+            }
+            let start = m2_engine::ai_target::Attitude::new(self.relation(side, PMC));
+            let n = &mut self.npcs[i];
+            let was = n.her_attitude.unwrap_or(start);
+            n.her_attitude = Some(m2_engine::ai_target::Attitude(
+                (was.0 - amount * INFRACTION_COST).clamp(-100.0, 100.0),
+            ));
+            noted += 1;
+        }
+        if noted > 0 {
+            eprintln!(
+                "people: an infraction of {amount} against her, noted by {noted} of {}",
+                faction.unwrap_or("every faction")
+            );
+            self.refresh_sides();
+        }
+        noted
+    }
+
     /// Each person's attitudes follow their army's relations, `dt`
     /// seconds on (0x822DE240 then 0x822D5948).
     fn calm(&mut self, dt: f32) {
+        // Their attitude to her too, toward their faction's relation to
+        // the PMC; no longer attacking, they stand down.
+        let mut calmed = false;
+        for i in 0..self.npcs.len() {
+            let (Some(side), Some(mut a)) = (self.npcs[i].faction, self.npcs[i].her_attitude)
+            else {
+                continue;
+            };
+            let was = a.attacks();
+            a.think(self.relation(side, PMC), dt);
+            calmed |= was && !a.attacks();
+            self.npcs[i].her_attitude = Some(a);
+        }
+        if calmed {
+            self.refresh_sides();
+        }
         for i in 0..self.npcs.len() {
             let Some(side) = self.npcs[i].faction else {
                 continue;
@@ -4321,6 +4395,7 @@ impl People {
             .map(|n| match n.faction {
                 Some(f) => {
                     n.provoked
+                        || n.her_attitude.is_some_and(|a| a.attacks())
                         || self.fights_for(f)
                         || n.spawn.is_some_and(|s| self.mission_soldiers.contains(&s))
                 }
@@ -5998,6 +6073,70 @@ pub(crate) mod tests {
         people.pursuit.clear();
         people.set_disguise(None);
         assert!(people.fights_for("Oil"));
+    }
+
+    // `Ai.AddInfraction(her, faction, amount)` (0x822F6FB8): only those of
+    // the faction sensing her now note it; their attitude to her drops by
+    // amount x 80 to no less than -100, and they fight her; it calms back
+    // toward their faction's relation to the PMC at 0.3 a second.
+    #[test]
+    fn an_infraction_the_scripts_add_turns_those_sensing_her_on_her() {
+        let mut physics = ground();
+        let mut people = People::default();
+        let oc = |entity, x| SpawnPoint {
+            template: Some("OC Soldier".into()),
+            ai: Some(AiProfile::default()),
+            model: Some(0x0d0b),
+            ..spawn(entity, "OC Soldier 0x0011055e", x)
+        };
+        let spawns = [oc(5, 10.0), oc(6, 12.0)];
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        people.add_kind(kind("OC Soldier", true));
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        let fights = |p: &People, e| {
+            p.npcs
+                .iter()
+                .find(|n| n.spawn == Some(e))
+                .map(|n| n.soldier)
+        };
+        assert_eq!(
+            (fights(&people, 5), fights(&people, 6)),
+            (Some(false), Some(false))
+        );
+        let record = m2_engine::ai_sense::SenseRecord {
+            offset: Vec3::ZERO,
+            distance: 10.0,
+            flat_distance: 10.0,
+            likelihood: 1.0,
+            hearing: 0.0,
+            sight: 1.0,
+            perceived: true,
+            since_update: 0.0,
+            person: true,
+            lifetime: 30.0,
+        };
+        if let Some(n) = people.npcs.iter_mut().find(|n| n.spawn == Some(5)) {
+            n.senses.merge(HER, record);
+        }
+        // Another army's infraction: nobody.
+        assert_eq!(people.add_infraction(Some("Chi"), 5.0), 0);
+        // OC's (a munitions pickup's 5): only he who senses her.
+        assert_eq!(people.add_infraction(Some("Oil"), 5.0), 1);
+        let att = |p: &People| {
+            p.npcs
+                .iter()
+                .find(|n| n.spawn == Some(5))
+                .and_then(|n| n.her_attitude)
+        };
+        assert_eq!(att(&people).map(|a| a.0), Some(-100.0));
+        assert_eq!(
+            (fights(&people, 5), fights(&people, 6)),
+            (Some(true), Some(false))
+        );
+        // Calmed back toward OC's relation to the PMC (none set: 0).
+        people.calm(300.0);
+        assert!(att(&people).is_some_and(|a| a.0 > -33.0));
+        assert_eq!(fights(&people, 5), Some(false));
     }
 
     #[test]
