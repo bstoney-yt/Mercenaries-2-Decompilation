@@ -2147,6 +2147,19 @@ impl MissionLink {
             // `Graphics.Effect.Terrain`'s calls, for the particles to start.
             p.terrain_asks.append(&mut w.effects.terrain);
         }
+        // `Graphics.Camera.SetFocusParams` and `RestoreFocusParams` for the
+        // first view: a new call starts the focus's blend, which runs on
+        // every tick (0x824B8208).
+        let ask = mission.world().borrow().effects.focus[0];
+        if ask.calls != game.focus_calls {
+            game.focus_calls = ask.calls;
+            game.focus.ask(ask.params, ask.seconds);
+            eprintln!(
+                "camera: the scripts set the focus to {:?} over {} s",
+                ask.params, ask.seconds
+            );
+        }
+        game.focus.step(dt, m2_engine::camera_focus::OWN);
         // `Graphics.Camera.SetFovParams`, `SetNearFar` and their restores
         // for the first view: a new call starts that set's blend, and both
         // run on every tick (0x824B8208).

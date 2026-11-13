@@ -182,6 +182,10 @@ pub struct Game {
     /// Lights blasts' scripts set, seconds before each comes in
     /// ([`m2_game::atmosphere_script`]).
     script_lights: Vec<(f32, ScriptAtmosphere)>,
+    /// The first view's focus as the scripts change it
+    /// (`Graphics.Camera.SetFocusParams`), and how many calls it has taken.
+    pub focus: m2_engine::camera_focus::FocusBlend,
+    pub focus_calls: u32,
     /// The first view's field of view (radians) and near and far distances
     /// as the scripts change them (`Graphics.Camera.SetFovParams`,
     /// `SetNearFar`), and how many calls each has taken.
@@ -508,6 +512,8 @@ impl Game {
             sky: AtmosphereMix::default(),
             screen_scroll: Default::default(),
             script_lights: Vec::new(),
+            focus: Default::default(),
+            focus_calls: 0,
             fov_blend: m2_engine::camera_blend::Blend::new([m2_engine::projection::FOV]),
             near_far_blend: m2_engine::camera_blend::Blend::new([
                 m2_engine::projection::NEAR,
@@ -3612,6 +3618,7 @@ impl Game {
             }
             view.lighting.clouds.noise = world.cloud_noise;
             view.lighting.flare_map = world.sun_flare;
+            view.lighting.focus = self.focus.current;
             // The light's screen overlay. The records name one texture,
             // `global_rain`, which is the one loaded: another is not drawn.
             if let (Some(a), Some(map)) = (world.index.atmosphere, world.screen_rain) {

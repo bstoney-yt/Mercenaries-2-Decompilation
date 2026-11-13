@@ -146,6 +146,11 @@ pub struct Lighting {
     pub sun_disc: Vec3,
     /// The sun flare's texture (`radial_flare`); `None` draws no flare.
     pub flare_map: Option<crate::TextureHandle>,
+    /// The depth of field's focus (the game's camera focus values): soft
+    /// nearer than the first, sharp from the second, soft from the third
+    /// to the fourth and beyond, by the fifth as an amount (the frame is
+    /// never less than one less twice it sharp).
+    pub focus: [f32; 5],
     /// The atmosphere record's screen overlay; `None` draws none.
     pub screen_overlay: Option<ScreenOverlay>,
     /// Linear RGB (see [`gamma_light`](Self::gamma_light)).
@@ -385,6 +390,8 @@ impl Default for Lighting {
             shadow_direction: None,
             sun_disc: Vec3::ZERO,
             flare_map: None,
+            // The game camera's own (0x821B6148).
+            focus: [0.0, 0.1, 100.0, 300.0, 0.3],
             screen_overlay: None,
             sun_color: Vec3::new(1.0, 0.95, 0.85),
             // Sky above, warm bounce from the ground below.
