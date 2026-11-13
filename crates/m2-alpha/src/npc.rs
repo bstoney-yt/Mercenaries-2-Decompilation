@@ -1252,6 +1252,8 @@ pub struct Npc {
     pub uid: u64,
     /// The state of their face's own random numbers.
     face_seed: u64,
+    /// Scared while getting out of a vehicle's way.
+    scared: bool,
     /// The stagger's clip they play, hit and still alive, and the seconds
     /// since their last stagger began ([`m2_engine::stagger`]).
     stagger: Option<usize>,
@@ -1437,6 +1439,7 @@ impl Npc {
             },
             uid,
             face_seed: uid.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1,
+            scared: false,
             stagger: None,
             since_stagger: None,
             shouted: false,
@@ -3035,6 +3038,11 @@ impl Npc {
                     wait: rng.range(PAUSE.0, PAUSE.1),
                 };
                 self.flee = None;
+                // Out of the way: the scared look goes.
+                if std::mem::take(&mut self.scared) {
+                    self.face
+                        .play(m2_engine::face_expression::SCARED, 0.0, -1.0, [0.0; 4]);
+                }
             } else {
                 speed = self.push(HUMAN_RUN);
                 wanted = to.normalize() * speed;
@@ -4930,7 +4938,16 @@ impl People {
                 let ahead = rel.dot(heading);
                 let side = (rel - heading * ahead).length();
                 if ahead > 0.0 && ahead < speed * DODGE_TIME && side < width + 1.5 {
+                    let calm = n.flee.is_none();
                     n.panic(centre + heading * ahead);
+                    // Getting out of a vehicle's way is the 360's
+                    // `ThreatReaction` (request 0x24 from the AI's sense
+                    // of a vehicle coming at them, 0x822E02A0), and
+                    // `Scared` shows while it lasts (0x8241FE38).
+                    if calm && n.flee.is_some() {
+                        n.show(m2_engine::face_expression::SCARED, -1.0);
+                        n.scared = true;
+                    }
                 }
             }
         }
@@ -7541,6 +7558,10 @@ pub(crate) mod tests {
         assert!(!hit.alive && hit.fling.is_some_and(|v| v.z > 10.0 && v.y > 2.0));
         assert!(ahead.alive && ahead.flee.is_some(), "dives aside");
         assert!(behind.alive && behind.flee.is_none());
+        // Getting out of its way, the one ahead looks scared; the one
+        // behind does not.
+        assert!(ahead.face.plays(m2_engine::face_expression::SCARED) && ahead.scared);
+        assert!(!behind.face.plays(m2_engine::face_expression::SCARED));
         // Parked, nobody minds.
         let mut people = People::default();
         let mut n = Npc::new(0, &rig(), Vec3::new(0.3, 0.0, 1.5), 0.0, stroll(), None);
