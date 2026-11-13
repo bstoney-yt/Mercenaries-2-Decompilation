@@ -2062,7 +2062,12 @@ impl GameAudio {
             let falloff =
                 Falloff::of_record(layer.min_distance, layer.max_distance, layer.exponent)
                     .unwrap_or_default();
-            let play = Play::at(buffer, at).gain(layer.volume).falloff(falloff);
+            let play = Play {
+                pitch: layer.start.rate(self.random()),
+                ..Play::at(buffer, at)
+                    .gain(layer.volume * layer.start.level_scale(self.random()))
+                    .falloff(falloff)
+            };
             self.out.with(|m| m.play(play));
         }
         self.zone = Some(zone);
@@ -2422,7 +2427,16 @@ impl GameAudio {
                         buffer.hash,
                         buffer.seconds()
                     );
-                    let play = Play::at(buffer, at).gain(found.volume);
+                    let (gain, pitch) = found.started(self.random(), self.random());
+                    eprintln!(
+                        "sound: key {key:08x} starts at level {gain:.4}, rate {pitch:.4} \
+                         (its record's ranges: {:?})",
+                        found.start
+                    );
+                    let play = Play {
+                        pitch,
+                        ..Play::at(buffer, at).gain(gain)
+                    };
                     let play = match found.falloff {
                         Some(f) => play.falloff(f),
                         None => play,
@@ -3108,14 +3122,20 @@ impl GameAudio {
                 Some(Some(found)) => {
                     let found = found.clone();
                     let pick = self.random();
+                    let (gain, pitch) = found.started(self.random(), self.random());
                     let voice = found.pick(pick).cloned().map(|buffer| {
                         eprintln!(
                             "sound: fly-past, set {set:08x}, cue {cue:08x}: sound {:08x} \
-                             ({:.2} s) at {at:.0}",
+                             ({:.2} s) at {at:.0}, level {gain:.4}, rate {pitch:.4} (its \
+                             record's ranges: {:?})",
                             buffer.hash,
-                            buffer.seconds()
+                            buffer.seconds(),
+                            found.start
                         );
-                        let play = Play::at(buffer, at).gain(found.volume);
+                        let play = Play {
+                            pitch,
+                            ..Play::at(buffer, at).gain(gain)
+                        };
                         let play = match found.falloff {
                             Some(f) => play.falloff(f),
                             None => play,
@@ -3519,6 +3539,7 @@ mod tests {
             volume: 1.0,
             min_distance: 10.0,
             max_distance: 1000.0,
+            start: m2_assets::voice::StartDraw::FLAT,
             positional: false,
             exponent: 1.0,
             variants: vec![(table, stream, 1.0)],
