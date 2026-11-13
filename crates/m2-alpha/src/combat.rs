@@ -1852,6 +1852,9 @@ pub struct Combat {
     /// The times she asked to see her ammo (reload, a weapon switch):
     /// the HUD shows both ammo boxes for each.
     pub ammo_shown: u32,
+    /// How many times all the HUD's counters have been asked up (see
+    /// [`crate::gamehud::SHOW_ALL_COUNTERS`]).
+    pub counters_shown: u32,
     /// Every shot fired, by its gun's sound set (0: none) and whether the
     /// hero fired it, and the muzzle flashes drawn as the game's effect
     /// and as the alpha's own: for the run's log.
@@ -2110,6 +2113,7 @@ impl Default for Combat {
             seed: 0x2545_f491_4f6c_dd1d,
             fired: Fired::default(),
             ammo_shown: 0,
+            counters_shown: 0,
             shots: std::collections::BTreeMap::new(),
             shooters: std::collections::BTreeMap::new(),
             flashes: (0, 0),
@@ -4481,6 +4485,17 @@ impl Combat {
                 self.gunner_rounds += 1;
             }
         }
+    }
+
+    /// The vehicles whose crews have settled on her: one entry (the
+    /// vehicle's place in the scene's list) for each armed seat whose
+    /// foe she is.
+    pub fn crews_on_her(&self) -> Vec<usize> {
+        self.crews
+            .iter()
+            .filter(|(_, gun)| gun.slot.who == Some(crate::npc::HER))
+            .map(|(&(i, _), _)| i)
+            .collect()
     }
 
     /// The vehicles whose guns have a foe, each with where that foe is

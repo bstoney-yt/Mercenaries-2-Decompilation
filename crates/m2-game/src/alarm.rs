@@ -66,17 +66,24 @@ pub struct Alarms {
     pub on: HashMap<u32, bool>,
     /// Each alarm object's object script, by module hash, for those with one.
     pub scripts: HashMap<u32, u32>,
+    /// Each alarm object's faction, as its `Association` names it
+    /// (`Allied`, `China`, `Guerilla`), for those that name one: the
+    /// soldiers who run to raise it are of it.
+    pub factions: HashMap<u32, String>,
     /// Messages posted and not yet taken, in order: (object, mode).
     pub queue: Vec<(u32, u32)>,
 }
 
 impl Alarms {
     /// An alarm object comes into play, its alarm off, with its object
-    /// script.
-    pub fn add(&mut self, object: u32, script: Option<u32>) {
+    /// script and its faction.
+    pub fn add(&mut self, object: u32, script: Option<u32>, faction: Option<String>) {
         self.on.entry(object).or_insert(false);
         if let Some(s) = script {
             self.scripts.insert(object, s);
+        }
+        if let Some(f) = faction {
+            self.factions.insert(object, f);
         }
     }
 
@@ -84,6 +91,7 @@ impl Alarms {
     pub fn remove(&mut self, object: u32) {
         self.on.remove(&object);
         self.scripts.remove(&object);
+        self.factions.remove(&object);
     }
 
     /// Posts a message; lost when the queue is full.
@@ -120,7 +128,7 @@ mod tests {
     #[test]
     fn a_message_sets_or_flips_the_flag_and_answers_it_every_time() {
         let mut a = Alarms::default();
-        a.add(7, None);
+        a.add(7, None, None);
         assert_eq!(a.apply(7, TOGGLE), Some(true));
         // On again: still on, and its script hears it again.
         assert_eq!(a.apply(7, ON), Some(true));
@@ -151,13 +159,13 @@ mod tests {
     #[test]
     fn an_alarm_coming_back_into_play_keeps_no_old_flag() {
         let mut a = Alarms::default();
-        a.add(7, None);
+        a.add(7, None, None);
         a.apply(7, ON);
         // Added twice while in play: unchanged.
-        a.add(7, None);
+        a.add(7, None, None);
         assert!(a.on[&7]);
         a.remove(7);
-        a.add(7, None);
+        a.add(7, None, None);
         assert!(!a.on[&7]);
     }
 }

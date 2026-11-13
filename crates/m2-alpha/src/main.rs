@@ -39,6 +39,7 @@
 //! `--fight` she shoots the nearest soldier, fires a rocket at a vehicle and
 //! throws a grenade.
 
+mod action_prompt;
 mod aim;
 #[cfg(target_os = "android")]
 mod android;
@@ -413,6 +414,11 @@ struct Options {
     /// `--check-shots <s>,<s>...` with `--screenshot` on foot: the scene
     /// is pictured at those seconds in too (`<out>-at<s>.ppm`).
     check_shots: Vec<f32>,
+    /// `--face-test <s>` with `--screenshot` on foot: that many seconds
+    /// in, the nearest person (and she) says a line for 3 s, then shows
+    /// `Angry`; their face's weights are logged every tenth of a second
+    /// for 8 s (face-check lines), as are hers.
+    face_test: Option<f32>,
     /// `--people-watch` with `--screenshot` on foot: each second, how
     /// many people are in play by what they are doing, and the nearest
     /// five's state, clip and distance (people-watch lines).
@@ -1030,6 +1036,9 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 }
             }
             "--people-watch" => o.people_watch = true,
+            "--face-test" => {
+                o.face_test = Some(value()?.parse().context("--face-test expects seconds")?)
+            }
             "--pause-at" => o.pause_at = Some(value()?.parse()?),
             "--contracts" => {
                 o.contracts = value()?.parse().context("--contracts expects a count")?
@@ -2331,7 +2340,13 @@ fn screenshot(
                 if off > 50.0 { " (NOT where asked)" } else { "" }
             );
         }
+        // `--face-test`: the person picked, and the tick it starts.
+        let face_tick = options.face_test.map(|s| (s * 60.0).round() as usize);
+        let mut face_who: Option<usize> = None;
         for i in 0..ticks {
+            if let Some(at) = face_tick {
+                face_test_step(&mut game, &mut face_who, i, at);
+            }
             if let Some((at, _)) = knock_tick
                 && i == at
             {
@@ -6108,6 +6123,75 @@ fn knock_log(game: &Game, k: usize, second: usize) {
     );
 }
 
+/// `--face-test`: at tick `at` the nearest person to her and she start
+/// saying a line; 3 s on they stop and the person shows `Angry`; every
+/// tenth of a second for 8 s both faces' weights are logged.
+fn face_test_step(game: &mut Game, who: &mut Option<usize>, i: usize, at: usize) {
+    use m2_engine::face_expression::{ANGRY, BLINK, FLAP};
+    if i == at {
+        let her = game.scene.player.as_ref().map(|p| p.character.position);
+        *who = her.and_then(|h| {
+            game.scene
+                .people
+                .npcs
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.alive && n.landed)
+                .min_by(|a, b| {
+                    a.1.character
+                        .position
+                        .distance(h)
+                        .total_cmp(&b.1.character.position.distance(h))
+                })
+                .map(|(k, _)| k)
+        });
+        match *who {
+            Some(k) => eprintln!(
+                "face-check: person {k} ({:08x}) and she start speaking",
+                game.scene.people.npcs[k].spawn.unwrap_or(0)
+            ),
+            None => eprintln!("face-check: nobody in play; only her face"),
+        }
+        if let Some(k) = *who {
+            game.scene.people.npcs[k].speak(true);
+        }
+        if let Some(p) = game.scene.player.as_mut() {
+            p.speak(true);
+        }
+    }
+    if i == at + 180 {
+        if let Some(k) = *who {
+            let n = &mut game.scene.people.npcs[k];
+            n.speak(false);
+            n.show(ANGRY, m2_engine::face_expression::ANGRY_SECONDS);
+        }
+        if let Some(p) = game.scene.player.as_mut() {
+            p.speak(false);
+        }
+        eprintln!("face-check: they stop speaking; the person shows Angry");
+    }
+    if i >= at && i < at + 480 && (i - at).is_multiple_of(6) {
+        let t = (i - at) as f32 / 60.0;
+        let w = |f: &m2_engine::face_expression::Face| {
+            format!(
+                "blink {:.2} flap {:.2} angry {:.2}",
+                f.weight(BLINK),
+                f.weight(FLAP),
+                f.weight(ANGRY)
+            )
+        };
+        let theirs = who
+            .and_then(|k| game.scene.people.npcs.get(k))
+            .map_or("-".to_owned(), |n| w(&n.face));
+        let hers = game
+            .scene
+            .player
+            .as_ref()
+            .map_or("-".to_owned(), |p| w(&p.face));
+        eprintln!("face-check: {t:.1} s: person {theirs}; she {hers}");
+    }
+}
+
 /// `--people-watch`: how many people are in play by what they are
 /// doing, and the nearest five to her, `second` seconds in.
 fn people_watch(game: &Game, second: usize) {
@@ -6134,13 +6218,17 @@ fn people_watch(game: &Game, second: usize) {
         .take(5)
         .map(|&(d, k)| {
             let n = &game.scene.people.npcs[k];
+            use m2_engine::face_expression::{ANGRY, BLINK, FLAP};
             format!(
-                "{k}: {} {:08x} {d:.0} m",
+                "{k}: {} {:08x} {d:.0} m, face blink {:.2} flap {:.2} angry {:.2}",
                 n.human_state(),
                 n.rig
                     .animator
                     .current()
-                    .map_or(0, |(c, _)| n.rig.clips[c].hash)
+                    .map_or(0, |(c, _)| n.rig.clips[c].hash),
+                n.face.weight(BLINK),
+                n.face.weight(FLAP),
+                n.face.weight(ANGRY),
             )
         })
         .collect();
@@ -9598,6 +9686,19 @@ impl Running {
             // The game's own prompt (`Hijack %s`); the buttons it asks
             // for are the HUD's to draw.
             info.prompt = (!v.running).then(|| format!("Hijack {}", v.vehicle));
+            // The engine's own prompt for it (kind 11, named with the
+            // vehicle's `LocalizedName`); while it runs, the hijack
+            // scripts drive the HUD.
+            info.action = (!v.running).then(|| {
+                let a = action_prompt::Action::Hijack;
+                let key = self.game.scene.world.as_ref().and_then(|w| {
+                    let db = &w.index.template_db;
+                    db.ids(&v.vehicle)
+                        .iter()
+                        .find_map(|id| db.localized.get(id).copied())
+                });
+                (a.kind(), a.text(key))
+            });
             // With the keyboard, which keys the arrow means (playtest 12:
             // no tap of 9 rounds reached the scripts).
             if v.running && !self.input.pad() {
@@ -10553,6 +10654,10 @@ fn mission_sounds(audio: &mut sound::GameAudio, m: &mut mission::MissionLink) {
     if let Some(preset) = m.take_reverb() {
         audio.set_reverb(preset);
     }
+    for (level, seconds) in m.take_master_volumes() {
+        audio.master_volume(level, seconds);
+    }
+    audio.lock_listener(m.listener_locked());
     for (cue, on) in m.take_ambiences() {
         audio.script_ambience(cue, on);
     }
