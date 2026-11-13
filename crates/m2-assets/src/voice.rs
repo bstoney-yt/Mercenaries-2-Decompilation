@@ -23,7 +23,9 @@
 //! ```text
 //! 0x00  u32  cue hash
 //! 0x04  u32  category (`POSITIONAL` or `RADIO`, below)
-//! 0x10  f32  volume
+//! 0x0c  u8   0: a short record, its level and pitch at 0x2c and 0x30;
+//!            1: a long one, their ranges at 0x50 and 0x5c
+//! 0x10  f32  priority (not its level: see [`record_level`])
 //! 0x14  u32  1 on the positional lines inspected, 0 on radio (unchecked)
 //! 0x18  f32  distance at which it starts to fade
 //! 0x1c  f32  distance beyond which it is not heard
@@ -240,6 +242,55 @@ pub struct Track {
     /// What its record's level is scaled by: its block's value where it
     /// has one (see [`MixedCue`]), else 1.
     pub level: f32,
+    /// How its track loops ([`TrackLoop`]).
+    pub looping: TrackLoop,
+}
+
+/// How a mixed cue's track loops: each track keeps its own time, and
+/// when that reaches `end` with passes left it goes back to `start` and
+/// the track's records are started again as their own starts come.
+///
+/// ```text
+/// 0x00  u8   passes after the first: 0 none, 0xff for ever
+/// 0x01  u8   the track's events (levels, curves)
+/// 0x02  u8   the track's records
+/// 0x04  f32  where a pass goes back to, seconds (-1 on a track that
+///            does not loop)
+/// 0x08  f32  where a pass ends, seconds
+/// 0x0c  u32  0x1c, then offsets within the track
+/// ```
+///
+/// From the 360 code: a track's update (`0x82842088`) adds the frame's
+/// time to its own (+0xb8); when that reaches the header's float at +8
+/// and its count of passes (+0xbd, the header's first byte, `0x82841FD8`)
+/// is not 0, the records are started again (`0x82841DA8`, `0x82844BE8`),
+/// the time becomes the float at +4 plus what it overshot by, and the
+/// count goes down by one unless it is 0xff. A record starts once the
+/// track's time reaches its start (`0x82844BE8`).
+///
+/// From samples: `amb_jungle`'s one-shot tracks loop for ever over 0 to
+/// 23.2 s, 25.67 to 65 s and 3.4 to 17.2 s, with their records at 5.11,
+/// 26.97 and 6.2 s (the `mixhead` example).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrackLoop {
+    /// Passes after the first; 0xff: for ever.
+    pub passes: u8,
+    pub start: f32,
+    pub end: f32,
+}
+
+impl TrackLoop {
+    /// A track that plays through once.
+    pub const ONCE: Self = Self {
+        passes: 0,
+        start: -1.0,
+        end: -1.0,
+    };
+
+    /// Whether it loops for ever.
+    pub fn is_endless(&self) -> bool {
+        self.passes == 0xff
+    }
 }
 
 /// A plain cue: its name hash, the record it plays, and how long it
@@ -260,18 +311,141 @@ pub struct PlainCue {
     pub seconds: f32,
 }
 
+/// The level a record's sound plays at, and its priority (the float at
+/// 0x10).
+///
+/// From the 360 code: a sound starts (`0x82838320`) at the level
+/// `0x82842E40` answers: for a record whose byte at 0xc is 0, the float
+/// at 0x2c; for one with it set, a level drawn evenly between the
+/// floats at 0x50 and 0x54. The float at 0x10, which was taken for the
+/// volume here, is the record's priority: `PalSoundInstance::
+/// GetWavePriority` (`0x828379C0`) answers it times the sound's fade
+/// with distance, for choosing which sounds to drop
+/// (`GetLowestPrioritySound`, `0x82837D90`); nothing multiplies it into
+/// the level.
+///
+/// From the data (the `recordvol` example, 1,776 records): every
+/// 64-byte record has the byte clear and every longer one has it set;
+/// the levels are steps of decibels (0.3162, 0.3981, 0.5012, 0.6310,
+/// 0.7079, 1.0), where the float at 0x10 is 0.85 or 0.96 on nearly all.
+///
+/// The level answered for a range is its middle (the draw itself, and
+/// the pitch beside it at 0x30 or 0x5c..0x60, are not played yet).
+pub fn record_level(rec: &[u8]) -> (f32, f32) {
+    let f = |at: usize| {
+        rec.get(at..at + 4)
+            .map_or(0.0, |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let ranged = rec.get(0xc).is_some_and(|&b| b != 0) && rec.len() >= 0x58;
+    let level = if ranged {
+        (f(0x50) + f(0x54)) * 0.5
+    } else {
+        f(0x2c)
+    };
+    (level, f(0x10))
+}
+
+/// What a record's sound starts at: a level and a pitch, each drawn
+/// evenly between two ends.
+///
+/// From the 360 code: as a sound starts (`0x82838320`) its pitch is
+/// drawn first (`0x82842DA8`: the float at 0x30 of a record whose byte
+/// at 0xc is 0, else between the floats at 0x5c and 0x60), then its
+/// level (`0x82842E40`, [`record_level`]). The pitch is added to the
+/// category's and sent to the voice as `pitch / 24 * 8192`
+/// (`0x82838558`: two doubles, 1/24 at `0x82076460` and 8192 at
+/// `0x82076458`), so 4096/12 of the voice's units to one of the
+/// record's.
+///
+/// The unit is taken as semitones. That rests on the voice counting
+/// 4096 to the octave, which is how the console's audio library states
+/// a source voice's pitch (a 4.12 fixed-point count of octaves); the
+/// call that hands the number to the library was not traced, so this
+/// part is inferred, not read. One thing does not fit and is not
+/// explained: the engine turns a category's pitch into the same unit
+/// with `6 * log2` (`0x82837598`, 2.0 at `0x820F8D88`, 6.0 at
+/// `0x82003CF8`), which would be six to the octave if its input is a
+/// plain rate.
+///
+/// From the data (the `recordvol` example): most records' ends are the
+/// same; some levels run 0.631 to 0.794 or 0.038 to 0.094, some pitches
+/// -1 to 1.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StartDraw {
+    /// The level's ends.
+    pub level: (f32, f32),
+    /// The pitch's ends, semitones.
+    pub pitch: (f32, f32),
+}
+
+impl StartDraw {
+    /// A sound at its own level and pitch.
+    pub const FLAT: Self = Self {
+        level: (1.0, 1.0),
+        pitch: (0.0, 0.0),
+    };
+
+    /// A record's.
+    pub fn of(rec: &[u8]) -> Self {
+        let f = |at: usize| {
+            rec.get(at..at + 4)
+                .map_or(0.0, |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        if rec.get(0xc).is_some_and(|&b| b != 0) && rec.len() >= 0x64 {
+            Self {
+                level: (f(0x50), f(0x54)),
+                pitch: (f(0x5c), f(0x60)),
+            }
+        } else {
+            Self {
+                level: (f(0x2c), f(0x2c)),
+                pitch: (f(0x30), f(0x30)),
+            }
+        }
+    }
+
+    /// The level a draw of 0 to 1 gives.
+    pub fn level(&self, draw: f32) -> f32 {
+        self.level.0 + (self.level.1 - self.level.0) * draw.clamp(0.0, 1.0)
+    }
+
+    /// What a draw of 0 to 1 scales the middle level by (1 for a level
+    /// with no spread): for a sound played at its record's middle level.
+    pub fn level_scale(&self, draw: f32) -> f32 {
+        let middle = (self.level.0 + self.level.1) * 0.5;
+        if middle > 0.0 && self.level.0 != self.level.1 {
+            self.level(draw) / middle
+        } else {
+            1.0
+        }
+    }
+
+    /// The pitch a draw of 0 to 1 gives, as a rate (1: its own).
+    pub fn rate(&self, draw: f32) -> f32 {
+        let semitones = self.pitch.0 + (self.pitch.1 - self.pitch.0) * draw.clamp(0.0, 1.0);
+        if semitones.is_finite() {
+            2.0_f32.powf(semitones / 12.0)
+        } else {
+            1.0
+        }
+    }
+}
+
 /// A record as the cue list points at it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Record {
     /// The cue hash its first word holds (0 for a record too short to
     /// hold one).
     pub cue: u32,
+    /// The level it plays at ([`record_level`]).
     pub volume: f32,
     /// Fades from `min_distance` and is not heard beyond `max_distance`
     /// (metres: the guns' shots 10 and 1000 or so), as a line's (0x18 and
     /// 0x1c); 0 for a record too short to hold them.
     pub min_distance: f32,
     pub max_distance: f32,
+    /// The level and pitch its sound starts at.
+    pub start: StartDraw,
     /// Whether it is placed in the world and fades with distance (the
     /// byte at 0x14), and the power its fade follows (the float at 0x24).
     ///
@@ -386,9 +560,10 @@ impl CueTable {
                 };
                 all.push(Record {
                     cue: word(0),
-                    volume: f32::from_bits(word(0x10)),
+                    volume: record_level(rec).0,
                     min_distance: f32::from_bits(word(0x18)),
                     max_distance: f32::from_bits(word(0x1c)),
+                    start: StartDraw::of(rec),
                     positional: rec[0x14] != 0,
                     exponent: f32::from_bits(word(0x24)),
                     variants: (first..size)
@@ -403,6 +578,7 @@ impl CueTable {
                     volume: 0.0,
                     min_distance: 0.0,
                     max_distance: 0.0,
+                    start: StartDraw::FLAT,
                     positional: false,
                     exponent: 0.0,
                     variants: Vec::new(),
@@ -422,7 +598,7 @@ impl CueTable {
                 groups.push(Group {
                     cue: word(0),
                     category: word(4),
-                    volume: f32::from_bits(word(0x10)),
+                    volume: record_level(rec).0,
                     min_distance: f32::from_bits(word(0x18)),
                     max_distance: f32::from_bits(word(0x1c)),
                     streams: (GROUP_VARIANTS..size)
@@ -439,7 +615,7 @@ impl CueTable {
             lines.push(Line {
                 cue: word(0),
                 category: word(4),
-                volume: f32::from_bits(word(0x10)),
+                volume: record_level(&rec).0,
                 min_distance: f32::from_bits(word(0x18)),
                 max_distance: f32::from_bits(word(0x1c)),
                 stream: word(0x38),
@@ -506,6 +682,9 @@ fn mixed_cues(region: &[u8], hash: u32, count: usize) -> Vec<MixedCue> {
     let mut mixes = Vec::new();
     let mut current: Option<MixedCue> = None;
     let mut pending: Vec<Curve> = Vec::new();
+    let mut looping = TrackLoop::ONCE;
+    // A loop's time: -1 for none, else seconds.
+    let time = |t: f32| t == -1.0 || (0.0..36000.0).contains(&t);
     let close = |m: Option<MixedCue>, mixes: &mut Vec<MixedCue>| {
         if let Some(m) = m.filter(|m| !m.tracks.is_empty()) {
             mixes.push(m);
@@ -515,6 +694,26 @@ fn mixed_cues(region: &[u8], hash: u32, count: usize) -> Vec<MixedCue> {
     while at + 4 <= region.len() {
         let (w, flags) = (word(at), word(at + 4));
         let (a, seconds) = (float(at + 8), float(at + 12));
+        // A track's header ([`TrackLoop`]): its counts, its loop and the
+        // 0x1c its offsets start with.
+        if current.is_some()
+            && at + 20 <= region.len()
+            && w >> 24 == 0
+            && (1..=16).contains(&(w >> 16 & 0xff))
+            && w >> 8 & 0xff <= 16
+            && word(at + 12) == 0x1c
+            && (0x1c..0x1000).contains(&word(at + 16))
+            && time(float(at + 4))
+            && time(float(at + 8))
+        {
+            looping = TrackLoop {
+                passes: w as u8,
+                start: float(at + 4),
+                end: float(at + 8),
+            };
+            at += 16;
+            continue;
+        }
         // A cue's hash, not a small offset (a track header's 0x44 is
         // followed by 0x10100, 0.2 and 0.7 on the minigun's loop).
         // Nor a track header (0x00010000 or 0x00010100), which a cue's
@@ -541,6 +740,7 @@ fn mixed_cues(region: &[u8], hash: u32, count: usize) -> Vec<MixedCue> {
                 curves: Vec::new(),
             });
             pending.clear();
+            looping = TrackLoop::ONCE;
             at += 16;
             continue;
         }
@@ -595,6 +795,7 @@ fn mixed_cues(region: &[u8], hash: u32, count: usize) -> Vec<MixedCue> {
                     start,
                     weight,
                     level: track_block(region, at - 16).unwrap_or(1.0),
+                    looping,
                 });
                 m.curves.push(std::mem::take(&mut pending));
                 at += 12;
@@ -666,7 +867,9 @@ mod tests {
         let mut w = [0u32; 16];
         w[0] = cue;
         w[1] = category;
-        w[4] = 0.7f32.to_bits();
+        // Its priority, and (a short record) its level at 0x2c.
+        w[4] = 0.85f32.to_bits();
+        w[11] = 0.7f32.to_bits();
         w[5] = u32::from(category == POSITIONAL);
         w[6] = min.to_bits();
         w[7] = max.to_bits();
@@ -678,7 +881,11 @@ mod tests {
         let mut w = vec![0u32; GROUP_VARIANTS / 4];
         w[0] = cue;
         w[1] = POSITIONAL;
-        w[4] = 1.0f32.to_bits();
+        // A long record: its level drawn between 0x50 and 0x54.
+        w[3] = 1;
+        w[4] = 0.85f32.to_bits();
+        w[20] = 0.5f32.to_bits();
+        w[21] = 0.7f32.to_bits();
         for &s in streams {
             w.extend([0x4216_80b7, s, (1.0 / streams.len() as f32).to_bits()]);
         }
@@ -695,6 +902,15 @@ mod tests {
         let t = CueTable::parse_data(&d).unwrap();
         assert_eq!((t.hash, t.groups.len(), t.lines.len()), (0xabcd, 1, 2));
         assert_eq!(t.groups[0].streams, [(7, 0.5), (8, 0.5)]);
+        // The middle of its range, not its priority.
+        assert!((t.groups[0].volume - 0.6).abs() < 1e-6);
+        // The record keeps the range, and a line's single level.
+        let start = t.records[1].start;
+        assert_eq!(start.level, (0.5, 0.7));
+        assert!((start.level(0.25) - 0.55).abs() < 1e-6);
+        assert!((start.level_scale(1.0) - 0.7 / 0.6).abs() < 1e-6);
+        assert_eq!(t.records[0].start.level, (0.7, 0.7));
+        assert_eq!(t.records[0].start.level_scale(0.9), 1.0);
         assert!(t.groups[0].is_positional());
         assert_eq!(t.streams(9), Some(vec![7, 8]));
         assert_eq!(t.streams(2), Some(vec![610]));
@@ -709,6 +925,19 @@ mod tests {
         assert_eq!((b.cue, b.stream, b.max_distance), (2, 610, 1000.0));
         let asset = crate::testutil::ucfx(&[crate::testutil::UcfxNode::Leaf(*b"data", d)]);
         assert_eq!(CueTable::parse(&asset).unwrap().lines.len(), 2);
+    }
+
+    #[test]
+    fn a_start_s_pitch_is_drawn_in_semitones() {
+        let s = StartDraw {
+            level: (1.0, 1.0),
+            pitch: (-12.0, 12.0),
+        };
+        assert_eq!(s.rate(0.0), 0.5);
+        assert_eq!(s.rate(0.5), 1.0);
+        assert_eq!(s.rate(1.0), 2.0);
+        assert_eq!(StartDraw::FLAT.rate(0.3), 1.0);
+        assert_eq!(StartDraw::FLAT.level_scale(0.3), 1.0);
     }
 
     // An engine's start as the vehicles' tables lay it out: the record
@@ -902,6 +1131,83 @@ mod tests {
         assert_eq!(t.mixes.len(), 1);
     }
 
+    // A looped mix as the ambience table has them: a bed track that
+    // plays through, and a one-shot track looping over its own span.
+    #[test]
+    fn a_track_carries_its_loop() {
+        let mut d = table(&[
+            line(1, RADIO, 10.0, 1000.0, 15),
+            line(2, RADIO, 10.0, 1000.0, 16),
+        ]);
+        let list = d.len() as u32;
+        let f = |v: f32| v.to_bits();
+        let words: Vec<u32> = vec![
+            0x9999_0077,
+            0x100,
+            f(0.316),
+            f(-1.0), // the mixed cue, looping
+            0x2_0000,
+            0x200,
+            f(1.0),
+            f(-1.0),
+            f(-1.0),
+            0,
+            0x44,
+            0x44,
+            // The bed's track: one record, no loop.
+            0x1_0000,
+            f(-1.0),
+            f(-1.0),
+            0x1c,
+            0x1c,
+            0x1c,
+            0x38,
+            0x102_0200,
+            1,
+            f(0.0),
+            0x10,
+            0xabcd,
+            0,
+            f(1.0),
+            0,
+            // A one-shot's: for ever over 0 to 23.2 s, its record 5.11 s in.
+            0x1_01ff,
+            f(0.0),
+            f(23.2),
+            0x1c,
+            0x64,
+            0x68,
+            0x84,
+            0x102_0201,
+            1,
+            f(5.11),
+            0x10,
+            0xabcd,
+            1,
+            f(0.25),
+            0,
+        ];
+        d.extend(words.iter().flat_map(|w| w.to_le_bytes()));
+        let end = d.len() as u32;
+        d[0x18..0x1c].copy_from_slice(&list.to_le_bytes());
+        d[0x1c..0x20].copy_from_slice(&end.to_le_bytes());
+        let t = CueTable::parse_data(&d).unwrap();
+        let m = t.mix(0x9999_0077).unwrap();
+        assert_eq!(m.tracks.len(), 2);
+        assert_eq!(m.tracks[0].looping, TrackLoop::ONCE);
+        let shot = m.tracks[1];
+        assert_eq!((shot.record, shot.start, shot.weight), (1, 5.11, 0.25));
+        assert_eq!(
+            shot.looping,
+            TrackLoop {
+                passes: 0xff,
+                start: 0.0,
+                end: 23.2
+            }
+        );
+        assert!(shot.looping.is_endless());
+    }
+
     #[test]
     fn finds_mixed_cues_and_their_tracks() {
         let mut d = table(&[
@@ -970,14 +1276,16 @@ mod tests {
                     record: 1,
                     start: 0.0,
                     weight: 1.0,
-                    level: 1.0
+                    level: 1.0,
+                    looping: TrackLoop::ONCE,
                 },
                 Track {
                     table: 0xabcd,
                     record: 0,
                     start: 0.5667,
                     weight: 1.0,
-                    level: 1.0
+                    level: 1.0,
+                    looping: TrackLoop::ONCE,
                 }
             ]
         );

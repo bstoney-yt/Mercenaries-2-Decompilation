@@ -17,10 +17,17 @@
 //! and plays the new faction's cue for it (inferred; the game's
 //! transition timing between factions is not decoded).
 //!
-//! Not done: the engine's own action level (combat raising the score to
-//! `action` while dynamic music is on), the state timings and the
-//! transitions' sync kinds. The first contract turns dynamic music off as
-//! it starts, so it needs none of it.
+//! With dynamic music on, the score also moves by itself: each faction's
+//! states and transitions are a machine ([`crate::music_machine`], from
+//! the 360 code) that leaves a state when its length has passed and
+//! weighs it against the action level at its interval. What the scripts
+//! ask for (`TransitionMusic`) still plays at once here, where the 360
+//! takes it up on its machine's next run and after the state's delay.
+//!
+//! Not done: the action level's counts (the game counts nobody yet, so
+//! combat does not raise the score), a piece running out (the game does
+//! not say when), and interrupting states giving back their piece's
+//! place. The first contract turns dynamic music off as it starts.
 //!
 //! The radios' playlists are kept here too ([`Music::playlist`]); the game
 //! plays one near its radio (`m2_engine::music_source`).
@@ -28,6 +35,7 @@
 use std::collections::HashMap;
 
 use crate::api::Command;
+use crate::music_machine::{Event, Faction, Hostility};
 
 /// The music's state as the scripts set it.
 #[derive(Debug, Default)]
@@ -43,7 +51,9 @@ pub struct Music {
     following: bool,
     /// The faction (name hash) of the music region the player is in.
     region: Option<u32>,
-    pub dynamic: bool,
+    /// Dynamic music is off (`Sound.SetDynamicMusic(false)`). It starts
+    /// out on, as the 360's factions do (`0x8235B2D0`).
+    pub fixed: bool,
     state: String,
     /// The cue playing, if any.
     playing: Option<String>,
@@ -52,6 +62,16 @@ pub struct Music {
     /// The radios' playlists (`Sound.AddMusicSourcePlaylist`, filled by
     /// `AddCueToMusicSourcePlaylist`), by name hash: their cues in order.
     playlists: HashMap<u32, Vec<String>>,
+    /// Each faction's states and transitions, and where it is
+    /// ([`crate::music_machine`]).
+    machines: HashMap<String, Faction>,
+    /// The action around the player, which the machines weigh.
+    pub hostility: Hostility,
+    /// `Sound.LockActionLevelMusic`: the action level stands as it is.
+    pub action_locked: bool,
+    /// The hostile characters aware of the player, by the engine's four
+    /// groups ([`crate::music_machine::group`]), as the game last said.
+    pub aware: [u32; 4],
 }
 
 impl Music {
@@ -160,9 +180,73 @@ impl Music {
         self.playlists.get(&hash).map_or(&[], Vec::as_slice)
     }
 
+    /// The machine of the faction in use.
+    pub fn machine(&mut self) -> &mut Faction {
+        self.machines.entry(self.faction.clone()).or_default()
+    }
+
+    /// `Sound.SetActionLevelsMusic(a, b, c, d)`: the four values of the
+    /// action around the player, the last argument the first value
+    /// (`0x82341A88`).
+    pub fn set_action_levels(&mut self, a: f32, b: f32, c: f32, d: f32) {
+        self.hostility.values = [d, c, b, a];
+    }
+
+    /// Runs the faction's machine for `dt` seconds and goes to the state
+    /// it moves to by itself, if any: at its interval by the action
+    /// level, when its length has passed, or when its piece is over.
+    /// `counts` are the hostile characters aware of the player in the
+    /// engine's four groups; `decay` is the hostility decay rate.
+    ///
+    /// The action follows the counts only with dynamic music on and the
+    /// level unlocked (`0x82362898`). A piece counts as playing while
+    /// one is set here: the game does not say yet when one has run out.
+    pub fn update(
+        &mut self,
+        dt: f32,
+        decay: f32,
+        counts: [u32; 4],
+        clocks: bool,
+        force: bool,
+        draw: impl FnMut() -> f32,
+    ) -> Option<Command> {
+        let (dynamic, locked) = (!self.fixed, self.action_locked);
+        if dynamic && !locked {
+            self.hostility.update(dt, decay, counts);
+        }
+        let (hostility, playing) = (self.hostility, self.playing.is_some());
+        let machine = self.machine();
+        machine.dynamic = dynamic;
+        machine.clocks = clocks;
+        machine.force |= force;
+        let events = machine.update(dt, &hostility, locked, false, playing, draw);
+        let level = machine.level;
+        let mut command = None;
+        for e in events {
+            if let Event::Entered(state) = e
+                && state != self.state
+            {
+                eprintln!(
+                    "music: the score moves from {} to {state} by itself (action level {level}, \
+                     hostility {:?})",
+                    self.state, hostility.values
+                );
+                command = self.go(&state).or(command);
+            }
+        }
+        command
+    }
+
     /// Goes to `state`: returns the command for the game when what plays
     /// changes.
     pub fn transition(&mut self, state: &str) -> Option<Command> {
+        // The machine takes it up at its next run (`0x82341570`); what
+        // plays changes at once here.
+        self.machine().ask(state);
+        self.go(state)
+    }
+
+    fn go(&mut self, state: &str) -> Option<Command> {
         self.state = state.to_ascii_lowercase();
         let cues: Vec<String> = self
             .bindings
@@ -227,6 +311,51 @@ mod tests {
         assert_eq!(m.transition("none"), Some(Command::Music(None)));
         assert_eq!(m.transition("silence"), None);
         assert_eq!(m.state(), "silence");
+    }
+
+    #[test]
+    fn the_score_moves_by_itself_when_a_state_s_length_has_passed() {
+        use crate::music_machine::State;
+        let mut m = Music::default();
+        m.set_faction("freeplay_city");
+        let state = |name: &str, length: f32| State {
+            name: name.into(),
+            length,
+            level: 0,
+            delay: 0.0,
+            interval: 10.0,
+            least: 0.0,
+            flags: 0,
+            thresholds: (2.0, 0.0),
+            transitions: Vec::new(),
+        };
+        m.machine().add_state(state("none", 15.0));
+        m.machine().add_state(state("explore", 30.0));
+        // Timeout transitions (kind 1), as the scripts declare them.
+        assert!(m.machine().add_transition("none", "explore", 1.0, 0, 1));
+        assert!(m.machine().add_transition("explore", "none", 1.0, 0, 1));
+        m.bind("mu_explore_01", "explore");
+        assert_eq!(m.transition("none"), None);
+        let mut moved = Vec::new();
+        for k in 1..=500 {
+            if let Some(c) = m.update(0.1, 1.0, [0; 4], true, false, || 0.5) {
+                moved.push((k as f32 * 0.1, c, m.state().to_owned()));
+            }
+        }
+        // 15 s of "none", then "explore" and its piece; 30 s later
+        // "none" again, and silence.
+        assert_eq!(moved.len(), 2, "{moved:?}");
+        assert!((moved[0].0 - 15.2).abs() < 0.21, "{moved:?}");
+        assert_eq!(moved[0].1, Command::Music(Some("mu_explore_01".into())));
+        assert_eq!(moved[0].2, "explore");
+        assert!((moved[1].0 - 45.3).abs() < 0.31, "{moved:?}");
+        assert_eq!(moved[1].1, Command::Music(None));
+        // With dynamic music off, or the clocks stopped, it stays put.
+        m.fixed = true;
+        m.transition("none");
+        assert!((0..500).all(|_| m.update(0.1, 1.0, [0; 4], true, false, || 0.5).is_none()));
+        m.fixed = false;
+        assert!((0..500).all(|_| m.update(0.1, 1.0, [0; 4], false, false, || 0.5).is_none()));
     }
 
     #[test]
