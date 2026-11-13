@@ -203,7 +203,8 @@ fn main() -> Result<()> {
         }
     }
     if name.eq_ignore_ascii_case("autogunship") {
-        autogunship(&mut mission, args.get(2).map(String::as_str))?;
+        let level = args.get(3).is_some_and(|a| a == "level");
+        autogunship(&mut mission, args.get(2).map(String::as_str), level)?;
     }
     println!("{name} lines logged: {failures}");
     Ok(())
@@ -213,10 +214,11 @@ fn main() -> Result<()> {
 /// (`target`, default `M113 AA (VZ) (Driver)`) 60 m off; the gunship is
 /// flown over her
 /// as AllCon003 flies it (`Airstrike.Flyby` from 300 m north of her to
-/// her, 100 m up, at 40 m/s, and on past her), and 15 s pass. Prints each
+/// her, 100 m up, at 40 m/s, and on past her on the 360 flyby path, or
+/// level with `level` as the fourth argument), and 30 s pass. Prints each
 /// `Gunship Shell` it fires (`gunship:` lines: when, from, which way)
 /// and the scripts' errors.
-fn autogunship(mission: &mut Mission, target: Option<&str>) -> Result<()> {
+fn autogunship(mission: &mut Mission, target: Option<&str>, level: bool) -> Result<()> {
     let target = target.unwrap_or("M113 AA (VZ) (Driver)");
     mission.put_player([100.0, 0.0, 100.0]);
     let tank = mission.spawn(target, [160.0, 0.0, 100.0]);
@@ -246,16 +248,33 @@ fn autogunship(mission: &mut Mission, target: Option<&str>) -> Result<()> {
     let (from, to) = ([50.0_f32, 100.0, 400.0], [100.0_f32, 100.0, 100.0]);
     let len = ((to[0] - from[0]).powi(2) + (to[2] - from[2]).powi(2)).sqrt();
     let mut shells = 0;
-    while mission.now() < start + 15.0 {
-        // Flown on its line at 40 m/s, on past her (as m2-alpha flies it).
+    let mut gunship = gunship;
+    while mission.now() < start + 30.0 {
+        // Flown at 40 m/s: level to her, then on past her. `level`: level,
+        // gone 1500 m past (the port before); else the 360's path (climbing
+        // one in four, gone at twice its run-in past her).
         if let Some(g) = gunship {
-            let k = 40.0 * (mission.now() - start) as f32 / len;
+            let s = 40.0 * (mission.now() - start) as f32;
+            let (flat, up) = if s <= len || level {
+                (s, 0.0)
+            } else {
+                let past = (s - len) / (1.0f32 + 0.0625).sqrt();
+                (len + past, 0.25 * past)
+            };
+            let k = flat / len;
             let at = [
                 from[0] + (to[0] - from[0]) * k,
-                100.0,
+                100.0 + up,
                 from[2] + (to[2] - from[2]) * k,
             ];
-            mission.place(g, at, 0.0);
+            let fly_on = if level { 1500.0 } else { 2.0 * len };
+            if flat - len >= fly_on {
+                println!("gunship: t={:.2} gone at {at:.0?}", mission.now() - start);
+                mission.flyby_gone(g);
+                gunship = None;
+            } else {
+                mission.place(g, at, 0.0);
+            }
         }
         mission.tick(0.25);
         for c in mission.take_commands() {
@@ -278,7 +297,10 @@ fn autogunship(mission: &mut Mission, target: Option<&str>) -> Result<()> {
             }
         }
     }
-    println!("gunship: {shells} shells in 15 s");
+    println!(
+        "gunship: {shells} shells in 30 s ({})",
+        if level { "level" } else { "360 path" }
+    );
     Ok(())
 }
 
