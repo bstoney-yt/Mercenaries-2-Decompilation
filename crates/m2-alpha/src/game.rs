@@ -2655,7 +2655,7 @@ impl Game {
                 fire: intent.trigger.fire,
                 steer: intent.walking(),
                 select: intent.trigger.select.is_some(),
-                hurt: hp < self.support_hp,
+                hurt: crate::support::hit_cancels(self.support_hp, hp),
                 pda: intent.trigger.pda,
             },
             // In a vehicle only the PDA opens: the game's car layout keeps

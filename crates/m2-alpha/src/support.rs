@@ -84,6 +84,18 @@ const SAT_FAR: f32 = 3000.0;
 /// crosses its reach in five seconds.
 const VIEW_SPEED: f32 = 20.0;
 pub const VIEW_REACH: f32 = 100.0;
+/// Whether health gone from `before` to `now` since the last tick calls a
+/// designation off.
+///
+/// From the 360 code, the map mode's update (`0x82441DD8`): it reads the
+/// damage events on her character since its last update and cancels (as
+/// the cancel button does) on one whose amount is above 0.5; smaller
+/// ones leave the view up. Here the health lost in a tick stands for the
+/// event's amount.
+pub fn hit_cancels(before: f32, now: f32) -> bool {
+    before - now > 0.5
+}
+
 /// The designator comes up this long before the view opens (seconds; the
 /// videos: a moment, up to a second).
 const EQUIP_TIME: f32 = 0.5;
@@ -978,6 +990,17 @@ impl Support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a hit above half a point of health calls the view off.
+    #[test]
+    fn a_small_hit_leaves_the_view_up() {
+        assert!(!hit_cancels(80.0, 80.0));
+        assert!(!hit_cancels(80.0, 79.5));
+        assert!(!hit_cancels(80.0, 79.6));
+        assert!(hit_cancels(80.0, 79.4));
+        // Healing never does.
+        assert!(!hit_cancels(80.0, 95.0));
+    }
 
     const DT: f32 = 0.05;
 
