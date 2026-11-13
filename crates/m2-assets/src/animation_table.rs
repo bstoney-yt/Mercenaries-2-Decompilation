@@ -215,6 +215,30 @@ impl AnimationTable {
         })
     }
 
+    /// A table of `columns` (name, type code as `TYPE` writes it) and
+    /// `rows` of cells, with no lists: for building one in code (tests,
+    /// tools). Rows shorter or longer than the columns are cut or padded
+    /// with [`ANY`].
+    pub fn from_rows(columns: &[(&str, u16)], rows: &[&[u32]]) -> Self {
+        let n = columns.len();
+        let cells = rows
+            .iter()
+            .flat_map(|r| (0..n).map(|i| r.get(i).copied().unwrap_or(ANY)))
+            .collect();
+        Self {
+            columns: columns
+                .iter()
+                .map(|&(name, code)| Column {
+                    name: name.to_owned(),
+                    kind: ColumnKind::from(code),
+                })
+                .collect(),
+            rows: rows.len(),
+            cells,
+            lists: Vec::new(),
+        }
+    }
+
     pub fn rows(&self) -> usize {
         self.rows
     }

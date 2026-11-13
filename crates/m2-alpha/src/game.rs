@@ -3362,11 +3362,7 @@ impl Game {
                         at,
                         set,
                         speed: world.physics.vehicle_speed(id),
-                        top: v.spec.tuning.max_speed.unwrap_or(if v.spec.tracked {
-                            14.0
-                        } else {
-                            32.0
-                        }),
+                        top: self.engine_top(v),
                     },
                 ))
             })
@@ -3374,6 +3370,23 @@ impl Game {
         near.sort_by(|a, b| a.0.total_cmp(&b.0));
         near.truncate(crate::sound::ENGINES_TRACKED);
         near.into_iter().map(|n| n.1).collect()
+    }
+
+    /// The speed a vehicle's engine cue measures its speed against: its
+    /// sound set's top gear's `MaxVelocity`, as the 360's engine
+    /// controllers divide by (0x823696E8, 0x82369518;
+    /// [`m2_engine::sound_gears`]); else (a set the table lacks, or no
+    /// world) its physics `MaxSpeed`, else 14 m/s tracked or 32 wheeled
+    /// (invented).
+    fn engine_top(&self, v: &crate::scene::ParkedVehicle) -> f32 {
+        self.scene
+            .world
+            .as_ref()
+            .and_then(|w| w.index.template_db.sound_gearbox_for_model(v.spec.model))
+            .and_then(|g| g.top_speed())
+            .filter(|&t| t > 0.0)
+            .or(v.spec.tuning.max_speed)
+            .unwrap_or(if v.spec.tracked { 14.0 } else { 32.0 })
     }
 
     /// The vehicle being driven's engine: its sound bank (the one its
@@ -3398,12 +3411,23 @@ impl Game {
             .and_then(|w| w.index.template_db.engine_set_for_model(v.spec.model))
             .unwrap_or(0);
         let physics = self.scene.world.as_ref().map(|w| &w.physics);
+        let gears = self
+            .scene
+            .world
+            .as_ref()
+            .and_then(|w| w.index.template_db.sound_gearbox_for_model(v.spec.model));
         let id = v.id;
         let (mut revs, mut slide, mut surface, mut braking) = (None, 0.0, 0.0, false);
         if let (Some(p), Some(id)) = (physics, id) {
-            // The top revs are its `GearMaxRPM` default of 8000 where the
-            // gearbox's own aren't to hand (360's divides by a record's).
-            revs = p.vehicle_gear(id).map(|(_, rpm)| (rpm / 8000.0).min(1.0));
+            // Over the sound gearbox's top revs (`UpExitRPM`, 0x823696E8),
+            // else its `GearMaxRPM` default of 8000. The rpm itself is the
+            // physics gearbox's, not the 360's sound-side simulation
+            // (0x82368080, not implemented).
+            let top_rpm = gears
+                .map(|g| g.max_rpm)
+                .filter(|&r| r > 0.0)
+                .unwrap_or(8000.0);
+            revs = p.vehicle_gear(id).map(|(_, rpm)| (rpm / top_rpm).min(1.0));
             braking = p.vehicle_braking(id);
             if let Some(at) = p.vehicle_transform(id) {
                 slide = p.vehicle_velocity(id).dot(at.x_axis.truncate());
@@ -3414,11 +3438,7 @@ impl Game {
             bank,
             set,
             speed,
-            top: v
-                .spec
-                .tuning
-                .max_speed
-                .unwrap_or(if v.spec.tracked { 14.0 } else { 32.0 }),
+            top: self.engine_top(v),
             throttle: self.throttle,
             horn: self.honking,
             heavy: heavy_horn(&v.spec.kind, &v.spec.label, v.spec.tracked),
