@@ -5502,7 +5502,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // each marked included or excluded (`AddObject` 823587B0 / 82359A58:
     // adding one already there only changes its mark). `UsePlayers(f)`
     // (82358AD8) adds the any-player wildcard `Player.GetAnyCharacter()`;
-    // `false` adds nothing. The wildcards (0xf0000000 any player,
+    // `false` or nil adds nothing (0x82308230 takes nil as false; only
+    // an absent flag is true). The wildcards (0xf0000000 any player,
     // 0xf0000001 all players, since #507 what `GetAnyCharacter` and
     // `GetAllCharacters` answer) are entries like any other:
     // - `GetObjects(f [, excluded])` (823588F0, 82359D58) lists the
@@ -5533,8 +5534,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             if not has(f, g) then f.objs[#f.objs + 1] = g end
             f.ex[g] = exclude and true or nil
         end
-        function F.UsePlayers(f, b)
-            if ok(f) and b ~= false then F.AddObject(f, Player.GetAnyCharacter()) end
+        -- The flag as the 360 reads it (0x82308230): a boolean or nil
+        -- (false) is taken; only when none is passed at all is it true.
+        -- `MrxTaskObjective.Activated` passes `bTgtPlayers`, nil for most
+        -- objectives: no players then.
+        function F.UsePlayers(f, ...)
+            local on = true
+            if select('#', ...) > 0 then on = (...) and true or false end
+            if ok(f) and on then F.AddObject(f, Player.GetAnyCharacter()) end
         end
         function F.SetFilter(f, label) if ok(f) then f.label = label end end
         function F.RemoveObject(f, g)
@@ -8247,6 +8254,30 @@ mod tests {
             .eval()
             .unwrap();
         assert!(r.iter().all(|&b| b), "{r:?}");
+    }
+
+    // `MrxTaskObjective.Activated` calls `UsePlayers(f, cfg.bTgtPlayers)`,
+    // nil for most objectives. The 360 reads the flag with 0x82308230,
+    // which takes nil as false: no players. Treated as true, MecCon001's
+    // "Enter vehicle" found her among its vehicles and its script failed
+    // ("attempt to index field '?'").
+    #[test]
+    fn use_players_with_nil_adds_no_players() {
+        let (host, _) = setup();
+        let r: (i64, i64, i64, i64) = host
+            .lua()
+            .load(
+                r#"local a, b, c, d = ObjectFilter.Create(), ObjectFilter.Create(),
+                    ObjectFilter.Create(), ObjectFilter.Create()
+                ObjectFilter.UsePlayers(a, nil)
+                ObjectFilter.UsePlayers(b, false)
+                ObjectFilter.UsePlayers(c)
+                ObjectFilter.UsePlayers(d, true)
+                return #a.objs, #b.objs, #c.objs, #d.objs"#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(r, (0, 0, 1, 1));
     }
 
     // From the 360 code (0x82359A58, 0x82359D58, 0x82359F80): an entry
