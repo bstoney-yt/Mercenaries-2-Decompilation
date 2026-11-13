@@ -541,8 +541,6 @@ const REGEN_RATE: f32 = 25.0;
 /// Where the health clamp stops her health: the hero script's healing
 /// keeps at least this much too (inferred; no script sets the floor).
 const CLAMP_FLOOR: f32 = 1.0;
-/// Seconds she stays down at no health.
-const DOWN_TIME: f32 = 2.5;
 /// RPG: rocket speed (m/s), reload (s) and how far it flies.
 const ROCKET_SPEED: f32 = 60.0;
 const RPG_RELOAD: f32 = 1.0;
@@ -1683,6 +1681,12 @@ pub struct Combat {
     pub scripted_health: bool,
     /// She just got back up after going down (taken by the mission).
     pub revived: bool,
+    /// She just died with the scripts running (taken by the mission,
+    /// which tells them: [`crate::death`]).
+    pub died: bool,
+    /// The scripts' revive (`Object.Revive`) came: her health, for the
+    /// next tick to stand her up with.
+    pub revive_hp: Option<f32>,
     /// The scripts keep her from dying (`Object.SetUnkillable`): her
     /// health stops at [`crate::npc::UNKILLABLE_FLOOR`].
     pub unkillable_her: bool,
@@ -2057,6 +2061,8 @@ impl Default for Combat {
             health_clamp: false,
             scripted_health: false,
             revived: false,
+            died: false,
+            revive_hp: None,
             unkillable_her: false,
             unkillable: std::collections::HashSet::new(),
             fire_lock: false,
@@ -3047,9 +3053,20 @@ impl Combat {
 
         if self.down > 0.0 {
             self.down -= dt;
+            // The scripts revived her: up at once, with their health.
+            if self.revive_hp.is_some() {
+                self.down = 0.0;
+            }
             if self.down <= 0.0 {
-                self.hp = self.max_hp;
-                self.revived = true;
+                // Their revive needs no `Hero.OnDeath` from us: their own
+                // death handlers ran.
+                match self.revive_hp.take() {
+                    Some(hp) => self.hp = hp.clamp(1.0, self.max_hp),
+                    None => {
+                        self.hp = self.max_hp;
+                        self.revived = true;
+                    }
+                }
                 f.player.down = false;
                 f.player.aiming = false;
             }
@@ -4012,7 +4029,10 @@ impl Combat {
         if self.hp <= 0.0 {
             self.tally.downs += 1;
             self.remarks.push(Remark::Down);
-            self.down = DOWN_TIME;
+            // With the scripts running she stays down for their death
+            // flow ([`crate::death`]); without, the alpha's own stand-up.
+            self.down = crate::death::down_time(self.scripted_health);
+            self.died = self.scripted_health;
             f.player.down = true;
             f.player.aiming = false;
             // On foot the 360 posts her `Die` (0x82287F98, when no hit's
@@ -7695,6 +7715,51 @@ mod tests {
         combat.step(&mut field, Trigger::default(), 1.0 / 60.0);
         assert_eq!(field.player.ragdoll, None);
         assert!(field.physics.ragdoll_nodes(doll).is_none());
+    }
+
+    /// With the scripts running a death goes to them: she stays down past
+    /// the alpha's 2.5 s, and gets up at once with their health when their
+    /// revive comes, with no `Hero.OnDeath` of ours.
+    #[test]
+    fn a_scripted_death_waits_for_the_scripts_revive() {
+        let mut physics = ground();
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        let mut vehicles = Vec::new();
+        let mut explosives = [];
+        let mut combat = Combat {
+            scripted_health: true,
+            ..Combat::default()
+        };
+        let mut field = Field {
+            physics: &mut physics,
+            player: &mut player,
+            people: &mut people,
+            vehicles: &mut vehicles,
+            arsenal: &arsenal,
+            explosives: &mut explosives,
+        };
+        combat.hurt_player(&mut field, 1.0e6, None);
+        assert!(field.player.down && combat.died);
+        let dt = 1.0 / 60.0;
+        for _ in 0..60 * 5 {
+            combat.step(&mut field, Trigger::default(), dt);
+        }
+        assert!(field.player.down, "still down 5 s on");
+        combat.revive_hp = Some(100.0);
+        combat.step(&mut field, Trigger::default(), dt);
+        assert!(!field.player.down);
+        assert_eq!(combat.hp, 100.0);
+        assert!(!combat.revived, "their revive: no Hero.OnDeath of ours");
+        // Without the scripts: up after 2.5 s at full health, as before.
+        let mut alone = Combat::default();
+        alone.hurt_player(&mut field, 1.0e6, None);
+        assert!(!alone.died);
+        for _ in 0..(60.0 * 2.6) as usize {
+            alone.step(&mut field, Trigger::default(), dt);
+        }
+        assert!(!field.player.down && alone.revived);
     }
 
     /// Killed on foot with no body loaded there is nothing to go limp;

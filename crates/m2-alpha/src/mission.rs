@@ -3528,6 +3528,12 @@ impl MissionLink {
             if std::mem::take(&mut game.combat.revived) {
                 mission.player_died();
             }
+            // Dead with the clamp off: her object dies, and the scripts'
+            // `PlayerDied` takes it from there ([`crate::death`]).
+            if std::mem::take(&mut game.combat.died) {
+                eprintln!("death: she died: the scripts' PlayerDied runs");
+                mission.kill(PLAYER);
+            }
             mission.set_health(PLAYER, game.combat.hp);
             mission.set_player_reserve(GRENADE, game.combat.grenades);
             // Called on foot, on land, as the support menu is.
@@ -3739,6 +3745,12 @@ impl MissionLink {
                     Command::HealthClamp(on) => {
                         eprintln!("mission: health clamp {on}");
                         game.combat.health_clamp = *on;
+                    }
+                    // The scripts revived her (the sickbay's
+                    // `RiseFromYourGrave`): she gets up where they put her.
+                    Command::Revive { guid, health } if *guid == PLAYER => {
+                        eprintln!("death: the scripts revive her with {health:.1}");
+                        game.combat.revive_hp = Some(*health);
                     }
                     Command::SetHealth { guid, health } if *guid == PLAYER => {
                         eprintln!(
