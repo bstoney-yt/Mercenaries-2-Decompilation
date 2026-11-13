@@ -4021,8 +4021,10 @@ impl Combat {
             // record where a hit landed on her, so it is always the plain
             // death; the clip played here before (479c4a51) is `Upright`
             // `ProneTransition`'s by the tables, not a death. In a
-            // vehicle the 360 goes by a mode of the seat, not traced:
-            // there the old clip still plays.
+            // vehicle the same `Die` goes, by the state table, to
+            // `InVehicle` `Die` (ragdoll mode `NONE`), then `Dead`: she
+            // stays in the seat, animated, playing the seat's own clips
+            // ([`crate::hijack::seated_death`]).
             let on_foot = f.player.driving.is_none() && !f.player.seated;
             let body = f.player.model_matrix();
             if let Some((_, rig)) = &mut f.player.model {
@@ -4037,8 +4039,6 @@ impl Combat {
                         .physics
                         .add_ragdoll(&rig.skeleton.parents, &world, Vec3::ZERO);
                     f.player.ragdoll = Some(id);
-                } else if let Some(die) = f.player.clips.die {
-                    rig.animator.play_once(die);
                 }
             }
             f.people.stand_down();
