@@ -33,6 +33,8 @@ Route files are one step per line (`#` comments):
     goto <x> <z> <radius> <timeout> <buttons|-> [<gain>] [max=<m/s>]  steer there by that position
     measure <buttons|-> <secs> [<ly>]  hold, logging tracked position and speed
     walkcam <x> <z> <radius> <timeout> [<buttons|-> [<every_s> <name>]]  stick forward, steer by the camera
+    airlog start <x> <z> <name> | airlog stop   log state-table movers near (x, z) in the background
+    fight <secs> [<every_s> <name>]  aim at the nearest slow ground mover and fire in bursts
     airwatch <dropx> <dropz> <secs> [<every_s> <name>]  log movers near a drop, camera on the fastest airborne one
     look <bearing> [<timeout>]     turn the camera to face that bearing (xmem.Camera)
     trackhero                      follow the player's character by the 360 code's tables (xmem.Hero)
@@ -236,6 +238,7 @@ def run(args) -> int:
     n = 0
     held = (0, 0, 0, 0.0, 0.0, 0.0, 0.0)
     tracker = None
+    airlog_state: dict = {}
 
     def shot(name: str) -> Path | None:
         nonlocal n
@@ -437,13 +440,13 @@ def run(args) -> int:
                 secs = float(w[2])
                 ly = float(w[3]) if len(w) > 3 else 0.0
                 apply(b, lt, rt, 0.0, ly, 0.0, 0.0)
-                t0, last = time.time(), None
-                while time.time() - t0 < secs:
+                m_t0, last = time.time(), None
+                while time.time() - m_t0 < secs:
                     pos = tracker.update() if tracker else None
                     now = time.time()
                     if pos is not None:
                         v = None if last is None else math.hypot(pos[0] - last[1][0], pos[2] - last[1][2]) / (now - last[0])
-                        say(f"measure {w[1]} t={now - t0:5.2f} pos=({pos[0]:.1f}, {pos[2]:.1f}) v={'-' if v is None else f'{v:.2f}'} m/s")
+                        say(f"measure {w[1]} t={now - m_t0:5.2f} pos=({pos[0]:.1f}, {pos[2]:.1f}) v={'-' if v is None else f'{v:.2f}'} m/s")
                         last = (now, pos)
                     time.sleep(0.25)
                 apply()
@@ -463,7 +466,7 @@ def run(args) -> int:
                 every = float(w[6]) if len(w) > 6 else 0.0
                 name = w[7] if len(w) > 7 else f"walkcam{i:03d}"
                 cam = xmem.Camera(xmem.Guest(p.pid))
-                end, t0, k, next_shot, last_say = time.time() + timeout, time.time(), 0, time.time(), 0.0
+                end, wc_t0, k, next_shot, last_say = time.time() + timeout, time.time(), 0, time.time(), 0.0
                 offset, sense, rx = 0.0, 1.0, 0.0
                 last_yaw, clicked = None, 0.0
                 stall_t, stall_p, jump_t = time.time(), None, 0.0
@@ -503,7 +506,7 @@ def run(args) -> int:
                         stall_t, stall_p = time.time(), pos
                     if time.time() - jump_t < 0.3:
                         bb |= BTN["a"]
-                    if b & BTN["ls"] and not clicked and time.time() - t0 > 1.0:
+                    if b & BTN["ls"] and not clicked and time.time() - wc_t0 > 1.0:
                         clicked = time.time()
                     if clicked and time.time() - clicked < 0.2:
                         bb |= BTN["ls"]
@@ -518,6 +521,108 @@ def run(args) -> int:
                     time.sleep(0.1)
                 else:
                     say(f"walkcam ({tx:.0f}, {tz:.0f}) TIMED OUT")
+                apply()
+            elif op == "airlog":
+                # airlog start <x> <z> <name> | airlog stop: in the background,
+                # every 0.25 s, log every state-table entry moving over 3 m/s
+                # within 1200 m of (x, z) to <out>/<name>.csv, timed on the
+                # route's clock (the t of the say() lines), until stopped.
+                import csv
+                import math
+                import threading
+                import xmem
+
+                if w[1] == "stop":
+                    if airlog_state.get("stop"):
+                        airlog_state["stop"].set()
+                        airlog_state["thread"].join(5)
+                        say("airlog: stopped")
+                else:
+                    ax, az, name = float(w[2]), float(w[3]), w[4]
+                    stop_ev = threading.Event()
+
+                    def logger(ax=ax, az=az, name=name, stop_ev=stop_ev):
+                        g2 = xmem.Guest(p.pid)
+                        with open(out / f"{name}.csv", "w", newline="") as fh:
+                            wr = csv.writer(fh)
+                            wr.writerow(["t", "index", "x", "y", "z", "speed"])
+                            last, prev = {}, None
+                            while not stop_ev.is_set():
+                                now = time.time()
+                                ents = xmem.state_entries(g2)
+                                if prev is not None:
+                                    dt = now - prev
+                                    for idx, pt in ents.items():
+                                        q = last.get(idx)
+                                        if q is None or math.hypot(pt[0] - ax, pt[2] - az) > 1200:
+                                            continue
+                                        v = math.dist(pt, q) / dt
+                                        if 3.0 < v < 150.0:
+                                            wr.writerow([f"{now - t0:.2f}", idx, f"{pt[0]:.1f}", f"{pt[1]:.1f}", f"{pt[2]:.1f}", f"{v:.1f}"])
+                                last, prev = ents, now
+                                stop_ev.wait(0.25)
+
+                    th = threading.Thread(target=logger, daemon=True)
+                    th.start()
+                    airlog_state.update(stop=stop_ev, thread=th)
+                    say(f"airlog: logging movers within 1200 m of ({ax:.0f}, {az:.0f}) to {name}.csv")
+            elif op == "fight":
+                # fight <secs> [<every_s> <name>]: aim (LT held) and fire RT in short
+                # bursts at the nearest slow ground mover within 60 m (a soldier:
+                # moved 1-8 m/s over the last second, near the hero's height),
+                # turning the camera with the right stick towards it; OCR logs
+                # the HUD (the "Kill enemies (n/4)" count) every few seconds.
+                import math
+                import xmem
+
+                secs = float(w[1])
+                every = float(w[2]) if len(w) > 2 else 2.0
+                name = w[3] if len(w) > 3 else f"fight{i:03d}"
+                g = xmem.Guest(p.pid)
+                cam = xmem.Camera(g)
+                hist: dict[int, tuple] = {}
+                end, k, next_shot, sense, rx, last_yaw = time.time() + secs, 0, time.time(), 1.0, 0.0, None
+                while time.time() < end:
+                    now = time.time()
+                    hp = tracker.update() if tracker else None
+                    ents = xmem.state_entries(g)
+                    target = None
+                    if hp is not None:
+                        cands = []
+                        for idx, pt in ents.items():
+                            old = hist.get(idx)
+                            if old and now - old[0] > 0.8:
+                                d_hero = math.hypot(pt[0] - hp[0], pt[2] - hp[2])
+                                v = math.dist(pt, old[1]) / (now - old[0])
+                                if 1.0 < v < 8.0 and 3.0 < d_hero < 60.0 and abs(pt[1] - hp[1]) < 6:
+                                    cands.append((d_hero, pt))
+                        target = min(cands)[1] if cands else None
+                    for idx, pt in ents.items():
+                        if idx not in hist or now - hist[idx][0] > 1.0:
+                            hist[idx] = (now, pt)
+                    fire = 0
+                    if target is not None:
+                        bearing = math.degrees(math.atan2(target[0] - hp[0], target[2] - hp[2]))
+                        yv = cam.yaw()
+                        if yv is not None:
+                            if last_yaw is not None and abs(rx) > 0.3:
+                                moved = (yv - last_yaw + 180) % 360 - 180
+                                if abs(moved) > 1.0 and (moved > 0) != (sense * rx > 0):
+                                    sense = -sense
+                            last_yaw = yv
+                            err = (bearing - yv + 180) % 360 - 180
+                            rx = max(-1.0, min(1.0, sense * err / 40))
+                            fire = 255 if abs(err) < 15 and int(now * 2) % 2 == 0 else 0
+                    else:
+                        rx = 0.0
+                    apply(0, 255, fire, 0.0, 0.0, rx, 0.0)
+                    if now >= next_shot:
+                        next_shot = now + every
+                        d = shot(f"{name}-{k:03d}")
+                        k += 1
+                        if d is not None:
+                            say(f"fight: target {target is not None}; ocr: {ocr(d)[:80]}")
+                    time.sleep(0.05)
                 apply()
             elif op == "airwatch":
                 # airwatch <dropx> <dropz> <secs> [<every_s> <name>]: every 0.25 s
@@ -538,10 +643,10 @@ def run(args) -> int:
                 f = open(out / f"{name}.csv", "w", newline="")
                 wr = csv.writer(f)
                 wr.writerow(["t", "index", "x", "y", "z", "speed"])
-                t0, last, prev_t, k, next_shot, sense, rx, last_yaw = time.time(), {}, None, 0, time.time(), 1.0, 0.0, None
+                aw_t0, last, prev_t, k, next_shot, sense, rx, last_yaw = time.time(), {}, None, 0, time.time(), 1.0, 0.0, None
                 hero_y = tracker.pos[1] if tracker and getattr(tracker, "pos", None) else -35.0
                 best_i = None
-                while time.time() - t0 < secs:
+                while time.time() - aw_t0 < secs:
                     now = time.time()
                     ents = xmem.state_entries(g)
                     hp = tracker.update() if tracker else None
@@ -555,7 +660,7 @@ def run(args) -> int:
                             v = math.dist(pt, q) / dt
                             if 3.0 < v < 120.0:
                                 movers.append((idx, pt, v))
-                                wr.writerow([f"{now - t0:.2f}", idx, f"{pt[0]:.1f}", f"{pt[1]:.1f}", f"{pt[2]:.1f}", f"{v:.1f}"])
+                                wr.writerow([f"{now - aw_t0:.2f}", idx, f"{pt[0]:.1f}", f"{pt[1]:.1f}", f"{pt[2]:.1f}", f"{v:.1f}"])
                     last, prev_t = ents, now
                     air = [m for m in movers if m[1][1] > hero_y + 5 and (hp is None or math.hypot(m[1][0] - hp[0], m[1][2] - hp[2]) > 3)]
                     if air:
