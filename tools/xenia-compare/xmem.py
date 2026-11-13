@@ -256,6 +256,35 @@ class Hero:
         return self.facing()
 
 
+def state_entries(g: Guest, table: int = 0x83658140):
+    """Every entry of the state table read page by page: {index: (x, y, z)}
+    (paged pool: slot mask +0x20, size +0x24, page shift +0x26, pages +0x70;
+    2816 slots in VzaCon001, 56 bytes each, position first)."""
+    hdr = g.read(table, 0x80)
+    if not hdr:
+        return {}
+    mask = struct.unpack(">I", hdr[0x20:0x24])[0]
+    esz, shift = struct.unpack(">hh", hdr[0x24:0x28])
+    pages = struct.unpack(">I", hdr[0x70:0x74])[0]
+    cap = struct.unpack(">I", hdr[0x1C:0x20])[0]
+    out = {}
+    n_pages = (cap + mask - 1) // mask
+    pp = g.read(pages, 4 * n_pages)
+    if not pp:
+        return out
+    for pi, page in enumerate(struct.unpack(f">{n_pages}I", pp)):
+        if not page:
+            continue
+        b = g.read(page, mask * esz)
+        if not b:
+            continue
+        for j in range(mask):
+            x, y, z = struct.unpack_from(">3f", b, j * esz)
+            if (x or z) and abs(x) < 8000 and abs(z) < 8000 and abs(y) < 2000:
+                out[(pi << shift) | j] = (x, y, z)
+    return out
+
+
 class Camera:
     """The local player's camera, as Player.GetCamera (0x8233BF58) finds it:
     0x8243C338 gives *(0x831345C8) + 0x20 + slot x 0x620 (slot 0 for the

@@ -33,6 +33,7 @@ Route files are one step per line (`#` comments):
     goto <x> <z> <radius> <timeout> <buttons|-> [<gain>] [max=<m/s>]  steer there by that position
     measure <buttons|-> <secs> [<ly>]  hold, logging tracked position and speed
     walkcam <x> <z> <radius> <timeout> [<buttons|-> [<every_s> <name>]]  stick forward, steer by the camera
+    airwatch <dropx> <dropz> <secs> [<every_s> <name>]  log movers near a drop, camera on the fastest airborne one
     look <bearing> [<timeout>]     turn the camera to face that bearing (xmem.Camera)
     trackhero                      follow the player's character by the 360 code's tables (xmem.Hero)
     trackfoot <x> <y> <z>|here     as track, for the hero on foot (here: where track was)
@@ -518,6 +519,69 @@ def run(args) -> int:
                 else:
                     say(f"walkcam ({tx:.0f}, {tz:.0f}) TIMED OUT")
                 apply()
+            elif op == "airwatch":
+                # airwatch <dropx> <dropz> <secs> [<every_s> <name>]: every 0.25 s
+                # read the whole state table (xmem.state_entries) and log every
+                # entry moving over 3 m/s within 800 m of the drop point to
+                # <out>/<name>.csv (t, index, x, y, z, speed); turn the camera
+                # with the right stick at the fastest one at least 5 m up from
+                # the hero (the delivery helicopter), frames every every_s.
+                import csv
+                import math
+                import xmem
+
+                dx, dz, secs = float(w[1]), float(w[2]), float(w[3])
+                every = float(w[4]) if len(w) > 4 else 1.0
+                name = w[5] if len(w) > 5 else f"air{i:03d}"
+                g = xmem.Guest(p.pid)
+                cam = xmem.Camera(g)
+                f = open(out / f"{name}.csv", "w", newline="")
+                wr = csv.writer(f)
+                wr.writerow(["t", "index", "x", "y", "z", "speed"])
+                t0, last, prev_t, k, next_shot, sense, rx, last_yaw = time.time(), {}, None, 0, time.time(), 1.0, 0.0, None
+                hero_y = tracker.pos[1] if tracker and getattr(tracker, "pos", None) else -35.0
+                best_i = None
+                while time.time() - t0 < secs:
+                    now = time.time()
+                    ents = xmem.state_entries(g)
+                    hp = tracker.update() if tracker else None
+                    movers = []
+                    if prev_t is not None:
+                        dt = now - prev_t
+                        for idx, pt in ents.items():
+                            q = last.get(idx)
+                            if q is None or math.hypot(pt[0] - dx, pt[2] - dz) > 800:
+                                continue
+                            v = math.dist(pt, q) / dt
+                            if 3.0 < v < 120.0:
+                                movers.append((idx, pt, v))
+                                wr.writerow([f"{now - t0:.2f}", idx, f"{pt[0]:.1f}", f"{pt[1]:.1f}", f"{pt[2]:.1f}", f"{v:.1f}"])
+                    last, prev_t = ents, now
+                    air = [m for m in movers if m[1][1] > hero_y + 5 and (hp is None or math.hypot(m[1][0] - hp[0], m[1][2] - hp[2]) > 3)]
+                    if air:
+                        best_i, bp, bv = max(air, key=lambda m: m[2])
+                        if hp is not None:
+                            bearing = math.degrees(math.atan2(bp[0] - hp[0], bp[2] - hp[2]))
+                            yv = cam.yaw()
+                            if yv is not None:
+                                if last_yaw is not None and abs(rx) > 0.3:
+                                    moved = (yv - last_yaw + 180) % 360 - 180
+                                    if abs(moved) > 1.0 and (moved > 0) != (sense * rx > 0):
+                                        sense = -sense
+                                last_yaw = yv
+                                err = (bearing - yv + 180) % 360 - 180
+                                rx = max(-1.0, min(1.0, sense * err / 40))
+                    else:
+                        rx = 0.0
+                    apply(0, 0, 0, 0.0, 0.0, rx, 0.0)
+                    if now >= next_shot:
+                        next_shot = now + every
+                        shot(f"{name}-{k:03d}")
+                        k += 1
+                        say(f"airwatch: {len(movers)} moving, airborne {len(air)}; following {best_i}")
+                    time.sleep(0.05)
+                f.close()
+                apply()
             elif op == "look":
                 # look <bearing> [<timeout>]: turn the camera with the right stick
                 # until it faces that bearing (degrees from +z towards +x), the
@@ -549,6 +613,10 @@ def run(args) -> int:
                 import xmem
 
                 tracker = xmem.Hero(xmem.Guest(p.pid))
+                for _ in range(30):  # the player may not be registered yet
+                    if tracker.update() is not None:
+                        break
+                    time.sleep(0.5)
                 say(f"trackhero: character {tracker.character()} at {tracker.update()}, facing {tracker.facing()}")
             elif op == "trackfoot":
                 # trackfoot <x> <y> <z>: as track, for the hero on foot (found

@@ -1,0 +1,30 @@
+# Round 8 after vzacon001-boat.txt: the boat along run 16's track (the one
+# that reached the beach), east of the shoals the 360 boat grounds on at
+# (-1521,2332), (-1483,2389), (-1519,2466); slower on the last legs. Then out,
+# sprint (L3 clicked once while moving), onto loc_vza_beach from the WSW so
+# the camera faces where the crate's helicopter comes from, and the drop.
+mark boat start
+trackhero
+goto -1550 2248 20 60 a
+goto -1497 2297 15 30 a max=20
+goto -1465 2330 12 30 a max=15
+goto -1465 2400 12 30 a max=15
+goto -1462 2440 12 30 a max=12
+goto -1478 2500 12 30 a max=12
+goto -1480 2560 10 30 a max=10           # onto the sand (run 16 beached at (-1480, 2536))
+mark beached
+hold x 2                                 # stop first: Y does not get her out while it moves
+press y 0.3
+wait 3
+ocr out1                                 # on foot the boat's hints ("Speed boost") are gone
+if_text boost press y 0.3                # still at the wheel: get out again
+wait 3
+ocr out2
+walkcam -1500 2650 6 150 - 2 swim       # swim/wade ashore, stick forward, steered by the camera
+walkcam -1490 2690 4 40                  # away from the beached boat, onto the sand (m2's autoplay is on foot here)
+walkcam -1478 2677 4 30                  # loc_vza_beach: "Wait for weapon delivery"
+mark at the beach marker
+airwatch -1472.6 2677 60 1 drop          # the delivery starts here: log movers near the drop point, camera on the helicopter
+mark crate window over
+walkcam -1460 2760 4 30 ls 1 sprint      # inland on sand: L3 clicked once moving (sprint), a frame a second
+mark sprint done
