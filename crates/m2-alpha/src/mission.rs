@@ -3516,6 +3516,20 @@ impl MissionLink {
                     Command::Invincible { guid, on } if *guid == PLAYER => {
                         game.combat.invincible = *on;
                     }
+                    // The shooting gallery holds her fire till it starts
+                    // (`MrxShootingGallery`: `Human.SetFireLock`).
+                    Command::FireLock { guid, on } if *guid == PLAYER => {
+                        eprintln!(
+                            "mission: her fire is {}",
+                            if *on { "locked" } else { "free" }
+                        );
+                        game.combat.fire_lock = *on;
+                    }
+                    // `Player.SetScopeEnabled` (MrxState, MrxGuiSatellite,
+                    // MrxGuiHudMessage): scopes off while any of them asks.
+                    Command::ScopeEnabled(on) => {
+                        game.combat.scope_off = !*on;
+                    }
                     // Her weapons, as the contract's scripts hand them out:
                     // fresh ones come with nothing in reserve.
                     Command::Loadout { who, weapons } if *who == PLAYER => {
@@ -4422,6 +4436,10 @@ impl MissionLink {
         };
         let w = mission.world().borrow();
         let place = |g: u32| w.objects.get(&g).map(|o| Vec3::from(o.position));
+        // A player wildcard among the targets (`vTgtInclude =
+        // Player.GetAllCharacters()`, VzaCon001's "Land on the beach")
+        // stands for her, as the scripts' filter has it.
+        let resolve = |g: u32| player_target(g, w.player);
         found
             .sequence_values::<mlua::Table>()
             .flatten()
@@ -4442,6 +4460,7 @@ impl MissionLink {
                         t.sequence_values::<mlua::Value>()
                             .flatten()
                             .filter_map(|v| m2_game::events::as_guid(&v))
+                            .filter_map(resolve)
                             .collect()
                     })
                     .unwrap_or_default();
@@ -5487,6 +5506,17 @@ return walk(m, 0)
 /// it is measured flat (`bXZOnly`), how many of its targets must be there
 /// (`nQuota`) and those targets (`vTgtInclude`). OilCon020's guns: a place
 /// and 15 m, flat, 1 of its pickups, no region (from the scripts).
+/// A target as the game finds it: a player wildcard
+/// (`Player.GetAnyCharacter`, `GetAllCharacters`: 0xf0000000, 0xf0000001)
+/// is the players' characters, with one player `her`; anything else is
+/// itself.
+fn player_target(g: u32, her: Option<u32>) -> Option<u32> {
+    match g {
+        m2_game::events::ANY_CHARACTER | m2_game::events::ALL_CHARACTERS => her,
+        g => Some(g),
+    }
+}
+
 const CONTRACT_DELIVERIES: &str = r#"
 local ps = rawget(_G, "MrxPlayState")
 if type(ps) ~= "table" or not ps.GetCurrentMission then return {} end
@@ -6835,6 +6865,21 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             {
                 let seat = game.ride.filter(|r| r.0 == i).map(|r| r.1);
                 get_out(&world.physics, v, seat, p);
+            }
+            return false;
+        }
+        // Every goal of an AI cleared (`Ai.RemoveGoal` with `Handle` 0:
+        // OilCon001's executive, PmcCon003's pursuers before their next
+        // goal): a route it runs on foot is dropped, a path its vehicle
+        // drives is left, and her own `MoveTo` is forgotten.
+        Command::ClearGoals { guid } => {
+            if *guid == PLAYER {
+                fleet.player_goal = None;
+            }
+            game.scene.people.clear_goals(*guid);
+            let vehicle = mission.world().borrow().vehicle_of(*guid);
+            if game.paths.stop(vehicle.unwrap_or(*guid)) {
+                eprintln!("mission: {guid:#x}'s goals cleared: its vehicle leaves its path");
             }
             return false;
         }
@@ -8329,6 +8374,18 @@ mod tests {
     }
 
     use super::*;
+
+    // VzaCon001's "Land on the beach": `vTgtInclude =
+    // Player.GetAllCharacters()` read as no target ("quota 1 of 0
+    // targets") after #507 made it the wildcard. It is her.
+    #[test]
+    fn a_player_wildcard_target_is_her() {
+        use m2_game::events::{ALL_CHARACTERS, ANY_CHARACTER};
+        assert_eq!(player_target(ALL_CHARACTERS, Some(1)), Some(1));
+        assert_eq!(player_target(ANY_CHARACTER, Some(1)), Some(1));
+        assert_eq!(player_target(ALL_CHARACTERS, None), None);
+        assert_eq!(player_target(0x4000_0176, Some(1)), Some(0x4000_0176));
+    }
 
     fn entry(model: u32, kind: &str, label: &str) -> CatalogueEntry {
         CatalogueEntry {

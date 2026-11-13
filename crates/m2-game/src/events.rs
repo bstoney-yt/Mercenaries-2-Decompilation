@@ -1405,6 +1405,17 @@ fn objects(t: &Table, i: i64, world: &dyn World) -> Vec<u32> {
                     .collect();
                 out.retain(|g| !excluded.contains(g));
             }
+            // A filter's player wildcards (`UsePlayers`, or the answers of
+            // `Player.GetAnyCharacter`/`GetAllCharacters` added to it)
+            // stand for the players' characters, as the 360's filter test
+            // has them (0x82359F80): with one player, her.
+            if out
+                .iter()
+                .any(|&g| matches!(g, ANY_CHARACTER | ALL_CHARACTERS))
+            {
+                out.retain(|&g| !matches!(g, ANY_CHARACTER | ALL_CHARACTERS));
+                out.extend(world.player());
+            }
             out.sort_unstable();
             out.dedup();
             out
@@ -2492,6 +2503,40 @@ mod tests {
         let mut got = log(&host);
         got.sort();
         assert_eq!(got, ["dead 5", "filter 5", "one 4"]);
+    }
+
+    // A filter holding a player wildcard (`ObjectFilter.UsePlayers`, or a
+    // module's `vTgtInclude = Player.GetAllCharacters()`, VzaCon001) stands
+    // for her (0x82359F80): her death fires its event; others' don't.
+    #[test]
+    fn a_filter_of_the_player_wildcard_is_her() {
+        let (host, events) = setup();
+        let g = host.lua().globals();
+        g.set("all", guid_value(ALL_CHARACTERS)).unwrap();
+        g.set("any", guid_value(ANY_CHARACTER)).unwrap();
+        host.lua()
+            .load(
+                r#"
+                local f = { objs = { all }, ex = {} }
+                Event.CreatePersistent(Event.ObjectDeath, { f },
+                    function(g) table.insert(log, "all " .. tostring(gid(g))) end)
+                local u = { objs = { any, 7 }, ex = {} }
+                Event.CreatePersistent(Event.ObjectDeath, { u },
+                    function(g) table.insert(log, "any " .. tostring(gid(g))) end)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld::default();
+        events.update(0.1, &world);
+        world.dead.push(5);
+        events.update(0.1, &world);
+        assert!(log(&host).is_empty(), "{:?}", log(&host));
+        world.dead.push(1);
+        events.update(0.1, &world);
+        let mut got = log(&host);
+        got.sort();
+        assert_eq!(got, ["all 1", "any 1"]);
     }
 
     #[test]
