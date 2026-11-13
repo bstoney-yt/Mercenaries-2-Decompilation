@@ -2596,6 +2596,33 @@ impl Scene {
                 .ok()
                 .and_then(|a| AnimationTable::parse(&a).ok());
         }
+        // How long people's `ThreatReaction` lasts (their scared look):
+        // its clip on the people's rig, by both tables.
+        if self.people.threat_seconds.is_none()
+            && let (Some(t), Some(rig)) = (&self.on_foot, &self.people_rig)
+        {
+            use m2_assets::animation_table::{self as table, AnimationTable};
+            let actions = source
+                .asset(table::ACTIONS, table::ANIMATION_TABLE_TYPE)
+                .ok()
+                .and_then(|a| AnimationTable::parse(&a).ok());
+            self.people.threat_seconds = actions.and_then(|actions| {
+                npc::threat_reaction_seconds(t, &actions, |c| {
+                    rig.clips
+                        .iter()
+                        .find(|b| b.hash == c)
+                        .map(|b| b.info.duration)
+                })
+            });
+            eprintln!(
+                "people: ThreatReaction lasts {}",
+                self.people
+                    .threat_seconds
+                    .map_or("? (not found: scared until they settle)".to_owned(), |s| {
+                        format!("{s:.2} s")
+                    })
+            );
+        }
         // The clips by name, then as the on-foot table gives them the
         // hero, then the hero's own group's for those it doesn't.
         let set = self

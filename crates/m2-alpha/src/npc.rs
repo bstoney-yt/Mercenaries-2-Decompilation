@@ -1344,8 +1344,10 @@ pub struct Npc {
     pub uid: u64,
     /// The state of their face's own random numbers.
     face_seed: u64,
-    /// Scared while getting out of a vehicle's way.
-    scared: bool,
+    /// Scared while getting out of a vehicle's way: the seconds the
+    /// `ThreatReaction` action has left ([`People::threat_seconds`]), or
+    /// below 0 when its length isn't known (until they settle).
+    scared: Option<f32>,
     /// The stagger's clip they play, hit and still alive, and the seconds
     /// since their last stagger began ([`m2_engine::stagger`]).
     stagger: Option<usize>,
@@ -1554,7 +1556,7 @@ impl Npc {
             },
             uid,
             face_seed: uid.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1,
-            scared: false,
+            scared: None,
             stagger: None,
             since_stagger: None,
             using: None,
@@ -2128,6 +2130,37 @@ impl Npc {
         };
         self.face
             .play(expression, 1.0, seconds, [r(5), r(6), r(7), r(8)]);
+    }
+
+    /// The 360's `ThreatReaction` starting (a vehicle coming at them):
+    /// the driver's action handler (0x8241FE38) posts `Scared` at weight
+    /// 1 until stopped as the action starts, and at 0 when it is left,
+    /// so their face is scared for the action's `seconds` (`None`: not
+    /// known, until they settle).
+    pub fn threat_reaction(&mut self, seconds: Option<f32>) {
+        self.show(m2_engine::face_expression::SCARED, -1.0);
+        self.scared = Some(seconds.filter(|&s| s > 0.0).unwrap_or(-1.0));
+    }
+
+    /// `dt` seconds of the threat reaction: its time up, the scared look
+    /// goes with it (0x8241FE38 posts `Scared` at 0 as the action is
+    /// left).
+    fn scared_step(&mut self, dt: f32) {
+        if let Some(left) = &mut self.scared
+            && *left >= 0.0
+        {
+            *left -= dt;
+            if *left <= 0.0 {
+                self.stop_scared();
+            }
+        }
+    }
+
+    /// The threat reaction left: `Scared` at weight 0 (0x8241FE38).
+    fn stop_scared(&mut self) {
+        self.scared = None;
+        self.face
+            .play(m2_engine::face_expression::SCARED, 0.0, -1.0, [0.0; 4]);
     }
 
     /// Their mouth flapping while a line of theirs plays (`on`), as the
@@ -3330,6 +3363,7 @@ impl Npc {
         let at = self.character.position;
         let mut wanted = Vec3::ZERO;
         let mut face = None;
+        self.scared_step(dt);
         let mut speed = self.push(HUMAN_WALK);
         let run = self.push(HUMAN_RUN);
         if let Some((target, left)) = &mut self.flee {
@@ -3343,10 +3377,9 @@ impl Npc {
                     wait: rng.range(PAUSE.0, PAUSE.1),
                 };
                 self.flee = None;
-                // Out of the way: the scared look goes.
-                if std::mem::take(&mut self.scared) {
-                    self.face
-                        .play(m2_engine::face_expression::SCARED, 0.0, -1.0, [0.0; 4]);
+                // Out of the way: a scared look of no known length goes.
+                if self.scared.is_some_and(|s| s < 0.0) {
+                    self.stop_scared();
                 }
             } else {
                 speed = self.push(HUMAN_RUN);
@@ -3567,11 +3600,34 @@ impl Npc {
 /// A follower keeps off a drop deeper than this (metres).
 const LEDGE: f32 = 3.0;
 
+/// How long the `ThreatReaction` action lasts for someone unarmed:
+/// the clip the on-foot table `t` gives the action's handle in the stance
+/// and action table `actions` (`Upright` `ThreatReaction`, handle
+/// f796ff3b: clip edec954e, 4.54 s, standing still), of those `length`
+/// knows (clip hash to seconds).
+pub fn threat_reaction_seconds(
+    t: &m2_assets::animation_table::AnimationTable,
+    actions: &m2_assets::animation_table::AnimationTable,
+    length: impl Fn(u32) -> Option<f32>,
+) -> Option<f32> {
+    use m2_assets::animation_table as table;
+    let handle = table::action_handle(actions, "Upright", "ThreatReaction")?;
+    let clip = table::handle_clip(t, handle, (table::ANY, table::ANY), table::UNARMED, |c| {
+        length(c).is_some()
+    })?;
+    length(clip.clip)
+}
+
 /// Everyone on the island but the player.
 #[derive(Debug, Default)]
 pub struct People {
     pub kinds: Vec<PersonKind>,
     pub npcs: Vec<Npc>,
+    /// How long the `ThreatReaction` action lasts, seconds: its clip's
+    /// length by the on-foot table ([`threat_reaction_seconds`]), `None`
+    /// when not known. Someone getting out of a vehicle's way looks
+    /// scared for as long.
+    pub threat_seconds: Option<f32>,
     /// Those the scripts keep from dying (`Object.SetUnkillable`), by
     /// spawn entity, here or still to come.
     unkillable: HashSet<u32>,
@@ -5421,8 +5477,7 @@ impl People {
                     // of a vehicle coming at them, 0x822E02A0), and
                     // `Scared` shows while it lasts (0x8241FE38).
                     if calm && n.flee.is_some() {
-                        n.show(m2_engine::face_expression::SCARED, -1.0);
-                        n.scared = true;
+                        n.threat_reaction(self.threat_seconds);
                     }
                 }
             }
@@ -8382,6 +8437,46 @@ pub(crate) mod tests {
         assert_eq!(m.fling, Some(Vec3::X));
     }
 
+    /// The scared look lasts the `ThreatReaction` action's length and
+    /// goes as it ends, fleeing or not (0x8241FE38); of no known length
+    /// it stays until they settle.
+    #[test]
+    fn a_threat_reaction_scares_them_for_its_length() {
+        use m2_engine::face_expression::SCARED;
+        let still = || Brain::Wander {
+            home: Vec3::ZERO,
+            target: Vec3::ZERO,
+            wait: 10.0,
+        };
+        let mut n = Npc::new(0, &rig(), Vec3::ZERO, 0.0, still(), None);
+        n.threat_reaction(Some(4.5));
+        assert!(n.face.plays(SCARED));
+        for _ in 0..60 * 4 {
+            n.scared_step(1.0 / 60.0);
+        }
+        assert!(n.face.plays(SCARED) && n.scared.is_some(), "4 s in");
+        for _ in 0..40 {
+            n.scared_step(1.0 / 60.0);
+        }
+        assert!(n.scared.is_none(), "4.67 s in, the action is over");
+        // Stopped: the expression now blends to 0, not held at 1.
+        let mut seed = 3u64;
+        for _ in 0..60 {
+            n.face.step(1.0 / 60.0, || {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (seed >> 40) as f32 / (1u64 << 24) as f32
+            });
+        }
+        assert_eq!(n.face.weight(SCARED), 0.0);
+        // Its length unknown: no timer, it waits for them to settle.
+        let mut m = Npc::new(0, &rig(), Vec3::ZERO, 0.0, still(), None);
+        m.threat_reaction(None);
+        for _ in 0..60 * 30 {
+            m.scared_step(1.0 / 60.0);
+        }
+        assert!(m.face.plays(SCARED) && m.scared.is_some_and(|s| s < 0.0));
+    }
+
     #[test]
     fn cars_knock_people_flying_and_the_rest_dive_aside() {
         let stroll = || Brain::Wander {
@@ -8389,7 +8484,10 @@ pub(crate) mod tests {
             target: Vec3::ZERO,
             wait: 10.0,
         };
-        let mut people = People::default();
+        let mut people = People {
+            threat_seconds: Some(4.5),
+            ..People::default()
+        };
         for z in [1.5, 12.0, -6.0] {
             let mut n = Npc::new(0, &rig(), Vec3::new(0.3, 0.0, z), 0.0, stroll(), None);
             n.landed = true;
@@ -8407,7 +8505,8 @@ pub(crate) mod tests {
         assert!(behind.alive && behind.flee.is_none());
         // Getting out of its way, the one ahead looks scared; the one
         // behind does not.
-        assert!(ahead.face.plays(m2_engine::face_expression::SCARED) && ahead.scared);
+        assert!(ahead.face.plays(m2_engine::face_expression::SCARED));
+        assert_eq!(ahead.scared, Some(4.5), "for the reaction's length");
         assert!(!behind.face.plays(m2_engine::face_expression::SCARED));
         // Parked, nobody minds.
         let mut people = People::default();
