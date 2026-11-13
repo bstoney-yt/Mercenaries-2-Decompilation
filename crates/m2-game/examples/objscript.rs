@@ -172,7 +172,23 @@ fn main() -> Result<()> {
                 }
             }
         }
-        for s in seen.iter().take(40) {
+        // The game reports the landing, as m2-alpha does once it is down.
+        let pilot = copter.and_then(|c| mission.world().borrow().driver_of(c));
+        if let Some(p) = pilot {
+            mission.arrived(p, [100.0, 0.0, 100.0]);
+            seen.push(format!("t={:.2} arrived {p}", mission.now()));
+            let end = mission.now() + 10.0;
+            while mission.now() < end {
+                mission.tick(0.25);
+                for c in mission.take_commands() {
+                    let short: String = format!("{c:?}").chars().take(150).collect();
+                    seen.push(format!("t={:.2} {short}", mission.now()));
+                }
+            }
+        }
+        let exists = copter.is_some_and(|c| mission.world().borrow().objects.contains_key(&c));
+        seen.push(format!("copter still in the scripts' world: {exists}"));
+        for s in seen.iter().rev().take(40).rev() {
             println!("{s}");
         }
     }
