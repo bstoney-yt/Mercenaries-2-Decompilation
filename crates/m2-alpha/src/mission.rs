@@ -6918,6 +6918,13 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
+        // A vehicle's door the scripts open or shut (`Vehicle.OpenDoor`:
+        // PmcCon033's targets stand up on their `pivot`; a tank's hatch):
+        // it swings as her boarding's do ([`crate::hijack::Hijacks`]).
+        Command::Door { guid, door, open } => {
+            game.door_requests.push((*guid, *door, *open));
+            return false;
+        }
         // Someone following her (`Ai.Role` `Follow`: a VIP to deliver).
         Command::Follow { guid, target, near } => {
             game.scene

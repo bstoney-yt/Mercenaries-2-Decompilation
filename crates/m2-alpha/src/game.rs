@@ -273,6 +273,11 @@ pub struct Game {
     /// Seconds the HUD's save icon has left up after the game was saved
     /// ([`SAVE_ICON_SECONDS`]).
     pub save_icon: f32,
+    /// Vehicle doors the scripts open or shut (`Vehicle.OpenDoor`,
+    /// `CloseDoor`): the vehicle's guid, the door's `Name` hash and
+    /// whether it opens; taken by the doors' swinging
+    /// ([`crate::hijack::Hijacks`]).
+    pub door_requests: Vec<(u32, u32, bool)>,
     /// Clips the scripts hold characters in by name (a faction HQ's
     /// briefing, [`crate::raw`]).
     pub raw: crate::raw::RawClips,
@@ -516,6 +521,7 @@ impl Game {
             shot: None,
             script_view: None,
             save_icon: 0.0,
+            door_requests: Vec::new(),
             raw: crate::raw::RawClips::default(),
             outfit_wanted: None,
             grapple: crate::grapple::Grappler::default(),
