@@ -77,6 +77,11 @@ pub struct Strikes {
     pub first: Option<Vec3>,
     /// Models to load (taken into [`Flights`]).
     wanted: Vec<u32>,
+    /// The template her thrown designator becomes (its weapon's
+    /// `WeaponThrown` ammunition: the Smoke Designator's `Smoke Grenade
+    /// Projectile`, the Beacon Designator's `ammo_designator_beacon`),
+    /// while she holds one to throw.
+    pub designator: Option<String>,
 }
 
 impl Strikes {

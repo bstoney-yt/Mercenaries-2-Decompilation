@@ -990,6 +990,9 @@ pub struct ScriptWorld {
     /// The layers' data-authored links by parent entity: (link name hash,
     /// child entity), made into [`Self::links`] as the parent is placed.
     pub physical_links: HashMap<u32, Vec<(u32, u32)>>,
+    /// The child templates spawned with a template, by its name in lower
+    /// case ([`crate::mission::GameData::template_children`]).
+    pub template_children: HashMap<String, Vec<(u32, String)>>,
     /// The sound engine's state the scripts set (`crate::script_sound`).
     pub sound: crate::script_sound::SoundSettings,
     /// The level and shell names and the post-processing values the

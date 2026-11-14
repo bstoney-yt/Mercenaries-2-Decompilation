@@ -14,8 +14,10 @@
 //! what they ask of the first one. For `AntiAir` it spawns a crewed
 //! `M113 AA (VZ) (Driver)` where the first stands, comes near it, has it
 //! lock on her and fire, and counts the radar calls the scripts make
-//! (`antiair:` lines). Prints names, counts and the scripts'
-//! errors only.
+//! (`antiair:` lines). For `C4` and `beacon` it throws one (`C4
+//! Projectile`, `ammo_designator_beacon`), leaves it 3 s and takes it
+//! away, printing what the scripts ask of it (`thrown:` lines). Prints
+//! names, counts and the scripts' errors only.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -200,8 +202,89 @@ fn main() -> Result<()> {
             println!("{s}");
         }
     }
+    if ["c4", "beacon"].contains(&name.to_ascii_lowercase().as_str()) {
+        thrown(&mut mission, name);
+    }
     println!("{name} lines logged: {failures}");
     Ok(())
+}
+
+/// `C4` and `beacon`: thrown as she throws them (`C4 Projectile`; the
+/// Beacon Designator's `ammo_designator_beacon`, whose light runs
+/// `beacon`), left lying 3 s, then gone. Prints, per object the scripts
+/// spoke to, what they asked for and when (`thrown:` lines), and the
+/// scripts' errors.
+fn thrown(mission: &mut Mission, name: &str) {
+    let template = if name.eq_ignore_ascii_case("c4") {
+        "C4 Projectile"
+    } else {
+        "ammo_designator_beacon"
+    };
+    mission.take_commands();
+    let start = mission.now();
+    let at = [100.0, 0.0, 100.0];
+    // C4 leaves her hand as itself; the beacon as her designator, the
+    // support manager's object (`m2-alpha`'s two paths).
+    let g = if template == "C4 Projectile" {
+        mission.ammo_spawned(template, at)
+    } else {
+        mission.designator_thrown(m2_game::mission::PLAYER, template, at)
+    };
+    let family: Vec<u32> = std::iter::once(g)
+        .chain(mission.world().borrow().links.children(g))
+        .collect();
+    for c in &family {
+        let o = mission
+            .world()
+            .borrow()
+            .objects
+            .get(c)
+            .map(|o| o.name.clone());
+        println!("thrown: {c:#x} {}", o.unwrap_or_default());
+    }
+    let mut lines = Vec::new();
+    let note = |m: &mut Mission, lines: &mut Vec<String>| {
+        let t = m.now() - start;
+        for c in m.take_commands() {
+            let line = match &c {
+                Command::MaterialAnimation { guid, name, looped } if family.contains(guid) => {
+                    format!("animation {name} looped {looped} on {guid:#x}")
+                }
+                Command::CueSound { at: Some(g), cue } if family.contains(g) => {
+                    format!("cue {cue} on {g:#x}")
+                }
+                Command::StopSound { at: Some(g), cue } if family.contains(g) => {
+                    format!("stop {cue} on {g:#x}")
+                }
+                Command::Ported(p) if format!("{p:?}").contains("StopMaterialAnimation") => {
+                    format!("{p:?}")
+                }
+                _ => continue,
+            };
+            lines.push(format!("thrown: t={t:.2} {line}"));
+        }
+        for l in m.take_log() {
+            lines.push(format!("thrown: log {l}"));
+        }
+    };
+    note(mission, &mut lines);
+    for _ in 0..12 {
+        mission.tick(0.25);
+        note(mission, &mut lines);
+    }
+    mission.ammo_gone(g);
+    for _ in 0..4 {
+        mission.tick(0.25);
+        note(mission, &mut lines);
+    }
+    let left = family
+        .iter()
+        .filter(|c| mission.world().borrow().objects.contains_key(c))
+        .count();
+    lines.push(format!("thrown: objects left after it went: {left}"));
+    for l in lines {
+        println!("{l}");
+    }
 }
 
 /// `AntiAir`: a crewed one (the layers' have no driver here, and only a

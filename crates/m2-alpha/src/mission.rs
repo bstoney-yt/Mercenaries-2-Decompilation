@@ -3723,6 +3723,7 @@ impl MissionLink {
             let (flown, burst) = crate::spans::time("scripts: strikes", || {
                 report_strikes(game, mission, &mut self.bombs)
             });
+            report_charges(game, mission);
             self.counts.flown += flown;
             self.counts.burst += burst;
             mission.set_player_reserve("C4", game.combat.charges);
@@ -6492,6 +6493,11 @@ fn strike(game: &mut Game, c: &Command) {
             let thrown = ["Smoke", "Flare", "Beacon"]
                 .iter()
                 .any(|k| kind.contains(k));
+            game.scene.strikes.designator = if thrown {
+                designator_ammo(game, kind)
+            } else {
+                None
+            };
             let aimed = !thrown && game.support.equip(kind);
             eprintln!("mission: the scripts hand her a {kind} (thrown: {thrown}, aimed: {aimed})");
             game.combat.to_throw = thrown;
@@ -6505,6 +6511,47 @@ fn strike(game: &mut Game, c: &Command) {
         }
         _ => {}
     }
+}
+
+/// The template designator weapon `kind` (`"Beacon Designator"`) throws:
+/// its `WeaponThrown` ammunition's.
+fn designator_ammo(game: &Game, kind: &str) -> Option<String> {
+    let t = &game.scene.world.as_ref()?.index.template_db;
+    let ammo = t.arms.thrown(kind)?.ammo.template;
+    t.names.get(&ammo).cloned()
+}
+
+/// Her C4 as objects of the scripts' world: each made one as it leaves
+/// her hand (`C4 Projectile`, whose script blinks and beeps it), moved
+/// as it flies, and taken away once it has gone off.
+fn report_charges(game: &mut Game, mission: &mut Mission) {
+    let lying: Vec<(u32, u32, Vec3)> = game.combat.charges_lying().collect();
+    let guids = &mut game.combat.charge_guids;
+    for &(id, ammo, at) in &lying {
+        match guids.get(&id) {
+            Some(&g) => mission.ammo_moved(g, at.to_array()),
+            None => {
+                let name = game
+                    .scene
+                    .world
+                    .as_ref()
+                    .and_then(|w| w.index.template_db.names.get(&ammo).cloned());
+                if let Some(name) = name {
+                    let g = mission.ammo_spawned(&name, at.to_array());
+                    eprintln!("mission: her {name} is out ({g:#x})");
+                    guids.insert(id, g);
+                }
+            }
+        }
+    }
+    guids.retain(|id, g| {
+        let out = lying.iter().any(|l| l.0 == *id);
+        if !out {
+            eprintln!("mission: her charge {g:#x} is gone");
+            mission.ammo_gone(*g);
+        }
+        out
+    });
 }
 
 /// Tells the scripts of her designators thrown and come to rest, the
@@ -6521,21 +6568,45 @@ fn report_strikes(game: &mut Game, mission: &mut Mission, bombs: &mut Vec<Vec3>)
             t.ordnance.projectiles.get(&id)?.timer.map(|t| t.0)
         })
         .unwrap_or(MARKER_TIMER);
+    // What she throws: her designator's own ammunition (a beacon for
+    // the cruise missile and artillery), and its template's timer.
+    let what = game
+        .scene
+        .strikes
+        .designator
+        .clone()
+        .unwrap_or_else(|| MARKER.to_owned());
+    let timer = game.scene.world.as_ref().and_then(|w| {
+        let t = &w.index.template_db;
+        t.ordnance.timers.get(&t.id(&what)?).copied()
+    });
+    let settle = timer.map_or(settle, |t| t.seconds);
+    let mut gone = Vec::new();
     for t in &mut game.combat.thrown {
         match t.guid {
             None => {
-                let g = mission.designator_thrown(PLAYER, MARKER, t.at.to_array());
-                eprintln!("mission: she throws her marker ({g:#x})");
+                let g = mission.designator_thrown(PLAYER, &what, t.at.to_array());
+                eprintln!("mission: she throws her marker, {what} ({g:#x})");
                 t.guid = Some(g);
             }
             Some(g) if !t.settled && t.age >= settle => {
                 eprintln!("mission: her marker lies at {:.1}", t.at);
                 mission.designator_settled(g, t.at.to_array());
                 t.settled = true;
+                // Its timer's response takes it away (the beacon; the
+                // smoke stays): 0x8227ED30.
+                if timer.is_some_and(|t| t.removes) {
+                    eprintln!("mission: her marker {g:#x} goes");
+                    mission.ammo_gone(g);
+                    gone.push(g);
+                }
             }
             _ => {}
         }
     }
+    game.combat
+        .thrown
+        .retain(|t| !t.guid.is_some_and(|g| gone.contains(&g)));
     let strikes = &mut game.scene.strikes;
     let counts = (strikes.arrived.len() as u32, strikes.burst.len() as u32);
     // The planes in the air, where they are (their radar blips follow

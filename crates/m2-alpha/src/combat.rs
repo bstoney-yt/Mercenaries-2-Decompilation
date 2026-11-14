@@ -1567,6 +1567,11 @@ enum Projectile {
     /// `arm` seconds and goes off when someone or something comes within
     /// `reach`, or is gone after `life`.
     Charge {
+        /// Its number among her throws, and its ammunition's template
+        /// (`C4 Projectile`): what the scripts know it by
+        /// ([`Combat::charges_lying`]).
+        id: u32,
+        ammo: u32,
         at: Vec3,
         velocity: Vec3,
         model: Option<u32>,
@@ -1818,6 +1823,9 @@ pub struct Combat {
     /// Designators thrown: the scripts' guid once they have it, where it
     /// is, how it flies and seconds since it left her hand.
     pub thrown: Vec<Thrown>,
+    /// Her C4 lying out as objects of the scripts' world: guid by its
+    /// number ([`Combat::charges_lying`]).
+    pub charge_guids: std::collections::HashMap<u32, u32>,
     /// The next throw is the designator's.
     throwing_designator: bool,
     /// The last rocket: from the launcher, towards what the crosshair was on.
@@ -1851,6 +1859,8 @@ pub struct Combat {
     pub explosive: usize,
     pub charges: u32,
     pub mines: u32,
+    /// The last charge's number ([`Combat::charges_lying`]).
+    charges_thrown: u32,
     /// Fire was held last tick (a one-shot-a-pull gun fires again only
     /// once it is let go).
     fire_held: bool,
@@ -2141,6 +2151,7 @@ impl Default for Combat {
             designator: false,
             to_throw: false,
             thrown: Vec::new(),
+            charge_guids: std::collections::HashMap::new(),
             throwing_designator: false,
             last_launch: None,
             fuses: Vec::new(),
@@ -2155,6 +2166,7 @@ impl Default for Combat {
             explosive: 0,
             charges: 0,
             mines: 0,
+            charges_thrown: 0,
             fire_held: false,
             lock: None,
             seat: 0,
@@ -2394,6 +2406,23 @@ impl Combat {
                 model,
                 ..
             } => Some((Flying::Charge(model), at, velocity)),
+        })
+    }
+
+    /// Her C4 out in the world (thrown, not yet gone off): its number,
+    /// its ammunition's template (`C4 Projectile`) and where it is. Each
+    /// is an object of the scripts' world while it lies (its template's
+    /// script, `C4`, blinks and beeps it).
+    pub fn charges_lying(&self) -> impl Iterator<Item = (u32, u32, Vec3)> + '_ {
+        self.projectiles.iter().filter_map(|p| match *p {
+            Projectile::Charge {
+                id,
+                ammo,
+                at,
+                mine: None,
+                ..
+            } => Some((id, ammo, at)),
+            _ => None,
         })
     }
 
@@ -5704,7 +5733,10 @@ impl Combat {
         let velocity = (flat * up.cos() + Vec3::Y * up.sin()) * t.speed_at(pitch);
         let timer = t.ammo.timer.map(|(s, _)| s);
         if t.detonator.is_some() || t.planted.is_some() {
+            self.charges_thrown += 1;
             self.projectiles.push(Projectile::Charge {
+                id: self.charges_thrown,
+                ammo: t.ammo.template,
                 at: from,
                 velocity,
                 model: t.ammo.model.or(t.model),
@@ -5965,6 +5997,8 @@ impl Combat {
                 velocity,
                 stuck,
                 model: _,
+                id: _,
+                ammo: _,
                 blast,
                 timer,
                 mine,
@@ -8833,6 +8867,41 @@ mod tests {
                 pda: true,
                 ..Trigger::default()
             }
+        );
+    }
+
+    // Her C4 out in the world is what the scripts are told of (`C4`
+    // blinks and beeps it); her mines are not.
+    #[test]
+    fn only_her_c4_lying_out_is_listed_for_the_scripts() {
+        let mut combat = Combat::default();
+        let charge = |id, mine| Projectile::Charge {
+            id,
+            ammo: 0x8000_5fd4,
+            at: Vec3::new(id as f32, 0.0, 0.0),
+            velocity: Vec3::ZERO,
+            model: None,
+            stuck: true,
+            blast: None,
+            timer: f32::INFINITY,
+            mine,
+        };
+        let mine = Mine {
+            arm: 1.0,
+            reach: 2.0,
+            life: 10.0,
+            blast: None,
+        };
+        combat.projectiles.push(charge(1, None));
+        combat.projectiles.push(charge(2, Some(mine)));
+        combat.projectiles.push(charge(3, None));
+        let lying: Vec<_> = combat.charges_lying().collect();
+        assert_eq!(
+            lying,
+            [
+                (1, 0x8000_5fd4, Vec3::new(1.0, 0.0, 0.0)),
+                (3, 0x8000_5fd4, Vec3::new(3.0, 0.0, 0.0))
+            ]
         );
     }
 
