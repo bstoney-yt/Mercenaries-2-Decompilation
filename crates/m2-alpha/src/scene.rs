@@ -226,27 +226,18 @@ const GAIT_KEYS: [(Gait, u32); 5] = [
     (Gait::FullSprint, 0x50ab_fbf3),
 ];
 
-/// Below this a character stands, m/s. Not the 360's: its node stands
-/// at 0.01 m/s ([`m2_engine::blend::STILL`]), but the alpha's character
-/// controller leaves a person stopped at a wall, or setting off, moving
-/// 0.001 to 0.07 m/s from tick to tick, and at 0.01 the hero flipped
-/// between standing and walking 106 times in 6 s (round 10's island run).
-/// 0.3 m/s is the alpha's old threshold (invented).
-pub const STAND: f32 = 0.3;
-
 /// The gait the 360's locomotion node plays moving `moved` m/s with the
 /// `Upright` paces `paces` ([`m2_engine::blend::gait`]), as the alpha's
 /// gaits: its jog plays the alpha's run clip (`Upright_Jog_Forward`), its
 /// run the alpha's sprint (`Upright_Run_Forward`), and its sprint
 /// [`Gait::FullSprint`] (`Upright_Sprint_Forward`).
 ///
-/// Below [`STAND`] she stands, not below the 360's
-/// [`STILL`](m2_engine::blend::STILL): see there.
+/// She stands at the 360's [`STILL`](m2_engine::blend::STILL), 0.01 m/s
+/// of her controller's velocity, the walk its walls leave her
+/// ([`m2_engine::Physics::move_character`]), as the node reads its
+/// proxy's (0x828071A8 through 0x82175C10).
 pub fn loco_gait(paces: [f32; 4], moved: f32) -> Gait {
     use m2_engine::blend::LocoGait;
-    if moved < STAND {
-        return Gait::Idle;
-    }
     match m2_engine::blend::gait(paces, moved) {
         LocoGait::Still => Gait::Idle,
         LocoGait::Walk => Gait::Walk,
@@ -4625,6 +4616,17 @@ mod tests {
         assert_eq!(loco_gait(jen, 12.0), Gait::FullSprint);
         // No sprint past the run (people's): the run goes on.
         assert_eq!(loco_gait([1.2, 2.5, 5.0, -1.0], 9.0), Gait::Sprint);
+    }
+
+    /// She stands at the 360's 0.01 m/s and walks above it (0x828071A8),
+    /// where the alpha stood her below 0.3.
+    #[test]
+    fn she_stands_at_a_hundredth_of_a_metre_a_second() {
+        let jen = [2.0, 5.0, 7.0, 12.0];
+        assert_eq!(loco_gait(jen, 0.0), Gait::Idle);
+        assert_eq!(loco_gait(jen, 0.01), Gait::Idle);
+        assert_eq!(loco_gait(jen, 0.02), Gait::Walk);
+        assert_eq!(loco_gait(jen, 0.2), Gait::Walk);
     }
 
     #[test]
