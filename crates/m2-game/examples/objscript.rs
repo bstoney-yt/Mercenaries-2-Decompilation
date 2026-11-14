@@ -14,7 +14,10 @@
 //! what they ask of the first one. For `AntiAir` it spawns a crewed
 //! `M113 AA (VZ) (Driver)` where the first stands, comes near it, has it
 //! lock on her and fire, and counts the radar calls the scripts make
-//! (`antiair:` lines). Prints names, counts and the scripts'
+//! (`antiair:` lines). For `Goal` it stands her beside the first,
+//! moves it into the goal's boundary (`LR_Goal`) and prints her cash
+//! before and after and whether the goal was removed. Prints names,
+//! counts and the scripts'
 //! errors only.
 
 use std::fs::File;
@@ -123,6 +126,35 @@ fn main() -> Result<()> {
             offered(&mission),
             alive(&mission)
         );
+    }
+    if name.eq_ignore_ascii_case("Goal")
+        && let Some(&(_, ball, at)) = on.first()
+    {
+        // Beside it, so that it wakes and sets up its goal; then into the
+        // goal's boundary (`LR_Goal`).
+        mission.put_player([at[0] + 3.0, at[1], at[2]]);
+        run(&mut mission, 1.0);
+        let goal = mission.world().borrow().by_name("LR_Goal");
+        let cash = |m: &Mission| m.world().borrow().cash;
+        let before = cash(&mission);
+        println!("beside it: the goal LR_Goal is {goal:?}");
+        if let Some(goal) = goal {
+            let to = mission
+                .world()
+                .borrow()
+                .objects
+                .get(&goal)
+                .map(|o| o.position);
+            if let Some(to) = to {
+                mission.place(ball, to, 0.0);
+            }
+            run(&mut mission, 1.0);
+            println!(
+                "in the goal: cash {before} -> {}, goal still there: {}",
+                cash(&mission),
+                mission.world().borrow().objects.contains_key(&goal),
+            );
+        }
     }
     if name.eq_ignore_ascii_case("AntiAir")
         && let Some(&(_, _, at)) = on.first()
