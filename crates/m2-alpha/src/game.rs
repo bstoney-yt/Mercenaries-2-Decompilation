@@ -1285,8 +1285,10 @@ impl Game {
                             if let Some(t) = p.turret {
                                 m.yaw = t.yaw;
                                 m.pitch = t.pitch;
+                                m.turret = crate::placed::turret(scene.source.as_mut(), &m, t);
                             }
                             m.seat = Some(p.seat);
+                            m.seat_link = Some(p.seat_link);
                             m
                         }),
                         (m, _) => m,
@@ -1395,6 +1397,7 @@ impl Game {
                                     "placed: she leaves the emplaced gun {:#x} with {} rounds",
                                     m.entity, m.rounds
                                 );
+                                scene.props.set_turned(m.entity, None);
                             }
                         }
                         // What lies within reach before any vehicle.
@@ -1681,7 +1684,20 @@ impl Game {
                             None => intent,
                         };
                         let waiting = !player.landed;
-                        player.update(physics, intent, dt);
+                        // Seated on it by its seat's clip, she only looks;
+                        // its turret turns after the view, at its own pace
+                        // ([`crate::combat::MannedTurret`]).
+                        if self.combat.manned.is_some() && player.seated {
+                            player.look(physics, intent, dt);
+                        } else {
+                            player.update(physics, intent, dt);
+                        }
+                        if let Some(m) = &mut self.combat.manned
+                            && let Some(t) = &mut m.turret
+                        {
+                            let nodes = t.step(player.camera_forward(), m.facing, dt);
+                            scene.props.set_turned(m.entity, Some(nodes));
+                        }
                         if waiting && player.landed && std::mem::take(&mut player.floor_landed) {
                             log_floor(&scene.props, physics, player.character.position);
                         }
@@ -2495,6 +2511,7 @@ impl Game {
                     || player.driving.is_some()
                     || scene.props.get(m.entity).is_none_or(|(p, _)| p.wrecked))
             {
+                scene.props.set_turned(m.entity, None);
                 self.combat.manned = None;
             }
         }

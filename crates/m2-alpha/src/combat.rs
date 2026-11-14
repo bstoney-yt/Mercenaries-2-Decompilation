@@ -1941,6 +1941,51 @@ pub struct Manned {
     /// Where she mans it: its seat's hardpoint ([`crate::placed::seat_points`]),
     /// else behind it ([`crate::placed::stand_behind`]).
     pub seat: Option<Vec3>,
+    /// Its seat's `SeatLink` name, by which her seated clip and the
+    /// seat's hardpoint are found as an AI gunner's are
+    /// ([`crate::hijack::Hijacks::seat`]).
+    pub seat_link: Option<u32>,
+    /// Its turret, where its model has the bones its seat's `Turret`
+    /// record names ([`MannedTurret`]).
+    pub turret: Option<MannedTurret>,
+}
+
+/// The turret of an emplaced gun she mans: its `Turret` record's bones on
+/// the gun's model ([`m2_engine::vehicle::Aimer`]), the model's nodes at
+/// rest (node to model), and where it has got: yaw and pitch, radians,
+/// from straight ahead.
+///
+/// From samples: the emplaced MG's (`Emplaced MG (VZ)`, model `df3b2fd1`)
+/// record turns bone `c9f161f3` -90..90 degrees and tilts `5e99f424`
+/// -20..30, each at most 120 degrees a second; the weapon's hardpoint
+/// (`59db5579`) hangs under the tilting bone, the seat's (`1b8194a7`) off
+/// the body, which stands. Inferred: her aim turns it as a vehicle's
+/// rider's turns a vehicle's turret ([`m2_engine::vehicle::Aimer`]): the
+/// engine's own turret update is not decoded.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MannedTurret {
+    pub aimer: m2_engine::vehicle::Aimer,
+    pub rest: Vec<Mat4>,
+    pub aim: (f32, f32),
+}
+
+impl MannedTurret {
+    /// Turns it toward `want` (a world direction) at its speeds for `dt`
+    /// seconds, for a gun placed facing `facing` (yaw, radians), and
+    /// gives its nodes' matrices as turned.
+    pub fn step(&mut self, want: Vec3, facing: f32, dt: f32) -> Vec<Mat4> {
+        self.aim = self.aimer.step(self.aim, turret_angles(want, facing), dt);
+        self.aimer.pose(&self.rest, self.aim.0, self.aim.1)
+    }
+}
+
+/// `dir`'s yaw from `facing` (across the ground, -pi..pi, toward +x
+/// positive as the models' yaw bones turn) and its pitch (up positive).
+pub fn turret_angles(dir: Vec3, facing: f32) -> (f32, f32) {
+    use std::f32::consts::{PI, TAU};
+    let flat = dir.with_y(0.0);
+    let yaw = (flat.x.atan2(flat.z) - facing + PI).rem_euclid(TAU) - PI;
+    (yaw, dir.y.atan2(flat.length()))
 }
 
 /// An emplaced gun's barrel above its place, metres, where its model's
@@ -6841,6 +6886,67 @@ mod tests {
     }
 
     use super::*;
+
+    // The emplaced MG's turret (its record's limits and speeds, bones
+    // straight up a stick): she looks off to her right and up; it gets
+    // there at 120 degrees a second and stops at its 90 and 30 degrees,
+    // for a gun placed facing west.
+    #[test]
+    fn a_manned_guns_turret_follows_her_look_at_its_pace() {
+        use m2_engine::anim::{Local, Skeleton};
+        let at = |y: f32| Local {
+            translation: Vec3::new(0.0, y, 0.0),
+            rotation: Quat::IDENTITY,
+            scale: Vec3::ONE,
+        };
+        let skeleton = Skeleton {
+            name_hashes: vec![1, 0xc9f1_61f3, 0x5e99_f424],
+            parents: vec![None, Some(0), Some(1)],
+            rest: vec![at(0.0), at(0.5), at(0.75)],
+            inverse_bind: vec![Mat4::IDENTITY; 3],
+        };
+        let record = m2_engine::seats::TurretRecord {
+            name: 0x2afe_1fa8,
+            bone_yaw: Some(0xc9f1_61f3),
+            bone_pitch: Some(0x5e99_f424),
+            yaw: (-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2),
+            yaw_speed: 2.0943952,
+            pitch: (-0.34906584, std::f32::consts::FRAC_PI_6),
+            pitch_speed: 2.0943952,
+        };
+        let aimer = m2_engine::vehicle::Aimer::of_skeleton(record, &skeleton).unwrap();
+        let mut t = MannedTurret {
+            rest: skeleton.model_matrices(&skeleton.rest_pose()),
+            aimer,
+            aim: (0.0, 0.0),
+        };
+        let west = -std::f32::consts::FRAC_PI_2;
+        // Placed facing west (-x); she looks north (+z), well up: that is
+        // a turn to her right of 90 degrees.
+        let look = Vec3::new(0.0, 1.0, 1.0).normalize();
+        let (yaw, pitch) = turret_angles(look, west);
+        assert!((yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-5, "{yaw}");
+        assert!((pitch - std::f32::consts::FRAC_PI_4).abs() < 1e-5);
+        let nodes = t.step(look, west, 0.25);
+        assert!((t.aim.0 - 2.0943952 * 0.25).abs() < 1e-5);
+        assert!(
+            (t.aim.1 - std::f32::consts::FRAC_PI_6).abs() < 1e-5,
+            "tilt stops at 30"
+        );
+        assert_eq!(nodes.len(), 3);
+        for _ in 0..10 {
+            t.step(look, west, 0.25);
+        }
+        assert!((t.aim.0 - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+        // Looking 120 degrees to its right, past its 90: it stays there.
+        let past = west + 2.0943952;
+        t.step(Vec3::new(past.sin(), 0.0, past.cos()), west, 1.0);
+        assert!(
+            (t.aim.0 - std::f32::consts::FRAC_PI_2).abs() < 1e-5,
+            "{:?}",
+            t.aim
+        );
+    }
     use crate::npc::tests::{ground, rig};
     use crate::npc::{Brain, Npc};
 

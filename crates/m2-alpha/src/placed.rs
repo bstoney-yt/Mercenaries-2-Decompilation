@@ -136,6 +136,8 @@ pub struct SeatPoints {
     pub entrance: Vec3,
     pub use_distance: f32,
     pub seat: Vec3,
+    /// The seat's name (its `SeatLink`'s, `3a7f35d1` on every emplaced gun).
+    pub seat_link: u32,
     pub turret: Option<m2_engine::seats::TurretRecord>,
 }
 
@@ -169,7 +171,27 @@ pub fn seat_points<R: std::io::Read + std::io::Seek>(
         entrance: node(entrance.hardpoint)?,
         use_distance: entrance.params.use_distance,
         seat: node(seat.hardpoint)?,
+        seat_link: seat.name,
         turret: s.turret_of(k).copied(),
+    })
+}
+
+/// The turret of emplaced gun `m` as `record` turns it on the gun's
+/// model ([`crate::combat::MannedTurret`]), straight ahead; `None` when
+/// the model can't be read or has neither of the record's bones.
+pub fn turret<R: std::io::Read + std::io::Seek>(
+    source: Option<&mut m2_engine::AssetSource<R>>,
+    m: &Manned,
+    record: m2_engine::seats::TurretRecord,
+) -> Option<crate::combat::MannedTurret> {
+    let data = source?.model(m.model).ok()?;
+    let parsed = data.parse().ok()?;
+    let skeleton = m2_engine::Skeleton::from_nodes(&parsed.nodes);
+    let aimer = m2_engine::vehicle::Aimer::of_skeleton(record, &skeleton)?;
+    Some(crate::combat::MannedTurret {
+        aimer,
+        rest: skeleton.model_matrices(&skeleton.rest_pose()),
+        aim: (0.0, 0.0),
     })
 }
 
@@ -415,6 +437,8 @@ impl Placed {
             hardpoint,
             barrel: None,
             seat: None,
+            seat_link: None,
+            turret: None,
         })
     }
 
