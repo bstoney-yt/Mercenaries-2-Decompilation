@@ -23,6 +23,13 @@
 //!   (`CollapseFireState`, its burnt material's cue) 3 to 12 s later, and
 //!   is destroyed 3 to 4.1 s after that.
 //!
+//! - `CreateObject` naming `DebrisTemplate` sends a part off as an object
+//!   of its own (the template's debris template), its machine starting in
+//!   the state named: a burning palm's leaves in `FireDebrisState`, their
+//!   embers (`0xE4AF6CDC`) and burning leaf (`0x602D65D7`); a palm shot
+//!   down's in `DebrisState`. Their changes are the new objects'
+//!   ([`Change::sent_off`]).
+//!
 //! **Inferred:** a machine starts in its `InitState`'s state (the part
 //! whole), told of no change; the random fraction is this module's own
 //! (a fixed sequence per object, [`Runner::new`]'s `seed`), as the engine's
@@ -35,6 +42,9 @@ use m2_assets::model::{PartStates, StateActs};
 pub struct Change {
     pub machine: u32,
     pub state: u32,
+    /// The part went off as an object of its own (`CreateObject`), whose
+    /// machine this is: the change is its, not the object's it left.
+    pub sent_off: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -44,6 +54,8 @@ struct Machine {
     states: Vec<u32>,
     acts: Vec<StateActs>,
     current: Option<u32>,
+    /// Sent off as an object of its own ([`StateActs::creates`]).
+    sent_off: bool,
 }
 
 /// The part machines of one object, from its destruction on.
@@ -74,6 +86,7 @@ impl Runner {
                 states: m.states.iter().map(|s| s.0).collect(),
                 acts: m.acts.clone(),
                 current: m.starts[0],
+                sent_off: false,
             })
             .collect();
         Self {
@@ -136,6 +149,7 @@ impl Runner {
         self.changes.push(Change {
             machine: machine.name,
             state,
+            sent_off: machine.sent_off,
         });
         let acts = machine.acts.get(k).cloned().unwrap_or_default();
         for &(to, node) in &acts.sets {
@@ -146,6 +160,12 @@ impl Runner {
         for &(message, node) in &acts.told {
             if let Some(other) = self.by_node(node) {
                 self.deliver_to(other, message, depth + 1);
+            }
+        }
+        for &(to, node) in &acts.creates {
+            if let Some(other) = self.by_node(node) {
+                self.machines[other].sent_off = true;
+                self.enter(other, to, depth + 1);
             }
         }
         for &(to, node, a, b) in &acts.delayed {
@@ -275,7 +295,11 @@ mod tests {
         for seed in [1, 7, 99, 12345] {
             let mut r = Runner::new(&canopy(), name, seed);
             r.deliver(DESTROY_MSG);
-            let change = |machine, state| Change { machine, state };
+            let change = |machine, state| Change {
+                machine,
+                state,
+                sent_off: false,
+            };
             assert_eq!(
                 r.take_changes(),
                 [change(TRUNK, COLLAPSE_FIRE), change(SLICE00, WAITING)]
@@ -300,6 +324,60 @@ mod tests {
             assert!((2.9..=4.2).contains(&(out - down)), "{out} {down}");
             assert!(r.settled());
         }
+    }
+
+    /// A burning palm: its trunk's `CollapseFireState` sends its leaf off
+    /// in `FireDebrisState` (its embers), as an object of its own.
+    #[test]
+    fn a_burning_palm_sends_its_leaves_off_burning() {
+        const FIRE_DEBRIS: u32 = 0x4c88_281b;
+        let trunk = machine(
+            1,
+            vec![
+                (
+                    PRISTINE,
+                    StateActs {
+                        on: vec![(0x3d0d_4c99, COLLAPSE_FIRE)],
+                        ..Default::default()
+                    },
+                ),
+                (
+                    COLLAPSE_FIRE,
+                    StateActs {
+                        creates: vec![(FIRE_DEBRIS, 14)],
+                        ..Default::default()
+                    },
+                ),
+            ],
+        );
+        let leaf = machine(
+            14,
+            vec![
+                (PRISTINE, StateActs::default()),
+                (FIRE_DEBRIS, StateActs::default()),
+            ],
+        );
+        let states = PartStates {
+            machines: vec![trunk, leaf],
+            ..Default::default()
+        };
+        let mut r = Runner::new(&states, u32::from, 3);
+        r.deliver(0x3d0d_4c99);
+        assert_eq!(
+            r.take_changes(),
+            [
+                Change {
+                    machine: 1,
+                    state: COLLAPSE_FIRE,
+                    sent_off: false
+                },
+                Change {
+                    machine: 14,
+                    state: FIRE_DEBRIS,
+                    sent_off: true
+                },
+            ]
+        );
     }
 
     #[test]
