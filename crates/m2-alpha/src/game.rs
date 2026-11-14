@@ -124,6 +124,10 @@ pub struct Game {
     pub combat: Combat,
     /// The island's placed objects worn down and brought down by blasts.
     pub destruction: Destruction,
+    /// The placed pickups she took since the scripts last heard (their
+    /// entities): each a `WeaponEvent` "pickup" for her
+    /// ([`crate::mission`]).
+    pub picked_up: Vec<u32>,
     /// Each vehicle model's load bed, its `HP_Truckbed` node in its own
     /// space, by model (`None`: it has none), as looked up.
     beds: HashMap<u32, Option<Vec3>>,
@@ -488,6 +492,7 @@ impl Game {
             restore: Vec::new(),
             combat,
             destruction: Destruction::default(),
+            picked_up: Vec::new(),
             beds: HashMap::new(),
             bed_shapes: HashMap::new(),
             beds_told: HashSet::new(),
@@ -2486,6 +2491,7 @@ impl Game {
                 if self.placed.is_pickup(from) {
                     self.placed
                         .taken(from, &mut scene.props, &mut world.physics);
+                    self.picked_up.push(from);
                 }
             }
             // Off an emplaced gun once she is down, in a vehicle, or it

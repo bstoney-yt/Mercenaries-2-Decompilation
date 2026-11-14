@@ -656,10 +656,31 @@ local function transit(pda, zones, callback, data)
     __m2_transit_box = box.__m2_dialog
 end
 -- The PDA as the scripts find it (`MrxGui.GetWidgetByNameAndOwner("PDA",
--- player)`): the HUD's, in its own Lua state, so a stand-in that opens the
--- transit map and does nothing else.
-local pda = setmetatable({ OpenTransitInterface = transit },
-    { __index = function() return function() end end })
+-- player)`): the HUD's, in its own Lua state (on the 360 one state holds
+-- both, and the scripts call the PDA widget itself: `MrxGuiManager`'s
+-- `PdaLoaded` makes it). So a stand-in that opens the transit map, and
+-- passes any other call on to the HUD's PDA as it was made (group
+-- `PdaWidget`): the munitions laptop's and crates' `UpdateSupport`.
+-- A call's arguments as they go across: plain values and guids.
+local function plain(v, depth)
+    if type(v) == "function" then return nil end
+    if type(v) ~= "table" then return v end
+    if depth > 3 then return nil end
+    local out = {}
+    for k, x in pairs(v) do out[k] = plain(x, depth + 1) end
+    return out
+end
+local pda = setmetatable({ OpenTransitInterface = transit }, {
+    __index = function(_, method)
+        return function(_, ...)
+            __m2_hud_call_count = __m2_hud_call_count + 1
+            local args = { n = select("#", ...) }
+            for i = 1, args.n do args[i] = plain((select(i, ...)), 0) end
+            __m2_keep_hud_call({ seq = __m2_hud_call_count, group = "PdaWidget",
+                method = method, data = args })
+        end
+    end,
+})
 local function lookup(original)
     local f = function(name, ...)
         local w = original(name, ...)
@@ -3339,6 +3360,14 @@ impl MissionLink {
             }
             // What rides on a vehicle is where it rides, for the scripts
             // that count it there (`Pg.GetObjectsInArea`).
+            // She took a placed pickup (the munitions laptop): as the
+            // 360's hero hears its `pickup` message (0x82281CD0, from her
+            // weapon messages 0x82282530), a `WeaponEvent` "pickup" for
+            // her and the item.
+            for item in std::mem::take(&mut game.picked_up) {
+                eprintln!("mission: she picks up {item:#x} (WeaponEvent pickup)");
+                mission.weapon_event(PLAYER, "pickup", item);
+            }
             for (g, at, yaw, (lo, hi)) in game.scene.props.cargo_places() {
                 mission.place(g, at.to_array(), yaw);
                 mission.set_bounds(g, lo.to_array(), hi.to_array());
@@ -9098,6 +9127,41 @@ mod tests {
             (method.as_str(), title.as_str(), first.as_str()),
             ("Display", "[Briefing.RootMenuDialog]", "[OilCon020.Title]")
         );
+    }
+
+    // The PDA the scripts find (the munitions laptop's): the HUD's, in its
+    // own state, so a call on it is kept for the HUD with its arguments.
+    #[test]
+    fn a_call_on_the_pda_goes_to_the_huds() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            Hud = {}
+            MrxGui = { GetWidgetByNameAndOwner = function() return nil end }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        lua.load(DIALOG_BOXES).exec().unwrap();
+        lua.load(
+            r#"local pda = MrxGui.GetWidgetByNameAndOwner("PDA", 1)
+               pda:UpdateSupport("artillery", nil, 3)"#,
+        )
+        .exec()
+        .unwrap();
+        let calls = hud_calls(&lua);
+        let call = calls
+            .iter()
+            .find(|c| c.group == "PdaWidget")
+            .expect("a PDA call");
+        assert_eq!(call.method, "UpdateSupport");
+        let Plain::Table(args) = &call.data else {
+            panic!("{:?}", call.data);
+        };
+        assert!(args.contains(&(Plain::Number(1.0), Plain::Text("artillery".into()))));
+        assert!(args.contains(&(Plain::Number(3.0), Plain::Number(3.0))));
+        assert!(args.contains(&(Plain::Text("n".into()), Plain::Number(3.0))));
     }
 
     // A starter on a prop is gone to only once she is seated in play;
