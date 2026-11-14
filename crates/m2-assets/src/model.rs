@@ -884,6 +884,16 @@ pub struct StateActs {
     /// (0x83232DB0), whose sound handler (0x8235FCE8) reads the message
     /// at word 2 and the second operand at word 1.
     pub messages: Vec<(u32, u32)>,
+    /// The messages it sends to another part of its own model
+    /// (`SendMessage` naming a node: a canopy's trunk tells its crown,
+    /// `Slice00`, to come down), as (message, the part's node).
+    pub told: Vec<(u32, u16)>,
+    /// The states it puts parts in later (verb `0xBD3403A0`): (state,
+    /// part's node, and the seconds between which the delay falls). From
+    /// the 360 code (0x82231C58): the delay is `a + r (b - a)`, `r` a
+    /// random fraction, for the two numbers before the state; posted to
+    /// the timed queue 0x83568398.
+    pub delayed: Vec<(u32, u16, f32, f32)>,
     /// The messages leaving it sends, as [`messages`](Self::messages):
     /// a building's leaving its `CollapseState` sends `73aa04b8`, which
     /// stops the rumble and plays its set's `0519d48b`.
@@ -919,6 +929,9 @@ const SEND_DAMAGE: u32 = 0x82d1_e93c;
 const SEND_MESSAGE: u32 = 0xba20_f82c;
 const STOP_EMITTER: u32 = 0x687c_78c5;
 const DETACH_STATE: u32 = 0xa530_b827;
+/// The verb that puts a part in a state after a random delay
+/// (`StateActs::delayed`); its name is not in the dictionary.
+pub const SET_STATE_LATER: u32 = 0xbd34_03a0;
 
 impl PartStates {
     fn parse(u: &Ucfx<'_>, stam: usize, nodes: &[Node]) -> Self {
@@ -1051,6 +1064,16 @@ impl PartStates {
                                     SEND_MESSAGE => {
                                         if let Some(message) = op(0) {
                                             acts.messages.push((message, op(1).unwrap_or(0)));
+                                            if let Some(n) = op(1).and_then(first) {
+                                                acts.told.push((message, n));
+                                            }
+                                        }
+                                    }
+                                    SET_STATE_LATER => {
+                                        if let (Some(a), Some(b), Some(to), Some(n)) =
+                                            (op(0), op(1), op(2), op(3).and_then(first))
+                                        {
+                                            acts.delayed.push((to, n, float(b), float(a)));
                                         }
                                     }
                                     _ => {}
@@ -1094,6 +1117,8 @@ impl PartStates {
                             detaches,
                             sends,
                             messages,
+                            told,
+                            delayed,
                             ..
                         } = acts;
                         a.on.extend(on);
@@ -1102,6 +1127,8 @@ impl PartStates {
                         a.detaches.extend(detaches);
                         a.sends.extend(sends);
                         a.messages.extend(messages);
+                        a.told.extend(told);
+                        a.delayed.extend(delayed);
                     }
                 }
                 _ => {}
@@ -2159,6 +2186,64 @@ mod tests {
             states.machines[0].acts[0].exit_messages,
             vec![(0x73aa_04b8, 0x5e3b_cf7b)]
         );
+    }
+
+    #[test]
+    fn a_state_tells_another_part_and_sets_a_state_later() {
+        // As `jungle_env_largecanopy01`'s trunk (100) in
+        // `CollapseFireState`: it tells the crown (101, `Slice00`)
+        // `1b071983`, and goes to `3cc4e770` 2.5 to 3 s later.
+        let enter = || leaf(b"CHDR", le(&[ON_ENTER, 0]));
+        let (three, two_and_a_half) = (3.0f32.to_bits(), 2.5f32.to_bits());
+        let data = ucfx(&[node(
+            b"STAM",
+            vec![
+                leaf(b"INFO", le(&[5, 15, 7])),
+                leaf(b"NODE", le(&[100, 1])),
+                leaf(b"STAT", le(&[0x0753_c8f7])),
+                enter(),
+                leaf(
+                    b"CEXE",
+                    le(&[
+                        1,
+                        three,
+                        1,
+                        two_and_a_half,
+                        1,
+                        0x3cc4_e770,
+                        1,
+                        100,
+                        2,
+                        SET_STATE_LATER,
+                        1,
+                        0x1b07_1983,
+                        1,
+                        101,
+                        2,
+                        SEND_MESSAGE,
+                        3,
+                    ]),
+                ),
+            ],
+        )]);
+        let u = Ucfx::parse(&data).unwrap();
+        let stam = u.children(None).next().unwrap();
+        let node = |name_hash| Node {
+            name_hash,
+            flags: 0,
+            first_child: None,
+            parent: None,
+            next_sibling: None,
+            unk_0x0c: 0,
+            local: Default::default(),
+            inverse_bind: Default::default(),
+            bounds_min: [0.0; 4],
+            bounds_max: [0.0; 4],
+        };
+        let states = PartStates::parse(&u, stam, &[node(100), node(101)]);
+        let acts = &states.machines[0].acts[0];
+        assert_eq!(acts.delayed, vec![(0x3cc4_e770, 0, 2.5, 3.0)]);
+        assert_eq!(acts.told, vec![(0x1b07_1983, 1)]);
     }
 
     #[test]

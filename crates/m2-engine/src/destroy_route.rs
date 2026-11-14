@@ -14,8 +14,8 @@
 //!
 //! **From samples** (the trees' state machines, `global_env_palmtree01`):
 //! the trunk's intact state (`0xACB51200`) goes to `CollapseState` on
-//! `DestroyMsg` and to [`FIRE`] on [`FIRE_DESTROY_MSG`]. `CollapseState`
-//! sets the trunk to `DestroyedState`; [`FIRE`] starts a fire on the
+//! `DestroyMsg` and to [`COLLAPSE_FIRE`] on [`FIRE_DESTROY_MSG`]. `CollapseState`
+//! sets the trunk to `DestroyedState`; [`COLLAPSE_FIRE`] starts a fire on the
 //! trunk's wreck and sets it to [`FIRE_DESTROYED`]. Each leaf's machine
 //! has [`DEBRIS`] and [`FIRE_DEBRIS`] (the latter starting embers on the
 //! leaf), both showing the same leaf. The tree scripts
@@ -31,9 +31,11 @@ pub use m2_assets::model::DESTROY_MSG;
 
 /// The message that destroys a part burning (`0x3D0D4C99`, 0x82289020).
 pub const FIRE_DESTROY_MSG: u32 = 0x3d0d_4c99;
-/// The trunk's state on [`FIRE_DESTROY_MSG`] (`0x0753C8F7`, its name not
-/// in the dictionary): its fire starts, then it sets [`FIRE_DESTROYED`].
-pub const FIRE: u32 = 0x0753_c8f7;
+/// `CollapseFireState`: the trunk's state on [`FIRE_DESTROY_MSG`] (a
+/// palm's: its fire starts, then it sets [`FIRE_DESTROYED`]); a canopy's
+/// trunk and crown come down through it either way
+/// ([`crate::part_runner`]).
+pub const COLLAPSE_FIRE: u32 = 0x0753_c8f7;
 /// `FireDestroyedState`: the trunk burnt down.
 pub const FIRE_DESTROYED: u32 = 0x0046_41a5;
 /// `FireDebrisState`: a leaf flying off burning.
@@ -66,17 +68,6 @@ pub fn blast_burns(key: u32) -> bool {
     destroy_message(1, key) == FIRE_DESTROY_MSG
 }
 
-/// The states a destroyed tree's parts go through, in order, the trunk's
-/// first, then its leaves': burning ([`FIRE`], [`FIRE_DESTROYED`],
-/// [`FIRE_DEBRIS`]) or not ([`COLLAPSE`], [`DESTROYED`], [`DEBRIS`]).
-pub fn tree_states(burning: bool) -> [u32; 3] {
-    if burning {
-        [FIRE, FIRE_DESTROYED, FIRE_DEBRIS]
-    } else {
-        [COLLAPSE, DESTROYED, DEBRIS]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,6 +76,7 @@ mod tests {
     #[test]
     fn the_states_are_named_by_their_hash() {
         assert_eq!(name_hash("FireDestroyedState"), FIRE_DESTROYED);
+        assert_eq!(name_hash("CollapseFireState"), COLLAPSE_FIRE);
         assert_eq!(name_hash("FireDebrisState"), FIRE_DEBRIS);
         assert_eq!(name_hash("CollapseState"), COLLAPSE);
         assert_eq!(name_hash("DestroyedState"), DESTROYED);
@@ -109,7 +101,5 @@ mod tests {
         assert_eq!(destroy_message(1, other), DESTROY_MSG);
         assert!(blast_burns(EXPLOSION) && blast_burns(EXPLOSION_LARGE));
         assert!(!blast_burns(other));
-        assert_eq!(tree_states(true), [FIRE, FIRE_DESTROYED, FIRE_DEBRIS]);
-        assert_eq!(tree_states(false), [COLLAPSE, DESTROYED, DEBRIS]);
     }
 }

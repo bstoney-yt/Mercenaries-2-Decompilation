@@ -344,8 +344,8 @@ pub struct Destruction {
     pub set_off: Vec<(Vec3, u32, Shows)>,
     /// Part states the props destroyed went to, for the scripts'
     /// `OnStateChange` ([`take_state_changes`](Self::take_state_changes)):
-    /// (entity, state name hash), in order.
-    state_changes: Vec<(u32, u32)>,
+    /// (entity, machine, state), in order.
+    state_changes: Vec<(u32, u32, u32)>,
     /// The island's objects among those (the trees), for the scripts to
     /// make objects of first: (entity, template, where).
     adoptions: Vec<(u32, u32, Vec3)>,
@@ -630,30 +630,23 @@ impl Destruction {
             StaticKey::Entity(e) => {
                 match cause {
                     Cause::Blast(at) => {
-                        // Blown up by an explosion, a model whose fire
-                        // state starts effects (a tree) burns down rather
-                        // than collapse (from the 360 code, 0x82289020:
-                        // [`m2_engine::destroy_route`]).
-                        let fire = props.state_effects(e, route::FIRE);
-                        let burns = route::blast_burns(kind) && !fire.is_empty();
-                        let mut shows = fire;
-                        shows.extend(props.state_effects(e, route::FIRE_DEBRIS));
+                        // Its part machines take the destroying message:
+                        // the fire-destroy one from an explosion (from the
+                        // 360 code, 0x82289020: [`m2_engine::destroy_route`]).
                         let broke = props.wreck(&mut world.physics, e, Some(at));
-                        if burns && broke {
-                            eprintln!(
-                                "destruct: {key:?} ({name}) burns down: {} effects",
-                                shows.len()
-                            );
-                            self.alight.push(shows);
-                            self.state_changes
-                                .extend(route::tree_states(true).map(|s| (e, s)));
+                        if broke {
+                            props.destroy_parts(e, route::destroy_message(1, kind));
                         }
                         broke
                     }
                     Cause::Crash { velocity, mass } => {
-                        props.wreck_crashed(&mut world.physics, e, |shifted| {
+                        let broke = props.wreck_crashed(&mut world.physics, e, |shifted| {
                             crate::game::flung(velocity, mass, shifted)
-                        })
+                        });
+                        if broke {
+                            props.destroy_parts(e, route::DESTROY_MSG);
+                        }
+                        broke
                     }
                 };
                 if let (Some(k), Some(c)) = (sound, props.centre(e)) {
@@ -1081,8 +1074,8 @@ impl Destruction {
     /// into is knocked on by it. Either, with no building's collapse, is
     /// heard as its template's `SoundKey` says ([`break_sound`]).
     /// The part states the props destroyed since the last call went to:
-    /// (entity, state name hash), in order.
-    pub fn take_state_changes(&mut self) -> Vec<(u32, u32)> {
+    /// (entity, machine, state), in order.
+    pub fn take_state_changes(&mut self) -> Vec<(u32, u32, u32)> {
         std::mem::take(&mut self.state_changes)
     }
 
@@ -1106,6 +1099,34 @@ impl Destruction {
         }
         for shows in self.alight.drain(..) {
             combat.state_shows(shows);
+        }
+        // Their part machines' changes (from [`Props::destroy_parts`] on):
+        // what each state starts (but the collapse's, which the bring-down
+        // below shows), and for the scripts, the island's by their entity
+        // (made the scripts' objects first).
+        for (k, c) in props.take_part_changes() {
+            if c.state != route::COLLAPSE {
+                let shows = props.state_effects(k, c.state);
+                if !shows.is_empty() {
+                    combat.state_shows(shows);
+                }
+            }
+            let entity = if adopted(k) {
+                let Some(o) = world.index.objects.get((k & !ADOPTED) as usize).copied() else {
+                    continue;
+                };
+                if !self.adoptions.iter().any(|a| a.0 == o.entity) {
+                    self.adoptions.push((o.entity, o.template, o.position));
+                }
+                o.entity
+            } else {
+                k
+            };
+            eprintln!(
+                "destruct: {entity:#x}'s part {:08x} goes to {:08x}",
+                c.machine, c.state
+            );
+            self.state_changes.push((entity, c.machine, c.state));
         }
         // The island's objects broken a part at a time whose props have
         // loaded: the island's copy and its collision go, the prop stands
@@ -1147,25 +1168,17 @@ impl Destruction {
             let sound_key = db.sound_keys.get(&template).copied();
             match cause {
                 Cause::Blast(from) => {
-                    // As a state layer's prop does ([`Self::wear_by`]):
-                    // one whose fire state starts effects (a tree) burns.
-                    let fire = props.state_effects(key, route::FIRE);
-                    let burnt = burns && !fire.is_empty();
-                    let mut shows = fire;
-                    shows.extend(props.state_effects(key, route::FIRE_DEBRIS));
                     props.wreck(&mut world.physics, key, Some(from));
-                    if burnt {
-                        let o = world.index.objects[i];
-                        let entity = o.entity;
-                        self.adoptions.push((entity, o.template, o.position));
-                        eprintln!(
-                            "destruct: object {i} ({template:08x}, entity {entity:#x}) burns down: {}                              effects",
-                            shows.len()
-                        );
-                        combat.state_shows(shows);
-                        self.state_changes
-                            .extend(route::tree_states(true).map(|s| (entity, s)));
-                    }
+                    // Its part machines take the destroying message, as a
+                    // state layer's prop's do ([`Self::wear_by`]).
+                    props.destroy_parts(
+                        key,
+                        if burns {
+                            route::FIRE_DESTROY_MSG
+                        } else {
+                            route::DESTROY_MSG
+                        },
+                    );
                     if props.broke_apart(key) && building {
                         if let Some(at) = props.centre(key) {
                             let sent =
@@ -1187,6 +1200,7 @@ impl Destruction {
                     props.wreck_crashed(&mut world.physics, key, |shifted| {
                         crate::game::flung(velocity, mass, shifted)
                     });
+                    props.destroy_parts(key, route::DESTROY_MSG);
                 }
             }
             if !building && let Some(k) = sound_key {

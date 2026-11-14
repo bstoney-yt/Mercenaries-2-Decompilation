@@ -3345,9 +3345,8 @@ impl MissionLink {
             }
             // The part states the props destroyed went to, for their
             // scripts' `OnStateChange` (a tree burnt down burns its
-            // leaves). The machine passed is 0: which of the model's part
-            // machines the 360 names there is not traced (the tree
-            // scripts read only the state).
+            // leaves), each with its machine: its part's node's name
+            // (`Slice00`, a canopy's crown, as its script asks).
             // The island's trees among them: objects of the scripts' with
             // their template's script first (no layer places them).
             for (g, template, at) in game.destruction.take_adoptions() {
@@ -3362,9 +3361,9 @@ impl MissionLink {
                     eprintln!("mission: {g:#x} ({name}) runs its template's script");
                 }
             }
-            for (g, state) in game.destruction.take_state_changes() {
-                eprintln!("mission: {g:#x}'s part state goes to {state:08x}");
-                mission.object_state_changed(g, 0, state);
+            for (g, machine, state) in game.destruction.take_state_changes() {
+                eprintln!("mission: {g:#x}'s part {machine:08x} goes to {state:08x}");
+                mission.object_state_changed(g, machine, state);
             }
             for (g, at, yaw) in game.scene.flights.places(&game.scene.vehicles) {
                 mission.place(g, at.to_array(), yaw);

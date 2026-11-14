@@ -141,8 +141,17 @@ fn main() -> Result<()> {
             let tree = 0xf001_0002;
             mission.put_player([3.0, 0.0, 0.0]);
             let adopted = mission.adopt_scripted(tree, &template, [0.0; 3]);
-            for state in [0x0753_c8f7, 0x0046_41a5, 0x4c88_281b] {
-                mission.object_state_changed(tree, 0, state);
+            // As a burnt tree's part machines go (`m2_engine::part_runner`):
+            // a palm's trunk, then a canopy's crown, `Slice00`.
+            let trunk = 0x501d_5fd7; // the palm's trunk part's node
+            let crown = m2_assets::name_hash("Slice00");
+            for (machine, state) in [
+                (trunk, 0x0753_c8f7),
+                (trunk, 0x0046_41a5),
+                (crown, 0x3cc4_e770),
+                (crown, 0x0753_c8f7),
+            ] {
+                mission.object_state_changed(tree, machine, state);
             }
             let mut played = Vec::new();
             for _ in 0..8 {
