@@ -80,6 +80,10 @@ pub struct GameOptions {
     /// used by the alpha's drawing.
     pub video_detail: f64,
     pub advanced_video: [f64; 8],
+    /// The loading screens' hint counter, kept in the profile as the 360
+    /// keeps it (a byte of its profile, `+0x7C`): the next hint shown is
+    /// this one ([`crate::loading`]).
+    pub loading_hint: u8,
 }
 
 impl Default for GameOptions {
@@ -99,6 +103,7 @@ impl Default for GameOptions {
             dialog_volume: 100.0,
             video_detail: crate::pause::DETAIL,
             advanced_video: crate::pause::ADVANCED,
+            loading_hint: 0,
         }
     }
 }
@@ -383,6 +388,24 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The loading hints' counter is kept in the settings file, and a
+    /// file from before it starts at the first hint.
+    #[test]
+    fn the_loading_hint_counter_is_kept() {
+        let mut config = Config::default();
+        assert_eq!(config.options.loading_hint, 0);
+        config.options.loading_hint = 17;
+        let back: Config = toml::from_str(&config.to_toml()).unwrap();
+        assert_eq!(back.options.loading_hint, 17);
+        let old: Config = toml::from_str(
+            "[options]
+subtitles = false
+",
+        )
+        .unwrap();
+        assert_eq!(old.options.loading_hint, 0);
+    }
 
     #[test]
     fn defaults_round_trip() {

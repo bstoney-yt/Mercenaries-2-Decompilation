@@ -9558,6 +9558,8 @@ impl App {
         let mut hud = ui::Hud::new();
         hud.game = game_hud(self.install.as_ref(), &self.mode, self.old_hud, &game);
         hud.loading = loading_screen(self.install.as_ref());
+        // The loading hints count on from the profile's counter.
+        hud.profile = true;
         hud.dev = self.dev;
         eprintln!(
             "keys: the developer's (F4 free camera, F5/F9 quick save and load, F3 culling, \
