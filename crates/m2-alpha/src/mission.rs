@@ -2262,9 +2262,12 @@ impl MissionLink {
         }
         // The face sets the scripts mounted, on the rig of each
         // character's template (`Animation.BindFaceAnimSet`, 0x82315CF8:
-        // the set goes on the rig asset, so everyone with it has it).
+        // the set goes on the rig asset, so everyone with it has it). The
+        // hero is looked up as anyone is, by her own template
+        // ([`face_template`]).
         let binds = std::mem::take(&mut mission.world().borrow_mut().sp.face_sets);
-        for b in binds {
+        for mut b in binds {
+            b.template = face_template(b.template.take(), b.character, game.scene.hero);
             let templates = game.scene.world.as_ref().map(|w| &w.index.template_db);
             let rig = b
                 .template
@@ -2301,16 +2304,16 @@ impl MissionLink {
             };
             let Some(guid) = speaker else { continue };
             let lip = if on && cinematic {
-                let template = mission
-                    .world()
-                    .borrow()
-                    .objects
-                    .get(&guid)
-                    .map(|o| o.name.clone())
-                    .or_else(|| {
-                        (guid == m2_game::mission::PLAYER)
-                            .then(|| game.scene.hero.template().to_owned())
-                    });
+                let template = face_template(
+                    mission
+                        .world()
+                        .borrow()
+                        .objects
+                        .get(&guid)
+                        .map(|o| o.name.clone()),
+                    guid,
+                    game.scene.hero,
+                );
                 let templates = game.scene.world.as_ref().map(|w| &w.index.template_db);
                 let rig = template
                     .as_deref()
@@ -6002,6 +6005,23 @@ return walk(m, 0)
 /// (`Player.GetAnyCharacter`, `GetAllCharacters`: 0xf0000000, 0xf0000001)
 /// is the players' characters, with one player `her`; anything else is
 /// itself.
+/// The template whose face rig a character's face sets go on and whose
+/// rig speaks their lines: their object's, else, for the hero, hers
+/// ([`Hero::template`]), whose `HumanAnimationSystem` names her rig as
+/// anyone's does.
+///
+/// **From the 360 code:** `Animation.BindFaceAnimSet` (0x82315CF8) finds
+/// the character's own `HumanAnimationSystem` record (store 0x83652B9C,
+/// keyed by the character) and mounts the set on the rig its +8 word
+/// names; nothing there treats the hero apart. **From samples:** every
+/// hero template names a rig, each hero's costumes and upgrades the same
+/// one (`mattias` and `MattiasV2` `0bba3066`, `Jen` and `JenChickensuit`
+/// `76f25a90`, `Chris` and `ChrisUpgrade1` `39f47e08`), so which outfit
+/// she wears does not change it.
+fn face_template(object: Option<String>, character: u32, hero: Hero) -> Option<String> {
+    object.or_else(|| (character == PLAYER).then(|| hero.template().to_owned()))
+}
+
 fn player_target(g: u32, her: Option<u32>) -> Option<u32> {
     match g {
         m2_game::events::ANY_CHARACTER | m2_game::events::ALL_CHARACTERS => her,
@@ -8841,6 +8861,28 @@ fn send_pursuit_car(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_hero_s_face_sets_go_on_her_own_template_s_rig() {
+        use super::{Hero, PLAYER, face_template};
+        // The hero is no script object: her face sets and lines go to
+        // her template, which names her rig.
+        assert_eq!(
+            face_template(None, PLAYER, Hero::Jennifer).as_deref(),
+            Some("Jen")
+        );
+        assert_eq!(
+            face_template(None, PLAYER, Hero::Mattias).as_deref(),
+            Some("mattias")
+        );
+        // Anyone else's is their object's; one not in play has none.
+        let fiona = Some("Fiona".to_owned());
+        assert_eq!(
+            face_template(fiona, 0x1234, Hero::Chris).as_deref(),
+            Some("Fiona")
+        );
+        assert_eq!(face_template(None, 0x1234, Hero::Chris), None);
+    }
+
     #[test]
     fn a_label_only_destroy_hunts_the_nearest_living_carriers() {
         use m2_math::glam::Vec3;
