@@ -2289,9 +2289,8 @@ impl MissionLink {
         // cinematic mode the 360 plays the speaker's face animation named
         // by the line (0x822782D8 posts the line's hash, 0x8241D270 finds
         // it in the sets mounted on their rig; [`m2_engine::lip_sync`]);
-        // out of it their mouth flaps while it plays (`Flap`). A line
-        // with no face animation flaps too (invented: the 360 then moves
-        // nothing).
+        // out of it their mouth flaps while it plays (`Flap`). In it, a
+        // line with no face animation moves nothing ([`line_flaps`]).
         let cinematic = mission.world().borrow().vo.cinematic;
         let speeches = mission.world().borrow_mut().vo.take_speech();
         for speech in speeches {
@@ -2357,7 +2356,7 @@ impl MissionLink {
                     {
                         rig.lip = lip;
                     }
-                    if !lips {
+                    if line_flaps(cinematic) {
                         p.speak(on);
                     }
                 }
@@ -2378,7 +2377,7 @@ impl MissionLink {
                     if lips || !on {
                         n.rig.lip = lip;
                     }
-                    if !lips {
+                    if line_flaps(cinematic) {
                         n.speak(on);
                     }
                 }
@@ -6002,6 +6001,19 @@ return walk(m, 0)
 /// (`Player.GetAnyCharacter`, `GetAllCharacters`: 0xf0000000, 0xf0000001)
 /// is the players' characters, with one player `her`; anything else is
 /// itself.
+/// Whether a speaker's mouth flaps while their line plays: only out of
+/// the voice manager's cinematic mode.
+///
+/// **From the 360 code:** a line's start (0x822782D8) posts the face
+/// expression `Flap` (0xD388246C) at 1 until put off (-1, 0x82DE896C) when
+/// the mode's flag (0x82C4D0D8) is clear, else only the line's face
+/// animation (queue 0x8320A758); its end (0x82278440) puts `Flap` off, or
+/// in the mode stops the animation (0xE2EC63DD). So in the mode a line
+/// with no face animation leaves the mouth still.
+fn line_flaps(cinematic: bool) -> bool {
+    !cinematic
+}
+
 fn player_target(g: u32, her: Option<u32>) -> Option<u32> {
     match g {
         m2_game::events::ANY_CHARACTER | m2_game::events::ALL_CHARACTERS => her,
@@ -8841,6 +8853,12 @@ fn send_pursuit_car(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_cinematic_line_moves_only_its_face_animation() {
+        assert!(super::line_flaps(false));
+        assert!(!super::line_flaps(true));
+    }
+
     #[test]
     fn a_label_only_destroy_hunts_the_nearest_living_carriers() {
         use m2_math::glam::Vec3;
