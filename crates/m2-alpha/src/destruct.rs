@@ -317,7 +317,10 @@ pub struct Destruction {
     taken: HashMap<usize, f32>,
     /// Destroyed, put up as props, waiting for their models to load to
     /// come down: (object, what did it).
-    falling: Vec<(usize, Cause)>,
+    /// The island's objects destroyed whose props have yet to load:
+    /// what destroyed them, and whether it burns them
+    /// ([`m2_engine::destroy_route::blast_burns`]).
+    falling: Vec<(usize, Cause, bool)>,
     /// Destroyed, by placed object.
     pub destroyed: HashSet<usize>,
     /// What a vehicle's body touched and left standing, logged once each
@@ -615,7 +618,10 @@ impl Destruction {
         }
         match key {
             StaticKey::Object(i) => match install {
-                Some(install) => self.bring_down(world, props, install, i, cause),
+                Some(install) => {
+                    let burns = matches!(cause, Cause::Blast(_)) && route::blast_burns(kind);
+                    self.bring_down(world, props, install, i, cause, burns)
+                }
                 None => return false,
             },
             StaticKey::Entity(e) => {
@@ -733,13 +739,14 @@ impl Destruction {
         install: &Install,
         i: usize,
         cause: Cause,
+        burns: bool,
     ) {
         self.destroyed.insert(i);
         let o = world.index.objects[i];
         let loose = world.loose_mass(i);
         if world.object_model(i).is_some_and(|m| m.has_wreck()) && props.adopt(install, key(i), &o)
         {
-            self.falling.push((i, cause));
+            self.falling.push((i, cause, burns));
         } else if let Some(m) = loose {
             // No wreck to show, but it comes loose (a café chair, a
             // planter): it goes flying, as what is knocked loose does,
@@ -830,7 +837,7 @@ impl Destruction {
                         velocity: vehicle.velocity,
                         mass: vehicle.mass,
                     };
-                    self.bring_down(world, props, install, i, cause);
+                    self.bring_down(world, props, install, i, cause, false);
                     out.push(Crashed::Down(key));
                 }
                 Some(c) => out.push(c),
@@ -1049,7 +1056,14 @@ impl Destruction {
                 {
                     eprintln!("destruct: object {i} ({t:#x}) falls with {e:#x} (DestructionLink)");
                     let at = world.index.objects[i].position;
-                    self.bring_down(world, props, install, i, Cause::Blast(BlastPush::none(at)));
+                    self.bring_down(
+                        world,
+                        props,
+                        install,
+                        i,
+                        Cause::Blast(BlastPush::none(at)),
+                        false,
+                    );
                     self.linked.insert(i);
                     fallen.push(t);
                 }
@@ -1102,7 +1116,7 @@ impl Destruction {
             }
             false
         });
-        self.falling.retain(|&(i, cause)| {
+        self.falling.retain(|&(i, cause, burns)| {
             let key = key(i);
             match props.get(key) {
                 Some((_, true)) => {}
@@ -1123,7 +1137,23 @@ impl Destruction {
             let sound_key = db.sound_keys.get(&template).copied();
             match cause {
                 Cause::Blast(from) => {
+                    // As a state layer's prop does ([`Self::wear_by`]):
+                    // one whose fire state starts effects (a tree) burns.
+                    let fire = props.state_effects(key, route::FIRE);
+                    let burnt = burns && !fire.is_empty();
+                    let mut shows = fire;
+                    shows.extend(props.state_effects(key, route::FIRE_DEBRIS));
                     props.wreck(&mut world.physics, key, Some(from));
+                    if burnt {
+                        let entity = world.index.objects[i].entity;
+                        eprintln!(
+                            "destruct: object {i} ({template:08x}, entity {entity:#x}) burns down: {}                              effects",
+                            shows.len()
+                        );
+                        combat.state_shows(shows);
+                        self.state_changes
+                            .extend(route::tree_states(true).map(|s| (entity, s)));
+                    }
                     if props.broke_apart(key) && building {
                         if let Some(at) = props.centre(key) {
                             let sent =
