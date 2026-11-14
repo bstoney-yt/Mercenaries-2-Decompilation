@@ -14,7 +14,9 @@
 //! what they ask of the first one. For `AntiAir` it spawns a crewed
 //! `M113 AA (VZ) (Driver)` where the first stands, comes near it, has it
 //! lock on her and fire, and counts the radar calls the scripts make
-//! (`antiair:` lines). Prints names, counts and the scripts'
+//! (`antiair:` lines). For a `tree_` script it makes an island tree of a
+//! template that runs it, burns it down and prints the material
+//! animations it plays. Prints names, counts and the scripts'
 //! errors only.
 
 use std::fs::File;
@@ -123,6 +125,36 @@ fn main() -> Result<()> {
             offered(&mission),
             alive(&mission)
         );
+    }
+    if name.starts_with("tree_") {
+        // An island tree of a template that runs it, burnt down: what
+        // its script plays.
+        let template = mission
+            .world()
+            .borrow()
+            .template_scripts
+            .iter()
+            .find(|(_, (s, _))| s == hash)
+            .map(|(t, _)| t.clone());
+        println!("a template that runs it: {template:?}");
+        if let Some(template) = template {
+            let tree = 0xf001_0002;
+            mission.put_player([3.0, 0.0, 0.0]);
+            let adopted = mission.adopt_scripted(tree, &template, [0.0; 3]);
+            for state in [0x0753_c8f7, 0x0046_41a5, 0x4c88_281b] {
+                mission.object_state_changed(tree, 0, state);
+            }
+            let mut played = Vec::new();
+            for _ in 0..8 {
+                mission.tick(0.25);
+                for c in mission.take_commands() {
+                    if let Command::MaterialAnimation { name, looped, .. } = c {
+                        played.push((name, looped));
+                    }
+                }
+            }
+            println!("adopted {adopted}; burnt down, it plays {played:?}");
+        }
     }
     if name.eq_ignore_ascii_case("AntiAir")
         && let Some(&(_, _, at)) = on.first()
