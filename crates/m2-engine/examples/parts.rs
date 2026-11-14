@@ -128,8 +128,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  switchable {:?}", st.switchable);
             for m in &st.machines {
                 println!("  part {:?}: {} states", m.node, m.states.len());
-                for (name, commands) in &m.states {
+                for (k, (name, commands)) in m.states.iter().enumerate() {
                     println!("    state {name:08x}: {commands:?}");
+                    if let Some(a) = m.acts.get(k) {
+                        if !a.on.is_empty() || !a.sets.is_empty() || !a.emitters.is_empty() {
+                            println!(
+                                "      on {:08x?} sets {:?} emitters {:?}",
+                                a.on, a.sets, a.emitters
+                            );
+                        }
+                    }
                 }
             }
             let chunks = st.chunks(&model.nodes);
