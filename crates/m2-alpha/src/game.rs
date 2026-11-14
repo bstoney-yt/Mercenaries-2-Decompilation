@@ -3437,19 +3437,27 @@ impl Game {
             .filter_map(|(i, v)| {
                 let set = *self.scene.engine_sets.get(&v.spec.model)?;
                 let id = v.id?;
-                let at = world.physics.vehicle_transform(id)?.w_axis.truncate();
+                let p = &world.physics;
+                let place = p.vehicle_transform(id)?;
+                let at = place.w_axis.truncate();
                 (set != 0).then_some((
                     at.distance(ear),
                     crate::sound::HeardEngine {
                         id: i,
                         at,
                         set,
-                        speed: world.physics.vehicle_speed(id),
+                        speed: p.vehicle_speed(id),
                         top: v.spec.tuning.max_speed.unwrap_or(if v.spec.tracked {
                             14.0
                         } else {
                             32.0
                         }),
+                        // As for her own engine ([`Game::engine`]).
+                        revs: p.vehicle_gear(id).map(|(_, rpm)| (rpm / 8000.0).min(1.0)),
+                        slide: p.vehicle_velocity(id).dot(place.x_axis.truncate()),
+                        surface: m2_engine::surface::tyre_class(p.vehicle_ground(id, 5.0)),
+                        braking: p.vehicle_braking(id),
+                        reversing: p.vehicle_rolling(id) < 0.0,
                     },
                 ))
             })
