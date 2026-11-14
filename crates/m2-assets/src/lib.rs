@@ -68,6 +68,7 @@ pub mod gfx;
 pub mod hash;
 pub mod havok;
 pub mod human_states;
+pub mod icon;
 pub mod layer;
 pub mod lua;
 pub mod material_animation;
