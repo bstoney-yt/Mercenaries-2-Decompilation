@@ -329,10 +329,24 @@ pub enum Category {
     Vo,
     /// The interface's sounds, which no script fades.
     Ui,
+    /// The full-screen movies' sound. From the 360 code: the movie player
+    /// (`0x824B6788`) plays it through Bink's own sound, not the sound
+    /// engine, so neither the scripts' master level
+    /// ([`Mixer::script_master`]; they set it to 0 before a cut-scene)
+    /// nor their category fades reach it; its level is the player's
+    /// dialog volume (see [`MOVIE_GAIN`]). No script names it.
+    Movie,
 }
 
+/// The gain the movies' sound plays at, on top of the player's dialog
+/// volume. From the 360 code: the movie player sets each Bink track's
+/// volume to the dialog volume (the options' `audioSetDialogVolume`
+/// level, third of the sound manager's three) times 43691, where Bink's
+/// 32768 is the sound as made: so 4/3.
+pub const MOVIE_GAIN: f32 = 43_691.0 / 32_768.0;
+
 impl Category {
-    const ALL: usize = 5;
+    const ALL: usize = 6;
 
     /// The category a script names (`non_ui`, `chatter`, ...), if one we
     /// play.
@@ -768,9 +782,15 @@ impl Mixer {
 
     /// Left and right gain for `play` from the listener.
     fn gains(&self, play: &Play) -> (f32, f32) {
+        // The movies' sound is Bink's own, outside the sound engine whose
+        // master level the scripts set ([`Category::Movie`]).
+        let script_master = match play.category {
+            Category::Movie => 1.0,
+            _ => self.script_master.level(),
+        };
         let g = play.gain
             * self.master
-            * self.script_master.level()
+            * script_master
             * self.level(play.category)
             * self.volume(play.category);
         let Some(at) = play.position else {
@@ -2318,6 +2338,35 @@ mod tests {
             ..KeySounds::default()
         };
         assert!((k.punch() - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_movies_sound_plays_under_the_scripts_master_level_at_the_dialog_volume() {
+        // A cut-scene: the scripts take the master level to 0 and the
+        // flow hushes the world and the music; the movie is still heard,
+        // at the dialog volume (here a half) times its gain.
+        let mut m = Mixer::new(100);
+        m.master = 1.0;
+        m.script_master.set(0.0, 0.0);
+        m.fade(Category::World, 0.0, 0.0);
+        m.fade(Category::Music, 0.0, 0.0);
+        m.set_volume(Category::Movie, 0.5);
+        m.set_volume(Category::Vo, 0.25);
+        m.play(Play::flat(tone(100, 1000)).looped());
+        m.play(Play::flat(tone(100, 1000)).looped().ui());
+        m.play(
+            Play::flat(tone(100, 1000))
+                .looped()
+                .category(Category::Movie)
+                .gain(0.5),
+        );
+        let mut out = vec![0.0; 2 * 100];
+        m.mix(&mut out);
+        // Only the movie: half scale, at half its gain, at half volume.
+        assert!((out[2 * 99] - 0.5 * 0.5 * 0.5).abs() < 1e-3, "{}", out[198]);
+        assert!((MOVIE_GAIN - 4.0 / 3.0).abs() < 1e-4);
+        // No script names it, so none can fade it.
+        assert_eq!(Category::named("movie"), None);
     }
 
     #[test]

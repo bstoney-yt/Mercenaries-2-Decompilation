@@ -100,7 +100,9 @@ pub use ai::{AiFlags, AiProfile};
 pub use anim::{Animator, BoundClip, Gait, Locomotion, Pose, Skeleton};
 pub use assets::{AssetError, AssetSource, DecodedTexture, Install, ModelData};
 pub use atmosphere::Atmosphere;
-pub use audio::{Category, Mixer, Play, SoundBuffer, SoundLibrary, Streams, VoiceId, Voices};
+pub use audio::{
+    Category, MOVIE_GAIN, Mixer, Play, SoundBuffer, SoundLibrary, Streams, VoiceId, Voices,
+};
 pub use model::{
     CpuModel, GpuModel, Looks, MaterialCache, ModelParts, MorphedFace, PieceMorph, StateFx,
     StateMessage,
