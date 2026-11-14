@@ -315,6 +315,9 @@ pub struct Templates {
     /// What each template with a `SoundEffect` plays as its objects come
     /// into being, by id ([`crate::spawn_sound`]).
     pub spawn_sounds: HashMap<u32, crate::spawn_sound::SpawnSound>,
+    /// The engine sounds' gears of each engine's sound set, by set
+    /// ([`crate::sound_gears`]).
+    pub sound_gears: HashMap<u32, crate::sound_gears::SoundGearbox>,
     /// The AI's class of each vehicle template's driver, by the
     /// vehicle's id ([`crate::vehicle_class`]).
     pub vehicle_classes: HashMap<u32, u8>,
@@ -993,6 +996,13 @@ impl Templates {
             .map_or(crate::vehicle_class::OTHER, |(class, _)| class)
     }
 
+    /// The engine sounds' gears of a vehicle of `model`: those of its
+    /// [`engine_set_for_model`](Self::engine_set_for_model), as the 360
+    /// fetches them by the entity's sound set ([`crate::sound_gears`]).
+    pub fn sound_gearbox_for_model(&self, model: u32) -> Option<&crate::sound_gears::SoundGearbox> {
+        self.sound_gears.get(&self.engine_set_for_model(model)?)
+    }
+
     /// The sound set most templates of `model` with an engine name in
     /// their `SoundEffect` ([`crate::spawn_sound::SpawnSound::engine`]):
     /// the set its engine's start and stop are heard from.
@@ -1036,6 +1046,21 @@ impl Templates {
             return Default::default();
         };
         let atmosphere = Atmosphere::read(&db, "Default");
+        let spawn_sounds = crate::spawn_sound::read(&db);
+        let sound_gears = source
+            .asset(
+                crate::sound_gears::SOUND_GEARS,
+                m2_assets::animation_table::ANIMATION_TABLE_TYPE,
+            )
+            .ok()
+            .and_then(|d| m2_assets::animation_table::AnimationTable::parse(&d).ok())
+            .map(|t| {
+                crate::sound_gears::SoundGearbox::read_all(
+                    &t,
+                    spawn_sounds.values().filter(|s| s.engine).map(|s| s.set),
+                )
+            })
+            .unwrap_or_default();
         let damage = source
             .asset(name_hash(DAMAGE_TABLE), DAMAGE_TABLE_TYPE)
             .ok()
@@ -1127,7 +1152,8 @@ impl Templates {
             explosions: crate::durability::explosions(&db),
             hijack: crate::hijack::read(&db),
             music_sources: crate::music_source::read(&db),
-            spawn_sounds: crate::spawn_sound::read(&db),
+            spawn_sounds,
+            sound_gears,
             vehicle_classes: crate::vehicle_class::read(&db),
             exhausts: crate::vehicle_parts::read(&db),
             winches: crate::winch::read(&db),

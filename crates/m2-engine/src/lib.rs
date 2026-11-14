@@ -76,6 +76,7 @@ pub mod road_ring;
 pub mod scatter;
 pub mod seats;
 pub mod social_use;
+pub mod sound_gears;
 pub mod sound_regions;
 pub mod spawn_sound;
 pub mod stagger;
