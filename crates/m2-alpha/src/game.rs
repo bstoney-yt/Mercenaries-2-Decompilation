@@ -324,6 +324,10 @@ pub struct Game {
     /// ([`Game::take_honks`]).
     pub honking: bool,
     honks: u32,
+    /// Vehicles that knocked something loose: each one's id, label, its
+    /// vertical velocity just before, and seconds until it is looked at
+    /// again (the knock-up check's log, [`KICK_LOOK`]).
+    kicks: Vec<(m2_engine::VehicleId, String, f32, f32)>,
     /// Her vehicle disguise ([`crate::disguise`]).
     pub disguise: crate::disguise::Disguise,
     /// Seconds the scripts asked her pad to shake (`Pg.Rumble`), for the
@@ -567,6 +571,7 @@ impl Game {
             pursued: false,
             honking: false,
             honks: 0,
+            kicks: Vec::new(),
             disguise: crate::disguise::Disguise::default(),
             rumble: 0.0,
             actions: Vec::new(),
@@ -2062,7 +2067,7 @@ impl Game {
                 dt,
             );
             run_over_pickups(world, &mut self.scene.flights, &self.scene.vehicles);
-            knock_loose(
+            let knocked = knock_loose(
                 world,
                 &mut self.scene.props,
                 &self.scene.vehicles,
@@ -2070,6 +2075,25 @@ impl Game {
                 &mut self.destruction,
                 self.scene.install.as_ref(),
             );
+            // Its vertical velocity a moment after each knock, against
+            // just before (a kick up shows here).
+            self.kicks.extend(
+                knocked
+                    .into_iter()
+                    .map(|(id, label, vy)| (id, label, vy, KICK_LOOK)),
+            );
+            let physics = &world.physics;
+            self.kicks.retain_mut(|(id, label, vy, left)| {
+                *left -= dt;
+                if *left > 0.0 {
+                    return true;
+                }
+                eprintln!(
+                    "knocked loose: the {label} going up {vy:.2} m/s before, {:.2} m/s {KICK_LOOK} s after",
+                    physics.vehicle_velocity(*id).y
+                );
+                false
+            });
             // What rides loose on a vehicle goes where its body went; what
             // slid or tipped off the bed is noted.
             let vehicles = &self.scene.vehicles;
@@ -4345,6 +4369,11 @@ fn within_bed(place: Mat4, (lo, hi): (Vec3, Vec3), bed: Vec3, c: Vec3) -> bool {
 /// run into that their weight breaks ([`Destruction::crash`]: plants,
 /// bushes, fences, lampposts, the island's and the state layers'), going
 /// on through it.
+/// Seconds after a knock its vehicle's vertical velocity is logged.
+const KICK_LOOK: f32 = 0.5;
+
+/// Returns each vehicle that knocked something loose: its id, label and
+/// vertical velocity just before (m/s).
 fn knock_loose(
     world: &mut World,
     props: &mut Props,
@@ -4352,7 +4381,8 @@ fn knock_loose(
     (beds, shapes, told): (&[Option<Vec3>], &[BedShape], &mut HashSet<usize>),
     destruction: &mut Destruction,
     install: Option<&Install>,
-) {
+) -> Vec<(m2_engine::VehicleId, String, f32)> {
+    let mut knocked = Vec::new();
     for (index, (v, bed)) in vehicles
         .iter()
         .zip(beds.iter().chain(std::iter::repeat(&None)))
@@ -4446,11 +4476,17 @@ fn knock_loose(
             (speed, &v.spec.label, bed.map(|b| ((index, id), b))),
         );
         if shifted > 0.0 || ploughed {
-            world
-                .physics
-                .set_vehicle_velocity(id, before * (mass / (mass + shifted)));
+            // What gave way didn't hold it: its speed and its spin as
+            // they were, less what it gave the prop (playtest 2026-11-14:
+            // a small prop it was turned and thrown by as by a wall).
+            let keep = mass / (mass + shifted);
+            let spin = world.physics.vehicle_spin_before(id);
+            world.physics.set_vehicle_velocity(id, before * keep);
+            world.physics.set_vehicle_spin(id, spin * keep);
+            knocked.push((id, v.spec.label.clone(), before.y));
         }
     }
+    knocked
 }
 
 /// What `vehicle` does to what it runs into: what its body touched in
@@ -4550,6 +4586,12 @@ fn run_into(
         let Some(m) = loose.filter(|&m| !holds && mass * speed >= KNOCK_RATIO * m) else {
             continue;
         };
+        // A fake physics prop (most light ones) is felt as at most a
+        // fiftieth of the vehicle (its `FakeToRealMassRatio`, the 360's
+        // mass changer on the contact: [`m2_engine::durability::FakeMass`]).
+        let raw = m;
+        let fake = world.index.template_db.fake_masses.get(&template).copied();
+        let m = fake.map_or(m, |f| f.felt(m, mass));
         let (fling, topple) = flung(vehicle.velocity, mass, m);
         let knocked = match key {
             StaticKey::Object(i) => world.knock(i, fling, topple),
@@ -4558,7 +4600,14 @@ fn run_into(
         };
         if knocked {
             shifted += m;
-            eprintln!("knocked loose: {key:?} ({m:.0} kg) by the {label} at {speed:.1} m/s");
+            eprintln!(
+                "knocked loose: {key:?} ({raw:.0} kg, felt as {m:.0}; {}) by the {label} at {speed:.1} m/s",
+                match fake {
+                    Some(f) if f.fake => "fake physics",
+                    Some(_) => "real physics",
+                    None => "no _PropPhysics",
+                }
+            );
         }
     }
     (shifted, ploughed)
