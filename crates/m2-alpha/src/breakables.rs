@@ -246,6 +246,7 @@ pub fn crasher_at(
         bounds,
         velocity: forward * speed,
         mass,
+        sound: 0,
     }
 }
 

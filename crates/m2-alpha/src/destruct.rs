@@ -105,7 +105,16 @@ pub struct Crasher {
     pub bounds: (Vec3, Vec3),
     pub velocity: Vec3,
     pub mass: f32,
+    /// Its template's `SoundKey` (0: none known): what it brings down is
+    /// heard by the sound table's cue for the two
+    /// ([`m2_engine::tuning::KeyTable::either`]).
+    pub sound: u32,
 }
+
+/// The `ParticleKey` every vehicle's template names (`Vehicle`): the
+/// particle table's column for what a vehicle runs into. From samples
+/// (the M151, the AMX30 and the rest checked name it).
+const VEHICLE_PARTICLES: &str = "Vehicle";
 
 /// Whether a vehicle runs into what is under `key`: its body touched it,
 /// else its box overlaps its collision (`boxed`), or, for what has no
@@ -325,6 +334,13 @@ pub struct Destruction {
     /// Breaks to be heard at the next [`update`](Self::update): where, and
     /// the template's `SoundKey`.
     heard: Vec<(Vec3, u32)>,
+    /// Effects (template name hashes) to start at the next
+    /// [`update`](Self::update), and where.
+    thrown: Vec<(Vec3, u32)>,
+    /// The `SoundKey` of the vehicle whose crash is being worked out
+    /// ([`Crasher::sound`]; 0 outside [`crash`](Self::crash)).
+    crashing: u32,
+    in_crash: bool,
     /// Damage the physics props have taken so far ([`wear`](Self::wear)).
     worn: HashMap<StaticKey, f32>,
     /// The state layers' props that blow up, worn under their template's
@@ -722,6 +738,7 @@ impl Destruction {
             let (velocity, spin) = cause.flings(o.position, m);
             world.knock(i, velocity, spin);
             if let Some(&k) = world.index.template_db.sound_keys.get(&o.template) {
+                let k = self.heard_as(world, k);
                 self.heard.push((o.position, k));
             }
         } else {
@@ -734,9 +751,11 @@ impl Destruction {
                 .get(&o.template)
                 .is_some_and(|d| d.collapse.is_some());
             if let Some(&k) = db.sound_keys.get(&o.template).filter(|_| !building) {
+                let k = self.heard_as(world, k);
                 self.heard.push((o.position, k));
             }
         }
+        self.throws_up(world, o.template, o.position);
         world.take_static(i);
     }
 
@@ -750,6 +769,22 @@ impl Destruction {
     /// box meets ([`Crasher::meets`]: a bush with no collision). What its
     /// body touched and still stands is logged once ([`held`]).
     pub fn crash(
+        &mut self,
+        world: &mut World,
+        props: &mut Props,
+        install: &Install,
+        vehicle: &Crasher,
+        touched: &[StaticKey],
+    ) -> Vec<Crashed> {
+        self.in_crash = true;
+        self.crashing = vehicle.sound;
+        let out = self.crash_within(world, props, install, vehicle, touched);
+        self.in_crash = false;
+        self.crashing = 0;
+        out
+    }
+
+    fn crash_within(
         &mut self,
         world: &mut World,
         props: &mut Props,
@@ -855,8 +890,10 @@ impl Destruction {
                         break_sound(world, template)
                     );
                     if let Some(&k) = world.index.template_db.sound_keys.get(&template) {
+                        let k = self.heard_as(world, k);
                         self.heard.push((position, k));
                     }
+                    self.throws_up(world, template, position);
                     props.wreck_crashed(&mut world.physics, e, |shifted| {
                         crate::game::flung(vehicle.velocity, vehicle.mass, shifted)
                     });
@@ -969,6 +1006,39 @@ impl Destruction {
         Some(vec![Crashed::Down(key)])
     }
 
+    /// What a break of something whose `SoundKey` is `key` is heard as:
+    /// run into by a vehicle, the sound table's cue for the vehicle's key
+    /// and its, either way round (0x8235E850 -> 0x82398958: OilCon020's
+    /// hedges, `prop_foliage_sml`, against the M151's `veh_armored_light`
+    /// give cue 1d0a87e6); else, or where the table has none, its own key.
+    fn heard_as(&self, world: &World, key: u32) -> u32 {
+        (self.crashing != 0)
+            .then(|| world.index.template_db.sound_table.as_ref())
+            .flatten()
+            .and_then(|t| t.either(self.crashing, key))
+            .unwrap_or(key)
+    }
+
+    /// What a vehicle bringing down `template` at `at` throws up: the
+    /// particle table's effect for its `ParticleKey` (row) struck by a
+    /// vehicle (column `Vehicle`): `Vegetation`'s
+    /// `global_particle_impact_bullet_leaves`. From the 360 code: a hit's
+    /// effect is the table's cell for the struck part's key and the hit's
+    /// (0x8218B410 -> 0x82398890). Only while a crash is worked out.
+    fn throws_up(&mut self, world: &World, template: u32, at: Vec3) {
+        if !self.in_crash {
+            return;
+        }
+        let db = &world.index.template_db;
+        let Some(&row) = db.particle_keys.get(&template) else {
+            return;
+        };
+        let column = m2_assets::name_hash(VEHICLE_PARTICLES);
+        if let Some(effect) = db.particle_table.as_ref().and_then(|t| t.get(row, column)) {
+            self.thrown.push((at, effect));
+        }
+    }
+
     /// A part breaking is heard where it stood, as its template's
     /// `SoundKey` says.
     fn part_heard(
@@ -980,12 +1050,14 @@ impl Destruction {
         k: usize,
         or: Vec3,
     ) {
+        let c = parts
+            .part_box(k)
+            .map_or(or, |(lo, hi)| at.transform_point3((lo + hi) * 0.5));
         if let Some(&s) = world.index.template_db.sound_keys.get(&template) {
-            let c = parts
-                .part_box(k)
-                .map_or(or, |(lo, hi)| at.transform_point3((lo + hi) * 0.5));
+            let s = self.heard_as(world, s);
             self.heard.push((c, s));
         }
+        self.throws_up(world, template, c);
     }
 
     /// Brings down what falls with what was brought down
@@ -1048,6 +1120,14 @@ impl Destruction {
         self.fall_linked(world, props, install);
         for (at, key) in self.heard.drain(..) {
             combat.broke(at, key);
+        }
+        for (at, effect) in self.thrown.drain(..) {
+            combat.game_fx.push(crate::combat::GameFx {
+                template: crate::combat::FxTemplate::Hash(effect),
+                at,
+                hold: None,
+                turn: None,
+            });
         }
         for shows in self.alight.drain(..) {
             combat.state_shows(shows);
@@ -1187,6 +1267,7 @@ mod tests {
             bounds: (Vec3::new(-1.0, 0.0, -2.2), Vec3::new(1.0, 1.6, 2.2)),
             velocity: Vec3::new(0.0, 0.0, 8.0),
             mass: 1000.0,
+            sound: 0,
         }
     }
 

@@ -4371,6 +4371,7 @@ fn knock_loose(
                 bounds: v.model.bounds,
                 velocity: Vec3::ZERO,
                 mass: v.spec.mass,
+                sound: 0,
             };
             // What stands in its box with collision, and what has none
             // (PirCon004's organ boxes: none rode, and the truck left
@@ -4429,11 +4430,17 @@ fn knock_loose(
         let Some(place) = world.physics.vehicle_transform(id) else {
             continue;
         };
+        let db = &world.index.template_db;
+        let sound = db
+            .id(&v.spec.label)
+            .and_then(|t| db.sound_keys.get(&t).copied())
+            .unwrap_or(0);
         let crasher = Crasher {
             place,
             bounds: v.model.bounds,
             velocity: before,
             mass,
+            sound,
         };
         let keys = world.physics.vehicle_statics(id);
         let (shifted, ploughed) = run_into(
