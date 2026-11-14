@@ -6639,7 +6639,6 @@ pub(crate) mod tests {
             aim_walk: Default::default(),
             shuffling: false,
             aim_clock: 0.0,
-            arm: Default::default(),
             cues: Vec::new(),
             own: Default::default(),
             foreign: Default::default(),

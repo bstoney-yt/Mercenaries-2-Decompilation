@@ -120,8 +120,6 @@ pub struct Rig {
     /// noise of the crouched gait's weight over the aim
     /// ([`m2_engine::aim_sweep::layer_weight`]).
     pub aim_clock: f32,
-    /// The arm that carries the rifle low, found once.
-    pub(crate) arm: std::sync::OnceLock<Option<Arc<[bool]>>>,
     /// The clips' events met and not yet taken: (clip, event).
     pub cues: Vec<(usize, usize)>,
     /// A hero's: the name hashes of the clips of the hero's own group.
@@ -802,7 +800,6 @@ impl Rig {
             aim_walk: Default::default(),
             shuffling: false,
             aim_clock: 0.0,
-            arm: Default::default(),
             skeleton: Arc::new(skeleton),
             clips: Arc::new(clips),
             locomotion: Some(Locomotion {
@@ -927,7 +924,6 @@ impl Rig {
             aim_walk: Default::default(),
             shuffling: false,
             aim_clock: 0.0,
-            arm: Default::default(),
             skeleton: Arc::new(skeleton),
             clips: Arc::new(clips),
             locomotion,
@@ -1029,10 +1025,21 @@ impl Rig {
 
     /// Moves at `gait` holding a rifle as `carry` says. Aiming, it is
     /// shouldered: by the whole body standing, by the upper body over the
-    /// legs' gait when moving. Running, it is held low across the body in
-    /// both hands, and sprinting too (the player's [`npc::FightClips::sprint`]);
-    /// otherwise the plain gait carries it low in the right hand, standing
-    /// at the ready too. Falls back to the plain gait without the clips.
+    /// legs' gait when moving. Otherwise each gait's own clip holds it,
+    /// played whole: the on-foot table's clip of the gait for what she
+    /// holds (`Upright_Walk_Forward`... rows of her equipment class),
+    /// which has it in both hands, with nothing laid over the upper body.
+    ///
+    /// From the 360 code: not aiming (the human state's aim bits,
+    /// `+0x3C >> 14`, 0), the locomotion node's step (0x828071A8) fades in
+    /// its gait mix alone (weight +0x11A0, 0x8280B770, as its init
+    /// 0x82804AE8 starts it); its hand IK ([`m2_engine::hand_ik`]) is
+    /// wired in only aiming (bits 2, 0x8280AE60) and its other upper input
+    /// only at bits 1 (0x8280B530). There is no arm of the standing clip
+    /// over the gait: the alpha's own carry (the standing right arm over
+    /// the walk and the run, from before the gaits were the table's rifle
+    /// clips) left the rifle in the standing hand and the front hand where
+    /// the gait clip holds it, off the rifle (playtest 11-13, Chris).
     ///
     /// Standing at the ready used to loop the "ready" clip (178a5642), but
     /// that clip is an aim sweep: the on-foot table gives it under handle
@@ -1080,12 +1087,7 @@ impl Rig {
         if carry != Carry::Aim {
             self.aim = None;
         }
-        // Carried low on the move, the rifle arm hangs as it does standing
-        // while the rest of her runs (the game's carry).
-        let arm = (carry == Carry::Low && gait != Gait::Idle && whole.is_none())
-            .then(|| self.gait_clip(Gait::Idle).zip(self.carry_arm()))
-            .flatten();
-        self.animator.set_upper(upper.or(arm));
+        self.animator.set_upper(upper);
     }
 
     /// The pose turned to aim along [`Rig::aim`], when aiming.
@@ -1251,16 +1253,6 @@ impl Rig {
     /// ([`aim_hands`](crate::combat::aim_hands)).
     pub fn aim_hands(&self) -> Option<(usize, usize)> {
         *self.hands.get_or_init(|| crate::combat::aim_hands(self))
-    }
-
-    /// The arm of the hand that carries the rifle low.
-    pub fn carry_arm(&self) -> Option<Arc<[bool]>> {
-        self.arm
-            .get_or_init(|| {
-                let (right, left) = crate::combat::hands(&self.skeleton)?;
-                self.skeleton.arm(right, left)
-            })
-            .clone()
     }
 
     /// The hand that carries the rifle low: her right (the aim pose holds
@@ -4288,8 +4280,8 @@ fn ground(
 
 /// The clips a rifle is held by at `gait` and `carry`: one played whole
 /// (held in both hands), and one over the upper body (the aim's arms).
-/// Neither: the gait's own clip, the rifle carried low in the right hand
-/// with the standing arm over it. `full_sprint` is the 360's sprint's
+/// Neither: the gait's own clip played whole, which holds it in both
+/// hands, nothing over it ([`Rig::hold_rifle`]). `full_sprint` is the 360's sprint's
 /// clip, where the rig has its own (`gait` comes as [`Gait::Sprint`]
 /// where it has not).
 fn rifle_clips(
@@ -4315,9 +4307,9 @@ fn rifle_clips(
 #[cfg(test)]
 mod tests {
     /// The 360's sprint with its own clip plays it whole, the rifle in
-    /// both hands; the walk and the alpha's sprint keep the carry (the
-    /// standing arm over the gait), the jog its low two-handed run, and
-    /// aiming the aim's arms.
+    /// both hands; the walk and the alpha's sprint (the 360's run) play
+    /// their own gait clips with nothing over them, the jog its low
+    /// two-handed run, and aiming the aim's arms.
     #[test]
     fn the_sprint_holds_the_rifle_in_both_hands() {
         let clips = npc::FightClips {
