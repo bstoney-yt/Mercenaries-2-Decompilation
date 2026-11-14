@@ -319,6 +319,9 @@ pub struct Hijacks {
     /// (by the same key as [`Hijacks::seats`]), over the seat's own guess
     /// ([`Seat::shown`]).
     scripts_shown: HashMap<(u32, String), bool>,
+    /// Seconds since she went down seated, while she is down (her
+    /// [`seated_death`] clips).
+    seated_dead: Option<f32>,
     /// Vehicles (index, model) whose parts are set as their templates say.
     dressed: std::collections::HashSet<(usize, u32)>,
     /// Riders' seats, by the vehicle's model and label and the seat.
@@ -412,6 +415,54 @@ struct Seat {
     /// The seat's `InVehicle` `SteerSweep` clip, when its vehicle sweeps
     /// ([`sweeps`]): held at the steer's [`sweep_weight`] through it.
     sweep: Option<u32>,
+    /// The seat's `InVehicle` `Die` and `Dead` clips ([`DEATH_ACTIONS`]):
+    /// killed seated she plays the first once, then holds the second
+    /// ([`seated_death`]).
+    death: [Option<u32>; 2],
+}
+
+/// The seated death's actions: `InVehicle` `Die`, whose `Complete` goes
+/// to `InVehicle` `Dead` (the game's human state table). Both are in the
+/// `InVehicle` stance with ragdoll mode `NONE`: she dies and stays in the
+/// seat, animated, not limp.
+pub const DEATH_ACTIONS: [&str; 2] = ["Die", "Dead"];
+
+/// Which of a seated death's clips plays `t` seconds into it, as an index
+/// into [`DEATH_ACTIONS`] (`Die` of `die` seconds, then `Dead`), with
+/// whether it plays once: `Die` once until it is over, then `Dead` looped;
+/// with no `Dead` clip the `Die` holds its last frame; with no `Die`, the
+/// `Dead` from the start. `None` with neither.
+pub fn seated_death(die: Option<f32>, dead: bool, t: f32) -> Option<(usize, bool)> {
+    match (die, dead) {
+        (Some(length), true) if t >= length => Some((1, false)),
+        (Some(_), _) => Some((0, true)),
+        (None, true) => Some((1, false)),
+        (None, false) => None,
+    }
+}
+
+/// The seat's clip for `InVehicle` action `action`, by the tables, where
+/// the vehicle table's row names the vehicle or its class: the catch-all
+/// row 1's clip is no clip of that action's (the seats example finds every
+/// seat without one of its own falling there). The seat's own row first,
+/// then the seat-less query's.
+fn seat_action_clip(
+    clips: &ClipTimes,
+    link: Option<u32>,
+    set: (u32, u32),
+    action: &str,
+) -> Option<u32> {
+    let (actions, vehicles) = clips.tables.as_ref()?;
+    let row =
+        |seat| animation_table::seat_clip_row(actions, vehicles, "InVehicle", action, set, seat);
+    let (clip, r) = row(link).or_else(|| row(None))?;
+    let named = |c: &str| {
+        vehicles
+            .column(c)
+            .and_then(|c| vehicles.cell(r, c))
+            .is_some_and(|v| v != animation_table::ANY)
+    };
+    (named("VehicleName") || named("VehicleClass")).then_some(clip)
 }
 
 /// The animation set classes and names whose seats sweep the wheel
@@ -496,6 +547,7 @@ impl Hijacks {
             near: None,
             seats: HashMap::new(),
             scripts_shown: HashMap::new(),
+            seated_dead: None,
             dressed: Default::default(),
             rider_seats: HashMap::new(),
             rider_clips: HashMap::new(),
@@ -1437,16 +1489,33 @@ impl Hijacks {
         let band = steer_band(game.steer).filter(|_| steering);
         let steer_clip = |seat: &Seat| band.and_then(|b| seat.steer[b]);
         let steer = game.steer;
+        // Killed seated: how long since, for her death clips.
+        let down = game.scene.player.as_ref().is_some_and(|p| p.down);
+        self.seated_dead = down.then(|| self.seated_dead.map_or(0.0, |t| t + dt));
+        let dead_for = self.seated_dead;
         let seated = her_seat.filter(shown).and_then(|seat| {
             let swept = seat.sweep.filter(|_| steering).and_then(|c| bind(game, c));
             let steered = steer_clip(&seat).and_then(|c| bind(game, c));
+            let death = dead_for.map(|_| seat.death.map(|c| c.and_then(|c| bind(game, c))));
             let index = bind(game, seat.clip)?;
             let scene = &mut game.scene;
             let world = scene.world.as_ref()?;
             let at = world.physics.vehicle_transform(scene.vehicles[i].id?)?;
             let p = scene.player.as_mut()?;
             let (_, rig) = p.model.as_mut()?;
+            // Dead in the seat: the seat's Die once, then its Dead (the
+            // state table's InVehicle Die -> Complete -> Dead, ragdoll
+            // NONE). With neither clip she sits on as before.
+            let dying = death.zip(dead_for).and_then(|(clips, t)| {
+                let die = clips[0].map(|c| rig.clips[c].info.duration);
+                let (k, once) = seated_death(die, clips[1].is_some(), t)?;
+                let clip = clips[k]?;
+                rig.animator
+                    .play_action(clip, once, m2_assets::name_hash(DEATH_ACTIONS[k]));
+                Some(clip)
+            });
             match (swept, band, steered) {
+                _ if dying.is_some() => {}
                 // Sweeping: the SteerSweep clip held at the steer's point
                 // through it (0x8229BC50's sweep flag).
                 (Some(s), ..) => {
@@ -1471,7 +1540,8 @@ impl Hijacks {
             // Her clip's space is the vehicle's, its origin on the seat
             // (her model's axes the vehicle's, as the hijack clips'),
             // with the vehicle's whole turn.
-            let frame = at * Mat4::from_translation(seat.at + seat_offset(rig, index));
+            let frame =
+                at * Mat4::from_translation(seat.at + seat_offset(rig, dying.unwrap_or(index)));
             p.seat_frame = Some(frame);
             p.character.position = frame.transform_point3(Vec3::ZERO);
             p.character.velocity = Vec3::ZERO;
@@ -2895,50 +2965,15 @@ fn find_seat(
     // table's row names the vehicle or its class (the catch-all's clip is
     // no steering one: the seats example finds 536 seat rows of their own
     // or their class's for each steering action, the rest on row 1).
-    let steer = STEER_ACTIONS.map(|action| {
-        clips.tables.as_ref().and_then(|(actions, vehicles)| {
-            let seat = link.map(|l| l.0);
-            let row = |seat| {
-                animation_table::seat_clip_row(actions, vehicles, "InVehicle", action, set, seat)
-            };
-            let (clip, r) = row(seat).or_else(|| row(None))?;
-            let named = |c: &str| {
-                vehicles
-                    .column(c)
-                    .and_then(|c| vehicles.cell(r, c))
-                    .is_some_and(|v| v != animation_table::ANY)
-            };
-            (named("VehicleName") || named("VehicleClass")).then_some(clip)
-        })
-    });
+    let steer = STEER_ACTIONS.map(|action| seat_action_clip(clips, link.map(|l| l.0), set, action));
     eprintln!("seat: {name}: steering clips {steer:08x?} ({STEER_ACTIONS:?})");
     // A sweeping seat's SteerSweep clip, where the vehicle table names it.
     let kind = scene.vehicles[i].spec.kind.clone();
     let sweep = sweeps(&kind, set)
-        .then(|| {
-            clips.tables.as_ref().and_then(|(actions, vehicles)| {
-                let seat = link.map(|l| l.0);
-                let row = |seat| {
-                    animation_table::seat_clip_row(
-                        actions,
-                        vehicles,
-                        "InVehicle",
-                        "SteerSweep",
-                        set,
-                        seat,
-                    )
-                };
-                let (clip, r) = row(seat).or_else(|| row(None))?;
-                let named = |c: &str| {
-                    vehicles
-                        .column(c)
-                        .and_then(|c| vehicles.cell(r, c))
-                        .is_some_and(|v| v != animation_table::ANY)
-                };
-                (named("VehicleName") || named("VehicleClass")).then_some(clip)
-            })
-        })
+        .then(|| seat_action_clip(clips, link.map(|l| l.0), set, "SteerSweep"))
         .flatten();
+    let death = DEATH_ACTIONS.map(|action| seat_action_clip(clips, link.map(|l| l.0), set, action));
+    eprintln!("seat: {name}: death clips {death:08x?} ({DEATH_ACTIONS:?})");
     if sweeps(&kind, set) {
         eprintln!("seat: {name}: sweeps its wheel (SteerSweep clip {sweep:08x?})");
     }
@@ -2979,6 +3014,7 @@ fn find_seat(
         set,
         steer,
         sweep,
+        death,
     })
 }
 
@@ -3031,6 +3067,7 @@ fn find_prop_seat(
         set,
         steer: [None; 4],
         sweep: None,
+        death: [None; 2],
     })
 }
 
@@ -3326,6 +3363,23 @@ mod tests {
         assert_eq!(steer_band(-1.0), Some(3));
         assert_eq!(STEER_ACTIONS[steer_band(0.9).unwrap()], "SteerLeft90");
         assert_eq!(STEER_ACTIONS[steer_band(-0.3).unwrap()], "SteerRight45");
+    }
+
+    /// Killed seated she plays the seat's Die once, then holds its Dead
+    /// (the state table's InVehicle Die -> Complete -> Dead); a missing
+    /// clip leaves the other, and with neither nothing changes.
+    #[test]
+    fn a_seated_death_plays_die_then_dead() {
+        assert_eq!(DEATH_ACTIONS, ["Die", "Dead"]);
+        assert_eq!(seated_death(Some(2.0), true, 0.0), Some((0, true)));
+        assert_eq!(seated_death(Some(2.0), true, 1.99), Some((0, true)));
+        assert_eq!(seated_death(Some(2.0), true, 2.0), Some((1, false)));
+        assert_eq!(seated_death(Some(2.0), true, 9.0), Some((1, false)));
+        // No Dead clip: the Die holds its last frame.
+        assert_eq!(seated_death(Some(2.0), false, 9.0), Some((0, true)));
+        // No Die clip: the Dead from the start.
+        assert_eq!(seated_death(None, true, 0.0), Some((1, false)));
+        assert_eq!(seated_death(None, false, 0.0), None);
     }
 
     #[test]
