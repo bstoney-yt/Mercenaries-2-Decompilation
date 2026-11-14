@@ -43,22 +43,54 @@
 //!   and keeps her in; pressed again while the clock runs, she gets out.
 //!   The update runs the clock down and takes the prompt back when it
 //!   ends; leaving the state (`0x8242E730`) takes it back too.
-//! - The facing choice (`0x82432CF0`) among several things in reach: one
-//!   alone is taken; else each is scored by the dot of her facing (the
-//!   state's `+0x12C`, normalized) with the way from the camera to it and
-//!   by its squared distance from her, and it beats the best so far when
-//!   its dot is more than 0.1 lower at worst and either 0.1 or more
-//!   higher, or higher and nearer, or (lower by under 0.1) nearer by more
-//!   than 3 m².
+//! - Among several things in reach the one she faces is offered and
+//!   taken ([`faced`], `0x82432CF0`): one alone is taken; else each is
+//!   scored by the dot of her look (the state's `+0x12C`, normalized) with
+//!   the way from the camera (the player's camera `+0x38`) to it, and by
+//!   its squared distance from her; it beats the best so far when its dot
+//!   is no more than 0.1 lower (`0x820B7FC4`) and either 0.1 or more
+//!   higher (`0x820BB468`), or higher and nearer, or (lower) nearer by
+//!   more than 3 m² (`0x820F9584`); the first starts against -1e30 and
+//!   1e30 (`0x820F9770`, `0x820F9774`).
 //!
-//! Not done here: that facing choice (the alpha keeps its own order: the
-//! scripts' text, then a gun, then an emplacement or a vehicle); grapple,
-//! subdue, verify and stow. Inferred: the helicopter's two heights are read
-//! here as one downward ray's height above what lies under it (what the
-//! physics stores at `+0x158`/`+0x160` was not traced).
+//! Inferred: the state's `+0x12C` read as the camera's look; the
+//! helicopter's two heights read as one downward ray's height above what
+//! lies under it (what the physics stores at `+0x158`/`+0x160` was not
+//! traced). The alpha offers the scripts' text first and keeps its own
+//! choice between a gun lying there and an emplaced gun (a gun lying
+//! there first); the facing choice is between that and the vehicle
+//! entrance in reach. Not done: grapple, subdue, verify and stow.
 
 use m2_engine::seats::Role;
 use m2_engine::world::VehicleKind;
+use m2_math::glam::Vec3;
+
+/// Which of `things` in reach she faces (`0x82432CF0`), looking along
+/// `look` from the camera at `eye`, standing at `her`: one alone is
+/// taken, none is none.
+pub fn faced(eye: Vec3, look: Vec3, her: Vec3, things: &[Vec3]) -> Option<usize> {
+    match things.len() {
+        0 => return None,
+        1 => return Some(0),
+        _ => {}
+    }
+    let look = look.normalize_or_zero();
+    let (mut best, mut best_dot, mut best_d2) = (None, -1.0e30_f32, 1.0e30_f32);
+    for (i, &at) in things.iter().enumerate() {
+        let dot = look.dot((at - eye).normalize_or_zero());
+        let d2 = at.distance_squared(her);
+        let gain = dot - best_dot;
+        let nearer = d2 - best_d2;
+        let better = gain > -0.1
+            && (gain >= 0.1 || (gain >= 0.0 && nearer < 0.0) || (gain < 0.0 && nearer < -3.0));
+        if better {
+            best = Some(i);
+            best_dot = dot;
+            best_d2 = d2;
+        }
+    }
+    best
+}
 
 /// What the use button does, by the 360's kind number (its priority on
 /// the HUD).
@@ -366,6 +398,36 @@ mod tests {
         assert!(!c.press(true, Some(6.0)));
         assert_eq!(Action::Exit.text(None), "[ContextAction.ExitVehicle]");
         assert_eq!(Action::Exit.kind(), 15);
+    }
+
+    /// The one she looks at most squarely is offered; nearly as squarely,
+    /// the nearer (by more than 3 m² when it is the less square).
+    #[test]
+    fn the_thing_she_faces_is_offered() {
+        let (eye, her) = (Vec3::new(0.0, 2.0, -4.0), Vec3::ZERO);
+        let ahead = Vec3::Z;
+        assert_eq!(faced(eye, ahead, her, &[]), None);
+        assert_eq!(faced(eye, ahead, her, &[Vec3::new(9.0, 0.0, 0.0)]), Some(0));
+        // A gun ahead, a car well off to the side: the gun, either order.
+        let gun = Vec3::new(0.0, 0.0, 2.0);
+        let car = Vec3::new(4.0, 0.0, -1.0);
+        assert_eq!(faced(eye, ahead, her, &[car, gun]), Some(1));
+        assert_eq!(faced(eye, ahead, her, &[gun, car]), Some(0));
+        // Nearly in line (within 0.1): a nearer one wins only by more
+        // than 3 m² when it is the less square.
+        let far = Vec3::new(0.0, 0.0, 6.0);
+        let near_side = Vec3::new(0.6, 0.0, 1.0);
+        let (d_far, d_near) = (
+            ahead.dot((far - eye).normalize()),
+            ahead.dot((near_side - eye).normalize()),
+        );
+        assert!(d_near < d_far && d_far - d_near < 0.1, "{d_far} {d_near}");
+        assert_eq!(faced(eye, ahead, her, &[far, near_side]), Some(1));
+        // Less square and nearer by under 3 m²: the first stays.
+        let behind_it = Vec3::new(0.2, 0.0, 6.0);
+        let a = Vec3::new(0.0, 0.0, 6.2);
+        assert!(a.distance_squared(her) - behind_it.distance_squared(her) < 3.0);
+        assert_eq!(faced(eye, ahead, her, &[a, behind_it]), Some(0));
     }
 
     /// The texts: named with the thing's key where the kind takes one,
