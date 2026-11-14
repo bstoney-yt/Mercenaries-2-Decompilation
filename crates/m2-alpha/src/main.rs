@@ -10174,7 +10174,7 @@ impl Running {
         };
         self.game.set_view_distance(o.view_distance);
         if let Some(m) = &mut self.mission {
-            m.set_options(o.subtitles, o.tutorials);
+            m.set_options(o);
         }
     }
 

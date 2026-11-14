@@ -2386,6 +2386,16 @@ return true
         self.world.borrow_mut().subtitles_off = !on;
     }
 
+    /// The player's inverted Y, rumble and autosave options, as the
+    /// natives read them from the profile (`Sys.YAxisInverted`,
+    /// `Sys.RumbleEnabled`, `Sys.IsAutosaveEnabled`).
+    pub fn set_profile_options(&mut self, invert_y: bool, rumble: bool, autosave: bool) {
+        self.world
+            .borrow_mut()
+            .sys_flags
+            .set_profile(invert_y, rumble, autosave);
+    }
+
     /// Whether the player has the tutorial tips on
     /// (`Sys.TutorialsEnabled`; on unless told).
     pub fn set_tutorials(&mut self, on: bool) {
