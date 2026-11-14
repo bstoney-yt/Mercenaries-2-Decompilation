@@ -19,6 +19,8 @@
 //! collides through its own triangles of the batch.
 
 use std::collections::{HashMap, HashSet};
+
+use m2_render::fasthash::{FastMap, FastSet};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
@@ -147,6 +149,9 @@ impl Loader {
                             let t = match source.texture(hash, max) {
                                 Ok(mut t) => {
                                     t.linear = linear;
+                                    // Its mips filtered here, not on the
+                                    // main thread at upload.
+                                    crate::model::complete_mips(&mut t);
                                     Some(t)
                                 }
                                 Err(e) => {
@@ -594,18 +599,18 @@ pub struct World {
     in_flight: HashSet<Request>,
     tiles: HashMap<u32, Slot<TerrainGpu>>,
     cells: HashMap<u32, Slot<TerrainGpu>>,
-    models: HashMap<u32, Slot<GpuModel>>,
+    models: FastMap<u32, Slot<GpuModel>>,
     /// When each loaded model last had a placed object near enough to
     /// keep it ([`MODEL_KEEP_MARGIN`]); one left out longer than
     /// [`MODEL_KEEP_FOR`] is freed with what only it uses.
-    model_seen: HashMap<u32, std::time::Instant>,
+    model_seen: FastMap<u32, std::time::Instant>,
     /// Models whose objects' collision is already in the world: loaded
     /// again after being freed, it is not added again.
     collided: HashSet<u32>,
     scatter: HashMap<u32, Slot<Vec<ClumpGpu>>>,
     /// Each tree species' far stand-in, by species.
     far_trees: Vec<Option<FarTreeGpu>>,
-    objects: HashMap<(i32, i32), Vec<usize>>,
+    objects: FastMap<(i32, i32), Vec<usize>>,
     /// Placed objects by model hash.
     by_model: HashMap<u32, Vec<usize>>,
     /// Placed objects by the entity placing them, for the members of
@@ -632,10 +637,10 @@ pub struct World {
     /// The models of placed objects that come loose when knocked, by hash.
     loose: HashMap<u32, Arc<Loose>>,
     /// Placed objects knocked loose: their pieces, in [`Loose`] order.
-    knocked: HashMap<usize, Vec<DebrisId>>,
+    knocked: FastMap<usize, Vec<DebrisId>>,
     /// Placed objects taken off the island ([`take`](Self::take)): what is
     /// left of them is drawn elsewhere (a building that came down).
-    taken: HashSet<usize>,
+    taken: FastSet<usize>,
     /// Placed objects whose standing collision was taken away
     /// ([`take_static`](Self::take_static)): destroyed, in nobody's way.
     felled: HashSet<usize>,
@@ -653,7 +658,7 @@ pub struct World {
     foliage_logged: std::time::Instant,
     /// `M2_HIDE=<model>,<model>...`: placed models by these names aren't
     /// drawn, to find which model a stray shape on screen is.
-    hidden: HashSet<u32>,
+    hidden: FastSet<u32>,
 }
 
 /// The foliage log's census of terrain cell `cell`'s blocks: each asset
@@ -764,7 +769,7 @@ impl World {
         let inland = inland_water(backend, heights.as_ref(), settings.sea_level)?;
         drop(source);
         let loader = Loader::spawn(install, index.clone(), TextureLimits::default())?;
-        let mut objects: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        let mut objects: FastMap<(i32, i32), Vec<usize>> = FastMap::default();
         let mut by_model: HashMap<u32, Vec<usize>> = HashMap::new();
         let mut by_entity: HashMap<u32, usize> = HashMap::new();
         for (i, o) in index.objects.iter().enumerate() {
@@ -786,8 +791,8 @@ impl World {
             in_flight: HashSet::new(),
             tiles: HashMap::new(),
             cells: HashMap::new(),
-            models: HashMap::new(),
-            model_seen: HashMap::new(),
+            models: FastMap::default(),
+            model_seen: FastMap::default(),
             collided: HashSet::new(),
             scatter: HashMap::new(),
             far_trees,
@@ -803,8 +808,8 @@ impl World {
             stats: WorldStats::default(),
             destroyed: HashSet::new(),
             loose: HashMap::new(),
-            knocked: HashMap::new(),
-            taken: HashSet::new(),
+            knocked: FastMap::default(),
+            taken: FastSet::default(),
             felled: HashSet::new(),
             member_of: HashMap::new(),
             member_object: HashMap::new(),
@@ -1457,13 +1462,13 @@ impl World {
                 }
             }
         }
-        fn ready<T>(slots: &HashMap<u32, Slot<T>>) -> usize {
+        fn ready<T, S>(slots: &HashMap<u32, Slot<T>, S>) -> usize {
             slots
                 .values()
                 .filter(|s| matches!(s, Slot::Ready(_)))
                 .count()
         }
-        fn failed<T>(slots: &HashMap<u32, Slot<T>>) -> usize {
+        fn failed<T, S>(slots: &HashMap<u32, Slot<T>, S>) -> usize {
             slots.values().filter(|s| matches!(s, Slot::Failed)).count()
         }
         self.stats.tiles = ready(&self.tiles);
