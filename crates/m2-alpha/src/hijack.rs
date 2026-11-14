@@ -405,6 +405,67 @@ struct Seat {
     /// The vehicle's `VehicleAnimationSet` class and name, which pick its
     /// clips in the tables.
     set: (u32, u32),
+    /// The seat's `InVehicle` steering clips, by [`STEER_ACTIONS`]: turned
+    /// 45 and 90 degrees to the left, then to the right (none where the
+    /// tables give the seat none).
+    steer: [Option<u32>; 4],
+    /// The seat's `InVehicle` `SteerSweep` clip, when its vehicle sweeps
+    /// ([`sweeps`]): held at the steer's [`sweep_weight`] through it.
+    sweep: Option<u32>,
+}
+
+/// The animation set classes and names whose seats sweep the wheel
+/// rather than take the banded steering clips. From the 360 code: a boat
+/// (physics kind 10) whose set's class is `0x2318B429` or name one of the
+/// four below (0x822A66A0), or a car (kind 2) whose set's class is
+/// `0xA14A4912` (0x822A6538).
+const SWEEP_BOAT_CLASS: u32 = 0x2318_B429;
+const SWEEP_BOAT_NAMES: [u32; 4] = [0x6A77_E320, 0xCDB2_EC38, 0xC49E_3E3F, 0x072C_3307];
+const SWEEP_CAR_CLASS: u32 = 0xA14A_4912;
+
+/// Whether a vehicle of kind `kind` (the catalogue's: `boat`, `car`...)
+/// whose seat set is `set` (class, name) sweeps its wheel (0x822A66A0,
+/// 0x822A6538).
+pub fn sweeps(kind: &str, set: (u32, u32)) -> bool {
+    match kind {
+        m2_engine::vehicle::BOAT => set.0 == SWEEP_BOAT_CLASS || SWEEP_BOAT_NAMES.contains(&set.1),
+        "tank" | m2_engine::vehicle::HELICOPTER => false,
+        _ => set.0 == SWEEP_CAR_CLASS,
+    }
+}
+
+/// How far through the `SteerSweep` clip the wheel stands, 0 (full one
+/// way) to 1, for steer `s` (-1 to 1, positive left). From the 360 code
+/// (0x8229BC50 with the sweep flag): the steering angle clamped to 45
+/// degrees either way (0x82DE2F3C x 0x82B7C5EC), over 45 degrees, plus
+/// 1, halved, set on the person's node (0x82287350). The angle is the
+/// boat's (its physics' slot 0x13C) or the car's steering wheel's
+/// (+0x84); here the steer's share of 45 degrees (inferred).
+pub fn sweep_weight(s: f32) -> f32 {
+    (s.clamp(-1.0, 1.0) + 1.0) * 0.5
+}
+
+/// The `Idle` action's name hash, which a seat's own clip plays under.
+const IDLE_ACTION: u32 = m2_engine::blend::action::IDLE;
+
+/// The seated driver's steering actions, as [`steer_band`] numbers them.
+pub const STEER_ACTIONS: [&str; 4] = ["SteerLeft45", "SteerLeft90", "SteerRight45", "SteerRight90"];
+
+/// Which steering action a driver's steer `s` (-1 to 1, positive to the
+/// left) asks for: `None` for `SteerZero` (back to `Idle`), else its
+/// index in [`STEER_ACTIONS`]. From the 360 code (0x8229BC50, the steer
+/// event of a seat whose vehicle's animation set does not sweep): -0.1 to
+/// 0.1 (`0x820B7FC4`, `0x820BB468`) is straight; up to 0.8 (`0x820B8034`)
+/// a 45, past it a 90, to the left for positive, to the right for
+/// negative (-0.8, `0x820F930C`).
+pub fn steer_band(s: f32) -> Option<usize> {
+    if (-0.1..=0.1).contains(&s) {
+        None
+    } else if s > 0.1 {
+        Some(if s <= 0.8 { 0 } else { 1 })
+    } else {
+        Some(if s >= -0.8 { 2 } else { 3 })
+    }
 }
 
 impl Hijacks {
@@ -1370,14 +1431,36 @@ impl Hijacks {
         // left her, else as the vehicle's entrance has it (a DriverHatch:
         // inside).
         let shown = |s: &Seat| self.scripts_shown.get(&key).copied().unwrap_or(s.shown);
+        // At the wheel, the steering clip of her steer's band (from the
+        // 360 code, 0x8229BC50), held while it lasts; straight, the Idle.
+        let steering = ride.is_none() && !game.scene.vehicles[i].spec.is_helicopter();
+        let band = steer_band(game.steer).filter(|_| steering);
+        let steer_clip = |seat: &Seat| band.and_then(|b| seat.steer[b]);
+        let steer = game.steer;
         let seated = her_seat.filter(shown).and_then(|seat| {
+            let swept = seat.sweep.filter(|_| steering).and_then(|c| bind(game, c));
+            let steered = steer_clip(&seat).and_then(|c| bind(game, c));
             let index = bind(game, seat.clip)?;
             let scene = &mut game.scene;
             let world = scene.world.as_ref()?;
             let at = world.physics.vehicle_transform(scene.vehicles[i].id?)?;
             let p = scene.player.as_mut()?;
             let (_, rig) = p.model.as_mut()?;
-            rig.animator.play(index);
+            match (swept, band, steered) {
+                // Sweeping: the SteerSweep clip held at the steer's point
+                // through it (0x8229BC50's sweep flag).
+                (Some(s), ..) => {
+                    rig.animator
+                        .play_action(s, true, m2_assets::name_hash("SteerSweep"));
+                    let length = rig.clips[s].info.duration;
+                    rig.animator.seek(sweep_weight(steer) * length);
+                }
+                (None, Some(b), Some(s)) => {
+                    rig.animator
+                        .play_action(s, true, m2_assets::name_hash(STEER_ACTIONS[b]))
+                }
+                _ => rig.animator.play_action(index, false, IDLE_ACTION),
+            }
             rig.animator.advance(dt);
             let forward = rig
                 .locomotion
@@ -2808,6 +2891,57 @@ fn find_seat(
         eprintln!("seat: {name}: no hardpoint or seat marker for the seat: not drawn");
         return None;
     };
+    // The seat's steering clips, found as its Idle is, where the vehicle
+    // table's row names the vehicle or its class (the catch-all's clip is
+    // no steering one: the seats example finds 536 seat rows of their own
+    // or their class's for each steering action, the rest on row 1).
+    let steer = STEER_ACTIONS.map(|action| {
+        clips.tables.as_ref().and_then(|(actions, vehicles)| {
+            let seat = link.map(|l| l.0);
+            let row = |seat| {
+                animation_table::seat_clip_row(actions, vehicles, "InVehicle", action, set, seat)
+            };
+            let (clip, r) = row(seat).or_else(|| row(None))?;
+            let named = |c: &str| {
+                vehicles
+                    .column(c)
+                    .and_then(|c| vehicles.cell(r, c))
+                    .is_some_and(|v| v != animation_table::ANY)
+            };
+            (named("VehicleName") || named("VehicleClass")).then_some(clip)
+        })
+    });
+    eprintln!("seat: {name}: steering clips {steer:08x?} ({STEER_ACTIONS:?})");
+    // A sweeping seat's SteerSweep clip, where the vehicle table names it.
+    let kind = scene.vehicles[i].spec.kind.clone();
+    let sweep = sweeps(&kind, set)
+        .then(|| {
+            clips.tables.as_ref().and_then(|(actions, vehicles)| {
+                let seat = link.map(|l| l.0);
+                let row = |seat| {
+                    animation_table::seat_clip_row(
+                        actions,
+                        vehicles,
+                        "InVehicle",
+                        "SteerSweep",
+                        set,
+                        seat,
+                    )
+                };
+                let (clip, r) = row(seat).or_else(|| row(None))?;
+                let named = |c: &str| {
+                    vehicles
+                        .column(c)
+                        .and_then(|c| vehicles.cell(r, c))
+                        .is_some_and(|v| v != animation_table::ANY)
+                };
+                (named("VehicleName") || named("VehicleClass")).then_some(clip)
+            })
+        })
+        .flatten();
+    if sweeps(&kind, set) {
+        eprintln!("seat: {name}: sweeps its wheel (SteerSweep clip {sweep:08x?})");
+    }
     // The data's rule (the hijack scripts hiding her, which
     // [`Hijacks::seat`] takes, go over it): a driver got in through a
     // `DriverHatch` entrance is inside, out of sight. The PC footage of
@@ -2843,6 +2977,8 @@ fn find_seat(
         at,
         shown: !hatch,
         set,
+        steer,
+        sweep,
     })
 }
 
@@ -2893,6 +3029,8 @@ fn find_prop_seat(
         at: at?,
         shown: true,
         set,
+        steer: [None; 4],
+        sweep: None,
     })
 }
 
@@ -3158,6 +3296,37 @@ mod tests {
     }
 
     use super::*;
+
+    /// The driver's steer picks the 360's steering action: straight within
+    /// a tenth, 45 degrees up to 0.8, 90 past it, left for positive.
+    #[test]
+    fn boats_and_some_cars_sweep_their_wheel() {
+        assert!(sweeps("boat", (SWEEP_BOAT_CLASS, 0)));
+        assert!(sweeps("boat", (1, 0xCDB2_EC38)));
+        assert!(!sweeps("boat", (SWEEP_CAR_CLASS, 2)));
+        assert!(sweeps("car", (SWEEP_CAR_CLASS, 2)));
+        assert!(!sweeps("car", (SWEEP_BOAT_CLASS, 2)));
+        assert!(!sweeps("tank", (SWEEP_CAR_CLASS, 2)));
+        assert_eq!(sweep_weight(0.0), 0.5);
+        assert_eq!(sweep_weight(1.0), 1.0);
+        assert_eq!(sweep_weight(-2.0), 0.0);
+        assert!((sweep_weight(-0.5) - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_steer_picks_its_band() {
+        assert_eq!(steer_band(0.0), None);
+        assert_eq!(steer_band(0.1), None);
+        assert_eq!(steer_band(-0.1), None);
+        assert_eq!(steer_band(0.5), Some(0));
+        assert_eq!(steer_band(0.8), Some(0));
+        assert_eq!(steer_band(1.0), Some(1));
+        assert_eq!(steer_band(-0.5), Some(2));
+        assert_eq!(steer_band(-0.8), Some(2));
+        assert_eq!(steer_band(-1.0), Some(3));
+        assert_eq!(STEER_ACTIONS[steer_band(0.9).unwrap()], "SteerLeft90");
+        assert_eq!(STEER_ACTIONS[steer_band(-0.3).unwrap()], "SteerRight45");
+    }
 
     #[test]
     fn seats_by_name_or_by_hex_hash() {

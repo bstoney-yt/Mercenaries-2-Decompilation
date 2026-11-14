@@ -52,6 +52,7 @@ pub mod hijack;
 pub mod human_state;
 pub mod ladder;
 pub mod lights;
+pub mod lip_sync;
 pub mod melee;
 pub mod model;
 pub mod motion;

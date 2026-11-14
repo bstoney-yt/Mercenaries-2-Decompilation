@@ -191,8 +191,9 @@ pub struct MissionView {
 pub struct RadarView {
     /// Where (world): its target's place plus its offset, or its own.
     pub at: Vec3,
-    /// Its texture (`objective_action`), from the scripts' radar icons.
-    pub icon: String,
+    /// Its texture (`objective_action`), from the scripts' radar icons;
+    /// `None` for a blip given none.
+    pub icon: Option<String>,
     /// RGBA.
     pub colour: [u8; 4],
     /// Kept on the rim while out of range (see [`m2_game::hud::Blip`]).
@@ -977,6 +978,9 @@ enum State {
 /// The mission scripts and what they want shown.
 pub struct MissionLink {
     state: State,
+    /// The face rigs and sets read, and the sets the scripts mounted
+    /// ([`m2_engine::lip_sync`]).
+    faces: m2_engine::lip_sync::Library,
     /// The nodes of the models of props with hardpoints the scripts use,
     /// by model: name hash and place in the model ([`prop_hardpoints`]).
     prop_nodes: HashMap<u32, Vec<(u32, Vec3)>>,
@@ -1219,6 +1223,7 @@ impl MissionLink {
         Self {
             state: State::Loading(rx),
             prop_nodes: HashMap::new(),
+            faces: Default::default(),
             movies: false,
             acts_logged: Default::default(),
             end_skip: false,
@@ -2256,12 +2261,91 @@ impl MissionLink {
                 face.play(name, f.a, f.b, [0.5, 0.25, 0.75, 0.5]);
             }
         }
-        for speech in mission.world().borrow_mut().vo.take_speech() {
+        // The face sets the scripts mounted, on the rig of each
+        // character's template (`Animation.BindFaceAnimSet`, 0x82315CF8:
+        // the set goes on the rig asset, so everyone with it has it).
+        let binds = std::mem::take(&mut mission.world().borrow_mut().sp.face_sets);
+        for b in binds {
+            let templates = game.scene.world.as_ref().map(|w| &w.index.template_db);
+            let rig = b
+                .template
+                .as_deref()
+                .and_then(|t| templates.and_then(|db| db.face_actor(t)));
+            match rig {
+                Some(rig) if b.bind => self.faces.bind(rig, b.set),
+                Some(rig) => self.faces.unbind(rig, b.set),
+                None => {}
+            }
+            eprintln!(
+                "facefx: {} set {:08x} {} {:#x} ({:?}, rig {})",
+                if b.bind { "bind" } else { "unbind" },
+                b.set,
+                if b.bind { "to" } else { "from" },
+                b.character,
+                b.template,
+                rig.map_or("none".to_owned(), |r| format!("{r:08x}"))
+            );
+        }
+        // The lines that started and stopped. In the voice manager's
+        // cinematic mode the 360 plays the speaker's face animation named
+        // by the line (0x822782D8 posts the line's hash, 0x8241D270 finds
+        // it in the sets mounted on their rig; [`m2_engine::lip_sync`]);
+        // out of it their mouth flaps while it plays (`Flap`). A line
+        // with no face animation flaps too (invented: the 360 then moves
+        // nothing).
+        let cinematic = mission.world().borrow().vo.cinematic;
+        let speeches = mission.world().borrow_mut().vo.take_speech();
+        for speech in speeches {
             let (on, speaker, cue) = match speech {
                 m2_game::vo::Speech::Started { speaker, cue, .. } => (true, speaker, cue),
                 m2_game::vo::Speech::Stopped { speaker, cue, .. } => (false, speaker, cue),
             };
             let Some(guid) = speaker else { continue };
+            let lip = if on && cinematic {
+                let template = mission
+                    .world()
+                    .borrow()
+                    .objects
+                    .get(&guid)
+                    .map(|o| o.name.clone())
+                    .or_else(|| {
+                        (guid == m2_game::mission::PLAYER)
+                            .then(|| game.scene.hero.template().to_owned())
+                    });
+                let templates = game.scene.world.as_ref().map(|w| &w.index.template_db);
+                let rig = template
+                    .as_deref()
+                    .and_then(|t| templates.and_then(|db| db.face_actor(t)));
+                let source = game.scene.source.as_mut();
+                match (rig, source) {
+                    (Some(rig), Some(source)) => {
+                        let lip = self.faces.find(rig, cue, |h, ty| source.asset(h, ty).ok());
+                        match &lip {
+                            Some(l) => eprintln!(
+                                "facefx: cue {cue:08x} anim {:08x} curves {} ({:.1} s, set {:08x}, rig {rig:08x}, speaker {guid:#x})",
+                                m2_assets::name_hash(&l.animation().name),
+                                l.curves(),
+                                l.animation().seconds(),
+                                l.set_hash
+                            ),
+                            None => eprintln!(
+                                "facefx: cue {cue:08x} has no animation in the {} sets on rig {rig:08x} (speaker {guid:#x}): Flap",
+                                self.faces.bound(rig).len()
+                            ),
+                        }
+                        lip
+                    }
+                    _ => {
+                        eprintln!(
+                            "facefx: cue {cue:08x}: speaker {guid:#x} ({template:?}) has no face rig: Flap"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let lips = lip.is_some();
             // Her own lines.
             if guid == m2_game::mission::PLAYER {
                 if let Some(p) = game.scene.player.as_mut() {
@@ -2269,7 +2353,14 @@ impl MissionLink {
                         "face: she {} speaking (line {cue:08x})",
                         if on { "starts" } else { "stops" }
                     );
-                    p.speak(on);
+                    if let Some((_, rig)) = &mut p.model
+                        && (lips || !on)
+                    {
+                        rig.lip = lip;
+                    }
+                    if !lips {
+                        p.speak(on);
+                    }
                 }
                 continue;
             }
@@ -2285,7 +2376,12 @@ impl MissionLink {
                         "face: {guid:#x} {} speaking (line {cue:08x})",
                         if on { "starts" } else { "stops" }
                     );
-                    n.speak(on);
+                    if lips || !on {
+                        n.rig.lip = lip;
+                    }
+                    if !lips {
+                        n.speak(on);
+                    }
                 }
                 None if on => {
                     eprintln!("face: line {cue:08x}'s speaker {guid:#x} is no person here")
@@ -3472,9 +3568,12 @@ impl MissionLink {
                 .support
                 .fallback(Kind::SatelliteBomb, !sturdy.is_empty(), STEP)
             {
+                // Their own free bomb, as the first contract gives it.
+                let given = mission.run(SAT_BOMB_FALLBACK, "satellite bomb fallback");
                 eprintln!(
-                    "mission: no bomb from the scripts in {FALLBACK_AFTER:.0} s with a gate to bring down: one is given her"
+                    "mission: no bomb from the scripts in {FALLBACK_AFTER:.0} s with a gate to bring down: theirs is given her ({given:?})"
                 );
+                self.stock_look = 0;
             }
             // A vehicle driven hard into a target (a gate) breaks it too:
             // by its speed of late, as the gate stops it.
@@ -3600,8 +3699,9 @@ impl MissionLink {
                 self.stock_look = STOCK_LOOK;
             }
             self.stock_look -= 1;
-            let (flown, burst) =
-                crate::spans::time("scripts: strikes", || report_strikes(game, mission));
+            let (flown, burst) = crate::spans::time("scripts: strikes", || {
+                report_strikes(game, mission, &mut self.bombs)
+            });
             self.counts.flown += flown;
             self.counts.burst += burst;
             mission.set_player_reserve("C4", game.combat.charges);
@@ -3900,7 +4000,7 @@ impl MissionLink {
                     }
                     _ => {}
                 }
-                support_item(game, &c);
+                support_item(&c);
                 strike(game, &c);
                 fly(game, mission, &mut self.landed, &c);
                 if obey(game, mission, &mut self.vehicles, &c) {
@@ -4837,6 +4937,7 @@ impl MissionLink {
                         Some((t, place(t)?, inside))
                     })
                     .collect();
+                let of_her = w.player.is_some_and(|her| targets.contains(&her));
                 Some(crate::autoplay::Delivery {
                     dest: dest?,
                     at,
@@ -4844,6 +4945,7 @@ impl MissionLink {
                     xz,
                     quota,
                     targets: placed,
+                    of_her,
                 })
             })
             .collect()
@@ -5468,16 +5570,18 @@ fn radar_views(
                 }
                 None => (offset, None),
             };
+            // Its texture, else its icon's by index; else none, which
+            // the minimap draws as a square in its colour, outlined.
             let icon = b
                 .texture
                 .clone()
                 .or_else(|| {
                     name_of
                         .as_ref()
+                        .filter(|_| b.icon != m2_game::hud::NO_ICON)
                         .and_then(|f| f.call::<Option<String>>(b.icon).ok().flatten())
                 })
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "objective_action".to_owned());
+                .filter(|s| !s.is_empty());
             let [r, g, bl] = b.colour;
             Some(RadarView {
                 at,
@@ -6315,7 +6419,7 @@ fn strike(game: &mut Game, c: &Command) {
 /// Tells the scripts of her designators thrown and come to rest, the
 /// aircraft over their marks and the ordnance gone off; how many of the
 /// last two there were.
-fn report_strikes(game: &mut Game, mission: &mut Mission) -> (u32, u32) {
+fn report_strikes(game: &mut Game, mission: &mut Mission, bombs: &mut Vec<Vec3>) -> (u32, u32) {
     let settle = game
         .scene
         .world
@@ -6345,7 +6449,7 @@ fn report_strikes(game: &mut Game, mission: &mut Mission) -> (u32, u32) {
     let counts = (strikes.arrived.len() as u32, strikes.burst.len() as u32);
     // The planes in the air, where they are (their radar blips follow
     // them), and those flown off.
-    for (g, at, yaw) in strikes.jets() {
+    for (g, at, yaw) in strikes.jets().chain(strikes.ordnance()) {
         mission.place(g, at.to_array(), yaw);
     }
     for g in strikes.gone.drain(..) {
@@ -6354,11 +6458,30 @@ fn report_strikes(game: &mut Game, mission: &mut Mission) -> (u32, u32) {
     for (g, at) in strikes.arrived.drain(..) {
         mission.flyby_arrived(g, at.to_array());
     }
-    for (g, _, at) in strikes.burst.drain(..) {
+    let bomb = game
+        .scene
+        .world
+        .as_ref()
+        .and_then(|w| w.index.template_db.id(SAT_BOMB));
+    for (g, template, at) in strikes.burst.drain(..) {
+        // The satellite guided bomb's (its script's `sBomb`): what brings
+        // the first contract's gates down.
+        if template.is_some() && template == bomb {
+            bombs.push(at);
+        }
         mission.ordnance_burst(g, at.to_array());
     }
     counts
 }
+
+/// The satellite guided bomb's ordnance (`mrxsatelliteguidedbomb`'s
+/// `sBomb`).
+const SAT_BOMB: &str = "Smart Bomb Projectile";
+
+/// The scripts' free satellite guided bomb, given her by the fallback
+/// (`MrxSupportData.AddFreebie` as its own loop calls it: key, one, no
+/// player, true; at most one).
+const SAT_BOMB_FALLBACK: &str = "MrxSupportData.AddFreebie(\"VzaCon01_SatBomb\", 1, nil, true, 1)";
 
 /// How high over a munition the munitions helicopter hovers to take it
 /// up, metres (invented).
@@ -6702,8 +6825,6 @@ fn stocked(m: &Mission) -> Vec<support::Stocked> {
     m.support_items()
         .into_iter()
         .filter(|i| i.stock > 0 || i.free > 0 || i.active)
-        // The free Satellite Guided Bomb is her own item ([`Kind`]).
-        .filter(|i| Kind::from_freebie(&i.key).is_none())
         .map(|i| support::Stocked {
             name: {
                 let shown = m.text(&i.name);
@@ -6724,29 +6845,18 @@ fn stocked(m: &Mission) -> Vec<support::Stocked> {
 }
 
 /// The scripts' free support items, given her or taken back.
-fn support_item(game: &mut Game, c: &Command) {
+fn support_item(c: &Command) {
     match c {
         Command::Freebie {
             key,
             quantity,
             limit,
-        } => match Kind::from_freebie(key) {
-            Some(kind) => {
-                game.support.grant(kind, *quantity, *limit);
-                eprintln!(
-                    "mission: the scripts give her {quantity} {} free ({key}, at most {limit:?}): she has {}",
-                    kind.name(),
-                    game.support.ready().map_or(0, |i| i.count)
-                );
-            }
-            None => eprintln!(
-                "mission: the scripts give her {quantity} {key:?}, a support item not known here"
-            ),
-        },
+        } => {
+            // Their item, in her stock as the scripts hold it
+            // ([`stocked`]): called in, their own script brings it.
+            eprintln!("mission: the scripts give her {quantity} {key:?} free (at most {limit:?})");
+        }
         Command::RemoveFreebie(key) => {
-            if let Some(kind) = Kind::from_freebie(key) {
-                game.support.take_back(kind);
-            }
             eprintln!("mission: the scripts take back her free {key:?}");
         }
         _ => {}
