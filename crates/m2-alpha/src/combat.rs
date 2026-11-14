@@ -399,6 +399,33 @@ pub fn armed_seats(v: &ParkedVehicle) -> Vec<u32> {
 /// soldier does, `npc::LOOK_EVERY`; inferred).
 const CREW_LOOK: f32 = 0.2;
 
+/// Vehicle `v`'s armed seat `seat`'s wire-guided weapon, if one: its
+/// `HomingWeapon` record and its round's `HomingProjectile`.
+fn tow_of(
+    v: &crate::scene::ParkedVehicle,
+    seat: usize,
+) -> Option<(m2_engine::weapons::Seeker, Option<(f32, f32)>)> {
+    let &mount = armed_seats(v).get(seat)?;
+    v.spec
+        .armed
+        .iter()
+        .filter(|m| m.seat == mount)
+        .find_map(|m| {
+            m.weapon
+                .seeker
+                .filter(|s| s.kind == m2_engine::weapons::TOW)
+                .map(|s| (s, m.weapon.ammo.homing))
+        })
+}
+
+/// What a homing missile flies at: the vehicle it locked on, or (a TOW)
+/// its mount's wire, by vehicle and armed seat.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Guide {
+    Vehicle(VehicleId),
+    Wire((usize, usize)),
+}
+
 /// What a soldier's launcher does this frame ([`Combat::npc_seek`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Seek {
@@ -407,7 +434,7 @@ enum Seek {
     /// Waiting for its lock.
     Held,
     /// Locked: fires, homing.
-    Fire(Option<crate::homing::Homing<VehicleId>>),
+    Fire(Option<crate::homing::Homing<Guide>>),
 }
 
 /// An armed seat of an army's vehicle: see [`Combat::crews_fire`].
@@ -1510,7 +1537,7 @@ enum Projectile {
         shell: bool,
         owner: Option<VehicleId>,
         blast: Option<Blast>,
-        homing: Option<crate::homing::Homing<VehicleId>>,
+        homing: Option<crate::homing::Homing<Guide>>,
         /// Its round's `DamageKey` (`Rocket`): what a weak point it
         /// strikes takes of its blast ([`DamageTable::weak_point`]).
         key: Option<u32>,
@@ -1857,7 +1884,10 @@ pub struct Combat {
     /// A crew's gun, not hers, is firing.
     crew_firing: bool,
     /// The homing a crew's next missile flies by (its gun's lock).
-    crew_homing: Option<crate::homing::Homing<VehicleId>>,
+    crew_homing: Option<crate::homing::Homing<Guide>>,
+    /// The wire-guided (TOW) mounts' guidance, by vehicle and armed seat
+    /// ([`crate::homing::Wire`]).
+    wires: std::collections::HashMap<(usize, usize), crate::homing::Wire>,
     /// The locks on her vehicle as she hears them, the vehicle they are
     /// for, and lockers numbered so far ([`crate::homing`]).
     warnings: crate::homing::Warnings,
@@ -2145,6 +2175,7 @@ impl Default for Combat {
             crews: std::collections::HashMap::new(),
             crew_firing: false,
             crew_homing: None,
+            wires: Default::default(),
             warnings: Default::default(),
             scripts: Default::default(),
             warned: None,
@@ -3261,6 +3292,7 @@ impl Combat {
         }
         self.fire_held = trigger.fire;
         self.track_lock(f, dt);
+        self.wire_hers(f);
         // Changing the clip, she lowers the rifle.
         let holding = on_foot && (trigger.aim || self.aim_left > 0.0) && self.changing.is_none();
         f.player.aiming = holding;
@@ -3675,6 +3707,29 @@ impl Combat {
             .collect()
     }
 
+    /// Her TOW's wire, while her seat has one: along her crosshair's line
+    /// (0x82295400: a player holder's camera position and facing), past
+    /// her own vehicle.
+    fn wire_hers(&mut self, f: &Field<'_>) {
+        let Some(i) = f.player.driving else { return };
+        let v = &f.vehicles[i];
+        let Some((s, _)) = tow_of(v, self.seat) else {
+            return;
+        };
+        let (eye, dir) = Self::aim_ray(f.player);
+        let own = v.id;
+        self.wires
+            .entry((i, self.seat))
+            .or_default()
+            .aim(eye, dir, s.range, |o, d, r| {
+                match own {
+                    Some(id) => f.physics.cast_ray_past(o, d, r, id),
+                    None => f.physics.cast_ray(o, d, r),
+                }
+                .map(|h| h.0)
+            });
+    }
+
     /// The warning cues to play (`false`) or stop (`true`) since last
     /// asked ([`crate::homing::Warnings`]).
     pub fn take_warning_cues(&mut self) -> Vec<(&'static str, bool)> {
@@ -3745,7 +3800,7 @@ impl Combat {
         Seek::Fire(
             target
                 .zip(l.ammo.homing)
-                .map(|(t, h)| crate::homing::Homing::new(t, h)),
+                .map(|(t, h)| crate::homing::Homing::new(Guide::Vehicle(t), h)),
         )
     }
 
@@ -3760,7 +3815,7 @@ impl Combat {
         f: &mut Field<'_>,
         i: usize,
         target: Option<Vec3>,
-        homing: Option<crate::homing::Homing<VehicleId>>,
+        homing: Option<crate::homing::Homing<Guide>>,
     ) {
         let Some(aim) = target else { return };
         let n = &f.people.npcs[i];
@@ -4201,7 +4256,7 @@ impl Combat {
         let homing = self
             .locked()
             .zip(self.launcher.ammo.and_then(|a| a.homing))
-            .map(|(t, h)| crate::homing::Homing::new(t, h));
+            .map(|(t, h)| crate::homing::Homing::new(Guide::Vehicle(t), h));
         self.last_launch = Some((from, goal));
         self.projectiles.push(Projectile::Rocket {
             at: from,
@@ -4484,7 +4539,17 @@ impl Combat {
                 });
             }
             _ => {
-                let homing = self.crew_homing.take();
+                // A TOW flies on its mount's wire (0x82293660: kind 3,
+                // no target, steered at its weapon's point).
+                let wired = w
+                    .seeker
+                    .filter(|s| s.kind == m2_engine::weapons::TOW)
+                    .and(ammo.homing)
+                    .map(|h| crate::homing::Homing::new(Guide::Wire((i, seat_ix)), h));
+                if wired.is_some() {
+                    eprintln!("homing: a TOW from vehicle {i} seat {seat_ix} flies on its wire");
+                }
+                let homing = self.crew_homing.take().or(wired);
                 let round = if homing.is_some() {
                     self.scripts.fired(ammo.template, from)
                 } else {
@@ -4714,6 +4779,10 @@ impl Combat {
                 };
                 let hint = m.weapon.hint;
                 let seeker = m.weapon.seeker.filter(|s| s.locks());
+                let tow = m
+                    .weapon
+                    .seeker
+                    .filter(|s| s.kind == m2_engine::weapons::TOW);
                 let guided = m.weapon.ammo.homing;
                 let skip = v.id;
                 let (near, far) = hint.map_or((0.0, GUNNER_RANGE), |h| (h.min_range, h.range));
@@ -4810,6 +4879,18 @@ impl Combat {
                 gun.watch.see(at, dt);
                 let seen = gun.watch.velocity;
                 let at = m2_engine::gunner_aim::aim(centre, at, seen, seen, true, at, speed, fall);
+                // A TOW mount's wire runs along its aim (0x82295400: an AI
+                // holder's own position and facing; taken as from the
+                // vehicle's middle toward where the crew aims).
+                if let Some(s) = tow {
+                    let own = skip.expect("it has a body");
+                    self.wires.entry((i, seat)).or_default().aim(
+                        centre,
+                        (at - centre).normalize_or(Vec3::Z),
+                        s.range,
+                        |o, d, r| f.physics.cast_ray_past(o, d, r, own).map(|h| h.0),
+                    );
+                }
                 let (wait, left, empty) = (gun.wait, gun.burst, gun.clip.gunner_empty(size));
                 let v = &mut f.vehicles[i];
                 let laid = match aimer {
@@ -4849,7 +4930,7 @@ impl Combat {
                     }
                     self.crew_homing = target
                         .zip(guided)
-                        .map(|(t, h)| crate::homing::Homing::new(t, h));
+                        .map(|(t, h)| crate::homing::Homing::new(Guide::Vehicle(t), h));
                     self.homing_fired += 1;
                     eprintln!("homing: a crew's gun locked on her vehicle fires");
                 }
@@ -5048,14 +5129,21 @@ impl Combat {
             let (blast, key) = gun
                 .and_then(|g| self.shells.get(&g.weapon).copied())
                 .unwrap_or((None, None));
+            // A main gun that is a TOW (the M2A3's) flies on its wire.
+            let homing = tow_of(v, self.seat)
+                .and_then(|(_, h)| h)
+                .map(|h| crate::homing::Homing::new(Guide::Wire((i, self.seat)), h));
+            if homing.is_some() {
+                eprintln!("homing: her TOW from vehicle {i} flies on its wire");
+            }
             self.projectiles.push(Projectile::Rocket {
                 at: from,
                 velocity: aim * speed,
                 flown: 0.0,
-                shell: true,
+                shell: homing.is_none(),
                 owner: Some(id),
                 blast,
-                homing: None,
+                homing,
                 key,
                 army: self.crew_firing,
                 round: None,
@@ -5804,6 +5892,7 @@ impl Combat {
                     .map(|m| m.w_axis.truncate()),
             )
             .collect();
+        let wires = self.wires.clone();
         self.projectiles.retain_mut(|p| match p {
             Projectile::Rocket {
                 at,
@@ -5820,18 +5909,32 @@ impl Combat {
                 // Turning after the vehicle it locked on, no faster than its
                 // turn rate; one gone, or too far off its nose, is lost and
                 // it flies on straight ([`crate::homing::Homing::steer`]).
-                // Its goal is the middle of the target's box (0x822951B0:
-                // the box's min and max halved, through its matrix).
-                if let Some(h) = homing {
-                    let middle = f
-                        .vehicles
-                        .iter()
-                        .find(|v| v.id == Some(h.target))
-                        .map_or(Vec3::ZERO, |v| (v.spec.bounds.0 + v.spec.bounds.1) * 0.5);
-                    let goal = f
-                        .physics
-                        .vehicle_transform(h.target)
-                        .map(|m| m.transform_point3(middle));
+                // A TOW's goal is its wire's point; with none (its mount's
+                // gone quiet) it flies on unsteered, as 0x82293280 does
+                // when its weapon is gone.
+                let wire = match homing {
+                    Some(crate::homing::Homing {
+                        target: Guide::Wire(k),
+                        ..
+                    }) => Some(wires.get(k).and_then(|w| w.point)),
+                    _ => None,
+                };
+                if let Some(h) = homing.as_mut().filter(|_| wire != Some(None)) {
+                    let goal = match h.target {
+                        // A vehicle's: the middle of its box (0x822951B0:
+                        // the box's min and max halved, through its matrix).
+                        Guide::Vehicle(id) => {
+                            let middle = f
+                                .vehicles
+                                .iter()
+                                .find(|v| v.id == Some(id))
+                                .map_or(Vec3::ZERO, |v| (v.spec.bounds.0 + v.spec.bounds.1) * 0.5);
+                            f.physics
+                                .vehicle_transform(id)
+                                .map(|m| m.transform_point3(middle))
+                        }
+                        Guide::Wire(_) => wire.flatten(),
+                    };
                     match goal.and_then(|g| h.steer(*at, *velocity, g, dt)) {
                         Some(v) => *velocity = v,
                         None => {

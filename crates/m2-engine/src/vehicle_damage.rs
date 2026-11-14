@@ -76,7 +76,11 @@ use m2_math::glam::{Mat4, Vec3};
 
 use crate::tuning::Table;
 
-/// `NodeHealth`'s scale and damaged-at fields (names unknown).
+/// `NodeHealth`'s scale and damaged-at fields. From the 360 code (schema
+/// 0x823F41F0, [`crate::node_health`]): they are `DamagePassThrough`, the
+/// share of a node's damage its object takes too (not a scale on the
+/// node's own), and `DamageThreshhold`. Read here as a scale, as before:
+/// 1 on every car sampled, so the same there.
 const SCALE: u32 = 0x27c5_0f84;
 const DAMAGED_AT: u32 = 0xea81_3967;
 /// The name `NodeHealth` records give that no model's node has (668 of

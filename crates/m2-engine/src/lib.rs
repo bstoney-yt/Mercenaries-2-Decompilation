@@ -57,6 +57,7 @@ pub mod melee;
 pub mod model;
 pub mod motion;
 pub mod music_source;
+pub mod node_health;
 pub mod on_foot;
 pub mod ordnance;
 pub mod osprey;

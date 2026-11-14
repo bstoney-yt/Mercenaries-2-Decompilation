@@ -365,6 +365,9 @@ pub struct GameData {
     /// Templates' `CashValue` (`Object.GetCashValue`) by the template's
     /// name in lower case.
     pub template_cash: HashMap<String, i32>,
+    /// Templates' `NodeHealth` records by name in lower case
+    /// ([`crate::node_damage::template_nodes`]).
+    pub template_nodes: HashMap<String, Vec<m2_engine::node_health::NodeRecord>>,
     /// Every template's name in the template database, in lower case:
     /// the names scripts look templates up by (`Pg.GetGuidByName("OC")`).
     pub template_names: std::collections::HashSet<String>,
@@ -482,6 +485,7 @@ impl GameData {
                     template_labels = labels_of(db.component("Label"));
                     data.template_cash = crate::cash::template_cash(&db);
                     data.template_children = crate::links::template_children(&db);
+                    data.template_nodes = crate::node_damage::template_nodes(&db);
                     template_scripts = db.hashes("ObjectScript");
                     template_script_data = script_data(&db);
                     template_alarms = carriers(&db, "Alarm");
@@ -752,6 +756,7 @@ impl Mission {
             physical_links,
             template_children,
             template_cash,
+            template_nodes,
             template_names,
             template_drivers,
             template_passengers,
@@ -783,6 +788,7 @@ impl Mission {
             w.physical_links = physical_links;
             w.template_children = template_children;
             w.template_cash = template_cash;
+            w.template_nodes = template_nodes;
             w.template_names = template_names;
             w.template_drivers = template_drivers;
             w.template_passengers = template_passengers;

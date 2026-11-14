@@ -679,6 +679,10 @@ pub struct Seeker {
     pub lock_time: f32,
 }
 
+/// The [`Seeker::kind`] of a wire-guided weapon (the TOW): its missiles
+/// fly at where its holder aims (360 0x82294C98).
+pub const TOW: u32 = 3;
+
 impl Seeker {
     /// Whether it locks on a target's signature (kinds 1 and 2).
     pub fn locks(&self) -> bool {
