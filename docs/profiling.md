@@ -29,3 +29,29 @@ invariant TSC (a VM) it would otherwise end the game at start, and with
 connects. Tracy's sampling and context-switch data need an elevated process; zones and frame marks do not.
 
 Provenance: invented (a development aid, nothing of the original game's).
+
+# Timing the CPU side without a GPU
+
+`m2-alpha` and `m2-render` have an optional `noop` feature, off by
+default, which builds in wgpu's no-GPU backend. Run with it selected and
+the game does all its CPU work (simulation, culling, the draw queue,
+wgpu's validation and command recording) while nothing reaches a GPU, so
+the CPU's share of a frame can be measured on a machine whose GPU is busy
+or absent:
+
+```
+cargo build --release -p m2-alpha --features noop
+WGPU_BACKEND=noop WGPU_NOOP_BACKEND=1 m2-alpha --install <game> --bench 150 --size 2560x1440 --screenshot out.ppm
+```
+
+The `bench:` lines' `cpu ms a frame` parts and `encode cpu ms a frame`
+stages are real; the `gpu ms a frame` stages read zero, and the picture
+is empty. Without `WGPU_BACKEND=noop` the build runs on the GPU as usual.
+
+The bench's CPU parts: `tick` (the game's step), `stream` (the scene
+loading and placing what is near), `scene` (the scene putting up its
+draws), `queue` (sorting them and handing each to the backend), `submit`
+(encoding the frame's passes, wgpu's `finish` and the submit) and `wait`
+(for the frame before last).
+
+Provenance: invented (a development aid).

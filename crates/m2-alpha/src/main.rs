@@ -2952,7 +2952,9 @@ fn run_bench(
     fov: f32,
     aspect: f32,
 ) -> anyhow::Result<()> {
-    const PARTS: [&str; 5] = ["tick", "stream", "draws", "submit", "wait"];
+    // `scene`: the scene putting up its draws; `queue`: sorting them and
+    // handing each to the backend (together, the old `draws`).
+    const PARTS: [&str; 6] = ["tick", "stream", "scene", "queue", "submit", "wait"];
     let tick = TICK.as_secs_f32();
     let frames = (seconds / tick).ceil().max(1.0) as u32;
     eprintln!(
@@ -2964,7 +2966,7 @@ fn run_bench(
         frametimes::FrameTimes::default(),
         frametimes::FrameTimes::default(),
     );
-    let (mut cpu_all, mut cpu_span) = ([0.0f64; 5], [0.0f64; 5]);
+    let (mut cpu_all, mut cpu_span) = ([0.0f64; PARTS.len()], [0.0f64; PARTS.len()]);
     let (mut gpu_all, mut draws_all, mut draws_span) =
         (m2_render::gpu::timer::GpuTimes::default(), 0u64, 0u64);
     let mut next_line = BENCH_EVERY;
@@ -2972,11 +2974,11 @@ fn run_bench(
         let t = k as f32 * tick;
         let start = Instant::now();
         let mut lap = start;
-        let part = |i: usize, lap: &mut Instant, cpu: &mut [f64; 5]| {
+        let part = |i: usize, lap: &mut Instant, cpu: &mut [f64; PARTS.len()]| {
             cpu[i] += lap.elapsed().as_secs_f64() * 1000.0;
             *lap = Instant::now();
         };
-        let mut cpu = [0.0f64; 5];
+        let mut cpu = [0.0f64; PARTS.len()];
         game.camera = route.pose(t);
         game.step(Intent::default(), tick);
         part(0, &mut lap, &mut cpu);
@@ -2988,16 +2990,17 @@ fn run_bench(
         let mut queue = DrawQueue::new();
         backend.begin_frame(&view)?;
         game.scene.draw(backend, &mut queue, &view, &game.combat)?;
-        let drawn = queue.flush(&view, backend)?.draws as u64;
         part(2, &mut lap, &mut cpu);
-        backend.end_frame()?;
+        let drawn = queue.flush(&view, backend)?.draws as u64;
         part(3, &mut lap, &mut cpu);
-        backend.wait_for_frame_before_last()?;
+        backend.end_frame()?;
         part(4, &mut lap, &mut cpu);
+        backend.wait_for_frame_before_last()?;
+        part(5, &mut lap, &mut cpu);
         let ms = start.elapsed().as_secs_f32() * 1000.0;
         all.push(ms);
         span.push(ms);
-        for i in 0..5 {
+        for i in 0..PARTS.len() {
             cpu_all[i] += cpu[i];
             cpu_span[i] += cpu[i];
         }
@@ -3036,7 +3039,7 @@ fn run_bench(
                 draws_span / n as u64,
             );
             span = frametimes::FrameTimes::default();
-            cpu_span = [0.0; 5];
+            cpu_span = [0.0; PARTS.len()];
             draws_span = 0;
         }
     }
