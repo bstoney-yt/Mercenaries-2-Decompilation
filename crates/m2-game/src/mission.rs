@@ -3164,7 +3164,7 @@ fn seat_crew(
 /// `repairpad` is the script of the helipads and the PMC's garage
 /// (0xcd561a19): awake, its lights are on (`Vehicle.SetParts` of
 /// `LightFront`), and they go out when it dies.
-pub const OBJECT_SCRIPTS: [(&str, u32); 16] = [
+pub const OBJECT_SCRIPTS: [(&str, u32); 17] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3181,7 +3181,16 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 16] = [
     ("pursuitcopter", PURSUIT_COPTER),
     ("AntiAir", homing::ANTI_AIR),
     ("HomingMissile", homing::HOMING_MISSILE),
+    ("Goal", GOAL),
 ];
+
+/// `Goal`'s module hash (`name_hash("Goal")`): the soccer ball whose goal
+/// pays cash. From samples (its script, block `resident`): once awake it
+/// waits for itself to enter the boundary `LR_Goal`; then, with the
+/// `_global_soccergoal 0x000b0982` object about, Fiona's `va3fio12`, $100 000
+/// (`MrxPmc.AddCashQty`) and the boundary removed. One placed in the
+/// layers.
+pub const GOAL: u32 = 0xad61_48d4;
 
 /// `pursuitcopter`'s module hash.
 pub const PURSUIT_COPTER: u32 = 0x3e29_6216;

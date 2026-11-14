@@ -3343,6 +3343,13 @@ impl MissionLink {
                 mission.place(g, at.to_array(), yaw);
                 mission.set_bounds(g, lo.to_array(), hi.to_array());
             }
+            // What was knocked loose whole is where it went, for the
+            // scripts that watch it (`Goal`'s ball entering `LR_Goal`).
+            if let Some(world) = game.scene.world.as_ref() {
+                for (g, at, yaw) in game.scene.props.loose_places(&world.physics) {
+                    mission.place(g, at.to_array(), yaw);
+                }
+            }
             for (g, at, yaw) in game.scene.flights.places(&game.scene.vehicles) {
                 mission.place(g, at.to_array(), yaw);
             }

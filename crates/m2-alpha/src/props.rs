@@ -750,6 +750,22 @@ impl Props {
             .collect()
     }
 
+    /// Where each prop knocked loose whole (not broken into its pieces)
+    /// has gone, and its heading: its first piece's place in the physics.
+    /// The scripts hear it ([`m2_game::mission::Mission::place`]), so that
+    /// a ball knocked into a goal's boundary is seen there (`Goal`).
+    pub fn loose_places(&self, physics: &Physics) -> Vec<(u32, Vec3, f32)> {
+        self.knocked
+            .iter()
+            .filter(|(e, _)| self.loose(**e).is_some_and(|l| !l.breaks))
+            .filter_map(|(e, pieces)| {
+                let at = physics.debris_place(*pieces.first()?)?;
+                let f = at.transform_vector3(Vec3::Z);
+                Some((*e, at.w_axis.truncate(), f.x.atan2(f.z)))
+            })
+            .collect()
+    }
+
     /// Whether `entity` was knocked loose (`None` if not): broken into
     /// its pieces, its model's [`Loose::breaks`], or gone as one.
     pub fn knocked_loose(&self, entity: u32) -> Option<bool> {
