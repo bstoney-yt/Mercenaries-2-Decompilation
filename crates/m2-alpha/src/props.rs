@@ -1780,14 +1780,16 @@ impl Props {
     pub fn advance(&mut self, dt: f32) {
         // Gates swing on; a shut one stands in the way again
         // ([`update`](Self::update) puts its collision back).
-        for s in self.swings.values_mut() {
+        // Each at its widest leaf's pace, a quarter turn where its model
+        // isn't in (invented).
+        for (e, s) in self.swings.iter_mut() {
             let to = if s.open { 1.0 } else { 0.0 };
-            let step = m2_engine::gate::SWING * dt;
-            s.at = if s.at < to {
-                (s.at + step).min(to)
-            } else {
-                (s.at - step).max(to)
-            };
+            let open = self
+                .shown
+                .get(e)
+                .and_then(|p| self.models.get(&p.model)?.as_ref()?.gate.as_ref())
+                .map_or(std::f32::consts::FRAC_PI_2, |g| g.gate.widest());
+            s.at = m2_engine::gate::swing(s.at, to, open, dt);
         }
         let shut: Vec<u32> = (self.swings.iter())
             .filter(|(_, s)| !s.open && s.at <= 0.0)
@@ -2278,7 +2280,8 @@ mod tests {
         assert!(!physics.has_static(StaticKey::Entity(1)));
         props.advance(1.0);
         let at = props.gate_open(1).unwrap();
-        assert!((at - m2_engine::gate::SWING).abs() < 1e-6, "{at}");
+        let quarter = std::f32::consts::FRAC_PI_2;
+        assert!((at - m2_engine::gate::swing(0.0, 1.0, quarter, 1.0)).abs() < 1e-6);
         props.advance(5.0);
         assert_eq!(props.gate_open(1), Some(1.0));
         // Shut: back, then gone from the swings (its collision goes back
