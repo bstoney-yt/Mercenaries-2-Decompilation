@@ -54,6 +54,7 @@ mod cheats;
 mod combat;
 mod config;
 mod coop;
+mod death;
 mod destruct;
 mod disguise;
 mod display;
