@@ -462,6 +462,9 @@ pub struct Player {
     /// (pitch and roll as well as heading) with her clip's origin on the
     /// seat ([`model_matrix`](Self::model_matrix)).
     pub seat_frame: Option<Mat4>,
+    /// On an emplaced gun she mans, seated by its seat's clip
+    /// ([`crate::hijack::Hijacks::seat`]).
+    pub manning: bool,
     /// Her clips for each class of weapon she can hold, a switch's and
     /// the pickup's ([`crate::held`]).
     pub moves: Moves,
@@ -695,6 +698,7 @@ impl Player {
             },
             face_seed: 0x2545_f491_4f6c_dd1d,
             seat_frame: None,
+            manning: false,
             moves: Moves::default(),
             in_hand: InHand::default(),
             shown: InHand::default(),
@@ -1011,6 +1015,23 @@ impl Player {
     }
 
     /// One fixed tick of `dt` seconds.
+    /// Seated on an emplaced gun she mans ([`crate::combat::Manned`],
+    /// placed and posed by [`crate::hijack::Hijacks::seat`]): she only
+    /// looks, as [`update`](Self::update) turns the view, and her face
+    /// goes on; nothing moves her or plays her on-foot clips.
+    pub fn look(&mut self, physics: &Physics, intent: Intent, dt: f32) {
+        let seed = &mut self.face_seed;
+        self.face.step(dt, || {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            (*seed >> 40) as f32 / (1u64 << 24) as f32
+        });
+        self.yaw += intent.look.x;
+        self.pitch = (self.pitch + intent.look.y).clamp(-1.2, 0.9);
+        self.camera(physics);
+    }
+
     pub fn update(&mut self, physics: &Physics, intent: Intent, dt: f32) {
         // Her face goes on while she is up; down, it stays as it was.
         if !self.down {
@@ -2108,7 +2129,7 @@ impl Player {
     pub fn model_matrix(&self) -> Mat4 {
         if let Some(seat) = self
             .seat_frame
-            .filter(|_| self.seated && self.driving.is_some())
+            .filter(|_| self.seated && (self.driving.is_some() || self.manning))
         {
             return seat;
         }

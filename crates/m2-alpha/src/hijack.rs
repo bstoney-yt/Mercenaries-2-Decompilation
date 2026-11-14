@@ -1306,9 +1306,13 @@ impl Hijacks {
             return;
         }
         let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+            let manning = self.seat_manned(game, dt);
             if let Some(p) = &mut game.scene.player {
-                p.seated = false;
-                p.seat_frame = None;
+                p.manning = manning;
+                if !manning {
+                    p.seated = false;
+                    p.seat_frame = None;
+                }
             }
             return;
         };
@@ -1396,10 +1400,84 @@ impl Hijacks {
         });
         if let Some(p) = &mut game.scene.player {
             p.seated = seated.is_some();
+            p.manning = false;
             if !p.seated {
                 p.seat_frame = None;
             }
         }
+    }
+
+    /// Seats her on the emplaced gun she mans ([`crate::combat::Manned`])
+    /// as an AI gunner is seated on one ([`find_prop_seat`]): her clip's
+    /// origin on its seat's hardpoint (`SeatLink` `3a7f35d1`, the model's
+    /// `1b8194a7`, level with the gun's feet), playing its animation
+    /// set's `InVehicle` `Idle` clip, out of the physics' way. Whether
+    /// she could be seated (else she stands behind it as before).
+    ///
+    /// From samples: the seat link, its hardpoint and the clip (the
+    /// tables'), as for the AI gunners. Invented: she goes round with the
+    /// turret, about its yaw bone (the seat's hardpoint is on the gun's
+    /// standing body, so the model alone would leave her where it faced
+    /// at rest while the gun turns up to 90 degrees away); the engine's
+    /// own turret seat update is not decoded. Before, she was put at the
+    /// seat's place at her own feet' height, inside the gun's collision,
+    /// which stood her on top of it (playtest 11-13: some 0.6 m up).
+    fn seat_manned(&mut self, game: &mut Game, dt: f32) -> bool {
+        let State::Ready(loaded) = &self.state else {
+            return false;
+        };
+        let Some(m) = game.combat.manned.as_ref() else {
+            return false;
+        };
+        let Some(link) = m.seat_link else {
+            return false;
+        };
+        let (entity, model, template) = (m.entity, m.model, m.template);
+        let turn = m
+            .turret
+            .as_ref()
+            .and_then(|t| Some((t.aimer.yaw_pivot?, t.aim.0)))
+            .map_or(Mat4::IDENTITY, |(pivot, yaw)| {
+                Mat4::from_translation(pivot)
+                    * Mat4::from_rotation_y(yaw)
+                    * Mat4::from_translation(-pivot)
+            });
+        let Some((prop, _)) = game.scene.props.get(entity) else {
+            return false;
+        };
+        let at = Mat4::from_rotation_translation(prop.rotation, prop.position);
+        let key = (model, template, link);
+        if !self.prop_seats.contains_key(&key) {
+            let seat = find_prop_seat(game, &mut self.points, &loaded.clips, model, template, link);
+            eprintln!("seat: she mans emplaced gun {entity:#x}: {seat:?}");
+            self.prop_seats.insert(key, seat);
+        }
+        let Some(seat) = self.prop_seats[&key] else {
+            return false;
+        };
+        let Some(index) = bind(game, seat.clip) else {
+            return false;
+        };
+        let Some(p) = game.scene.player.as_mut() else {
+            return false;
+        };
+        let Some((_, rig)) = p.model.as_mut() else {
+            return false;
+        };
+        rig.animator.play(index);
+        rig.animator.advance(dt);
+        let forward = rig
+            .locomotion
+            .as_ref()
+            .map_or(m2_math::glam::Vec2::Y, |l| l.forward);
+        let frame = at * turn * Mat4::from_translation(seat.at + seat_offset(rig, index));
+        let ahead = frame.transform_vector3(Vec3::Z);
+        p.facing = ahead.x.atan2(ahead.z) + forward.x.atan2(forward.y);
+        p.seat_frame = Some(frame);
+        p.character.position = frame.transform_point3(Vec3::ZERO);
+        p.character.velocity = Vec3::ZERO;
+        p.seated = true;
+        true
     }
 
     /// The doors the scripts open or shut (`Vehicle.OpenDoor`,
