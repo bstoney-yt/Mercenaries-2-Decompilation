@@ -399,6 +399,21 @@ end
 /// for the game HUD, which runs in a Lua state of its
 /// own. Each call then goes on as it would. The groups and methods are
 /// those `MrxGuiInterface` gives `HudInterface`.
+///
+/// Inside such a call the scripts' `MrxGuiManager.ToggleHud` does nothing
+/// here: the HUD runs the same call in its own state, so its own copy of
+/// the widget puts the HUD to sleep and wakes it again as it closes. From
+/// the scripts (no executable read): `ToggleHud(p, false)` adds one to the
+/// player's `nHudState` and sleeps every HUD widget, `ToggleHud(p, true)`
+/// takes one off and wakes them only once it is back to 0 (`MrxGuiManager`
+/// `vz_73962eb2`, lines 146 to 197); `CommenceFanfare` hides the HUD if
+/// `GetHudState` says it shows and `_EndFanfare` shows it again on that
+/// note (`vz_da6af53d`, lines 635 to 638 and 954 to 955); the shop does the
+/// same (`vz_16316efa`, 401 to 403 and 718 to 719). This state's copy of
+/// the fanfare never closes (the HUD's callback reaches the mission's
+/// callback directly), so its hide, passed on as a `GuiManager` call, left
+/// the HUD's count at 1 and the HUD asleep once the contract's fanfare
+/// closed (VzaCon001's end, as she comes out at the PMC's hut).
 const HUD_CALLS: &str = r#"
 __m2_hud_calls = {}
 __m2_hud_call_count = 0
@@ -503,7 +518,16 @@ for group, names in pairs(methods) do
                     group = group, method = name, data = data,
                     callback = callback })
                 local r
-                if type(f) == "function" then r = f(self, t, ...) end
+                if type(f) == "function" then
+                    -- The HUD runs this call's widget code itself, and that
+                    -- puts its HUD to sleep and wakes it: see `HUD_CALLS`.
+                    local outer = __m2_in_hud_call
+                    __m2_in_hud_call = true
+                    local ok, out = pcall(f, self, t, ...)
+                    __m2_in_hud_call = outer
+                    if not ok then error(out, 0) end
+                    r = out
+                end
                 -- A message added here gets the call's number as its id,
                 -- for the HUD to tell its own message by: what the
                 -- scripts keep to take it down again (`MrxSubtitle`'s
@@ -678,10 +702,14 @@ end
 -- "briefing", which keeps the message box and subtitles) and shows it on
 -- leaving. A `GuiManager` `ToggleHud` call for the HUD, which runs its own
 -- `MrxGuiManager.ToggleHud`; the original then runs as it would.
+-- Not from inside a HUD call (see `HUD_CALLS`): the HUD's own copy of the
+-- widget (the fanfare's `CommenceFanfare`, the shop) hides its HUD and
+-- shows it again as it closes, where this state's copy never closes.
 local function toggling(m, name)
     local d = rawget(m, name)
     if type(d) ~= "function" or __m2_dialog_wrapped[d] then return end
     local f = function(player, on, reason, ...)
+        if __m2_in_hud_call then return end
         -- The bootstrap's calls the manager's: one call for the HUD.
         if __m2_toggling then return d(player, on, reason, ...) end
         __m2_hud_call_count = __m2_hud_call_count + 1
@@ -9021,6 +9049,62 @@ mod tests {
                 ("mission".to_owned(), Some(false)),
                 ("other".to_owned(), None),
             ]
+        );
+    }
+
+    // The contract's fanfare hides the HUD as it commences (its widget's
+    // `CommenceFanfare`, inside `Hud.Fanfare:Commence`): the HUD's own
+    // copy does that and shows it again as it closes, so this state's copy
+    // passes nothing on and leaves its own count alone. The HQ's toggle
+    // outside any HUD call still goes over.
+    #[test]
+    fn a_toggle_inside_a_hud_call_stays_with_the_hud() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            ran = 0
+            MrxGuiManager = { ToggleHud = function(p, on, why) ran = ran + 1 end }
+            Hud = { Fanfare = {
+                Create = function() end,
+                AddItem = function() end,
+                Commence = function(self, t)
+                    MrxGuiManager.ToggleHud(1, false)
+                    if t.bBroken then error("broken") end
+                end,
+            } }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        lua.load(DIALOG_BOXES).exec().unwrap();
+        lua.load("Hud.Fanfare:Commence({ fCallback = function() end })")
+            .exec()
+            .unwrap();
+        let calls = hud_calls(&lua);
+        let groups: Vec<_> = calls
+            .iter()
+            .map(|c| (c.group.as_str(), c.method.as_str()))
+            .collect();
+        assert_eq!(groups, [("Fanfare", "Commence")]);
+        assert_eq!(lua.globals().get::<i64>("ran").unwrap(), 0);
+        // Out of the call again, a toggle goes over as before.
+        lua.load("MrxGuiManager.ToggleHud(1, true)").exec().unwrap();
+        let calls = hud_calls(&lua);
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[1].group, "GuiManager");
+        assert_eq!(lua.globals().get::<i64>("ran").unwrap(), 1);
+        // And an error inside the call does not leave toggles cut off.
+        let ok: bool = lua
+            .load("return (pcall(function() Hud.Fanfare:Commence({ bBroken = true }) end))")
+            .eval()
+            .unwrap();
+        assert!(!ok);
+        assert!(
+            !lua.globals()
+                .get::<Option<bool>>("__m2_in_hud_call")
+                .unwrap()
+                .unwrap_or(false)
         );
     }
 
