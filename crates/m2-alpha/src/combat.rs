@@ -3766,8 +3766,19 @@ impl Combat {
         let from = n.character.position + Vec3::Y * 1.8;
         eprintln!("grenade: a soldier throws from {from:.1} at {at:.1}");
         let gravity = m2_engine::physics::GRAVITY;
-        let velocity =
-            lob_velocity(from, at, THROW, gravity).unwrap_or_else(|| farthest(at - from, THROW));
+        // The low lob, else the high one where the low one would meet
+        // something on the way (the cover he throws from: playtest
+        // 2026-11-14's grenades went off at the throwers' feet, behind
+        // their cover, unseen), else the low one anyway.
+        let clear = |v: Vec3| arc_clear(f.physics, from, v, at, gravity);
+        let velocity = match lob_velocities(from, at, THROW, gravity) {
+            Some((low, high)) if !clear(low) && clear(high) => {
+                eprintln!("grenade: the low lob is blocked: thrown high");
+                high
+            }
+            Some((low, _)) => low,
+            None => farthest(at - from, THROW),
+        };
         // The grenade template's blast (inferred: the same `Grenade` as
         // hers); without one read, the alpha's own blast.
         let blast = self
@@ -6649,19 +6660,57 @@ fn ground_under(physics: &Physics, at: Vec3) -> Option<Vec3> {
 /// The velocity at `speed` that lobs a round from `from` down onto `to`
 /// under `gravity`: the lower of its two arcs, if it reaches.
 fn lob_velocity(from: Vec3, to: Vec3, speed: f32, gravity: f32) -> Option<Vec3> {
+    lob_velocities(from, to, speed, gravity).map(|(low, _)| low)
+}
+
+/// Both arcs at `speed` that lob a round from `from` down onto `to`
+/// under `gravity`, the lower first, if it reaches.
+fn lob_velocities(from: Vec3, to: Vec3, speed: f32, gravity: f32) -> Option<(Vec3, Vec3)> {
     let d = to - from;
     let flat = d.with_y(0.0);
     let x = flat.length();
     if x < 1e-3 {
-        return Some(d.normalize_or(Vec3::NEG_Y) * speed);
+        let v = d.normalize_or(Vec3::NEG_Y) * speed;
+        return Some((v, v));
     }
     let v2 = speed * speed;
     let room = v2 * v2 - gravity * (gravity * x * x + 2.0 * d.y * v2);
     if room < 0.0 {
         return None;
     }
-    let (sin, cos) = ((v2 - room.sqrt()) / (gravity * x)).atan().sin_cos();
-    Some(flat / x * (speed * cos) + Vec3::Y * (speed * sin))
+    let arc = |tan: f32| {
+        let (sin, cos) = tan.atan().sin_cos();
+        flat / x * (speed * cos) + Vec3::Y * (speed * sin)
+    };
+    Some((
+        arc((v2 - room.sqrt()) / (gravity * x)),
+        arc((v2 + room.sqrt()) / (gravity * x)),
+    ))
+}
+
+/// How near its mark, metres across, a lob may come down on something
+/// and still count as clear ([`arc_clear`]; invented).
+const ARC_NEAR: f32 = 3.0;
+
+/// Whether a round thrown from `from` at `velocity` under `gravity`
+/// flies on to within [`ARC_NEAR`] of `to` (across) before it meets
+/// anything solid, stepped a thirtieth of a second at a time for at most
+/// 4 s.
+fn arc_clear(physics: &Physics, from: Vec3, velocity: Vec3, to: Vec3, gravity: f32) -> bool {
+    const STEP: f32 = 1.0 / 30.0;
+    let (mut at, mut v) = (from, velocity);
+    for _ in 0..120 {
+        if (at - to).with_y(0.0).length() <= ARC_NEAR {
+            return true;
+        }
+        v.y -= gravity * STEP;
+        let step = v * STEP;
+        if physics.cast_ray(at, step, step.length()).is_some() {
+            return (at - to).with_y(0.0).length() <= ARC_NEAR;
+        }
+        at += step;
+    }
+    false
 }
 
 /// The velocity at `speed` that lobs a round furthest along `way`: 45
@@ -7526,6 +7575,33 @@ mod tests {
             combat.slung(false),
             [Some(Weapon::Rifle), Some(Weapon::GrenadeLauncher)]
         );
+    }
+
+    #[test]
+    fn a_soldier_lobs_high_over_the_wall_in_front_of_him() {
+        let gravity = m2_engine::physics::GRAVITY;
+        let mut physics = ground();
+        let (from, to) = (Vec3::new(0.0, 1.8, 0.0), Vec3::new(0.0, 0.0, 14.0));
+        let (low, high) = lob_velocities(from, to, THROW, gravity).unwrap();
+        assert!(high.y > low.y);
+        // Both land on the mark.
+        for v in [low, high] {
+            let t = (to.z - from.z) / v.z;
+            let y = from.y + v.y * t - 0.5 * gravity * t * t;
+            assert!(y.abs() < 1e-2, "{v:?} lands at {y}");
+        }
+        assert!(arc_clear(&physics, from, low, to, gravity));
+        // A wall 2.5 m high 1.5 m ahead of him: the low lob meets it,
+        // the high one clears it.
+        physics.add_static(
+            StaticKey::Object(9),
+            &m2_engine::CollisionShape::cuboid(Vec3::new(3.0, 1.25, 0.2)),
+            Vec3::new(0.0, 1.25, 1.5),
+            m2_math::glam::Quat::IDENTITY,
+        );
+        physics.step(1.0 / 60.0);
+        assert!(!arc_clear(&physics, from, low, to, gravity));
+        assert!(arc_clear(&physics, from, high, to, gravity));
     }
 
     #[test]
