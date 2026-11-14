@@ -191,8 +191,9 @@ pub struct MissionView {
 pub struct RadarView {
     /// Where (world): its target's place plus its offset, or its own.
     pub at: Vec3,
-    /// Its texture (`objective_action`), from the scripts' radar icons.
-    pub icon: String,
+    /// Its texture (`objective_action`), from the scripts' radar icons;
+    /// `None` for a blip given none.
+    pub icon: Option<String>,
     /// RGBA.
     pub colour: [u8; 4],
     /// Kept on the rim while out of range (see [`m2_game::hud::Blip`]).
@@ -5569,16 +5570,18 @@ fn radar_views(
                 }
                 None => (offset, None),
             };
+            // Its texture, else its icon's by index; else none, which
+            // the minimap draws as a square in its colour, outlined.
             let icon = b
                 .texture
                 .clone()
                 .or_else(|| {
                     name_of
                         .as_ref()
+                        .filter(|_| b.icon != m2_game::hud::NO_ICON)
                         .and_then(|f| f.call::<Option<String>>(b.icon).ok().flatten())
                 })
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "objective_action".to_owned());
+                .filter(|s| !s.is_empty());
             let [r, g, bl] = b.colour;
             Some(RadarView {
                 at,
