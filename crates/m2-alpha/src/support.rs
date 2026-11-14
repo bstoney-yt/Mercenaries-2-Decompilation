@@ -21,12 +21,19 @@
 //! "Satellite Designator" (800052f3, model global_weapon_detonator).
 //!
 //! The first contract's script gives the bomb free
-//! (`MrxSupportData.AddFreebie("VzaCon01_SatBomb", ...)`, as
-//! [`Support::grant`] here) once she has opened and closed her PDA at the
-//! first gate, and again at the second, and hears the call's steps
-//! ([`Support::posts`]) as the satellite interface posts them. Should it
-//! never give one while a gate stands, one is given anyway after a while
-//! ([`Support::fallback`]).
+//! (`MrxSupportData.AddFreebie("VzaCon01_SatBomb", ...)`) once she has
+//! opened and closed her PDA at the first gate, and again at the second,
+//! and hears the call's steps ([`Support::posts`]) as the satellite
+//! interface posts them. With the scripts running the bomb is theirs: in
+//! her stock ([`Support::stock`]), called in by them, its designator
+//! handed back ([`Support::equip`]) to open the view and the wheel here,
+//! the confirmed spot given to their support manager
+//! ([`Support::designated`]), and `MrxSatelliteGuidedBomb` flies the
+//! Tucano over, plays its line, drops the "Smart Bomb Projectile" and blips
+//! it red on the radar. The alpha's own bomb ([`Kind::SatelliteBomb`],
+//! [`Support::grant`]) is left for play without the scripts. Should they
+//! never give one while a gate stands, theirs is asked for after a while
+//! ([`Support::fallback`]; Invented).
 //!
 //! From the 360 code: the view's field of view is the engine's default
 //! camera's ([`default_fov_y`]: 142 m of ground from top to bottom at 16:9
@@ -449,6 +456,11 @@ pub struct Support {
     /// Where an aimed designator came down: its template and the spot
     /// (on the ground she stands on, for the satellite's).
     pub designated: Option<(&'static str, Vec3)>,
+    /// The satellite view and its wheel under way are for a designator the
+    /// scripts handed her: its confirmed spot goes back to them
+    /// ([`designated`](Self::designated)), and their item's own script
+    /// brings the strike in, not the alpha's bomb.
+    scripted: bool,
     /// Where she stood last tick.
     here: Vec3,
 }
@@ -559,6 +571,16 @@ impl Support {
         let Some(aim) = Aim::of(kind) else {
             return false;
         };
+        // The satellite's: the view and its timing wheel, as the
+        // designator's script (`MrxSupportDesignatorSatellite`, its
+        // interface `mrxguisatellite`) runs them for every satellite item;
+        // the spot goes back to the scripts once both wedges are hit.
+        if aim == Aim::Satellite {
+            // Taken up already: the view opens on the next step.
+            self.scripted = true;
+            self.phase = Phase::Holding { left: 0.0 };
+            return true;
+        }
         self.phase = Phase::Designating {
             aim,
             at: Vec2::new(self.here.x, self.here.z),
@@ -604,18 +626,19 @@ impl Support {
         }
     }
 
-    /// Takes her free `kind` back (the scripts' `RemoveFreebie`).
-    pub fn take_back(&mut self, kind: Kind) {
-        self.items.retain(|i| i.kind != kind);
-    }
-
     /// Keeps her from being stuck without a strike the mission needs:
     /// while `wanted` (a target only a strike brings down is marked) and
     /// she has no `kind`, isn't calling one and none is on its way, the
-    /// seconds add up; after [`FALLBACK_AFTER`] she is given one free.
-    /// Returns whether she was.
+    /// seconds add up; after [`FALLBACK_AFTER`] one is due her. Returns
+    /// whether it is: the caller asks the scripts for their free one
+    /// (Invented: the game has no such fallback).
     pub fn fallback(&mut self, kind: Kind, wanted: bool, dt: f32) -> bool {
-        let has = self.items.iter().any(|i| i.kind == kind && i.count > 0);
+        // Hers, or the scripts' free one in her stock.
+        let has = self.items.iter().any(|i| i.kind == kind && i.count > 0)
+            || self
+                .stock
+                .iter()
+                .any(|s| s.count > 0 && Kind::from_freebie(&s.key) == Some(kind));
         if !wanted || has || self.busy() || !self.inbound.is_empty() {
             self.wanted = 0.0;
             return false;
@@ -625,7 +648,6 @@ impl Support {
             return false;
         }
         self.wanted = 0.0;
-        self.grant(kind, 1, Some(1));
         true
     }
 
@@ -778,7 +800,11 @@ impl Support {
                     held: 0.0,
                 },
             },
-            Phase::Holding { .. } if back || call.hurt || self.ready().is_none() => Phase::Idle,
+            Phase::Holding { .. }
+                if back || call.hurt || (self.ready().is_none() && !self.scripted) =>
+            {
+                Phase::Idle
+            }
             Phase::Holding { left } if left <= dt => {
                 self.posts.push(TARGETTING_START);
                 Phase::Viewing {
@@ -853,10 +879,19 @@ impl Support {
                     // Moved off the spot: the wheel goes, the view stays.
                     Phase::Viewing { at, open }
                 } else if hit.iter().all(|&h| h) {
-                    if let Some(i) = self.items.iter_mut().find(|i| i.count > 0) {
-                        i.count -= 1;
+                    if self.scripted {
+                        // Their item, paid for when they called it in: the
+                        // spot goes to their support manager.
+                        self.designated = Some((
+                            Aim::Satellite.designator(),
+                            Vec3::new(from.x, her.y, from.y),
+                        ));
+                    } else {
+                        if let Some(i) = self.items.iter_mut().find(|i| i.count > 0) {
+                            i.count -= 1;
+                        }
+                        self.inbound.push((from, FALL_TIME));
                     }
-                    self.inbound.push((from, FALL_TIME));
                     Phase::Confirmed {
                         at: from,
                         open,
@@ -890,6 +925,9 @@ impl Support {
                 left: left - dt,
             },
         };
+        if matches!(self.phase, Phase::Idle | Phase::Menu) {
+            self.scripted = false;
+        }
         let mut landed = Vec::new();
         self.inbound.retain_mut(|(at, left)| {
             *left -= dt;
@@ -1316,10 +1354,7 @@ mod tests {
             step(&mut s, right, her, &mut posts);
         }
         assert!(matches!(s.phase, Phase::Viewing { .. }), "{:?}", s.phase);
-        // Taken back by the scripts, there is nothing to call.
         step(&mut s, select, her, &mut posts);
-        s.take_back(Kind::SatelliteBomb);
-        assert_eq!(s.ready(), None);
     }
 
     #[test]
@@ -1396,10 +1431,57 @@ mod tests {
         assert!(!s.fallback(Kind::SatelliteBomb, false, 0.1));
         assert!(!s.fallback(Kind::SatelliteBomb, true, FALLBACK_AFTER - 1.0));
         assert!(s.fallback(Kind::SatelliteBomb, true, 1.5));
-        assert_eq!(s.ready().map(|i| (i.count, i.free)), Some((1, true)));
-        // She has one: no more.
+        // The scripts' own free one, once in her stock: no more.
+        assert_eq!(s.ready(), None, "the caller asks the scripts");
+        s.stock.push(Stocked {
+            key: "VzaCon01_SatBomb".into(),
+            name: "Satellite Guided Bomb".into(),
+            method: "Satellite".into(),
+            count: 1,
+            free: true,
+        });
         assert!(!s.fallback(Kind::SatelliteBomb, true, FALLBACK_AFTER * 2.0));
-        assert_eq!(s.ready().map(|i| i.count), Some(1));
+    }
+
+    /// A satellite designator the scripts hand her opens the view and its
+    /// wheel as her own does; both wedges hit, the spot goes back to the
+    /// scripts (no bomb of the alpha's), where the view was as the needle
+    /// started.
+    #[test]
+    fn the_scripts_satellite_runs_the_wheel_and_hands_the_spot_back() {
+        let her = Vec3::new(100.0, 8.0, -50.0);
+        let mut posts = Vec::new();
+        let mut s = Support::default();
+        s.step(Call::default(), her, DT);
+        assert!(s.equip("Satellite Designator"));
+        step(&mut s, Call::default(), her, &mut posts);
+        assert_eq!(posts, [TARGETTING_START]);
+        assert!(matches!(s.phase, Phase::Viewing { .. }), "{:?}", s.phase);
+        press_fire(&mut s, her, &mut posts);
+        assert!(matches!(s.phase, Phase::Timing { .. }));
+        let press = Call {
+            use_pressed: true,
+            ..Call::default()
+        };
+        for _ in 0..2 {
+            wait_for(&mut s, her, false, &mut posts);
+            wait_for(&mut s, her, true, &mut posts);
+            step(&mut s, press, her, &mut posts);
+            assert_eq!(posts.last(), Some(&SECTOR_HIT));
+        }
+        assert!(matches!(s.phase, Phase::Confirmed { .. }));
+        assert_eq!(
+            s.designated,
+            Some(("Satellite Designator", Vec3::new(her.x, her.y, her.z)))
+        );
+        assert_eq!(s.inbound(), None, "their script brings the bomb");
+        // The check shows, then she is done; the next call is her own.
+        for _ in 0..200 {
+            step(&mut s, Call::default(), her, &mut posts);
+        }
+        assert_eq!(s.phase, Phase::Idle);
+        assert!(posts.contains(&TARGETTING_SUCCESS));
+        assert!(!s.scripted);
     }
 
     #[test]

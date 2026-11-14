@@ -12,7 +12,7 @@
 //! and a readable account of the session in [`Mission::take_log`].
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
@@ -33,6 +33,9 @@ use crate::layers::{LayerOp, LayerState, finished, layer_name};
 use crate::library::{KNOWN_MODULES, LOADERS, Library};
 use crate::object_hooks::{ON_DEATH, ON_STATE_CHANGE, death_args, state_change_args};
 use crate::script::{ScriptError, ScriptHost};
+
+mod homing;
+pub use homing::{ANTI_AIR, HOMING_MISSILE, HomingKind, HomingPost};
 
 /// The script that starts the game (`Init`, then `LoadGame`).
 pub const BOOTSTRAP: u32 = 0xb442_0059;
@@ -821,14 +824,12 @@ impl Mission {
 
         let host = ScriptHost::new()?;
         host.stub_missing_globals()?;
-        host.script_names(library.scripts().iter().flat_map(|s| {
-            s.chunk
-                .main
-                .names(s.chunk.version)
-                .into_iter()
-                .filter(|(u, _)| *u == m2_assets::lua::NameUse::SetGlobal)
-                .map(|(_, n)| n)
-        }))?;
+        host.script_names(script_defined(
+            library
+                .scripts()
+                .iter()
+                .flat_map(|s| s.chunk.main.names(s.chunk.version)),
+        ))?;
         api::install(host.lua(), &world)?;
         host.complete_libraries(&api::LIBRARIES)?;
         let events = Events::default();
@@ -2391,6 +2392,16 @@ return true
         self.world.borrow_mut().subtitles_off = !on;
     }
 
+    /// The player's inverted Y, rumble and autosave options, as the
+    /// natives read them from the profile (`Sys.YAxisInverted`,
+    /// `Sys.RumbleEnabled`, `Sys.IsAutosaveEnabled`).
+    pub fn set_profile_options(&mut self, invert_y: bool, rumble: bool, autosave: bool) {
+        self.world
+            .borrow_mut()
+            .sys_flags
+            .set_profile(invert_y, rumble, autosave);
+    }
+
     /// Whether the player has the tutorial tips on
     /// (`Sys.TutorialsEnabled`; on unless told).
     pub fn set_tutorials(&mut self, on: bool) {
@@ -3169,7 +3180,7 @@ fn seat_crew(
 /// `repairpad` is the script of the helipads and the PMC's garage
 /// (0xcd561a19): awake, its lights are on (`Vehicle.SetParts` of
 /// `LightFront`), and they go out when it dies.
-pub const OBJECT_SCRIPTS: [(&str, u32); 14] = [
+pub const OBJECT_SCRIPTS: [(&str, u32); 16] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3184,6 +3195,8 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 14] = [
     ("pmcgate", PMC_GATE),
     ("repairpad", REPAIR_PAD),
     ("pursuitcopter", PURSUIT_COPTER),
+    ("AntiAir", homing::ANTI_AIR),
+    ("HomingMissile", homing::HOMING_MISSILE),
 ];
 
 /// `pursuitcopter`'s module hash.
@@ -3317,6 +3330,36 @@ fn object_script(
     )
 }
 
+/// The names the scripts define themselves, which read nil rather than a
+/// stub while unset ([`ScriptHost::script_names`]): those they assign as
+/// globals, and the keys they assign in tables that no script reads as a
+/// global. An object's field the scripts set only on some objects
+/// (`HomingMissile`'s `self.TimerEvent`) falls back through its class to
+/// the globals when unset; there it must read nil, as on the 360, or the
+/// script takes it as set.
+fn script_defined(
+    names: impl IntoIterator<Item = (m2_assets::lua::NameUse, String)>,
+) -> BTreeSet<String> {
+    use m2_assets::lua::NameUse;
+    let (mut globals, mut fields, mut read) = (BTreeSet::new(), BTreeSet::new(), HashSet::new());
+    for (u, n) in names {
+        match u {
+            NameUse::SetGlobal => {
+                globals.insert(n);
+            }
+            NameUse::SetField => {
+                fields.insert(n);
+            }
+            NameUse::GetGlobal => {
+                read.insert(n);
+            }
+            _ => {}
+        }
+    }
+    globals.extend(fields.into_iter().filter(|n| !read.contains(n)));
+    globals
+}
+
 /// The first lines of a (Lua) error, on one line.
 pub fn first_lines(s: &str) -> String {
     s.lines().take(4).collect::<Vec<_>>().join(" | ")
@@ -3333,6 +3376,24 @@ pub(crate) fn is_exclusion(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A key set only in tables reads nil as a global unless some script
+    // reads it as one (then it may be a library not written yet).
+    #[test]
+    fn fields_set_in_tables_are_script_names() {
+        use m2_assets::lua::NameUse::*;
+        let names = script_defined([
+            (SetGlobal, "Init".to_owned()),
+            (SetField, "TimerEvent".to_owned()),
+            (SetField, "Marker".to_owned()),
+            (GetGlobal, "Marker".to_owned()),
+            (Field, "AddObjective".to_owned()),
+        ]);
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            ["Init", "TimerEvent"]
+        );
+    }
 
     #[test]
     fn the_object_scripts_are_named_by_their_hash() {

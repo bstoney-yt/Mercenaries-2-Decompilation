@@ -1609,6 +1609,25 @@ pub fn human_animation_sets(db: &Layer<'_>) -> HashMap<u32, (u32, u32)> {
         .collect()
 }
 
+/// Each person template's face rig, by id: its `HumanAnimationSystem`
+/// record's `facefxactor` word, the name hash of a `facefxactor` asset
+/// ([`m2_assets::facefx::ACTOR_TYPE`]). Templates naming none (0) are left
+/// out. From the 360 code: `Animation.BindFaceAnimSet` (0x82315CF8) reads
+/// the person's record (store 0x83652B9C) +8 as that asset's name and
+/// looks it up with type 0x1CF649BB; that the record's word is this field
+/// is from samples (the field holds hashes of the rigs' asset names).
+pub fn face_actors(db: &Layer<'_>) -> HashMap<u32, u32> {
+    let systems = Table::new(db, "HumanAnimationSystem");
+    let field = name_hash("facefxactor");
+    systems
+        .templates()
+        .filter_map(|t| {
+            let r = systems.of_template(t).first()?;
+            Some((t, systems.word(r, field).filter(|&h| h != 0)?))
+        })
+        .collect()
+}
+
 /// Every template's `Health` value, by id: a vehicle's, a person's, a
 /// hero's (the `Mattias` template's 120).
 pub fn healths(db: &Layer<'_>) -> HashMap<u32, f32> {

@@ -1111,6 +1111,8 @@ pub struct Autoplay {
     /// When she last called a laser-guided item in, and the spot she
     /// went to for a clear line to its target.
     laser_called: Option<f32>,
+    /// When she last chose one of the scripts' strikes in the menu.
+    stock_called: Option<f32>,
     laser_spot: Option<Vec3>,
     laser_since: f32,
     /// Seconds her laser has been off its target.
@@ -1930,6 +1932,16 @@ impl Autoplay {
                 }
                 Aim::Laser => intent.trigger.fire = true,
             },
+            // A satellite item's view and wheel: confirmed where it opens,
+            // each wedge pressed as the needle comes into it.
+            Phase::Viewing { .. } => {
+                self.tapped = !self.tapped;
+                intent.trigger.fire = self.tapped;
+            }
+            Phase::Timing { .. } => {
+                self.tapped = !self.tapped;
+                intent.trigger.fire = self.tapped && game.support.wheel_ready();
+            }
             _ => {}
         }
         intent
@@ -3388,6 +3400,30 @@ impl Autoplay {
                     self.way = None;
                 }
             }
+            // Stalled close to a place she is to get herself to: out, and
+            // the rest on foot. VzaCon001's "Rescue Carmona" waits for her
+            // in `region_vza_youwin`, the ruined hotel's courtyard, walled
+            // by its buildings and entered by arches no tank fits through:
+            // the walk round story run (main cf197509) drove the AMX30
+            // round it from 371 s to its 500 s cap, stalling 6 times
+            // 23-34 m off, never on foot.
+            let leg = match &self.goal {
+                Some(Goal::Reach { target, .. }) => {
+                    self.deliveries.iter().find(|d| d.dest == *target)
+                }
+                _ => None,
+            };
+            let v = &game.scene.vehicles[i];
+            if walk_in_from_stall(v.spec.is_boat(), game.scene.props.carrying(i), d, leg)
+                && self.may_get_out(game, i)
+            {
+                eprintln!(
+                    "autoplay {:.1} s: stalled in the {} {d:.0} m from where she is to get herself to: getting out to go on foot",
+                    self.clock, v.spec.label
+                );
+                self.leave = true;
+                return self.press(speed);
+            }
             // A boat run aground near the place: out, into the shallows
             // (further off, it backs off the rocks). Not when the place
             // lies on open water (a race's checkpoint: she would lose
@@ -4396,8 +4432,15 @@ impl Autoplay {
             );
         }
         let away = at + (here - at).with_y(0.0).normalize_or(Vec3::X) * (CALL_FROM.0 + 10.0);
+        // A strike of hers or the scripts' to call (#637: the first
+        // contract's bomb is theirs now), and none just called in.
+        let calling = self
+            .stock_called
+            .is_some_and(|t| self.clock - t < STOCK_CALL_WAIT);
         let waiting = support.phase == Phase::Idle
-            && (support.inbound().is_some() || support.ready().is_none());
+            && (support.inbound().is_some()
+                || calling
+                || strike_line(&support.entries()).is_none());
         if waiting || support.phase == Phase::Idle {
             if d < CALL_FROM.0 {
                 return self.walk(game, away, 2.0, dt);
@@ -4502,6 +4545,9 @@ impl Autoplay {
                     game.support.selected = i;
                     self.laser_called = Some(self.clock);
                 } else if let Some(i) = strike_line(&game.support.entries()) {
+                    if matches!(game.support.entries().get(i), Some(Entry::Stocked(_))) {
+                        self.stock_called = Some(self.clock);
+                    }
                     // Else her own strike, the line a player scrolls to:
                     // the menu's line as it stood was a delivery of the
                     // scripts' (the contract sweep: ChiCon001 and ChiCon003
@@ -6290,8 +6336,17 @@ fn contract_first(places: Vec<&Mark>) -> Vec<&Mark> {
 /// The support menu's line with her own strike on it (the satellite
 /// bomb), if she holds one.
 fn strike_line(entries: &[Entry<'_>]) -> Option<usize> {
-    entries.iter().position(|e| matches!(e, Entry::Own(_)))
+    entries.iter().position(|e| match e {
+        Entry::Own(_) => true,
+        // The scripts' own satellite guided bomb (the first contract's
+        // `VzaCon01_SatBomb`, #637): called in as theirs.
+        Entry::Stocked(s) => s.count > 0 && crate::support::Kind::from_freebie(&s.key).is_some(),
+    })
 }
+
+/// Seconds she leaves the menu shut after calling one of the scripts'
+/// items in: they hand her its designator a tick or so later (Invented).
+const STOCK_CALL_WAIT: f32 = 3.0;
 
 /// Whether a marker of the scripts' is still up on `g` (an action's, or a
 /// pickup's whose context action she took: the fuel tanks' "Steal fuel").
@@ -6439,10 +6494,23 @@ fn sight_step(at: Vec3, here: Vec3) -> SightStep {
     }
 }
 
+/// Whether a vehicle stalled `d` metres (flat) from the place of
+/// `delivery` is left there for the rest on foot: a delivery of her
+/// herself (on foot she counts as much as driven: the scripts' test,
+/// `Event.Boundary` on its region or `Event.ObjectProximity` on its place,
+/// is of her, or of the vehicle she rides in), not yet made, within
+/// [`HOP_NEAR`]; not a boat (off it she is in the sea), nor a vehicle
+/// with goods on it (they are what she brings).
+fn walk_in_from_stall(boat: bool, carrying: bool, d: f32, delivery: Option<&Delivery>) -> bool {
+    !boat && !carrying && d < HOP_NEAR && delivery.is_some_and(|l| l.of_her && !l.arrived())
+}
+
 /// One of the contract's active deliveries (`MrxTaskObjectiveDeliver`):
 /// its destination place (`dest`, at `at`), its drop-off radius and
 /// whether flat, how many targets must be there, and its targets with
-/// where they are and, where it has a region, whether inside it.
+/// where they are and, where it has a region, whether inside it; and
+/// whether she herself is one of them (`of_her`: `vTgtInclude =
+/// Player.GetAnyCharacter()`, VzaCon001's waypoints and "Rescue Carmona").
 #[derive(Clone, Debug, PartialEq)]
 pub struct Delivery {
     pub dest: u32,
@@ -6451,6 +6519,7 @@ pub struct Delivery {
     pub xz: bool,
     pub quota: usize,
     pub targets: Vec<(u32, Vec3, Option<bool>)>,
+    pub of_her: bool,
 }
 
 impl Delivery {
@@ -6930,6 +6999,7 @@ mod tests {
             xz: true,
             quota: 1,
             targets,
+            of_her: false,
         };
         // Just outside, entering, inside.
         assert!(!d(vec![gun(15.6)]).arrived());
@@ -6954,6 +7024,38 @@ mod tests {
             ..d(vec![(7, at, Some(false))])
         };
         assert!(!outside.arrived());
+    }
+
+    // VzaCon001's "Rescue Carmona": her to `region_vza_youwin`, the hotel
+    // courtyard (the run on cf197509 stalled the AMX30 23-34 m off, outside
+    // it, and drove round it till the cap).
+    #[test]
+    fn a_stall_near_a_delivery_of_her_is_walked_from() {
+        let hotel = Vec3::new(-1421.5, 26.0, 3052.0);
+        let her = |inside: bool| Delivery {
+            dest: 0xb35d0,
+            at: hotel,
+            radius: Some(5.0),
+            xz: true,
+            quota: 1,
+            targets: vec![(1, Vec3::new(-1447.3, 24.7, 3046.0), Some(inside))],
+            of_her: true,
+        };
+        let outside = her(false);
+        assert!(walk_in_from_stall(false, false, 27.0, Some(&outside)));
+        // Too far yet: driven on.
+        assert!(!walk_in_from_stall(false, false, 60.0, Some(&outside)));
+        // Already inside: nothing to walk to.
+        assert!(!walk_in_from_stall(false, false, 27.0, Some(&her(true))));
+        // A boat, goods aboard, or a delivery of something else: stays in.
+        assert!(!walk_in_from_stall(true, false, 27.0, Some(&outside)));
+        assert!(!walk_in_from_stall(false, true, 27.0, Some(&outside)));
+        let truck = Delivery {
+            of_her: false,
+            ..outside.clone()
+        };
+        assert!(!walk_in_from_stall(false, false, 27.0, Some(&truck)));
+        assert!(!walk_in_from_stall(false, false, 27.0, None));
     }
 
     // A box of the carbine's rounds is wanted while it has room for them,
@@ -7529,6 +7631,21 @@ mod tests {
             Some(1)
         );
         assert_eq!(strike_line(&[Entry::Stocked(&c4)]), None);
+        // The scripts' satellite bomb (#637) is a strike too, while she
+        // has one.
+        let mut theirs = Stocked {
+            key: "VzaCon01_SatBomb".to_owned(),
+            name: "Satellite Guided Bomb".to_owned(),
+            method: "Satellite".to_owned(),
+            count: 1,
+            free: true,
+        };
+        assert_eq!(
+            strike_line(&[Entry::Stocked(&c4), Entry::Stocked(&theirs)]),
+            Some(1)
+        );
+        theirs.count = 0;
+        assert_eq!(strike_line(&[Entry::Stocked(&theirs)]), None);
     }
 
     #[test]

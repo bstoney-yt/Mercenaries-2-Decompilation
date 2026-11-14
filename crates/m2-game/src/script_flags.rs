@@ -27,10 +27,11 @@
 //! check (`lua_checkstack(L, 1)`), not an argument count.
 //! `SetAutosaveEnabled` needs a boolean; anything else answers nil.
 //!
-//! Invented: the starting profile options (autosave on, rumble on,
-//! Y axis not inverted) — the 360 loads them from the player's profile,
-//! and the defaults that profile code writes weren't traced. The port
-//! always has a profile and is never the German SKU.
+//! The starting profile options are the profile's defaults
+//! ([`crate::profile::ProfileOptions`], from the 360 code `0x8239B028`):
+//! autosave on, rumble on, Y axis not inverted; the player's own options
+//! go over them ([`SysFlags::set_profile`]). Invented: the port always has
+//! a profile and is never the German SKU.
 
 use mlua::{MultiValue, Value};
 
@@ -60,6 +61,7 @@ pub struct SysFlags {
 
 impl Default for SysFlags {
     fn default() -> Self {
+        let profile = crate::profile::ProfileOptions::default();
         Self {
             auto_load: false,
             disable_asset_preload: false,
@@ -68,14 +70,25 @@ impl Default for SysFlags {
             demo_mode: false,
             play_intro_movies: true,
             start_with_resources: false,
-            y_axis_inverted: false,
-            autosave_enabled: true,
-            rumble_enabled: true,
+            y_axis_inverted: profile.invert_y != 0,
+            autosave_enabled: profile.autosave != 0,
+            rumble_enabled: profile.rumble != 0,
             force_next_autosave: false,
             button_layout: 6,
             have_profile: true,
             german_sku: false,
         }
+    }
+}
+
+impl SysFlags {
+    /// The player's profile options the natives read: inverted Y
+    /// (`YAxisInverted`, +0x7D), rumble (`RumbleEnabled`, +0x81) and
+    /// autosave (`IsAutosaveEnabled`, +0x7F).
+    pub fn set_profile(&mut self, invert_y: bool, rumble: bool, autosave: bool) {
+        self.y_axis_inverted = invert_y;
+        self.rumble_enabled = rumble;
+        self.autosave_enabled = autosave;
     }
 }
 
@@ -136,6 +149,20 @@ pub fn set_autosave(flags: &mut SysFlags, args: &[Value]) -> MultiValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The profile's defaults start the natives' options, and the
+    /// player's own go over them.
+    #[test]
+    fn profile_options_reach_the_natives() {
+        let mut f = SysFlags::default();
+        assert_eq!(getter(&f, "YAxisInverted"), Some(false));
+        assert_eq!(getter(&f, "RumbleEnabled"), Some(true));
+        assert_eq!(getter(&f, "IsAutosaveEnabled"), Some(true));
+        f.set_profile(true, false, false);
+        assert_eq!(getter(&f, "YAxisInverted"), Some(true));
+        assert_eq!(getter(&f, "RumbleEnabled"), Some(false));
+        assert_eq!(getter(&f, "IsAutosaveEnabled"), Some(false));
+    }
 
     #[test]
     fn retail_values() {

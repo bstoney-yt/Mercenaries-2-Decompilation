@@ -535,6 +535,9 @@ impl Default for HeroDamage {
 
 /// People are hit within this distance of the line from shins to head.
 const BODY_RADIUS: f32 = 0.3;
+/// How far ahead of his shoulder a soldier's rocket starts, m: past his
+/// body's radius (invented: the 360's projectile skips its owner).
+const LAUNCH_CLEAR: f32 = BODY_RADIUS + 0.2;
 /// Health comes back after this many quiet seconds, at this rate a second.
 const REGEN_AFTER: f32 = 4.0;
 const REGEN_RATE: f32 = 25.0;
@@ -1513,6 +1516,9 @@ enum Projectile {
         key: Option<u32>,
         /// A soldier's: what it does isn't to her account.
         army: bool,
+        /// A homing missile fired on a lock on her vehicle: its number
+        /// for the scripts ([`crate::homing::ScriptSide`]).
+        round: Option<u32>,
     },
     Grenade {
         at: Vec3,
@@ -1734,6 +1740,10 @@ pub struct Combat {
     remarks: Vec<Remark>,
     /// People shot and blasts set off, for the screenshot check.
     pub hits: u32,
+    /// The engine's random numbers a knockdown's length is spread by
+    /// ([`melee::knockdown_seconds`](m2_engine::melee::knockdown_seconds)):
+    /// the stream at `0x82B5E588`, from its start-up seed.
+    knock_rng: m2_game::script_math::EngineRng,
     pub blasts: u32,
     /// Where the last one went off, and what it pushes what it breaks
     /// with, where known.
@@ -1841,6 +1851,8 @@ pub struct Combat {
     /// The locks on her vehicle as she hears them, the vehicle they are
     /// for, and lockers numbered so far ([`crate::homing`]).
     warnings: crate::homing::Warnings,
+    /// What the scripts hear of those locks ([`crate::homing::ScriptSide`]).
+    pub scripts: crate::homing::ScriptSide,
     warned: Option<VehicleId>,
     lockers: u32,
     /// What homing weapons see of each template (`HomingTarget`).
@@ -1848,6 +1860,9 @@ pub struct Combat {
     /// Debug (`--homing-check`): her vehicle shows ground and air
     /// signatures of 1, whatever its template says.
     pub homing_check: bool,
+    /// Homing shots fired at her vehicle once locked (soldiers' and
+    /// crews'), for the `--homing-check` log.
+    pub homing_fired: u32,
     gunner_wait: Vec<f32>,
     /// Rounds left in each such gunner's burst.
     gunner_burst: Vec<u32>,
@@ -2076,6 +2091,7 @@ impl Default for Combat {
             part_fx_next: 0.0,
             remarks: Vec::new(),
             hits: 0,
+            knock_rng: m2_game::script_math::EngineRng::default(),
             blasts: 0,
             last_blast: None,
             last_push: None,
@@ -2118,10 +2134,12 @@ impl Default for Combat {
             crew_firing: false,
             crew_homing: None,
             warnings: Default::default(),
+            scripts: Default::default(),
             warned: None,
             lockers: 0,
             homing_targets: Vec::new(),
             homing_check: false,
+            homing_fired: 0,
             gunner_wait: Vec::new(),
             gunner_burst: Vec::new(),
             gunner_clips: Vec::new(),
@@ -3414,6 +3432,7 @@ impl Combat {
                     homing: None,
                     key: ammo.key,
                     army: false,
+                    round: None,
                 });
                 self.effect(
                     Effect::Flash {
@@ -3577,13 +3596,20 @@ impl Combat {
     fn her_mark(&self, f: &Field<'_>) -> Option<crate::homing::Mark<VehicleId>> {
         let v = &f.vehicles[f.player.driving?];
         let id = v.id?;
-        let at = f.physics.vehicle_transform(id)?.w_axis.truncate();
         let signature = if self.homing_check {
             [1.0, 1.0]
         } else {
             m2_engine::weapons::homing_signature(&self.homing_targets, &v.spec.label, v.spec.model)?
         };
+        // The middle of its box, not its body's origin: that sits at the
+        // wheels, and a seeker's line to it ran into the ground until the
+        // holder was within a few metres (seen in the --homing-check run:
+        // no lock from 40 m, one at 7 m).
         let (lo, hi) = v.spec.bounds;
+        let at = f
+            .physics
+            .vehicle_transform(id)?
+            .transform_point3((lo + hi) * 0.5);
         Some(crate::homing::Mark {
             id,
             at,
@@ -3600,6 +3626,24 @@ impl Combat {
             self.warned = vehicle;
         }
         self.warnings.tick(dt);
+    }
+
+    /// The homing missiles fired on her vehicle still flying: their
+    /// rounds ([`crate::homing::ScriptSide`]), where they are and their
+    /// heading (yaw, radians).
+    pub fn rounds_flying(&self) -> Vec<(u32, Vec3, f32)> {
+        self.projectiles
+            .iter()
+            .filter_map(|p| match p {
+                Projectile::Rocket {
+                    at,
+                    velocity,
+                    round: Some(r),
+                    ..
+                } => Some((*r, *at, velocity.x.atan2(velocity.z))),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The warning cues to play (`false`) or stop (`true`) since last
@@ -3642,8 +3686,10 @@ impl Combat {
         let event = n.seeking.tick(dt, &s, from, mark, |o, d, r| {
             physics.cast_ray_vehicle(o, d, r, None).and_then(|h| h.1)
         });
+        let locker = crate::homing::Locker::soldier(n.spawn, n.seeking.owner);
         if let Some(e) = event {
             self.warnings.hear(n.seeking.owner, e);
+            self.scripts.post(e, locker);
         }
         if mark.is_none() || !up {
             return Seek::Unguided;
@@ -3659,8 +3705,10 @@ impl Combat {
         for (e, t) in events {
             if mark.map(|m| m.id) == Some(t) {
                 self.warnings.hear(n.seeking.owner, e);
+                self.scripts.post(e, locker);
             }
         }
+        self.homing_fired += 1;
         eprintln!(
             "homing: a soldier's {:#x} locked on her vehicle fires",
             l.template
@@ -3693,6 +3741,10 @@ impl Combat {
         let spread = SoldierSpread::new(distance, n.accuracy(), 0.0);
         let (a, b) = (self.random(), self.random());
         let dir = spread.stray((aim - from).normalize_or(Vec3::Z), a, b);
+        // Over his shoulder is the top of his own body's capsule: it
+        // starts just clear of him, or it bursts on him at once (the
+        // `--homing-check` run: each soldier's rocket killed him).
+        let from = from + dir * LAUNCH_CLEAR;
         let speed = Some(l.ammo.human_speed())
             .filter(|&v| v > 0.0)
             .unwrap_or(ROCKET_SPEED);
@@ -3700,6 +3752,11 @@ impl Combat {
             "rocket: a soldier fires his {:#x} at {distance:.0} m",
             l.template
         );
+        let round = if homing.is_some() {
+            self.scripts.fired(l.ammo.template, from)
+        } else {
+            None
+        };
         self.projectiles.push(Projectile::Rocket {
             at: from,
             velocity: dir * speed,
@@ -3710,6 +3767,7 @@ impl Combat {
             homing,
             key: l.ammo.key,
             army: true,
+            round,
         });
         self.effect(
             Effect::Flash {
@@ -3732,8 +3790,19 @@ impl Combat {
         let from = n.character.position + Vec3::Y * 1.8;
         eprintln!("grenade: a soldier throws from {from:.1} at {at:.1}");
         let gravity = m2_engine::physics::GRAVITY;
-        let velocity =
-            lob_velocity(from, at, THROW, gravity).unwrap_or_else(|| farthest(at - from, THROW));
+        // The low lob, else the high one where the low one would meet
+        // something on the way (the cover he throws from: playtest
+        // 2026-11-14's grenades went off at the throwers' feet, behind
+        // their cover, unseen), else the low one anyway.
+        let clear = |v: Vec3| arc_clear(f.physics, from, v, at, gravity);
+        let velocity = match lob_velocities(from, at, THROW, gravity) {
+            Some((low, high)) if !clear(low) && clear(high) => {
+                eprintln!("grenade: the low lob is blocked: thrown high");
+                high
+            }
+            Some((low, _)) => low,
+            None => farthest(at - from, THROW),
+        };
         // The grenade template's blast (inferred: the same `Grenade` as
         // hers); without one read, the alpha's own blast.
         let blast = self
@@ -3987,8 +4056,10 @@ impl Combat {
             // record where a hit landed on her, so it is always the plain
             // death; the clip played here before (479c4a51) is `Upright`
             // `ProneTransition`'s by the tables, not a death. In a
-            // vehicle the 360 goes by a mode of the seat, not traced:
-            // there the old clip still plays.
+            // vehicle the same `Die` goes, by the state table, to
+            // `InVehicle` `Die` (ragdoll mode `NONE`), then `Dead`: she
+            // stays in the seat, animated, playing the seat's own clips
+            // ([`crate::hijack::seated_death`]).
             let on_foot = f.player.driving.is_none() && !f.player.seated;
             let body = f.player.model_matrix();
             if let Some((_, rig)) = &mut f.player.model {
@@ -4003,8 +4074,6 @@ impl Combat {
                         .physics
                         .add_ragdoll(&rig.skeleton.parents, &world, Vec3::ZERO);
                     f.player.ragdoll = Some(id);
-                } else if let Some(die) = f.player.clips.die {
-                    rig.animator.play_once(die);
                 }
             }
             f.people.stand_down();
@@ -4115,6 +4184,7 @@ impl Combat {
             homing,
             key: self.launcher.ammo.and_then(|a| a.key),
             army: false,
+            round: None,
         });
         self.effect(
             Effect::Flash {
@@ -4385,6 +4455,12 @@ impl Combat {
                 });
             }
             _ => {
+                let homing = self.crew_homing.take();
+                let round = if homing.is_some() {
+                    self.scripts.fired(ammo.template, from)
+                } else {
+                    None
+                };
                 self.projectiles.push(Projectile::Rocket {
                     at: from,
                     velocity: aim * ammo.velocity.max(1.0),
@@ -4392,9 +4468,10 @@ impl Combat {
                     shell: false,
                     owner: Some(id),
                     blast: ammo.burst(),
-                    homing: self.crew_homing.take(),
+                    homing,
                     key: ammo.key,
                     army: self.crew_firing,
+                    round,
                 });
                 self.effect(
                     Effect::Flash {
@@ -4679,6 +4756,8 @@ impl Combat {
                 // A homing gun names her vehicle while it goes for her, and
                 // its lock runs (360 0x822AE598, 0x82294B70).
                 let on_her = gun.slot.who == Some(crate::npc::HER) && mark.is_some();
+                // The vehicle as the scripts know it, if theirs.
+                let theirs = f.vehicles[i].guid.or(f.vehicles[i].spot.map(|s| s.0));
                 if let Some(s) = seeker {
                     if gun.seeking.owner == 0 {
                         self.lockers += 1;
@@ -4693,6 +4772,8 @@ impl Combat {
                     });
                     if let Some(e) = event {
                         self.warnings.hear(gun.seeking.owner, e);
+                        self.scripts
+                            .post(e, crate::homing::Locker::crew(theirs, gun.seeking.owner));
                     }
                 }
                 let Some(at) = gun.at else { continue };
@@ -4723,6 +4804,7 @@ impl Combat {
                 // ... and it holds its fire until locked, each missile
                 // locked afresh (0x822AE598, 0x82293660).
                 self.crew_homing = None;
+                self.scripts.disarm();
                 if seeker.is_some() && on_her {
                     let gun = self.crews.entry((i, seat)).or_default();
                     if gun.seeking.lock.locked().is_none() {
@@ -4732,11 +4814,14 @@ impl Combat {
                     for (e, t) in events {
                         if mark.map(|m| m.id) == Some(t) {
                             self.warnings.hear(gun.seeking.owner, e);
+                            let locker = crate::homing::Locker::crew(theirs, gun.seeking.owner);
+                            self.scripts.post(e, locker);
                         }
                     }
                     self.crew_homing = target
                         .zip(guided)
                         .map(|(t, h)| crate::homing::Homing::new(t, h));
+                    self.homing_fired += 1;
                     eprintln!("homing: a crew's gun locked on her vehicle fires");
                 }
                 let to = at - centre;
@@ -4944,6 +5029,7 @@ impl Combat {
                 homing: None,
                 key,
                 army: self.crew_firing,
+                round: None,
             });
             if let Some(v) = f.vehicles.get_mut(i) {
                 v.fired += 1;
@@ -5420,9 +5506,10 @@ impl Combat {
             if n.hurt(taken, push) && soldier {
                 self.remarks.push(Remark::Kill);
             }
-            // Still alive: felled for the 360's knockdown time (its random
-            // spread stood in for by the blow's count, invented).
-            let r = (self.hits as f32 * 0.618_034).fract();
+            // Still alive: felled for the 360's knockdown time, spread by
+            // a draw of the engine's generator (0x82423848 draws
+            // 0x8215E260's stream 1 once a blow).
+            let r = self.knock_rng.unit();
             let seconds = melee::knockdown_seconds(melee::KNOCKDOWN_SECONDS, false, r);
             n.knock_down_for(seconds, push);
             self.hits += 1;
@@ -5696,15 +5783,23 @@ impl Combat {
                 homing,
                 key,
                 army,
+                round: _,
             } => {
                 // Turning after the vehicle it locked on, no faster than its
                 // turn rate; one gone, or too far off its nose, is lost and
                 // it flies on straight ([`crate::homing::Homing::steer`]).
+                // Its goal is the middle of the target's box (0x822951B0:
+                // the box's min and max halved, through its matrix).
                 if let Some(h) = homing {
+                    let middle = f
+                        .vehicles
+                        .iter()
+                        .find(|v| v.id == Some(h.target))
+                        .map_or(Vec3::ZERO, |v| (v.spec.bounds.0 + v.spec.bounds.1) * 0.5);
                     let goal = f
                         .physics
                         .vehicle_transform(h.target)
-                        .map(|m| m.w_axis.truncate());
+                        .map(|m| m.transform_point3(middle));
                     match goal.and_then(|g| h.steer(*at, *velocity, g, dt)) {
                         Some(v) => *velocity = v,
                         None => {
@@ -6598,19 +6693,57 @@ fn ground_under(physics: &Physics, at: Vec3) -> Option<Vec3> {
 /// The velocity at `speed` that lobs a round from `from` down onto `to`
 /// under `gravity`: the lower of its two arcs, if it reaches.
 fn lob_velocity(from: Vec3, to: Vec3, speed: f32, gravity: f32) -> Option<Vec3> {
+    lob_velocities(from, to, speed, gravity).map(|(low, _)| low)
+}
+
+/// Both arcs at `speed` that lob a round from `from` down onto `to`
+/// under `gravity`, the lower first, if it reaches.
+fn lob_velocities(from: Vec3, to: Vec3, speed: f32, gravity: f32) -> Option<(Vec3, Vec3)> {
     let d = to - from;
     let flat = d.with_y(0.0);
     let x = flat.length();
     if x < 1e-3 {
-        return Some(d.normalize_or(Vec3::NEG_Y) * speed);
+        let v = d.normalize_or(Vec3::NEG_Y) * speed;
+        return Some((v, v));
     }
     let v2 = speed * speed;
     let room = v2 * v2 - gravity * (gravity * x * x + 2.0 * d.y * v2);
     if room < 0.0 {
         return None;
     }
-    let (sin, cos) = ((v2 - room.sqrt()) / (gravity * x)).atan().sin_cos();
-    Some(flat / x * (speed * cos) + Vec3::Y * (speed * sin))
+    let arc = |tan: f32| {
+        let (sin, cos) = tan.atan().sin_cos();
+        flat / x * (speed * cos) + Vec3::Y * (speed * sin)
+    };
+    Some((
+        arc((v2 - room.sqrt()) / (gravity * x)),
+        arc((v2 + room.sqrt()) / (gravity * x)),
+    ))
+}
+
+/// How near its mark, metres across, a lob may come down on something
+/// and still count as clear ([`arc_clear`]; invented).
+const ARC_NEAR: f32 = 3.0;
+
+/// Whether a round thrown from `from` at `velocity` under `gravity`
+/// flies on to within [`ARC_NEAR`] of `to` (across) before it meets
+/// anything solid, stepped a thirtieth of a second at a time for at most
+/// 4 s.
+fn arc_clear(physics: &Physics, from: Vec3, velocity: Vec3, to: Vec3, gravity: f32) -> bool {
+    const STEP: f32 = 1.0 / 30.0;
+    let (mut at, mut v) = (from, velocity);
+    for _ in 0..120 {
+        if (at - to).with_y(0.0).length() <= ARC_NEAR {
+            return true;
+        }
+        v.y -= gravity * STEP;
+        let step = v * STEP;
+        if physics.cast_ray(at, step, step.length()).is_some() {
+            return (at - to).with_y(0.0).length() <= ARC_NEAR;
+        }
+        at += step;
+    }
+    false
 }
 
 /// The velocity at `speed` that lobs a round furthest along `way`: 45
@@ -6761,6 +6894,20 @@ fn lock_share(held: f32, time: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    /// A knockdown's length is spread by the engine's own random draws
+    /// from its start-up seed, not by how many blows have landed: from a
+    /// fresh start the first two fell for about 6.66 and 6.21 seconds
+    /// (worked by hand from 0x94153A94).
+    #[test]
+    fn knockdowns_are_spread_by_the_engine_s_draws() {
+        use m2_engine::melee::{KNOCKDOWN_SECONDS, knockdown_seconds};
+        let mut combat = Combat::default();
+        let mut next = || knockdown_seconds(KNOCKDOWN_SECONDS, false, combat.knock_rng.unit());
+        assert!((next() - 6.663_352).abs() < 1e-4);
+        assert!((next() - 6.213_857).abs() < 1e-4);
+        assert!((next() - 6.754_052).abs() < 1e-4);
+    }
+
     /// An effect set off along a way is turned so its +Z lies along it
     /// and its +Y stays up: the launcher's flash (+Z) goes out of the
     /// barrel, the rocket's smoke (-Z) out of its tail, not up.
@@ -7475,6 +7622,33 @@ mod tests {
             combat.slung(false),
             [Some(Weapon::Rifle), Some(Weapon::GrenadeLauncher)]
         );
+    }
+
+    #[test]
+    fn a_soldier_lobs_high_over_the_wall_in_front_of_him() {
+        let gravity = m2_engine::physics::GRAVITY;
+        let mut physics = ground();
+        let (from, to) = (Vec3::new(0.0, 1.8, 0.0), Vec3::new(0.0, 0.0, 14.0));
+        let (low, high) = lob_velocities(from, to, THROW, gravity).unwrap();
+        assert!(high.y > low.y);
+        // Both land on the mark.
+        for v in [low, high] {
+            let t = (to.z - from.z) / v.z;
+            let y = from.y + v.y * t - 0.5 * gravity * t * t;
+            assert!(y.abs() < 1e-2, "{v:?} lands at {y}");
+        }
+        assert!(arc_clear(&physics, from, low, to, gravity));
+        // A wall 2.5 m high 1.5 m ahead of him: the low lob meets it,
+        // the high one clears it.
+        physics.add_static(
+            StaticKey::Object(9),
+            &m2_engine::CollisionShape::cuboid(Vec3::new(3.0, 1.25, 0.2)),
+            Vec3::new(0.0, 1.25, 1.5),
+            m2_math::glam::Quat::IDENTITY,
+        );
+        physics.step(1.0 / 60.0);
+        assert!(!arc_clear(&physics, from, low, to, gravity));
+        assert!(arc_clear(&physics, from, high, to, gravity));
     }
 
     #[test]
@@ -8401,6 +8575,24 @@ mod tests {
         assert!(ray_capsule(Vec3::new(0.0, 2.5, 0.0), Vec3::Z, a, seg, 0.3).is_none());
         // Behind the shooter.
         assert!(ray_capsule(Vec3::new(0.0, 1.2, 20.0), Vec3::Z, a, seg, 0.3).is_none());
+    }
+
+    // A soldier's rocket from over his shoulder (chest + 0.4 m) starts on
+    // his own capsule's top and met him at once; started LAUNCH_CLEAR
+    // along its way it leaves him, level or aimed down at a car.
+    #[test]
+    fn a_soldiers_rocket_starts_clear_of_him() {
+        let feet = Vec3::ZERO;
+        let (a, seg) = (feet + Vec3::Y * 0.25, Vec3::Y * 1.45);
+        let shoulder = feet + Vec3::Y * (1.3 + 0.4);
+        assert_eq!(
+            ray_capsule(shoulder, Vec3::Z, a, seg, BODY_RADIUS),
+            Some(0.0)
+        );
+        for dir in [Vec3::Z, Vec3::new(0.0, -0.05, 1.0).normalize()] {
+            let from = shoulder + dir * LAUNCH_CLEAR;
+            assert_eq!(ray_capsule(from, dir, a, seg, BODY_RADIUS), None, "{dir}");
+        }
     }
     /// PmcCon001 hands her an Assault Rifle, not the first contract's
     /// carbine: it is the gun in the rifle's place, one clip in and none
