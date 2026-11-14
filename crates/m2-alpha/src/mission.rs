@@ -3343,6 +3343,15 @@ impl MissionLink {
                 mission.place(g, at.to_array(), yaw);
                 mission.set_bounds(g, lo.to_array(), hi.to_array());
             }
+            // The part states the props destroyed went to, for their
+            // scripts' `OnStateChange` (a tree burnt down burns its
+            // leaves). The machine passed is 0: which of the model's part
+            // machines the 360 names there is not traced (the tree
+            // scripts read only the state).
+            for (g, state) in game.destruction.take_state_changes() {
+                eprintln!("mission: {g:#x}'s part state goes to {state:08x}");
+                mission.object_state_changed(g, 0, state);
+            }
             for (g, at, yaw) in game.scene.flights.places(&game.scene.vehicles) {
                 mission.place(g, at.to_array(), yaw);
             }
