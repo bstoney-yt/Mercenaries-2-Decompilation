@@ -6612,6 +6612,7 @@ pub(crate) mod tests {
             breakup: None,
             parts: None,
             state_fx: Default::default(),
+            part_states: None,
             state_messages: Default::default(),
             looks: None,
             lamp_nodes: Default::default(),

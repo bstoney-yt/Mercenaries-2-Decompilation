@@ -1036,6 +1036,9 @@ pub struct CpuModel {
     /// The effects its part states start (`StartEmitter`), by state
     /// ([`StateFx`]).
     pub state_fx: std::sync::Arc<Vec<StateFx>>,
+    /// Its part state machines and its nodes' name hashes, for running
+    /// them once its object is destroyed ([`crate::part_runner`]).
+    pub part_states: Option<std::sync::Arc<(m2_assets::model::PartStates, Vec<u32>)>>,
     /// The messages its part states send (`SendMessage`), by state
     /// ([`StateMessage`]).
     pub state_messages: std::sync::Arc<Vec<StateMessage>>,
@@ -1384,6 +1387,12 @@ impl CpuModel {
             breakup: None,
             parts,
             state_fx: std::sync::Arc::new(StateFx::of(model)),
+            part_states: model.states.as_ref().map(|st| {
+                std::sync::Arc::new((
+                    st.clone(),
+                    model.nodes.iter().map(|n| n.name_hash).collect(),
+                ))
+            }),
             state_messages: std::sync::Arc::new(StateMessage::of(model)),
             looks,
             lamp_nodes: lamp_nodes(&model.nodes),
@@ -1541,6 +1550,9 @@ pub struct GpuModel {
     forced: Vec<bool>,
     /// The effects its part states start ([`CpuModel::state_fx`]).
     pub state_fx: std::sync::Arc<Vec<StateFx>>,
+    /// Its part state machines and its nodes' name hashes, for running
+    /// them once its object is destroyed ([`crate::part_runner`]).
+    pub part_states: Option<std::sync::Arc<(m2_assets::model::PartStates, Vec<u32>)>>,
     /// The messages its part states send ([`CpuModel::state_messages`]).
     pub state_messages: std::sync::Arc<Vec<StateMessage>>,
     /// The looks a person model can take ([`CpuModel::looks`]); each
@@ -1801,6 +1813,7 @@ impl GpuModel {
             track_travel: 0.0,
             parts: cpu.parts.clone(),
             state_fx: cpu.state_fx.clone(),
+            part_states: cpu.part_states.clone(),
             state_messages: cpu.state_messages.clone(),
             parts_hidden: None,
             forced: Vec::new(),

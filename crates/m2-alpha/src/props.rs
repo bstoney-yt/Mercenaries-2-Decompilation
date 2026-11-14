@@ -157,6 +157,11 @@ pub struct Props {
     /// The material animations playing on them
     /// ([`play_material_animation`](Self::play_material_animation)).
     material_anims: HashMap<u32, m2_engine::material_anim::Playing>,
+    /// The part machines of those destroyed, running on
+    /// ([`destroy_parts`](Self::destroy_parts)).
+    part_runners: HashMap<u32, m2_engine::part_runner::Runner>,
+    /// Their changes since last asked: (entity, change).
+    part_changes: Vec<(u32, m2_engine::part_runner::Change)>,
     /// Node matrices of those that move on their own, by entity
     /// ([`crate::moving`]).
     poses: HashMap<u32, Vec<Mat4>>,
@@ -1784,6 +1789,12 @@ impl Props {
         for a in self.material_anims.values_mut() {
             a.advance(dt);
         }
+        for (e, r) in self.part_runners.iter_mut() {
+            r.advance(dt);
+            self.part_changes
+                .extend(r.take_changes().into_iter().map(|c| (*e, c)));
+        }
+        self.part_runners.retain(|_, r| !r.settled());
         // Gates swing on; a shut one stands in the way again
         // ([`update`](Self::update) puts its collision back).
         for s in self.swings.values_mut() {
@@ -1817,6 +1828,37 @@ impl Props {
                 }
             }
         }
+    }
+
+    /// `entity` was destroyed: its model's part machines take `message`
+    /// (`DestroyMsg`, or the fire-destroy message from an explosion) and
+    /// run on from there ([`m2_engine::part_runner`]). Nothing for a model
+    /// with no part states.
+    pub fn destroy_parts(&mut self, entity: u32, message: u32) {
+        let Some(states) = self
+            .shown
+            .get(&entity)
+            .and_then(|p| self.models.get(&p.model)?.as_ref())
+            .and_then(|m| m.gpu.part_states.clone())
+        else {
+            return;
+        };
+        let (machines, names) = &*states;
+        let name = |n: u16| names.get(usize::from(n)).copied().unwrap_or(0);
+        let mut runner = m2_engine::part_runner::Runner::new(machines, name, entity);
+        runner.deliver(message);
+        self.part_changes
+            .extend(runner.take_changes().into_iter().map(|c| (entity, c)));
+        if !runner.settled() {
+            self.part_runners.insert(entity, runner);
+        }
+    }
+
+    /// The part machines' changes since last asked ([`destroy_parts`]).
+    ///
+    /// [`destroy_parts`]: Self::destroy_parts
+    pub fn take_part_changes(&mut self) -> Vec<(u32, m2_engine::part_runner::Change)> {
+        std::mem::take(&mut self.part_changes)
     }
 
     /// Plays material animation `anim` on `entity` (the scripts'

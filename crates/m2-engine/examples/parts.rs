@@ -19,6 +19,12 @@ use m2_engine::Install;
 /// the model's node names and the state machine's words.
 const WORDS: &[&str] = &[
     "damage",
+    "Slice00",
+    "CollapseFireState",
+    "PristineState",
+    "DestroyedState",
+    "FireDestroyedState",
+    "CollapseState",
     "damaged",
     "destroyed",
     "destroy",
@@ -103,7 +109,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut source = install.open_world()?;
     let words: Vec<(u32, &str)> = WORDS.iter().map(|w| (name_hash(w), *w)).collect();
     let word = |h: u32| words.iter().find(|w| w.0 == h).map(|w| w.1);
-    for arg in &args[1..] {
+    let destroy = args.iter().any(|a| a == "--destroy");
+    for arg in args[1..].iter().filter(|a| *a != "--destroy") {
         let hash = u32::from_str_radix(arg.trim_start_matches("0x"), 16)
             .ok()
             .filter(|_| arg.len() == 8 || arg.starts_with("0x"))
@@ -124,6 +131,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             model.info.lod_count,
             model.info.flags
         );
+        // `--destroy` (after the install): its part machines destroyed
+        // (by a round, then by an explosion), each change and when.
+        if destroy && let Some(st) = &model.states {
+            for (how, message) in [
+                ("destroyed", m2_engine::destroy_route::DESTROY_MSG),
+                ("blown up", m2_engine::destroy_route::FIRE_DESTROY_MSG),
+            ] {
+                let name = |n: u16| model.nodes.get(usize::from(n)).map_or(0, |n| n.name_hash);
+                let mut r = m2_engine::part_runner::Runner::new(st, name, hash);
+                r.deliver(message);
+                let mut timeline: Vec<(f32, m2_engine::part_runner::Change)> =
+                    r.take_changes().into_iter().map(|c| (0.0, c)).collect();
+                for i in 1..=300 {
+                    r.advance(0.1);
+                    let t = i as f32 * 0.1;
+                    timeline.extend(r.take_changes().into_iter().map(|c| (t, c)));
+                }
+                println!("  {how}:");
+                for (t, c) in timeline {
+                    println!(
+                        "    {t:5.1} s: part {:08x} ({}) to {:08x} ({})",
+                        c.machine,
+                        word(c.machine).unwrap_or("?"),
+                        c.state,
+                        word(c.state).unwrap_or("?")
+                    );
+                }
+            }
+        }
         let hidden = model.states.as_ref().map(|st| {
             println!("  switchable {:?}", st.switchable);
             for m in &st.machines {
@@ -131,11 +167,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for (k, (name, commands)) in m.states.iter().enumerate() {
                     println!("    state {name:08x}: {commands:?}");
                     if let Some(a) = m.acts.get(k)
-                        && (!a.on.is_empty() || !a.sets.is_empty() || !a.emitters.is_empty())
+                        && (!a.on.is_empty()
+                            || !a.sets.is_empty()
+                            || !a.emitters.is_empty()
+                            || !a.told.is_empty()
+                            || !a.delayed.is_empty())
                     {
                         println!(
-                            "      on {:08x?} sets {:?} emitters {:?}",
-                            a.on, a.sets, a.emitters
+                            "      on {:08x?} sets {:?} emitters {:?} told {:08x?} later {:?}",
+                            a.on, a.sets, a.emitters, a.told, a.delayed
                         );
                     }
                 }
