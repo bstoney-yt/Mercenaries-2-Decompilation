@@ -7743,6 +7743,32 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
         // One whose model has no hinge (the villa's front arch,
         // `_pmcoutpost_gate_open`) has no joint for the 360's OpenGate
         // (0x82332DD8) to drive: it stands as it is.
+        // A material animation the scripts play on an object (a burnt
+        // tree's leaves: `Object.PlayMaterialAnimation`, 0x82332B70): its
+        // values go in place of the prop's materials' own as it plays
+        // ([`m2_engine::material_anim`]).
+        Command::MaterialAnimation { guid, name, looped } => {
+            let scene = &mut game.scene;
+            let hash = m2_assets::name_hash(name);
+            let anim = scene
+                .source
+                .as_mut()
+                .and_then(|s| s.asset(hash, m2_assets::animation::ANIMATION_TYPE).ok())
+                .and_then(|data| m2_assets::MaterialAnimation::parse(&data).ok());
+            match anim {
+                Some(anim) => {
+                    eprintln!(
+                        "mission: {guid:#x} plays material animation {name} ({} materials, {} frames{})",
+                        anim.materials.len(),
+                        anim.frames,
+                        if *looped { ", looped" } else { "" }
+                    );
+                    scene.props.play_material_animation(*guid, anim, *looped);
+                }
+                None => eprintln!("mission: material animation {name} for {guid:#x}: not found"),
+            }
+            return false;
+        }
         Command::OpenGate(guid) => {
             let name = mission
                 .world()
