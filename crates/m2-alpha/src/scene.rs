@@ -2514,6 +2514,16 @@ impl Scene {
         self.world.as_ref()?.index.template_db.damage.clone()
     }
 
+    /// The game's particle table ([`m2_engine::tuning::KeyTable`]).
+    pub fn particle_table(&self) -> Option<m2_engine::tuning::KeyTable> {
+        self.world
+            .as_ref()?
+            .index
+            .template_db
+            .particle_table
+            .clone()
+    }
+
     /// The thrown weapons the hero's template's `EquipmentLink`s hand
     /// them (free roam), each with how many they carry.
     pub fn hero_explosives(&self) -> Vec<(String, u32)> {

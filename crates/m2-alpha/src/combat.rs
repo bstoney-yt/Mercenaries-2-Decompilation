@@ -1806,6 +1806,9 @@ pub struct Combat {
     /// The game's damage table: what each kind of round and blast does to
     /// people and vehicles.
     pub damage_table: Option<DamageTable>,
+    /// The particle table: what a hit throws up by what it struck and
+    /// how ([`m2_engine::tuning::KeyTable`]).
+    pub particle_table: Option<m2_engine::tuning::KeyTable>,
     /// Pairs of vehicles body to body last tick ([`Combat::vehicle_crashes`]):
     /// a crash is counted as they meet, not while they stay pressed together.
     pub bumping: std::collections::HashSet<(VehicleId, VehicleId)>,
@@ -1895,6 +1898,8 @@ pub struct Combat {
     /// their surface's word names, or the generic one standing in
     /// ([`m2_engine::surface::bullet_impact`]).
     pub impacts: (u32, u32),
+    /// Of those named, how many the particle table decided.
+    pub table_impacts: u32,
     /// Those impacts by template.
     pub impact_kinds: std::collections::BTreeMap<&'static str, u32>,
     /// What the fighting has come to (for checking).
@@ -2109,6 +2114,7 @@ impl Default for Combat {
             rpg: Rifle::launcher(Weapon::Rpg),
             gl: Rifle::launcher(Weapon::GrenadeLauncher),
             damage_table: None,
+            particle_table: None,
             bumping: Default::default(),
             throwables: Vec::new(),
             explosive: 0,
@@ -2147,6 +2153,7 @@ impl Default for Combat {
             flashes: (0, 0),
             cases: 0,
             impacts: (0, 0),
+            table_impacts: 0,
             impact_kinds: std::collections::BTreeMap::new(),
             tally: Tally::default(),
             hurts: Vec::new(),
@@ -2863,7 +2870,7 @@ impl Combat {
             .collect();
         format!(
             "shots by sound set: {} (others firing: {}); flashes: {} the game's, {} the \
-             alpha's own; cases {}; impacts {} by surface, {} generic ({})",
+             alpha's own; cases {}; impacts {} by surface ({} of them by the particle table),              {} generic ({})",
             if sets.is_empty() {
                 "none".to_owned()
             } else {
@@ -2878,6 +2885,7 @@ impl Combat {
             self.flashes.1,
             self.cases,
             self.impacts.0,
+            self.table_impacts,
             self.impacts.1,
             self.impact_kinds
                 .iter()
@@ -2901,6 +2909,32 @@ impl Combat {
         let (key, surface) = physics
             .cast_ray_surface(from, dir, t + 0.05)
             .map_or((None, 0), |(_, _, key, surface)| (key, surface));
+        let at = from + dir * (t - IMPACT_BACK).max(0.0);
+        // The particle table's effect for the surface struck by a bullet
+        // first: a surface's word is a `ParticleKey` (`TERRAIN_GRASS` is
+        // the table's `Terrain_grass` row; names hash without case), and
+        // the table decides the terrain's, water's and vegetation's. An
+        // empty cell gives nothing of the table's (0x8218B410 starts no
+        // effect when the cell is 0): the surface's own pick stands there
+        // ([`m2_engine::surface::bullet_impact`]), as walls and metal
+        // still throw up their sparks in the game by another way.
+        let bullet = m2_assets::name_hash("Bullet");
+        if let Some(effect) = self
+            .particle_table
+            .as_ref()
+            .filter(|_| surface != 0)
+            .and_then(|t| t.get_exact(surface, bullet))
+        {
+            self.impacts.0 += 1;
+            self.table_impacts += 1;
+            self.game_fx.push(GameFx {
+                template: FxTemplate::Hash(effect),
+                at,
+                hold: None,
+                turn: None,
+            });
+            return key;
+        }
         let (template, named) = m2_engine::surface::bullet_impact(surface);
         if named {
             self.impacts.0 += 1;
@@ -2908,7 +2942,7 @@ impl Combat {
             self.impacts.1 += 1;
         }
         *self.impact_kinds.entry(template).or_default() += 1;
-        self.show_fx(template, from + dir * (t - IMPACT_BACK).max(0.0));
+        self.show_fx(template, at);
         key
     }
 
