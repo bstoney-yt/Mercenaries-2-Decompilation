@@ -1562,6 +1562,8 @@ struct Mine {
     reach: f32,
     life: f32,
     blast: Option<Blast>,
+    /// What it becomes once armed (`Proximity Mine (Planted)`).
+    planted: u32,
 }
 
 /// What she asks of her weapons this tick.
@@ -1834,6 +1836,11 @@ pub struct Combat {
     pub mines: u32,
     /// The last charge's number ([`Combat::charges_lying`]).
     charges_thrown: u32,
+    /// Her armed mines are the scripts' (`proximitymine` sets them off):
+    /// they no longer go off here on reach ([`Combat::mines_planted`]).
+    pub scripted_mines: bool,
+    /// Her armed mines as objects of the scripts' world: guid by number.
+    pub mine_guids: std::collections::HashMap<u32, u32>,
     /// Fire was held last tick (a one-shot-a-pull gun fires again only
     /// once it is let go).
     fire_held: bool,
@@ -2137,6 +2144,8 @@ impl Default for Combat {
             charges: 0,
             mines: 0,
             charges_thrown: 0,
+            scripted_mines: false,
+            mine_guids: std::collections::HashMap::new(),
             fire_held: false,
             lock: None,
             seat: 0,
@@ -2393,6 +2402,28 @@ impl Combat {
             } => Some((id, ammo, at)),
             _ => None,
         })
+    }
+
+    /// Her mines lying armed: number, the template each has become
+    /// (`Proximity Mine (Planted)`) and where it lies.
+    pub fn mines_planted(&self) -> impl Iterator<Item = (u32, u32, Vec3)> + '_ {
+        self.projectiles.iter().filter_map(|p| match *p {
+            Projectile::Charge {
+                id,
+                at,
+                timer,
+                mine: Some(m),
+                ..
+            } if timer <= 0.0 => Some((id, m.planted, at)),
+            _ => None,
+        })
+    }
+
+    /// Takes charge or mine `id` away (its script removed it: a mine that
+    /// popped up).
+    pub fn remove_charge(&mut self, id: u32) {
+        self.projectiles
+            .retain(|p| !matches!(*p, Projectile::Charge { id: i, .. } if i == id));
     }
 
     /// Takes up `weapon` (a launcher: the RPG or a grenade launcher) in
@@ -5660,6 +5691,7 @@ impl Combat {
                     reach,
                     life: planted.timer.map_or(f32::INFINITY, |(s, _)| s),
                     blast: planted.burst(),
+                    planted: planted.template,
                 }),
             });
         } else {
@@ -5804,6 +5836,7 @@ impl Combat {
                     .map(|m| m.w_axis.truncate()),
             )
             .collect();
+        let scripted_mines = self.scripted_mines;
         self.projectiles.retain_mut(|p| match p {
             Projectile::Rocket {
                 at,
@@ -5917,7 +5950,12 @@ impl Combat {
                     Some(m) => {
                         m.life -= dt;
                         let armed = *timer <= 0.0;
-                        if armed && near.iter().any(|p| p.distance(*at) < m.reach) {
+                        // Once armed it is the planted mine's script that
+                        // sets it off ([`Combat::mines_planted`]).
+                        if armed
+                            && !scripted_mines
+                            && near.iter().any(|p| p.distance(*at) < m.reach)
+                        {
                             blasts.push((*at, m.blast, None));
                             return false;
                         }
@@ -8788,6 +8826,7 @@ mod tests {
             reach: 2.0,
             life: 10.0,
             blast: None,
+            planted: 0x8000_6b6c,
         };
         combat.projectiles.push(charge(1, None));
         combat.projectiles.push(charge(2, Some(mine)));
@@ -8800,6 +8839,37 @@ mod tests {
                 (3, 0x8000_5fd4, Vec3::new(3.0, 0.0, 0.0))
             ]
         );
+    }
+
+    // An armed mine is listed as the template it has become; one still
+    // arming is not; a mine its script removed is gone.
+    #[test]
+    fn armed_mines_are_listed_as_planted_and_can_be_removed() {
+        let mut combat = Combat::default();
+        let mine = |id, timer| Projectile::Charge {
+            id,
+            ammo: 0x8000_6ea1,
+            at: Vec3::new(id as f32, 0.0, 0.0),
+            velocity: Vec3::ZERO,
+            model: None,
+            stuck: true,
+            blast: None,
+            timer,
+            mine: Some(Mine {
+                arm: 6.0,
+                reach: 3.0,
+                life: f32::INFINITY,
+                blast: None,
+                planted: 0x8000_6b6c,
+            }),
+        };
+        combat.projectiles.push(mine(1, -0.5));
+        combat.projectiles.push(mine(2, 4.0));
+        let planted: Vec<_> = combat.mines_planted().collect();
+        assert_eq!(planted, [(1, 0x8000_6b6c, Vec3::new(1.0, 0.0, 0.0))]);
+        combat.remove_charge(1);
+        assert_eq!(combat.mines_planted().count(), 0);
+        assert_eq!(combat.projectiles.len(), 1);
     }
 
     #[test]

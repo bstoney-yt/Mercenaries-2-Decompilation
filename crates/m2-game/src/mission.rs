@@ -36,6 +36,7 @@ use crate::script::{ScriptError, ScriptHost};
 
 mod ammo;
 mod homing;
+mod mines;
 pub use homing::{ANTI_AIR, HOMING_MISSILE, HomingKind, HomingPost};
 
 /// The script that starts the game (`Init`, then `LoadGame`).
@@ -3189,7 +3190,10 @@ fn seat_crew(
 /// `C4` and `beacon` are the scripts of her stuck C4 and of the Beacon
 /// Designator's beacon light: they blink and, a second on, beep until
 /// they go ([`Mission::ammo_spawned`]).
-pub const OBJECT_SCRIPTS: [(&str, u32); 18] = [
+///
+/// `mine` and `proximitymine` are the placed mines' and her planted
+/// mine's ([`Mission::placed_mines`]).
+pub const OBJECT_SCRIPTS: [(&str, u32); 20] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3208,6 +3212,8 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 18] = [
     ("HomingMissile", homing::HOMING_MISSILE),
     ("C4", ammo::C4),
     ("beacon", ammo::BEACON),
+    ("mine", mines::MINE),
+    ("proximitymine", mines::PROXIMITY_MINE),
 ];
 
 /// `pursuitcopter`'s module hash.
