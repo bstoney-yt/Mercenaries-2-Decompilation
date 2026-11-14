@@ -2216,6 +2216,10 @@ pub struct Character {
     /// Downward acceleration it falls at, m/s² ([`GRAVITY`] unless its
     /// template gives its own `_HumanPhysics` `Gravity`).
     pub gravity: f32,
+    /// The upright surface it last pushed against (its flat normal), kept
+    /// while it goes on pushing, as a proxy keeps its contacts from step
+    /// to step ([`Physics::move_character`]).
+    pub wall: Option<Vec3>,
 }
 
 impl Character {
@@ -2228,6 +2232,7 @@ impl Character {
             radius: 0.35,
             height: 1.8,
             gravity: GRAVITY,
+            wall: None,
         }
     }
 
@@ -6820,6 +6825,14 @@ impl Physics {
     /// Moves `character` for `dt` seconds: horizontally at `walk` (m/s; its
     /// y is ignored), jumping at `jump` m/s if given while grounded, falling
     /// under gravity otherwise.
+    ///
+    /// Its velocity afterwards is the walk the walls it met leave it
+    /// ([`solved_walk`]), as a character proxy's is, and not the distance
+    /// the controller moved it: pushed against a wall the controller
+    /// nudges it in and out by up to 0.1 m/s a tick, which the 360's
+    /// locomotion node, standing at 0.01 m/s of its proxy's velocity
+    /// ([`crate::blend::STILL`]), would read as setting off. Over a step
+    /// it climbed, or meeting nothing upright, it is the distance moved.
     pub fn move_character(
         &self,
         character: &mut Character,
@@ -6834,27 +6847,94 @@ impl Physics {
         vertical -= character.gravity * dt;
         let desired = Vec3::new(walk.x, 0.0, walk.z) * dt + Vec3::Y * (vertical * dt);
         let shape = r::Capsule::new_y(character.half_height(), character.radius);
+        let mut hits: Vec<(r::ColliderHandle, Vec3, Vec3)> = Vec::new();
         let movement = self.controller.move_shape(
             dt,
             &self.world.query_pipeline_with_filter(solid()),
             &shape,
             &pose(character.centre(), Quat::IDENTITY),
             vector(desired),
-            |_| {},
+            |hit| {
+                let n = vec3(hit.hit.normal1);
+                if n.y.abs() < WALL_NORMAL_Y {
+                    hits.push((hit.handle, vec3(hit.hit.witness1), n));
+                }
+            },
         );
+        // Each upright face met, by its own normal (the contact's tilts
+        // where the capsule meets a triangle's edge, and a step's edge is no
+        // wall), turned to face the walk and laid flat.
+        let mut walls: Vec<Vec3> = hits
+            .iter()
+            .filter_map(|&(handle, at, n)| {
+                let only = |h: r::ColliderHandle, _: &r::Collider| h == handle;
+                let ray = r::Ray::new(vector(at + n * 0.05), vector(-n));
+                let (_, hit) = self
+                    .world
+                    .query_pipeline_with_filter(solid().predicate(&only))
+                    .cast_ray_and_get_normal(&ray, 0.1, true)?;
+                let face = vec3(hit.normal);
+                if face.y.abs() >= WALL_NORMAL_Y {
+                    return None;
+                }
+                let flat = Vec3::new(face.x, 0.0, face.z).normalize_or_zero();
+                Some(if flat.dot(walk) > 0.0 { -flat } else { flat })
+            })
+            .collect();
         let moved = vec3(movement.translation);
         character.position += moved;
         character.grounded = movement.grounded;
+        let flat = Vec3::new(walk.x, 0.0, walk.z);
+        // A move that met no wall yet fell short of the walk is still at
+        // the last one (the controller holds off it by its offset).
+        let short = Vec3::new(moved.x, 0.0, moved.z).length() < flat.length() * dt * SHORT;
+        match (walls.last(), character.wall) {
+            (Some(&n), _) => character.wall = Some(n),
+            (None, Some(n)) if short && flat.dot(n) < 0.0 => walls.push(n),
+            _ => character.wall = None,
+        }
+        let climbed = movement.grounded && moved.y > CLIMBED;
+        let along = if climbed || walls.is_empty() {
+            Vec3::new(moved.x / dt, 0.0, moved.z / dt)
+        } else {
+            solved_walk(flat, &walls)
+        };
         character.velocity = Vec3::new(
-            moved.x / dt,
+            along.x,
             if movement.grounded { 0.0 } else { vertical },
-            moved.z / dt,
+            along.z,
         );
         // Landing on something while rising (a ceiling) stops the climb.
         if !movement.grounded && vertical > 0.0 && moved.y < desired.y * 0.5 {
             character.velocity.y = 0.0;
         }
     }
+}
+
+/// Normals flatter than this (their up part, of 1) are walls a walk
+/// pushes against rather than ground under it.
+const WALL_NORMAL_Y: f32 = 0.7;
+/// Risen at least this far in a grounded move, metres: a step climbed.
+const CLIMBED: f32 = 1e-3;
+/// A move this share of the walk or less fell short of it.
+const SHORT: f32 = 0.9;
+
+/// What is left of the flat walk `walk` once each wall it pushes into
+/// (`walls`, their flat normals) takes away the part into it: a character
+/// proxy's solved velocity (Havok's proxy, whose velocity the 360's
+/// locomotion reads through 0x8268E030; that it holds the solved walk is
+/// inferred, the library's own behaviour, not read in the program).
+pub fn solved_walk(walk: Vec3, walls: &[Vec3]) -> Vec3 {
+    let mut v = walk;
+    for _ in 0..2 {
+        for &n in walls {
+            let into = v.dot(n);
+            if into < 0.0 {
+                v -= n * into;
+            }
+        }
+    }
+    v
 }
 
 #[cfg(test)]
@@ -7901,6 +7981,65 @@ mod tests {
         assert!(c.position.y.abs() < 0.1, "{}", c.position.y);
     }
 
+    /// Pushed against a wall a character's velocity is the walk the wall
+    /// leaves it, every tick: none pushed square on (the 360's locomotion
+    /// stands it, at 0.01 m/s), the part along the wall pushed at a slant;
+    /// standing still, none. The controller alone moved it in and out by
+    /// up to 0.1 m/s a tick, flipping it between standing and walking 120
+    /// times in 6 s.
+    #[test]
+    fn a_character_pushing_into_a_wall_has_the_walk_it_leaves() {
+        let mut p = ready();
+        let wall = CollisionShape::mesh(
+            &[
+                Vec3::new(0.0, 0.0, -5.0),
+                Vec3::new(0.0, 0.0, 5.0),
+                Vec3::new(0.0, 1.5, 5.0),
+                Vec3::new(0.0, 1.5, -5.0),
+            ],
+            &[[0, 1, 2], [0, 2, 3]],
+        )
+        .unwrap();
+        p.add_static(
+            StaticKey::Object(0),
+            &wall,
+            Vec3::new(5.0, 0.0, -10.0),
+            Quat::IDENTITY,
+        );
+        p.step(DT);
+        for (start, walking, along) in [
+            (Vec3::ZERO, Vec3::ZERO, 0.0),
+            (Vec3::new(0.0, 0.0, -10.0), Vec3::new(4.0, 0.0, 0.0), 0.0),
+            (Vec3::new(0.0, 0.0, -10.0), Vec3::new(4.0, 0.0, 0.3), 0.3),
+        ] {
+            let mut c = Character::new(start);
+            walk(&p, &mut c, walking, 3.0);
+            for _ in 0..360 {
+                p.move_character(&mut c, walking, None, DT);
+                let speed = m2_math::glam::Vec2::new(c.velocity.x, c.velocity.z).length();
+                assert!((speed - along).abs() < 1e-3, "{walking}: {speed} m/s");
+            }
+        }
+    }
+
+    #[test]
+    fn a_wall_takes_the_part_of_a_walk_into_it() {
+        let wall = Vec3::NEG_X;
+        assert_eq!(solved_walk(Vec3::new(4.0, 0.0, 0.0), &[wall]), Vec3::ZERO);
+        assert_eq!(
+            solved_walk(Vec3::new(4.0, 0.0, 1.0), &[wall]),
+            Vec3::new(0.0, 0.0, 1.0)
+        );
+        // Walking away from it, nothing.
+        assert_eq!(
+            solved_walk(Vec3::new(-4.0, 0.0, 1.0), &[wall]),
+            Vec3::new(-4.0, 0.0, 1.0)
+        );
+        // Into a corner, nowhere.
+        let corner = solved_walk(Vec3::new(4.0, 0.0, 4.0), &[wall, Vec3::NEG_Z]);
+        assert!(corner.length() < 1e-6, "{corner}");
+    }
+
     #[test]
     fn climbs_a_step_but_not_a_wall() {
         let mut p = ready();
@@ -7925,7 +8064,15 @@ mod tests {
         p.step(DT);
 
         let mut c = Character::new(Vec3::new(0.0, 0.0, 0.0));
-        walk(&p, &mut c, Vec3::new(0.0, 0.0, 4.0), 3.0);
+        // Over the step it is moving all but the ten ticks the controller
+        // holds it at the step's lip before stepping up (it moves it no
+        // distance then: measured, the same as by the distance moved).
+        let mut stopped = 0;
+        for _ in 0..(3.0 / DT) as usize {
+            p.move_character(&mut c, Vec3::new(0.0, 0.0, 4.0), None, DT);
+            stopped += usize::from(c.velocity.z < 1.0);
+        }
+        assert!(stopped <= 10, "stood {stopped} ticks");
         assert!(c.position.z > 8.0, "stopped at {}", c.position);
         assert!(
             (c.position.y - 0.4).abs() < 0.1,
