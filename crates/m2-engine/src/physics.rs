@@ -6258,13 +6258,14 @@ impl Physics {
         radius: f32,
         skip: Option<VehicleId>,
     ) -> Option<f32> {
-        let mut filter = solid();
-        if let Some(v) = skip
-            .and_then(|v| self.vehicles.get(v.0))
-            .and_then(Option::as_ref)
-        {
-            filter = filter.exclude_rigid_body(v.controller.chassis);
-        }
+        // All of the vehicle: its turret's and gun's bodies too (a light
+        // tank's camera turns about a point inside its turret: the
+        // M551's is 0.4 m over the ring, playtest 2026-11-14's camera
+        // inside the cheat's tank).
+        let own = self.bodies_of(skip);
+        let keep =
+            |_: r::ColliderHandle, c: &r::Collider| c.parent().is_none_or(|p| !own.contains(&p));
+        let filter = solid().predicate(&keep);
         let ball = r::Ball::new(radius.max(1e-3));
         let options = rapier3d::parry::query::ShapeCastOptions {
             max_time_of_impact: max,
@@ -7224,6 +7225,24 @@ mod tests {
         let alone = p.add_vehicle(&car(), Vec3::new(10.0, 0.5, 0.0), 0.0);
         assert!((p.vehicle_mass(alone).unwrap() - car().mass).abs() < 1.0);
         assert_eq!(p.vehicle_mass(VehicleId(99)), None);
+    }
+
+    /// Her camera's ball passes through all of the tank she drives: its
+    /// hull and its turret on a body of its own (playtest 2026-11-14: the
+    /// camera of the M551, which turns about a point inside its turret,
+    /// sat inside the tank). Another vehicle still stops it.
+    #[test]
+    fn the_camera_passes_through_her_own_tank_s_turret() {
+        let mut p = Physics::new();
+        let id = p.add_vehicle(&gun_tank(), Vec3::new(0.0, 0.5, 0.0), 0.0);
+        p.step(1.0 / 60.0);
+        let at = p.vehicle_transform(id).unwrap();
+        // From behind it at the turret's height, toward it.
+        let from = at.transform_point3(Vec3::new(0.0, 2.0, -6.0));
+        let ahead = at.transform_vector3(Vec3::Z);
+        assert_eq!(p.cast_sphere(from, ahead, 12.0, 0.2, Some(id)), None);
+        let d = p.cast_sphere(from, ahead, 12.0, 0.2, None).unwrap();
+        assert!(d > 4.0 && d < 5.2, "{d}");
     }
 
     /// A shot from a tank's own gun passes through all of it: its hull,
