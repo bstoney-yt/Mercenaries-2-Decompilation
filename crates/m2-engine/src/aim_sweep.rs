@@ -23,10 +23,18 @@
 //!   and 0x82003BCC, stored at 0x82E7483C) and mid by the rest; above,
 //!   high and mid likewise.
 //!
-//! The 360 measures the yaw the other way round from this crate's
-//! `atan2(x, z)`: measured on the rifle sweep clips (round 10), their
-//! rifle turns from about +170 degrees to -55 through the clip, so
-//! [`phase`] takes this crate's yaw negated.
+//! The yaw is the body's heading less the aim's, the other way round from
+//! this crate's aim-less-body yaw, so [`phase`] takes this crate's yaw
+//! negated. From the 360 code: the locomotion step (0x828071A8) sets the
+//! node's +0x1580 to the wrapped difference of +0x1584, the heading of the
+//! way the body goes (+0x1568, the last movement direction), less the
+//! heading of the aiming record's direction (0x82287330's record, whose
+//! +0x18 and +0x24 the sweep step reads as the pitch and the yaw offset).
+//! A heading is `-atan2(-x, z)` (0x82855048 calling the library's atan2,
+//! 0x82853F88), this crate's `atan2(x, z)`; the assets' axes are the
+//! game's, so the two agree ([`sweep_yaw`]). The rifle sweep clips agree
+//! too: measured in round 10, their rifle turns from about +170 degrees
+//! to -55 through the clip.
 //!
 //! - Each group's other two clips are its firing poses (standing: entries
 //!   17, 21 and 26; moving: 16, 20 and 25). The step weights them by a
@@ -85,8 +93,24 @@ pub const TO: f32 = 90.0;
 /// The pitch at which an aim is all low or all high, degrees.
 pub const FULL_PITCH: f32 = 45.0;
 
+/// A way's heading, radians, as the 360 takes it (0x82855048:
+/// `-atan2(-x, z)`), the same as this crate's `atan2(x, z)`.
+pub fn heading(x: f32, z: f32) -> f32 {
+    -(-x).atan2(z)
+}
+
+/// The sweep's yaw as the 360's locomotion step sets it (0x828071A8, the
+/// node's +0x1580): the heading of the way the body goes, `body` (x, z),
+/// less the aim's, `aim`, wrapped to within half a turn; radians.
+pub fn sweep_yaw(aim: [f32; 2], body: [f32; 2]) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    let d = heading(body[0], body[1]) - heading(aim[0], aim[1]);
+    (d + PI).rem_euclid(TAU) - PI
+}
+
 /// How far through its clip a sweep is held for an aim `yaw` radians
-/// from the body (this crate's `atan2(x, z)` sense), 0 to 1.
+/// from the body (this crate's `atan2(x, z)` sense, the aim's heading less
+/// the body's: [`sweep_yaw`] negated), 0 to 1.
 pub fn phase(yaw: f32) -> f32 {
     let deg = -yaw.to_degrees();
     ((deg - FROM) / (TO - FROM)).clamp(0.0, 1.0)
@@ -317,6 +341,22 @@ pub fn lattice(n: i32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_360_takes_the_body_less_the_aim() {
+        // Aimed 60 degrees to the body's +x side (this crate's +60): the
+        // 360's yaw is -60, and the sweep is held at the same point.
+        let (s, c) = 60f32.to_radians().sin_cos();
+        let yaw = sweep_yaw([s, c], [0.0, 1.0]);
+        assert!((yaw + 60f32.to_radians()).abs() < 1e-5, "{yaw}");
+        assert!((heading(s, c) - s.atan2(c)).abs() < 1e-6);
+        let ours = s.atan2(c) - 0f32.atan2(1.0);
+        assert!((phase(ours) - (yaw.to_degrees() - FROM) / (TO - FROM)).abs() < 1e-5);
+        // Wrapped: a body heading +170 and an aim -170 are 20 apart.
+        let (b, a) = (170f32.to_radians(), (-170f32).to_radians());
+        let yaw = sweep_yaw([a.sin(), a.cos()], [b.sin(), b.cos()]);
+        assert!((yaw - (-20f32).to_radians()).abs() < 1e-4, "{yaw}");
+    }
 
     #[test]
     fn the_sweep_spans_245_degrees() {
