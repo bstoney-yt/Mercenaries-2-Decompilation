@@ -9993,7 +9993,21 @@ impl Running {
         if !self.focused {
             return;
         }
-        let driving = self.game.driving().is_some();
+        // The layout of what she drives: a car's, a tank's or a
+        // helicopter's (`tControlMap`, [`pad::Mode`]).
+        let mode = match self.game.driving() {
+            None => pad::Mode::OnFoot,
+            Some(_) => self
+                .game
+                .scene
+                .player
+                .as_ref()
+                .and_then(|p| p.driving)
+                .and_then(|i| self.game.scene.vehicles.get(i))
+                .map_or(pad::Mode::Car, |v| {
+                    pad::Mode::of_vehicle(v.spec.is_helicopter(), v.spec.tracked)
+                }),
+        };
         let rumble = std::mem::take(&mut self.game.rumble);
         self.pad.rumble(rumble);
         // A dialog box the scripts put up has the pad: its stick and
@@ -10028,7 +10042,7 @@ impl Running {
         self.pad.pda = (self.game.support.pda || store) && !self.hud.menu;
         let mut held = Input::default();
         let target = if dialog { &mut held } else { &mut self.input };
-        let keys = self.pad.poll(target, driving, dt);
+        let keys = self.pad.poll(target, mode, dt);
         // The joystick table's wait for a button, and what it shows.
         let captured = self.pad.take_captured();
         if captured.is_some() {
@@ -10595,10 +10609,11 @@ impl Running {
         if self.input.take_pressed(Action::Shop) && !self.hud.menu && !store {
             self.show_shop(&config.enhanced.shop);
         }
-        // The cheat menu: a developer's key (taken either way), or its
-        // code typed in play by anyone.
+        // The cheat menu: its key (F7) or its code typed in play, by
+        // anyone (playtest 2026-11-14: a play build without `--dev` had
+        // only the code).
         let typed = std::mem::take(&mut self.cheat_typed);
-        if (self.input.take_pressed(Action::Cheats) && self.dev || typed) && !self.hud.menu {
+        if (self.input.take_pressed(Action::Cheats) || typed) && !self.hud.menu {
             self.show_cheats();
         }
         if self.hud.menu != self.sound_held {
