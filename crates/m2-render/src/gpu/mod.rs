@@ -16,7 +16,6 @@
 //! Clean-room. Written against wgpu's public API and general rendering
 //! practice; nothing here comes from the original executable.
 
-mod fasthash;
 mod post;
 mod shader;
 mod shadow;
@@ -24,7 +23,7 @@ pub mod timer;
 
 use std::collections::HashMap;
 
-use fasthash::FastMap;
+use crate::fasthash::FastMap;
 
 use ::wgpu::util::DeviceExt;
 use m2_math::glam::{Mat4, Vec3};
@@ -408,6 +407,9 @@ fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 }
 
 /// A frame between `begin_frame` and `end_frame`.
+/// An [`OpenFrame`]'s lists kept between frames.
+type Spare = (Vec<RecordedDraw>, Vec<u8>, Vec<[u32; 2]>, Vec<[f32; 16]>);
+
 #[derive(Debug)]
 struct OpenFrame {
     view: View,
@@ -528,6 +530,8 @@ pub struct WgpuBackend {
     materials: FastMap<MaterialId, Material>,
 
     frame: Option<OpenFrame>,
+    /// The last frame's lists, emptied, for the next ([`Spare`]).
+    spare: Option<Spare>,
     /// Frames ended so far, which is also the number of the open frame.
     frames: u64,
     /// The GPU time of each frame's stages, where the device can tell.
@@ -1106,6 +1110,7 @@ impl WgpuBackend {
             textures: Slots::default(),
             materials: FastMap::default(),
             frame: None,
+            spare: None,
             frames: 0,
             timer,
             submitted: [None, None],
@@ -2765,12 +2770,15 @@ impl RenderBackend for WgpuBackend {
         if self.frame.is_some() {
             return Err(BackendError::FrameAlreadyOpen);
         }
+        // The last frame's lists, emptied, so a frame doesn't grow them
+        // from nothing (megabytes copied and mapped afresh each frame).
+        let (draws, uniforms, slots, palette) = self.spare.take().unwrap_or_default();
         self.frame = Some(OpenFrame {
             view: *view,
-            draws: Vec::new(),
-            uniforms: Vec::new(),
-            slots: Vec::new(),
-            palette: Vec::new(),
+            draws,
+            uniforms,
+            slots,
+            palette,
         });
         Ok(())
     }
@@ -3076,7 +3084,23 @@ impl WgpuBackend {
                 }
             }
         }
+        self.keep_spare(draws, uniforms, slots, palette);
         Ok(())
+    }
+
+    /// Keeps a finished frame's lists, emptied, for the next frame.
+    fn keep_spare(
+        &mut self,
+        mut draws: Vec<RecordedDraw>,
+        mut uniforms: Vec<u8>,
+        mut slots: Vec<[u32; 2]>,
+        mut palette: Vec<[f32; 16]>,
+    ) {
+        draws.clear();
+        uniforms.clear();
+        slots.clear();
+        palette.clear();
+        self.spare = Some((draws, uniforms, slots, palette));
     }
 }
 

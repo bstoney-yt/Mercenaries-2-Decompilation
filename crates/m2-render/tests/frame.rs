@@ -350,3 +350,17 @@ fn equal_keys_draw_in_push_order() {
     let materials: Vec<u32> = backend.draws().map(|d| d.material.0).collect();
     assert!(materials.windows(2).all(|w| w[0] <= w[1]), "{materials:?}");
 }
+
+#[test]
+fn a_new_queue_starts_empty_after_one_dropped_full() {
+    let mut backend = RecordingBackend::new();
+    let (vb, ib) = triangle_buffers(&mut backend);
+    let mut queue = DrawQueue::new();
+    for _ in 0..100 {
+        queue.push(prim(call(vb, ib, 3), Layer::WORLD, false, 10.0));
+    }
+    drop(queue);
+    let queue = DrawQueue::new();
+    assert!(queue.is_empty());
+    assert_eq!(queue.keys().count(), 0);
+}
