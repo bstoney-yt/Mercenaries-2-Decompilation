@@ -3929,61 +3929,9 @@ impl Autoplay {
             return self.plant(game, at, dt);
         }
         // In the water she can't fire: out where she can climb, first.
-        if swimming_now {
-            let out = game
-                .scene
-                .world
-                .as_ref()
-                .and_then(|w| landing(&w.physics, here, at, &self.tried));
-            // One she swims at and can't climb out at: another.
-            if let Some(l) = self.landing
-                && self.since_moved() > SPOT_GIVE_UP
-            {
-                eprintln!(
-                    "autoplay {:.1} s: no way out at {l:.1} in {SPOT_GIVE_UP} s: another",
-                    self.clock
-                );
-                self.tried.push(l);
-                self.landing = None;
-                self.fresh_headway();
-                self.stranded += 1;
-                // Swimming she gets out at none of them (round 33's
-                // AllCon002: 11 banks in 2000 s): hopped out, as a hop
-                // anywhere she makes no headway, and logged with them.
-                if self.stranded >= STRANDED_HOP
-                    && let Some(p) = game.scene.player.as_mut()
-                {
-                    eprintln!(
-                        "autoplay {:.1} s: no headway for {:.0} s at {here:.1} ({}): hopped to {l:.1}",
-                        self.clock,
-                        SPOT_GIVE_UP * self.stranded as f32,
-                        self.what
-                    );
-                    p.character.position = l + Vec3::Y * 0.1;
-                    p.character.velocity = Vec3::ZERO;
-                    self.hops.push((here, l));
-                    self.stranded = 0;
-                    return Intent::default();
-                }
-            }
-            if let Some(out) = out {
-                if self.landing.is_none_or(|l| l.distance(out) > 4.0) {
-                    eprintln!(
-                        "autoplay {:.1} s: in the water at {here:.1}: out at {out:.1}",
-                        self.clock
-                    );
-                }
-                self.landing = Some(out);
-                self.blast_spot = None;
-                self.blocked = 0.0;
-                return self.walk(game, out, 1.0, dt);
-            }
-        } else if here.y > WATERLINE + LANDING_DRY {
-            // Only once out on dry ground: in the shallows she is in and out
-            // of swimming (round 34's AllCon002: 12 ways out, never hopped).
-            self.stranded = 0;
+        if let Some(intent) = self.out_of_water(game, here, at, swimming_now, dt) {
+            return intent;
         }
-        self.landing = None;
         let Some(p) = game.scene.player.as_ref() else {
             return Intent::default();
         };
@@ -4396,15 +4344,99 @@ impl Autoplay {
         }
     }
 
+    /// Swimming, she can neither fire nor call in support (OilCon002
+    /// round 3; AllCon003 on #631's check: 950 s treading water 58 m from
+    /// its third AA gun, calling its bunker buster again and again): the
+    /// way out where she can climb, as an intent, while she swims ([`landing`],
+    /// hopped out after [`STRANDED_HOP`] banks she can't climb). `None` once
+    /// she is out.
+    fn out_of_water(
+        &mut self,
+        game: &mut Game,
+        here: Vec3,
+        at: Vec3,
+        swimming: bool,
+        dt: f32,
+    ) -> Option<Intent> {
+        if swimming {
+            let out = game
+                .scene
+                .world
+                .as_ref()
+                .and_then(|w| landing(&w.physics, here, at, &self.tried));
+            // One she swims at and can't climb out at: another.
+            if let Some(l) = self.landing
+                && self.since_moved() > SPOT_GIVE_UP
+            {
+                eprintln!(
+                    "autoplay {:.1} s: no way out at {l:.1} in {SPOT_GIVE_UP} s: another",
+                    self.clock
+                );
+                self.tried.push(l);
+                self.landing = None;
+                self.fresh_headway();
+                self.stranded += 1;
+                // Swimming she gets out at none of them (round 33's
+                // AllCon002: 11 banks in 2000 s): hopped out, as a hop
+                // anywhere she makes no headway, and logged with them.
+                if self.stranded >= STRANDED_HOP
+                    && let Some(p) = game.scene.player.as_mut()
+                {
+                    eprintln!(
+                        "autoplay {:.1} s: no headway for {:.0} s at {here:.1} ({}): hopped to {l:.1}",
+                        self.clock,
+                        SPOT_GIVE_UP * self.stranded as f32,
+                        self.what
+                    );
+                    p.character.position = l + Vec3::Y * 0.1;
+                    p.character.velocity = Vec3::ZERO;
+                    self.hops.push((here, l));
+                    self.stranded = 0;
+                    return Some(Intent::default());
+                }
+            }
+            if let Some(out) = out {
+                if self.landing.is_none_or(|l| l.distance(out) > 4.0) {
+                    eprintln!(
+                        "autoplay {:.1} s: in the water at {here:.1}: out at {out:.1}",
+                        self.clock
+                    );
+                }
+                self.landing = Some(out);
+                self.blast_spot = None;
+                self.blocked = 0.0;
+                return Some(self.walk(game, out, 1.0, dt));
+            }
+        } else if here.y > WATERLINE + LANDING_DRY {
+            // Only once out on dry ground: in the shallows she is in and out
+            // of swimming (round 34's AllCon002: 12 ways out, never hopped).
+            self.stranded = 0;
+        }
+        self.landing = None;
+        None
+    }
+
     fn strike(&mut self, game: &mut Game, at: Vec3, dt: f32) -> Intent {
         let flat = |a: Vec3| a.with_y(0.0).distance(at.with_y(0.0));
         if let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) {
+            debug_assert_eq!(strike_step(true, false), StrikeStep::Drive);
             let speed = vehicle_state(game, i).map_or(0.0, |s| s.1);
             let d = vehicle_at(game, i).map_or(0.0, |m| flat(m.w_axis.truncate()));
             if d < CALL_FROM.1 {
                 return self.press(speed);
             }
             return self.drive(game, i, at, CALL_FROM.1 - 15.0, dt);
+        }
+        let Some(p) = game.scene.player.as_ref() else {
+            return Intent::default();
+        };
+        let here = p.character.position;
+        // Out of the water first: swimming, the support menu is no use.
+        let swimming = p.swimming();
+        if strike_step(false, swimming) == StrikeStep::OutOfWater
+            && let Some(intent) = self.out_of_water(game, here, at, swimming, dt)
+        {
+            return intent;
         }
         let Some(p) = game.scene.player.as_ref() else {
             return Intent::default();
@@ -5725,6 +5757,27 @@ fn perch(
         }
     }
     None
+}
+
+/// What she does first towards calling in a strike: driving, gets there
+/// in her vehicle; swimming, gets out of the water (she can't call support
+/// from it: AllCon003 on #631's check trod water 950 s by its third AA
+/// gun, the support menu up and down); else the call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StrikeStep {
+    Drive,
+    OutOfWater,
+    Call,
+}
+
+fn strike_step(driving: bool, swimming: bool) -> StrikeStep {
+    if driving {
+        StrikeStep::Drive
+    } else if swimming {
+        StrikeStep::OutOfWater
+    } else {
+        StrikeStep::Call
+    }
 }
 
 /// Where she can climb out of the water nearest `at`: ground on
@@ -7236,6 +7289,15 @@ mod tests {
             vantage(&p, target, target, &[], &BLAST_RINGS, BLAST_BODY),
             None
         );
+    }
+
+    // AllCon003 on #631's check: in the water by its third AA gun she
+    // called the bunker buster from it again and again for 950 s.
+    #[test]
+    fn a_strike_is_called_from_dry_ground() {
+        assert_eq!(strike_step(false, true), StrikeStep::OutOfWater);
+        assert_eq!(strike_step(false, false), StrikeStep::Call);
+        assert_eq!(strike_step(true, false), StrikeStep::Drive);
     }
 
     // In a river with a bank 18 m high close by and a beach further off
