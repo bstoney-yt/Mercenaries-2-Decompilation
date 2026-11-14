@@ -1725,6 +1725,8 @@ struct VehicleBody {
     held: bool,
     /// Its velocity before the last step, m/s: what it hit things with.
     before: Vec3,
+    /// Its spin before the last step, radians a second about each axis.
+    spin_before: Vec3,
     /// A boat's: it floats instead of rolling on wheels.
     hull: Option<Hull>,
     /// A helicopter's: it flies.
@@ -3555,6 +3557,10 @@ impl Physics {
                 .bodies
                 .get(v.controller.chassis)
                 .map_or(Vec3::ZERO, |b| vec3(b.linvel()));
+            v.spin_before = w
+                .bodies
+                .get(v.controller.chassis)
+                .map_or(Vec3::ZERO, |b| vec3(b.angvel()));
             if v.held {
                 continue;
             }
@@ -4667,6 +4673,7 @@ impl Physics {
             hinge,
             held: false,
             before: Vec3::ZERO,
+            spin_before: Vec3::ZERO,
             hull,
             rotor,
         }));
@@ -5875,6 +5882,25 @@ impl Physics {
             .get(id.0)
             .and_then(Option::as_ref)
             .map_or(Vec3::ZERO, |v| v.before)
+    }
+
+    /// A vehicle's spin before the last step, radians a second about each
+    /// axis.
+    pub fn vehicle_spin_before(&self, id: VehicleId) -> Vec3 {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map_or(Vec3::ZERO, |v| v.spin_before)
+    }
+
+    /// Sets a vehicle's spin, radians a second about each axis.
+    pub fn set_vehicle_spin(&mut self, id: VehicleId, spin: Vec3) {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
+            body.set_angvel(vector(spin), true);
+        }
     }
 
     /// Sets a vehicle's velocity, m/s (as it was before something it hit

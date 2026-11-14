@@ -4446,9 +4446,13 @@ fn knock_loose(
             (speed, &v.spec.label, bed.map(|b| ((index, id), b))),
         );
         if shifted > 0.0 || ploughed {
-            world
-                .physics
-                .set_vehicle_velocity(id, before * (mass / (mass + shifted)));
+            // What gave way didn't hold it: its speed and its spin as
+            // they were, less what it gave the prop (playtest 2026-11-14:
+            // a small prop it was turned and thrown by as by a wall).
+            let keep = mass / (mass + shifted);
+            let spin = world.physics.vehicle_spin_before(id);
+            world.physics.set_vehicle_velocity(id, before * keep);
+            world.physics.set_vehicle_spin(id, spin * keep);
         }
     }
 }
@@ -4550,6 +4554,15 @@ fn run_into(
         let Some(m) = loose.filter(|&m| !holds && mass * speed >= KNOCK_RATIO * m) else {
             continue;
         };
+        // A fake physics prop (most light ones) is felt as at most a
+        // fiftieth of the vehicle (its `FakeToRealMassRatio`, the 360's
+        // mass changer on the contact: [`m2_engine::durability::FakeMass`]).
+        let m = world
+            .index
+            .template_db
+            .fake_masses
+            .get(&template)
+            .map_or(m, |f| f.felt(m, mass));
         let (fling, topple) = flung(vehicle.velocity, mass, m);
         let knocked = match key {
             StaticKey::Object(i) => world.knock(i, fling, topple),

@@ -424,6 +424,9 @@ pub struct Templates {
     /// says what each kind of damage does to its objects (`PropFragile`,
     /// `Prop`, `Fence`, `Car`, ...).
     pub modifiers: HashMap<u32, u32>,
+    /// Each `_PropPhysics` template's fake mass ratios, by id
+    /// ([`crate::durability::FakeMass`]).
+    pub fake_masses: HashMap<u32, crate::durability::FakeMass>,
     /// The game's damage table, if found.
     pub damage: Option<DamageTable>,
     /// Every gun, thrown weapon and vehicle armament ([`crate::weapons`]).
@@ -1167,6 +1170,7 @@ impl Templates {
             gravity_scales: crate::durability::gravity_scales(&db),
             projectiles: crate::durability::projectiles(&db),
             modifiers: crate::durability::modifier_keys(&db),
+            fake_masses: crate::durability::fake_masses(&db),
             health: crate::tuning::healths(&db),
             speeds: crate::tuning::human_speeds(&db),
             swim_speeds: crate::tuning::human_swim_speeds(&db),
