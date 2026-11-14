@@ -1021,6 +1021,9 @@ impl Player {
                 *seed ^= *seed << 17;
                 (*seed >> 40) as f32 / (1u64 << 24) as f32
             });
+            if let Some((_, rig)) = &mut self.model {
+                rig.step_lip(dt);
+            }
         }
         self.yaw += intent.look.x;
         self.pitch = (self.pitch + intent.look.y).clamp(-1.2, 0.9);
