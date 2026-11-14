@@ -654,10 +654,8 @@ impl Props {
         let mut at = Mat4::from_rotation_translation(p.rotation, p.position);
         if let (Some(bed), Some(place)) = (bed, physics.vehicle_transform(id)) {
             let local = place.inverse() * at;
-            let (blo, bhi) = box_around(local, bounds);
-            let middle = (blo + bhi) * 0.5;
-            if let Some(floor) = bed.floor_under(middle.x, bhi.y, middle.z) {
-                let lift = (floor + BED_CLEAR - blo.y).max(0.0);
+            let lift = bed.lift_onto(box_around(local, bounds), BED_CLEAR);
+            if lift > 0.0 {
                 at = place * Mat4::from_translation(Vec3::Y * lift) * local;
             }
         }

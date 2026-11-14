@@ -1050,6 +1050,30 @@ impl CollisionShape {
         Some(from - toi)
     }
 
+    /// How far up goods filling the box `lo`..`hi` (this shape's space,
+    /// a vehicle's bed) go to stand `clear` over the bed's floor, 0 if
+    /// they stand on it or over it already. Goods sunk in it (the floor
+    /// under their top) come up to the floor under their middle; goods
+    /// wholly under it (authored 0.9 to 1.3 m under the El Grande's bed:
+    /// OilCon020's guns) come up onto the floor over them: the bed's
+    /// surface over their bottom, taken from as far over that as they
+    /// are tall (invented: the port's own correction, the 360's
+    /// attachment is not traced).
+    pub fn lift_onto(&self, (lo, hi): (Vec3, Vec3), clear: f32) -> f32 {
+        let (x, z) = ((lo.x + hi.x) * 0.5, (lo.z + hi.z) * 0.5);
+        if let Some(floor) = self.floor_under(x, hi.y, z) {
+            return (floor + clear - lo.y).max(0.0);
+        }
+        let up = r::Ray::new(vector(Vec3::new(x, lo.y, z)), vector(Vec3::Y));
+        let Some(toi) = self.shape.cast_local_ray(&up, 100.0, true) else {
+            return 0.0;
+        };
+        let under = lo.y + toi;
+        self.floor_under(x, under + (hi.y - lo.y) + 0.05, z)
+            .filter(|&f| f >= under - 1e-3)
+            .map_or(0.0, |floor| (floor + clear - lo.y).max(0.0))
+    }
+
     /// The box the shape fills, in its own space.
     pub fn bounds(&self) -> (Vec3, Vec3) {
         let b = self.shape.compute_local_aabb();
@@ -8023,6 +8047,105 @@ mod tests {
         p.step(DT);
         let moved = p.debris_place(id).unwrap().w_axis.x - before;
         assert!(moved < MAX_LINEAR_SPEED * 2.0 * DT * 1.05, "{moved}");
+    }
+
+    /// Drives a car with a bed 1 m up and eight 200 kg crates of 0.5 m on
+    /// it, put in `drop` metres under the bed's floor and lifted by
+    /// [`CollisionShape::lift_onto`] when `lift`, at full throttle for
+    /// 4 s on flat ground: its speed then (m/s) and its wheels down.
+    fn drive_with_crates(drop: f32, lift: bool) -> (f32, usize) {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 400.0);
+        p.step(DT);
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        for _ in 0..120 {
+            p.step(DT);
+        }
+        // Its bed's floor 1 m up, and the frame under it 0.3 m up (as a
+        // truck's `PHY2` has its chassis under the bed).
+        let sheet = |y: f32| {
+            [
+                Vec3::new(-1.0, y, -2.2),
+                Vec3::new(1.0, y, -2.2),
+                Vec3::new(1.0, y, 0.0),
+                Vec3::new(-1.0, y, 0.0),
+            ]
+        };
+        let mut v = sheet(1.0).to_vec();
+        v.extend(sheet(0.3));
+        let bed = CollisionShape::mesh(&v, &[[0, 2, 1], [0, 3, 2], [4, 6, 5], [4, 7, 6]]).unwrap();
+        assert!(p.add_bed(id, &bed));
+        let place = p.vehicle_transform(id).unwrap();
+        let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.25), 200.0);
+        let spots = [-0.6, -1.1, -1.6, -2.0]
+            .into_iter()
+            .flat_map(|z| [(-0.5, z), (0.5, z)]);
+        for (x, z) in spots {
+            let centre = Vec3::new(x, 1.27 - drop, z);
+            let lifted = if lift {
+                bed.lift_onto(
+                    (centre - Vec3::splat(0.25), centre + Vec3::splat(0.25)),
+                    0.02,
+                )
+            } else {
+                0.0
+            };
+            let at = place * Mat4::from_translation(centre + Vec3::Y * lifted);
+            p.add_cargo(&piece, at, Vec3::ZERO);
+        }
+        for _ in 0..240 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..VehicleControls::default()
+                },
+            );
+            p.step(DT);
+        }
+        (p.vehicle_speed(id), p.vehicle_contacts(id).0)
+    }
+
+    #[test]
+    fn goods_put_in_under_the_bed_come_up_onto_it() {
+        let bed = CollisionShape::mesh(
+            &[
+                Vec3::new(-1.0, 1.0, -2.2),
+                Vec3::new(1.0, 1.0, -2.2),
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(-1.0, 1.0, 0.0),
+            ],
+            &[[0, 2, 1], [0, 3, 2]],
+        )
+        .unwrap();
+        let crate_at = |y: f32| {
+            let c = Vec3::new(0.0, y, -1.0);
+            (c - Vec3::splat(0.25), c + Vec3::splat(0.25))
+        };
+        // On it: no lift; sunk in it: up to the floor; 1.1 m under it:
+        // up onto it too; off to the side: nothing to stand on.
+        assert_eq!(bed.lift_onto(crate_at(1.3), 0.02), 0.0);
+        assert!((bed.lift_onto(crate_at(1.1), 0.02) - 0.17).abs() < 1e-3);
+        assert!((bed.lift_onto(crate_at(0.17), 0.02) - 1.1).abs() < 1e-3);
+        let aside = (Vec3::new(3.0, 0.0, 0.0), Vec3::new(3.5, 0.5, 0.5));
+        assert_eq!(bed.lift_onto(aside, 0.02), 0.0);
+    }
+
+    #[test]
+    fn crates_put_in_under_the_bed_ride_without_holding_the_car() {
+        // OilCon020's guns stood 0.9 to 1.3 m under the El Grande's bed:
+        // ridden there, they jammed it.
+        let (on_speed, on_down) = drive_with_crates(0.0, false);
+        let (sunk_speed, sunk_down) = drive_with_crates(1.1, false);
+        let (lifted_speed, lifted_down) = drive_with_crates(1.1, true);
+        eprintln!(
+            "crates on the bed {on_speed:.1} m/s, {on_down} wheels down;              sunk {sunk_speed:.1} m/s, {sunk_down}; lifted {lifted_speed:.1} m/s, {lifted_down}"
+        );
+        assert!(on_speed > 5.0 && on_down == 4, "{on_speed} {on_down}");
+        assert!(
+            (lifted_speed - on_speed).abs() < 0.5 && lifted_down == 4,
+            "{lifted_speed} {lifted_down}"
+        );
     }
 
     #[test]
