@@ -3259,6 +3259,7 @@ impl Npc {
                 *seed ^= *seed << 17;
                 (*seed >> 40) as f32 / (1u64 << 24) as f32
             });
+            self.rig.step_lip(dt);
         }
         if !self.landed {
             // Onto the ground (or the roof or floor of their post) under
@@ -6637,6 +6638,7 @@ pub(crate) mod tests {
             kick: Default::default(),
             aim_legs: false,
             aim_walk: Default::default(),
+            lip: None,
             shuffling: false,
             aim_clock: 0.0,
             arm: Default::default(),

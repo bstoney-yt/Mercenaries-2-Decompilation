@@ -977,6 +977,9 @@ enum State {
 /// The mission scripts and what they want shown.
 pub struct MissionLink {
     state: State,
+    /// The face rigs and sets read, and the sets the scripts mounted
+    /// ([`m2_engine::lip_sync`]).
+    faces: m2_engine::lip_sync::Library,
     /// The nodes of the models of props with hardpoints the scripts use,
     /// by model: name hash and place in the model ([`prop_hardpoints`]).
     prop_nodes: HashMap<u32, Vec<(u32, Vec3)>>,
@@ -1219,6 +1222,7 @@ impl MissionLink {
         Self {
             state: State::Loading(rx),
             prop_nodes: HashMap::new(),
+            faces: Default::default(),
             movies: false,
             acts_logged: Default::default(),
             end_skip: false,
@@ -2256,12 +2260,91 @@ impl MissionLink {
                 face.play(name, f.a, f.b, [0.5, 0.25, 0.75, 0.5]);
             }
         }
-        for speech in mission.world().borrow_mut().vo.take_speech() {
+        // The face sets the scripts mounted, on the rig of each
+        // character's template (`Animation.BindFaceAnimSet`, 0x82315CF8:
+        // the set goes on the rig asset, so everyone with it has it).
+        let binds = std::mem::take(&mut mission.world().borrow_mut().sp.face_sets);
+        for b in binds {
+            let templates = game.scene.world.as_ref().map(|w| &w.index.template_db);
+            let rig = b
+                .template
+                .as_deref()
+                .and_then(|t| templates.and_then(|db| db.face_actor(t)));
+            match rig {
+                Some(rig) if b.bind => self.faces.bind(rig, b.set),
+                Some(rig) => self.faces.unbind(rig, b.set),
+                None => {}
+            }
+            eprintln!(
+                "facefx: {} set {:08x} {} {:#x} ({:?}, rig {})",
+                if b.bind { "bind" } else { "unbind" },
+                b.set,
+                if b.bind { "to" } else { "from" },
+                b.character,
+                b.template,
+                rig.map_or("none".to_owned(), |r| format!("{r:08x}"))
+            );
+        }
+        // The lines that started and stopped. In the voice manager's
+        // cinematic mode the 360 plays the speaker's face animation named
+        // by the line (0x822782D8 posts the line's hash, 0x8241D270 finds
+        // it in the sets mounted on their rig; [`m2_engine::lip_sync`]);
+        // out of it their mouth flaps while it plays (`Flap`). A line
+        // with no face animation flaps too (invented: the 360 then moves
+        // nothing).
+        let cinematic = mission.world().borrow().vo.cinematic;
+        let speeches = mission.world().borrow_mut().vo.take_speech();
+        for speech in speeches {
             let (on, speaker, cue) = match speech {
                 m2_game::vo::Speech::Started { speaker, cue, .. } => (true, speaker, cue),
                 m2_game::vo::Speech::Stopped { speaker, cue, .. } => (false, speaker, cue),
             };
             let Some(guid) = speaker else { continue };
+            let lip = if on && cinematic {
+                let template = mission
+                    .world()
+                    .borrow()
+                    .objects
+                    .get(&guid)
+                    .map(|o| o.name.clone())
+                    .or_else(|| {
+                        (guid == m2_game::mission::PLAYER)
+                            .then(|| game.scene.hero.template().to_owned())
+                    });
+                let templates = game.scene.world.as_ref().map(|w| &w.index.template_db);
+                let rig = template
+                    .as_deref()
+                    .and_then(|t| templates.and_then(|db| db.face_actor(t)));
+                let source = game.scene.source.as_mut();
+                match (rig, source) {
+                    (Some(rig), Some(source)) => {
+                        let lip = self.faces.find(rig, cue, |h, ty| source.asset(h, ty).ok());
+                        match &lip {
+                            Some(l) => eprintln!(
+                                "facefx: cue {cue:08x} anim {:08x} curves {} ({:.1} s, set {:08x}, rig {rig:08x}, speaker {guid:#x})",
+                                m2_assets::name_hash(&l.animation().name),
+                                l.curves(),
+                                l.animation().seconds(),
+                                l.set_hash
+                            ),
+                            None => eprintln!(
+                                "facefx: cue {cue:08x} has no animation in the {} sets on rig {rig:08x} (speaker {guid:#x}): Flap",
+                                self.faces.bound(rig).len()
+                            ),
+                        }
+                        lip
+                    }
+                    _ => {
+                        eprintln!(
+                            "facefx: cue {cue:08x}: speaker {guid:#x} ({template:?}) has no face rig: Flap"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let lips = lip.is_some();
             // Her own lines.
             if guid == m2_game::mission::PLAYER {
                 if let Some(p) = game.scene.player.as_mut() {
@@ -2269,7 +2352,14 @@ impl MissionLink {
                         "face: she {} speaking (line {cue:08x})",
                         if on { "starts" } else { "stops" }
                     );
-                    p.speak(on);
+                    if let Some((_, rig)) = &mut p.model
+                        && (lips || !on)
+                    {
+                        rig.lip = lip;
+                    }
+                    if !lips {
+                        p.speak(on);
+                    }
                 }
                 continue;
             }
@@ -2285,7 +2375,12 @@ impl MissionLink {
                         "face: {guid:#x} {} speaking (line {cue:08x})",
                         if on { "starts" } else { "stops" }
                     );
-                    n.speak(on);
+                    if lips || !on {
+                        n.rig.lip = lip;
+                    }
+                    if !lips {
+                        n.speak(on);
+                    }
                 }
                 None if on => {
                     eprintln!("face: line {cue:08x}'s speaker {guid:#x} is no person here")
