@@ -23,6 +23,8 @@ pub mod timer;
 
 use std::collections::HashMap;
 
+use crate::fasthash::FastMap;
+
 use ::wgpu::util::DeviceExt;
 use m2_math::glam::{Mat4, Vec3};
 
@@ -405,6 +407,9 @@ fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 }
 
 /// A frame between `begin_frame` and `end_frame`.
+/// An [`OpenFrame`]'s lists kept between frames.
+type Spare = (Vec<RecordedDraw>, Vec<u8>, Vec<[u32; 2]>, Vec<[f32; 16]>);
+
 #[derive(Debug)]
 struct OpenFrame {
     view: View,
@@ -507,10 +512,10 @@ pub struct WgpuBackend {
 
     shaders: HashMap<VertexLayout, wgpu::ShaderModule>,
     layouts: Layouts,
-    pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
+    pipelines: FastMap<PipelineKey, wgpu::RenderPipeline>,
     /// The glow layer's pipelines for additive and translucent keys.
-    glow_pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
-    shadow_pipelines: HashMap<ShadowKey, wgpu::RenderPipeline>,
+    glow_pipelines: FastMap<PipelineKey, wgpu::RenderPipeline>,
+    shadow_pipelines: FastMap<ShadowKey, wgpu::RenderPipeline>,
     /// When the backend started, for animated surfaces.
     started: std::time::Instant,
     /// Bloom, exposure and grade after the world.
@@ -522,9 +527,11 @@ pub struct WgpuBackend {
     vertex_buffers: Slots<VertexBuffer>,
     index_buffers: Slots<IndexBuffer>,
     textures: Slots<Texture>,
-    materials: HashMap<MaterialId, Material>,
+    materials: FastMap<MaterialId, Material>,
 
     frame: Option<OpenFrame>,
+    /// The last frame's lists, emptied, for the next ([`Spare`]).
+    spare: Option<Spare>,
     /// Frames ended so far, which is also the number of the open frame.
     frames: u64,
     /// The GPU time of each frame's stages, where the device can tell.
@@ -1090,9 +1097,9 @@ impl WgpuBackend {
             white,
             shaders: HashMap::new(),
             layouts: Layouts::default(),
-            pipelines: HashMap::new(),
-            glow_pipelines: HashMap::new(),
-            shadow_pipelines: HashMap::new(),
+            pipelines: FastMap::default(),
+            glow_pipelines: FastMap::default(),
+            shadow_pipelines: FastMap::default(),
             cascades: std::cell::Cell::new(None),
             started: std::time::Instant::now(),
             post,
@@ -1101,8 +1108,9 @@ impl WgpuBackend {
             vertex_buffers: Slots::default(),
             index_buffers: Slots::default(),
             textures: Slots::default(),
-            materials: HashMap::new(),
+            materials: FastMap::default(),
             frame: None,
+            spare: None,
             frames: 0,
             timer,
             submitted: [None, None],
@@ -2762,12 +2770,15 @@ impl RenderBackend for WgpuBackend {
         if self.frame.is_some() {
             return Err(BackendError::FrameAlreadyOpen);
         }
+        // The last frame's lists, emptied, so a frame doesn't grow them
+        // from nothing (megabytes copied and mapped afresh each frame).
+        let (draws, uniforms, slots, palette) = self.spare.take().unwrap_or_default();
         self.frame = Some(OpenFrame {
             view: *view,
-            draws: Vec::new(),
-            uniforms: Vec::new(),
-            slots: Vec::new(),
-            palette: Vec::new(),
+            draws,
+            uniforms,
+            slots,
+            palette,
         });
         Ok(())
     }
@@ -3073,7 +3084,23 @@ impl WgpuBackend {
                 }
             }
         }
+        self.keep_spare(draws, uniforms, slots, palette);
         Ok(())
+    }
+
+    /// Keeps a finished frame's lists, emptied, for the next frame.
+    fn keep_spare(
+        &mut self,
+        mut draws: Vec<RecordedDraw>,
+        mut uniforms: Vec<u8>,
+        mut slots: Vec<[u32; 2]>,
+        mut palette: Vec<[f32; 16]>,
+    ) {
+        draws.clear();
+        uniforms.clear();
+        slots.clear();
+        palette.clear();
+        self.spare = Some((draws, uniforms, slots, palette));
     }
 }
 
