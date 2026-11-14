@@ -68,6 +68,11 @@
 //! drawn list in that order and takes deactivated ones off it; its draw
 //! (0x82380E50) draws the list in order but holds the Flash widgets (type
 //! 6) back until the rest are drawn.
+//!
+//! From the 360 code: which button glyph each control word in a text is
+//! (0x8238D2B8 reads the word, 0x8238EA80 gives its glyph); see
+//! [`button_glyph`]. Inferred: `[pda]`, `[pause]` and `[support]`, by
+//! picture.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1282,8 +1287,9 @@ fn colour_name(word: &str) -> Option<[f32; 3]> {
     })
 }
 
-/// The button page's glyphs below U+E014 that [`button_glyph`] gives no
-/// word: U+E00C is an empty black disc and U+E00F is not on the page.
+/// The button page's glyphs below U+E01C that [`button_glyph`] gives no
+/// word: U+E00C is an empty black disc and U+E00F is not on the page (the
+/// 360's text code gives it to a word it has no picture for).
 pub const UNMATCHED_GLYPHS: [char; 2] = ['\u{e00c}', '\u{e00f}'];
 
 /// The glyph a control word stands for on the PC (`[pfire] Shoot`): the
@@ -1291,50 +1297,64 @@ pub const UNMATCHED_GLYPHS: [char; 2] = ['\u{e00c}', '\u{e00f}'];
 /// (`english_18`'s second, `pc\common_18_buttons`), at private-use
 /// characters U+E000 on.
 ///
-/// Which pad button each word is comes from the game's data: the HUD
-/// movies' text formatter (`formatText` in `topbar` and `minimap`, vz.wad)
-/// swaps each word for a pad picture loaded by name, `[confirm]` for
-/// `button_A`, `[bash]`, `[honk]` and `[cancel]` for `button_B`,
-/// `[reload]` for `button_X`, `[action]` for `button_Y`, `[left stick]`
-/// for `button_joystick_L` (as `[move]`), `[sswitch]` for
-/// `button_Dpad_left`, `[support]` for `button_joystick_L_press`. Those
-/// are the console's pictures; the PC font page has its own, and the four
-/// round ones (U+E000 to U+E003, the only face-button discs on it) are
-/// taken to be A, B, X and Y in that order, the formatter's own order
-/// (`b1` to `b4`). The pictures agree where they can be read (U+E001 a
-/// fist for the bash, U+E002 a magazine for the reload), but no data ties
-/// a code point to a pad button: inferred, unchecked on the PC.
-/// `[jump]` is not in the formatter; it is given U+E000, the face disc
-/// no other word takes (`[confirm]` is the pistol on the PC, below).
-/// `[support]` is given the headset (U+E01C), the support radio, by
-/// picture: the page has no disc of its own for the left stick's press.
+/// From the 360 code: the text code reads a bracketed word by its name
+/// hash (0x8238D2B8) and swaps a control word for one character of the
+/// font's button page (0x8238EA80, called for every control word by
+/// 0x8238B390): `[jump]` U+E000, `[bash]` and `[honk]` U+E001, `[reload]`
+/// U+E002, `[action]` U+E003, `[crouch]` U+E004, `[pfire]` U+E005,
+/// `[sfire]` U+E006, `[pswitch]` U+E007, `[move]` and `[left stick]`
+/// U+E008, `[aim]` and `[right stick]` U+E009, `[sprint]` U+E00A,
+/// `[zoom]` U+E00B; the stick pushes `[l-stick left]`, `right`, `up`,
+/// `down` U+E010 to U+E013 (`[left stick up]` and the like are the same
+/// words: the hash switch gives both names one id), `[r-stick left]` to
+/// `down` U+E014 to U+E017; the d-pad's up, down, right and left U+E018
+/// to U+E01B (`[sswitch]` the left's); `[confirm]` U+E000 and `[cancel]`
+/// U+E001 (swapped when a setting at 0x82B7C5F8 is 8, unread; taken
+/// not to be for English). The PC font's page holds just those code
+/// points (U+E000 to U+E01B, no U+E00F) and two more (U+E01C, U+E01D), so
+/// it is taken to be drawn by the same table with the PC's pictures. So
+/// the PC's car text `[move] Steer [left stick up] Accelerate[n][left
+/// stick down] Brake/Reverse` shows three pictures. From footage (a PC
+/// frame of that prompt, 360 lines): "Steer" and "Accelerate" are 21
+/// pixels apart, about one 30-pixel glyph (at 720 lines) and its spaces,
+/// not the 70 or so the written word would take, and both lines' words
+/// start level, after glyphs of the same width (U+E008, U+E013).
 ///
-/// The rest are matched by picture: the PC footage's satellite help shows
-/// `[move]` as the four arrows and `[confirm]` as the pistol (the fire
-/// button confirms), and the others are the pictures that say what the
-/// words do. Words without a glyph show the key bound to them, if the
-/// host named it ([`Screen::set_key_names`]), else stay as written.
+/// Not from that table (inferred, by picture, as before): `[pda]` U+E00D
+/// and `[pause]` U+E00E (the 360 has them the other way round), and
+/// `[support]` the PC's headset U+E01C, a picture the 360's page has no
+/// code for (the 360 gives it the d-pad's up, U+E018).
+///
+/// Words without a glyph show the key bound to them, if the host named it
+/// ([`Screen::set_key_names`]), else stay as written.
 pub fn button_glyph(word: &str) -> Option<char> {
     Some(match word.to_ascii_lowercase().as_str() {
-        "jump" => '\u{e000}',
+        "jump" | "confirm" => '\u{e000}',
         "bash" | "honk" | "cancel" => '\u{e001}',
         "reload" => '\u{e002}',
         "action" => '\u{e003}',
         "crouch" => '\u{e004}',
-        // Fire, and what the fire button does.
-        "pfire" | "confirm" => '\u{e005}',
+        "pfire" => '\u{e005}',
         "sfire" => '\u{e006}',
         "pswitch" => '\u{e007}',
         "move" | "left stick" => '\u{e008}',
-        "aim" => '\u{e009}',
+        "aim" | "right stick" => '\u{e009}',
         "sprint" => '\u{e00a}',
         "zoom" => '\u{e00b}',
         "pda" => '\u{e00d}',
         "pause" => '\u{e00e}',
-        "dpad left" | "sswitch" => '\u{e010}',
-        "dpad right" => '\u{e011}',
-        "dpad up" => '\u{e012}',
-        "dpad down" => '\u{e013}',
+        "l-stick left" | "left stick left" => '\u{e010}',
+        "l-stick right" | "left stick right" => '\u{e011}',
+        "l-stick up" | "left stick up" => '\u{e012}',
+        "l-stick down" | "left stick down" => '\u{e013}',
+        "r-stick left" => '\u{e014}',
+        "r-stick right" => '\u{e015}',
+        "r-stick up" => '\u{e016}',
+        "r-stick down" => '\u{e017}',
+        "dpad up" => '\u{e018}',
+        "dpad down" => '\u{e019}',
+        "dpad right" => '\u{e01a}',
+        "dpad left" | "sswitch" => '\u{e01b}',
         "support" => '\u{e01c}',
         _ => return None,
     })
@@ -3304,11 +3324,16 @@ mod tests {
             ("cancel", '\u{e001}'),
             ("action", '\u{e003}'),
             ("left stick", '\u{e008}'),
-            ("sswitch", '\u{e010}'),
+            ("right stick", '\u{e009}'),
+            ("sswitch", '\u{e01b}'),
             ("support", '\u{e01c}'),
+            // The 360's table: the confirm is the jump's face button.
+            ("confirm", '\u{e000}'),
         ] {
             assert_eq!(button_glyph(w), Some(g), "{w}");
         }
+        // One word for each of the page's glyphs the 360's table gives,
+        // U+E000 to U+E01B, each its own, and none of the unmatched ones.
         let words = [
             "jump",
             "bash",
@@ -3324,16 +3349,52 @@ mod tests {
             "zoom",
             "pda",
             "pause",
-            "dpad left",
-            "dpad right",
+            "l-stick left",
+            "l-stick right",
+            "l-stick up",
+            "l-stick down",
+            "r-stick left",
+            "r-stick right",
+            "r-stick up",
+            "r-stick down",
             "dpad up",
             "dpad down",
+            "dpad right",
+            "dpad left",
         ];
-        let given: Vec<char> = words.iter().filter_map(|w| button_glyph(w)).collect();
+        let mut given: Vec<char> = words.iter().filter_map(|w| button_glyph(w)).collect();
+        assert_eq!(given.len(), words.len());
         for g in UNMATCHED_GLYPHS {
             assert!(!given.contains(&g), "{g:?}");
         }
-        assert_eq!(given.len() + UNMATCHED_GLYPHS.len(), 0x14);
+        given.extend(UNMATCHED_GLYPHS);
+        given.sort_unstable();
+        let page: Vec<char> = ('\u{e000}'..='\u{e01b}').collect();
+        assert_eq!(given, page);
+    }
+
+    /// The PC's vehicle texts name the stick's pushes as `[left stick up]`
+    /// and `[left stick down]`, which the 360's text code takes as
+    /// `[l-stick up]` and `[l-stick down]`: their glyphs, not the words.
+    #[test]
+    fn the_pcs_vehicle_prompts_show_the_stick_pushes_as_glyphs() {
+        let s = Screen::default();
+        assert_eq!(
+            s.display_text(
+                "[move] Steer [left stick up] Accelerate[n][left stick down] Brake/Reverse"
+            ),
+            "\u{e008} Steer \u{e012} Accelerate\n\u{e013} Brake/Reverse"
+        );
+        for (a, b) in [
+            ("left stick left", "l-stick left"),
+            ("left stick right", "l-stick right"),
+            ("Left Stick Up", "l-stick up"),
+            ("left stick down", "L-Stick Down"),
+        ] {
+            assert_eq!(button_glyph(a), button_glyph(b), "{a}");
+            assert!(button_glyph(a).is_some(), "{a}");
+        }
+        assert_eq!(s.display_text("[r-stick down] Look"), "\u{e017} Look");
     }
 
     #[test]
@@ -3447,15 +3508,12 @@ mod tests {
     fn control_words_without_a_picture_name_their_keys() {
         let mut s = Screen::default();
         s.set_key_names([
-            ("L-Stick Up".to_owned(), "T".to_owned()),
+            ("Lean".to_owned(), "T".to_owned()),
             ("pfire".to_owned(), "F".to_owned()),
         ]);
-        assert_eq!(s.display_text("[l-stick up] Look up"), "[T] Look up");
+        assert_eq!(s.display_text("[lean] Lean"), "[T] Lean");
         // A word the fonts have a picture for keeps it; others as written.
-        assert_eq!(
-            s.display_text("[pfire] [l-stick down]"),
-            "\u{e005} [l-stick down]"
-        );
+        assert_eq!(s.display_text("[pfire] [peek]"), "\u{e005} [peek]");
     }
 
     #[test]
