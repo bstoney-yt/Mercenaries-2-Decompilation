@@ -1555,8 +1555,10 @@ pub struct GpuModel {
     /// The material each of its records got from the [`MaterialCache`],
     /// one hold each, given back by [`release`](Self::release).
     material_ids: Vec<MaterialId>,
-    /// Each record's material name hash, as [`material_ids`](Self::material_ids).
+    /// Each record's material name hash and constants, as
+    /// [`material_ids`](Self::material_ids).
     material_names: Vec<u32>,
+    material_constants: Vec<[f32; m2_assets::model::MATERIAL_CONSTANTS]>,
     /// Values put in place of its materials' own for the instance drawn
     /// next ([`set_surfaces`](Self::set_surfaces)): a material
     /// animation's, by material.
@@ -1786,6 +1788,7 @@ impl GpuModel {
         Ok(Self {
             material_ids: ids.clone(),
             material_names: cpu.materials.iter().map(|m| m.name_hash).collect(),
+            material_constants: cpu.materials.iter().map(|m| m.constants).collect(),
             surfaces: Default::default(),
             tint: [1.0; 4],
             beams_lit: false,
@@ -2232,17 +2235,19 @@ impl GpuModel {
     }
 
     /// Draws its materials named in `by_name` (material name hash) with
-    /// those values in place of their own until set again (empty: as they
-    /// are): an instance's material animation, set before drawing it.
-    pub fn set_surfaces(&self, by_name: &[(u32, m2_render::SurfaceOverride)]) {
+    /// those constants put in place of their own until set again (empty:
+    /// as they are): an instance's material animation, set before drawing
+    /// it ([`crate::material_anim::surface`]).
+    pub fn set_surfaces(&self, by_name: &[(u32, crate::material_anim::Constants)]) {
         let mut s = self.surfaces.borrow_mut();
         s.clear();
-        for &(name, over) in by_name {
-            for (k, &n) in self.material_names.iter().enumerate() {
+        for (name, over) in by_name {
+            for (k, n) in self.material_names.iter().enumerate() {
                 if n == name
-                    && let Some(&id) = self.material_ids.get(k)
+                    && let (Some(&id), Some(base)) =
+                        (self.material_ids.get(k), self.material_constants.get(k))
                 {
-                    s.push((id, over));
+                    s.push((id, crate::material_anim::surface(base, over)));
                 }
             }
         }
