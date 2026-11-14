@@ -1737,6 +1737,10 @@ pub struct Combat {
     remarks: Vec<Remark>,
     /// People shot and blasts set off, for the screenshot check.
     pub hits: u32,
+    /// The engine's random numbers a knockdown's length is spread by
+    /// ([`melee::knockdown_seconds`](m2_engine::melee::knockdown_seconds)):
+    /// the stream at `0x82B5E588`, from its start-up seed.
+    knock_rng: m2_game::script_math::EngineRng,
     pub blasts: u32,
     /// Where the last one went off, and what it pushes what it breaks
     /// with, where known.
@@ -2081,6 +2085,7 @@ impl Default for Combat {
             part_fx_next: 0.0,
             remarks: Vec::new(),
             hits: 0,
+            knock_rng: m2_game::script_math::EngineRng::default(),
             blasts: 0,
             last_blast: None,
             last_push: None,
@@ -5470,9 +5475,10 @@ impl Combat {
             if n.hurt(taken, push) && soldier {
                 self.remarks.push(Remark::Kill);
             }
-            // Still alive: felled for the 360's knockdown time (its random
-            // spread stood in for by the blow's count, invented).
-            let r = (self.hits as f32 * 0.618_034).fract();
+            // Still alive: felled for the 360's knockdown time, spread by
+            // a draw of the engine's generator (0x82423848 draws
+            // 0x8215E260's stream 1 once a blow).
+            let r = self.knock_rng.unit();
             let seconds = melee::knockdown_seconds(melee::KNOCKDOWN_SECONDS, false, r);
             n.knock_down_for(seconds, push);
             self.hits += 1;
@@ -6812,6 +6818,20 @@ fn lock_share(held: f32, time: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    /// A knockdown's length is spread by the engine's own random draws
+    /// from its start-up seed, not by how many blows have landed: from a
+    /// fresh start the first two fell for about 6.66 and 6.21 seconds
+    /// (worked by hand from 0x94153A94).
+    #[test]
+    fn knockdowns_are_spread_by_the_engine_s_draws() {
+        use m2_engine::melee::{KNOCKDOWN_SECONDS, knockdown_seconds};
+        let mut combat = Combat::default();
+        let mut next = || knockdown_seconds(KNOCKDOWN_SECONDS, false, combat.knock_rng.unit());
+        assert!((next() - 6.663_352).abs() < 1e-4);
+        assert!((next() - 6.213_857).abs() < 1e-4);
+        assert!((next() - 6.754_052).abs() < 1e-4);
+    }
+
     /// An effect set off along a way is turned so its +Z lies along it
     /// and its +Y stays up: the launcher's flash (+Z) goes out of the
     /// barrel, the rocket's smoke (-Z) out of its tail, not up.
