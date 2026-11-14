@@ -149,6 +149,9 @@ impl Loader {
                             let t = match source.texture(hash, max) {
                                 Ok(mut t) => {
                                     t.linear = linear;
+                                    // Its mips filtered here, not on the
+                                    // main thread at upload.
+                                    crate::model::complete_mips(&mut t);
                                     Some(t)
                                 }
                                 Err(e) => {

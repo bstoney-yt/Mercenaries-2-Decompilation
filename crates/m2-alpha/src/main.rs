@@ -2944,6 +2944,9 @@ const BENCH_EVERY: f32 = 10.0;
 /// milliseconds a frame in the tick, streaming, building the draws,
 /// submitting and waiting for the GPU, the GPU's in each stage, and draws
 /// a frame.
+/// A bench frame this slow (ms) logs a `bench hitch:` line.
+const BENCH_HITCH_MS: f32 = 50.0;
+
 fn run_bench(
     backend: &mut WgpuBackend,
     game: &mut Game,
@@ -3000,6 +3003,21 @@ fn run_bench(
         let ms = start.elapsed().as_secs_f32() * 1000.0;
         all.push(ms);
         span.push(ms);
+        // A slow frame says where its time went, which the 1% low can't.
+        let spent = spans::take_frame();
+        if ms >= BENCH_HITCH_MS {
+            eprintln!(
+                "bench hitch: {t:.1} s, {ms:.0} ms; cpu ms {}; spans ms {}",
+                PARTS
+                    .iter()
+                    .zip(cpu)
+                    .filter(|(_, v)| *v >= 1.0)
+                    .map(|(name, v)| format!("{name} {v:.0}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                spans::describe(&spent, 1.0, 8)
+            );
+        }
         for i in 0..PARTS.len() {
             cpu_all[i] += cpu[i];
             cpu_span[i] += cpu[i];

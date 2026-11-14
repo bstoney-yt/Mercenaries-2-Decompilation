@@ -690,6 +690,24 @@ fn mips_dropped(width: u32, height: u32, drop: u32) -> u32 {
     n
 }
 
+/// The full mip chain [`upload_texture`] would upload for `t`: its own
+/// when complete, else one generated from its top level. Done ahead (the
+/// asset loader does it on its thread), so the upload need not: a
+/// 1024x1024 map took the main thread 5 ms to filter, a 2048x2048 one 20.
+pub fn complete_mips(t: &mut DecodedTexture) {
+    if t.mips.is_empty() {
+        return;
+    }
+    let full = TextureDesc {
+        width: t.width,
+        height: t.height,
+        format: TextureFormat::Rgba8Srgb,
+    };
+    if t.mips.len() as u32 != full.full_chain_len() {
+        t.mips = generate_mips(t.width, t.height, &t.mips[0]);
+    }
+}
+
 /// Uploads a decoded texture, generating any mips its chain lacks.
 pub fn upload_texture(
     backend: &mut dyn RenderBackend,
@@ -1430,6 +1448,8 @@ impl CpuModel {
             .map(|(hash, linear)| {
                 let t = source.texture(hash, max_width).ok().map(|mut t| {
                     t.linear = linear;
+                    // Filtered here, on the loading thread, not at upload.
+                    complete_mips(&mut t);
                     t
                 });
                 (hash, t)
@@ -2595,5 +2615,50 @@ mod tests {
         assert_ne!(early, late);
         assert!(backend.material(late).texture.is_some());
         assert_eq!(backend.live_buffers().texture, 3);
+    }
+}
+
+#[cfg(test)]
+mod complete_mips_tests {
+    use super::*;
+
+    fn texture(width: u32, height: u32, levels: usize) -> DecodedTexture {
+        let mut mips = Vec::new();
+        let (mut w, mut h) = (width, height);
+        for i in 0..levels {
+            mips.push(
+                (0..w * h * 4)
+                    .map(|b| (b as usize * 7 + i * 31) as u8)
+                    .collect(),
+            );
+            (w, h) = ((w / 2).max(1), (h / 2).max(1));
+        }
+        DecodedTexture {
+            width,
+            height,
+            mips,
+            alpha: false,
+            linear: false,
+        }
+    }
+
+    #[test]
+    fn a_short_chain_is_made_as_the_upload_made_it() {
+        // 16x16 has a five-level chain; three given.
+        let mut t = texture(16, 16, 3);
+        let expected = generate_mips(16, 16, &t.mips[0]);
+        complete_mips(&mut t);
+        assert_eq!(t.mips, expected);
+    }
+
+    #[test]
+    fn a_full_chain_and_no_chain_are_left_alone() {
+        let mut t = texture(16, 8, 5);
+        let before = t.mips.clone();
+        complete_mips(&mut t);
+        assert_eq!(t.mips, before);
+        let mut empty = texture(16, 16, 0);
+        complete_mips(&mut empty);
+        assert!(empty.mips.is_empty());
     }
 }
