@@ -324,14 +324,27 @@ impl Cause {
 
     /// What a break by it of something whose `SoundKey` is `key` is heard
     /// as: by a vehicle, the sound table's cue for the two
-    /// ([`crash_cue`]); by a blast or a round, its own key.
+    /// ([`crash_cue`]); by a blast or a round, the table's cue for it and
+    /// the ground ([`GROUND_SOUND`]: its pieces coming down on it).
     fn heard(&self, table: Option<&m2_engine::tuning::KeyTable>, key: u32) -> u32 {
         match *self {
             Cause::Crash { sound, .. } => crash_cue(table, sound, key),
-            Cause::Blast(_) => key,
+            Cause::Blast(_) => crash_cue(table, m2_assets::name_hash(GROUND_SOUND), key),
         }
     }
 }
+
+/// The sound table's key for the ground (`Terrain`, the key the 360's
+/// collision code gives the island's ground, 0x19FC10AC): what something
+/// broken by a blast or a round is heard against. From the 360 code: a
+/// template's `SoundKey` (component 0x83654A5C, by part 0x82399040) is
+/// read only to look up the sound table for two things meeting, a
+/// contact (0x8235E3A8) or a hit (0x8235E190), through 0x8235E600 ->
+/// 0x8235E850 -> 0x82398958; nothing plays it as a cue of its own, so
+/// a break is heard as its pieces meeting what they come down on.
+/// Inferred: that is the ground, and heard as it breaks rather than as
+/// each piece lands.
+const GROUND_SOUND: &str = "Terrain";
 
 /// What something whose `SoundKey` is `key` run into by a vehicle whose
 /// `SoundKey` is `vehicle` is heard as: the sound table's cell for the
@@ -636,7 +649,8 @@ impl Destruction {
         let name = db.names.get(&template).map_or("?", String::as_str);
         eprintln!(
             "destruct: {key:?} ({name}) broken at {at:.1}: {taken:.0} of {health:.0} health, last \
-             {hit:.0} ({damage:.0} of kind {kind:08x} x {scale})"
+             {hit:.0} ({damage:.0} of kind {kind:08x} x {scale}); {}",
+            break_sound(world, template, self.in_crash.then_some(self.crashing))
         );
         let sound = db.sound_keys.get(&template).copied();
         // A state layer's prop whose template leaves a blast on dying
@@ -1042,16 +1056,16 @@ impl Destruction {
     /// run into by a vehicle, the sound table's cue for the vehicle's key
     /// and its, either way round (0x8235E850 -> 0x82398958: OilCon020's
     /// hedges, `prop_foliage_sml`, against the M151's `veh_armored_light`
-    /// give cue 1d0a87e6); else, or where the table has none, its own key.
+    /// give cue 1d0a87e6); broken by a blast or a round, the table's cue
+    /// for it and the ground ([`GROUND_SOUND`]); its own key only where
+    /// the table has none.
     fn heard_as(&self, world: &World, key: u32) -> u32 {
-        if !self.in_crash {
-            return key;
-        }
-        crash_cue(
-            world.index.template_db.sound_table.as_ref(),
-            self.crashing,
-            key,
-        )
+        let against = if self.in_crash {
+            self.crashing
+        } else {
+            m2_assets::name_hash(GROUND_SOUND)
+        };
+        crash_cue(world.index.template_db.sound_table.as_ref(), against, key)
     }
 
     /// What a vehicle bringing down `template` at `at` throws up: the
@@ -1267,7 +1281,15 @@ fn break_sound(world: &World, template: u32, crashing: Option<u32>) -> String {
                 crash_cue(db.sound_table.as_ref(), v, k)
             )
         }
-        Some(k) => format!("template {template:08x} {name:?} heard by its SoundKey {k:08x}"),
+        Some(&k) => format!(
+            "template {template:08x} {name:?} (SoundKey {k:08x}) heard as cue {:08x} of the sound \
+             table (against the ground)",
+            crash_cue(
+                db.sound_table.as_ref(),
+                m2_assets::name_hash(GROUND_SOUND),
+                k
+            )
+        ),
         None => format!("template {template:08x} {name:?} has no SoundKey: none played"),
     }
 }
@@ -1345,8 +1367,12 @@ mod tests {
         };
         assert_eq!(crash.heard(Some(&t), 2), 0xc0e);
         assert_eq!(crash.heard(None, 2), 2);
+        // Blown up or shot down: the table's cue for it against the
+        // ground (`Terrain`: a key this table lacks, so its first row).
         let blast = Cause::Blast(BlastPush::none(Vec3::ZERO));
-        assert_eq!(blast.heard(Some(&t), 2), 2);
+        assert_eq!(blast.heard(Some(&t), 2), 0xc0e);
+        assert_eq!(blast.heard(None, 2), 2);
+        assert_eq!(m2_assets::name_hash(GROUND_SOUND), 0x19fc_10ac);
     }
 
     /// A jeep: 4.4 m long along z, 2 m wide, 1.6 m high, standing at
