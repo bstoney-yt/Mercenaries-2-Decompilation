@@ -41,12 +41,23 @@
 //! gives `Upright` `Die` the mode `FULL` and `DieAnimatedRagdoll`
 //! `ON_END`.
 //!
+//! - **Which way the quarter turn goes**: the way and the side both make
+//!   the facing a vector with 0x82854FE0, which reads the engine's sine
+//!   table (8192 entries to the turn, 0x82B56558; the angle times
+//!   8192 / 2pi, 0x820F8C9C over 0x82B5E574, plus a half, truncated) as
+//!   `(table[i], 0, -table[i - 2048])`, that is `(sin h, 0, cos h)`. A
+//!   heading is `atan2(x, z)` (0x82855048), this crate's, so facing `+z`
+//!   the quarter turn (pi/2 added) points `+x`, as [`heading`] has it.
+//!   The picker's side is the hit's place from the person's
+//!   (record +0x58 and +0x60 less +0x48 and +0x50) along that vector,
+//!   under 0 for side 1; the way's sideways test is the hit's travel
+//!   (+0x64, +0x6C) along it, 0 or more for way 3.
+//!
 //! **Inferred**: that `FULL` is a ragdoll at once and `ON_END` one when
 //! the clip ends (the driver compares the mode with `ON_END`'s hash; its
-//! use was not read). And which way the quarter turn goes: [`Body`]'s
-//! heading is this crate's, clockwise from `+z` seen from above, taken to
-//! be the original's; if the original's turns the other way, ways 2 and
-//! 3 and the two sides are mirrored.
+//! use was not read). And that the record's facing (+0x54) is the
+//! person's heading as the engine keeps it, which nothing found writes
+//! otherwise.
 //!
 //! **Not traced, so not here**: what sets the record's flag (height 2 is
 //! never chosen: [`Hit::flagged`] is for a caller that knows), where the
@@ -119,8 +130,22 @@ pub struct Hit {
     pub flagged: bool,
 }
 
+/// Entries in the engine's sine table, a turn.
+const SINE_ENTRIES: i32 = 8192;
+
+/// Entry `i` of the engine's sine table (`i` taken modulo 8192).
+fn sine_table(i: i32) -> f32 {
+    let i = i & (SINE_ENTRIES - 1);
+    (f64::from(i) * std::f64::consts::TAU / f64::from(SINE_ENTRIES)).sin() as f32
+}
+
+/// The flat way a heading points, `(x, z)` (0x82854FE0): the sine table
+/// at the angle's nearest step, and its negated entry a quarter turn
+/// back as the cosine.
 fn heading(yaw: f32) -> (f32, f32) {
-    yaw.sin_cos()
+    let step = (SINE_ENTRIES as f32 / std::f32::consts::TAU).mul_add(yaw, 0.5);
+    let i = step as i32;
+    (sine_table(i), -sine_table(i.wrapping_sub(2048)))
 }
 
 /// The way of a hit travelling `direction` for a person facing `facing`
@@ -246,6 +271,27 @@ mod tests {
             ..BODY
         };
         assert_eq!(height(&bare, 0.2, false), 1);
+    }
+
+    #[test]
+    fn the_quarter_turn_points_to_the_right_of_the_facing() {
+        // Facing +z, the turned way is +x; facing +x, it is -z.
+        let (x, z) = heading(std::f32::consts::FRAC_PI_2);
+        assert!((x - 1.0).abs() < 1e-6 && z.abs() < 1e-6, "{x} {z}");
+        let (x, z) = heading(std::f32::consts::PI);
+        assert!(x.abs() < 1e-6 && (z + 1.0).abs() < 1e-6, "{x} {z}");
+        // The table rounds to its steps: a hair over 45 degrees is the
+        // 1024th step, 45 exactly.
+        let (x, z) = heading(45.001f32.to_radians());
+        assert_eq!((x, z), heading(std::f32::consts::FRAC_PI_4));
+        // Turned to face +x, a hit landing at -z is on side 1, at +z 0.
+        let east = Body {
+            facing: std::f32::consts::FRAC_PI_2,
+            ..BODY
+        };
+        assert_eq!(side(&east, Vec3::new(0.0, 1.2, -0.2)), 0);
+        assert_eq!(side(&east, Vec3::new(0.0, 1.2, 0.2)), 1);
+        assert_eq!(way(std::f32::consts::FRAC_PI_2, Vec3::NEG_Z), 3);
     }
 
     #[test]
