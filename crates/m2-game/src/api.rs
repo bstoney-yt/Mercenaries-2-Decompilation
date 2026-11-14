@@ -1259,6 +1259,9 @@ pub struct ScriptWorld {
     /// closing, so the `"gateFullyClosed"` physics event holds as soon as
     /// they are shut).
     pub shut: HashSet<u32>,
+    /// Vehicles that sank ([`crate::mission::Mission::vehicle_sinking`]):
+    /// their `"VehicleSinking"` physics event holds.
+    pub sunk: HashSet<u32>,
     /// Objects the scripts removed (`Object.Remove`) while alive: gone,
     /// not dead, so an `ObjectDeath` on them never fires (inferred:
     /// JetCon001's death events on its bunker busters outlive their
@@ -1838,6 +1841,7 @@ impl World for ScriptWorld {
         match name {
             "gatefullyclosed" => Some(self.shut.contains(&object)),
             "gatestuck" => Some(false),
+            "vehiclesinking" => Some(self.sunk.contains(&object)),
             _ => None,
         }
     }
@@ -8194,7 +8198,15 @@ mod tests {
         assert_eq!(world.borrow().physics_event(7, "gatestuck"), Some(false));
         host.lua().load("Object.OpenGate(7)").exec().unwrap();
         assert_eq!(closed(&world), Some(false));
-        assert_eq!(world.borrow().physics_event(7, "vehiclesinking"), None);
+        assert_eq!(
+            world.borrow().physics_event(7, "vehiclesinking"),
+            Some(false)
+        );
+        world.borrow_mut().sunk.insert(7);
+        assert_eq!(
+            world.borrow().physics_event(7, "vehiclesinking"),
+            Some(true)
+        );
     }
 
     #[test]
