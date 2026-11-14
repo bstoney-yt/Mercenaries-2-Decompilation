@@ -231,6 +231,20 @@ return true
 /// `MrxGuiDialogBox` (its widgets, fonts and pad handling), or taken down.
 /// The option picked goes into `__m2_hud_choices` with the call's number,
 /// for the mission's callback ([`GameHud::take_choices`]).
+/// A call the mission's scripts made on the PDA widget (their stand-in
+/// for it, group `PdaWidget`), made on the HUD's own: the munitions
+/// laptop's `UpdateSupport`. False when the HUD has no PDA or no such
+/// method.
+const PDA_CALL: &str = r##"
+local method, args = ...
+local g = rawget(_G, "MrxGui")
+if type(g) ~= "table" or type(g.GetWidgetByNameAndOwner) ~= "function" then return false end
+local w = g.GetWidgetByNameAndOwner("PDA", Sys.StringToGuid("0x1"))
+if w == nil or type(w[method]) ~= "function" then return false end
+w[method](w, unpack(args, 1, args.n or #args))
+return true
+"##;
+
 const DIALOG_CALL: &str = r##"
 local method, data, seq = ...
 __m2_dialog_boxes = __m2_dialog_boxes or {}
@@ -3779,6 +3793,18 @@ impl Thread {
                 Err(e) => format!("gui call {name}: {e}"),
             });
         }
+        for c in s.hud_calls.iter().filter(|c| c.group == "PdaWidget") {
+            let done = c.data.to_lua(lua).and_then(|args| {
+                lua.load(PDA_CALL)
+                    .set_name("=m2-pda call")
+                    .call::<bool>((c.method.as_str(), args))
+            });
+            log.push(match done {
+                Ok(true) => format!("pda call {}: {:?}", c.method, c.data),
+                Ok(false) => format!("pda call {}: the HUD's PDA has no such method", c.method),
+                Err(e) => format!("pda call {}: {e}", c.method),
+            });
+        }
         for c in s.hud_calls.iter().filter(|c| c.group == "DialogBox") {
             let done = c.data.to_lua(lua).and_then(|data| {
                 lua.load(DIALOG_CALL)
@@ -6421,6 +6447,36 @@ fn text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mission's call on the PDA is made on the HUD's own PDA, as the
+    /// scripts made it.
+    #[test]
+    fn a_pda_call_is_made_on_the_huds_pda() {
+        let lua = Lua::new();
+        lua.load(
+            r#"
+            Sys = { StringToGuid = function() return 1 end }
+            local pda = { UpdateSupport = function(self, item, x, n) got = { item, x, n } end }
+            MrxGui = { GetWidgetByNameAndOwner = function(name) if name == "PDA" then return pda end end }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let args = Plain::Table(vec![
+            (Plain::Number(1.0), Plain::Text("artillery".into())),
+            (Plain::Number(3.0), Plain::Number(3.0)),
+            (Plain::Text("n".into()), Plain::Number(3.0)),
+        ]);
+        let call = |method: &str| {
+            lua.load(PDA_CALL)
+                .call::<bool>((method, args.to_lua(&lua).unwrap()))
+                .unwrap()
+        };
+        assert!(call("UpdateSupport"));
+        let (item, n): (String, f64) = lua.load("return got[1], got[3]").eval().unwrap();
+        assert_eq!((item.as_str(), n), ("artillery", 3.0));
+        assert!(!call("NoSuchMethod"));
+    }
     use crate::combat::RIFLE_CLIP;
 
     #[test]

@@ -3164,7 +3164,7 @@ fn seat_crew(
 /// `repairpad` is the script of the helipads and the PMC's garage
 /// (0xcd561a19): awake, its lights are on (`Vehicle.SetParts` of
 /// `LightFront`), and they go out when it dies.
-pub const OBJECT_SCRIPTS: [(&str, u32); 16] = [
+pub const OBJECT_SCRIPTS: [(&str, u32); 17] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3181,7 +3181,15 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 16] = [
     ("pursuitcopter", PURSUIT_COPTER),
     ("AntiAir", homing::ANTI_AIR),
     ("HomingMissile", homing::HOMING_MISSILE),
+    ("Laptop", LAPTOP),
 ];
+
+/// `Laptop`'s module hash: the munitions laptops (`Munitions (Laptop)`).
+/// From samples (its Lua): awake, a blip on the map and a wait for the
+/// hero to pick it up (`Event.WeaponEvent { "hero", "pickup", "Laptop" }`);
+/// then a `MunitionsPickup` post, a support item's stock up by one, the
+/// PDA's `UpdateSupport` and Fiona's line.
+pub const LAPTOP: u32 = 0x4068_2f05;
 
 /// `pursuitcopter`'s module hash.
 pub const PURSUIT_COPTER: u32 = 0x3e29_6216;
