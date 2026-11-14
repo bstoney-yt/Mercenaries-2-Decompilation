@@ -11,6 +11,8 @@ use crate::buffer::{VertexFormat, VertexLayout, VertexSemantic};
 
 /// Bind group 0: per frame. Must match `FrameUniforms` in `mod.rs`.
 const COMMON: &str = r#"
+// The materials' maps are one array of textures (see `maps`).
+enable wgpu_binding_array;
 struct Frame {
     view_proj: mat4x4<f32>,
     eye: vec4<f32>,
@@ -206,6 +208,13 @@ struct Material {
     // x: open water, y: scale on the sky it mirrors, z: on its waves,
     // w: how soon its waves fade with the pixel's size
     water: vec4<f32>,
+    // Its maps' places in `maps`: base, detail, specular, normal (0: the
+    // white stand-in)
+    tex: vec4<u32>,
+    // Its ground layers' places in `maps`
+    layer_tex: vec4<u32>,
+    // x: its base map's sampler in `samplers` (0: repeating, 1: clamped)
+    samp: vec4<u32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -220,17 +229,14 @@ struct Material {
 // The draw the vertex belongs to (set by the entry points).
 var<private> draw: Draw;
 @group(1) @binding(1) var<storage, read> palette: array<mat4x4<f32>>;
-@group(2) @binding(0) var<uniform> material: Material;
-@group(2) @binding(1) var base_map: texture_2d<f32>;
-@group(2) @binding(2) var base_sampler: sampler;
-@group(2) @binding(3) var detail_map: texture_2d<f32>;
-@group(2) @binding(4) var detail_sampler: sampler;
-@group(2) @binding(5) var specular_map: texture_2d<f32>;
-@group(2) @binding(6) var normal_map: texture_2d<f32>;
-@group(2) @binding(7) var layer0: texture_2d<f32>;
-@group(2) @binding(8) var layer1: texture_2d<f32>;
-@group(2) @binding(9) var layer2: texture_2d<f32>;
-@group(2) @binding(10) var layer3: texture_2d<f32>;
+// Every texture a material uses, by the places its record names, and the
+// samplers (bound once a pass: switching material sets only the record).
+@group(2) @binding(0) var maps: binding_array<texture_2d<f32>>;
+@group(2) @binding(1) var samplers: binding_array<sampler>;
+// The draw's material: its record in one buffer of them all, at an offset
+// set as the draw changes material. The last group, since wgpu applies a
+// changed group again with every group after it.
+@group(4) @binding(0) var<uniform> material: Material;
 // Depth of what was drawn before the water (reversed: 0 is nothing).
 @group(3) @binding(0) var scene_depth: texture_depth_2d;
 @group(3) @binding(1) var scene_color: texture_2d<f32>;
@@ -714,7 +720,7 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
     // Water's map is its foam, drifting over world space.
     let drift = vec2<f32>(0.021, 0.013) * frame.view_dir.w;
     let base_uv = select(v.uv, v.world_pos.xz * 0.15 + drift, water);
-    let base_texel = textureSample(base_map, base_sampler, base_uv);
+    let base_texel = textureSample(maps[material.tex.x], samplers[material.samp.x], base_uv);
     var base = select(base_texel, vec4<f32>(1.0), water) * material.color;
     let ao = material.params.z > 0.5 && !ground;
     if ao {
@@ -729,12 +735,12 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
     var water_alpha = 1.0;
     // Sampled outside branches: derivatives need uniform control flow.
     let p = vec4<f32>(v.world_pos, 1.0);
-    let t0 = textureSample(layer0, detail_sampler, layer_uv(0u, p)).rgb;
-    let t1 = textureSample(layer1, detail_sampler, layer_uv(1u, p)).rgb;
-    let t2 = textureSample(layer2, detail_sampler, layer_uv(2u, p)).rgb;
-    let t3 = textureSample(layer3, detail_sampler, layer_uv(3u, p)).rgb;
+    let t0 = textureSample(maps[material.layer_tex.x], samplers[0], layer_uv(0u, p)).rgb;
+    let t1 = textureSample(maps[material.layer_tex.y], samplers[0], layer_uv(1u, p)).rgb;
+    let t2 = textureSample(maps[material.layer_tex.z], samplers[0], layer_uv(2u, p)).rgb;
+    let t3 = textureSample(maps[material.layer_tex.w], samplers[0], layer_uv(3u, p)).rgb;
     let detail_uv = v.world_pos.xz * material.detail.x;
-    let detail_texel = textureSample(detail_map, detail_sampler, detail_uv).rgb;
+    let detail_texel = textureSample(maps[material.tex.y], samplers[0], detail_uv).rgb;
     if ground {
         // As the game's terrain shaders: the vertex colour weights the
         // tiled layers (r the first), the colour map makes up any shortfall
@@ -762,12 +768,12 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
     } else if material.detail.x > 0.0 {
         // Each texel against the map's average (its smallest mip), so the
         // base colour keeps its brightness.
-        let mean = textureSampleLevel(detail_map, detail_sampler, detail_uv, 16.0).rgb;
+        let mean = textureSampleLevel(maps[material.tex.y], samplers[0], detail_uv, 16.0).rgb;
         let fade = clamp(1.0 - dist / material.detail.y, 0.0, 1.0);
         rgb = rgb * mix(vec3<f32>(1.0), detail_texel / max(mean, vec3<f32>(0.05)), fade);
     }
-    let spec_texel = textureSample(specular_map, base_sampler, v.uv).rgb;
-    let normal_texel = textureSample(normal_map, base_sampler, v.uv);
+    let spec_texel = textureSample(maps[material.tex.z], samplers[material.samp.x], v.uv).rgb;
+    let normal_texel = textureSample(maps[material.tex.w], samplers[material.samp.x], v.uv);
     // Highlight and reflection, added after any ambient occlusion.
     var shine = vec3<f32>(0.0);
     var spec_light = vec3<f32>(0.0);
@@ -990,7 +996,7 @@ fn fs_glow(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
     let s = surface(v, front);
     var rgb = pow(max(s.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
     if material.params.y < 0.5 && material.params.z > 0.5 {
-        let t = textureSample(base_map, base_sampler, v.uv);
+        let t = textureSample(maps[material.tex.x], samplers[material.samp.x], v.uv);
         rgb = srgb_encode(t.rgb) * material.color.rgb * v.color.rgb * v.tint.rgb;
     }
     if material.params.w > 0.5 {
@@ -1021,7 +1027,7 @@ fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
 // out as they cut themselves.
 @fragment
 fn fs_shadow(v: Varyings) {
-    var a = textureSample(base_map, base_sampler, v.uv).a * material.color.a;
+    var a = textureSample(maps[material.tex.x], samplers[material.samp.x], v.uv).a * material.color.a;
     if material.params.z > 0.5 && material.maps.w < 0.5 {
         a = a * v.color.a;
     }
@@ -1268,7 +1274,8 @@ mod tests {
             .unwrap_or_else(|e| panic!("{}", e.emit_to_string(src)));
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::empty(),
+            // The materials' texture and sampler arrays.
+            naga::valid::Capabilities::TEXTURE_AND_SAMPLER_BINDING_ARRAY,
         )
         .validate(&module)
         .unwrap_or_else(|e| panic!("{e:?}\n{src}"));

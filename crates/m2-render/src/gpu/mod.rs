@@ -23,6 +23,8 @@ pub mod timer;
 
 use std::collections::HashMap;
 
+use crate::fasthash::FastMap;
+
 use ::wgpu::util::DeviceExt;
 use m2_math::glam::{Mat4, Vec3};
 
@@ -203,7 +205,133 @@ struct Texture {
 #[derive(Debug)]
 struct Material {
     desc: MaterialDesc,
-    bind_group: wgpu::BindGroup,
+    /// Its record's place in the material buffer ([`Materials`]).
+    slot: u32,
+    /// The places in the texture array its maps hold ([`TextureSlots`]),
+    /// in [`MaterialUniforms`]' order: base, detail, specular, normal,
+    /// then the four ground layers.
+    textures: [u32; 8],
+}
+
+/// Most textures a frame's materials can use at once: the size of the
+/// texture array they are drawn with ([`TextureSlots`]).
+const MAX_TEXTURES: u32 = 1 << 16;
+
+/// The places textures hold in the texture array every material draws
+/// from, kept while any material uses them. Place 0 is the white
+/// stand-in for a map a material has not got. A texture destroyed while
+/// a material still uses it keeps its place (and its GPU memory) until
+/// the last such material goes, as a material's own bind group kept it
+/// before.
+///
+/// Every material once had a group of its uniforms and eleven textures
+/// and samplers, and a 1440p frame switched material some 5,300 times;
+/// wgpu's cost to set a group grows with its entries, so switching now
+/// sets a one-entry group at another offset (see `Materials`) while the
+/// textures are bound once a pass.
+#[derive(Debug)]
+struct TextureSlots<V> {
+    /// Per place: its texture, view and the materials' holds on it.
+    slots: Vec<Option<(Option<TextureHandle>, V, u32)>>,
+    by_handle: FastMap<TextureHandle, u32>,
+    free: Vec<u32>,
+    /// A place was given a new texture since the array was last bound.
+    changed: bool,
+}
+
+impl<V: Clone> TextureSlots<V> {
+    fn new(white: V) -> Self {
+        Self {
+            slots: vec![Some((None, white, u32::MAX))],
+            by_handle: FastMap::default(),
+            free: Vec::new(),
+            changed: true,
+        }
+    }
+
+    /// `handle`'s place (0 for none), giving it one if new, with one more
+    /// hold on it.
+    fn acquire(&mut self, handle: Option<TextureHandle>, view: impl FnOnce() -> V) -> u32 {
+        let Some(handle) = handle else {
+            return 0;
+        };
+        if let Some(&slot) = self.by_handle.get(&handle) {
+            if let Some(Some(entry)) = self.slots.get_mut(slot as usize) {
+                entry.2 += 1;
+            }
+            return slot;
+        }
+        if self.free.is_empty() && self.slots.len() >= MAX_TEXTURES as usize {
+            // The array is full: drawn with the stand-in (never seen: a
+            // frame holds a few thousand).
+            eprintln!("textures: more than {MAX_TEXTURES} in use, one drawn white");
+            return 0;
+        }
+        let entry = Some((Some(handle), view(), 1));
+        let slot = match self.free.pop() {
+            Some(slot) => {
+                self.slots[slot as usize] = entry;
+                slot
+            }
+            None => {
+                self.slots.push(entry);
+                (self.slots.len() - 1) as u32
+            }
+        };
+        self.by_handle.insert(handle, slot);
+        self.changed = true;
+        slot
+    }
+
+    /// Lets go of one hold on place `slot`, freeing it with the last.
+    fn release(&mut self, slot: u32) {
+        if slot == 0 {
+            return;
+        }
+        let Some(cell) = self.slots.get_mut(slot as usize) else {
+            return;
+        };
+        if let Some(entry) = cell {
+            entry.2 -= 1;
+            if entry.2 == 0 {
+                if let Some(h) = entry.0 {
+                    self.by_handle.remove(&h);
+                }
+                *cell = None;
+                self.free.push(slot);
+            }
+        }
+    }
+
+    /// The view at each place, the stand-in in free ones.
+    fn views(&self) -> Vec<&V> {
+        let white = &self.slots[0].as_ref().expect("place 0 is never freed").1;
+        self.slots
+            .iter()
+            .map(|s| s.as_ref().map_or(white, |e| &e.1))
+            .collect()
+    }
+}
+
+/// Every material's [`MaterialUniforms`] in one uniform buffer, each at
+/// its place's offset; place 0 is the default material (drawn for a
+/// material not set).
+#[derive(Debug)]
+struct Materials {
+    records: Vec<MaterialUniforms>,
+    free: Vec<u32>,
+    /// Bytes from one record to the next (the device's offset alignment).
+    stride: u64,
+    buffer: wgpu::Buffer,
+    /// Group 4: the buffer, bound at a record's offset (the last group:
+    /// wgpu applies a changed group again with every group after it).
+    group: wgpu::BindGroup,
+}
+
+/// Bytes from one material record to the next: its size, rounded up to
+/// the device's uniform offset alignment.
+fn material_stride(alignment: u32) -> u64 {
+    (std::mem::size_of::<MaterialUniforms>() as u64).next_multiple_of(u64::from(alignment.max(1)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -354,7 +482,7 @@ struct Caster {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct MaterialUniforms {
     color: [f32; 4],
     params: [f32; 4],
@@ -379,15 +507,13 @@ struct MaterialUniforms {
     reflection: [f32; 4],
     /// x: open water.
     water: [f32; 4],
-}
-
-/// Texture views a material binds besides its uniforms.
-struct MaterialViews<'a> {
-    base: &'a wgpu::TextureView,
-    detail: &'a wgpu::TextureView,
-    specular: &'a wgpu::TextureView,
-    normal: &'a wgpu::TextureView,
-    layers: [&'a wgpu::TextureView; 4],
+    /// Its maps' places in the texture array: base, detail, specular,
+    /// normal ([`TextureSlots`]).
+    tex: [u32; 4],
+    /// Its ground layers' places.
+    layer_tex: [u32; 4],
+    /// x: its base map's sampler (0: repeating, 1: clamped).
+    samp: [u32; 4],
 }
 
 /// A 2D float texture binding visible to the fragment stage.
@@ -405,6 +531,9 @@ fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 }
 
 /// A frame between `begin_frame` and `end_frame`.
+/// An [`OpenFrame`]'s lists kept between frames.
+type Spare = (Vec<RecordedDraw>, Vec<u8>, Vec<[u32; 2]>, Vec<[f32; 16]>);
+
 #[derive(Debug)]
 struct OpenFrame {
     view: View,
@@ -503,14 +632,19 @@ pub struct WgpuBackend {
     /// Repeating, then clamping.
     samplers: [wgpu::Sampler; 2],
     white: wgpu::TextureView,
-    default_material: wgpu::BindGroup,
+    /// Every material's record ([`Materials`]).
+    material_records: Materials,
+    /// Group 2: the texture array and samplers ([`TextureSlots`]).
+    texture_slots: TextureSlots<wgpu::TextureView>,
+    maps_layout: wgpu::BindGroupLayout,
+    maps_group: wgpu::BindGroup,
 
     shaders: HashMap<VertexLayout, wgpu::ShaderModule>,
     layouts: Layouts,
-    pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
+    pipelines: FastMap<PipelineKey, wgpu::RenderPipeline>,
     /// The glow layer's pipelines for additive and translucent keys.
-    glow_pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
-    shadow_pipelines: HashMap<ShadowKey, wgpu::RenderPipeline>,
+    glow_pipelines: FastMap<PipelineKey, wgpu::RenderPipeline>,
+    shadow_pipelines: FastMap<ShadowKey, wgpu::RenderPipeline>,
     /// When the backend started, for animated surfaces.
     started: std::time::Instant,
     /// Bloom, exposure and grade after the world.
@@ -522,9 +656,11 @@ pub struct WgpuBackend {
     vertex_buffers: Slots<VertexBuffer>,
     index_buffers: Slots<IndexBuffer>,
     textures: Slots<Texture>,
-    materials: HashMap<MaterialId, Material>,
+    materials: FastMap<MaterialId, Material>,
 
     frame: Option<OpenFrame>,
+    /// The last frame's lists, emptied, for the next ([`Spare`]).
+    spare: Option<Spare>,
     /// Frames ended so far, which is also the number of the open frame.
     frames: u64,
     /// The GPU time of each frame's stages, where the device can tell.
@@ -785,28 +921,35 @@ impl WgpuBackend {
         });
         let material_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("material"),
+            // One material's record, at its offset in the buffer of them
+            // all (see `Materials`).
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: std::num::NonZeroU64::new(
+                        std::mem::size_of::<MaterialUniforms>() as u64,
+                    ),
+                },
+                count: None,
+            }],
+        });
+        // Every material's textures, and the samplers (see `TextureSlots`).
+        let maps_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("material maps"),
             entries: &[
-                uniform_entry(0, false),
-                texture_entry(1),
                 wgpu::BindGroupLayoutEntry {
-                    binding: 2,
+                    count: std::num::NonZeroU32::new(MAX_TEXTURES),
+                    ..texture_entry(0)
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
+                    count: std::num::NonZeroU32::new(2),
                 },
-                texture_entry(3),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                texture_entry(5),
-                texture_entry(6),
-                texture_entry(7),
-                texture_entry(8),
-                texture_entry(9),
-                texture_entry(10),
             ],
         });
         // Depth beneath and colour to mirror, for water: copies of the
@@ -842,8 +985,9 @@ impl WgpuBackend {
             bind_group_layouts: &[
                 Some(&frame_layout),
                 Some(&draw_layout),
-                Some(&material_layout),
+                Some(&maps_layout),
                 Some(&scene_layout),
+                Some(&material_layout),
             ],
             immediate_size: 0,
         });
@@ -853,6 +997,8 @@ impl WgpuBackend {
                 bind_group_layouts: &[
                     Some(&shadow_frame_layout),
                     Some(&draw_layout),
+                    Some(&maps_layout),
+                    None,
                     Some(&material_layout),
                 ],
                 immediate_size: 0,
@@ -1052,19 +1198,10 @@ impl WgpuBackend {
         };
         let post = post::Post::new(&device, output, width, height, &depth.view);
         Self {
-            default_material: Self::material_group(
-                &device,
-                &material_layout,
-                &samplers,
-                &MaterialViews {
-                    base: &white,
-                    detail: &white,
-                    specular: &white,
-                    normal: &white,
-                    layers: [&white; 4],
-                },
-                &MaterialDesc::default(),
-            ),
+            material_records: Self::materials(&device, &material_layout, 1),
+            texture_slots: TextureSlots::new(white.clone()),
+            maps_group: Self::maps_group(&device, &maps_layout, &[&white], &samplers),
+            maps_layout,
             adapter,
             device,
             queue,
@@ -1090,9 +1227,9 @@ impl WgpuBackend {
             white,
             shaders: HashMap::new(),
             layouts: Layouts::default(),
-            pipelines: HashMap::new(),
-            glow_pipelines: HashMap::new(),
-            shadow_pipelines: HashMap::new(),
+            pipelines: FastMap::default(),
+            glow_pipelines: FastMap::default(),
+            shadow_pipelines: FastMap::default(),
             cascades: std::cell::Cell::new(None),
             started: std::time::Instant::now(),
             post,
@@ -1101,8 +1238,9 @@ impl WgpuBackend {
             vertex_buffers: Slots::default(),
             index_buffers: Slots::default(),
             textures: Slots::default(),
-            materials: HashMap::new(),
+            materials: FastMap::default(),
             frame: None,
+            spare: None,
             frames: 0,
             timer,
             submitted: [None, None],
@@ -1239,19 +1377,14 @@ impl WgpuBackend {
     }
 
     /// `samplers` are the repeating and clamping ones.
-    fn material_group(
-        device: &wgpu::Device,
-        layout: &wgpu::BindGroupLayout,
-        samplers: &[wgpu::Sampler; 2],
-        views: &MaterialViews<'_>,
-        desc: &MaterialDesc,
-    ) -> wgpu::BindGroup {
+    /// `desc`'s record, its maps at places `textures` (see [`Material`]).
+    fn material_uniforms(desc: &MaterialDesc, textures: [u32; 8]) -> MaterialUniforms {
         let cutoff = match desc.blend {
             BlendMode::Masked { cutoff } => cutoff,
             _ => 0.0,
         };
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
-        let uniforms = MaterialUniforms {
+        MaterialUniforms {
             color: desc.color,
             params: [
                 cutoff,
@@ -1323,62 +1456,122 @@ impl WgpuBackend {
                 desc.water_waves,
                 desc.water_fade,
             ],
-        };
-        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("material uniforms"),
-            contents: bytemuck::bytes_of(&uniforms),
-            usage: wgpu::BufferUsages::UNIFORM,
+            tex: [textures[0], textures[1], textures[2], textures[3]],
+            layer_tex: [textures[4], textures[5], textures[6], textures[7]],
+            samp: [u32::from(desc.clamp), 0, 0, 0],
+        }
+    }
+
+    /// The material buffer with room for `records` records, the default
+    /// material's first.
+    fn materials(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        records: usize,
+    ) -> Materials {
+        let stride = material_stride(device.limits().min_uniform_buffer_offset_alignment);
+        let records = records.max(1);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("materials"),
+            size: stride * records as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
+        let group = Self::material_records_group(device, layout, &buffer);
+        let default = Self::material_uniforms(&MaterialDesc::default(), [0; 8]);
+        Materials {
+            records: vec![default],
+            free: Vec::new(),
+            stride,
+            buffer,
+            group,
+        }
+    }
+
+    fn material_records_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        buffer: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("material"),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(std::mem::size_of::<MaterialUniforms>() as u64),
+                }),
+            }],
+        })
+    }
+
+    /// Group 2: `views` by place, and the repeating and clamped samplers.
+    fn maps_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        views: &[&wgpu::TextureView],
+        samplers: &[wgpu::Sampler; 2],
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("material maps"),
             layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureViewArray(views),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(views.base),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&samplers[usize::from(desc.clamp)]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(views.detail),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&samplers[0]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(views.specular),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::TextureView(views.normal),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: wgpu::BindingResource::TextureView(views.layers[0]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: wgpu::BindingResource::TextureView(views.layers[1]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: wgpu::BindingResource::TextureView(views.layers[2]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: wgpu::BindingResource::TextureView(views.layers[3]),
+                    resource: wgpu::BindingResource::SamplerArray(&[&samplers[0], &samplers[1]]),
                 },
             ],
         })
+    }
+
+    /// Writes material place `slot`'s record, growing the buffer if it
+    /// has no room.
+    fn write_material(&mut self, slot: u32, record: MaterialUniforms) {
+        let m = &mut self.material_records;
+        let slot = slot as usize;
+        if slot >= m.records.len() {
+            m.records.resize(slot + 1, record);
+        }
+        m.records[slot] = record;
+        if (slot as u64 + 1) * m.stride > m.buffer.size() {
+            let records = (slot + 1).next_power_of_two();
+            let grown = Self::materials(&self.device, &self.material_layout, records);
+            m.buffer = grown.buffer;
+            m.group = grown.group;
+            let mut bytes = vec![0u8; m.records.len() * m.stride as usize];
+            for (i, r) in m.records.iter().enumerate() {
+                let at = i * m.stride as usize;
+                bytes[at..at + std::mem::size_of::<MaterialUniforms>()]
+                    .copy_from_slice(bytemuck::bytes_of(r));
+            }
+            self.queue.write_buffer(&m.buffer, 0, &bytes);
+        } else {
+            self.queue.write_buffer(
+                &m.buffer,
+                slot as u64 * m.stride,
+                bytemuck::bytes_of(&record),
+            );
+        }
+    }
+
+    /// Frees a removed material's place and its holds on its maps.
+    fn let_go(&mut self, old: &Material) {
+        for &t in &old.textures {
+            self.texture_slots.release(t);
+        }
+        self.material_records.free.push(old.slot);
+    }
+
+    /// The offset of `id`'s record (the default material's for one not set).
+    fn material_offset(&self, id: MaterialId) -> u32 {
+        let slot = self.materials.get(&id).map_or(0, |m| m.slot);
+        (u64::from(slot) * self.material_records.stride) as u32
     }
 
     /// The GPU and graphics API in use.
@@ -1886,6 +2079,7 @@ impl WgpuBackend {
             });
             pass.set_bind_group(0, group, &[]);
             pass.set_bind_group(1, &self.draw_group, &[]);
+            pass.set_bind_group(2, &self.maps_group, &[]);
             let mut pipeline_now: Option<&ShadowKey> = None;
             let mut material_now = None;
             let mut vertices_now = None;
@@ -1905,16 +2099,16 @@ impl WgpuBackend {
                     pipeline_now = Some(&caster.pipeline);
                 }
                 if caster.pipeline.masked && material_now != Some(d.material) {
-                    let material = self
-                        .materials
-                        .get(&d.material)
-                        .map_or(&self.default_material, |m| &m.bind_group);
-                    pass.set_bind_group(2, material, &[]);
+                    pass.set_bind_group(
+                        4,
+                        &self.material_records.group,
+                        &[self.material_offset(d.material)],
+                    );
                     material_now = Some(d.material);
                 } else if material_now.is_none() {
                     // Opaque casters run no fragment stage, but the layout
                     // still wants a material group bound.
-                    pass.set_bind_group(2, &self.default_material, &[]);
+                    pass.set_bind_group(4, &self.material_records.group, &[0]);
                     material_now = Some(MaterialId(u32::MAX));
                 }
                 if vertices_now != Some(d.vertex_buffer.0) {
@@ -2025,6 +2219,7 @@ impl WgpuBackend {
         pass.set_bind_group(0, &self.frame_group, &[]);
         pass.set_bind_group(1, &self.draw_group, &[]);
         pass.set_bind_group(3, &self.depth.group, &[]);
+        pass.set_bind_group(2, &self.maps_group, &[]);
         let mut pipeline_now: Option<&PipelineKey> = None;
         let mut material_now = None;
         let mut vertices_now = None;
@@ -2043,11 +2238,11 @@ impl WgpuBackend {
                 pipeline_now = Some(&d.pipeline);
             }
             if material_now != Some(d.material) {
-                let material = self
-                    .materials
-                    .get(&d.material)
-                    .map_or(&self.default_material, |m| &m.bind_group);
-                pass.set_bind_group(2, material, &[]);
+                pass.set_bind_group(
+                    4,
+                    &self.material_records.group,
+                    &[self.material_offset(d.material)],
+                );
                 material_now = Some(d.material);
             }
             if vertices_now != Some(d.vertex_buffer.0) {
@@ -2145,6 +2340,7 @@ impl WgpuBackend {
         }
         pass.set_bind_group(1, &self.draw_group, &[]);
         pass.set_bind_group(3, &self.depth.group, &[]);
+        pass.set_bind_group(2, &self.maps_group, &[]);
         // State is set only when it changes: the queue has sorted the
         // draws so neighbours share pipelines, materials and buffers, and
         // each command costs time to record and submit.
@@ -2162,11 +2358,11 @@ impl WgpuBackend {
                 pipeline_now = Some(&d.pipeline);
             }
             if material_now != Some(d.material) {
-                let material = self
-                    .materials
-                    .get(&d.material)
-                    .map_or(&self.default_material, |m| &m.bind_group);
-                pass.set_bind_group(2, material, &[]);
+                pass.set_bind_group(
+                    4,
+                    &self.material_records.group,
+                    &[self.material_offset(d.material)],
+                );
                 material_now = Some(d.material);
             }
             if vertices_now != Some(d.vertex_buffer.0) {
@@ -2508,9 +2704,19 @@ async fn open(
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("m2"),
-            // Timestamps for the frame timer, where the adapter has them.
-            required_features: adapter.features() & timer::features(),
-            required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
+            // Timestamps for the frame timer, where the adapter has them;
+            // arrays of textures for the materials' maps (`TextureSlots`).
+            required_features: (adapter.features() & timer::features()) | maps_features(),
+            // Five groups: frame, draw, material, scene and the materials'
+            // maps.
+            required_limits: wgpu::Limits {
+                max_bind_groups: 5,
+                // The textures and the two samplers.
+                max_binding_array_elements_per_shader_stage: MAX_TEXTURES + 2,
+                max_binding_array_sampler_elements_per_shader_stage: 2,
+                ..wgpu::Limits::default()
+            }
+            .using_resolution(adapter.limits()),
             ..Default::default()
         })
         .await
@@ -2706,45 +2912,61 @@ impl RenderBackend for WgpuBackend {
     }
 
     fn remove_material(&mut self, id: MaterialId) -> Result<(), BackendError> {
-        self.materials.remove(&id);
+        if let Some(old) = self.materials.remove(&id) {
+            self.let_go(&old);
+        }
         Ok(())
     }
 
     fn set_material(&mut self, id: MaterialId, desc: &MaterialDesc) -> Result<(), BackendError> {
-        let view = |t: Option<TextureHandle>| -> Result<&wgpu::TextureView, BackendError> {
-            match t {
-                Some(t) => Ok(&self.textures.get(t.0)?.view),
-                None => Ok(&self.white),
+        // Its maps, in `Material::textures`' order; every one must exist
+        // before any place is taken.
+        let handles = [
+            desc.texture,
+            desc.detail.map(|d| d.texture),
+            desc.specular
+                .and_then(|s| s.map)
+                .or(desc.emissive.and_then(|e| e.map)),
+            desc.normal_map.map(|n| n.texture),
+            desc.layers[0].map(|l| l.texture),
+            desc.layers[1].map(|l| l.texture),
+            desc.layers[2].map(|l| l.texture),
+            desc.layers[3].map(|l| l.texture),
+        ];
+        for h in handles.iter().flatten() {
+            self.textures.get(h.0)?;
+        }
+        let mut textures = [0u32; 8];
+        for (slot, h) in textures.iter_mut().zip(handles) {
+            let view = h
+                .and_then(|h| self.textures.get(h.0).ok())
+                .map(|t| t.view.clone());
+            *slot = self
+                .texture_slots
+                .acquire(h, || view.expect("checked above"));
+        }
+        let old = self.materials.remove(&id);
+        let slot = match &old {
+            Some(old) => old.slot,
+            None => match self.material_records.free.pop() {
+                Some(slot) => slot,
+                None => self.material_records.records.len() as u32,
+            },
+        };
+        if let Some(old) = &old {
+            // Its old maps' holds, after the new ones were taken (a map it
+            // keeps keeps its place).
+            for &t in &old.textures {
+                self.texture_slots.release(t);
             }
-        };
-        let views = MaterialViews {
-            base: view(desc.texture)?,
-            detail: view(desc.detail.map(|d| d.texture))?,
-            specular: view(
-                desc.specular
-                    .and_then(|s| s.map)
-                    .or(desc.emissive.and_then(|e| e.map)),
-            )?,
-            normal: view(desc.normal_map.map(|n| n.texture))?,
-            layers: [
-                view(desc.layers[0].map(|l| l.texture))?,
-                view(desc.layers[1].map(|l| l.texture))?,
-                view(desc.layers[2].map(|l| l.texture))?,
-                view(desc.layers[3].map(|l| l.texture))?,
-            ],
-        };
-        let bind_group = Self::material_group(
-            &self.device,
-            &self.material_layout,
-            &self.samplers,
-            &views,
-            desc,
-        );
+        }
+        self.write_material(slot, Self::material_uniforms(desc, textures));
         self.materials.insert(
             id,
             Material {
                 desc: *desc,
-                bind_group,
+                slot,
+                textures,
             },
         );
         Ok(())
@@ -2762,12 +2984,15 @@ impl RenderBackend for WgpuBackend {
         if self.frame.is_some() {
             return Err(BackendError::FrameAlreadyOpen);
         }
+        // The last frame's lists, emptied, so a frame doesn't grow them
+        // from nothing (megabytes copied and mapped afresh each frame).
+        let (draws, uniforms, slots, palette) = self.spare.take().unwrap_or_default();
         self.frame = Some(OpenFrame {
             view: *view,
-            draws: Vec::new(),
-            uniforms: Vec::new(),
-            slots: Vec::new(),
-            palette: Vec::new(),
+            draws,
+            uniforms,
+            slots,
+            palette,
         });
         Ok(())
     }
@@ -3014,6 +3239,15 @@ impl WgpuBackend {
             self.queue
                 .write_buffer(&self.palette_buffer, 0, bytemuck::cast_slice(&palette));
         }
+        if self.texture_slots.changed {
+            self.texture_slots.changed = false;
+            self.maps_group = Self::maps_group(
+                &self.device,
+                &self.maps_layout,
+                &self.texture_slots.views(),
+                &self.samplers,
+            );
+        }
         let size = self.size();
         let format = self.overlay_format();
         let over = |target: &wgpu::TextureView,
@@ -3073,8 +3307,31 @@ impl WgpuBackend {
                 }
             }
         }
+        self.keep_spare(draws, uniforms, slots, palette);
         Ok(())
     }
+
+    /// Keeps a finished frame's lists, emptied, for the next frame.
+    fn keep_spare(
+        &mut self,
+        mut draws: Vec<RecordedDraw>,
+        mut uniforms: Vec<u8>,
+        mut slots: Vec<[u32; 2]>,
+        mut palette: Vec<[f32; 16]>,
+    ) {
+        draws.clear();
+        uniforms.clear();
+        slots.clear();
+        palette.clear();
+        self.spare = Some((draws, uniforms, slots, palette));
+    }
+}
+
+/// What the materials' texture array needs of the device
+/// ([`TextureSlots`]): every D3D12 and Vulkan desktop GPU this runs on has
+/// it (checked on the Quadro P2000 under both and on WARP).
+fn maps_features() -> wgpu::Features {
+    wgpu::Features::TEXTURE_BINDING_ARRAY | wgpu::Features::PARTIALLY_BOUND_BINDING_ARRAY
 }
 
 /// Whether draws of `blend` have a pipeline in the glow layer
@@ -3195,5 +3452,57 @@ mod layout_tests {
         assert!(in_glow_layer(BlendKind::Translucent));
         assert!(!in_glow_layer(BlendKind::Opaque));
         assert!(!in_glow_layer(BlendKind::Masked));
+    }
+}
+
+#[cfg(test)]
+mod material_slot_tests {
+    use super::*;
+    use crate::buffer::RawHandle;
+
+    fn texture(index: u32) -> TextureHandle {
+        TextureHandle(RawHandle {
+            index,
+            generation: 0,
+        })
+    }
+
+    #[test]
+    fn a_map_holds_one_place_while_any_material_uses_it() {
+        let mut slots = TextureSlots::new("white");
+        assert_eq!(slots.acquire(None, || "never"), 0);
+        let a = slots.acquire(Some(texture(5)), || "a");
+        assert_eq!(slots.acquire(Some(texture(5)), || "again"), a);
+        let b = slots.acquire(Some(texture(6)), || "b");
+        assert_ne!(a, b);
+        assert_eq!(slots.views(), [&"white", &"a", &"b"]);
+        slots.changed = false;
+        slots.release(a);
+        assert_eq!(slots.views()[a as usize], &"a", "still held once");
+        slots.release(a);
+        assert_eq!(slots.views()[a as usize], &"white", "freed");
+        // Freeing needs no new array; a new map in the freed place does.
+        assert!(!slots.changed);
+        assert_eq!(slots.acquire(Some(texture(7)), || "c"), a);
+        assert!(slots.changed);
+        // The stand-in is never let go.
+        slots.release(0);
+        assert_eq!(slots.views()[0], &"white");
+    }
+
+    #[test]
+    fn records_are_aligned_and_name_their_maps_and_sampler() {
+        assert_eq!(material_stride(256) % 256, 0);
+        assert!(material_stride(256) >= std::mem::size_of::<MaterialUniforms>() as u64);
+        let desc = MaterialDesc {
+            clamp: true,
+            ..MaterialDesc::default()
+        };
+        let r = WgpuBackend::material_uniforms(&desc, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(r.tex, [1, 2, 3, 4]);
+        assert_eq!(r.layer_tex, [5, 6, 7, 8]);
+        assert_eq!(r.samp[0], 1);
+        let r = WgpuBackend::material_uniforms(&MaterialDesc::default(), [0; 8]);
+        assert_eq!((r.tex, r.samp[0]), ([0; 4], 0));
     }
 }

@@ -107,10 +107,10 @@ struct Swing {
 /// The state layers' models in play.
 #[derive(Debug, Default)]
 pub struct Props {
-    shown: HashMap<u32, Prop>,
+    shown: m2_render::fasthash::FastMap<u32, Prop>,
     /// By hash, once some shown prop wants it: `None` until it has loaded
     /// (and when it failed).
-    models: HashMap<u32, Option<PropModel>>,
+    models: m2_render::fasthash::FastMap<u32, Option<PropModel>>,
     /// Wanted, not yet asked of the loaders.
     waiting: HashSet<u32>,
     /// Asked of the loaders, not yet uploaded.
