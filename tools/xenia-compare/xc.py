@@ -890,6 +890,16 @@ def run(args) -> int:
                 addr, val = int(w[1], 16), int(w[2])
                 ok = g.write(addr, bytes([val]))
                 say(f"poke {addr:#x} = {val}: {'ok' if ok else 'FAILED'}, reads back {g.read(addr, 1)}")
+            elif op == "pokestr":
+                # pokestr <guest hex address> <text>: write a NUL-terminated string
+                # (a runtime data value, e.g. the game's "Mission" skip setting at
+                # 0x83133F98, 64 bytes, as multiplayer.ini would set it at boot).
+                import xmem
+
+                g = xmem.Guest(p.pid)
+                addr, text = int(w[1], 16), w[2]
+                ok = g.write(addr, text.encode("ascii")[:63] + b"\x00")
+                say(f"pokestr {addr:#x} = {text!r}: {'ok' if ok else 'FAILED'}, reads back {g.read(addr, len(text) + 1)}")
             elif op == "trackhero":
                 # trackhero: follow the local player's character through the
                 # 360 code's own tables (xmem.Hero): one record, in a vehicle
