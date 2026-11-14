@@ -5120,6 +5120,19 @@ impl Combat {
 
     /// Wrecks vehicle `i`, `v`, if it isn't already: it burns and can't be
     /// driven.
+    /// Vehicle `v` sank ([`crate::game::Game`]'s sinking): lost as a
+    /// wreck is, without its blast, fire or remark (invented: the 360's
+    /// sinking only takes its floats' lift and tells the scripts).
+    pub fn sink(&mut self, physics: &mut Physics, v: &mut ParkedVehicle) {
+        if v.wrecked {
+            return;
+        }
+        v.wrecked = true;
+        if let Some(id) = v.id {
+            physics.wreck_vehicle(id);
+        }
+    }
+
     fn wreck(&mut self, physics: &mut Physics, v: &mut ParkedVehicle, i: usize) {
         if v.wrecked {
             return;

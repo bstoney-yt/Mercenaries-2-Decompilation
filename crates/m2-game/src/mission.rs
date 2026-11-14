@@ -1804,6 +1804,13 @@ impl Mission {
             .map_or(&[], |e| e.path.as_slice())
     }
 
+    /// Vehicle `guid` sank: its `VehicleSinking` physics event holds
+    /// (the scripts' `ObjectPhysicsEvent`; the 360 sends it once,
+    /// [`m2_engine::durability::Buoyancy`]).
+    pub fn vehicle_sinking(&mut self, guid: u32) {
+        self.world.borrow_mut().sunk.insert(guid);
+    }
+
     /// She honked: the friendly faction gates hear it for
     /// [`api::HONK_HEARD`] seconds.
     pub fn honk(&mut self) {

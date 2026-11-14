@@ -321,6 +321,13 @@ pub struct Game {
     /// ([`Game::take_honks`]).
     pub honking: bool,
     honks: u32,
+    /// Seconds each vehicle (by index) has had a quarter or more of its
+    /// box under the water, and those that have sunk ([`Game::sink`]).
+    in_water: HashMap<usize, f32>,
+    sunk: HashSet<usize>,
+    /// The mission vehicles that sank, not yet told to the scripts
+    /// ([`Game::take_sunk`]).
+    sunk_guids: Vec<u32>,
     /// Her vehicle disguise ([`crate::disguise`]).
     pub disguise: crate::disguise::Disguise,
     /// Seconds the scripts asked her pad to shake (`Pg.Rumble`), for the
@@ -563,6 +570,9 @@ impl Game {
             pursued: false,
             honking: false,
             honks: 0,
+            in_water: HashMap::new(),
+            sunk: HashSet::new(),
+            sunk_guids: Vec::new(),
             disguise: crate::disguise::Disguise::default(),
             rumble: 0.0,
             actions: Vec::new(),
@@ -1848,6 +1858,8 @@ impl Game {
             .map(|v| self.bed_shapes.get(&v.spec.model).cloned().flatten())
             .collect();
         let focus = self.focus();
+        // Vehicles under the water long enough sink.
+        self.sink(dt);
         if let Some(world) = &mut self.scene.world {
             let driven = self
                 .scene
@@ -3509,6 +3521,86 @@ impl Game {
 
     /// The horn presses since the last call (the faction gates, the
     /// disguise and the friendly soldiers hear each one).
+    /// The mission vehicles that sank since the last call (their
+    /// `VehicleSinking` physics event).
+    pub fn take_sunk(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.sunk_guids)
+    }
+
+    /// Vehicles in the water `dt` seconds more: each but a boat with a
+    /// quarter or more of its box under the sea counts its time there,
+    /// and once that reaches its template's `Buoyancy` delay (5 s
+    /// without one) it sinks: it is lost (wrecked, without a blast), she
+    /// gets out if she is in it, and a mission vehicle's
+    /// `VehicleSinking` goes to the scripts. From the 360 code: the time,
+    /// the share and the event ([`m2_engine::durability::Buoyancy`]). The
+    /// boats float by their own hulls here ([`m2_engine::Physics`]'s
+    /// boats) and are left to them.
+    fn sink(&mut self, dt: f32) {
+        use m2_engine::durability::{SINK_SHARE, submerged_share};
+        let Some(world) = &mut self.scene.world else {
+            return;
+        };
+        let Some(sea) = world.physics.water() else {
+            return;
+        };
+        let mut sinking = Vec::new();
+        for (i, v) in self.scene.vehicles.iter().enumerate() {
+            if v.wrecked || v.spec.is_boat() || self.sunk.contains(&i) {
+                continue;
+            }
+            let Some(at) = v.id.and_then(|id| world.physics.vehicle_transform(id)) else {
+                continue;
+            };
+            let (lo, hi) = v.spec.bounds;
+            let (mut bottom, mut top) = (f32::MAX, f32::MIN);
+            for x in [lo.x, hi.x] {
+                for y in [lo.y, hi.y] {
+                    for z in [lo.z, hi.z] {
+                        let y = at.transform_point3(Vec3::new(x, y, z)).y;
+                        bottom = bottom.min(y);
+                        top = top.max(y);
+                    }
+                }
+            }
+            if submerged_share(bottom, top, sea) < SINK_SHARE {
+                continue;
+            }
+            let t = self.in_water.entry(i).or_insert(0.0);
+            *t += dt;
+            let after = world
+                .index
+                .template_db
+                .buoyancy_for(&v.spec.label)
+                .sink_after;
+            if *t >= after {
+                sinking.push((i, *t));
+            }
+        }
+        for (i, t) in sinking {
+            self.sunk.insert(i);
+            self.in_water.remove(&i);
+            let v = &mut self.scene.vehicles[i];
+            eprintln!(
+                "sink: the {} has been in the water {t:.1} s: it sinks{}",
+                v.spec.label,
+                v.guid
+                    .map_or(String::new(), |g| format!(" (VehicleSinking for {g:#x})"))
+            );
+            if let Some(g) = v.guid {
+                self.sunk_guids.push(g);
+            }
+            self.combat.sink(&mut world.physics, v);
+            if let Some(p) = self.scene.player.as_mut()
+                && p.driving == Some(i)
+            {
+                let seat = self.ride.filter(|r| r.0 == i).map(|r| r.1);
+                get_out(&world.physics, &self.scene.vehicles[i], seat, p);
+                self.ride = None;
+            }
+        }
+    }
+
     pub fn take_honks(&mut self) -> u32 {
         std::mem::take(&mut self.honks)
     }

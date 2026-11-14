@@ -100,8 +100,9 @@ pub trait World {
     }
     /// Whether a physics event of `object` holds: `"gateFullyClosed"`
     /// while a gate the scripts shut (`Object.CloseGate`) stays shut,
-    /// `"gateStuck"` never (gates shut at once here, so none sticks);
-    /// `None` for one not known (`"VehicleSinking"`).
+    /// `"gateStuck"` never (gates shut at once here, so none sticks),
+    /// `"VehicleSinking"` once the vehicle has sunk; `None` for one not
+    /// known.
     fn physics_event(&self, _object: u32, _name: &str) -> Option<bool> {
         None
     }

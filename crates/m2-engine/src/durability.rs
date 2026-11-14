@@ -475,6 +475,83 @@ pub fn modifier_keys(db: &Layer<'_>) -> HashMap<u32, u32> {
         .collect()
 }
 
+/// A template's `Buoyancy` record: how an object in the water floats,
+/// and how long it floats before it sinks.
+///
+/// From the 360 code: the water body an object gets (0x821A6878) reads
+/// the record's five floats; with none it takes 1, 1, 5, 2 and 1 (the
+/// constants at 0x820BAEE8, 0x820BAF84 and 0x820C77A4). Each tick
+/// (0x821A7608) that a quarter or more of its box is under the water
+/// (0x821A7ED0, against 0x820DABDC) its time in the water grows
+/// (0x821A7A90, never shrinking); once that reaches [`Self::sink_after`]
+/// its floats lose their lift, and a vehicle (an object of kind 2, 3, 4,
+/// 8 or 10: a car, a tank, a helicopter, a jet or a boat) sends its
+/// `VehicleSinking` physics event once (0x82161C80 on 0x8322DA60, kind
+/// 0, which the scripts' `ObjectPhysicsEvent` reads by that name,
+/// 0x82354D28).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Buoyancy {
+    /// Its lift (`Buoyancy`).
+    pub lift: f32,
+    /// Its drag in the water (`Drag`).
+    pub drag: f32,
+    /// Seconds in the water before it sinks (field `ecef5b40`, name
+    /// unknown).
+    pub sink_after: f32,
+    /// How fast its floats lose their lift once it sinks (field
+    /// `92848892`, name unknown).
+    pub sink_rate: f32,
+    /// Field `567bc21e` (name unknown; it slows the loss float by float).
+    pub unk_567bc21e: f32,
+}
+
+impl Default for Buoyancy {
+    fn default() -> Self {
+        Self {
+            lift: 1.0,
+            drag: 1.0,
+            sink_after: 5.0,
+            sink_rate: 2.0,
+            unk_567bc21e: 1.0,
+        }
+    }
+}
+
+/// The share of an object's box under the water from which its time in
+/// the water counts ([`Buoyancy`]; 0x820DABDC).
+pub const SINK_SHARE: f32 = 0.25;
+
+/// How much of a box from height `bottom` to `top` is under water at
+/// height `water`, 0 to 1 (0x821A7ED0's share).
+pub fn submerged_share(bottom: f32, top: f32, water: f32) -> f32 {
+    if top <= bottom {
+        return if water > bottom { 1.0 } else { 0.0 };
+    }
+    ((water - bottom) / (top - bottom)).clamp(0.0, 1.0)
+}
+
+/// Each template's `Buoyancy` record, by id.
+pub fn buoyancy(db: &Layer<'_>) -> HashMap<u32, Buoyancy> {
+    let t = Table::new(db, "Buoyancy");
+    let d = Buoyancy::default();
+    t.templates()
+        .filter_map(|id| {
+            let r = t.of_template(id).first()?;
+            let f = |field: u32, or: f32| t.float(r, field).unwrap_or(or);
+            Some((
+                id,
+                Buoyancy {
+                    lift: f(name_hash("Buoyancy"), d.lift),
+                    drag: f(name_hash("Drag"), d.drag),
+                    sink_after: f(0xecef_5b40, d.sink_after),
+                    sink_rate: f(0x9284_8892, d.sink_rate),
+                    unk_567bc21e: f(0x567b_c21e, d.unk_567bc21e),
+                },
+            ))
+        })
+        .collect()
+}
+
 /// How hard a vehicle of `mass` (kg) running into something at `speed`
 /// (m/s) hits it, before the damage table scales it by what it hits (its
 /// `ModifierKey` row) and the vehicle's kind of damage ([`RAM_KIND`]): a
@@ -695,6 +772,20 @@ mod tests {
 
     // Each side takes a hundredth of the size times its cell, only once a
     // crash reaches 5 and only past 1 damage.
+    // A quarter of its box under the water is where its time counts.
+    #[test]
+    fn the_share_under_water_is_of_the_box_s_height() {
+        assert_eq!(submerged_share(0.0, 2.0, -1.0), 0.0);
+        assert_eq!(submerged_share(0.0, 2.0, 0.5), SINK_SHARE);
+        assert_eq!(submerged_share(0.0, 2.0, 5.0), 1.0);
+        assert_eq!(submerged_share(1.0, 1.0, 2.0), 1.0);
+        let d = Buoyancy::default();
+        assert_eq!(
+            (d.lift, d.drag, d.sink_after, d.sink_rate),
+            (1.0, 1.0, 5.0, 2.0)
+        );
+    }
+
     #[test]
     fn a_crash_hurts_past_the_floor_and_past_one() {
         assert_eq!(crash_damage(4.9, 100.0), 0.0, "under the floor");

@@ -2683,6 +2683,9 @@ impl MissionLink {
         // vehicle she rides, as the scripts have it; the faction's
         // soldiers take her for one of theirs while it holds, and the
         // scripts and the HUD's gauge hear how it stands.
+        for g in game.take_sunk() {
+            mission.vehicle_sinking(g);
+        }
         let honks = game.take_honks();
         if honks > 0 {
             mission.honk();
