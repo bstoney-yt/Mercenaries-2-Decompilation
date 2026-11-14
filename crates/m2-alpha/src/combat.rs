@@ -5756,11 +5756,25 @@ impl Combat {
                         .physics
                         .vehicle_transform(h.target)
                         .map(|m| m.w_axis.truncate());
-                    match goal.and_then(|g| h.steer(*at, *velocity, g, dt)) {
-                        Some(v) => *velocity = v,
-                        None => {
+                    use crate::homing::Steer;
+                    match goal.map_or(Steer::Lost, |g| h.steer(*at, *velocity, g, dt)) {
+                        Steer::Fly(v) => *velocity = v,
+                        Steer::Lost => {
                             eprintln!("homing: a missile lost its target");
                             *homing = None;
+                        }
+                        // Near enough its goal: it bursts where it is
+                        // (0x82293280, its `HomingProjectile` +8).
+                        Steer::Burst => {
+                            eprintln!(
+                                "homing: a missile bursts within {:.1} m of its goal",
+                                h.proximity
+                            );
+                            if *army {
+                                armies.push(*at);
+                            }
+                            blasts.push((*at, *blast, *key));
+                            return false;
                         }
                     }
                 }
