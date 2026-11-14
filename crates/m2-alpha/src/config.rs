@@ -84,15 +84,18 @@ pub struct GameOptions {
 
 impl Default for GameOptions {
     fn default() -> Self {
+        let profile = m2_game::profile::ProfileOptions::default();
         Self {
-            subtitles: true,
-            tutorials: true,
-            autosave: true,
-            pad_sensitivity: 50.0,
+            // A new profile's, from the 360 code (0x8239B028): subtitles
+            // on only in the Russian game; this one is English.
+            subtitles: m2_game::profile::default_subtitles(m2_game::profile::Language::English),
+            tutorials: profile.tutorials != 0,
+            autosave: profile.autosave != 0,
+            pad_sensitivity: f64::from(profile.sensitivity),
             invert_pad: false,
             rumble: true,
             pad_buttons: Vec::new(),
-            brightness: 50.0,
+            brightness: f64::from(profile.brightness),
             view_distance: 100.0,
             // The profile's default for all three (from the 360 code,
             // 0x8239B028; m2_game::profile).

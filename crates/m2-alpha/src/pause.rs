@@ -177,7 +177,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             profile: String::new(),
-            subtitles: true,
+            subtitles: m2_game::profile::default_subtitles(m2_game::profile::Language::English),
             tutorials: true,
             autosave: true,
             invert_mouse: false,

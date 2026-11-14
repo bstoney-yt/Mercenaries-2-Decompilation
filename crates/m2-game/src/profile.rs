@@ -37,12 +37,28 @@
 //!   vibration and sensitivity (setting ids `0x10040002`, `0x10040003`,
 //!   `0x10040018`; low 25, high 75, else 50: [`console_sensitivity`]).
 //!
-//! Not established: which of the three volumes is the music, the effects
-//! or the dialog (their option names' hashes, `0xE65739B8`, `0xD6E00BD8`,
-//! `0x940B6B17`, matched no string); that +0x13 is the brightness (it is
-//! only applied to a renderer float, default 50); the subtitles default
-//! (on only where a language value reads 8; which language that is wasn't
-//! traced). Unknown fields are named by offset.
+//! - The volumes, by their option names' hashes: `audioSFXVolume`
+//!   (`0xE65739B8`) +0x16, `audioMusicVolume` (`0xD6E00BD8`) +0x17,
+//!   `audioDialogVolume` (`0x940B6B17`) +0x18, in the mixer's order.
+//!   `gameDifficulty` (`0x8FEF2A84`) is +0x0E (default 2);
+//!   `joingameMap` and `joingameMission` are the strings at +0xF2, +0x132.
+//! - +0x13 is the brightness: `videoBrightness` (`0xBBBE452B`, setter
+//!   `0x82373710`) writes the same renderer float the apply step fills
+//!   from it.
+//! - Subtitles start on only in the Russian game: the default is "the
+//!   language is 8" (`0x8239B028`), and `Sys.GetLanguage` (`0x82345FC8`)
+//!   names 8 `Russian` ([`Language`], [`default_subtitles`]).
+//!
+//! The save record's 0x3000-byte block at +0x470 holds the game's save
+//! data ([`SaveDataHeader`]): the scripts' save text (as
+//! [`crate::savedata`] writes it, at most [`SAVE_DATA_CAPACITY`] bytes)
+//! compressed at level 9 (`0x828141A8`), behind a 12-byte header, when it
+//! fits ([`fits_in_record`]; `0x8230C4A8`). Loading uncompresses it
+//! (`0x82814260`) and runs `return ` and the text (`0x8230C880`), as
+//! ours does. Saving also stamps the record: the time at +0x38, a count
+//! from the scripts at +0x28, a 0x20-character name at +0x40 and a byte
+//! at +0x65 (what each shows wasn't traced). Unknown fields are named by
+//! offset.
 
 use m2_layout::assert_layout;
 
@@ -60,8 +76,75 @@ pub const OPTIONS_VERSION: u32 = 4;
 pub const DEFAULT_VOLUME: u8 = 75;
 /// The look sensitivity's default, 0 to 100 (`0x82B767B9`).
 pub const DEFAULT_SENSITIVITY: u8 = 50;
-/// +0x13's default (applied times 0.01 to the renderer).
-pub const DEFAULT_FIELD_13: u8 = 50;
+/// The brightness's default (applied times 0.01 to the renderer).
+pub const DEFAULT_BRIGHTNESS: u8 = 50;
+/// The difficulty's default (`gameDifficulty`).
+pub const DEFAULT_DIFFICULTY: u8 = 2;
+/// The volumes' order in [`ProfileOptions::volumes`] and the mixer.
+pub const VOLUME_SFX: usize = 0;
+pub const VOLUME_MUSIC: usize = 1;
+pub const VOLUME_DIALOG: usize = 2;
+/// How much save text the game gathers at most (`0x8230C4A8`).
+pub const SAVE_DATA_CAPACITY: usize = 0x18000;
+/// The save record's block for the compressed save data.
+pub const SAVE_BLOCK_LEN: usize = 0x3000;
+
+/// The game's languages, as `Sys.GetLanguage` names them (`0x82345FC8`;
+/// any other value is `English`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Language {
+    English = 0,
+    Spanish = 1,
+    Italian = 2,
+    French = 3,
+    German = 4,
+    Japanese = 5,
+    Russian = 8,
+}
+
+/// Whether a new profile starts with subtitles on: only in Russian
+/// (`0x8239B028`).
+pub fn default_subtitles(language: Language) -> bool {
+    language == Language::Russian
+}
+
+/// The header of the save data in the record's +0x470 block
+/// (`0x8230C4A8`, `0x8230C880`), big-endian as stored.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaveDataHeader {
+    /// 1; anything else isn't loaded.
+    pub kind: [u8; 4],
+    /// The compressed data's length, after the header.
+    pub packed_len: [u8; 4],
+    /// The save text's length.
+    pub text_len: [u8; 4],
+}
+
+assert_layout!(SaveDataHeader, size = 12, {
+    kind: 0,
+    packed_len: 4,
+    text_len: 8,
+});
+
+impl SaveDataHeader {
+    /// The kind the game writes and loads.
+    pub const KIND: u32 = 1;
+
+    pub fn new(packed_len: u32, text_len: u32) -> Self {
+        Self {
+            kind: Self::KIND.to_be_bytes(),
+            packed_len: packed_len.to_be_bytes(),
+            text_len: text_len.to_be_bytes(),
+        }
+    }
+}
+
+/// Whether save data compressed to `packed_len` bytes goes in the save
+/// record: header and data under [`SAVE_BLOCK_LEN`] (`0x8230C4A8`).
+pub fn fits_in_record(packed_len: usize) -> bool {
+    packed_len + std::mem::size_of::<SaveDataHeader>() < SAVE_BLOCK_LEN
+}
 /// The fuel capacity's default (`0x8239B028`, `0x8239C6D8`).
 pub const DEFAULT_FUEL_CAPACITY: u32 = 300;
 /// The profile name's default format (`0x8239C7A8`): `auto_` and the
@@ -86,7 +169,8 @@ pub struct ProfileOptions {
     pub hint_counter: u8,
     /// `gameInvert`: the look's Y axis inverted.
     pub invert_y: u8,
-    pub field_0e: u8,
+    /// `gameDifficulty`; default 2.
+    pub difficulty: u8,
     /// `gameAutosave`.
     pub autosave: u8,
     /// `gameSensitivity`, 0 to 100.
@@ -95,12 +179,13 @@ pub struct ProfileOptions {
     pub rumble: u8,
     /// `gameTutorials`.
     pub tutorials: u8,
-    /// Applied times 0.01 to a renderer float; default 50.
-    pub field_13: u8,
+    /// The brightness (`videoBrightness`), applied times 0.01 to the
+    /// renderer; default 50.
+    pub brightness: u8,
     /// `videoSubtitles`.
     pub subtitles: u8,
     pub field_15: u8,
-    /// The audio mixer's three volumes, 0 to 100, in its order.
+    /// The SFX, music and dialog volumes, 0 to 100 ([`VOLUME_SFX`]...).
     pub volumes: [u8; 3],
     pub field_19: [u8; 3],
     pub field_1c: [u8; 200],
@@ -109,8 +194,10 @@ pub struct ProfileOptions {
     pub field_ec: [u8; 4],
     pub field_f0: u8,
     pub field_f1: u8,
-    pub string_f2: [u8; 0x40],
-    pub string_132: [u8; 0x40],
+    /// `joingameMap`.
+    pub joingame_map: [u8; 0x40],
+    /// `joingameMission`.
+    pub joingame_mission: [u8; 0x40],
     /// The profile's name (`auto_XXXXXXXX` by default).
     pub name: [u8; 0x40],
     /// `Player.GetAvailableCostumes` and the byte after it.
@@ -135,15 +222,15 @@ assert_layout!(ProfileOptions, size = TITLE_SETTINGS_LEN, {
     sensitivity: 0x10,
     rumble: 0x11,
     tutorials: 0x12,
-    field_13: 0x13,
+    brightness: 0x13,
     subtitles: 0x14,
     volumes: 0x16,
     field_1c: 0x1C,
     field_e4: 0xE4,
     field_ec: 0xEC,
     field_f0: 0xF0,
-    string_f2: 0xF2,
-    string_132: 0x132,
+    joingame_map: 0xF2,
+    joingame_mission: 0x132,
     name: 0x172,
     available_costumes: 0x1B2,
     field_1b4: 0x1B4,
@@ -186,12 +273,12 @@ impl Default for ProfileOptions {
             field_08: [0; 4],
             hint_counter: 0,
             invert_y: 0,
-            field_0e: 2,
+            difficulty: DEFAULT_DIFFICULTY,
             autosave: 1,
             sensitivity: DEFAULT_SENSITIVITY,
             rumble: 1,
             tutorials: 1,
-            field_13: DEFAULT_FIELD_13,
+            brightness: DEFAULT_BRIGHTNESS,
             subtitles: 0,
             field_15: 1,
             volumes: [DEFAULT_VOLUME; 3],
@@ -202,8 +289,8 @@ impl Default for ProfileOptions {
             field_ec: 1u32.to_be_bytes(),
             field_f0: 3,
             field_f1: 0,
-            string_f2: [0; 0x40],
-            string_132: [0; 0x40],
+            joingame_map: [0; 0x40],
+            joingame_mission: [0; 0x40],
             name: [0; 0x40],
             available_costumes: [0; 2],
             field_1b4: 0,
@@ -261,12 +348,12 @@ impl ProfileOptions {
         put(&[
             self.hint_counter,
             self.invert_y,
-            self.field_0e,
+            self.difficulty,
             self.autosave,
             self.sensitivity,
             self.rumble,
             self.tutorials,
-            self.field_13,
+            self.brightness,
             self.subtitles,
             self.field_15,
         ]);
@@ -277,8 +364,8 @@ impl ProfileOptions {
         put(&self.field_e8);
         put(&self.field_ec);
         put(&[self.field_f0, self.field_f1]);
-        put(&self.string_f2);
-        put(&self.string_132);
+        put(&self.joingame_map);
+        put(&self.joingame_mission);
         put(&self.name);
         put(&self.available_costumes);
         put(&[self.field_1b4]);
@@ -326,7 +413,7 @@ mod tests {
         );
         assert_eq!(o.fuel_capacity(), 300);
         assert_eq!(o.hint_counter, 0);
-        assert_eq!(o.field_13, 50);
+        assert_eq!(o.brightness, 50);
         let b = o.to_bytes();
         assert_eq!(&b[0..4], &[0, 0, 0, 4]);
         assert_eq!(b[0x04], 2);
@@ -376,6 +463,25 @@ mod tests {
         assert_eq!((b[0x0C], b[0x0D], b[0x14]), (7, 1, 1));
         assert_eq!(&b[0x172..0x176], b"auto");
         assert_eq!(&b[0x1B2..0x1B4], &[5, 6]);
+    }
+
+    /// The volumes by name, the language rule for subtitles, and the save
+    /// data's header and room.
+    #[test]
+    fn volumes_subtitles_and_save_data() {
+        let o = ProfileOptions::default();
+        assert_eq!(o.volumes[VOLUME_MUSIC], 75);
+        assert_eq!((VOLUME_SFX, VOLUME_MUSIC, VOLUME_DIALOG), (0, 1, 2));
+        assert_eq!((o.difficulty, o.brightness), (2, 50));
+        assert!(!default_subtitles(Language::English));
+        assert!(default_subtitles(Language::Russian));
+        assert_eq!(Language::Russian as u32, 8);
+        let h = SaveDataHeader::new(0x1234, 0x9000);
+        assert_eq!(h.kind, [0, 0, 0, 1]);
+        assert_eq!(h.packed_len, [0, 0, 0x12, 0x34]);
+        assert!(fits_in_record(0x3000 - 13));
+        assert!(!fits_in_record(0x3000 - 12));
+        assert_eq!(SAVE_DATA_CAPACITY, 0x18000);
     }
 
     /// CRC-32 MSB-first with the 360's polynomial: the standard check
