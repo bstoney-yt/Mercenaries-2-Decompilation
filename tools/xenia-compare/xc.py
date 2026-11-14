@@ -34,6 +34,7 @@ Route files are one step per line (`#` comments):
     measure <buttons|-> <secs> [<ly>]  hold, logging tracked position and speed
     walkcam <x> <z> <radius> <timeout> [<buttons|-> [<every_s> <name>]]  stick forward, steer by the camera
     airlog start <x> <z> <name> | airlog stop   log state-table movers near (x, z) in the background
+    stickresp [moving]             measure the camera's response to the right stick
     fight2 <secs> [<every_s> <name>] approach, aim (yaw and pitch) and fire at ground movers
     fight <secs> [<every_s> <name>]  aim at the nearest slow ground mover and fire in bursts
     airwatch <dropx> <dropz> <secs> [<every_s> <name>]  log movers near a drop, camera on the fastest airborne one
@@ -190,6 +191,23 @@ def stats(path: Path) -> str:
     im = Image.open(path).convert("RGB")
     st = ImageStat.Stat(im)
     return f"{im.width}x{im.height} mean={sum(st.mean) / 3:.1f} rgb={tuple(round(m) for m in st.mean)}"
+
+
+def cam_stick(err: float, fine: float = 3.0) -> float:
+    """Right-stick deflection to close a camera error (degrees), from the
+    measured on-foot response (round 12, stickresp; standing and running
+    alike): |0.25| does nothing, 0.5 ~0.6 deg/s, 0.75 ~17 deg/s (pitch
+    14-20), 1.0 ~170+ deg/s yaw (pitch 44-58): a dead zone to about 0.5 and a
+    steep curve, so it is stepped, not proportional. The sign is the error's;
+    callers flip it for yaw (+x lowers the bearing)."""
+    a = abs(err)
+    if a > 30:
+        mag = 1.0
+    elif a > fine:
+        mag = 0.75
+    else:
+        return 0.0
+    return mag if err > 0 else -mag
 
 
 def marker_x(path: Path, rgb, tol: int = 40, min_px: int = 12):
@@ -496,7 +514,7 @@ def run(args) -> int:
                             sense = -sense
                     last_yaw = yv
                     err = (want - offset - yv + 180) % 360 - 180
-                    rx = max(-1.0, min(1.0, sense * err / 40))
+                    rx = -cam_stick(err, fine=6.0)  # measured: +x lowers the bearing
                     bb = b & ~BTN["ls"]
                     # Stalled (under 1 m in 2 s: a bank or ledge at the water's
                     # edge, z ~2640 on VzaCon001's beach): jump (A) while pushing on.
@@ -647,6 +665,14 @@ def run(args) -> int:
                 secs = float(w[1])
                 every = float(w[2]) if len(w) > 2 else 3.0
                 name = w[3] if len(w) > 3 else f"fight{i:03d}"
+                # at x,y,z;x,y,z...: fixed targets (the mission layer's own
+                # placements, e.g. VzaCon001's vza_beachguard_1..4, which stand
+                # still), cycled every 10 s, instead of movers from the table.
+                fixed = []
+                if len(w) > 5 and w[4] == "at":
+                    fixed = [tuple(float(v) for v in t.split(",")) for t in w[5].split(";")]
+                fixed_i, fixed_t = 0, time.time()
+                stand_off = next((float(t[9:]) for t in w if t.startswith("standoff=")), 25.0)
                 g = xmem.Guest(p.pid)
                 cam = xmem.Camera(g)
                 seen: dict[int, tuple] = {}   # index -> (t last moved, pos)
@@ -665,11 +691,11 @@ def run(args) -> int:
                     if hp is None:
                         time.sleep(0.1)
                         continue
-                    if tgt is not None and now - seen.get(tgt, (0, None))[0] > 5.0:
+                    if not fixed and tgt is not None and now - seen.get(tgt, (0, None))[0] > 5.0:
                         downed.add(tgt)
                         say(f"fight2: target {tgt} still for 5 s: counted down ({len(downed)})")
                         tgt = None
-                    if tgt is None:
+                    if tgt is None and not fixed:
                         cands = []
                         for idx, (tm, pt) in seen.items():
                             if idx in downed or now - tm > 1.5 or idx not in ents:
@@ -680,10 +706,16 @@ def run(args) -> int:
                                 cands.append((d, idx))
                         tgt = min(cands)[1] if cands else None
                     fire, ly = 0, 0.0
-                    if tgt is not None and (tgt not in ents or math.hypot(ents[tgt][0] - hp[0], ents[tgt][2] - hp[2]) > 150):
+                    if fixed:
+                        if now - fixed_t > 10.0:
+                            fixed_i, fixed_t = (fixed_i + 1) % len(fixed), now
+                        tgt = f"guard{fixed_i + 1}"
+                        tp = fixed[fixed_i]
+                    elif tgt is not None and (tgt not in ents or math.hypot(ents[tgt][0] - hp[0], ents[tgt][2] - hp[2]) > 150):
                         tgt = None  # gone, or the slot reused for something far away
-                    if tgt is not None:
+                    if tgt is not None and not fixed:
                         tp = ents[tgt]
+                    if tgt is not None:
                         d = math.hypot(tp[0] - hp[0], tp[2] - hp[2])
                         bearing = math.degrees(math.atan2(tp[0] - hp[0], tp[2] - hp[2]))
                         yv, pv, cp = cam.yaw(), cam.pitch(), cam.pos()
@@ -691,21 +723,16 @@ def run(args) -> int:
                             # Measured (look, r6d): right stick left (-) raises the
                             # camera's yaw; fixed, not learnt (learning flip-flopped).
                             err = (bearing - yv + 180) % 360 - 180
-                            rx = max(-1.0, min(1.0, -err / 30))
+                            rx = -cam_stick(err)
                             perr = 0.0
                             if pv is not None and cp is not None:
                                 hd = max(1.0, math.hypot(tp[0] - cp[0], tp[2] - cp[2]))
                                 want_p = math.degrees(math.atan2(tp[1] + 1.2 - cp[1], hd))
-                                if last_pitch is not None and abs(ry) > 0.3:
-                                    mv = pv - last_pitch
-                                    if abs(mv) > 0.5 and (mv > 0) != (sy * ry > 0):
-                                        sy = -sy
-                                last_pitch = pv
                                 perr = want_p - pv
-                                ry = max(-1.0, min(1.0, sy * perr / 20))
-                            if d > 25.0:
+                                ry = cam_stick(perr)  # measured: +y raises the pitch
+                            if d > stand_off:
                                 ly = 1.0
-                            elif abs(err) < 8 and abs(perr) < 6 and int(now * 2.5) % 2 == 0:
+                            elif abs(err) < 4 and abs(perr) < 4 and int(now * 2.5) % 2 == 0:
                                 fire = 255
                             if now - last_say > 1.0:
                                 last_say = now
@@ -725,7 +752,35 @@ def run(args) -> int:
                             if "completed" in low and "kill" in low:
                                 say("fight2: Kill enemies completed")
                                 break
+                            if "medevac" in low or "stock up" in low or "loading" in low:
+                                say("fight2: a loading tip: she is down, stopping")
+                                break
                     time.sleep(0.05)
+                apply()
+            elif op == "stickresp":
+                # stickresp [moving]: hold the right stick at x then y = +-0.25,
+                # 0.5, 0.75, 1.0 for 1.5 s each (1 s rest between), sampling the
+                # camera's yaw, pitch and position (xmem.Camera) every 0.1 s;
+                # logs each hold's mean rate (deg/s) over its last second.
+                # "moving": the left stick held forward throughout.
+                import xmem
+
+                cam = xmem.Camera(xmem.Guest(p.pid))
+                ly = 1.0 if len(w) > 1 and w[1] == "moving" else 0.0
+                for axis in ("x", "y"):
+                    for v in (0.25, 0.5, 0.75, 1.0, -0.25, -0.5, -0.75, -1.0):
+                        apply(0, 0, 0, 0.0, ly, v if axis == "x" else 0.0, v if axis == "y" else 0.0)
+                        t_s, samples = time.time(), []
+                        while time.time() - t_s < 1.5:
+                            samples.append((time.time(), cam.yaw(), cam.pitch()))
+                            time.sleep(0.1)
+                        apply(0, 0, 0, 0.0, ly, 0.0, 0.0)
+                        late = [x for x in samples if x[0] - t_s >= 0.5 and x[1] is not None]
+                        if len(late) >= 2:
+                            (ta, ya, pa), (tb, yb, pb) = late[0], late[-1]
+                            dy = (yb - ya + 180) % 360 - 180
+                            say(f"stickresp {'moving' if ly else 'standing'} r{axis}={v:+.2f}: yaw {dy / (tb - ta):+7.1f} deg/s, pitch {(pb - pa) / (tb - ta):+6.1f} deg/s (pitch now {pb:+.1f})")
+                        time.sleep(1.0)
                 apply()
             elif op == "airwatch":
                 # airwatch <dropx> <dropz> <secs> [<every_s> <name>]: every 0.25 s
