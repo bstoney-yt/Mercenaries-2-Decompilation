@@ -341,6 +341,40 @@ impl<T: Copy> Homing<T> {
     }
 }
 
+/// A wire-guided weapon's guidance (`HomingWeapon` kind 3, the TOW:
+/// 0x82294C98, called each frame by 0x82293BE8 for a kind-3 weapon in
+/// place of the lock). Its missiles fly at [`Wire::point`]: where its
+/// holder's aim line meets something (record +0x28), answered a frame
+/// late (+0x38). 0x82293660 launches a kind-3 missile with no target and
+/// flag 0x40, and 0x82293280 then steers it at its weapon's point.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Wire {
+    /// Where its missiles fly to; none before its first answer.
+    pub point: Option<Vec3>,
+    /// The line asked last frame: where it met something, or its end.
+    asked: Option<Vec3>,
+}
+
+impl Wire {
+    /// One frame: last frame's answer becomes the point, and a new line
+    /// is asked along unit `dir` from 1 m past `origin` (0x82294C98 adds
+    /// the direction to the aim's origin), `range` long (the record's
+    /// +0xc). `cast` gives the distance to the first thing along it.
+    pub fn aim(
+        &mut self,
+        origin: Vec3,
+        dir: Vec3,
+        range: f32,
+        cast: impl FnOnce(Vec3, Vec3, f32) -> Option<f32>,
+    ) {
+        if let Some(p) = self.asked.take() {
+            self.point = Some(p);
+        }
+        let start = origin + dir;
+        self.asked = Some(start + dir * cast(start, dir, range).unwrap_or(range));
+    }
+}
+
 /// The warning sounds one player hears of the locks on her (the
 /// `AntiAir` script's `_UpdateHomingState` and `_SetSound`).
 #[derive(Debug, Default)]
@@ -792,6 +826,24 @@ mod tests {
             at.steer(Vec3::ZERO, v, Vec3::new(0.0, 0.0, -10.0), DT),
             None
         );
+    }
+
+    // A TOW's point follows its holder's aim a frame late: nothing
+    // before the first answer, then where the line met something, else
+    // the line's end (300 m, from 1 m past the aim's origin).
+    #[test]
+    fn a_wire_follows_the_aim_a_frame_late() {
+        let mut w = Wire::default();
+        let o = Vec3::new(0.0, 2.0, 0.0);
+        w.aim(o, Vec3::Z, 300.0, |start, _, _| {
+            assert_eq!(start, Vec3::new(0.0, 2.0, 1.0));
+            Some(49.0)
+        });
+        assert_eq!(w.point, None);
+        w.aim(o, Vec3::X, 300.0, |_, _, _| None);
+        assert_eq!(w.point, Some(Vec3::new(0.0, 2.0, 50.0)));
+        w.aim(o, Vec3::X, 300.0, |_, _, _| None);
+        assert_eq!(w.point, Some(Vec3::new(301.0, 2.0, 0.0)));
     }
 
     // The warnings: a lock coming on starts the targeting cue and the
