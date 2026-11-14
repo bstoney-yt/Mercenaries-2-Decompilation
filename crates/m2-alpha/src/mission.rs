@@ -4841,6 +4841,7 @@ impl MissionLink {
                         Some((t, place(t)?, inside))
                     })
                     .collect();
+                let of_her = w.player.is_some_and(|her| targets.contains(&her));
                 Some(crate::autoplay::Delivery {
                     dest: dest?,
                     at,
@@ -4848,6 +4849,7 @@ impl MissionLink {
                     xz,
                     quota,
                     targets: placed,
+                    of_her,
                 })
             })
             .collect()
