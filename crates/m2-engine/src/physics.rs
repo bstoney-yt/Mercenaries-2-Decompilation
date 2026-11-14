@@ -1099,7 +1099,20 @@ impl CollisionShape {
     /// given and parses, else its rigid visible geometry at `lod` (a stand
     /// in).
     pub fn for_model(model: &Model<'_>, phy2: Option<&[u8]>, lod: u32) -> Option<Self> {
-        Self::for_model_part(model, phy2, lod, None)
+        Self::for_model_part(model, phy2, lod, None, None)
+    }
+
+    /// [`for_model`](Self::for_model) with its nodes where `nodes` (model
+    /// space, one a node) puts them, not at rest: a gate's shapes with
+    /// its leaves swung open ([`crate::gate::Gate::nodes`]), as the 360's
+    /// leaves are bodies of their own on their hinges.
+    pub fn for_model_posed(
+        model: &Model<'_>,
+        phy2: Option<&[u8]>,
+        lod: u32,
+        nodes: &[Mat4],
+    ) -> Option<Self> {
+        Self::for_model_part(model, phy2, lod, None, Some(nodes))
     }
 
     /// The `PHY2` shapes [`for_model`](Self::for_model) stands in the
@@ -1141,7 +1154,7 @@ impl CollisionShape {
     /// vertices carry in their position's `w`: its visible geometry at
     /// `lod`, in model space.
     pub fn for_sub_object(model: &Model<'_>, index: u32, lod: u32) -> Option<Self> {
-        Self::for_model_part(model, None, lod, Some(index))
+        Self::for_model_part(model, None, lod, Some(index), None)
     }
 
     fn for_model_part(
@@ -1149,6 +1162,7 @@ impl CollisionShape {
         phy2: Option<&[u8]>,
         lod: u32,
         sub_object: Option<u32>,
+        posed: Option<&[Mat4]>,
     ) -> Option<Self> {
         let mut vertices = Vec::new();
         let mut triangles = Vec::new();
@@ -1200,7 +1214,10 @@ impl CollisionShape {
                 let node = p
                     .shape_node(k)
                     .and_then(|n| u16::try_from(n).ok())
-                    .and_then(|n| model.node_to_model(n))
+                    .and_then(|n| match posed {
+                        Some(nodes) => nodes.get(usize::from(n)).copied(),
+                        None => model.node_to_model(n),
+                    })
                     .unwrap_or(Mat4::IDENTITY);
                 let to_model = node * p.shape_place(k).map_or(Mat4::IDENTITY, place);
                 let (v, t) = s.geometry.triangles(s.radius);
@@ -10405,6 +10422,7 @@ mod tests {
             version: 0x39,
             model: 0,
             unk_0x14: [0; 3],
+            constraints: Vec::new(),
             // A trunk and its leaves on node 1, a piece it breaks into on
             // node 2 (hidden intact).
             parts: vec![

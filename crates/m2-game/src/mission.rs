@@ -12,7 +12,7 @@
 //! and a readable account of the session in [`Mission::take_log`].
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
@@ -33,6 +33,9 @@ use crate::layers::{LayerOp, LayerState, finished, layer_name};
 use crate::library::{KNOWN_MODULES, LOADERS, Library};
 use crate::object_hooks::{ON_DEATH, ON_STATE_CHANGE, death_args, state_change_args};
 use crate::script::{ScriptError, ScriptHost};
+
+mod homing;
+pub use homing::{ANTI_AIR, HOMING_MISSILE, HomingKind, HomingPost};
 
 /// The script that starts the game (`Init`, then `LoadGame`).
 pub const BOOTSTRAP: u32 = 0xb442_0059;
@@ -815,14 +818,12 @@ impl Mission {
 
         let host = ScriptHost::new()?;
         host.stub_missing_globals()?;
-        host.script_names(library.scripts().iter().flat_map(|s| {
-            s.chunk
-                .main
-                .names(s.chunk.version)
-                .into_iter()
-                .filter(|(u, _)| *u == m2_assets::lua::NameUse::SetGlobal)
-                .map(|(_, n)| n)
-        }))?;
+        host.script_names(script_defined(
+            library
+                .scripts()
+                .iter()
+                .flat_map(|s| s.chunk.main.names(s.chunk.version)),
+        ))?;
         api::install(host.lua(), &world)?;
         host.complete_libraries(&api::LIBRARIES)?;
         let events = Events::default();
@@ -990,6 +991,66 @@ impl Mission {
             .exec();
         self.settle(name);
         Ok(result?)
+    }
+
+    /// Keeps the scripts' save data now as the retry save
+    /// ([`api::ScriptWorld::retry_save`]), as `Pg.SaveGame("retry")` does
+    /// at a contract's start: the fail fanfare's Retry loads it
+    /// ([`answer_retry_load`](Self::answer_retry_load)). Its size.
+    pub fn keep_retry(&mut self) -> Result<usize, MissionError> {
+        let text = self.save_data()?;
+        let n = text.len();
+        self.world.borrow_mut().retry_save = Some(text);
+        Ok(n)
+    }
+
+    /// Whether a retry save is kept ([`keep_retry`](Self::keep_retry)).
+    pub fn has_retry(&self) -> bool {
+        self.world.borrow().retry_save.is_some()
+    }
+
+    /// Loads the retry save in place if the scripts asked
+    /// (`Pg.LoadGame("retry")`): as the 360's 0x8230C880 does, its data is
+    /// compiled as `"return " .. data` and handed to the bootstrap's
+    /// `LoadSingleton` in the running scripts, `Pg.LoadIsRetry` answering
+    /// true. Not done here (unknown in the 360's 0x8230C740, which runs
+    /// first): the engine's own resets before the load. Whether it ran.
+    fn answer_retry_load(&mut self) -> bool {
+        let text = {
+            let mut w = self.world.borrow_mut();
+            if !std::mem::take(&mut w.retry_load) {
+                return false;
+            }
+            w.retry_save.clone()
+        };
+        let Some(text) = text else {
+            return false;
+        };
+        let lua = self.host.lua();
+        let loaded = lua
+            .globals()
+            .set("__m2_saved", text.as_str())
+            .and_then(|()| {
+                lua.load(format!(
+                    "Scripts[\"{BOOTSTRAP:08x}\"].LoadSingleton({LOAD_SAVED})"
+                ))
+                .set_name("=retry load")
+                .exec()
+            });
+        let _ = lua.globals().set("__m2_saved", Value::Nil);
+        match loaded {
+            Ok(()) => self.log.push(format!(
+                "t={:.1} save: the retry save loaded in place, {} bytes",
+                self.now,
+                text.len()
+            )),
+            Err(e) => self.log.push(format!(
+                "t={:.1} save: retry load: {}",
+                self.now,
+                first_lines(&e.to_string())
+            )),
+        }
+        true
     }
 
     /// Has [`start`](Self::start) load a save: `text` is the scripts' save
@@ -2807,6 +2868,20 @@ end
                 commands.extend(self.report(&format!("{when}, {ran} modules loaded")));
             }
             let mut delivered = 0;
+            // The retry save the scripts take as a contract starts is kept
+            // now, as the 360's `Pg.SaveGame("retry")` keeps it before it
+            // returns ([`keep_retry`](Self::keep_retry)).
+            if commands
+                .iter()
+                .any(|c| matches!(c, Command::Save { slot } if slot == api::RETRY))
+            {
+                match self.keep_retry() {
+                    Ok(n) => self
+                        .log
+                        .push(format!("  save: the retry save kept, {n} bytes")),
+                    Err(e) => self.log.push(format!("  save: retry: {e}")),
+                }
+            }
             for c in &commands {
                 if let Command::Goal {
                     guid,
@@ -2834,6 +2909,10 @@ end
                 })
                 .collect();
             if requests.is_empty() {
+                if self.answer_retry_load() {
+                    commands = self.report(&format!("{when}, retry loaded"));
+                    continue;
+                }
                 if delivered > 0 {
                     commands = self.report(&format!("{when}, deliveries done"));
                     continue;
@@ -3085,7 +3164,7 @@ fn seat_crew(
 /// `repairpad` is the script of the helipads and the PMC's garage
 /// (0xcd561a19): awake, its lights are on (`Vehicle.SetParts` of
 /// `LightFront`), and they go out when it dies.
-pub const OBJECT_SCRIPTS: [(&str, u32); 14] = [
+pub const OBJECT_SCRIPTS: [(&str, u32); 16] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3100,6 +3179,8 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 14] = [
     ("pmcgate", PMC_GATE),
     ("repairpad", REPAIR_PAD),
     ("pursuitcopter", PURSUIT_COPTER),
+    ("AntiAir", homing::ANTI_AIR),
+    ("HomingMissile", homing::HOMING_MISSILE),
 ];
 
 /// `pursuitcopter`'s module hash.
@@ -3233,6 +3314,36 @@ fn object_script(
     )
 }
 
+/// The names the scripts define themselves, which read nil rather than a
+/// stub while unset ([`ScriptHost::script_names`]): those they assign as
+/// globals, and the keys they assign in tables that no script reads as a
+/// global. An object's field the scripts set only on some objects
+/// (`HomingMissile`'s `self.TimerEvent`) falls back through its class to
+/// the globals when unset; there it must read nil, as on the 360, or the
+/// script takes it as set.
+fn script_defined(
+    names: impl IntoIterator<Item = (m2_assets::lua::NameUse, String)>,
+) -> BTreeSet<String> {
+    use m2_assets::lua::NameUse;
+    let (mut globals, mut fields, mut read) = (BTreeSet::new(), BTreeSet::new(), HashSet::new());
+    for (u, n) in names {
+        match u {
+            NameUse::SetGlobal => {
+                globals.insert(n);
+            }
+            NameUse::SetField => {
+                fields.insert(n);
+            }
+            NameUse::GetGlobal => {
+                read.insert(n);
+            }
+            _ => {}
+        }
+    }
+    globals.extend(fields.into_iter().filter(|n| !read.contains(n)));
+    globals
+}
+
 /// The first lines of a (Lua) error, on one line.
 pub fn first_lines(s: &str) -> String {
     s.lines().take(4).collect::<Vec<_>>().join(" | ")
@@ -3249,6 +3360,24 @@ pub(crate) fn is_exclusion(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A key set only in tables reads nil as a global unless some script
+    // reads it as one (then it may be a library not written yet).
+    #[test]
+    fn fields_set_in_tables_are_script_names() {
+        use m2_assets::lua::NameUse::*;
+        let names = script_defined([
+            (SetGlobal, "Init".to_owned()),
+            (SetField, "TimerEvent".to_owned()),
+            (SetField, "Marker".to_owned()),
+            (GetGlobal, "Marker".to_owned()),
+            (Field, "AddObjective".to_owned()),
+        ]);
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            ["Init", "TimerEvent"]
+        );
+    }
 
     #[test]
     fn the_object_scripts_are_named_by_their_hash() {

@@ -1284,6 +1284,24 @@ pub struct GameFx {
     pub template: FxTemplate,
     pub at: Vec3,
     pub hold: Option<u64>,
+    /// The frame it is set off in (the effect's +Z along `forward`, its
+    /// +Y up): a launcher's flash and back-blast along the barrel, a
+    /// rocket's smoke out of its tail. None: the world's frame.
+    pub turn: Option<Quat>,
+}
+
+/// The frame an effect set off along `forward` is turned to: its +Z along
+/// `forward`, its +Y as near the world's up as that allows, as the
+/// launcher's muzzle node and the rocket model lie (both with +Y up and
+/// +Z out of the barrel or nose, from samples: the RPG's muzzle node
+/// 0xB1486EF3 is unturned, 0.25 m along +Z).
+pub fn fx_turn(forward: Vec3) -> Option<Quat> {
+    let f = forward.try_normalize()?;
+    let right = Vec3::Y.cross(f).try_normalize().unwrap_or(Vec3::X);
+    let up = f.cross(right);
+    Some(Quat::from_mat3(&m2_math::glam::Mat3::from_cols(
+        right, up, f,
+    )))
 }
 
 /// A template, by id, by name, or by its name's hash (a state machine's
@@ -1495,6 +1513,9 @@ enum Projectile {
         key: Option<u32>,
         /// A soldier's: what it does isn't to her account.
         army: bool,
+        /// A homing missile fired on a lock on her vehicle: its number
+        /// for the scripts ([`crate::homing::ScriptSide`]).
+        round: Option<u32>,
     },
     Grenade {
         at: Vec3,
@@ -1823,6 +1844,8 @@ pub struct Combat {
     /// The locks on her vehicle as she hears them, the vehicle they are
     /// for, and lockers numbered so far ([`crate::homing`]).
     warnings: crate::homing::Warnings,
+    /// What the scripts hear of those locks ([`crate::homing::ScriptSide`]).
+    pub scripts: crate::homing::ScriptSide,
     warned: Option<VehicleId>,
     lockers: u32,
     /// What homing weapons see of each template (`HomingTarget`).
@@ -2100,6 +2123,7 @@ impl Default for Combat {
             crew_firing: false,
             crew_homing: None,
             warnings: Default::default(),
+            scripts: Default::default(),
             warned: None,
             lockers: 0,
             homing_targets: Vec::new(),
@@ -2781,6 +2805,7 @@ impl Combat {
                 template: FxTemplate::Id(shell),
                 at,
                 hold: None,
+                turn: None,
             });
         }
         match feel.and_then(|f| f.flash) {
@@ -2790,6 +2815,7 @@ impl Combat {
                     template: FxTemplate::Id(flash),
                     at: from,
                     hold: None,
+                    turn: None,
                 });
             }
             None => {
@@ -2892,6 +2918,7 @@ impl Combat {
             template: FxTemplate::Name(name.to_owned()),
             at,
             hold: None,
+            turn: None,
         });
     }
 
@@ -2902,6 +2929,7 @@ impl Combat {
             template: FxTemplate::Name(name.to_owned()),
             at,
             hold: Some(key),
+            turn: None,
         });
     }
 
@@ -2914,6 +2942,7 @@ impl Combat {
                 template: FxTemplate::Hash(effect),
                 at,
                 hold: None,
+                turn: None,
             });
         }
     }
@@ -3391,6 +3420,7 @@ impl Combat {
                     homing: None,
                     key: ammo.key,
                     army: false,
+                    round: None,
                 });
                 self.effect(
                     Effect::Flash {
@@ -3579,6 +3609,24 @@ impl Combat {
         self.warnings.tick(dt);
     }
 
+    /// The homing missiles fired on her vehicle still flying: their
+    /// rounds ([`crate::homing::ScriptSide`]), where they are and their
+    /// heading (yaw, radians).
+    pub fn rounds_flying(&self) -> Vec<(u32, Vec3, f32)> {
+        self.projectiles
+            .iter()
+            .filter_map(|p| match p {
+                Projectile::Rocket {
+                    at,
+                    velocity,
+                    round: Some(r),
+                    ..
+                } => Some((*r, *at, velocity.x.atan2(velocity.z))),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The warning cues to play (`false`) or stop (`true`) since last
     /// asked ([`crate::homing::Warnings`]).
     pub fn take_warning_cues(&mut self) -> Vec<(&'static str, bool)> {
@@ -3619,8 +3667,10 @@ impl Combat {
         let event = n.seeking.tick(dt, &s, from, mark, |o, d, r| {
             physics.cast_ray_vehicle(o, d, r, None).and_then(|h| h.1)
         });
+        let locker = crate::homing::Locker::soldier(n.spawn, n.seeking.owner);
         if let Some(e) = event {
             self.warnings.hear(n.seeking.owner, e);
+            self.scripts.post(e, locker);
         }
         if mark.is_none() || !up {
             return Seek::Unguided;
@@ -3636,6 +3686,7 @@ impl Combat {
         for (e, t) in events {
             if mark.map(|m| m.id) == Some(t) {
                 self.warnings.hear(n.seeking.owner, e);
+                self.scripts.post(e, locker);
             }
         }
         eprintln!(
@@ -3677,6 +3728,11 @@ impl Combat {
             "rocket: a soldier fires his {:#x} at {distance:.0} m",
             l.template
         );
+        let round = if homing.is_some() {
+            self.scripts.fired(l.ammo.template, from)
+        } else {
+            None
+        };
         self.projectiles.push(Projectile::Rocket {
             at: from,
             velocity: dir * speed,
@@ -3687,6 +3743,7 @@ impl Combat {
             homing,
             key: l.ammo.key,
             army: true,
+            round,
         });
         self.effect(
             Effect::Flash {
@@ -4092,6 +4149,7 @@ impl Combat {
             homing,
             key: self.launcher.ammo.and_then(|a| a.key),
             army: false,
+            round: None,
         });
         self.effect(
             Effect::Flash {
@@ -4110,7 +4168,14 @@ impl Combat {
             },
             1.2,
         );
-        self.show_fx(fx::BACK_BLAST, from);
+        // The launcher's flash and back-blast in the barrel's frame: its
+        // emitter gives off along +Z, out of the muzzle.
+        self.game_fx.push(GameFx {
+            template: FxTemplate::Name(fx::BACK_BLAST.to_owned()),
+            at: from,
+            hold: None,
+            turn: fx_turn(velocity),
+        });
         self.sounds.push(Sound::Launch {
             at: from,
             set: self.launcher.feel.sound_set,
@@ -4355,6 +4420,12 @@ impl Combat {
                 });
             }
             _ => {
+                let homing = self.crew_homing.take();
+                let round = if homing.is_some() {
+                    self.scripts.fired(ammo.template, from)
+                } else {
+                    None
+                };
                 self.projectiles.push(Projectile::Rocket {
                     at: from,
                     velocity: aim * ammo.velocity.max(1.0),
@@ -4362,9 +4433,10 @@ impl Combat {
                     shell: false,
                     owner: Some(id),
                     blast: ammo.burst(),
-                    homing: self.crew_homing.take(),
+                    homing,
                     key: ammo.key,
                     army: self.crew_firing,
+                    round,
                 });
                 self.effect(
                     Effect::Flash {
@@ -4649,6 +4721,8 @@ impl Combat {
                 // A homing gun names her vehicle while it goes for her, and
                 // its lock runs (360 0x822AE598, 0x82294B70).
                 let on_her = gun.slot.who == Some(crate::npc::HER) && mark.is_some();
+                // The vehicle as the scripts know it, if theirs.
+                let theirs = f.vehicles[i].guid.or(f.vehicles[i].spot.map(|s| s.0));
                 if let Some(s) = seeker {
                     if gun.seeking.owner == 0 {
                         self.lockers += 1;
@@ -4663,6 +4737,8 @@ impl Combat {
                     });
                     if let Some(e) = event {
                         self.warnings.hear(gun.seeking.owner, e);
+                        self.scripts
+                            .post(e, crate::homing::Locker::crew(theirs, gun.seeking.owner));
                     }
                 }
                 let Some(at) = gun.at else { continue };
@@ -4693,6 +4769,7 @@ impl Combat {
                 // ... and it holds its fire until locked, each missile
                 // locked afresh (0x822AE598, 0x82293660).
                 self.crew_homing = None;
+                self.scripts.disarm();
                 if seeker.is_some() && on_her {
                     let gun = self.crews.entry((i, seat)).or_default();
                     if gun.seeking.lock.locked().is_none() {
@@ -4702,6 +4779,8 @@ impl Combat {
                     for (e, t) in events {
                         if mark.map(|m| m.id) == Some(t) {
                             self.warnings.hear(gun.seeking.owner, e);
+                            let locker = crate::homing::Locker::crew(theirs, gun.seeking.owner);
+                            self.scripts.post(e, locker);
                         }
                     }
                     self.crew_homing = target
@@ -4914,6 +4993,7 @@ impl Combat {
                 homing: None,
                 key,
                 army: self.crew_firing,
+                round: None,
             });
             if let Some(v) = f.vehicles.get_mut(i) {
                 v.fired += 1;
@@ -5666,6 +5746,7 @@ impl Combat {
                 homing,
                 key,
                 army,
+                round: _,
             } => {
                 // Turning after the vehicle it locked on, no faster than its
                 // turn rate; one gone, or too far off its nose, is lost and
@@ -5697,7 +5778,7 @@ impl Combat {
                 if *shell {
                     streaks.push((*at, *at + step));
                 } else {
-                    puffs.push(*at);
+                    puffs.push((*at, *velocity));
                 }
                 *at += step;
                 *flown += len;
@@ -5798,11 +5879,17 @@ impl Combat {
                 true
             }
         });
-        for (k, at) in puffs.into_iter().enumerate() {
+        for (k, (at, velocity)) in puffs.into_iter().enumerate() {
             self.effect(Effect::Smoke { at, size: 0.4 }, 0.8);
             // Rockets have no id: the k-th in flight (one at a time, as a
-            // rule).
-            self.hold_fx(fx::ROCKET, at, (2 << 32) | k as u64);
+            // rule). Its smoke in the rocket's frame: the trail's emitter
+            // points along -Z, out of the tail.
+            self.game_fx.push(GameFx {
+                template: FxTemplate::Name(fx::ROCKET.to_owned()),
+                at,
+                hold: Some((2 << 32) | k as u64),
+                turn: fx_turn(velocity),
+            });
         }
         for (from, to) in streaks {
             self.effect(Effect::Tracer { from, to }, dt * 1.5);
@@ -6130,6 +6217,7 @@ impl Combat {
             template: FxTemplate::Id(b.template),
             at,
             hold: None,
+            turn: None,
         });
         let hers = if b.key == Some(m2_assets::name_hash("ExplosionLarge")) {
             self.hero_damage.explosion_large
@@ -6483,6 +6571,7 @@ impl Combat {
                 template: FxTemplate::Hash(effect),
                 at,
                 hold: Some(key),
+                turn: None,
             });
         }
         if self.part_fx_next <= 0.0 {
@@ -6723,6 +6812,23 @@ fn lock_share(held: f32, time: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    /// An effect set off along a way is turned so its +Z lies along it
+    /// and its +Y stays up: the launcher's flash (+Z) goes out of the
+    /// barrel, the rocket's smoke (-Z) out of its tail, not up.
+    #[test]
+    fn effects_set_off_along_a_way_turn_their_z_to_it() {
+        let ahead = Vec3::new(1.0, 0.2, -1.0).normalize();
+        let t = fx_turn(ahead * 25.0).expect("a way");
+        assert!((t * Vec3::Z).distance(ahead) < 1e-5);
+        assert!((t * Vec3::NEG_Z).distance(-ahead) < 1e-5);
+        assert!((t * Vec3::Y).y > 0.9);
+        assert!((t * Vec3::X).y.abs() < 1e-5);
+        // Straight up: still a frame; no way, none.
+        let up = fx_turn(Vec3::Y).expect("up");
+        assert!((up * Vec3::Z).distance(Vec3::Y) < 1e-5);
+        assert!(fx_turn(Vec3::ZERO).is_none());
+    }
+
     /// The Stinger's 2 s lock: half way after a second, whole at 2 and
     /// after; a weapon with no time to wait is locked at once.
     #[test]

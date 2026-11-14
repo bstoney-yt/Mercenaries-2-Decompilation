@@ -258,6 +258,8 @@ pub struct Game {
     pub ride: Option<(usize, u32)>,
     /// Her getting in or out by the clips, under way ([`crate::boarding`]).
     pub boarding: Option<crate::boarding::Boarding>,
+    /// A helicopter's bail-out prompt ([`crate::action_prompt::ExitConfirm`]).
+    pub exit_confirm: crate::action_prompt::ExitConfirm,
     /// Got in by a boarding entrance (`EntranceParameters` `bBoarding`, a
     /// boat's from the water): the vehicle, and the seat it gave her,
     /// which she is put out of onto the deck once in
@@ -541,6 +543,7 @@ impl Game {
             climb: None,
             ride: None,
             boarding: None,
+            exit_confirm: Default::default(),
             onto_deck: None,
             support_hp: 0.0,
             lens: (60.0, 16.0 / 9.0),
@@ -1231,6 +1234,13 @@ impl Game {
                         None => player.ladder = Some(c.pose()),
                     }
                 }
+                // The bail-out prompt's clock (0x8242E7A0), and gone
+                // once she is out (0x8242E730).
+                if player.driving.is_none() {
+                    self.exit_confirm.clear();
+                } else if self.exit_confirm.tick(dt) {
+                    eprintln!("exit prompt: taken back");
+                }
                 if intent.use_pressed && !climbing {
                     // The emplaced gun she would man, if nothing nearer
                     // takes the key.
@@ -1319,8 +1329,46 @@ impl Game {
                         && (gun.is_none() || picked.is_some_and(|(i, _)| i == EMPLACED));
                     let manning = manning.filter(|_| man_it);
                     let picked = picked.filter(|&(i, _)| i != EMPLACED);
+                    // Of a gun lying there (or else an emplaced gun) and a
+                    // vehicle's entrance, the one she faces
+                    // ([`crate::action_prompt::faced`], 0x82432CF0).
+                    let near = scene
+                        .flights
+                        .within(player.character.position)
+                        .map(|l| l.at)
+                        .or(manning.as_ref().map(|m| m.pivot));
+                    let car = picked
+                        .filter(|&(i, _)| i < LADDER)
+                        .and_then(|(i, e)| entrance_place(physics, &scene.vehicles[i], e));
+                    let to_car = match (near, car) {
+                        (Some(n), Some(c)) => {
+                            crate::action_prompt::faced(
+                                player.eye(),
+                                player.camera_forward(),
+                                her,
+                                &[n, c],
+                            ) == Some(1)
+                        }
+                        _ => false,
+                    };
+                    if to_car {
+                        eprintln!("use: she faces the vehicle, not what lies by her");
+                    }
+                    let manning = manning.filter(|_| !to_car);
                     match player.driving {
                         // Out over deep water she swims (`Player::update_swim`).
+                        // A helicopter up high asks first (0x8242FA70).
+                        Some(i)
+                            if !self.exit_confirm.press(
+                                scene.vehicles[i].spec.is_helicopter(),
+                                height_above(physics, &scene.vehicles[i]),
+                            ) =>
+                        {
+                            eprintln!(
+                                "exit prompt: the {} is up high: press again to bail out",
+                                scene.vehicles[i].spec.label
+                            );
+                        }
                         Some(i) => {
                             let seat = self.ride.filter(|r| r.0 == i).map(|r| r.1);
                             match animated_exit(physics, &scene.vehicles[i], seat) {
@@ -1350,7 +1398,9 @@ impl Game {
                             }
                         }
                         // What lies within reach before any vehicle.
-                        None if scene.flights.within(player.character.position).is_some() => {
+                        None if !to_car
+                            && scene.flights.within(player.character.position).is_some() =>
+                        {
                             taking = true;
                         }
                         // An emplaced gun.
@@ -2397,6 +2447,7 @@ impl Game {
                         template: combat::FxTemplate::Hash(effect),
                         at: p.at,
                         hold: None,
+                        turn: None,
                     });
                 }
                 // Heard as its own sound set says it is taken (the ammo
@@ -3121,6 +3172,7 @@ impl Game {
                     vehicle_name(db, strings, &spec.label, spec.model),
                     action.kind(),
                     action.text(key),
+                    entrance_place(&w.physics, v, entrance),
                 )
             }),
             _ => None,
@@ -3146,9 +3198,14 @@ impl Game {
                         Offer::Walk => None,
                         Offer::TakeAmmo => {
                             let refill = crate::mission::refill(db, &self.combat, &lying.what);
-                            self.combat
-                                .can_use(refill, lying.what.health)
-                                .then(|| (word(TAKE_AMMO, "Take Ammo"), Prompt::TakeAmmo, None))
+                            self.combat.can_use(refill, lying.what.health).then(|| {
+                                (
+                                    word(TAKE_AMMO, "Take Ammo"),
+                                    Prompt::TakeAmmo,
+                                    None,
+                                    lying.at,
+                                )
+                            })
                         }
                         Offer::Equip => Some((
                             word(EQUIP, "Equip %s").replace(
@@ -3157,6 +3214,7 @@ impl Game {
                             ),
                             Prompt::PickupWeapon,
                             shown_key(db, lying.what.template, lying.what.gun),
+                            lying.at,
                         )),
                     },
                     None if self.combat.manned.is_none() => self
@@ -3168,12 +3226,27 @@ impl Game {
                                     .replace("%s", &shown_name(db, strings, m.template, None)),
                                 Prompt::Use,
                                 shown_key(db, m.template, None),
+                                m.pivot,
                             )
                         }),
                     None => None,
                 }
             }
             _ => None,
+        };
+        // What lies by her or the vehicle in reach: the one she faces, as
+        // the use key takes it ([`crate::action_prompt::faced`]).
+        let prompt = match (prompt, &can_enter, player) {
+            (Some(p), Some((.., Some(car))), Some(her)) => {
+                let to_car = crate::action_prompt::faced(
+                    her.eye(),
+                    her.camera_forward(),
+                    her.character.position,
+                    &[p.3, *car],
+                ) == Some(1);
+                (!to_car).then_some(p)
+            }
+            (p, ..) => p,
         };
         HudInfo {
             playing: self.on_foot && player.is_some(),
@@ -3219,8 +3292,14 @@ impl Game {
             // key takes, else the vehicle to get into (the alpha's order;
             // the 360 picks the one she faces).
             action: prompt
-                .map(|(_, a, key)| (a.kind(), a.text(key)))
+                .map(|(_, a, key, _)| (a.kind(), a.text(key)))
                 .or_else(|| can_enter.as_ref().map(|c| (c.1, c.2.clone())))
+                // In a helicopter up high, its bail-out prompt (plain).
+                .or_else(|| {
+                    use crate::action_prompt::Action as Prompt;
+                    (self.exit_confirm.shown() && player.is_some_and(|p| p.driving.is_some()))
+                        .then(|| (Prompt::Exit.kind(), Prompt::Exit.text(None)))
+                })
                 .filter(|_| self.on_foot && self.context.is_none())
                 .filter(|_| !self.input_locked && !self.cinematic && !self.support.busy()),
             context_action: self
@@ -4085,6 +4164,7 @@ fn hit_world(
                 template: combat::FxTemplate::Hash(effect),
                 at,
                 hold: None,
+                turn: None,
             });
         }
     }
@@ -4775,6 +4855,7 @@ fn state_effects(world: &World, combat: &mut Combat) {
                 template: combat::FxTemplate::Hash(fx.effect),
                 at: fx.at.map_or(o.position, |at| placed.transform_point3(at)),
                 hold: None,
+                turn: None,
             });
         }
     }
@@ -4813,6 +4894,7 @@ fn exhaust_smoke(
                 template: combat::FxTemplate::Hash(effect),
                 at: (at * *rest).w_axis.truncate(),
                 hold: Some(0xe000_0000_0000_0000 | (i as u64) << 8 | k as u64),
+                turn: None,
             });
         }
     }
@@ -5513,6 +5595,33 @@ fn door_out(at: Mat4, spec: &VehicleSpec) -> Vec3 {
 /// over water
 /// deeper than she can stand in ([`WADE`]); the autoplay waits for it
 /// (the player may get out anywhere, and swims).
+/// How far down from `v` the first thing under it lies, metres; `None`
+/// past [`HEIGHT_REACH`] or with `v` not in the world. Stands in for the
+/// two heights the 360's helicopter physics keeps (`+0x158`, `+0x160`),
+/// which were not traced (inferred).
+fn height_above(physics: &Physics, v: &ParkedVehicle) -> Option<f32> {
+    let id = v.id?;
+    let at = physics.vehicle_transform(id)?.w_axis.truncate();
+    physics
+        .cast_ray_past(at, Vec3::NEG_Y, HEIGHT_REACH, id)
+        .map(|(d, _)| d)
+}
+
+/// How far down [`height_above`] looks, metres (Invented: well past the
+/// 5 m the bail-out prompt asks at).
+const HEIGHT_REACH: f32 = 50.0;
+
+/// Where vehicle `v`'s entrance `entrance` is, world space (its middle
+/// without one); `None` with `v` not in the world.
+fn entrance_place(physics: &Physics, v: &ParkedVehicle, entrance: Option<u32>) -> Option<Vec3> {
+    let at = physics.vehicle_transform(v.id?)?;
+    Some(
+        entrance
+            .and_then(|e| v.spec.entrance_at(e))
+            .map_or(at.w_axis.truncate(), |l| at.transform_point3(l)),
+    )
+}
+
 pub(crate) fn can_get_out(physics: &Physics, v: &ParkedVehicle) -> bool {
     let (Some(water), Some(id)) = (physics.water(), v.id.filter(|_| v.spec.is_boat())) else {
         return true;

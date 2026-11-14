@@ -1120,6 +1120,9 @@ pub struct MissionLink {
     stock_look: u32,
     /// The counts last given to the score's action level (for the log).
     music_aware: [u32; 4],
+    /// The homing missiles fired on her vehicle that are the scripts'
+    /// objects: their guids by round ([`homing_to_scripts`]).
+    homing_rounds: HashMap<u32, u32>,
     /// Her support stock by item key, as last looked at.
     stock_counts: Vec<(String, u32)>,
     /// Aimed designators' marks (guid, where) waiting to settle, and the
@@ -1277,6 +1280,7 @@ impl MissionLink {
             saves: Vec::new(),
             stock_look: 0,
             music_aware: [0; 4],
+            homing_rounds: HashMap::new(),
             stock_counts: Vec::new(),
             aimed: Vec::new(),
             landed: HashSet::new(),
@@ -1627,21 +1631,43 @@ impl MissionLink {
             .collect()
     }
 
-    /// Closes the fanfare of the mission's HUD call `seq` with no game HUD
-    /// to: what the HUD's own close does to the game (its script
-    /// `vz_da6af53d`, line 979 on: her invincibility for the fanfare off,
-    /// `MrxHqManager.UnlockAllHq`, the HQs the end sequence locked), then
-    /// the callback (Continue: no `bRetry`).
-    pub fn close_fanfare_without_hud(&mut self, seq: u64) {
-        if let State::Running(m) = &mut self.state {
-            let code = "local c = Player.GetLocalCharacter()\n\
-                 if c then Object.SetInvincible(c, false, \"Fanfare\") end\n\
-                 if MrxHqManager and MrxHqManager.UnlockAllHq then MrxHqManager.UnlockAllHq() end";
-            if let Err(e) = m.run(code, "fanfare close") {
-                self.write([format!("fanfare close {seq}: {e}")]);
-            }
+    /// Answers the failed contract's fanfare as its Retry (`retry`) or
+    /// Continue would, with no game HUD to show it: what the HUD does as
+    /// it closes (its script `vz_da6af53d`, line 979 on: her
+    /// invincibility for the fanfare off, `MrxHqManager.UnlockAllHq`),
+    /// then its callback, which for a contract's, a mission's or a wager's
+    /// fanfare is handed `bRetry` after its own data ([`FANFARE_ANSWER`];
+    /// from the scripts: the fanfare widget's delete, which reads the
+    /// flash's answer "false" as Retry). A Retry has the scripts load the
+    /// retry save (`Pg.LoadGame("retry")`).
+    pub fn answer_fanfare(&mut self, seq: u64, retry: bool) {
+        let State::Running(m) = &mut self.state else {
+            return;
+        };
+        let code = format!(
+            "local c = Player.GetLocalCharacter()
+             if c then Object.SetInvincible(c, false, \"Fanfare\") end
+             if MrxHqManager and MrxHqManager.UnlockAllHq then MrxHqManager.UnlockAllHq() end
+             local t = __m2_hud_callbacks[{seq}]
+             __m2_hud_callbacks[{seq}] = nil
+             {FANFARE_ANSWER}(t, {retry})"
+        );
+        match m.run(&code, "fanfare answer") {
+            Ok(()) => self.write([format!(
+                "fanfare {seq} answered: {}",
+                if retry { "Retry" } else { "Continue" }
+            )]),
+            Err(e) => self.write([format!("fanfare answer {seq}: {e}")]),
         }
-        self.hud_callback(seq);
+    }
+
+    /// Whether the scripts have a retry save kept (`Pg.SaveGame("retry")`
+    /// at the contract's start), for the fail fanfare's Retry to load.
+    pub fn has_retry(&self) -> bool {
+        match &self.state {
+            State::Running(m) => m.has_retry(),
+            _ => false,
+        }
     }
 
     pub fn hud_callback(&mut self, seq: u64) {
@@ -3541,9 +3567,12 @@ impl MissionLink {
                 .support
                 .fallback(Kind::SatelliteBomb, !sturdy.is_empty(), STEP)
             {
+                // Their own free bomb, as the first contract gives it.
+                let given = mission.run(SAT_BOMB_FALLBACK, "satellite bomb fallback");
                 eprintln!(
-                    "mission: no bomb from the scripts in {FALLBACK_AFTER:.0} s with a gate to bring down: one is given her"
+                    "mission: no bomb from the scripts in {FALLBACK_AFTER:.0} s with a gate to bring down: theirs is given her ({given:?})"
                 );
+                self.stock_look = 0;
             }
             // A vehicle driven hard into a target (a gate) breaks it too:
             // by its speed of late, as the gate stops it.
@@ -3669,8 +3698,9 @@ impl MissionLink {
                 self.stock_look = STOCK_LOOK;
             }
             self.stock_look -= 1;
-            let (flown, burst) =
-                crate::spans::time("scripts: strikes", || report_strikes(game, mission));
+            let (flown, burst) = crate::spans::time("scripts: strikes", || {
+                report_strikes(game, mission, &mut self.bombs)
+            });
             self.counts.flown += flown;
             self.counts.burst += burst;
             mission.set_player_reserve("C4", game.combat.charges);
@@ -3716,6 +3746,7 @@ impl MissionLink {
                 }
             }
             mission.set_hostile_aware(aware);
+            homing_to_scripts(game, mission, &mut self.homing_rounds);
             crate::spans::time("scripts: lua", || mission.tick(f64::from(STEP)));
             // The scripts' own interface runs too: its animations finish
             // and their callbacks run (`MrxGuiCinematic.ShowMovie` plays
@@ -3953,13 +3984,22 @@ impl MissionLink {
                     Command::DropWeapon { who, weapon } => {
                         eprintln!("mission: {who:#x} lets go of their {weapon}");
                     }
+                    // The retry save stays in memory, kept by the scripts'
+                    // side ([`Mission::keep_retry`]): the 360 never writes
+                    // it as a user save (0x8230C4A8).
+                    Command::Save { slot } if slot == m2_game::api::RETRY => {
+                        eprintln!(
+                            "mission: the scripts take the retry save (kept in memory: {})",
+                            mission.has_retry()
+                        );
+                    }
                     Command::Save { slot } => {
                         eprintln!("mission: the scripts ask for a save ({slot})");
                         self.saves.push(slot.clone());
                     }
                     _ => {}
                 }
-                support_item(game, &c);
+                support_item(&c);
                 strike(game, &c);
                 fly(game, mission, &mut self.landed, &c);
                 if obey(game, mission, &mut self.vehicles, &c) {
@@ -4661,6 +4701,15 @@ impl MissionLink {
             if !found.is_empty() {
                 return found;
             }
+            // A destroy objective by label only (`sTgtLabelFilter`, a
+            // quota of anything carrying it): the scripts list and mark
+            // no target, so the nearest that carry it now are hers to
+            // destroy (PmcCon001 r2: "Kill Solano's Entourage" by "VZ",
+            // 10 of them; she sat in the tank with nothing to do).
+            let hunted = self.hunted(index);
+            if !hunted.is_empty() {
+                return hunted;
+            }
         }
         let acts = self.contract_actions();
         if *self.acts_logged.borrow() != acts {
@@ -4721,6 +4770,71 @@ impl MissionLink {
         } else {
             marks.into_iter().filter(|m| m.mission.is_some()).collect()
         }
+    }
+
+    /// The nearest carriers of the labels of the contract's label-only
+    /// destroy objectives ([`CONTRACT_LABELS`], [`hunt_order`]), as marks
+    /// to destroy.
+    fn hunted(&self, index: i64) -> Vec<Mark> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        let labels: Vec<u32> = match mission
+            .lua()
+            .load(CONTRACT_LABELS)
+            .set_name("=contract labels")
+            .eval::<Option<Vec<String>>>()
+        {
+            Ok(l) => l
+                .unwrap_or_default()
+                .iter()
+                .map(|l| m2_assets::name_hash(l))
+                .collect(),
+            Err(e) => {
+                eprintln!(
+                    "mission: contract labels: {}",
+                    m2_game::mission::first_lines(&e.to_string())
+                );
+                return Vec::new();
+            }
+        };
+        if labels.is_empty() {
+            return Vec::new();
+        }
+        let w = mission.world().borrow();
+        let Some((me, her)) = w
+            .player
+            .and_then(|p| Some((p, Vec3::from(w.objects.get(&p)?.position))))
+        else {
+            return Vec::new();
+        };
+        let carried: Vec<(u32, Vec3, bool, Vec<u32>)> = w
+            .objects
+            .iter()
+            .filter(|&(&g, _)| g != me)
+            .map(|(&g, o)| (g, Vec3::from(o.position), o.alive, o.all_labels()))
+            .collect();
+        hunt_order(
+            carried
+                .iter()
+                .map(|(g, at, a, l)| (*g, *at, *a, l.as_slice())),
+            &labels,
+            her,
+        )
+        .into_iter()
+        .filter_map(|g| {
+            let o = w.objects.get(&g)?;
+            Some(Mark {
+                target: g,
+                kind: "destroy".to_owned(),
+                name: o.name.clone(),
+                at: Vec3::from(o.position),
+                alive: true,
+                mission: Some(MarkFor::Index(index)),
+                secondary: false,
+            })
+        })
+        .collect()
     }
 
     /// The standing targets of the current contract's active destroy
@@ -4822,6 +4936,7 @@ impl MissionLink {
                         Some((t, place(t)?, inside))
                     })
                     .collect();
+                let of_her = w.player.is_some_and(|her| targets.contains(&her));
                 Some(crate::autoplay::Delivery {
                     dest: dest?,
                     at,
@@ -4829,6 +4944,7 @@ impl MissionLink {
                     xz,
                     quota,
                     targets: placed,
+                    of_her,
                 })
             })
             .collect()
@@ -5366,6 +5482,22 @@ fn hud_calls(lua: &mlua::Lua) -> Vec<HudCall> {
 
 /// The fanfare call [`HUD_CALLS`] kept last with a callback, while that
 /// callback has not been called.
+/// Calls a fanfare's callback `t` as the fanfare widget's delete does
+/// (from the scripts: the HUD's fanfare script, `_DeleteFanfareWidget`'s
+/// target): `fCallback(unpack(tCallbackData))`, with `bRetry` added after
+/// the data for a fanfare of `sType` "contract", "mission" or "wager".
+const FANFARE_ANSWER: &str = "(function(t, bRetry)
+    if type(t) ~= 'table' or type(t.fCallback) ~= 'function' then return end
+    local a = {}
+    if type(t.tCallbackData) == 'table' then
+        for i = 1, table.getn(t.tCallbackData) do a[i] = t.tCallbackData[i] end
+    end
+    if t.sType == 'contract' or t.sType == 'mission' or t.sType == 'wager' then
+        a[table.getn(a) + 1] = bRetry
+    end
+    t.fCallback(unpack(a))
+end)";
+
 fn waiting_fanfare(lua: &mlua::Lua) -> Option<u64> {
     let g = lua.globals();
     let seq = g.get::<Option<u64>>("__m2_fanfare").ok().flatten()?;
@@ -5952,6 +6084,59 @@ walk(m, 0)
 return out
 "#;
 
+/// The labels of the current contract's active destroy objectives that
+/// name no targets, only a label (`sTgtLabelFilter`; from the scripts:
+/// `MrxTaskObjective` keeps it in its `_uTgtObjFilter`, whose
+/// `ObjectFilter.GetObjects` lists nothing for a label).
+const CONTRACT_LABELS: &str = r#"
+local ps = rawget(_G, "MrxPlayState")
+if type(ps) ~= "table" or not ps.GetCurrentMission then return nil end
+local m = ps.GetCurrentMission()
+if type(m) ~= "table" then return nil end
+local out = {}
+local function walk(t, depth)
+    if depth > 6 or type(t) ~= "table" then return end
+    local ok, kids = pcall(function() return t:GetChildren() end)
+    if not ok or type(kids) ~= "table" then return end
+    for _, c in pairs(kids) do
+        local okActive, active = pcall(function() return c:IsActive() end)
+        local cfg = type(c.GetConfig) == "function" and c:GetConfig() or {}
+        if okActive and active and type(cfg) == "table"
+            and cfg.sModuleName == "MrxTaskObjectiveDestroy"
+            and type(cfg.sTgtLabelFilter) == "string" and cfg.vTgtInclude == nil then
+            out[#out + 1] = cfg.sTgtLabelFilter
+        end
+        walk(c, depth + 1)
+    end
+end
+walk(m, 0)
+return out
+"#;
+
+/// At most this many of a label's carriers are hers to hunt at once
+/// (invented).
+const HUNT_MOST: usize = 6;
+
+/// Only those this near her, metres (invented: the reach of a fight
+/// she can see).
+const HUNT_REACH: f32 = 400.0;
+
+/// The nearest `HUNT_MOST` alive objects within [`HUNT_REACH`] of `from`
+/// carrying one of `labels` (name hashes), nearest first.
+fn hunt_order<'a>(
+    objects: impl Iterator<Item = (u32, Vec3, bool, &'a [u32])>,
+    labels: &[u32],
+    from: Vec3,
+) -> Vec<u32> {
+    let mut found: Vec<(u32, f32)> = objects
+        .filter(|&(_, _, alive, carried)| alive && carried.iter().any(|l| labels.contains(l)))
+        .map(|(g, at, _, _)| (g, at.distance(from)))
+        .filter(|&(_, d)| d < HUNT_REACH)
+        .collect();
+    found.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    found.into_iter().take(HUNT_MOST).map(|(g, _)| g).collect()
+}
+
 /// The targets of the current contract's active destroy objectives
 /// ([`CONTRACT_TARGETS`]), marked or not.
 fn contract_destroy_targets(mission: &Mission) -> Vec<u32> {
@@ -6231,7 +6416,7 @@ fn strike(game: &mut Game, c: &Command) {
 /// Tells the scripts of her designators thrown and come to rest, the
 /// aircraft over their marks and the ordnance gone off; how many of the
 /// last two there were.
-fn report_strikes(game: &mut Game, mission: &mut Mission) -> (u32, u32) {
+fn report_strikes(game: &mut Game, mission: &mut Mission, bombs: &mut Vec<Vec3>) -> (u32, u32) {
     let settle = game
         .scene
         .world
@@ -6261,7 +6446,7 @@ fn report_strikes(game: &mut Game, mission: &mut Mission) -> (u32, u32) {
     let counts = (strikes.arrived.len() as u32, strikes.burst.len() as u32);
     // The planes in the air, where they are (their radar blips follow
     // them), and those flown off.
-    for (g, at, yaw) in strikes.jets() {
+    for (g, at, yaw) in strikes.jets().chain(strikes.ordnance()) {
         mission.place(g, at.to_array(), yaw);
     }
     for g in strikes.gone.drain(..) {
@@ -6270,11 +6455,30 @@ fn report_strikes(game: &mut Game, mission: &mut Mission) -> (u32, u32) {
     for (g, at) in strikes.arrived.drain(..) {
         mission.flyby_arrived(g, at.to_array());
     }
-    for (g, _, at) in strikes.burst.drain(..) {
+    let bomb = game
+        .scene
+        .world
+        .as_ref()
+        .and_then(|w| w.index.template_db.id(SAT_BOMB));
+    for (g, template, at) in strikes.burst.drain(..) {
+        // The satellite guided bomb's (its script's `sBomb`): what brings
+        // the first contract's gates down.
+        if template.is_some() && template == bomb {
+            bombs.push(at);
+        }
         mission.ordnance_burst(g, at.to_array());
     }
     counts
 }
+
+/// The satellite guided bomb's ordnance (`mrxsatelliteguidedbomb`'s
+/// `sBomb`).
+const SAT_BOMB: &str = "Smart Bomb Projectile";
+
+/// The scripts' free satellite guided bomb, given her by the fallback
+/// (`MrxSupportData.AddFreebie` as its own loop calls it: key, one, no
+/// player, true; at most one).
+const SAT_BOMB_FALLBACK: &str = "MrxSupportData.AddFreebie(\"VzaCon01_SatBomb\", 1, nil, true, 1)";
 
 /// How high over a munition the munitions helicopter hovers to take it
 /// up, metres (invented).
@@ -6618,8 +6822,6 @@ fn stocked(m: &Mission) -> Vec<support::Stocked> {
     m.support_items()
         .into_iter()
         .filter(|i| i.stock > 0 || i.free > 0 || i.active)
-        // The free Satellite Guided Bomb is her own item ([`Kind`]).
-        .filter(|i| Kind::from_freebie(&i.key).is_none())
         .map(|i| support::Stocked {
             name: {
                 let shown = m.text(&i.name);
@@ -6640,29 +6842,18 @@ fn stocked(m: &Mission) -> Vec<support::Stocked> {
 }
 
 /// The scripts' free support items, given her or taken back.
-fn support_item(game: &mut Game, c: &Command) {
+fn support_item(c: &Command) {
     match c {
         Command::Freebie {
             key,
             quantity,
             limit,
-        } => match Kind::from_freebie(key) {
-            Some(kind) => {
-                game.support.grant(kind, *quantity, *limit);
-                eprintln!(
-                    "mission: the scripts give her {quantity} {} free ({key}, at most {limit:?}): she has {}",
-                    kind.name(),
-                    game.support.ready().map_or(0, |i| i.count)
-                );
-            }
-            None => eprintln!(
-                "mission: the scripts give her {quantity} {key:?}, a support item not known here"
-            ),
-        },
+        } => {
+            // Their item, in her stock as the scripts hold it
+            // ([`stocked`]): called in, their own script brings it.
+            eprintln!("mission: the scripts give her {quantity} {key:?} free (at most {limit:?})");
+        }
         Command::RemoveFreebie(key) => {
-            if let Some(kind) = Kind::from_freebie(key) {
-                game.support.take_back(kind);
-            }
             eprintln!("mission: the scripts take back her free {key:?}");
         }
         _ => {}
@@ -6972,6 +7163,75 @@ fn set_turret(
             v.aims[k].1 = angle;
         }
     }
+}
+
+/// The scripts' local player (`Player.GetLocalPlayer`), the target's
+/// player of the locks on her.
+const LOCAL_PLAYER: u32 = 1;
+
+/// Hands the scripts the locks on her vehicle since the last step
+/// ([`crate::homing::ScriptSide`]): each missile fired on one becomes an
+/// object of theirs (its template's `HomingMissile` script run on it),
+/// then the events go to `AntiAir`'s handlers with the guids they know;
+/// a missile in flight is kept where it is, and one burst or gone leaves
+/// their world.
+fn homing_to_scripts(
+    game: &mut Game,
+    mission: &mut m2_game::mission::Mission,
+    rounds: &mut HashMap<u32, u32>,
+) {
+    use m2_game::mission::{HomingKind, HomingPost};
+    let (fired, posts) = game.combat.scripts.take();
+    let names = game
+        .scene
+        .world
+        .as_ref()
+        .map(|w| &w.index.template_db.names);
+    for (round, template, at) in fired {
+        let name = names.and_then(|n| n.get(&template).or_else(|| n.get(&(template | 1 << 31))));
+        if let Some(name) = name {
+            let guid = mission.homing_round(name, at.to_array());
+            eprintln!("homing: the scripts' missile {guid:#x} ({name}), round {round}");
+            rounds.insert(round, guid);
+        }
+    }
+    for p in posts {
+        let kind = match p.event {
+            crate::homing::LockEvent::Start => HomingKind::Start,
+            crate::homing::LockEvent::Update(s) => HomingKind::Update(s),
+            crate::homing::LockEvent::Clear => HomingKind::Clear,
+            crate::homing::LockEvent::Launched => HomingKind::Launched,
+        };
+        let post = HomingPost {
+            kind,
+            player: LOCAL_PLAYER,
+            owner: p.locker.owner,
+            vehicle: p.locker.vehicle,
+            ammo: p.round.and_then(|r| rounds.get(&r).copied()),
+        };
+        let ran = mission.homing_post(post);
+        if !matches!(kind, HomingKind::Update(_)) {
+            eprintln!(
+                "homing: AntiAir.{} owner {:#x} vehicle {:?} ammo {:?}: ran {ran}",
+                kind.handler(),
+                post.owner,
+                post.vehicle.map(|v| format!("{v:#x}")),
+                post.ammo.map(|a| format!("{a:#x}"))
+            );
+        }
+    }
+    let flying = game.combat.rounds_flying();
+    rounds.retain(|round, guid| match flying.iter().find(|f| f.0 == *round) {
+        Some(&(_, at, yaw)) => {
+            mission.place(*guid, at.to_array(), yaw);
+            true
+        }
+        None => {
+            eprintln!("homing: the scripts' missile {guid:#x} is gone");
+            mission.round_gone(*guid);
+            false
+        }
+    });
 }
 
 fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> bool {
@@ -7564,9 +7824,11 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
-        // A gate or door opened (PmcCon001's villa doors): its model is
-        // taken down with its collision, so she walks through (inferred:
-        // the door's own opening animation isn't played).
+        // A gate or door opened (PmcCon001's villa gates): its hinged
+        // leaves swing open, as the 360's joints do ([`m2_engine::gate`]).
+        // One whose model has no hinge (the villa's front arch,
+        // `_pmcoutpost_gate_open`) has no joint for the 360's OpenGate
+        // (0x82332DD8) to drive: it stands as it is.
         Command::OpenGate(guid) => {
             let name = mission
                 .world()
@@ -7575,18 +7837,15 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 .get(guid)
                 .map_or_else(|| "?".to_owned(), |o| o.name.clone());
             let scene = &mut game.scene;
-            match (&mut scene.world, scene.props.get(*guid)) {
-                (Some(world), Some(_)) => {
-                    scene.props.hide(&mut world.physics, [*guid]);
-                    eprintln!(
-                        "mission: Object.OpenGate {name} ({guid:#x}): opened, its model and \
-                         collision taken down (inferred: no opening animation)"
-                    );
-                }
-                _ => eprintln!(
-                    "mission: Object.OpenGate {name} ({guid:#x}): no model of it up to open"
-                ),
-            }
+            let Some(world) = &mut scene.world else {
+                return false;
+            };
+            let said = match scene.props.open_gate(&mut world.physics, *guid, true) {
+                Some(true) => "its leaves swing open",
+                Some(false) => "no hinge in its model: it stands as it is",
+                None => "no model of it up to open",
+            };
+            eprintln!("mission: Object.OpenGate {name} ({guid:#x}): {said}");
             return false;
         }
         // An infraction the scripts add against her (`Ai.AddInfraction`:
@@ -7656,18 +7915,18 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 }
             }
         }
-        // Shut again: its model and collision go back up where its layer
-        // has it (as OpenGate took them down).
+        // Shut: a gate the scripts opened swings back, its collision back
+        // up once shut. Like the 360's CloseGate (0x82332F18), which only
+        // sets its joints' targets, it does nothing to a gate never opened
+        // (PmcCon001 shuts the middle gate before opening it, and the HQ
+        // door it never opened) or to one with no hinge.
         Command::CloseGate(guid) => {
-            let put = game.scene.show_props([*guid]);
-            eprintln!(
-                "mission: Object.CloseGate {guid:#x}: {}",
-                if put > 0 {
-                    "shut, its model and collision back up"
-                } else {
-                    "already shut, or not a layer's model here"
-                }
-            );
+            let scene = &mut game.scene;
+            if let Some(world) = &mut scene.world
+                && scene.props.open_gate(&mut world.physics, *guid, false) == Some(true)
+            {
+                eprintln!("mission: Object.CloseGate {guid:#x}: its leaves swing shut");
+            }
             return false;
         }
         Command::Weapons { guid, on } if *guid == PLAYER => {
@@ -8582,6 +8841,29 @@ fn send_pursuit_car(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_label_only_destroy_hunts_the_nearest_living_carriers() {
+        use m2_math::glam::Vec3;
+        let vz = [m2_assets::name_hash("VZ")];
+        let pmc = [m2_assets::name_hash("PMC")];
+        let objs: Vec<(u32, Vec3, bool, &[u32])> = vec![
+            (10, Vec3::new(50.0, 0.0, 0.0), true, &vz),
+            (11, Vec3::new(20.0, 0.0, 0.0), true, &vz),
+            (12, Vec3::new(5.0, 0.0, 0.0), false, &vz),
+            (13, Vec3::new(3.0, 0.0, 0.0), true, &pmc),
+            (14, Vec3::new(900.0, 0.0, 0.0), true, &vz),
+        ];
+        let got = super::hunt_order(objs.iter().copied(), &vz, Vec3::ZERO);
+        assert_eq!(got, vec![11, 10]);
+        let many: Vec<(u32, Vec3, bool, &[u32])> = (0..20)
+            .map(|i| (i, Vec3::new(i as f32, 0.0, 0.0), true, &vz[..]))
+            .collect();
+        assert_eq!(
+            super::hunt_order(many.into_iter(), &vz, Vec3::ZERO),
+            (0..super::HUNT_MOST as u32).collect::<Vec<_>>()
+        );
+    }
+
     // `Vehicle.SetTurretYaw` / `SetTurretPitch` (0x82347E00, 0x82347D20
     // -> 0x82275CD8): the named turret's target, radians as given.
     #[test]
@@ -8789,6 +9071,52 @@ mod tests {
         let exit_only = box_of("Display", "[Briefing.RootMenuDialog]", &["[Generic.Exit]"]);
         assert_eq!(contract_pick(&exit_only, &offered), None);
         assert_eq!(contract_pick(&menu, &[]), None);
+    }
+
+    // The fail fanfare's answer reaches a contract's callback as the
+    // fanfare widget's delete hands it: `bRetry` after the callback's own
+    // data, only for a contract's, a mission's or a wager's fanfare.
+    #[test]
+    fn the_fanfare_answer_hands_a_contract_its_retry() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            got = {}
+            function cb(self, retry) got[table.getn(got) + 1] = { self, retry } end
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let answer = |t: &str, retry: bool| {
+            lua.load(format!("{FANFARE_ANSWER}({t}, {retry})"))
+                .exec()
+                .unwrap();
+        };
+        answer(
+            "{ sType = 'contract', fCallback = cb, tCallbackData = { 'mission' } }",
+            true,
+        );
+        answer(
+            "{ sType = 'contract', fCallback = cb, tCallbackData = { 'mission' } }",
+            false,
+        );
+        answer("{ fCallback = cb, tCallbackData = { 'other' } }", true);
+        answer("{ sType = 'contract' }", true);
+        let got: Vec<(String, Option<bool>)> = lua
+            .load("local o = {} for i, g in ipairs(got) do o[i] = { g[1], g[2] } end return o")
+            .eval::<Vec<mlua::Table>>()
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.get(1).unwrap(), t.get(2).unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("mission".to_owned(), Some(true)),
+                ("mission".to_owned(), Some(false)),
+                ("other".to_owned(), None),
+            ]
+        );
     }
 
     // The HQ hides the HUD on entering (`MrxHq.GlobalEnter`: the
