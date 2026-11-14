@@ -2327,7 +2327,7 @@ impl MissionLink {
                                 l.set_hash
                             ),
                             None => eprintln!(
-                                "facefx: cue {cue:08x} has no animation in the {} sets on rig {rig:08x} (speaker {guid:#x}): Flap",
+                                "facefx: cue {cue:08x} has no animation in the {} sets on rig {rig:08x} (speaker {guid:#x}): the mouth stays still",
                                 self.faces.bound(rig).len()
                             ),
                         }
@@ -2335,7 +2335,7 @@ impl MissionLink {
                     }
                     _ => {
                         eprintln!(
-                            "facefx: cue {cue:08x}: speaker {guid:#x} ({template:?}) has no face rig: Flap"
+                            "facefx: cue {cue:08x}: speaker {guid:#x} ({template:?}) has no face rig: the mouth stays still"
                         );
                         None
                     }
