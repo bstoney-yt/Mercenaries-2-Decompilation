@@ -2267,7 +2267,8 @@ impl MissionLink {
         // with no face animation flaps too (invented: the 360 then moves
         // nothing).
         let cinematic = mission.world().borrow().vo.cinematic;
-        for speech in mission.world().borrow_mut().vo.take_speech() {
+        let speeches = mission.world().borrow_mut().vo.take_speech();
+        for speech in speeches {
             let (on, speaker, cue) = match speech {
                 m2_game::vo::Speech::Started { speaker, cue, .. } => (true, speaker, cue),
                 m2_game::vo::Speech::Stopped { speaker, cue, .. } => (false, speaker, cue),
