@@ -1,0 +1,28 @@
+# Round 5 after vzacon001-boat.txt: boat to the beach (no coast test), out,
+# sprint (L3 clicked once while moving), onto loc_vza_beach from the WSW so
+# the camera faces where the crate's helicopter comes from, the drop, then
+# the launcher: RB switch weapon, LT aim, RT fire.
+mark boat start
+track -1727 -36 2069
+goto -1530 2262 25 60 a
+goto -1490 2320 15 40 a                  # east of a blockage the 360 boat stops at, (-1521, 2332)
+goto -1500 2450 20 60 a
+goto -1490 2660 15 45 a                  # the 360 boat beaches near (-1480, 2536)
+mark beached
+press y 0.3
+wait 3
+trackfoot here
+walk -1491 2668 3 60 ls 1 sprint         # L3 clicked once moving: sprint, a frame a second
+walk -1478 2677 4 30                     # onto loc_vza_beach heading ENE
+mark at the beach marker
+burst drop 45 1
+mark crate window over
+press rb 0.3                             # switch weapon (launcher?)
+wait 2
+shot weapon
+set 0 0 0 0 lt                           # aim
+wait 1.5
+press rt 0.3                             # fire
+burst rpg 6 1
+release
+mark done
