@@ -1274,6 +1274,8 @@ pub struct Prim {
     pub colour: [f32; 4],
     /// Multiplies what is under it (Flash's multiply blend mode).
     pub multiply: bool,
+    /// Its texture is clamped at the edges (Flash gradients), not tiled.
+    pub clamp: bool,
 }
 
 /// RGBA8 pixels.
@@ -1782,6 +1784,14 @@ impl GameHud {
     }
 
     fn upload(&mut self, ctx: &egui::Context) {
+        // Gradients' textures are clamped at their edges (the game's
+        // Scaleform pads them), the rest tile.
+        let clamped: HashSet<u32> = self
+            .prims
+            .iter()
+            .filter(|p| p.clamp)
+            .filter_map(|p| p.texture)
+            .collect();
         for (hash, image) in self.pending.drain(..) {
             if let Some(i) = &image {
                 self.pixels.insert(
@@ -1799,11 +1809,12 @@ impl GameHud {
                     &i.rgba,
                 );
                 // Tiled widgets repeat their texture.
-                ctx.load_texture(
-                    format!("hud {hash:08x}"),
-                    image,
-                    TextureOptions::LINEAR_REPEAT,
-                )
+                let options = if clamped.contains(&hash) {
+                    TextureOptions::LINEAR
+                } else {
+                    TextureOptions::LINEAR_REPEAT
+                };
+                ctx.load_texture(format!("hud {hash:08x}"), image, options)
             });
             self.textures.insert(hash, handle);
         }
@@ -3143,6 +3154,15 @@ impl Thread {
 
     /// Texture `hash` from the archive (or the language archive).
     fn decode(&mut self, hash: u32, log: &mut Vec<String>) -> Option<Image> {
+        // A gradient's texture is made, not read.
+        let made = MADE_GRADIENTS.with_borrow(|m| m.get(&hash).cloned());
+        if let Some((width, height, rgba)) = made.and_then(|n| flash::gradient::made_pixels(&n)) {
+            return Some(Image {
+                width,
+                height,
+                rgba,
+            });
+        }
         let found = self.assets.texture(hash, MAX_TEXTURE).or_else(|e| {
             self.language
                 .as_mut()
@@ -5192,6 +5212,7 @@ fn quad(texture: Option<u32>, r: [f32; 4], uv: [f32; 4], colour: [f32; 4], degre
         ],
         colour,
         multiply: false,
+        clamp: false,
     }
 }
 
@@ -5554,6 +5575,13 @@ fn show_all(rect: [f32; 4], size: [f32; 2]) -> [f32; 4] {
     [x, y, x + sw, y + sh]
 }
 
+thread_local! {
+    /// Textures the HUD thread makes for Flash gradients, by name hash:
+    /// their names, which say how to make them
+    /// ([`flash::gradient::made_pixels`]).
+    static MADE_GRADIENTS: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::new());
+}
+
 /// Triangles as prims (quads with the last corner doubled), asking for
 /// their textures.
 fn triangle_prims(triangles: &[flash::Triangle], out: &mut Vec<Prim>, want: &mut Vec<u32>) {
@@ -5562,6 +5590,9 @@ fn triangle_prims(triangles: &[flash::Triangle], out: &mut Vec<Prim>, want: &mut
         let texture = t.texture.as_deref().map(|name| {
             *textures.entry(name).or_insert_with(|| {
                 let hash = name_hash(name);
+                if name.starts_with(flash::gradient::MADE_PREFIX) {
+                    MADE_GRADIENTS.with_borrow_mut(|m| m.insert(hash, name.to_owned()));
+                }
                 want.push(hash);
                 hash
             })
@@ -5574,6 +5605,7 @@ fn triangle_prims(triangles: &[flash::Triangle], out: &mut Vec<Prim>, want: &mut
             uv: [ua, ub, uc, uc],
             colour: t.colour,
             multiply: t.multiply,
+            clamp: t.clamp,
         });
     }
 }
@@ -5757,6 +5789,7 @@ fn minimap(
             uv: [centre_uv, ua, ub, ub],
             colour: white,
             multiply: false,
+            clamp: false,
         });
     }
     road_strokes(view, roads, out, want);
@@ -5977,6 +6010,7 @@ fn road_strokes(view: &MapView, roads: &[Road], out: &mut Vec<Prim>, want: &mut 
                     uv: [[u, 0.0], [u2, 0.0], [u2, 1.0], [u, 1.0]],
                     colour,
                     multiply: false,
+                    clamp: false,
                 });
             };
             if road.paved {
@@ -6226,6 +6260,7 @@ fn fan(poly: &[[f32; 2]], colour: [f32; 4], out: &mut Vec<Prim>) {
             uv: [[0.0; 2]; 4],
             colour,
             multiply: false,
+            clamp: false,
         });
     }
 }
@@ -6276,6 +6311,7 @@ fn stroke(a: [f32; 2], b: [f32; 2], width: f32, colour: [f32; 4]) -> Prim {
         uv: [[0.0; 2]; 4],
         colour,
         multiply: false,
+        clamp: false,
     }
 }
 
@@ -6345,6 +6381,7 @@ fn wedge(
                 uv: points.map(uv_at),
                 colour,
                 multiply: false,
+                clamp: false,
             }
         })
         .collect()

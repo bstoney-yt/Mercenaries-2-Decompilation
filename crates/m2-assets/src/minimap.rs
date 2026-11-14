@@ -700,6 +700,7 @@ mod tests {
                 },
             ],
             edges,
+            gradients: 0,
         }
     }
 

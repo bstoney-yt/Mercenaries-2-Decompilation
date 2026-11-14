@@ -15,7 +15,14 @@
 //!     --set <name>=<text>    show text in the text widget(s) called name
 //!     --background <file>    draw over this PNG (8-bit RGB or RGBA, no
 //!                            interlace), scaled to the screen size
+//! cargo run -p m2-game --example hud -- <vz.wad> flash <movie> <out.png> [--gradients] [--scale <s>]
 //! ```
+//!
+//! `flash` draws a Flash movie (by its exporter name, `pause_menu`) as
+//! [`m2_assets::flash`] lays out its first frame, with the game's
+//! textures, by a software rasteriser (no GPU): what the alpha's HUD draws
+//! of it before any script runs. `--gradients` instead draws each shape
+//! with a gradient fill alone, fitted to a 256-pixel tile, side by side.
 //!
 //! `tree` prints each widget with its type, box, anchors, texture and UVs,
 //! font and text, and handlers. `png` draws the layout as it starts:
@@ -38,6 +45,10 @@ use m2_assets::strings::STRINGS_TYPE;
 use m2_assets::texture::{BODY, INFO};
 use m2_assets::{BlockContents, StringTable, Texture, Ucfx, WadArchive, name_hash};
 use m2_game::gui::{self, Anchor, Correction, HUD_LAYOUT, Widget};
+
+#[path = "hud/flash_png.rs"]
+mod flash_png;
+use flash_png::flash_png;
 
 /// Type hash of texture assets.
 const TEXTURE_TYPE: u32 = 0xf011_157a;
@@ -129,6 +140,12 @@ fn run(args: &[String]) -> Result<(), Error> {
             }
             println!("wrote {out}");
             Ok(())
+        }
+        "flash" => {
+            let [name, out, options @ ..] = rest else {
+                return Err("usage: flash <movie> <out.png> [--gradients] [--scale <s>]".into());
+            };
+            flash_png(&mut wad, name, out, options)
         }
         "crop" => {
             // A region of a PNG, enlarged (nearest) by a whole factor.
