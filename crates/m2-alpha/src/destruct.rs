@@ -346,6 +346,9 @@ pub struct Destruction {
     /// `OnStateChange` ([`take_state_changes`](Self::take_state_changes)):
     /// (entity, state name hash), in order.
     state_changes: Vec<(u32, u32)>,
+    /// The island's objects among those (the trees), for the scripts to
+    /// make objects of first: (entity, template, where).
+    adoptions: Vec<(u32, u32, Vec3)>,
     /// The island's objects destroyed whose links were followed
     /// ([`fall_linked`](Self::fall_linked)).
     linked: HashSet<usize>,
@@ -1083,6 +1086,13 @@ impl Destruction {
         std::mem::take(&mut self.state_changes)
     }
 
+    /// The island's objects among those (the trees: no layer makes them
+    /// objects of the scripts'), to make so before their states are told:
+    /// (entity, template, where).
+    pub fn take_adoptions(&mut self) -> Vec<(u32, u32, Vec3)> {
+        std::mem::take(&mut self.adoptions)
+    }
+
     pub fn update(
         &mut self,
         world: &mut World,
@@ -1145,7 +1155,9 @@ impl Destruction {
                     shows.extend(props.state_effects(key, route::FIRE_DEBRIS));
                     props.wreck(&mut world.physics, key, Some(from));
                     if burnt {
-                        let entity = world.index.objects[i].entity;
+                        let o = world.index.objects[i];
+                        let entity = o.entity;
+                        self.adoptions.push((entity, o.template, o.position));
                         eprintln!(
                             "destruct: object {i} ({template:08x}, entity {entity:#x}) burns down: {}                              effects",
                             shows.len()

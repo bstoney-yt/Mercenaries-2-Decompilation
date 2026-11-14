@@ -3348,6 +3348,20 @@ impl MissionLink {
             // leaves). The machine passed is 0: which of the model's part
             // machines the 360 names there is not traced (the tree
             // scripts read only the state).
+            // The island's trees among them: objects of the scripts' with
+            // their template's script first (no layer places them).
+            for (g, template, at) in game.destruction.take_adoptions() {
+                let name = game
+                    .scene
+                    .world
+                    .as_ref()
+                    .and_then(|w| w.index.template_db.names.get(&template).cloned());
+                if let Some(name) = name
+                    && mission.adopt_scripted(g, &name, at.to_array())
+                {
+                    eprintln!("mission: {g:#x} ({name}) runs its template's script");
+                }
+            }
             for (g, state) in game.destruction.take_state_changes() {
                 eprintln!("mission: {g:#x}'s part state goes to {state:08x}");
                 mission.object_state_changed(g, 0, state);
