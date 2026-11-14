@@ -171,6 +171,9 @@ pub struct Game {
     props_up: bool,
     /// The driver's throttle last tick, -1 (reverse) to 1.
     pub throttle: f32,
+    /// Her steering last tick, -1 to 1, positive to the left (the
+    /// seated driver's pose follows it: [`crate::hijack`]).
+    pub steer: f32,
     /// What stops her vehicle dead, for the log ([`crate::halt`]).
     halts: crate::halt::Halts,
     /// Seconds to the next puffs of spray off boats going fast.
@@ -509,6 +512,7 @@ impl Game {
             arrival: None,
             props_up: false,
             throttle: 0.0,
+            steer: 0.0,
             halts: crate::halt::Halts::default(),
             spray_wait: 0.0,
             sky: AtmosphereMix::default(),
@@ -1629,6 +1633,7 @@ impl Game {
                     if self.honking && !was_honking {
                         self.honks += 1;
                     }
+                    self.steer = steer;
                     physics.drive(
                         id,
                         VehicleControls {
