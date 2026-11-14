@@ -3948,10 +3948,13 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
-    // 100 until the scripts set it: invented, the game's figure is not
-    // decoded.
+    // Until the scripts set it, the profile's default (from the 360 code:
+    // 300, `0x8239B028`; crate::profile).
     add(&player, "GetFuelCapacity", |w, _, _| {
-        values([Value::Number(f64::from(w.fuel_capacity.unwrap_or(100.0)))])
+        let default = crate::profile::ProfileOptions::default().fuel_capacity();
+        values([Value::Number(f64::from(
+            w.fuel_capacity.unwrap_or(default as f32),
+        ))])
     })?;
     add(&player, "SetFuelCapacity", |w, _, a| {
         if let Some(c) = num(a.first()) {

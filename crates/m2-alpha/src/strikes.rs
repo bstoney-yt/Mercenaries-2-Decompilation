@@ -173,6 +173,15 @@ impl Strikes {
             .map(|j| (j.guid, j.at, j.dir.x.atan2(j.dir.z)))
     }
 
+    /// The ordnance in flight: guid, where, and its heading (radians
+    /// about y): the scripts' radar blips on it follow it (the satellite
+    /// bomb's `BlipAircraft`).
+    pub fn ordnance(&self) -> impl Iterator<Item = (u32, Vec3, f32)> + '_ {
+        self.shells
+            .iter()
+            .map(|s| (s.guid, s.at, s.velocity.x.atan2(s.velocity.z)))
+    }
+
     /// Flies everything on by `dt` seconds.
     pub fn step(&mut self, physics: &Physics, dt: f32) {
         for j in &mut self.jets {
@@ -297,6 +306,32 @@ mod tests {
         let mut v = Vec3::Z * 10.0;
         home(&mut v, Vec3::ZERO, -Vec3::Z * 100.0, 30.0, 90.0, 0.5);
         assert_eq!(v, Vec3::Z * 10.0);
+    }
+
+    /// A bomb let go is where it has fallen to, for its radar blip, and
+    /// heads the way it flies.
+    #[test]
+    fn a_bomb_in_flight_reports_where_it_is() {
+        let mut s = Strikes::default();
+        s.start(
+            &Command::Ordnance {
+                guid: 9,
+                what: "Smart Bomb Projectile".into(),
+                at: [0.0, 80.0, -100.0],
+                launch: m2_game::airstrike::Launch::Velocity([0.0, -60.0, 90.0]),
+                fuse: m2_game::airstrike::Fuse::Impact,
+                target: None,
+                owner: Some(1),
+            },
+            &Templates::default(),
+        );
+        let physics = Physics::default();
+        let (_, before, _) = s.ordnance().next().unwrap();
+        s.step(&physics, 0.1);
+        let (guid, at, yaw) = s.ordnance().next().unwrap();
+        assert_eq!(guid, 9);
+        assert!(at.z > before.z && at.y < before.y, "{before} -> {at}");
+        assert!(yaw.abs() < 1e-4, "heading north: {yaw}");
     }
 
     #[test]

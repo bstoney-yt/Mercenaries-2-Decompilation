@@ -824,6 +824,12 @@ impl Destruction {
             let (Some((at, bounds)), Some((p, _))) = (props.placed_bounds(e), props.get(e)) else {
                 continue;
             };
+            // A gate the scripts opened stands where its leaves swung
+            // (its collision is theirs, [`Props::open_gate`]): its parts
+            // aren't where its model's rest has them, so none is run into.
+            if props.gate_open(e).is_some() {
+                continue;
+            }
             let (template, model, position) = (p.template, p.model, p.position);
             let key = StaticKey::Entity(e);
             if !runs_into(world, &boxed, touched, key, || vehicle.meets(at, bounds)) {

@@ -171,6 +171,8 @@ pub struct Widget {
     pub sprite_run: Option<SpriteRun>,
     /// `SetImagePieSliceRender` arguments, as given.
     pub pie_slice: Option<Vec<f32>>,
+    /// Its text animation under way (`AnimateText`, [`crate::gui_anim`]).
+    pub reveal: Option<crate::gui_anim::TextReveal>,
     pub text: String,
     pub font: String,
     pub scale: f32,
@@ -247,6 +249,7 @@ impl Widget {
             sprite_frame: 0,
             sprite_run: None,
             pie_slice: None,
+            reveal: None,
             text: String::new(),
             font: String::new(),
             scale: 1.0,
@@ -329,6 +332,10 @@ pub enum DrawItem {
         size: f32,
         colour: [f32; 4],
         justification: Anchor,
+        /// Its text animation, if one is under way: each character drawn
+        /// at [`crate::gui_anim::TextReveal::scale`] of its width, about
+        /// its middle, counted in order across the spans.
+        reveal: Option<crate::gui_anim::TextReveal>,
     },
     /// A Flash movie's place (`swf` once set). A `fullscreen` movie's
     /// rect is the whole screen.
@@ -708,6 +715,18 @@ impl Screen {
                     w.sprite_run = None;
                 }
             }
+            // The text animation (0x8238A248, done in 0x8238DE68, halted
+            // by 0x8238A2B8): over once every character is at its last
+            // state; a fade-out's text is put away.
+            if let Some(r) = &mut w.reveal {
+                r.t += dt;
+                if r.done(w.text.chars().count()) {
+                    if r.mode == crate::gui_anim::TextMode::FadeOut {
+                        w.visible = false;
+                    }
+                    w.reveal = None;
+                }
+            }
         }
         let ids: Vec<u32> = self.widgets.keys().copied().collect();
         for id in ids {
@@ -1029,6 +1048,7 @@ impl Screen {
                             size: c.scale * VIRTUAL_SIZE.1 / FONT_LINES * w.scale,
                             colour,
                             justification: w.justification,
+                            reveal: w.reveal,
                         });
                     }
                 }
@@ -2242,14 +2262,29 @@ natives! {
         }
         Ok(out)
     },
-    // Recorded as calls only: the text and sprite animations and the clock
-    // wipe draw as their full image or text (see the module docs).
+    // (widget, mode): a text widget with text starts its animation
+    // ([`crate::gui_anim`], 0x82320250); an unknown mode does nothing.
     "AnimateText" => |s, _, a| {
-        s.log_unknown("AnimateText (drawn whole)");
-        let _ = a;
+        let mode = a.text(1).and_then(|m| crate::gui_anim::TextMode::named(&m));
+        if let (Some(mode), Some(w)) = (mode, s.widgets.get_mut(&a.id(0)))
+            && w.kind == Kind::Text
+            && !w.text.is_empty()
+        {
+            w.reveal = Some(crate::gui_anim::TextReveal::new(mode));
+        }
         Ok(MultiValue::new())
     },
-    "HaltTextAnimation" => |_, _, _| Ok(MultiValue::new()),
+    // (widget): ends its text animation (0x82320398, 0x8238AB68); the text
+    // shows whole, a fade-out's goes.
+    "HaltTextAnimation" => |s, _, a| {
+        if let Some(w) = s.widgets.get_mut(&a.id(0))
+            && let Some(r) = w.reveal.take()
+            && r.mode == crate::gui_anim::TextMode::FadeOut
+        {
+            w.visible = false;
+        }
+        Ok(MultiValue::new())
+    },
     "AnimateSprite" => |s, _, a| {
         let run = SpriteRun {
             from: a.num(1).map_or(0, |f| f.max(0.0) as u32),
@@ -2685,6 +2720,17 @@ natives! {
     // vertical anchor, world x min, max, z min, max): makes the minimap,
     // its circle centred on (x, y), and answers its id
     // (`MinimapWidget:SetUpMinimap`).
+    // (minimap): the scripts' `MinimapWidget:Delete`. From the 360 code
+    // (0x82321C60): a minimap widget (type 3) is taken off the manager's
+    // list and its slot, and destroyed at once; any other widget is left
+    // as it is (the native answers with its error).
+    "MinimapDelete" => |s, _, a| {
+        let id = a.id(0);
+        if s.widgets.get(&id).is_some_and(|w| w.kind == Kind::Minimap) {
+            s.delete(id);
+        }
+        Ok(MultiValue::new())
+    },
     "MinimapCreate" => |s, l, a| {
         let id = s.create(Kind::Minimap, String::new());
         let (x, y, r) = (a.f(0).unwrap_or(0.0), a.f(1).unwrap_or(0.0), a.f(2).unwrap_or(0.0));
@@ -2930,6 +2976,57 @@ mod tests {
         // To the front, in order again, a parent before its children.
         run(&host, "_GuiInternal.PushWidgetToFront(box)");
         assert_eq!(screen.borrow().order, [4, 1, 3, 2]);
+    }
+
+    /// `MinimapDelete` takes a minimap away, and only a minimap.
+    #[test]
+    fn a_minimap_is_deleted_and_nothing_else() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            map = G.MinimapCreate(100, 100, 50)
+            pic = G.CreateImageWidget()
+            G.MinimapDelete(pic)
+            G.MinimapDelete(map)
+            "#,
+        );
+        let id = |name: &str| host.lua().globals().get::<u32>(name).unwrap();
+        let s = screen.borrow();
+        assert!(s.widget(id("map")).is_none(), "the minimap is gone");
+        assert!(s.widget(id("pic")).is_some(), "an image is not a minimap");
+    }
+
+    /// The tutorial's typewriter: the text comes out a character each
+    /// 1/30 s and the animation ends once it is all out.
+    #[test]
+    fn a_text_animation_runs_its_time() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            words = G.CreateTextWidget()
+            G.SetTextText(words, "Get to the gate")
+            G.AnimateText(words, "typewriter")
+            "#,
+        );
+        let id = |name: &str| host.lua().globals().get::<u32>(name).unwrap();
+        let words = id("words");
+        let reveal = || screen.borrow().widget(words).unwrap().reveal;
+        tick(host.lua(), 0.1);
+        let r = reveal().expect("under way");
+        assert_eq!(r.mode, crate::gui_anim::TextMode::Typewriter);
+        // Three characters out at 0.1 s, not the fourth.
+        assert_eq!((r.scale(2), r.scale(3)), (1.0, 0.0));
+        // 15 characters: all out by 0.5 s.
+        tick(host.lua(), 0.45);
+        assert_eq!(reveal(), None);
+        assert!(screen.borrow().widget(words).unwrap().visible);
+        // An unknown mode does nothing.
+        run(&host, "_GuiInternal.AnimateText(words, 'scroll')");
+        assert_eq!(reveal(), None);
     }
 
     #[test]

@@ -8,36 +8,51 @@
 //! the left trigger, 18 the left bumper, 19 the left stick's press, 20 to
 //! 22 the right's, 23 Start, 24 Back), so from the game's data:
 //!
-//! | on foot (`human`)       | in a car (`car`)          |
-//! |-------------------------|---------------------------|
-//! | A jump                  | A forward                 |
-//! | B melee                 | B call allies             |
-//! | X reload                | X reverse                 |
-//! | Y action (get in, use)  | Y exit                    |
-//! | LT crouch               | LT handbrake              |
-//! | LB throw an explosive   |                           |
-//! | L3 sprint               |                           |
-//! | RT fire                 | RT fire                   |
-//! | RB switch weapon        | RB switch weapon          |
-//! | R3 zoom                 | R3 reset camera           |
-//! | d-pad up/down support   | d-pad up/down cash & fuel |
-//! | d-pad left explosive    | d-pad right camera mode   |
-//! | Start pause, Back PDA   | Start pause, Back PDA     |
+//! | on foot (`human`)      | car, boat (`car`, `boat`) | `tank`           | `helicopter`         |
+//! |------------------------|---------------------------|------------------|----------------------|
+//! | A jump                 | A forward                 | A forward        | A raise              |
+//! | B melee                | B call allies             | B call allies    | B call allies        |
+//! | X reload               | X reverse                 | X reverse        | X lower              |
+//! | Y action (get in, use) | Y exit                    | Y exit           | Y exit               |
+//! | LT crouch              | LT handbrake              |                  | LT lower             |
+//! | LB throw an explosive  |                           |                  | LB raise             |
+//! | L3 sprint              |                           |                  |                      |
+//! | RT fire                | RT fire                   | RT fire          | RT fire              |
+//! | RB switch weapon       | RB switch weapon          | RB switch weapon | RB switch weapon     |
+//! | R3 zoom                | R3 reset camera           | R3 reset camera  | R3 reset camera      |
+//! | d-pad up/down support  | d-pad up/down cash & fuel | the same         | the same, left winch |
+//! | d-pad left explosive   | d-pad right camera mode   |                  |                      |
+//! | Start pause, Back PDA  | Start pause, Back PDA     | the same         | the same             |
 //!
-//! The left stick moves (steers in a car), the right stick looks. The
-//! hijack scripts' buttons are Y, A, X and B and the left stick's pushes
+//! The left stick moves on foot, steers a car or a boat (its across only:
+//! `TurnLR`), and drives a tank and flies a helicopter both ways (`Move`
+//! with `TurnLR` or `LeftRight`); the right stick looks. The hijack
+//! scripts' buttons are Y, A, X and B and the left stick's pushes
 //! (`RPad_Up`... in [`m2_game::hijack::BUTTONS`]).
 //!
+//! The helicopter's are the 360 code's too: its pad handler (0x824307C0,
+//! for an object of kind 4) sends its climb as the left bumper less the
+//! left trigger plus A less X (0x8234C7D8 on the pad's bytes 18 and 17,
+//! 6 and 7), clamped to -1..1, its ahead and across from the left stick
+//! turned by the camera, and its turn from the right stick's across. Here
+//! the climb is [`Action::MoveUp`] less [`Action::Reload`], as Space and
+//! R are on the keys. `Call_Allies` is the horn: the HUD movies' text
+//! formatter draws `[honk]` as B, and B is [`Action::Melee`], the horn's
+//! key.
+//!
 //! R3 puts the binoculars up on foot (the layout's zoom: [`Action::Binoculars`]).
+//! In a vehicle it does nothing here: the layout's camera reset has no
+//! counterpart yet, and none of the layouts rights an overturned vehicle
+//! (playtest 2026-11-14: R3 flipped the car over, the alpha's own
+//! [`Action::Reset`], which stays on the keys).
 //! Invented where the alpha has a thing the layout doesn't: LT raises the
-//! weapon as well on foot ([`Action::Aim`], as crouch does on the keys)
-//! and rights an overturned vehicle when driving ([`Action::Reset`], where
-//! the layout resets the camera); the d-pad's right sets off C4 on foot
-//! ([`Action::Detonate`]); the d-pad's up and down move to the next seat
-//! in a vehicle ([`Action::Seat`], as the helicopter's `Seat Menu`);
-//! L3 latches sprint until the stick comes back to rest; the left stick
-//! under half way walks ([`Action::Walk`]); the right stick turns at up
-//! to [`LOOK_RATE`] mouse counts a second, squared for fine aim.
+//! weapon as well on foot ([`Action::Aim`], as crouch does on the keys);
+//! the d-pad's right sets off C4 on foot ([`Action::Detonate`]); the
+//! d-pad's up and down move to the next seat in a vehicle
+//! ([`Action::Seat`], as the helicopter's `Seat Menu`); L3 latches sprint
+//! until the stick comes back to rest; the left stick under half way
+//! walks ([`Action::Walk`]); the right stick turns at up to [`LOOK_RATE`]
+//! mouse counts a second, squared for fine aim.
 //!
 //! In the front end and the menus, A is Enter, B Escape and the d-pad the
 //! arrows ([`MenuKey`]). In the PDA the buttons and the sticks' pushes are
@@ -192,20 +207,97 @@ pub const ON_FOOT: &[(Button, Action)] = &[
     (Button::Back, Action::Pda),
 ];
 
-/// What they do driving.
+/// What they do in a car or a boat (`tControlMap.car`, `.boat`).
 pub const DRIVING: &[(Button, Action)] = &[
     (Button::A, Action::MoveForward),
     (Button::X, Action::MoveBack),
+    (Button::B, Action::Melee),
     (Button::Y, Action::Use),
     (Button::LeftTrigger, Action::MoveUp),
     (Button::RightTrigger, Action::Fire),
     (Button::RightBumper, Action::SwitchWeapon),
-    (Button::RightStick, Action::Reset),
     (Button::DpadUp, Action::Seat),
     (Button::DpadDown, Action::Seat),
     (Button::Start, Action::Quit),
     (Button::Back, Action::Pda),
 ];
+
+/// What they do in a tank (`tControlMap.tank`): a car's, without the
+/// handbrake.
+pub const TANK: &[(Button, Action)] = &[
+    (Button::A, Action::MoveForward),
+    (Button::X, Action::MoveBack),
+    (Button::B, Action::Melee),
+    (Button::Y, Action::Use),
+    (Button::RightTrigger, Action::Fire),
+    (Button::RightBumper, Action::SwitchWeapon),
+    (Button::DpadUp, Action::Seat),
+    (Button::DpadDown, Action::Seat),
+    (Button::Start, Action::Quit),
+    (Button::Back, Action::Pda),
+];
+
+/// What they do in a helicopter (`tControlMap.helicopter`, and the 360's
+/// pad handler 0x824307C0): A and the left bumper raise it, X and the
+/// left trigger lower it.
+pub const HELICOPTER: &[(Button, Action)] = &[
+    (Button::A, Action::MoveUp),
+    (Button::LeftBumper, Action::MoveUp),
+    (Button::X, Action::Reload),
+    (Button::LeftTrigger, Action::Reload),
+    (Button::B, Action::Melee),
+    (Button::Y, Action::Use),
+    (Button::RightTrigger, Action::Fire),
+    (Button::RightBumper, Action::SwitchWeapon),
+    (Button::DpadUp, Action::Seat),
+    (Button::DpadDown, Action::Seat),
+    (Button::Start, Action::Quit),
+    (Button::Back, Action::Pda),
+];
+
+/// Which of the layouts the pad plays by: on foot, or what she drives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    #[default]
+    OnFoot,
+    /// A car, a boat, or anything else neither tracked nor flying.
+    Car,
+    Tank,
+    Helicopter,
+}
+
+impl Mode {
+    /// The layout for a vehicle: a helicopter's, a tracked one's (a
+    /// tank's), else a car's.
+    pub fn of_vehicle(helicopter: bool, tracked: bool) -> Self {
+        match (helicopter, tracked) {
+            (true, _) => Self::Helicopter,
+            (false, true) => Self::Tank,
+            (false, false) => Self::Car,
+        }
+    }
+
+    pub fn driving(self) -> bool {
+        self != Self::OnFoot
+    }
+
+    /// Its buttons.
+    pub fn layout(self) -> &'static [(Button, Action)] {
+        match self {
+            Self::OnFoot => ON_FOOT,
+            Self::Car => DRIVING,
+            Self::Tank => TANK,
+            Self::Helicopter => HELICOPTER,
+        }
+    }
+
+    /// Whether the left stick's up and down count: on foot, in a tank
+    /// (`Move`) and in a helicopter; a car's and a boat's stick only
+    /// steers (A and X are the pedals).
+    pub fn stick_both_ways(self) -> bool {
+        self != Self::Car
+    }
+}
 
 /// The hijack scripts' face buttons, in either.
 pub const HIJACK: &[(Button, Action)] = &[
@@ -335,10 +427,11 @@ impl Pad {
             [0.0; 2]
         }
     }
-    /// Reads the pad and feeds `input` (a no-op without one). `driving`
+    /// Reads the pad and feeds `input` (a no-op without one). `mode`
     /// picks the layout; `dt` is the seconds since the last read. Answers
     /// the menu keys pressed since then ([`Pad::menu_keys`]).
-    pub fn poll(&mut self, input: &mut Input, driving: bool, dt: f64) -> Vec<MenuKey> {
+    pub fn poll(&mut self, input: &mut Input, mode: Mode, dt: f64) -> Vec<MenuKey> {
+        let driving = mode.driving();
         let state = m2_sys::xinput::poll().or_else(|| self.events.state());
         if state.is_some() != self.connected {
             self.connected = state.is_some();
@@ -365,7 +458,7 @@ impl Pad {
             self.motors = on && took;
         }
         let keys = self.keys(&s);
-        self.feed(input, s, driving, dt);
+        self.feed(input, s, mode, dt);
         // The touch controls' sprint is switched on, not held: she sprints
         // on foot whenever she moves while it is.
         if self.touch.sprint {
@@ -435,8 +528,9 @@ impl Pad {
     }
 
     /// Feeds one reading `s` to `input`.
-    pub fn feed(&mut self, input: &mut Input, s: PadState, driving: bool, dt: f64) {
-        let base = if driving { DRIVING } else { ON_FOOT };
+    pub fn feed(&mut self, input: &mut Input, s: PadState, mode: Mode, dt: f64) {
+        let driving = mode.driving();
+        let base = mode.layout();
         let layout = self.table.map_or_else(|| base.to_vec(), |t| t.layout(base));
         let sprint = self
             .table
@@ -472,8 +566,10 @@ impl Pad {
         input.set_pad_hold(Action::Walk, !driving && tilt > 0.0 && tilt < 0.5);
         // The stick: steering only in a car (A and X are the pedals),
         // except with the PDA open, whose map it moves both ways
-        // (playtest: in a car the map would not go up or down).
-        input.set_stick(if driving && !self.pda {
+        // (playtest: in a car the map would not go up or down); a tank
+        // and a helicopter go by it both ways (playtest 2026-11-14: the
+        // cheat's tank and helicopters would not move on the stick).
+        input.set_stick(if !mode.stick_both_ways() && !self.pda {
             [lx, 0.0]
         } else {
             [lx, ly]
@@ -737,7 +833,6 @@ mod tests {
             Action::Sprint,
             Action::Walk,
             Action::Use,
-            Action::Reset,
             Action::Reload,
             Action::Fire,
             Action::Aim,
@@ -759,6 +854,10 @@ mod tests {
         ];
         let mut all = reached(ON_FOOT);
         all.extend(reached(DRIVING));
+        all.extend(reached(TANK));
+        all.extend(reached(HELICOPTER));
+        // Righting a vehicle is the keys' only (no layout has it).
+        assert!(!all.contains(&Action::Reset));
         let missing: Vec<_> = play.iter().filter(|a| !all.contains(a)).collect();
         assert!(missing.is_empty(), "{missing:?}");
     }
@@ -767,23 +866,23 @@ mod tests {
     fn buttons_press_and_let_go_their_actions() {
         let mut pad = Pad::default();
         let mut input = Input::default();
-        pad.feed(&mut input, press(xb::A | xb::X), false, 0.016);
+        pad.feed(&mut input, press(xb::A | xb::X), Mode::OnFoot, 0.016);
         assert!(input.pad());
         assert!(input.take_pressed(Action::MoveUp));
         assert!(input.take_pressed(Action::Reload));
         // A is the hijack's too.
         assert!(input.take_pressed(Action::PadA));
         assert!(input.held(Action::MoveUp));
-        pad.feed(&mut input, press(xb::X), false, 0.016);
+        pad.feed(&mut input, press(xb::X), Mode::OnFoot, 0.016);
         assert!(!input.held(Action::MoveUp));
         assert!(!input.take_pressed(Action::Reload), "one press");
         // Into a car with X held: X's on-foot reload is let go; the
         // reverse waits for the next press.
-        pad.feed(&mut input, press(xb::X), true, 0.016);
+        pad.feed(&mut input, press(xb::X), Mode::Car, 0.016);
         assert!(!input.held(Action::Reload));
         assert!(!input.held(Action::MoveBack));
-        pad.feed(&mut input, PadState::default(), true, 0.016);
-        pad.feed(&mut input, press(xb::X), true, 0.016);
+        pad.feed(&mut input, PadState::default(), Mode::Car, 0.016);
+        pad.feed(&mut input, press(xb::X), Mode::Car, 0.016);
         assert!(input.held(Action::MoveBack));
     }
 
@@ -795,11 +894,78 @@ mod tests {
             left: [-0.5, 0.9],
             ..PadState::default()
         };
-        pad.feed(&mut input, up_left, true, 0.016);
+        pad.feed(&mut input, up_left, Mode::Car, 0.016);
         assert_eq!(input.stick(), [-0.5, 0.0]);
         pad.pda = true;
-        pad.feed(&mut input, up_left, true, 0.016);
+        pad.feed(&mut input, up_left, Mode::Car, 0.016);
         assert_eq!(input.stick(), [-0.5, 0.9]);
+    }
+
+    #[test]
+    fn a_tank_and_a_helicopter_go_by_the_stick_both_ways() {
+        // Playtest 2026-11-14: in the cheat's tank and helicopters the
+        // stick's push ahead did nothing (`tControlMap.tank`'s `Move`).
+        let up_left = PadState {
+            left: [-0.5, 0.9],
+            ..PadState::default()
+        };
+        for mode in [Mode::Tank, Mode::Helicopter, Mode::OnFoot] {
+            let mut pad = Pad::default();
+            let mut input = Input::default();
+            pad.feed(&mut input, up_left, mode, 0.016);
+            assert_eq!(input.stick(), [-0.5, 0.9], "{mode:?}");
+        }
+        assert_eq!(Mode::of_vehicle(true, false), Mode::Helicopter);
+        assert_eq!(Mode::of_vehicle(false, true), Mode::Tank);
+        assert_eq!(Mode::of_vehicle(false, false), Mode::Car);
+    }
+
+    #[test]
+    fn a_helicopter_climbs_on_a_and_lb_and_comes_down_on_x_and_lt() {
+        // 0x824307C0: climb = (LB - LT) + (A - X).
+        let mut pad = Pad::default();
+        let mut input = Input::default();
+        pad.feed(&mut input, press(xb::A), Mode::Helicopter, 0.016);
+        assert!(input.held(Action::MoveUp));
+        assert!(!input.held(Action::MoveForward), "A is no throttle here");
+        pad.feed(
+            &mut input,
+            press(xb::LEFT_SHOULDER),
+            Mode::Helicopter,
+            0.016,
+        );
+        assert!(input.held(Action::MoveUp));
+        pad.feed(&mut input, press(xb::X), Mode::Helicopter, 0.016);
+        assert!(input.held(Action::Reload) && !input.held(Action::MoveUp));
+        assert!(!input.held(Action::MoveBack));
+        let lt = PadState {
+            left_trigger: 1.0,
+            ..PadState::default()
+        };
+        pad.feed(&mut input, lt, Mode::Helicopter, 0.016);
+        assert!(input.held(Action::Reload));
+    }
+
+    #[test]
+    fn b_honks_in_every_vehicle_and_r3_rights_none() {
+        // `Call_Allies` on B (`[honk]`); R3 is the layouts' camera reset.
+        for mode in [Mode::Car, Mode::Tank, Mode::Helicopter] {
+            let mut pad = Pad::default();
+            let mut input = Input::default();
+            pad.feed(&mut input, press(xb::B), mode, 0.016);
+            assert!(input.held(Action::Melee), "{mode:?}");
+            pad.feed(&mut input, press(xb::RIGHT_THUMB), mode, 0.016);
+            assert!(!input.take_pressed(Action::Reset), "{mode:?}");
+        }
+        // A tank has no handbrake on LT.
+        let mut pad = Pad::default();
+        let mut input = Input::default();
+        let lt = PadState {
+            left_trigger: 1.0,
+            ..PadState::default()
+        };
+        pad.feed(&mut input, lt, Mode::Tank, 0.016);
+        assert!(!input.held(Action::MoveUp));
     }
 
     #[test]
@@ -811,7 +977,7 @@ mod tests {
             left_trigger: 0.3,
             ..PadState::default()
         };
-        pad.feed(&mut input, s, false, 0.016);
+        pad.feed(&mut input, s, Mode::OnFoot, 0.016);
         assert!(input.held(Action::Fire));
         assert!(!input.held(Action::MoveDown));
         // Driving, the left trigger is the handbrake.
@@ -819,7 +985,7 @@ mod tests {
             left_trigger: 1.0,
             ..PadState::default()
         };
-        pad.feed(&mut input, s, true, 0.016);
+        pad.feed(&mut input, s, Mode::Car, 0.016);
         assert!(input.held(Action::MoveUp));
         assert!(!input.held(Action::Fire));
     }
@@ -833,7 +999,7 @@ mod tests {
             right: [0.5, 0.0],
             ..PadState::default()
         };
-        pad.feed(&mut input, s, false, 0.5);
+        pad.feed(&mut input, s, Mode::OnFoot, 0.5);
         assert_eq!(input.axis(Action::MoveBack, Action::MoveForward), 1.0);
         assert!(input.held(Action::MoveForward), "a push");
         assert!(
@@ -849,7 +1015,7 @@ mod tests {
             right: [0.0, 0.5],
             ..PadState::default()
         };
-        pad.feed(&mut input, up, false, 0.5);
+        pad.feed(&mut input, up, Mode::OnFoot, 0.5);
         let (_, dy) = input.take_pad_look();
         assert!((dy - 0.25 * LOOK_RATE).abs() < 1e-9, "{dy}");
         pad.look = None;
@@ -859,7 +1025,7 @@ mod tests {
             left: [0.3, 0.0],
             ..PadState::default()
         };
-        pad.feed(&mut input, s, false, 0.016);
+        pad.feed(&mut input, s, Mode::OnFoot, 0.016);
         assert!(input.held(Action::Walk));
         assert!((input.axis(Action::MoveLeft, Action::MoveRight) - 0.3).abs() < 1e-6);
         // In a car the stick only steers.
@@ -867,7 +1033,7 @@ mod tests {
             left: [0.0, 1.0],
             ..PadState::default()
         };
-        pad.feed(&mut input, s, true, 0.016);
+        pad.feed(&mut input, s, Mode::Car, 0.016);
         assert_eq!(input.axis(Action::MoveBack, Action::MoveForward), 0.0);
     }
 
@@ -884,17 +1050,17 @@ mod tests {
             left: [-1.0, -0.3],
             ..PadState::default()
         };
-        pad.feed(&mut input, lock(xb::X), true, 0.016);
+        pad.feed(&mut input, lock(xb::X), Mode::Car, 0.016);
         let i = crate::player::Intent::from_input(&mut input, &config, false);
         assert_eq!(i.movement, m2_math::glam::Vec2::new(-1.0, -1.0));
-        pad.feed(&mut input, lock(xb::A), true, 0.016);
+        pad.feed(&mut input, lock(xb::A), Mode::Car, 0.016);
         let i = crate::player::Intent::from_input(&mut input, &config, false);
         assert_eq!(i.movement, m2_math::glam::Vec2::new(-1.0, 1.0));
         let s = PadState {
             left: [1.0, 1.0],
             ..PadState::default()
         };
-        pad.feed(&mut input, s, false, 0.016);
+        pad.feed(&mut input, s, Mode::OnFoot, 0.016);
         let i = crate::player::Intent::from_input(&mut input, &config, false);
         assert!((i.walking().length() - 1.0).abs() < 1e-6);
     }
@@ -917,7 +1083,7 @@ mod tests {
             ..Pad::default()
         };
         let mut input = Input::default();
-        pad.feed(&mut input, at(0.0), false, 0.016);
+        pad.feed(&mut input, at(0.0), Mode::OnFoot, 0.016);
         assert_eq!(Pad::stick_steps(&pad.last, &at(-0.9)), [MenuKey::Down]);
     }
 
@@ -930,10 +1096,10 @@ mod tests {
             left: [0.0, 1.0],
             ..PadState::default()
         };
-        pad.feed(&mut input, push(xb::LEFT_THUMB), false, 0.016);
-        pad.feed(&mut input, push(0), false, 0.016);
+        pad.feed(&mut input, push(xb::LEFT_THUMB), Mode::OnFoot, 0.016);
+        pad.feed(&mut input, push(0), Mode::OnFoot, 0.016);
         assert!(input.held(Action::Sprint));
-        pad.feed(&mut input, PadState::default(), false, 0.016);
+        pad.feed(&mut input, PadState::default(), Mode::OnFoot, 0.016);
         assert!(!input.held(Action::Sprint));
     }
 
@@ -1053,7 +1219,7 @@ mod tests {
         ev.axis(axis::RTRIGGER, 0.9);
         let mut pad = Pad::default();
         let mut input = Input::default();
-        pad.feed(&mut input, ev.state().unwrap(), false, 0.016);
+        pad.feed(&mut input, ev.state().unwrap(), Mode::OnFoot, 0.016);
         assert!(input.held(Action::Fire));
         assert!(input.take_pressed(Action::SwitchWeapon));
     }

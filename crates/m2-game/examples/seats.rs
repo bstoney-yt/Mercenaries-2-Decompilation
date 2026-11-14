@@ -4,8 +4,11 @@
 //! installation's `vz.wad`.
 //!
 //! ```text
-//! cargo run --release -p m2-game --example seats -- <vz.wad> > seats.txt
+//! cargo run --release -p m2-game --example seats -- <vz.wad> [action] > seats.txt
 //! ```
+//!
+//! `action` is the `InVehicle` action looked up (`Idle` if not given; a
+//! driver's `SteerLeft45`, say).
 //!
 //! One line a seat: the template, the seat's name hash, the clip, the
 //! vehicle table's row and whether that row is the vehicle's own, its
@@ -24,10 +27,11 @@ use m2_game::hijack::ClipTimes;
 
 fn main() -> ExitCode {
     let Some(path) = std::env::args().nth(1) else {
-        eprintln!("usage: seats <vz.wad>");
+        eprintln!("usage: seats <vz.wad> [action]");
         return ExitCode::FAILURE;
     };
-    match run(&path) {
+    let action = std::env::args().nth(2).unwrap_or_else(|| "Idle".to_owned());
+    match run(&path, &action) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -36,7 +40,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn run(path: &str, action: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut wad = WadArchive::open(BufReader::new(File::open(path)?))?;
     let times = ClipTimes::read(&mut wad)?;
     let (actions, vehicles) = times.tables.as_ref().ok_or("no animation tables")?;
@@ -48,9 +52,9 @@ fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         let set = times.sets[name];
         for &(seat, _) in times.seats.get(name).into_iter().flatten() {
             let found =
-                table::seat_clip_row(actions, vehicles, "InVehicle", "Idle", set, Some(seat))
+                table::seat_clip_row(actions, vehicles, "InVehicle", action, set, Some(seat))
                     .or_else(|| {
-                        table::seat_clip_row(actions, vehicles, "InVehicle", "Idle", set, None)
+                        table::seat_clip_row(actions, vehicles, "InVehicle", action, set, None)
                     });
             let Some((clip, row)) = found else {
                 println!("{name}\tseat {seat:08x}\tnone");
@@ -65,7 +69,7 @@ fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
             let handle = actions.lookup(
                 &[
                     ("Stance", Some(m2_assets::name_hash("InVehicle"))),
-                    ("Action", Some(m2_assets::name_hash("Idle"))),
+                    ("Action", Some(m2_assets::name_hash(action))),
                     ("Seat", Some(seat)),
                 ],
                 "AnimationHandles",
@@ -73,7 +77,7 @@ fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
             let seat_named = actions
                 .lookup_row(&[
                     ("Stance", Some(m2_assets::name_hash("InVehicle"))),
-                    ("Action", Some(m2_assets::name_hash("Idle"))),
+                    ("Action", Some(m2_assets::name_hash(action))),
                     ("Seat", Some(seat)),
                 ])
                 .and_then(|r| actions.cell(r, actions.column("Seat")?))
