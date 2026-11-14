@@ -486,6 +486,10 @@ struct Options {
     /// swim her forward walking, at her pace and sprinting, logging how
     /// fast she goes (`swim-check:` lines).
     swim_check: bool,
+    /// `--sink-check`: a parked car is put in deep water with her in it,
+    /// then a helicopter set down on the sea, each held past its
+    /// `Buoyancy` delay; PASS when each sinks and she is put out.
+    sink_check: bool,
     /// With `--board`: the entrance she stands at, by name or hash
     /// (`entrance_driver`, `8efe45f3`); else the front right one.
     entrance: Option<u32>,
@@ -856,6 +860,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--seated" => o.seated = true,
             "--board" => o.board = true,
             "--swim-check" => o.swim_check = true,
+            "--sink-check" => o.sink_check = true,
             "--ladder-check" => {
                 o.ladder_check = Some(
                     value()?
@@ -7022,6 +7027,10 @@ fn drive_for_screenshot(
         swim_check(game, tick);
         return Ok(());
     }
+    if options.sink_check {
+        sink_check(game, tick);
+        return Ok(());
+    }
     if let Some(hold) = options.ladder_check {
         ladder_check(game, hold, tick);
         return Ok(());
@@ -7961,6 +7970,94 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 /// `--swim-check`: she is put in the nearest water over 4 m deep (looked
 /// for in rings out to 600 m) and swims forward for 4 s walking, at her
 /// pace and sprinting, through the game's tick; logs her speed each time.
+/// `--sink-check`: the first parked car (no boat, no helicopter) is put
+/// on water more than 6 m deep near her with her at the wheel, and held
+/// its `Buoyancy` delay (5 s without one) and 10 s more, its time under
+/// the water logged each second; then the first helicopter likewise
+/// (its delay 0), held 3 s. Each passes when it has sunk and she is no
+/// longer in it. One line `sink-check: PASS` or `FAIL ...` at the end.
+fn sink_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::Vec3;
+    let mut fails: Vec<String> = Vec::new();
+    let mut passed: Vec<String> = Vec::new();
+    for (kind, heli, extra) in [("car", false, 10.0f32), ("helicopter", true, 3.0)] {
+        let Some(world) = game.scene.world.as_ref() else {
+            fails.push("no island".into());
+            break;
+        };
+        let here = game.focus();
+        let pick = game.scene.vehicles.iter().position(|v| {
+            v.id.is_some() && !v.wrecked && !v.spec.is_boat() && v.spec.is_helicopter() == heli
+        });
+        let Some(i) = pick else {
+            fails.push(format!("no parked {kind}"));
+            continue;
+        };
+        let physics = &world.physics;
+        let ground = |x: f32, z: f32| {
+            let top = 600.0;
+            physics
+                .cast_ray(Vec3::new(x, top, z), Vec3::NEG_Y, 1200.0)
+                .map(|(d, _)| top - d)
+        };
+        let Some(at) = crate::game::deep_spot(here, ground, |x, z| physics.water_at(x, z), 6.0)
+        else {
+            fails.push(format!("no water 6 m deep within 600 m of {here:.0}"));
+            break;
+        };
+        let label = game.scene.vehicles[i].spec.label.clone();
+        let after = world.index.template_db.buoyancy_for(&label).sink_after;
+        eprintln!("sink-check: the {label} ({kind}) put in at {at:.1}, its delay {after} s");
+        // On the water, at rest, her at the wheel.
+        let world = game.scene.world.as_mut().expect("an island");
+        let v = &mut game.scene.vehicles[i];
+        if let Some(id) = v.id.take() {
+            world.physics.remove_vehicle(id);
+        }
+        v.id = Some(world.physics.add_vehicle(&v.spec, at + Vec3::Y * 0.5, 0.0));
+        if let Some(p) = game.scene.player.as_mut() {
+            p.driving = Some(i);
+            p.landed = true;
+        }
+        let ticks = ((after + extra) / tick) as u32;
+        let every = ((1.0 / tick) as u32).max(1);
+        let mut sunk_at = None;
+        for t in 0..ticks {
+            game.step(Intent::default(), tick);
+            if t % every == 0 {
+                eprintln!(
+                    "sink-check: {:.0} s: {:.1} s a quarter under, sunk {}",
+                    t as f32 * tick,
+                    game.in_water(i),
+                    game.sunk(i)
+                );
+            }
+            if game.sunk(i) && sunk_at.is_none() {
+                sunk_at = Some(t as f32 * tick);
+            }
+        }
+        let out = game
+            .scene
+            .player
+            .as_ref()
+            .is_none_or(|p| p.driving != Some(i));
+        match sunk_at {
+            Some(s) if out => passed.push(format!("{kind} sank at {s:.1} s, she is out")),
+            Some(s) => fails.push(format!("{kind} sank at {s:.1} s but she is still in it")),
+            None => fails.push(format!("{kind} did not sink in {:.0} s", after + extra)),
+        }
+    }
+    if fails.is_empty() {
+        eprintln!("sink-check: PASS {}", passed.join("; "));
+    } else {
+        eprintln!(
+            "sink-check: FAIL {} (passed: {})",
+            fails.join("; "),
+            passed.join("; ")
+        );
+    }
+}
+
 fn swim_check(game: &mut Game, tick: f32) {
     use m2_math::glam::{Vec2, Vec3};
     let here = game.focus();

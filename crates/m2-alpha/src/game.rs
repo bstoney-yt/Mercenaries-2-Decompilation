@@ -3601,6 +3601,15 @@ impl Game {
         }
     }
 
+    /// Whether vehicle `i` has sunk ([`Game::sink`]), and how long it has
+    /// been a quarter or more under the water.
+    pub fn sunk(&self, i: usize) -> bool {
+        self.sunk.contains(&i)
+    }
+    pub fn in_water(&self, i: usize) -> f32 {
+        self.in_water.get(&i).copied().unwrap_or(0.0)
+    }
+
     pub fn take_honks(&mut self) -> u32 {
         std::mem::take(&mut self.honks)
     }
@@ -4997,6 +5006,32 @@ fn parkable(v: &ParkedVehicle) -> bool {
     v.id.is_none() && v.guid.is_none() && v.spot.is_none()
 }
 
+/// The nearest spot to `from` where the water (`water`: its height at
+/// x, z) stands more than `depth` metres over the ground there (`ground`:
+/// its height at x, z), on the water's surface: rings out every 20 m to
+/// 600 m. For `--sink-check` (a car put in water deeper than it is
+/// tall). `None` where there is none.
+pub(crate) fn deep_spot(
+    from: Vec3,
+    ground: impl Fn(f32, f32) -> Option<f32>,
+    water: impl Fn(f32, f32) -> Option<f32>,
+    depth: f32,
+) -> Option<Vec3> {
+    for r in (0..=600).step_by(20) {
+        let n = (r / 5).max(1);
+        for k in 0..n {
+            let a = k as f32 / n as f32 * std::f32::consts::TAU;
+            let (x, z) = (from.x + a.sin() * r as f32, from.z + a.cos() * r as f32);
+            if let (Some(w), Some(g)) = (water(x, z), ground(x, z))
+                && w - g > depth
+            {
+                return Some(Vec3::new(x, w, z));
+            }
+        }
+    }
+    None
+}
+
 /// Spray off both sides of each boat going fast on the water, a third of
 /// the way up from its stern, and churned water behind it.
 fn spray(world: &World, vehicles: &[ParkedVehicle], combat: &mut Combat) {
@@ -6091,6 +6126,27 @@ mod tests {
     use m2_engine::TemplateInfo;
 
     use super::*;
+
+    #[test]
+    fn the_sink_check_finds_water_deeper_than_a_car() {
+        // The sea at -36; the sea floor falls away east of x 100 (-40 to
+        // x 200, -60 from it): 6 m deep is first met at x 200.
+        let water = |_: f32, _: f32| Some(-36.0);
+        let ground = |x: f32, _: f32| {
+            Some(if x < 100.0 {
+                -30.0
+            } else if x < 200.0 {
+                -40.0
+            } else {
+                -60.0
+            })
+        };
+        let at = deep_spot(Vec3::ZERO, ground, water, 6.0).unwrap();
+        assert!(at.x >= 200.0 && at.y == -36.0, "{at}");
+        // Shallow everywhere, or dry: none.
+        assert!(deep_spot(Vec3::ZERO, |_, _| Some(-38.0), water, 6.0).is_none());
+        assert!(deep_spot(Vec3::ZERO, ground, |_, _| None, 6.0).is_none());
+    }
 
     #[test]
     fn an_arrival_loads_until_its_place_is_in_or_its_time_is_up() {
