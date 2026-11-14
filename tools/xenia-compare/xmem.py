@@ -49,9 +49,21 @@ def xenia_pid(name: str = "m2-alpha-xenia") -> int:
 
 class Guest:
     def __init__(self, pid: int) -> None:
+        self.pid = pid
         self.h = k32.OpenProcess(0x0010 | 0x0400, False, pid)  # VM_READ | QUERY_INFORMATION
         if not self.h:
             raise OSError(ctypes.get_last_error(), "OpenProcess")
+
+    def write(self, guest: int, data: bytes) -> bool:
+        """Write guest data (a runtime flag only: never code or files)."""
+        h = k32.OpenProcess(0x0008 | 0x0020 | 0x0010 | 0x0400, False, self.pid)  # VM_OPERATION|VM_WRITE|VM_READ|QUERY
+        if not h:
+            return False
+        done = ctypes.c_size_t()
+        k32.WriteProcessMemory.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+        ok = k32.WriteProcessMemory(h, HOST_BASE + guest, data, len(data), ctypes.byref(done))
+        k32.CloseHandle(h)
+        return bool(ok) and done.value == len(data)
 
     def read(self, guest: int, n: int) -> bytes | None:
         buf = ctypes.create_string_buffer(n)

@@ -39,6 +39,7 @@ Route files are one step per line (`#` comments):
     fight <secs> [<every_s> <name>]  aim at the nearest slow ground mover and fire in bursts
     airwatch <dropx> <dropz> <secs> [<every_s> <name>]  log movers near a drop, camera on the fastest airborne one
     look <bearing> [<timeout>]     turn the camera to face that bearing (xmem.Camera)
+    poke <hex addr> <byte>         set a guest data byte (runtime flag only)
     trackhero                      follow the player's character by the 360 code's tables (xmem.Hero)
     trackfoot <x> <y> <z>|here     as track, for the hero on foot (here: where track was)
     walk <x> <z> <radius> <timeout> [<buttons|-> [<every_s> <name>]]  walk/sprint (ls) there
@@ -163,8 +164,13 @@ class Xenia:
                         size = f.stat().st_size
                         time.sleep(0.3)
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(f), dest)
-                    return True
+                    for _ in range(20):  # Xenia may still hold the file
+                        try:
+                            shutil.move(str(f), dest)
+                            return True
+                        except PermissionError:
+                            time.sleep(0.25)
+                    return False
         return False
 
 
@@ -669,8 +675,10 @@ def run(args) -> int:
                 # placements, e.g. VzaCon001's vza_beachguard_1..4, which stand
                 # still), cycled every 10 s, instead of movers from the table.
                 fixed = []
-                if len(w) > 5 and w[4] == "at":
-                    fixed = [tuple(float(v) for v in t.split(",")) for t in w[5].split(";")]
+                if "at" in w[4:] and w.index("at", 4) + 1 < len(w):
+                    spec = w[w.index("at", 4) + 1]
+                    fixed = [tuple(float(v) for v in t.split(",")) for t in spec.split(";")]
+                say(f"fight2: {len(fixed)} fixed targets" if fixed else "fight2: targets from the state table")
                 fixed_i, fixed_t = 0, time.time()
                 stand_off = next((float(t[9:]) for t in w if t.startswith("standoff=")), 25.0)
                 g = xmem.Guest(p.pid)
@@ -869,6 +877,19 @@ def run(args) -> int:
                     time.sleep(0.15)
                 apply(*held[:3], held[3], held[4], 0.0, 0.0)
                 say(f"look: camera yaw {cam.yaw()} (wanted {want:.0f})")
+            elif op == "poke":
+                # poke <guest hex address> <byte>: set one guest data byte, a
+                # runtime flag (never code, the XEX or files). E.g. 0x83134382 =
+                # the game's own GodMode setting (multiplayer.ini key "GodMode",
+                # read at boot by 0x822193D8; applied to the player's character
+                # when it is assigned, 0x8243CBC8 -> 0x8228C730): set it before
+                # the hero spawns.
+                import xmem
+
+                g = xmem.Guest(p.pid)
+                addr, val = int(w[1], 16), int(w[2])
+                ok = g.write(addr, bytes([val]))
+                say(f"poke {addr:#x} = {val}: {'ok' if ok else 'FAILED'}, reads back {g.read(addr, 1)}")
             elif op == "trackhero":
                 # trackhero: follow the local player's character through the
                 # 360 code's own tables (xmem.Hero): one record, in a vehicle
