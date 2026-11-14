@@ -142,6 +142,22 @@ pub fn fall_impact(limits: &FallLimits, distance: f32) -> Option<Fell> {
     }
 }
 
+/// The bounds the program keeps a template's `PhysicsPropertyGravityScaler`
+/// `Scale` within: -10 and 10 (0x82DE8C30, 0x820BAEEC).
+pub const GRAVITY_SCALE_LIMITS: (f32, f32) = (-10.0, 10.0);
+
+/// The downward pull, m/s², on a person whose template scales gravity by
+/// `scale` (the paratroopers' 0.2) when it would otherwise be `gravity`.
+///
+/// From the 360 code: the object physics setup (0x821831B0) looks the
+/// object up in the `PhysicsPropertyGravityScaler` store (0x83651B64) and
+/// gives its rigid bodies an action (vtable 0x820C8284) holding the scale,
+/// clamped to [`GRAVITY_SCALE_LIMITS`]. That the walking capsule a person
+/// falls as (`InAir.Fall`) is among those bodies is inferred, not read.
+pub fn scaled_gravity(gravity: f32, scale: f32) -> f32 {
+    gravity * scale.clamp(GRAVITY_SCALE_LIMITS.0, GRAVITY_SCALE_LIMITS.1)
+}
+
 /// How far a person fell: the height they left the ground at less the
 /// height they came down at.
 ///
@@ -706,6 +722,29 @@ mod tests {
         // The messages' names hash to the program's words.
         assert_eq!(m2_assets::name_hash(FallImpact::Light.name()), 0x9e1b_18f4);
         assert_eq!(m2_assets::name_hash(FallImpact::Heavy.name()), 0x5648_2a61);
+    }
+
+    #[test]
+    fn a_gravity_scale_is_kept_within_ten_either_way() {
+        // The paratroopers' 0.2 of the program's 9.8.
+        assert!((scaled_gravity(9.8, 0.2) - 1.96).abs() < 1e-5);
+        assert_eq!(scaled_gravity(9.8, 1.0), 9.8);
+        assert_eq!(scaled_gravity(1.0, 25.0), 10.0);
+        assert_eq!(scaled_gravity(1.0, -25.0), -10.0);
+    }
+
+    #[test]
+    fn a_paratrooper_dropped_high_takes_the_deadly_falls_damage() {
+        // Dropped 100 m over the ground (`paradroplocation` flies its plane
+        // that high), a soldier's limits make the fall deadly whatever the
+        // pull: the distance is the height left less the height landed.
+        let mut w = FallWatch::default();
+        assert_eq!(w.step(true, 140.0), None);
+        let fell = w.step(false, 40.0).unwrap();
+        assert_eq!(
+            fall_impact(&FallLimits::default(), fell).map(|f| f.damage),
+            Some(FALL_DEATH_DAMAGE)
+        );
     }
 
     #[test]

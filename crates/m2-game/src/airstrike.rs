@@ -171,10 +171,24 @@ pub(crate) fn install(
     Ok(())
 }
 
+/// The template a flyby of a name the database lacks flies instead.
+///
+/// From the 360 code: `Airstrike.Flyby` (0x823158D0) looks its first
+/// argument's name hash up among the templates (0x82408B88) and hands the
+/// result, none for a name the database lacks, to the flyby's spawn
+/// (0x82392AE8), which with none looks up name hash 0x8307FF04 instead:
+/// `b52_ghost` (from samples: the one template of that hash).
+pub const FLYBY_FALLBACK: &str = "b52_ghost";
+
 fn flyby(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiValue> {
-    let Some(what) = template_name(w, a.first()) else {
+    let Some(mut what) = template_name(w, a.first()) else {
         return values([Value::Nil]);
     };
+    // A name no template has (the paradrop locations' "paradop"): the
+    // program's fallback, where the database is known.
+    if !w.template_names.is_empty() && !w.is_template(&what) {
+        what = FLYBY_FALLBACK.to_owned();
+    }
     let n = |i: usize| num(a.get(i)).unwrap_or(0.0);
     let altitude = n(5);
     let from = [n(1), altitude, n(2)];

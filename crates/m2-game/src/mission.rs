@@ -3164,7 +3164,21 @@ fn seat_crew(
 /// `repairpad` is the script of the helipads and the PMC's garage
 /// (0xcd561a19): awake, its lights are on (`Vehicle.SetParts` of
 /// `LightFront`), and they go out when it dies.
-pub const OBJECT_SCRIPTS: [(&str, u32); 16] = [
+///
+/// The paradrop chain: `paradroplocation` (the 20 placed `Paradrop
+/// Location (AL/CH)`, 0xc1349ba1), awake, flies its faction's paradrop
+/// plane 100 m over it from 50 m west and 300 m north at 40 m/s
+/// (`Airstrike.Flyby`) and removes itself; the plane's `paradrop`
+/// (0x6dea6fe8) shows a blip coloured by its faction's relation to the
+/// PMC and drops 16 men, one each 0.75 s from 6 s on, within 10 m of it
+/// (`Pg.Spawn` of the faction's `Paratrooper`); the man's `paratrooper`
+/// (0xee1b0a30), awake, waits for his health to drop below 100 (his
+/// landing's fall damage, or a round) and puts the faction's `Airborne`
+/// soldier in his place. The locations name their plane
+/// `"Support Vehicle (paradop_al)"` (sic), a template the data lacks, so
+/// the flyby is the program's fallback ([`crate::airstrike`]) and no men
+/// drop from it.
+pub const OBJECT_SCRIPTS: [(&str, u32); 19] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3179,9 +3193,19 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 16] = [
     ("pmcgate", PMC_GATE),
     ("repairpad", REPAIR_PAD),
     ("pursuitcopter", PURSUIT_COPTER),
+    ("paradroplocation", PARADROP_LOCATION),
+    ("paradrop", PARADROP),
+    ("paratrooper", PARATROOPER),
     ("AntiAir", homing::ANTI_AIR),
     ("HomingMissile", homing::HOMING_MISSILE),
 ];
+
+/// `paradroplocation`'s module hash.
+pub const PARADROP_LOCATION: u32 = 0xc134_9ba1;
+/// `paradrop`'s module hash (the paradrop plane's script).
+pub const PARADROP: u32 = 0x6dea_6fe8;
+/// `paratrooper`'s module hash.
+pub const PARATROOPER: u32 = 0xee1b_0a30;
 
 /// `pursuitcopter`'s module hash.
 pub const PURSUIT_COPTER: u32 = 0x3e29_6216;
@@ -3842,6 +3866,66 @@ mod tests {
         assert_eq!(low, "<=");
         // A part she doesn't have never holds.
         assert_eq!(part, 0);
+    }
+
+    // The paratrooper's own watch, its figure a string: the 360 reads it
+    // through Lua's conversion, so it holds below 100.
+    #[test]
+    fn a_health_watch_reads_a_figure_given_as_text() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        let man = m.spawn("Allied Paratrooper", [0.0, 100.0, 0.0]).unwrap();
+        m.run(
+            &format!(
+                r#"
+                shed = 0
+                Event.Create(Event.ObjectHealth, {{ Sys.StringToGuid('{man:#x}'), "<", "100" }},
+                    function() shed = shed + 1 end)
+                "#
+            ),
+            "test",
+        )
+        .unwrap();
+        m.tick(0.1);
+        m.set_health(man, 120.0);
+        m.tick(0.1);
+        assert_eq!(m.lua().globals().raw_get::<i64>("shed").unwrap(), 0);
+        m.set_health(man, 90.0);
+        m.tick(0.1);
+        m.tick(0.1);
+        assert_eq!(m.lua().globals().raw_get::<i64>("shed").unwrap(), 1);
+    }
+
+    // The paradrop locations name a plane the data lacks ("paradop"): the
+    // flyby is of the program's fallback, `b52_ghost`; a plane it has
+    // flies as named.
+    #[test]
+    fn a_flyby_of_a_template_the_data_lacks_is_of_the_fallback() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.world.borrow_mut().template_names.extend([
+            "b52_ghost".to_owned(),
+            "support vehicle (paradrop_al)".to_owned(),
+        ]);
+        m.take_commands();
+        m.run(
+            r#"
+            Airstrike.Flyby("Support Vehicle (paradop_al)", -50, 300, 0, 0, 100, 40)
+            Airstrike.Flyby("Support Vehicle (Paradrop_AL)", -50, 300, 0, 0, 100, 40)
+            "#,
+            "test",
+        )
+        .unwrap();
+        let flown: Vec<String> = m
+            .take_commands()
+            .into_iter()
+            .filter_map(|c| match c {
+                Command::Flyby { what, .. } => Some(what),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(flown, ["b52_ghost", "Support Vehicle (Paradrop_AL)"]);
+        assert!(OBJECT_SCRIPTS.contains(&("paradroplocation", PARADROP_LOCATION)));
+        assert!(OBJECT_SCRIPTS.contains(&("paradrop", PARADROP)));
+        assert!(OBJECT_SCRIPTS.contains(&("paratrooper", PARATROOPER)));
     }
 
     #[test]
