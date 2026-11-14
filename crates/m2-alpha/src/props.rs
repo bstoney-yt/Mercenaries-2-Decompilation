@@ -654,10 +654,24 @@ impl Props {
         let mut at = Mat4::from_rotation_translation(p.rotation, p.position);
         if let (Some(bed), Some(place)) = (bed, physics.vehicle_transform(id)) {
             let local = place.inverse() * at;
+            let (lo, _) = box_around(local, bounds);
             let lift = bed.lift_onto(box_around(local, bounds), BED_CLEAR);
             if lift > 0.0 {
                 at = place * Mat4::from_translation(Vec3::Y * lift) * local;
             }
+            // Where it starts, in the vehicle's frame: its box's bottom
+            // against the bed's floor under it (the floor is BED_CLEAR
+            // under the bottom once lifted).
+            let floor = if lift > 0.0 {
+                format!("bed floor {:.2}", lo.y + lift - BED_CLEAR)
+            } else {
+                "on or over the bed already".to_owned()
+            };
+            eprintln!(
+                "cargo: {entity:#x} loaded: lifted {lift:.2} m, its bottom {:.2} -> {:.2} m up the vehicle ({floor})",
+                lo.y,
+                lo.y + lift
+            );
         }
         let velocity = physics.vehicle_velocity(id);
         physics.remove_static(StaticKey::Entity(entity));
