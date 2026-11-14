@@ -5140,10 +5140,10 @@ impl Combat {
     /// masses at the speed they closed at along the contact normal
     /// (before the step that met), and each takes
     /// [`m2_engine::durability::crash_damage`] of it with the damage
-    /// table's cell for its own `ModifierKey` row and the other's kind
-    /// (`Car`, every vehicle's `DamageKey`): a `Car` takes twice the
-    /// hundredth, a `Tank` none, and nothing under size 5 or past no more
-    /// than 1. The part where they met takes the same. Returns the
+    /// table's cell for its own `ModifierKey` row and the other's key's
+    /// column (`Car` where its template names none): a `Car` takes twice
+    /// the hundredth from a car or a tank, a `Tank` none, and nothing
+    /// under size 5 or past no more than 1. The part where they met takes the same. Returns the
     /// crashes, for the log: (struck vehicle, the other, closing speed,
     /// damage it took). From the 360 code: the size, floor, hundredth and
     /// cells (0x82162BB8, 0x82163758, 0x8228B5F0, 0x82287CF8). Inferred:
