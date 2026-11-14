@@ -200,8 +200,50 @@ fn main() -> Result<()> {
             println!("{s}");
         }
     }
+    if name.eq_ignore_ascii_case("dropoff")
+        && let Some(&(_, first, at)) = on.first()
+    {
+        dropoff(&mut mission, first, at);
+    }
     println!("{name} lines logged: {failures}");
     Ok(())
+}
+
+/// `dropoff`: she stands 20 m from the first drop point for 70 s (its
+/// wait is 30 to 60 s). Prints what the scripts spawn and fly there and
+/// their errors (`dropoff:` lines).
+fn dropoff(mission: &mut Mission, first: u32, at: [f32; 3]) {
+    let name = mission
+        .world()
+        .borrow()
+        .objects
+        .get(&first)
+        .map(|o| o.name.clone());
+    println!("dropoff: {first:#x} {name:?} at {at:?}");
+    mission.put_player([at[0] + 20.0, at[1], at[2]]);
+    mission.take_commands();
+    mission.take_log();
+    let start = mission.now();
+    let mut shown = 0;
+    while mission.now() < start + 70.0 {
+        mission.tick(0.25);
+        for c in mission.take_commands() {
+            let line = match &c {
+                Command::Spawn { what, position, .. } => format!("spawn {what} at {position:.0?}"),
+                Command::Goal { .. } => format!("{c:?}").chars().take(140).collect(),
+                _ => continue,
+            };
+            if shown < 20 {
+                shown += 1;
+                println!("dropoff: t={:.1} {line}", mission.now() - start);
+            }
+        }
+        for l in mission.take_log() {
+            if l.contains("rror") || l.contains("Dropoff") || l.contains("DropOff") {
+                println!("dropoff: log {}", l.chars().take(160).collect::<String>());
+            }
+        }
+    }
 }
 
 /// `AntiAir`: a crewed one (the layers' have no driver here, and only a

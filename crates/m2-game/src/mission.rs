@@ -3164,7 +3164,7 @@ fn seat_crew(
 /// `repairpad` is the script of the helipads and the PMC's garage
 /// (0xcd561a19): awake, its lights are on (`Vehicle.SetParts` of
 /// `LightFront`), and they go out when it dies.
-pub const OBJECT_SCRIPTS: [(&str, u32); 16] = [
+pub const OBJECT_SCRIPTS: [(&str, u32); 17] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3181,7 +3181,16 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 16] = [
     ("pursuitcopter", PURSUIT_COPTER),
     ("AntiAir", homing::ANTI_AIR),
     ("HomingMissile", homing::HOMING_MISSILE),
+    ("dropoff", DROPOFF),
 ];
+
+/// `dropoff`'s module hash: the script of the `DropPoint (..)` templates
+/// (13 placed). Its name is from the hash. Awake, it waits 30 to 60 s
+/// (`math.randf`) and has its faction's helicopter bring one of its
+/// faction's cargoes there (`MrxCopterDrop.Create`): containers or a
+/// vehicle (`M151 .50Cal (VZ)`, `M151 (MG) (GR)`, `NGLV (MG)`, `EXT`,
+/// `HMMWV (Armored) (50Cal)`, `T300 (M60)`), once each time it wakes.
+pub const DROPOFF: u32 = 0x8fc9_ade1;
 
 /// `pursuitcopter`'s module hash.
 pub const PURSUIT_COPTER: u32 = 0x3e29_6216;
@@ -3359,6 +3368,17 @@ pub(crate) fn is_exclusion(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // `dropoff` is run under the name its hash is of.
+    #[test]
+    fn the_drop_points_are_run_by_their_name() {
+        assert_eq!(m2_assets::name_hash("dropoff"), super::DROPOFF);
+        assert!(
+            super::OBJECT_SCRIPTS
+                .iter()
+                .any(|&(n, h)| n == "dropoff" && h == super::DROPOFF)
+        );
+    }
+
     use super::*;
 
     // A key set only in tables reads nil as a global unless some script
