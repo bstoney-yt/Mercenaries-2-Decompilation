@@ -3019,6 +3019,7 @@ impl Combat {
         } else {
             trigger
         };
+        self.her_vehicle_wrecked(f);
         // A fall that hurt her ([`m2_engine::on_foot::fall_impact`]).
         if let Some(fell) = f.player.fell.take() {
             self.hurt_player(f, fell.damage, None);
@@ -3979,6 +3980,48 @@ impl Combat {
     /// ([`m2_engine::stagger`]: the long stagger, for the explosion keys
     /// only). The way it travelled is taken as from the blast to her
     /// (inferred).
+    /// The vehicle she is in was wrecked: she is put out of it, the
+    /// blast at its middle reaches her as on foot (the blasts here pass
+    /// over anyone in a vehicle, [`Combat::explode`]), and it knocks her
+    /// down (playtest 2026-11-14: she sat on unhurt in the burning wreck).
+    ///
+    /// From the 360 code: a person who dies in a seat is first put out of
+    /// it, as the seat's mode says (0x82287EC0: mode 2 gets out by
+    /// 0x822A1280, then dies by 0x82287F98; 1 dies there as a ragdoll).
+    /// Inferred: that a living rider is put out of a dead vehicle too
+    /// (the vehicle's death, 0x82289F40, was not seen to do it), and the
+    /// blast: an `Explosion` at the vehicle's middle, by her own row of
+    /// the damage table ([`HeroDamage`]).
+    fn her_vehicle_wrecked(&mut self, f: &mut Field<'_>) {
+        let Some(i) = f.player.driving else {
+            return;
+        };
+        let Some(v) = f.vehicles.get(i).filter(|v| v.wrecked) else {
+            return;
+        };
+        let Some(body) = v.id.and_then(|id| f.physics.vehicle_transform(id)) else {
+            return;
+        };
+        let (lo, hi) = v.spec.bounds;
+        let middle = body.transform_point3((lo + hi) * 0.5);
+        eprintln!(
+            "wreck: the {} she is in is wrecked: she is thrown out",
+            v.spec.label
+        );
+        crate::game::get_out(f.physics, v, None, f.player);
+        if f.player.driving.is_some() {
+            // Nowhere to put her: as before.
+            return;
+        }
+        self.seat = 0;
+        let key = Some(m2_assets::name_hash("Explosion"));
+        let d = (f.player.character.position + Vec3::Y).distance(middle);
+        let damage = 100.0 * (1.0 - d / REACH).max(0.0);
+        self.tally.taken_blasts +=
+            self.hurt_player(f, damage * self.hero_damage.explosion, Some(middle));
+        Self::blast_staggers_her(f, middle, key);
+    }
+
     fn blast_staggers_her(f: &mut Field<'_>, at: Vec3, key: Option<u32>) {
         let direction = (f.player.character.position - at).with_y(0.0);
         f.player.stagger(&m2_engine::stagger::Event {
@@ -7526,6 +7569,61 @@ mod tests {
             combat.slung(false),
             [Some(Weapon::Rifle), Some(Weapon::GrenadeLauncher)]
         );
+    }
+
+    #[test]
+    fn she_is_thrown_out_of_her_wrecked_vehicle_and_hurt() {
+        use m2_engine::tuning::VehicleTuning;
+        let mut physics = ground();
+        let dt = 1.0 / 60.0;
+        let spec = crate::npc::tests::tank(VehicleTuning::default());
+        let id = physics.add_vehicle(&spec, Vec3::new(0.0, 0.1, 0.0), 0.0);
+        physics.step(dt);
+        let mut vehicles = vec![ParkedVehicle {
+            spec,
+            model: crate::npc::tests::empty_model(),
+            id: Some(id),
+            wrecked: false,
+            guid: None,
+            spot: None,
+            crew: Vec::new(),
+            turret: 0.0,
+            hijack_nodes: Vec::new(),
+            door_turns: Vec::new(),
+            gun: 0.0,
+            aims: Vec::new(),
+            rolled: 0.0,
+            fired: 0,
+            mg_fired: 0,
+            damage: 0.0,
+            hit: 0.0,
+            parts: None,
+            loose: Vec::new(),
+            debris_thrown: false,
+        }];
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        player.driving = Some(0);
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        let mut combat = Combat::default();
+        let full = combat.hp;
+        let mut field = Field {
+            physics: &mut physics,
+            player: &mut player,
+            people: &mut people,
+            vehicles: &mut vehicles,
+            arsenal: &arsenal,
+            explosives: &mut [],
+        };
+        // Whole, she stays in it.
+        combat.step(&mut field, Trigger::default(), dt);
+        assert_eq!(field.player.driving, Some(0));
+        assert_eq!(combat.hp, full);
+        // Wrecked: out of it, hurt by its blast.
+        field.vehicles[0].wrecked = true;
+        combat.step(&mut field, Trigger::default(), dt);
+        assert_eq!(field.player.driving, None);
+        assert!(combat.hp < full, "{} of {full}", combat.hp);
     }
 
     #[test]
