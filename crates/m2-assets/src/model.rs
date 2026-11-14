@@ -888,6 +888,11 @@ pub struct StateActs {
     /// (`SendMessage` naming a node: a canopy's trunk tells its crown,
     /// `Slice00`, to come down), as (message, the part's node).
     pub told: Vec<(u32, u16)>,
+    /// The parts it sends off as objects of their own (`CreateObject`
+    /// naming [`DEBRIS_TEMPLATE`]: a burning palm's leaves), each with the
+    /// state its machine starts in there (`FireDebrisState`, embers; or
+    /// `DebrisState`): (state, the part's node).
+    pub creates: Vec<(u32, u16)>,
     /// The states it puts parts in later (verb `0xBD3403A0`): (state,
     /// part's node, and the seconds between which the delay falls). From
     /// the 360 code (0x82231C58): the delay is `a + r (b - a)`, `r` a
@@ -929,6 +934,9 @@ const SEND_DAMAGE: u32 = 0x82d1_e93c;
 const SEND_MESSAGE: u32 = 0xba20_f82c;
 const STOP_EMITTER: u32 = 0x687c_78c5;
 const DETACH_STATE: u32 = 0xa530_b827;
+/// `DebrisTemplate`: the template field a `CreateObject` names for the
+/// object a part goes off as (a palm's leaves).
+pub const DEBRIS_TEMPLATE: u32 = 0x31eb_7ea2;
 /// The verb that puts a part in a state after a random delay
 /// (`StateActs::delayed`); its name is not in the dictionary.
 pub const SET_STATE_LATER: u32 = 0xbd34_03a0;
@@ -1055,6 +1063,15 @@ impl PartStates {
                                         if operands.iter().any(|&at| w[at] == DETACH_STATE) {
                                             acts.detaches.extend(op(1).and_then(first));
                                         }
+                                        // (1, 0, `DebrisTemplate`, state, part): the
+                                        // part goes off as an object of the
+                                        // template's debris template, its machine
+                                        // starting in that state.
+                                        if let (Some(DEBRIS_TEMPLATE), Some(to), Some(n)) =
+                                            (op(2), op(3), op(4).and_then(first))
+                                        {
+                                            acts.creates.push((to, n));
+                                        }
                                     }
                                     SEND_DAMAGE => {
                                         if let (Some(amount), Some(to)) = (op(0), op(1)) {
@@ -1119,6 +1136,7 @@ impl PartStates {
                             messages,
                             told,
                             delayed,
+                            creates,
                             ..
                         } = acts;
                         a.on.extend(on);
@@ -1129,6 +1147,7 @@ impl PartStates {
                         a.messages.extend(messages);
                         a.told.extend(told);
                         a.delayed.extend(delayed);
+                        a.creates.extend(creates);
                     }
                 }
                 _ => {}
@@ -2221,6 +2240,18 @@ mod tests {
                         101,
                         2,
                         SEND_MESSAGE,
+                        1,
+                        1,
+                        1,
+                        0,
+                        1,
+                        DEBRIS_TEMPLATE,
+                        1,
+                        0x4c88_281b,
+                        1,
+                        101,
+                        2,
+                        CREATE_OBJECT,
                         3,
                     ]),
                 ),
@@ -2244,6 +2275,8 @@ mod tests {
         let acts = &states.machines[0].acts[0];
         assert_eq!(acts.delayed, vec![(0x3cc4_e770, 0, 2.5, 3.0)]);
         assert_eq!(acts.told, vec![(0x1b07_1983, 1)]);
+        // And, as a burning palm's trunk, sends the part off burning.
+        assert_eq!(acts.creates, vec![(0x4c88_281b, 1)]);
     }
 
     #[test]

@@ -1111,6 +1111,16 @@ impl Destruction {
                     combat.state_shows(shows);
                 }
             }
+            // A part sent off as an object of its own (a burning palm's
+            // leaves): the change is that object's, whose effects show, but
+            // not the object's it left, whose script is not told.
+            if c.sent_off {
+                eprintln!(
+                    "destruct: {k:#x}'s part {:08x} goes off in {:08x}",
+                    c.machine, c.state
+                );
+                continue;
+            }
             let entity = if adopted(k) {
                 let Some(o) = world.index.objects.get((k & !ADOPTED) as usize).copied() else {
                     continue;
