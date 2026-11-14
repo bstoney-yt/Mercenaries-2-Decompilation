@@ -297,7 +297,14 @@ enum Cause {
     Blast(BlastPush),
     /// A vehicle of `mass` (kg) running into it at `velocity` (m/s): its
     /// pieces knocked on as the vehicle knocks loose what it hits.
-    Crash { velocity: Vec3, mass: f32 },
+    /// `sound` is the vehicle's `SoundKey` (0: none known), what it
+    /// brings down is heard by ([`crash_cue`]), even when that comes down
+    /// later (a prop put up to fall, [`Destruction::update`]).
+    Crash {
+        velocity: Vec3,
+        mass: f32,
+        sound: u32,
+    },
 }
 
 impl Cause {
@@ -308,10 +315,32 @@ impl Cause {
     /// to).
     fn flings(&self, at: Vec3, mass: f32) -> (Vec3, Vec3) {
         match *self {
-            Cause::Crash { velocity, mass: by } => crate::game::flung(velocity, by, mass),
+            Cause::Crash {
+                velocity, mass: by, ..
+            } => crate::game::flung(velocity, by, mass),
             Cause::Blast(push) => push.throw(at, at, 1.0),
         }
     }
+
+    /// What a break by it of something whose `SoundKey` is `key` is heard
+    /// as: by a vehicle, the sound table's cue for the two
+    /// ([`crash_cue`]); by a blast or a round, its own key.
+    fn heard(&self, table: Option<&m2_engine::tuning::KeyTable>, key: u32) -> u32 {
+        match *self {
+            Cause::Crash { sound, .. } => crash_cue(table, sound, key),
+            Cause::Blast(_) => key,
+        }
+    }
+}
+
+/// What something whose `SoundKey` is `key` run into by a vehicle whose
+/// `SoundKey` is `vehicle` is heard as: the sound table's cell for the
+/// two, one way round else the other, a key it lacks finding its first
+/// row or column (0x8235E850 -> 0x82398958; a vehicle whose key isn't
+/// known, 0, so finds the first row); its own key only where there is no
+/// table or the cell is empty.
+fn crash_cue(table: Option<&m2_engine::tuning::KeyTable>, vehicle: u32, key: u32) -> u32 {
+    table.and_then(|t| t.either(vehicle, key)).unwrap_or(key)
 }
 
 /// What a model's part state starts: effect template name hash, and
@@ -632,13 +661,14 @@ impl Destruction {
             StaticKey::Entity(e) => {
                 match cause {
                     Cause::Blast(at) => props.wreck(&mut world.physics, e, Some(at)),
-                    Cause::Crash { velocity, mass } => {
+                    Cause::Crash { velocity, mass, .. } => {
                         props.wreck_crashed(&mut world.physics, e, |shifted| {
                             crate::game::flung(velocity, mass, shifted)
                         })
                     }
                 };
                 if let (Some(k), Some(c)) = (sound, props.centre(e)) {
+                    let k = cause.heard(world.index.template_db.sound_table.as_ref(), k);
                     self.heard.push((c, k));
                 }
             }
@@ -675,6 +705,7 @@ impl Destruction {
         let cause = Cause::Crash {
             velocity: vehicle.velocity,
             mass: vehicle.mass,
+            sound: vehicle.sound,
         };
         let size = m2_engine::durability::crash_size(vehicle.mass, 0.0, speed);
         let hit = (
@@ -834,11 +865,12 @@ impl Destruction {
                         crash.map(|c| c.how),
                         vehicle.mass,
                         vehicle.velocity.length(),
-                        break_sound(world, o.template)
+                        break_sound(world, o.template, self.in_crash.then_some(self.crashing))
                     );
                     let cause = Cause::Crash {
                         velocity: vehicle.velocity,
                         mass: vehicle.mass,
+                        sound: vehicle.sound,
                     };
                     self.bring_down(world, props, install, i, cause);
                     out.push(Crashed::Down(key));
@@ -887,7 +919,7 @@ impl Destruction {
                         crash.map(|c| c.how),
                         vehicle.mass,
                         vehicle.velocity.length(),
-                        break_sound(world, template)
+                        break_sound(world, template, self.in_crash.then_some(self.crashing))
                     );
                     if let Some(&k) = world.index.template_db.sound_keys.get(&template) {
                         let k = self.heard_as(world, k);
@@ -951,7 +983,7 @@ impl Destruction {
                 parts.count(),
                 vehicle.mass,
                 vehicle.velocity.length(),
-                break_sound(world, template)
+                break_sound(world, template, self.in_crash.then_some(self.crashing))
             );
             props.wreck_part(&mut world.physics, e, k, |shifted| {
                 crate::game::flung(vehicle.velocity, vehicle.mass, shifted)
@@ -997,7 +1029,7 @@ impl Destruction {
             parts.count(),
             vehicle.mass,
             vehicle.velocity.length(),
-            break_sound(world, o.template)
+            break_sound(world, o.template, self.in_crash.then_some(self.crashing))
         );
         for &k in &hit {
             self.part_heard(world, o.template, parts, at, k, o.position);
@@ -1012,11 +1044,14 @@ impl Destruction {
     /// hedges, `prop_foliage_sml`, against the M151's `veh_armored_light`
     /// give cue 1d0a87e6); else, or where the table has none, its own key.
     fn heard_as(&self, world: &World, key: u32) -> u32 {
-        (self.crashing != 0)
-            .then(|| world.index.template_db.sound_table.as_ref())
-            .flatten()
-            .and_then(|t| t.either(self.crashing, key))
-            .unwrap_or(key)
+        if !self.in_crash {
+            return key;
+        }
+        crash_cue(
+            world.index.template_db.sound_table.as_ref(),
+            self.crashing,
+            key,
+        )
     }
 
     /// What a vehicle bringing down `template` at `at` throws up: the
@@ -1169,7 +1204,10 @@ impl Destruction {
                 .durability
                 .get(&template)
                 .is_some_and(|d| d.collapse.is_some());
-            let sound_key = db.sound_keys.get(&template).copied();
+            let sound_key = db
+                .sound_keys
+                .get(&template)
+                .map(|&k| cause.heard(db.sound_table.as_ref(), k));
             match cause {
                 Cause::Blast(from) => {
                     props.wreck(&mut world.physics, key, Some(from));
@@ -1190,7 +1228,7 @@ impl Destruction {
                         combat.state_shows(props.state_effects(key, m2_engine::StateFx::COLLAPSE));
                     }
                 }
-                Cause::Crash { velocity, mass } => {
+                Cause::Crash { velocity, mass, .. } => {
                     props.wreck_crashed(&mut world.physics, key, |shifted| {
                         crate::game::flung(velocity, mass, shifted)
                     });
@@ -1210,7 +1248,7 @@ impl Destruction {
 /// collapse's rumble; anything else is heard as its `SoundKey` says
 /// (`sound: key ... plays ...` logs what that is), or not at all if it
 /// has none (no other sound stands in).
-fn break_sound(world: &World, template: u32) -> String {
+fn break_sound(world: &World, template: u32, crashing: Option<u32>) -> String {
     let db = &world.index.template_db;
     let name = db.names.get(&template).map_or("?", String::as_str);
     let building = db
@@ -1220,6 +1258,14 @@ fn break_sound(world: &World, template: u32) -> String {
     match db.sound_keys.get(&template) {
         _ if building => {
             format!("template {template:08x} {name:?} has a building's collapse: no break sound")
+        }
+        Some(&k) if crashing.is_some() => {
+            let v = crashing.unwrap_or(0);
+            format!(
+                "template {template:08x} {name:?} (SoundKey {k:08x}) heard as cue {:08x} of the \
+                 sound table (vehicle key {v:08x})",
+                crash_cue(db.sound_table.as_ref(), v, k)
+            )
         }
         Some(k) => format!("template {template:08x} {name:?} heard by its SoundKey {k:08x}"),
         None => format!("template {template:08x} {name:?} has no SoundKey: none played"),
@@ -1258,6 +1304,50 @@ mod tests {
     use m2_math::glam::Quat;
 
     use super::*;
+
+    /// A sound table of rows Car, Plant (keys 1, 2) and column Plant (2):
+    /// Car x Plant cue 0xc0e, Plant x Plant empty.
+    fn plant_table() -> m2_engine::tuning::KeyTable {
+        // The asset's layout: rows and columns at 0x48 and 0x4c, their
+        // keys from 0x50, then 8-byte cells.
+        let mut d = vec![0u8; 0x50];
+        d[0x48..0x4c].copy_from_slice(&2u32.to_le_bytes());
+        d[0x4c..0x50].copy_from_slice(&1u32.to_le_bytes());
+        for w in [1u32, 2, 2, 0xc0e, 0, 0, 0] {
+            d.extend_from_slice(&w.to_le_bytes());
+        }
+        m2_engine::tuning::KeyTable::parse(&d).expect("a table")
+    }
+
+    #[test]
+    fn what_a_vehicle_runs_into_is_heard_by_the_sound_tables_cue() {
+        let t = plant_table();
+        // The plant's own key (2) has no sound of its own: the car's row
+        // decides (bring_down's loose and wreck branches, the parts of a
+        // part-breaking object, all by `heard_as` in a crash).
+        assert_eq!(crash_cue(Some(&t), 1, 2), 0xc0e);
+        // A vehicle whose key isn't known finds the first row.
+        assert_eq!(crash_cue(Some(&t), 0, 2), 0xc0e);
+        // No table, or an empty cell both ways: its own key.
+        assert_eq!(crash_cue(None, 1, 2), 2);
+        assert_eq!(crash_cue(Some(&t), 2, 2), 2);
+    }
+
+    #[test]
+    fn what_comes_down_later_is_heard_as_its_cause_has_it() {
+        // A prop put up to fall (`falling`) or a state layer's prop
+        // wrecked at once: run into, the table's cue; blown up, its own.
+        let t = plant_table();
+        let crash = Cause::Crash {
+            velocity: Vec3::X,
+            mass: 3000.0,
+            sound: 1,
+        };
+        assert_eq!(crash.heard(Some(&t), 2), 0xc0e);
+        assert_eq!(crash.heard(None, 2), 2);
+        let blast = Cause::Blast(BlastPush::none(Vec3::ZERO));
+        assert_eq!(blast.heard(Some(&t), 2), 2);
+    }
 
     /// A jeep: 4.4 m long along z, 2 m wide, 1.6 m high, standing at
     /// `at` facing +z.
