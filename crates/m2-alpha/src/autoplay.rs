@@ -932,6 +932,15 @@ pub struct Autoplay {
     /// The current contract's active deliveries (set each tick:
     /// [`crate::mission::MissionLink::deliveries`]).
     pub deliveries: Vec<Delivery>,
+    /// The scripts turned down her last support call ("[PDA.Support.denied.
+    /// ...]" in the message box: `MrxSupport` main.F33, script line 734, as
+    /// `TestAALevel` of the designator's `sAATestLevel` finds anti-air up;
+    /// set by the game loop, taken each tick).
+    pub support_denied: bool,
+    /// What she is not to call support on again: what a call was turned
+    /// down for (AllCon003's Chinese AA, "medium": 21 bunker busters
+    /// turned down in 2400 s on her first try at it).
+    no_strike: Vec<u32>,
     /// The delivery she last got out at, and when: getting back into a
     /// vehicle while it still stands is a failed delivery, logged.
     pub delivery_exit: Option<(u32, f32)>,
@@ -1610,8 +1619,21 @@ impl Autoplay {
                 self.clock, p.template
             );
         }
+        // A call the scripts turned down: not again on what it was for.
+        if std::mem::take(&mut self.support_denied)
+            && let Some(Goal::Blast { target, .. }) = &self.goal
+            && !self.no_strike.contains(target)
+        {
+            eprintln!(
+                "autoplay {:.1} s: support turned down for {target:#x} (anti-air up): her own weapons from now on",
+                self.clock
+            );
+            self.no_strike.push(*target);
+        }
         let striking = !rifle
-            && matches!(&self.goal, Some(Goal::Blast { target, at }) if (sturdy(target) && !cannon) || (spent && !gun(at) && !cannon))
+            && matches!(&self.goal, Some(Goal::Blast { target, at })
+                if may_strike(&self.no_strike, *target)
+                    && ((sturdy(target) && !cannon) || (spent && !gun(at) && !cannon)))
             || matches!(self.goal, Some(Goal::Deliver(_)));
         // A call she is no longer after is put away: the designator goes
         // with a weapon taken up (twice from the satellite's view).
@@ -5759,6 +5781,19 @@ fn perch(
     None
 }
 
+/// Whether she may call support on `target`: not on one a call was
+/// turned down for (the scripts' anti-air test, [`Autoplay::support_denied`]).
+fn may_strike(denied: &[u32], target: u32) -> bool {
+    !denied.contains(&target)
+}
+
+/// Whether a message the scripts put in the message box is a support call
+/// turned down (`MrxSupport`'s denial puts "[red][PDA.Support.denied.
+/// denied] " and the reason's text key in it).
+pub fn is_support_denial(text: &str) -> bool {
+    text.contains("[PDA.Support.denied.")
+}
+
 /// What she does first towards calling in a strike: driving, gets there
 /// in her vehicle; swimming, gets out of the water (she can't call support
 /// from it: AllCon003 on #631's check trod water 950 s by its third AA
@@ -7289,6 +7324,19 @@ mod tests {
             vantage(&p, target, target, &[], &BLAST_RINGS, BLAST_BODY),
             None
         );
+    }
+
+    // AllCon003: the Chinese AA turns down her bunker buster ("medium"),
+    // 21 times in 2400 s; once turned down, not called on it again.
+    #[test]
+    fn a_strike_turned_down_is_not_called_again() {
+        assert!(is_support_denial(
+            "[red][PDA.Support.denied.denied] [PDA.Support.denied.medium]"
+        ));
+        assert!(!is_support_denial("[PDA.Support.called]"));
+        assert!(may_strike(&[], 0xf9a92));
+        assert!(!may_strike(&[0xf9a92], 0xf9a92));
+        assert!(may_strike(&[0xf9a92], 0xf9aa3));
     }
 
     // AllCon003 on #631's check: in the water by its third AA gun she

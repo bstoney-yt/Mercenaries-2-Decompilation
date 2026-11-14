@@ -5307,6 +5307,13 @@ fn mission_for_screenshot(
                     continue;
                 }
                 boxed_seen = c.seq;
+                if c.group == "MessageBox"
+                    && c.method == "AddMessage"
+                    && let Some(a) = auto.as_mut()
+                    && autoplay::is_support_denial(&plain_text(&c.data))
+                {
+                    a.support_denied = true;
+                }
                 if c.callback && c.group == "MessageBox" && c.method == "AddMessage" {
                     boxed.push((now + message_seconds(&c.data), c.seq));
                 }
@@ -6723,6 +6730,21 @@ fn grapple_keys(game: &mut Game, input: &mut Input, allowed: bool) {
 
 /// How long the message box shows a message (its call's `nDuration`,
 /// seconds; 5 when not given, as the objectives' messages ask).
+/// The text a HUD call carries, its strings joined (a message box entry's
+/// `sText` and the like), for matching.
+fn plain_text(data: &gamehud::Plain) -> String {
+    use gamehud::Plain;
+    match data {
+        Plain::Text(t) => t.clone(),
+        Plain::Table(t) => t
+            .iter()
+            .map(|(_, v)| plain_text(v))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    }
+}
+
 fn message_seconds(data: &gamehud::Plain) -> f32 {
     use gamehud::Plain;
     let Plain::Table(t) = data else {
