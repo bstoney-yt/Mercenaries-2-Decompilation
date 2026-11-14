@@ -17,8 +17,19 @@ use m2_render::DrawQueue;
 
 use crate::flights::Flights;
 
-/// An aircraft flies on this far past its mark before it is gone, metres.
-const FLY_ON: f32 = 1500.0;
+/// How a flyby's path climbs past its mark: by this share of each leg's
+/// length, a leg being the way from where it came in to the mark.
+///
+/// From the 360 code (`Airstrike.Flyby` 0x823158D0 builds the path in
+/// 0x82392AE8): five points, its start, halfway (0.5 at 0x820D9EDC), the
+/// mark, then the mark plus the start-to-mark way once and twice, each of
+/// the last two higher by 0.25 (0x820DABDC) of that way's length plus the
+/// mark's height over the start (0 for a flyby: both are given the same
+/// altitude). So it flies on twice its run-in past the mark, climbing one
+/// in four. Not traced: what the path's controller (store 0x836567A0)
+/// does at the last point; here the aircraft is gone there, as the port
+/// had it gone at the end of its run before (inferred).
+const CLIMB: f32 = 0.25;
 /// Ordnance the template gives no speed falls at this, m/s.
 const FALL_SPEED: f32 = 80.0;
 /// Ordnance still flying this long is gone (it fell off the world).
@@ -36,9 +47,12 @@ struct Jet {
     /// Its heading, level, and speed (m/s).
     dir: Vec3,
     speed: f32,
-    /// Its mark, and how far on it has flown since it passed it.
+    /// Its mark, and how far on it has flown since it passed it (flat).
     to: Vec3,
     past: Option<f32>,
+    /// How far it flies on past the mark, flat: twice its run-in
+    /// ([`CLIMB`]).
+    fly_on: f32,
 }
 
 /// A bomb or missile in flight.
@@ -79,6 +93,27 @@ pub struct Strikes {
     wanted: Vec<u32>,
 }
 
+/// Flies jet `j` on by `dt` seconds along its path: level to its mark,
+/// then climbing ([`CLIMB`]). Whether it passed its mark just now.
+fn fly(j: &mut Jet, dt: f32) -> bool {
+    match &mut j.past {
+        Some(p) => {
+            let step = (j.dir + Vec3::Y * CLIMB).normalize_or(j.dir) * j.speed * dt;
+            j.at += step;
+            *p += step.with_y(0.0).length();
+            false
+        }
+        None => {
+            j.at += j.dir * j.speed * dt;
+            let passed = (j.to - j.at).with_y(0.0).dot(j.dir) <= 0.0;
+            if passed {
+                j.past = Some(0.0);
+            }
+            passed
+        }
+    }
+}
+
 impl Strikes {
     /// Starts what command `c` flies, if it is a strike's.
     pub fn start(&mut self, c: &Command, templates: &Templates) {
@@ -107,6 +142,7 @@ impl Strikes {
                     speed: speed.max(1.0),
                     to,
                     past: None,
+                    fly_on: 2.0 * (to - from).with_y(0.0).length(),
                 });
             }
             Command::Ordnance {
@@ -180,19 +216,13 @@ impl Strikes {
     /// Flies everything on by `dt` seconds.
     pub fn step(&mut self, physics: &Physics, dt: f32) {
         for j in &mut self.jets {
-            j.at += j.dir * j.speed * dt;
-            match &mut j.past {
-                Some(p) => *p += j.speed * dt,
-                None if (j.to - j.at).with_y(0.0).dot(j.dir) <= 0.0 => {
-                    j.past = Some(0.0);
-                    self.arrived.push((j.guid, j.to));
-                }
-                None => {}
+            if fly(j, dt) {
+                self.arrived.push((j.guid, j.to));
             }
         }
         let gone = &mut self.gone;
         self.jets.retain(|j| {
-            let stays = j.past.is_none_or(|p| p < FLY_ON);
+            let stays = j.past.is_none_or(|p| p < j.fly_on);
             if !stays {
                 gone.push(j.guid);
             }
@@ -349,18 +379,60 @@ mod tests {
         assert_eq!(s.arrived, vec![(7, Vec3::new(0.0, 0.0, 200.0))]);
         // In the air it is where it has flown to, heading north; gone,
         // it says so once.
+        // A second past its mark it has climbed one in four.
         let (guid, at, yaw) = s.jets().next().unwrap();
         assert_eq!((guid, yaw), (7, 0.0));
-        assert!((at.z - 300.0).abs() < 1.0 && s.gone.is_empty(), "{at}");
+        let flat = 100.0 / (1.0f32 + CLIMB * CLIMB).sqrt();
+        assert!(
+            (at.z - (200.0 + flat)).abs() < 1.0 && s.gone.is_empty(),
+            "{at}"
+        );
+        assert!((at.y - (100.0 + CLIMB * flat)).abs() < 1.0, "{at}");
         assert_eq!(s.jets.len(), 1);
         // It is heard from where it is for as long as it flies (no
         // template database here: no sound set).
-        assert_eq!(s.sounding(), vec![(7, Vec3::new(0.0, 100.0, 300.0), 0)]);
+        assert_eq!(s.sounding(), vec![(7, at, 0)]);
         for _ in 0..200 {
             s.step(&physics, 0.1);
         }
         assert!(s.sounding().is_empty());
         assert!(s.jets().next().is_none());
         assert_eq!(s.gone, vec![7]);
+    }
+
+    // AllCon003's gunship (300 m north of her to her, 40 m/s): it flies on
+    // twice its run-in past her, 600 m, climbing to 150 m above where it
+    // passed her, and is gone there.
+    #[test]
+    fn a_flyby_flies_on_twice_its_run_in_climbing() {
+        let mut s = Strikes::default();
+        s.start(
+            &Command::Flyby {
+                guid: 9,
+                what: "Support Vehicle (Autogunship)".into(),
+                from: [50.0, 100.0, 400.0],
+                to: [100.0, 100.0, 100.0],
+                speed: 40.0,
+            },
+            &Templates::default(),
+        );
+        let run_in = Vec3::new(50.0, 0.0, -300.0).length();
+        let physics = Physics::default();
+        let mut last = Vec3::ZERO;
+        let mut t = 0.0;
+        while s.gone.is_empty() && t < 60.0 {
+            if let Some((_, at, _)) = s.jets().next() {
+                last = at;
+            }
+            s.step(&physics, 0.05);
+            t += 0.05;
+        }
+        assert_eq!(s.gone, vec![9]);
+        let past = (last - Vec3::new(100.0, 0.0, 100.0)).with_y(0.0).length();
+        assert!((past - 2.0 * run_in).abs() < 3.0, "{past}");
+        assert!(
+            (last.y - (100.0 + 2.0 * CLIMB * run_in)).abs() < 2.0,
+            "{last}"
+        );
     }
 }
