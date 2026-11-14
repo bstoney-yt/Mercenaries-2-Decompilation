@@ -1809,6 +1809,8 @@ pub struct Combat {
     /// Pairs of vehicles body to body last tick ([`Combat::vehicle_crashes`]):
     /// a crash is counted as they meet, not while they stay pressed together.
     pub bumping: std::collections::HashSet<(VehicleId, VehicleId)>,
+    /// The vehicles touching statics last tick, and what ([`Combat::world_crashes`]).
+    pub bumping_statics: std::collections::HashSet<(VehicleId, m2_engine::StaticKey)>,
     /// The thrown weapons she can carry, as their templates say: the
     /// grenade, C4 and the proximity mine; which she throws, and how many
     /// C4 charges and mines she has (grenades are
@@ -2110,6 +2112,7 @@ impl Default for Combat {
             gl: Rifle::launcher(Weapon::GrenadeLauncher),
             damage_table: None,
             bumping: Default::default(),
+            bumping_statics: Default::default(),
             throwables: Vec::new(),
             explosive: 0,
             charges: 0,
@@ -5137,10 +5140,10 @@ impl Combat {
     /// masses at the speed they closed at along the contact normal
     /// (before the step that met), and each takes
     /// [`m2_engine::durability::crash_damage`] of it with the damage
-    /// table's cell for its own `ModifierKey` row and the other's kind
-    /// (`Car`, every vehicle's `DamageKey`): a `Car` takes twice the
-    /// hundredth, a `Tank` none, and nothing under size 5 or past no more
-    /// than 1. The part where they met takes the same. Returns the
+    /// table's cell for its own `ModifierKey` row and the other's key's
+    /// column (`Car` where its template names none): a `Car` takes twice
+    /// the hundredth from a car or a tank, a `Tank` none, and nothing
+    /// under size 5 or past no more than 1. The part where they met takes the same. Returns the
     /// crashes, for the log: (struck vehicle, the other, closing speed,
     /// damage it took). From the 360 code: the size, floor, hundredth and
     /// cells (0x82162BB8, 0x82163758, 0x8228B5F0, 0x82287CF8). Inferred:
@@ -5187,8 +5190,11 @@ impl Combat {
                 if vehicles[struck].wrecked {
                     continue;
                 }
+                // Its own key's row, the other's key's column (0x82287CF8);
+                // a template naming none counts as a car's.
+                let column = vehicles[other].spec.tuning.key.unwrap_or(kind);
                 let cell = match (self.damage_table.as_ref(), vehicles[struck].spec.tuning.key) {
-                    (Some(t), Some(row)) => t.scale(row, kind).unwrap_or(0.0),
+                    (Some(t), Some(row)) => t.scale(row, column).unwrap_or(0.0),
                     _ => 0.0,
                 };
                 let damage = m2_engine::durability::crash_damage(size, cell);
@@ -5203,6 +5209,76 @@ impl Combat {
                 self.hurt_vehicle(physics, v, struck, damage);
                 out.push((struck, other, closing, damage));
             }
+        }
+        out
+    }
+
+    /// Vehicles running into the world: each of `vehicles` whose body
+    /// has met a static since the last tick (the terrain, a rock, a wall,
+    /// a building) takes the crash's damage as one meeting another
+    /// vehicle does ([`Combat::vehicle_crashes`]): the crash's size from
+    /// its mass and the static's (a fixed one counts as
+    /// [`m2_engine::durability::FIXED_MASS`]) and the closing speed along
+    /// the contact, then the damage table's cell for its own
+    /// `ModifierKey` (row) against the static's key (column, from
+    /// `key_of`: `Terrain` for the ground, else its template's
+    /// `ModifierKey`; none counts as `Any`). Answers each crash that
+    /// passed the floor: the vehicle, what it met, the closing speed and
+    /// the damage (0 where the cell gave none past 1).
+    ///
+    /// From the 360 code: the collision event (0x82162BB8 -> 0x82163B80)
+    /// keeps each side's key from 0x82398D48 (the part it was struck on,
+    /// up its nodes to the whole's, 0x82398B18), and 0x19FC10AC
+    /// (`Terrain`) for a body of kind 13, the ground; 0x8228B5F0 drops it
+    /// under the floor and passes it to 0x82287CF8, which damages each
+    /// side by the cell (0x823987D0) of its own key's row and the other
+    /// side's column, times a hundredth of the size, where that is over
+    /// 1. A key the table lacks finds its first row or column (`Any`).
+    pub fn world_crashes(
+        &mut self,
+        physics: &mut Physics,
+        vehicles: &mut [ParkedVehicle],
+        key_of: impl Fn(m2_engine::StaticKey) -> Option<u32>,
+    ) -> Vec<(usize, m2_engine::StaticKey, f32, f32)> {
+        use m2_engine::durability as d;
+        let mut now = std::collections::HashSet::new();
+        let mut met = Vec::new();
+        for (i, v) in vehicles.iter().enumerate() {
+            let Some(a) = v.id else { continue };
+            if v.wrecked {
+                continue;
+            }
+            for (key, at, normal, mass) in physics.vehicle_static_hits(a) {
+                if now.insert((a, key)) && !self.bumping_statics.contains(&(a, key)) {
+                    met.push((i, key, at, normal, mass));
+                }
+            }
+        }
+        self.bumping_statics = now;
+        let any = m2_assets::name_hash("Any");
+        let mut out = Vec::new();
+        for (i, key, at, normal, mass) in met {
+            let Some(a) = vehicles[i].id else { continue };
+            let closing = physics.vehicle_velocity_before(a).dot(normal).max(0.0);
+            let size = d::crash_size(vehicles[i].spec.mass, mass, closing);
+            if size < d::CRASH_FLOOR {
+                continue;
+            }
+            let column = key_of(key).unwrap_or(any);
+            let cell = match (self.damage_table.as_ref(), vehicles[i].spec.tuning.key) {
+                (Some(t), Some(row)) => t.scale(row, column).or_else(|| t.scale(row, any)),
+                _ => None,
+            }
+            .unwrap_or(0.0);
+            let damage = d::crash_damage(size, cell);
+            if damage > 0.0 {
+                let v = &mut vehicles[i];
+                if let Some(body) = physics.vehicle_transform(a) {
+                    v.hit_parts(body, at, damage);
+                }
+                self.hurt_vehicle(physics, v, i, damage);
+            }
+            out.push((i, key, closing, damage));
         }
         out
     }
@@ -7526,6 +7602,124 @@ mod tests {
             combat.slung(false),
             [Some(Weapon::Rifle), Some(Weapon::GrenadeLauncher)]
         );
+    }
+
+    /// A damage table of `rows` by `columns` (name hashes) and their
+    /// cells, as the archive's asset lays it out.
+    fn damage_table(rows: &[&str], columns: &[&str], cells: &[f32]) -> DamageTable {
+        let mut d = vec![0u8; 0x48];
+        d.extend((rows.len() as u32).to_le_bytes());
+        d.extend((columns.len() as u32).to_le_bytes());
+        for k in rows.iter().chain(columns) {
+            d.extend(m2_assets::name_hash(k).to_le_bytes());
+        }
+        for c in cells {
+            d.extend(c.to_bits().to_le_bytes());
+        }
+        DamageTable::parse(&d).expect("a table")
+    }
+
+    #[test]
+    fn a_vehicle_driven_into_a_wall_takes_the_crash_by_the_wall_s_key() {
+        use m2_engine::tuning::VehicleTuning;
+        let mut physics = ground();
+        let dt = 1.0 / 60.0;
+        let wall = StaticKey::Object(3);
+        physics.add_static(
+            wall,
+            &m2_engine::CollisionShape::cuboid(Vec3::new(6.0, 3.0, 0.5)),
+            Vec3::new(0.0, 3.0, 12.0),
+            m2_math::glam::Quat::IDENTITY,
+        );
+        let spec = crate::npc::tests::tank(VehicleTuning {
+            key: Some(m2_assets::name_hash("Car")),
+            ..VehicleTuning::default()
+        });
+        let mass = spec.mass;
+        let id = physics.add_vehicle(&spec, Vec3::new(0.0, 0.1, 0.0), 0.0);
+        let mut vehicles = vec![ParkedVehicle {
+            spec,
+            model: crate::npc::tests::empty_model(),
+            id: Some(id),
+            wrecked: false,
+            guid: None,
+            spot: None,
+            crew: Vec::new(),
+            turret: 0.0,
+            hijack_nodes: Vec::new(),
+            door_turns: Vec::new(),
+            gun: 0.0,
+            aims: Vec::new(),
+            rolled: 0.0,
+            fired: 0,
+            mg_fired: 0,
+            damage: 0.0,
+            hit: 0.0,
+            parts: None,
+            loose: Vec::new(),
+            debris_thrown: false,
+        }];
+        let mut combat = Combat {
+            // The car's row: nothing of `Any`, 2 of `Terrain`, 3 of a
+            // `Building`.
+            damage_table: Some(damage_table(
+                &["Car"],
+                &["Any", "Terrain", "Building"],
+                &[0.0, 2.0, 3.0],
+            )),
+            ..Combat::default()
+        };
+        let building = m2_assets::name_hash("Building");
+        let terrain = m2_assets::name_hash("Terrain");
+        let key_of = |k: StaticKey| match k {
+            StaticKey::Cell(_) => Some(terrain),
+            k if k == wall => Some(building),
+            _ => None,
+        };
+        // Settling onto the ground hurts nothing.
+        for _ in 0..90 {
+            physics.step(dt);
+            for (_, _, _, damage) in combat.world_crashes(&mut physics, &mut vehicles, key_of) {
+                assert_eq!(damage, 0.0);
+            }
+        }
+        assert_eq!(vehicles[0].damage, 0.0);
+        let up = physics.vehicle_velocity(id).y;
+        physics.set_vehicle_velocity(id, Vec3::new(0.0, up, 15.0));
+        let mut hit = None;
+        for _ in 0..120 {
+            physics.step(dt);
+            let closing = physics.vehicle_velocity_before(id).z;
+            for (i, key, c, damage) in combat.world_crashes(&mut physics, &mut vehicles, key_of) {
+                if key == wall {
+                    hit = Some((i, c, damage, closing));
+                }
+            }
+            if hit.is_some() {
+                break;
+            }
+        }
+        let (i, closing, damage, before) = hit.expect("it never met the wall");
+        assert_eq!(i, 0);
+        assert!(
+            (closing - before).abs() < 1.0 && closing > 10.0,
+            "{closing}"
+        );
+        // The size from its mass and a fixed body's, times the
+        // building's 3, a hundredth of it.
+        let size = m2_engine::durability::crash_size(mass, 0.0, closing);
+        let want = m2_engine::durability::crash_damage(size, 3.0);
+        assert!(
+            want > 1.0 && (damage - want).abs() < 1e-3,
+            "{damage} {want}"
+        );
+        assert!((vehicles[0].damage - damage).abs() < 1e-3);
+        // Held against it, it is not hurt again.
+        for _ in 0..30 {
+            physics.step(dt);
+            let again = combat.world_crashes(&mut physics, &mut vehicles, key_of);
+            assert!(again.iter().all(|c| c.1 != wall), "{again:?}");
+        }
     }
 
     #[test]

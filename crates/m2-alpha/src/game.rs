@@ -2103,6 +2103,35 @@ impl Game {
                     v.most_health()
                 );
             }
+            // Vehicles running into the world (the ground, rocks, walls,
+            // buildings) are hurt as by another vehicle, by the damage
+            // table's cell for what they met.
+            let terrain = m2_assets::name_hash(m2_engine::durability::TERRAIN_KEY);
+            let crashes = {
+                let index = &world.index;
+                let props = &self.scene.props;
+                let key_of = |k: StaticKey| match k {
+                    StaticKey::Cell(_) => Some(terrain),
+                    StaticKey::Object(i) | StaticKey::Member(i, _) => index
+                        .objects
+                        .get(i)
+                        .and_then(|o| index.template_db.modifiers.get(&o.template).copied()),
+                    StaticKey::Entity(e) => props
+                        .get(e)
+                        .and_then(|(p, _)| index.template_db.modifiers.get(&p.template).copied()),
+                };
+                self.combat
+                    .world_crashes(&mut world.physics, &mut self.scene.vehicles, key_of)
+            };
+            for (i, key, closing, damage) in crashes {
+                let v = &self.scene.vehicles[i];
+                eprintln!(
+                    "crash: the {} hit {key:?} at {closing:.1} m/s, takes {damage:.1} ({:.0} of {:.0} left)",
+                    v.spec.label,
+                    (v.most_health() - v.damage).max(0.0),
+                    v.most_health()
+                );
+            }
             // What came down (to a vehicle, the traffic's too, or a blast
             // last tick) comes down whether she is on foot or the free
             // camera flies: its island copy has lost its collision already.

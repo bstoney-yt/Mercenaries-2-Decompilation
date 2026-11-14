@@ -5491,6 +5491,74 @@ impl Physics {
         out
     }
 
+    /// The statics a vehicle's body is in contact with (its wheels'
+    /// contacts aside): the terrain's cells, placed objects, buildings and
+    /// a state layer's models, each once, with the deepest point of
+    /// contact, the contact normal from the vehicle toward it (world
+    /// space) and its mass (0 for a fixed one, as the 360's collision
+    /// event's size takes it: [`crate::durability::crash_size`]).
+    pub fn vehicle_static_hits(&self, id: VehicleId) -> Vec<(StaticKey, Vec3, Vec3, f32)> {
+        let Some(body) = self
+            .vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .and_then(|v| self.world.bodies.get(v.controller.chassis))
+        else {
+            return Vec::new();
+        };
+        let mut out: Vec<(StaticKey, Vec3, Vec3, f32)> = Vec::new();
+        for &c in body.colliders() {
+            let Some(mine) = self.world.colliders.get(c) else {
+                continue;
+            };
+            for pair in self.world.narrow_phase.contact_pairs_with(c) {
+                if !pair.has_any_active_contact() {
+                    continue;
+                }
+                let first = pair.collider1 == c;
+                let other = if first {
+                    pair.collider2
+                } else {
+                    pair.collider1
+                };
+                let Some(&key) = self.keys.get(&other) else {
+                    continue;
+                };
+                if out.iter().any(|(k, ..)| *k == key) {
+                    continue;
+                }
+                let Some((manifold, deepest)) = pair
+                    .manifolds()
+                    .iter()
+                    .flat_map(|m| m.points.iter().map(move |p| (m, p)))
+                    .min_by(|a, b| a.1.dist.total_cmp(&b.1.dist))
+                else {
+                    continue;
+                };
+                let (local, normal) = if first {
+                    (deepest.local_p1, vec3(manifold.data.normal))
+                } else {
+                    (deepest.local_p2, -vec3(manifold.data.normal))
+                };
+                let mass = self
+                    .world
+                    .colliders
+                    .get(other)
+                    .and_then(|o| o.parent())
+                    .and_then(|b| self.world.bodies.get(b))
+                    .filter(|b| b.is_dynamic())
+                    .map_or(0.0, |b| b.mass());
+                out.push((
+                    key,
+                    vec3(mine.position().transform_point(local)),
+                    normal.normalize_or_zero(),
+                    mass,
+                ));
+            }
+        }
+        out
+    }
+
     /// The other vehicles a vehicle's body is in contact with, body to
     /// body, each once, with the deepest point of contact and the contact
     /// normal from this one toward the other (world space).
@@ -9917,6 +9985,43 @@ mod tests {
         let back = p.vehicle_bumps(b);
         assert_eq!(back.first().map(|m| m.0), Some(a));
         assert!(back[0].2.z < -0.9, "and back the other way");
+    }
+
+    #[test]
+    fn a_car_driven_into_a_wall_hits_it_and_the_ground_is_known() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
+        let wall = StaticKey::Object(7);
+        p.add_static(
+            wall,
+            &CollisionShape::cuboid(Vec3::new(5.0, 2.0, 0.5)),
+            Vec3::new(0.0, 2.0, 10.0),
+            Quat::IDENTITY,
+        );
+        p.step(DT);
+        let a = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        for _ in 0..60 {
+            p.step(DT);
+        }
+        assert!(
+            p.vehicle_static_hits(a).iter().all(|h| h.0 != wall),
+            "apart, it doesn't touch the wall"
+        );
+        let up = p.vehicle_velocity(a).y;
+        p.set_vehicle_velocity(a, Vec3::new(0.0, up, 10.0));
+        let mut met = None;
+        for _ in 0..120 {
+            p.step(DT);
+            if let Some(&h) = p.vehicle_static_hits(a).iter().find(|h| h.0 == wall) {
+                met = Some(h);
+                break;
+            }
+        }
+        let (_, at, normal, mass) = met.expect("it never met the wall");
+        // Its front bumper on the wall's face, 9.5 m on; toward it; fixed.
+        assert!((at.z - 9.5).abs() < 0.5, "met at {at:?}");
+        assert!(normal.z > 0.9, "normal {normal:?}");
+        assert_eq!(mass, 0.0);
     }
 
     #[test]
