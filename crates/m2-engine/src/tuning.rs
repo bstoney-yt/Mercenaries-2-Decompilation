@@ -1326,6 +1326,17 @@ impl KeyTable {
             .filter(|&v| v != 0)
     }
 
+    /// Cell `row` by `column` where both are the table's own keys (no
+    /// first-row stand-in); `None` for 0.
+    pub fn get_exact(&self, row: u32, column: u32) -> Option<u32> {
+        let r = self.rows.iter().position(|&k| k == row)?;
+        let c = self.columns.iter().position(|&k| k == column)?;
+        self.cells
+            .get(r * self.columns.len() + c)
+            .map(|c| c.0)
+            .filter(|&v| v != 0)
+    }
+
     /// The cell for keys `a` and `b` one way, else the other (the sound
     /// table's lookup).
     pub fn either(&self, a: u32, b: u32) -> Option<u32> {
