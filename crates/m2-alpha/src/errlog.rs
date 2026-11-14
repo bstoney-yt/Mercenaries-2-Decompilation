@@ -13,9 +13,21 @@
 //! ends (`keep_crash_reports`). A process killed from outside loses what
 //! was still in the pipe (4 KB at most).
 //!
+//! A windowed build (`--features windowed`, no console) started from a
+//! shortcut or Explorer has no standard error at all; then [`start`]
+//! opens `last-run.log` itself (beside the settings file or the exe,
+//! where the launcher's `2> last-run.log` put it) and sends standard
+//! error and standard output there through the same pipe. A run whose
+//! standard error is already a file or a pipe (the dev scripts' own
+//! redirects) is written where it was, as before.
+//!
 //! Invented: nothing here is the original game's.
 
 use std::io::{Read, Write};
+
+/// The log a windowed build writes when started without one.
+#[cfg(windows)]
+const LOG_FILE: &str = "last-run.log";
 
 /// Copies `from` to `to` until `from` ends, each read's worth in one
 /// write.
@@ -49,6 +61,14 @@ mod piped {
 
     static PIPED: Mutex<Option<Piped>> = Mutex::new(None);
 
+    /// The log file this process opened itself, when it had no standard
+    /// error.
+    static OWN_FILE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+    pub fn own_file() -> Option<std::path::PathBuf> {
+        OWN_FILE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     pub fn start() -> std::io::Result<()> {
         let stderr = std::io::stderr();
         if stderr.is_terminal() {
@@ -58,7 +78,15 @@ mod piped {
         if piped.is_some() {
             return Ok(());
         }
-        let original = stderr.as_handle().try_clone_to_owned()?;
+        let missing = m2_sys::stdio::is_missing(stderr.as_handle());
+        let original = if missing {
+            let path = crate::config::Config::file_beside(super::LOG_FILE);
+            let file = std::fs::File::create(&path)?;
+            *OWN_FILE.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+            OwnedHandle::from(file)
+        } else {
+            stderr.as_handle().try_clone_to_owned()?
+        };
         let sink = std::fs::File::from(original.try_clone()?);
         let (reader, writer) = std::io::pipe()?;
         let writer = OwnedHandle::from(writer);
@@ -66,6 +94,11 @@ mod piped {
             .name("log".into())
             .spawn(move || super::pump(reader, sink))?;
         m2_sys::stdio::set_stderr(&writer)?;
+        // Without a console the standard output is missing too: what the
+        // game prints goes to the same log.
+        if missing && m2_sys::stdio::is_missing(std::io::stdout().as_handle()) {
+            m2_sys::stdio::set_stdout(&writer)?;
+        }
         *piped = Some(Piped {
             writer,
             original,
@@ -90,12 +123,21 @@ mod piped {
 }
 
 /// Starts batching the log, when standard error is a file or a pipe (not
-/// a console, and not missing as in a windowed game started plainly).
-/// Only on Windows; elsewhere, and when it can't be set up, the log is
-/// written as before.
+/// a console); when it is missing (a windowed build started plainly),
+/// opens `last-run.log` for it first. Only on Windows; elsewhere, and
+/// when it can't be set up, the log is written as before.
 pub fn start() {
     #[cfg(windows)]
     let _ = piped::start();
+}
+
+/// The log file [`start`] opened itself, if it did: where to send the
+/// player when the game can't start.
+pub fn own_file() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    return piped::own_file();
+    #[cfg(not(windows))]
+    None
 }
 
 /// Writes out what is left of the log and puts standard error back.

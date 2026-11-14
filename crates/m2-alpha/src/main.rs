@@ -38,6 +38,15 @@
 //! in the nearest parked vehicle instead and drives it forward; with
 //! `--fight` she shoots the nearest soldier, fires a rocket at a vehicle and
 //! throws a grenade.
+//!
+//! Built with `--features windowed` (the play builds) it is a windowed
+//! program: Windows opens no console with it, the log goes to
+//! `last-run.log` ([`errlog`]) and a start that fails says so in a message
+//! box. Without it (the default, for the dev scripts) it stays a console
+//! program.
+
+// No console window with a windowed build.
+#![cfg_attr(all(windows, feature = "windowed"), windows_subsystem = "windows")]
 
 mod action_prompt;
 mod aim;
@@ -65,6 +74,7 @@ mod flights;
 mod flow;
 mod frametimes;
 mod game;
+mod game_icon;
 mod gamehud;
 mod grapple;
 mod gunships;
@@ -1175,11 +1185,20 @@ fn keep_crash_reports() {
             env!("CARGO_PKG_VERSION"),
             std::backtrace::Backtrace::force_capture()
         );
-        if std::fs::write(&path, report).is_ok() {
+        let written = std::fs::write(&path, &report).is_ok();
+        if written {
             eprintln!("crash report written to {}", path.display());
         }
         // The process ends here (panics abort): the log's last lines out.
         errlog::finish();
+        if errlog::own_file().is_some() {
+            let whence = if written {
+                format!("\n\nThe report is in {}.", path.display())
+            } else {
+                String::new()
+            };
+            error_box(&format!("The game crashed: {info}{whence}"));
+        }
     }));
 }
 
@@ -1212,8 +1231,26 @@ fn main() -> anyhow::Result<()> {
     errlog::start();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let out = run(&args, EventLoop::new);
+    if let (Err(e), Some(log)) = (&out, errlog::own_file()) {
+        // A windowed build has no console to show the error in.
+        eprintln!("error: {e:#}");
+        errlog::finish();
+        error_box(&format!(
+            "The game could not start: {e:#}\n\nThe log is in {}.",
+            log.display()
+        ));
+    }
     errlog::finish();
     out
+}
+
+/// Tells the player, in a message box, why the game stopped (Windows only;
+/// a windowed build has nowhere else to say it).
+fn error_box(text: &str) {
+    #[cfg(windows)]
+    m2_sys::stdio::error_box("Mercenaries 2 (beta)", text);
+    #[cfg(not(windows))]
+    let _ = text;
 }
 
 /// The game, given its arguments and how to make its event loop (the
@@ -9513,10 +9550,21 @@ impl App {
         // settings keep it ([`display`]).
         let (full, how) =
             display::fullscreen_for(monitor.clone(), w.mode, (w.width, w.height), w.refresh);
-        let attributes = Window::default_attributes()
+        let mut attributes = Window::default_attributes()
             .with_title("Mercenaries 2 (beta)")
             .with_inner_size(display::fit((w.width, w.height), monitor.as_ref()))
             .with_fullscreen(full);
+        // The original game's icon, from the install.
+        if let Some(icons) = self.install.as_ref().and_then(|i| game_icon::load(&i.root)) {
+            #[cfg(windows)]
+            {
+                use winit::platform::windows::WindowAttributesExtWindows;
+                attributes = attributes.with_taskbar_icon(Some(icons.taskbar));
+            }
+            #[cfg(not(windows))]
+            let _ = icons.taskbar;
+            attributes = attributes.with_window_icon(Some(icons.window));
+        }
         let window = Arc::new(event_loop.create_window(attributes)?);
         let display = display::Display::new(w);
         eprintln!("display: start {how}: {}", display::describe(&window));

@@ -56,3 +56,6 @@ workspace = true
 # wgpu's and egui's own scopes to a Tracy profiler; see docs/profiling.md.
 [features]
 tracy = ["dep:tracy-client", "dep:profiling"]
+# The play builds: a windowed program (no console window opens with it);
+# the log goes to last-run.log. See src/main.rs and src/errlog.rs.
+windowed = []
