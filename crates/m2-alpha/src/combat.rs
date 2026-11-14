@@ -535,6 +535,9 @@ impl Default for HeroDamage {
 
 /// People are hit within this distance of the line from shins to head.
 const BODY_RADIUS: f32 = 0.3;
+/// How far ahead of his shoulder a soldier's rocket starts, m: past his
+/// body's radius (invented: the 360's projectile skips its owner).
+const LAUNCH_CLEAR: f32 = BODY_RADIUS + 0.2;
 /// Health comes back after this many quiet seconds, at this rate a second.
 const REGEN_AFTER: f32 = 4.0;
 const REGEN_RATE: f32 = 25.0;
@@ -1857,6 +1860,9 @@ pub struct Combat {
     /// Debug (`--homing-check`): her vehicle shows ground and air
     /// signatures of 1, whatever its template says.
     pub homing_check: bool,
+    /// Homing shots fired at her vehicle once locked (soldiers' and
+    /// crews'), for the `--homing-check` log.
+    pub homing_fired: u32,
     gunner_wait: Vec<f32>,
     /// Rounds left in each such gunner's burst.
     gunner_burst: Vec<u32>,
@@ -2133,6 +2139,7 @@ impl Default for Combat {
             lockers: 0,
             homing_targets: Vec::new(),
             homing_check: false,
+            homing_fired: 0,
             gunner_wait: Vec::new(),
             gunner_burst: Vec::new(),
             gunner_clips: Vec::new(),
@@ -3589,13 +3596,20 @@ impl Combat {
     fn her_mark(&self, f: &Field<'_>) -> Option<crate::homing::Mark<VehicleId>> {
         let v = &f.vehicles[f.player.driving?];
         let id = v.id?;
-        let at = f.physics.vehicle_transform(id)?.w_axis.truncate();
         let signature = if self.homing_check {
             [1.0, 1.0]
         } else {
             m2_engine::weapons::homing_signature(&self.homing_targets, &v.spec.label, v.spec.model)?
         };
+        // The middle of its box, not its body's origin: that sits at the
+        // wheels, and a seeker's line to it ran into the ground until the
+        // holder was within a few metres (seen in the --homing-check run:
+        // no lock from 40 m, one at 7 m).
         let (lo, hi) = v.spec.bounds;
+        let at = f
+            .physics
+            .vehicle_transform(id)?
+            .transform_point3((lo + hi) * 0.5);
         Some(crate::homing::Mark {
             id,
             at,
@@ -3694,6 +3708,7 @@ impl Combat {
                 self.scripts.post(e, locker);
             }
         }
+        self.homing_fired += 1;
         eprintln!(
             "homing: a soldier's {:#x} locked on her vehicle fires",
             l.template
@@ -3726,6 +3741,10 @@ impl Combat {
         let spread = SoldierSpread::new(distance, n.accuracy(), 0.0);
         let (a, b) = (self.random(), self.random());
         let dir = spread.stray((aim - from).normalize_or(Vec3::Z), a, b);
+        // Over his shoulder is the top of his own body's capsule: it
+        // starts just clear of him, or it bursts on him at once (the
+        // `--homing-check` run: each soldier's rocket killed him).
+        let from = from + dir * LAUNCH_CLEAR;
         let speed = Some(l.ammo.human_speed())
             .filter(|&v| v > 0.0)
             .unwrap_or(ROCKET_SPEED);
@@ -4802,6 +4821,7 @@ impl Combat {
                     self.crew_homing = target
                         .zip(guided)
                         .map(|(t, h)| crate::homing::Homing::new(t, h));
+                    self.homing_fired += 1;
                     eprintln!("homing: a crew's gun locked on her vehicle fires");
                 }
                 let to = at - centre;
@@ -5768,11 +5788,18 @@ impl Combat {
                 // Turning after the vehicle it locked on, no faster than its
                 // turn rate; one gone, or too far off its nose, is lost and
                 // it flies on straight ([`crate::homing::Homing::steer`]).
+                // Its goal is the middle of the target's box (0x822951B0:
+                // the box's min and max halved, through its matrix).
                 if let Some(h) = homing {
+                    let middle = f
+                        .vehicles
+                        .iter()
+                        .find(|v| v.id == Some(h.target))
+                        .map_or(Vec3::ZERO, |v| (v.spec.bounds.0 + v.spec.bounds.1) * 0.5);
                     let goal = f
                         .physics
                         .vehicle_transform(h.target)
-                        .map(|m| m.w_axis.truncate());
+                        .map(|m| m.transform_point3(middle));
                     match goal.and_then(|g| h.steer(*at, *velocity, g, dt)) {
                         Some(v) => *velocity = v,
                         None => {
@@ -8548,6 +8575,24 @@ mod tests {
         assert!(ray_capsule(Vec3::new(0.0, 2.5, 0.0), Vec3::Z, a, seg, 0.3).is_none());
         // Behind the shooter.
         assert!(ray_capsule(Vec3::new(0.0, 1.2, 20.0), Vec3::Z, a, seg, 0.3).is_none());
+    }
+
+    // A soldier's rocket from over his shoulder (chest + 0.4 m) starts on
+    // his own capsule's top and met him at once; started LAUNCH_CLEAR
+    // along its way it leaves him, level or aimed down at a car.
+    #[test]
+    fn a_soldiers_rocket_starts_clear_of_him() {
+        let feet = Vec3::ZERO;
+        let (a, seg) = (feet + Vec3::Y * 0.25, Vec3::Y * 1.45);
+        let shoulder = feet + Vec3::Y * (1.3 + 0.4);
+        assert_eq!(
+            ray_capsule(shoulder, Vec3::Z, a, seg, BODY_RADIUS),
+            Some(0.0)
+        );
+        for dir in [Vec3::Z, Vec3::new(0.0, -0.05, 1.0).normalize()] {
+            let from = shoulder + dir * LAUNCH_CLEAR;
+            assert_eq!(ray_capsule(from, dir, a, seg, BODY_RADIUS), None, "{dir}");
+        }
     }
     /// PmcCon001 hands her an Assault Rifle, not the first contract's
     /// carbine: it is the gun in the rifle's place, one clip in and none
