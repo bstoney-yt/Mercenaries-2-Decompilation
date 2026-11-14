@@ -323,6 +323,9 @@ pub struct Game {
     /// The horn held this tick (driving), and its presses not yet taken
     /// ([`Game::take_honks`]).
     pub honking: bool,
+    /// A semi's engine gain over its cue's
+    /// ([`crate::config::EnhancedConfig::semi_engine_gain`]).
+    pub semi_gain: f32,
     honks: u32,
     /// Her vehicle disguise ([`crate::disguise`]).
     pub disguise: crate::disguise::Disguise,
@@ -567,6 +570,7 @@ impl Game {
             pursued: false,
             honking: false,
             honks: 0,
+            semi_gain: crate::config::SEMI_ENGINE_GAIN,
             disguise: crate::disguise::Disguise::default(),
             rumble: 0.0,
             actions: Vec::new(),
@@ -3458,6 +3462,7 @@ impl Game {
                         surface: m2_engine::surface::tyre_class(p.vehicle_ground(id, 5.0)),
                         braking: p.vehicle_braking(id),
                         reversing: p.vehicle_rolling(id) < 0.0,
+                        gain: self.engine_gain(v, &world.index.template_db),
                     },
                 ))
             })
@@ -3517,7 +3522,23 @@ impl Game {
             slide,
             surface,
             braking,
+            gain: self
+                .scene
+                .world
+                .as_ref()
+                .map_or(1.0, |w| self.engine_gain(v, &w.index.template_db)),
         })
+    }
+
+    /// Vehicle `v`'s engine gain over its cue's: [`Game::semi_gain`] for
+    /// a semi (its engine bank `veh_semi`, its template's or its kind's),
+    /// else 1.
+    fn engine_gain(&self, v: &ParkedVehicle, db: &Templates) -> f32 {
+        let semi = m2_assets::name_hash("veh_semi");
+        let bank = db.engine_for_model(v.spec.model).unwrap_or_else(|| {
+            m2_assets::name_hash(crate::sound::engine_bank(&v.spec.kind, &v.spec.label))
+        });
+        if bank == semi { self.semi_gain } else { 1.0 }
     }
 
     /// The horn presses since the last call (the faction gates, the

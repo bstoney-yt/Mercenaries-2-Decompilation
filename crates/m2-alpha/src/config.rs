@@ -24,7 +24,7 @@ pub struct Config {
     pub enhanced: EnhancedConfig,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EnhancedConfig {
     /// Smarter enemy soldiers (`enabled = true` to switch on).
@@ -32,6 +32,26 @@ pub struct EnhancedConfig {
     /// The shop from anywhere, every item unlocked (a cheat; the game
     /// unlocks them as contract rewards).
     pub shop: ShopCheat,
+    /// How much louder a semi truck's engine is than its cue says, hers
+    /// and others' (`semi_engine_gain`; 1 is the game's). Not the game's:
+    /// the owner asked for semis at least twice as loud (playtest
+    /// 2026-11-14), though the 360's cue is authored that quiet on
+    /// throttle, so the default is [`SEMI_ENGINE_GAIN`].
+    pub semi_engine_gain: f32,
+}
+
+/// [`EnhancedConfig::semi_engine_gain`]'s default: the owner's twice as
+/// loud (invented, by request).
+pub const SEMI_ENGINE_GAIN: f32 = 2.0;
+
+impl Default for EnhancedConfig {
+    fn default() -> Self {
+        Self {
+            smarter_ai: Default::default(),
+            shop: ShopCheat::default(),
+            semi_engine_gain: SEMI_ENGINE_GAIN,
+        }
+    }
 }
 
 /// `[enhanced.shop]`: the shop opens anywhere with its key, on the game's
@@ -459,6 +479,18 @@ mod tests {
     #[test]
     fn the_smarter_soldiers_are_off_unless_switched_on() {
         assert!(!Config::default().enhanced.smarter_ai.enabled);
+        // The owner's louder semis, by default and as set.
+        assert_eq!(
+            Config::default().enhanced.semi_engine_gain,
+            SEMI_ENGINE_GAIN
+        );
+        let quiet: Config = toml::from_str(
+            "[enhanced]
+semi_engine_gain = 1.0
+",
+        )
+        .unwrap();
+        assert_eq!(quiet.enhanced.semi_engine_gain, 1.0);
         let config: Config = toml::from_str(
             r#"
             [enhanced.smarter_ai]

@@ -2039,6 +2039,7 @@ fn screenshot(
         options.load.as_ref(),
     );
     game.scene.people.smarter = config.enhanced.smarter_ai;
+    game.semi_gain = config.enhanced.semi_engine_gain;
     give_guns(&mut game, &options.guns);
     if options.fly {
         game.on_foot = false;
@@ -9550,6 +9551,7 @@ impl App {
             self.load.as_ref(),
         );
         game.scene.people.smarter = self.config.enhanced.smarter_ai;
+        game.semi_gain = self.config.enhanced.semi_engine_gain;
         give_guns(&mut game, &self.guns);
         if self.fly {
             game.on_foot = false;
