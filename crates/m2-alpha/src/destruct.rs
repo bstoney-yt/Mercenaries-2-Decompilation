@@ -23,6 +23,7 @@
 //! `SoundKey` says (`_global_fencewoodpanel`'s `prop_sheetmetal_sml`), as
 //! a blast brings it down or a vehicle does ([`break_sound`]).
 
+use m2_engine::destroy_route as route;
 use std::collections::{HashMap, HashSet};
 
 use m2_engine::durability::{BlastPush, Crash, CrashHow};
@@ -338,6 +339,10 @@ pub struct Destruction {
     /// ([`crate::combat::Combat::set_off`]): where, its template, and
     /// what its model's `CollapseState` starts (effect name hash, where).
     pub set_off: Vec<(Vec3, u32, Shows)>,
+    /// Part states the props destroyed went to, for the scripts'
+    /// `OnStateChange` ([`take_state_changes`](Self::take_state_changes)):
+    /// (entity, state name hash), in order.
+    state_changes: Vec<(u32, u32)>,
     /// The island's objects destroyed whose links were followed
     /// ([`fall_linked`](Self::fall_linked)).
     linked: HashSet<usize>,
@@ -615,7 +620,27 @@ impl Destruction {
             },
             StaticKey::Entity(e) => {
                 match cause {
-                    Cause::Blast(at) => props.wreck(&mut world.physics, e, Some(at)),
+                    Cause::Blast(at) => {
+                        // Blown up by an explosion, a model whose fire
+                        // state starts effects (a tree) burns down rather
+                        // than collapse (from the 360 code, 0x82289020:
+                        // [`m2_engine::destroy_route`]).
+                        let fire = props.state_effects(e, route::FIRE);
+                        let burns = route::blast_burns(kind) && !fire.is_empty();
+                        let mut shows = fire;
+                        shows.extend(props.state_effects(e, route::FIRE_DEBRIS));
+                        let broke = props.wreck(&mut world.physics, e, Some(at));
+                        if burns && broke {
+                            eprintln!(
+                                "destruct: {key:?} ({name}) burns down: {} effects",
+                                shows.len()
+                            );
+                            self.alight.push(shows);
+                            self.state_changes
+                                .extend(route::tree_states(true).map(|s| (e, s)));
+                        }
+                        broke
+                    }
                     Cause::Crash { velocity, mass } => {
                         props.wreck_crashed(&mut world.physics, e, |shifted| {
                             crate::game::flung(velocity, mass, shifted)
@@ -1038,6 +1063,12 @@ impl Destruction {
     /// names points, if it has a building's collapse; one a vehicle ran
     /// into is knocked on by it. Either, with no building's collapse, is
     /// heard as its template's `SoundKey` says ([`break_sound`]).
+    /// The part states the props destroyed since the last call went to:
+    /// (entity, state name hash), in order.
+    pub fn take_state_changes(&mut self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut self.state_changes)
+    }
+
     pub fn update(
         &mut self,
         world: &mut World,
