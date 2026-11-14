@@ -4345,6 +4345,26 @@ fn within_bed(place: Mat4, (lo, hi): (Vec3, Vec3), bed: Vec3, c: Vec3) -> bool {
 /// run into that their weight breaks ([`Destruction::crash`]: plants,
 /// bushes, fences, lampposts, the island's and the state layers'), going
 /// on through it.
+/// A vehicle's template's `SoundKey`: the template its label names that
+/// has one, else the lowest vehicle template of its `model` that has one
+/// (a traffic or mission vehicle whose label is no template's name).
+pub(crate) fn vehicle_sound_key(db: &m2_engine::Templates, label: &str, model: u32) -> Option<u32> {
+    db.ids(label)
+        .into_iter()
+        .find_map(|t| db.sound_keys.get(&t).copied())
+        .or_else(|| {
+            let mut by_model: Vec<u32> = db
+                .infos
+                .iter()
+                .filter(|(_, i)| i.model == Some(model) && i.vehicle.is_some())
+                .map(|(&t, _)| t)
+                .filter(|t| db.sound_keys.contains_key(t))
+                .collect();
+            by_model.sort_unstable();
+            by_model.first().and_then(|t| db.sound_keys.get(t).copied())
+        })
+}
+
 fn knock_loose(
     world: &mut World,
     props: &mut Props,
@@ -4431,10 +4451,7 @@ fn knock_loose(
             continue;
         };
         let db = &world.index.template_db;
-        let sound = db
-            .id(&v.spec.label)
-            .and_then(|t| db.sound_keys.get(&t).copied())
-            .unwrap_or(0);
+        let sound = vehicle_sound_key(db, &v.spec.label, v.spec.model).unwrap_or(0);
         let crasher = Crasher {
             place,
             bounds: v.model.bounds,
@@ -6011,6 +6028,27 @@ mod tests {
     use m2_engine::TemplateInfo;
 
     use super::*;
+
+    #[test]
+    fn a_vehicles_sound_key_is_found_by_label_else_by_model() {
+        let mut db = m2_engine::Templates::default();
+        db.names.insert(5, "veh_jeep".into());
+        db.sound_keys.insert(5, 0xa1);
+        db.infos.insert(
+            9,
+            m2_engine::TemplateInfo {
+                model: Some(0x77),
+                vehicle: Some(m2_engine::VehicleKind::Car),
+                engine: None,
+                person: false,
+                human: false,
+            },
+        );
+        db.sound_keys.insert(9, 0xb2);
+        assert_eq!(vehicle_sound_key(&db, "veh_jeep", 0x77), Some(0xa1));
+        assert_eq!(vehicle_sound_key(&db, "RTR (crappy)", 0x77), Some(0xb2));
+        assert_eq!(vehicle_sound_key(&db, "RTR (crappy)", 0x78), None);
+    }
 
     #[test]
     fn an_arrival_loads_until_its_place_is_in_or_its_time_is_up() {
