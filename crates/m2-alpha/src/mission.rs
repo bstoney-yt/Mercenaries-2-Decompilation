@@ -2464,7 +2464,7 @@ impl MissionLink {
         if self.ashore > 0 && game.scene.player.as_ref().is_some_and(|p| p.landed) {
             self.ashore -= 1;
             // Thousands of rays a look: twice a second is plenty.
-            if self.ashore.is_multiple_of(30) && go_ashore(game) {
+            if self.ashore.is_multiple_of(30) && go_ashore(game).is_some() {
                 self.ashore = 0;
             }
         }
@@ -3006,9 +3006,9 @@ impl MissionLink {
                 .player
                 .as_ref()
                 .is_some_and(|p| p.landed || p.swimming())
-            && go_ashore(game)
         {
-            eprintln!("paradrop-check: she is put ashore to drop over dry ground");
+            let to = go_ashore(game);
+            check.put_ashore(to);
         }
         // A pursuit run out: the scripts read level 0 again.
         let pursued = !game.scene.people.pursuit.is_empty();
@@ -6131,38 +6131,66 @@ const BOARDING: u32 = 1800;
 /// Moves a player standing under the sea to the nearest dry ground within
 /// 1.5 km. True once she stands on dry ground (moved there, or there
 /// already); false while none around her has loaded.
-fn go_ashore(game: &mut Game) -> bool {
+fn go_ashore(game: &mut Game) -> Option<Vec3> {
     let (Some(world), Some(player)) = (&game.scene.world, &mut game.scene.player) else {
-        return true;
+        return None;
     };
     // Boats and docks the layers place float at -36 m: dry ground is
     // above that, whatever height the sea is drawn at.
     let sea = world.settings.sea_level.max(WATERLINE);
-    let from = player.character.position;
-    if from.y > sea {
-        return true;
-    }
     let ground = |x: f32, z: f32| {
         let top = 600.0;
         let (t, normal) = world
             .physics
             .cast_ray(Vec3::new(x, top, z), Vec3::NEG_Y, 1200.0)?;
-        let y = top - t;
-        (y > sea + 0.5 && normal.y > 0.7).then_some(Vec3::new(x, y + 1.0, z))
+        Some((top - t, normal.y))
     };
+    let to = dry_spot(
+        player.character.position,
+        ground,
+        |x, z| world.physics.water_at(x, z),
+        sea,
+    )?;
+    // Already standing on it: left as she is.
+    let from = player.character.position;
+    if player.landed && (to - from).with_y(0.0).length() < 1e-3 {
+        return Some(to);
+    }
+    // As a teleport puts her down (her swim and landing state too).
+    player.drop_at(to);
+    Some(to)
+}
+
+/// The nearest dry ground to `from` (its own spot first, then rings out
+/// every 25 m to 1.5 km): where the ground (`ground`: its height and the
+/// up part of its normal at x, z) is level enough (normal over 0.7) and
+/// more than 0.5 m over the water there (`water`, else `sea`, and never
+/// under `sea`), as the paradrop check's own dry test has it. A metre
+/// over that ground, to drop onto it; `None` where there is none.
+pub(crate) fn dry_spot(
+    from: Vec3,
+    ground: impl Fn(f32, f32) -> Option<(f32, f32)>,
+    water: impl Fn(f32, f32) -> Option<f32>,
+    sea: f32,
+) -> Option<Vec3> {
+    let dry = |x: f32, z: f32| {
+        let (y, up) = ground(x, z)?;
+        let surface = water(x, z).unwrap_or(sea).max(sea);
+        (y > surface + 0.5 && up > 0.7).then_some(Vec3::new(x, y + 1.0, z))
+    };
+    if let Some(here) = dry(from.x, from.z) {
+        return Some(here);
+    }
     for r in (1..=60).map(|i| i as f32 * 25.0) {
         let n = ((r / 10.0) as usize).max(8);
         for k in 0..n {
             let a = k as f32 / n as f32 * std::f32::consts::TAU;
-            if let Some(to) = ground(from.x + r * a.cos(), from.z + r * a.sin()) {
-                player.character.position = to;
-                player.character.velocity = Vec3::ZERO;
-                player.landed = false;
-                return true;
+            if let Some(to) = dry(from.x + r * a.cos(), from.z + r * a.sin()) {
+                return Some(to);
             }
         }
     }
-    false
+    None
 }
 
 /// Whether `guid` is a layer entity that places a person.
@@ -9215,6 +9243,40 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn she_is_put_on_dry_ground_not_on_the_sea() {
+        // The sea at -36 everywhere; an island whose shore is 100 m east
+        // of her (ground at -34 from x 100 on, the sea floor -50 before),
+        // and a lagoon over it at -33.8 from x 100 to 120.
+        let sea = -36.0;
+        let ground = |x: f32, _z: f32| {
+            Some(if x >= 100.0 {
+                (-34.0, 1.0)
+            } else {
+                (-50.0, 1.0)
+            })
+        };
+        let water = |x: f32, _z: f32| {
+            Some(if (100.0..120.0).contains(&x) {
+                -33.8
+            } else {
+                -36.0
+            })
+        };
+        let at = dry_spot(Vec3::new(0.0, -36.0, 0.0), ground, water, sea).unwrap();
+        // Out of the lagoon, on the ground past it, a metre over it.
+        assert!(at.x >= 120.0, "{at}");
+        assert!((at.y - -33.0).abs() < 1e-3, "{at}");
+        // Already on dry ground: where she is.
+        let here = dry_spot(Vec3::new(130.0, -34.0, 0.0), ground, water, sea).unwrap();
+        assert_eq!(here, Vec3::new(130.0, -33.0, 0.0));
+        // A slope too steep, or all sea: nowhere.
+        assert!(dry_spot(Vec3::ZERO, |_, _| Some((-34.0, 0.5)), |_, _| None, sea).is_none());
+        assert!(dry_spot(Vec3::ZERO, |_, _| Some((-50.0, 1.0)), |_, _| None, sea).is_none());
+        // Ground under the waterline where no water is reported: still sea.
+        assert!(dry_spot(Vec3::ZERO, |_, _| Some((-35.8, 1.0)), |_, _| None, sea).is_none());
+    }
 
     // VzaCon001's "Land on the beach": `vTgtInclude =
     // Player.GetAllCharacters()` read as no target ("quota 1 of 0

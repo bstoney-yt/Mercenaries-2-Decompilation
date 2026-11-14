@@ -41,6 +41,11 @@ const AFTER: f32 = 5.0;
 const SETTLE: f32 = 2.0;
 /// Seconds she has to come ashore before the check gives up.
 const ASHORE_WAIT: f32 = 60.0;
+/// Seconds she is given to land where she was put ashore before it is
+/// asked again (invented: the ground under her streams in meanwhile).
+const LAND_TIME: f32 = 5.0;
+/// Puts ashore before the check gives up (invented).
+const MOST_PUTS: u32 = 3;
 /// Seconds after it the check gives up: the last man leaves at 17.25 s
 /// and falls 100 m at 1.96 m/s² in about 10 s.
 const GIVE_UP: f32 = 90.0;
@@ -61,6 +66,9 @@ pub struct Check {
     ashore_for: f32,
     /// Seconds to the next ask to put her ashore (each costs many rays).
     ask_in: f32,
+    /// Where she was last put ashore, and how many times she has been.
+    put_at: Option<m2_math::glam::Vec3>,
+    puts: u32,
     done: bool,
 }
 
@@ -73,6 +81,24 @@ pub enum Ask {
 }
 
 impl Check {
+    /// Play put her ashore at `to` as [`Ask::Ashore`] asked (`None`: no
+    /// dry ground within reach). She is given [`LAND_TIME`] to land there
+    /// before the next ask, which then reports where she is.
+    pub fn put_ashore(&mut self, to: Option<m2_math::glam::Vec3>) {
+        match to {
+            Some(at) => {
+                eprintln!("paradrop-check: she is put ashore at {at:.0} to drop over dry ground");
+                self.put_at = Some(at);
+                self.puts += 1;
+                self.ask_in = LAND_TIME;
+            }
+            None => {
+                eprintln!("paradrop-check: FAIL no dry ground within 1.5 km to put her on");
+                self.done = true;
+            }
+        }
+    }
+
     /// One step of `dt` seconds of play.
     pub fn tick(&mut self, game: &Game, mission: &mut Mission, dt: f32) -> Ask {
         if self.done {
@@ -98,6 +124,22 @@ impl Check {
             let dry = player.landed && !water(her);
             self.ashore_for = if dry { self.ashore_for + dt } else { 0.0 };
             if !dry {
+                // Put ashore before and still not on dry ground: once she
+                // has had time to land there, that put failed.
+                if let Some(at) = self.put_at.take() {
+                    eprintln!(
+                        "paradrop-check: put ashore at {at:.0} but she is at {her:.0}                          (landed {}, in water {})",
+                        player.landed,
+                        water(her)
+                    );
+                }
+                if self.puts >= MOST_PUTS {
+                    eprintln!(
+                        "paradrop-check: FAIL put ashore {MOST_PUTS} times, never on dry ground                          (at {her:.0})"
+                    );
+                    self.done = true;
+                    return Ask::Nothing;
+                }
                 if self.played >= AFTER + ASHORE_WAIT {
                     eprintln!(
                         "paradrop-check: FAIL she never stood on dry ground (at {her:.0} after {:.0} s)",
