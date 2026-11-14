@@ -154,6 +154,9 @@ pub struct Props {
     heard: HashSet<u32>,
     /// Knocked loose since [`take_knocked`](Self::take_knocked).
     fresh_knocks: Vec<u32>,
+    /// The material animations playing on them
+    /// ([`play_material_animation`](Self::play_material_animation)).
+    material_anims: HashMap<u32, m2_engine::material_anim::Playing>,
     /// Node matrices of those that move on their own, by entity
     /// ([`crate::moving`]).
     poses: HashMap<u32, Vec<Mat4>>,
@@ -1778,6 +1781,9 @@ impl Props {
 
     /// Moves on `dt` seconds: what breaks apart sinks.
     pub fn advance(&mut self, dt: f32) {
+        for a in self.material_anims.values_mut() {
+            a.advance(dt);
+        }
         // Gates swing on; a shut one stands in the way again
         // ([`update`](Self::update) puts its collision back).
         for s in self.swings.values_mut() {
@@ -1811,6 +1817,18 @@ impl Props {
                 }
             }
         }
+    }
+
+    /// Plays material animation `anim` on `entity` (the scripts'
+    /// `Object.PlayMaterialAnimation`), in place of any it played.
+    pub fn play_material_animation(
+        &mut self,
+        entity: u32,
+        anim: m2_assets::material_animation::MaterialAnimation,
+        looped: bool,
+    ) {
+        self.material_anims
+            .insert(entity, m2_engine::material_anim::Playing::new(anim, looped));
     }
 
     /// `entity` was heard coming down as a building: its collapse's end
@@ -1849,6 +1867,16 @@ impl Props {
             // of their own would draw them whole a second time.
             if m.members.iter().any(|x| self.shown.contains_key(x)) {
                 continue;
+            }
+            // Its material animation's values, or its materials as they
+            // are (the model is shared by every prop of it).
+            if !self.material_anims.is_empty() {
+                let surfaces = self
+                    .material_anims
+                    .get(e)
+                    .map(m2_engine::material_anim::Playing::surfaces)
+                    .unwrap_or_default();
+                m.gpu.set_surfaces(&surfaces);
             }
             let moved = match (self.broken.get(e), self.knocked.get(e)) {
                 (Some(pieces), _) => Some((m.breakup.as_deref().map(|b| &b.pieces), pieces)),
