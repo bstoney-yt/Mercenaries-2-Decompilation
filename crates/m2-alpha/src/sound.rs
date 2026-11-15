@@ -832,6 +832,9 @@ pub struct HeardEngine {
     pub surface: f32,
     pub braking: bool,
     pub reversing: bool,
+    /// Its engine's gain over its cue's (1 but for a semi:
+    /// [`crate::config::EnhancedConfig::semi_engine_gain`]).
+    pub gain: f32,
 }
 
 impl HeardEngine {
@@ -885,6 +888,9 @@ pub struct EngineInput {
     pub slide: f32,
     pub surface: f32,
     pub braking: bool,
+    /// Its engine's gain over its cue's (1 but for a semi:
+    /// [`crate::config::EnhancedConfig::semi_engine_gain`]).
+    pub gain: f32,
 }
 
 /// The resident bank's horns: a car's, then a lorry's.
@@ -2976,7 +2982,7 @@ impl GameAudio {
             ]);
             self.out.with(|m| {
                 for (id, (g, pitch)) in e.voices.iter().zip(mix) {
-                    m.set_gain(*id, fade * g);
+                    m.set_gain(*id, fade * g * input.gain);
                     m.set_pitch(*id, pitch);
                 }
             });
@@ -2985,7 +2991,7 @@ impl GameAudio {
         let want = (input.speed.abs() / input.top.max(1.0)).min(1.0) * 0.8 + load * 0.2;
         e.rpm += (want - e.rpm) * (dt * ENGINE_EASE).min(1.0);
         let fade = (e.running / ENGINE_FADE_IN).min(1.0);
-        let gain = ENGINE_GAIN * fade * (0.85 + 0.15 * load);
+        let gain = ENGINE_GAIN * fade * (0.85 + 0.15 * load) * input.gain;
         let mix = Engine::mix(&e.sounds, e.rpm);
         self.out.with(|m| {
             for (id, (g, pitch)) in e.voices.iter().zip(mix) {
@@ -3159,7 +3165,7 @@ impl GameAudio {
                 self.out.with(|m| {
                     for (id, (g, pitch)) in voices.iter().zip(mix) {
                         m.set_position(*id, n.at);
-                        m.set_gain(*id, g);
+                        m.set_gain(*id, g * n.gain);
                         m.set_pitch(*id, pitch);
                     }
                 });
@@ -3443,6 +3449,7 @@ mod tests {
             surface: 0.0,
             braking: false,
             reversing: false,
+            gain: 1.0,
         };
         let p = n.params();
         let get = |k: u32| p.iter().find(|x| x.0 == k).map(|x| x.1);
