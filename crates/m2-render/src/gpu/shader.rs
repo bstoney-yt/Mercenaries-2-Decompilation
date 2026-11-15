@@ -179,6 +179,13 @@ struct Draw {
     direct: vec4<f32>,
     // In place of the material's highlight colour, when w is 1
     specular: vec4<f32>,
+    // In place of the material's ambient and emitted colours, when w is 1
+    ambient: vec4<f32>,
+    emissive: vec4<f32>,
+    // The texture coordinates' transform, two rows over (u, v, 1), when
+    // the first's w is 1
+    uv_u: vec4<f32>,
+    uv_v: vec4<f32>,
 };
 
 struct Material {
@@ -259,6 +266,8 @@ struct Varyings {
     @location(9) @interpolate(flat) over_specular: vec4<f32>,
     // Negative: the material's own
     @location(10) @interpolate(flat) over_opacity: f32,
+    @location(11) @interpolate(flat) over_ambient: vec4<f32>,
+    @location(12) @interpolate(flat) over_emissive: vec4<f32>,
 };
 "#;
 
@@ -270,6 +279,12 @@ fn surface_direct(v: Varyings) -> vec3<f32> {
 }
 fn surface_specular(v: Varyings) -> vec3<f32> {
     return select(material.specular.rgb, v.over_specular.rgb, v.over_specular.w > 0.5);
+}
+fn surface_ambient(v: Varyings) -> vec3<f32> {
+    return select(material.ambient.rgb, v.over_ambient.rgb, v.over_ambient.w > 0.5);
+}
+fn surface_emissive(v: Varyings) -> vec3<f32> {
+    return select(material.emissive.rgb, v.over_emissive.rgb, v.over_emissive.w > 0.5);
 }
 fn surface_opacity(v: Varyings) -> f32 {
     return select(material.color.a, v.over_opacity, v.over_opacity >= 0.0);
@@ -820,7 +835,7 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
         // material's diffuse and ambient colours.
         let light = light_from_display(
             light_to_display(surface_sun()) * (max(dot(n, l), 0.0) * shade) * surface_direct(v)
-                + ambient_display(n) * material.ambient.rgb,
+                + ambient_display(n) * surface_ambient(v),
         );
         let shallow = vec3<f32>(0.09, 0.30, 0.34);
         var body = mix(shallow, base.rgb, 1.0 - exp(-depth / 5.0)) * light;
@@ -930,7 +945,7 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
             // The point lights past the clamp: the game's shaders sum them
             // unclamped (an explosion's flash, 12 times white, blows out).
             let direct = clamp(sun, vec3<f32>(0.0), vec3<f32>(1.0)) + points;
-            lit = rgb * light_from_display(direct * surface_direct(v) + ambient_display(n) * material.ambient.rgb);
+            lit = rgb * light_from_display(direct * surface_direct(v) + ambient_display(n) * surface_ambient(v));
         }
         var tint = vec3<f32>(1.0);
         if material.maps.x > 0.5 {
@@ -962,7 +977,7 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
     }
     rgb = rgb + shine;
     // Light the surface gives off, on top of what it reflects.
-    var glow = material.emissive.rgb;
+    var glow = surface_emissive(v);
     if material.emissive.w > 0.5 {
         glow = glow * spec_texel;
     }
@@ -1246,7 +1261,12 @@ fn place(v: VertexIn, instance: u32) -> Varyings {{
     out.clip = frame.view_proj * world;
     out.world_pos = world.xyz;
     out.normal = (model * vec4<f32>(normal, 0.0)).xyz;
-    out.uv = {uv} + draw.uv.xy;
+    let base_uv = {uv};
+    let moved_uv = vec2<f32>(
+        dot(draw.uv_u.xyz, vec3<f32>(base_uv, 1.0)),
+        dot(draw.uv_v.xyz, vec3<f32>(base_uv, 1.0)),
+    );
+    out.uv = select(base_uv, moved_uv, draw.uv_u.w > 0.5) + draw.uv.xy;
     out.color = {color};
     out.tangent = vec4<f32>((model * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w);
     out.haze = vec4<f32>(0.0, 0.0, 0.0, 1.0);
@@ -1255,6 +1275,8 @@ fn place(v: VertexIn, instance: u32) -> Varyings {{
     out.over_direct = draw.direct;
     out.over_specular = draw.specular;
     out.over_opacity = draw.uv.w;
+    out.over_ambient = draw.ambient;
+    out.over_emissive = draw.emissive;
     return out;
 }}
 

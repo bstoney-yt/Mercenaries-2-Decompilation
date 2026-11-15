@@ -93,6 +93,14 @@ pub struct SurfaceOverride {
     /// The opacity the texture's alpha is scaled by (the alpha of
     /// `MaterialDesc::color`).
     pub opacity: Option<f32>,
+    /// The ambient light's colour on the surface (`MaterialDesc::ambient`).
+    pub ambient: Option<[f32; 3]>,
+    /// The colour it gives off (`Emissive::color`); nothing on a material
+    /// that gives off none.
+    pub emissive: Option<[f32; 3]>,
+    /// Its texture coordinates' transform, two rows: `u' = r0 . (u, v, 1)`,
+    /// `v' = r1 . (u, v, 1)`, before any scroll ([`DrawCall::uv_offset`]).
+    pub uv: Option<[[f32; 3]; 2]>,
 }
 
 impl SurfaceOverride {
@@ -101,6 +109,9 @@ impl SurfaceOverride {
         direct: None,
         specular: None,
         opacity: None,
+        ambient: None,
+        emissive: None,
+        uv: None,
     };
 }
 
