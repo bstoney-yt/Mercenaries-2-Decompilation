@@ -7561,6 +7561,8 @@ mod tests {
             hardpoint: 0,
             barrel: None,
             seat: None,
+            seat_link: None,
+            turret: None,
         }
     }
 

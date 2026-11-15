@@ -19,6 +19,12 @@
 //! - `Marker.Add3D` draws its model where its target stands when it is
 //!   called, turned as the target faces (`Object.GetYaw`'s angle) and
 //!   scaled by its scale.
+//! - `Marker.AddDisc` (`_MarkerAddDisc`, 8231B410 into 823817E0) draws
+//!   `global_locationmarker` (`0xF84AEB3C`, a unit disc: radius 1, 1 m
+//!   high) at its target's place (or its point) lifted by its lift,
+//!   scaled by its radius; its arguments are `(target, radius, r, g, b,
+//!   lift)` with radius 1, colour 255 each and lift 0 where left out, the
+//!   colour over 255 (0x820CB628) as the others'.
 //! - `Marker.Add` draws `global_objectivemarker` (`0x40FF196A`) at its
 //!   target's place (followed as it moves) plus its offset, scaled by its
 //!   scale, and lifted by the target's height (its bounds' top over their
@@ -36,6 +42,10 @@
 //! - Whether the models fade with distance as the icon markers do (the
 //!   records carry 200 m and 300 m as `Marker.Add`'s icons do): they are
 //!   drawn at any distance here.
+//! - A disc's scale: its one scale is the radius, applied to its height as
+//!   well here (the model's top and bottom nodes are left where they are);
+//!   and whether it follows its target (the 360 takes the target's place
+//!   when it is called; here it follows, as a pin does).
 //! - A pin's lift by its target's height: the scripts' world here has no
 //!   bounds for its objects, so the pin stands its offset over the
 //!   target's place only.
@@ -46,6 +56,8 @@ use m2_math::glam::{Mat4, Quat, Vec3};
 pub const TRIPWIRE_MODEL: u32 = 0xC2DC_97E1;
 /// `global_objectivemarker`'s name hash: the model a pin draws.
 pub const PIN_MODEL: u32 = 0x40FF_196A;
+/// `global_locationmarker`'s name hash: the model a disc draws.
+pub const DISC_MODEL: u32 = 0xF84A_EB3C;
 /// A tripwire model's end nodes: the one 1 m to the model's -x side and
 /// the one 1 m to its +x side.
 pub const TRIPWIRE_ENDS: [u32; 2] = [0xAB81_4FE1, 0x98EF_01C8];
@@ -105,6 +117,34 @@ mod tests {
     fn model_hashes_are_the_names() {
         assert_eq!(m2_assets::name_hash("global_tripwire"), TRIPWIRE_MODEL);
         assert_eq!(m2_assets::name_hash("global_objectivemarker"), PIN_MODEL);
+        assert_eq!(m2_assets::name_hash("global_locationmarker"), DISC_MODEL);
+    }
+
+    /// A disc's unit model is scaled to its radius where it is lifted to,
+    /// in its colour.
+    #[test]
+    fn a_disc_is_its_radius_across_at_its_lift() {
+        let disc = MarkerModel {
+            model: DISC_MODEL,
+            at: Vec3::new(3.0, 1.0 + 0.05, -2.0),
+            yaw: None,
+            scale: 4.0,
+            width: None,
+            colour: [0, 255, 0],
+        };
+        let world = disc.world();
+        let centre = world.transform_point3(Vec3::ZERO);
+        assert!(centre.distance(Vec3::new(3.0, 1.05, -2.0)) < 1e-5);
+        // The rim (radius 1 in the model) lies 4 m out, flat.
+        let rim = world.transform_point3(Vec3::X);
+        assert!((rim.with_y(0.0).distance(centre.with_y(0.0)) - 4.0).abs() < 1e-4);
+        assert!((rim.y - centre.y).abs() < 1e-5);
+        assert_eq!(disc.tint(), [0.0, 1.0, 0.0, 1.0]);
+        assert!(
+            disc.node_moves(&[DISC_MODEL])
+                .iter()
+                .all(|m| *m == Vec3::ZERO)
+        );
     }
 
     #[test]
