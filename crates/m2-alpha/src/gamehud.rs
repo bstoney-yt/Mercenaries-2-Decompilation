@@ -3937,7 +3937,7 @@ impl Thread {
                 eprintln!(
                     "hud text: no button picture matched for {}: on the PC, which of \
                      english_18's button page (pc\\common_18_buttons) glyphs {} (or past \
-                     U+E013) is each",
+                     U+E01B) is each",
                     keyed.join(", "),
                     gui_runtime::UNMATCHED_GLYPHS
                         .iter()
