@@ -56,3 +56,4 @@ workspace = true
 # wgpu's and egui's own scopes to a Tracy profiler; see docs/profiling.md.
 [features]
 tracy = ["dep:tracy-client", "dep:profiling"]
+noop = ["m2-render/noop"]
