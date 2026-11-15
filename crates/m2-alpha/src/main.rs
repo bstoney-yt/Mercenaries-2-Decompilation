@@ -10423,6 +10423,8 @@ impl Running {
             }
             m.set_volume(Category::Music, level(music));
             m.set_volume(Category::Vo, level(dialog));
+            // The movies play at the dialog volume (see `movie`).
+            m.set_volume(Category::Movie, level(dialog));
         });
     }
 
