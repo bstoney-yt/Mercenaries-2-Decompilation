@@ -16,12 +16,15 @@
 //! Clean-room. Written against wgpu's public API and general rendering
 //! practice; nothing here comes from the original executable.
 
+mod fasthash;
 mod post;
 mod shader;
 mod shadow;
 pub mod timer;
 
 use std::collections::HashMap;
+
+use fasthash::FastMap;
 
 use ::wgpu::util::DeviceExt;
 use m2_math::glam::{Mat4, Vec3};
@@ -507,10 +510,10 @@ pub struct WgpuBackend {
 
     shaders: HashMap<VertexLayout, wgpu::ShaderModule>,
     layouts: Layouts,
-    pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
+    pipelines: FastMap<PipelineKey, wgpu::RenderPipeline>,
     /// The glow layer's pipelines for additive and translucent keys.
-    glow_pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
-    shadow_pipelines: HashMap<ShadowKey, wgpu::RenderPipeline>,
+    glow_pipelines: FastMap<PipelineKey, wgpu::RenderPipeline>,
+    shadow_pipelines: FastMap<ShadowKey, wgpu::RenderPipeline>,
     /// When the backend started, for animated surfaces.
     started: std::time::Instant,
     /// Bloom, exposure and grade after the world.
@@ -522,7 +525,7 @@ pub struct WgpuBackend {
     vertex_buffers: Slots<VertexBuffer>,
     index_buffers: Slots<IndexBuffer>,
     textures: Slots<Texture>,
-    materials: HashMap<MaterialId, Material>,
+    materials: FastMap<MaterialId, Material>,
 
     frame: Option<OpenFrame>,
     /// Frames ended so far, which is also the number of the open frame.
@@ -1090,9 +1093,9 @@ impl WgpuBackend {
             white,
             shaders: HashMap::new(),
             layouts: Layouts::default(),
-            pipelines: HashMap::new(),
-            glow_pipelines: HashMap::new(),
-            shadow_pipelines: HashMap::new(),
+            pipelines: FastMap::default(),
+            glow_pipelines: FastMap::default(),
+            shadow_pipelines: FastMap::default(),
             cascades: std::cell::Cell::new(None),
             started: std::time::Instant::now(),
             post,
@@ -1101,7 +1104,7 @@ impl WgpuBackend {
             vertex_buffers: Slots::default(),
             index_buffers: Slots::default(),
             textures: Slots::default(),
-            materials: HashMap::new(),
+            materials: FastMap::default(),
             frame: None,
             frames: 0,
             timer,

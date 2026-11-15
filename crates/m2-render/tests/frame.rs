@@ -309,3 +309,44 @@ fn materials_check_their_textures() {
     backend.end_frame().unwrap();
     assert!(backend.set_material(MaterialId(9), &material).is_err());
 }
+
+#[test]
+fn equal_keys_draw_in_push_order() {
+    let mut backend = RecordingBackend::new();
+    let (vb, ib) = triangle_buffers(&mut backend);
+    let view = View {
+        near: 1.0,
+        far: 101.0,
+        ..View::default()
+    };
+    let mut queue = DrawQueue::new();
+    // Material 7 at one depth, many times, labelled by tint, around
+    // others that sort before and after them.
+    let labelled = |n: u32| {
+        let mut c = call(vb, ib, 7);
+        c.tint = [n as f32, 0.0, 0.0, 1.0];
+        prim(c, Layer::WORLD, false, 50.0)
+    };
+    for n in 0..40 {
+        queue.push(labelled(n));
+        if n % 7 == 0 {
+            queue.push(prim(call(vb, ib, 9), Layer::WORLD, false, 50.0));
+            queue.push(prim(call(vb, ib, 1), Layer::WORLD, false, 50.0));
+        }
+    }
+    queue.assign_keys(&view);
+    queue.sort().unwrap();
+    let keys: Vec<SortKey> = queue.keys().collect();
+    assert!(keys.windows(2).all(|w| w[0] <= w[1]));
+    backend.begin_frame(&view).unwrap();
+    queue.submit(&mut backend).unwrap();
+    backend.end_frame().unwrap();
+    let sevens: Vec<u32> = backend
+        .draws()
+        .filter(|d| d.material.0 == 7)
+        .map(|d| d.tint[0] as u32)
+        .collect();
+    assert_eq!(sevens, (0..40).collect::<Vec<_>>());
+    let materials: Vec<u32> = backend.draws().map(|d| d.material.0).collect();
+    assert!(materials.windows(2).all(|w| w[0] <= w[1]), "{materials:?}");
+}
