@@ -6669,7 +6669,6 @@ pub(crate) mod tests {
             lip: None,
             shuffling: false,
             aim_clock: 0.0,
-            arm: Default::default(),
             cues: Vec::new(),
             own: Default::default(),
             foreign: Default::default(),
