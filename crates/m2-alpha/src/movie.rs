@@ -6,6 +6,24 @@
 //! separate `ffmpeg` process that pipes raw frames and samples back; the
 //! movies themselves are never copied. Where `ffmpeg` is found:
 //! `M2_FFMPEG`, else `ffmpeg.exe` beside m2-alpha, else the `PATH`.
+//!
+//! # The sound
+//!
+//! From the 360 code: the movie player (`0x824B6788`) opens the file with
+//! Bink's sound tracks 0 to 3 and 2001 plus the language's index
+//! (`BinkSetSoundTrack`-style table at `0x82DE88D8`, before the open), and
+//! then sets every track's volume to the player's dialog volume (the
+//! sound manager's third level, which the options' `audioSetDialogVolume`
+//! sets) times 43691 (Bink's 32768 is as made). Bink plays it on its own
+//! voices, outside the sound engine, so the scripts'
+//! `Sound.SetMasterVolume(0)` before a cut-scene (both of the first two
+//! contracts' do it; from the mission log) leaves it alone. Here it plays
+//! as [`Category::Movie`], which that master level and the category fades
+//! skip, at [`MOVIE_GAIN`].
+//!
+//! Invented: the sound is decoded whole before it plays; a movie waits up
+//! to [`SOUND_WAIT`] for it, and sound decoded later starts where the
+//! pictures are, so it stays in step (Bink streams it with the frames).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -13,7 +31,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use std::time::{Duration, Instant};
 
-use m2_engine::{Install, Play, SoundBuffer, VoiceId};
+use m2_engine::{Category, Install, MOVIE_GAIN, Play, SoundBuffer, VoiceId};
 
 /// The sample rate and channels the movies' sound is decoded to.
 const RATE: u32 = 48_000;
@@ -288,11 +306,21 @@ impl Movie {
     /// Returns whether the movie is over.
     pub fn update(&mut self, mut play: impl FnMut(Play) -> VoiceId) -> bool {
         let started = match self.started {
-            Some(t) => t,
+            Some(t) => {
+                // Sound decoded after the pictures started: from where
+                // they are.
+                if self.voice.is_none()
+                    && let Ok(buffer) = self.sound.try_recv()
+                {
+                    let late = from(&buffer, t.elapsed().as_secs_f64());
+                    self.voice = Some(play(sound(late)));
+                }
+                t
+            }
             None => {
                 match self.sound.try_recv() {
                     Ok(buffer) => {
-                        self.voice = Some(play(Play::flat(buffer).ui()));
+                        self.voice = Some(play(sound(buffer)));
                     }
                     // No sound (yet): wait a little for it.
                     Err(TryRecvError::Empty) if self.opened.elapsed() < SOUND_WAIT => {
@@ -326,6 +354,25 @@ impl Movie {
         // the decoder have stopped early, a second after it did).
         let over_time = started.elapsed().as_secs_f64() > self.info.seconds() + 0.25;
         self.drained && (over_time || due > u64::from(self.info.frames))
+    }
+}
+
+/// How a movie's sound plays: Bink's, outside the sound engine (see the
+/// module's docs).
+fn sound(buffer: SoundBuffer) -> Play {
+    Play::flat(buffer)
+        .category(Category::Movie)
+        .gain(MOVIE_GAIN)
+}
+
+/// `buffer` from `seconds` in (empty past its end).
+fn from(buffer: &SoundBuffer, seconds: f64) -> SoundBuffer {
+    let channels = usize::from(buffer.channels.max(1));
+    let frame = (seconds.max(0.0) * f64::from(buffer.rate)) as usize;
+    let at = (frame * channels).min(buffer.samples.len());
+    SoundBuffer {
+        samples: buffer.samples[at..].into(),
+        ..buffer.clone()
     }
 }
 
@@ -377,6 +424,35 @@ mod tests {
             )
         );
         assert_eq!(sound_mix(&[0]), None);
+    }
+
+    fn stereo(frames: i16) -> SoundBuffer {
+        SoundBuffer {
+            hash: 0,
+            channels: 2,
+            rate: 10,
+            samples: (0..frames).flat_map(|f| [f, -f]).collect(),
+        }
+    }
+
+    #[test]
+    fn the_sound_plays_as_bink_s_outside_the_scripts_master_level() {
+        let p = sound(stereo(4));
+        assert_eq!(p.category, Category::Movie);
+        assert!((p.gain - 43_691.0 / 32_768.0).abs() < 1e-6);
+        assert!(p.position.is_none() && !p.looping);
+    }
+
+    #[test]
+    fn sound_decoded_late_starts_where_the_pictures_are() {
+        let b = stereo(30);
+        // A second and a half in at 10 Hz: frame 15 on, both channels.
+        let late = from(&b, 1.5);
+        assert_eq!(late.frames(), 15);
+        assert_eq!(&late.samples[..2], &[15, -15]);
+        assert_eq!((late.rate, late.channels), (10, 2));
+        assert_eq!(from(&b, 0.0), b);
+        assert_eq!(from(&b, 9.0).frames(), 0);
     }
 
     #[test]

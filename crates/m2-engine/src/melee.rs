@@ -34,10 +34,29 @@
 //! ground to 1.25 m and the high box on from there to 1.75 m, which is
 //! what makes "low" mean "something below the chest" (inferred).
 //!
-//! **Inferred**: the impulse as a change of speed, `force / Mass` with the
-//! template's `_HumanPhysics` `Mass` (100 by default): the queue it goes
-//! on (0x8319C8B8) is handed to each physics object's own handler, which
-//! was not traced for people.
+//! - **The impulse's way to the body** (traced for this module): the
+//!   blow's record {target, force, direction, point} goes on the impulse
+//!   queue 0x8319C8B8 (0x8217D758). The physics pass (0x821544F0) hands
+//!   each to its target's physics object (slot 0xF0, 0x82185320, which
+//!   every physics class shares, a person's proxy class 0x820C7E48 among
+//!   them). That makes it the impulse `force * direction`, kg m/s, and
+//!   applies it at the point (slot 0x14, 0x82181858) to the object's
+//!   rigid body of the record's index (+0x4C, +0x50). That is a Havok
+//!   point impulse (0x8216DD38 calling 0x8262AC00 on the body's +0x38,
+//!   skipping motion type 7), so the speed it gives is the impulse over
+//!   that body's own mass. Another producer, 0x8243DFA8, multiplies its
+//!   force by each ragdoll body's mass (0x8262C120), which confirms the
+//!   record holds an impulse.
+//! - **The knockdown's spread** (0x82423848): `r` is one draw of the
+//!   engine's generator, stream 1 (`0x8215E260(1)`, state `0x82B5E588`,
+//!   seeded `0x94153A94`; `m2_game::script_math::EngineRng`).
+//!
+//! **Inferred**: the body a standing person's impulse moves, and so its
+//! mass. A person's proxy (0x82176F38 constructor) reads its
+//! `_HumanPhysics` record, but the code that builds its body is VMX128
+//! and decompiles cut short, so whether that body carries the record's
+//! `Mass` (field 0, registered default 100, 0x823EAE98) was not seen.
+//! Here the change of speed is `impulse / Mass` with that 100.
 
 use m2_math::glam::{Vec2, Vec3};
 

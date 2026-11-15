@@ -16,12 +16,15 @@
 //! Clean-room. Written against wgpu's public API and general rendering
 //! practice; nothing here comes from the original executable.
 
+mod fasthash;
 mod post;
 mod shader;
 mod shadow;
 pub mod timer;
 
 use std::collections::HashMap;
+
+use fasthash::FastMap;
 
 use ::wgpu::util::DeviceExt;
 use m2_math::glam::{Mat4, Vec3};
@@ -42,14 +45,15 @@ pub use ::wgpu;
 /// matrix and the palette length, then the same for its instances, then
 /// its texture coordinate offset (and the opacity in place of its
 /// material's, negative for none), then its tint, then its direct light
-/// colour and its highlight colour in place of its material's (w 1 when
-/// given). The frame's draws lie one after another
+/// colour, its highlight, ambient and emitted colours in place of its
+/// material's (w 1 when given), then its texture transform's two rows
+/// (the first's w 1 when given). The frame's draws lie one after another
 /// in one storage buffer, and each instance drawn has a slot (the draw's
 /// index and its instance's) in another: a draw is drawn with its first
 /// slot as its first instance, so its vertices find their uniforms from
 /// the instance index, and no bind group changes between draws. Binding
 /// one per draw cost the CPU about 8 ms a frame of 10,000 draws.
-const DRAW_UNIFORM_SIZE: u64 = 144;
+const DRAW_UNIFORM_SIZE: u64 = 208;
 /// Bytes of an instance's slot: its draw's index and its own.
 const SLOT_SIZE: u64 = 8;
 /// Bone matrices the palette buffer starts with.
@@ -179,6 +183,8 @@ impl<T> Slots<T> {
 #[derive(Debug)]
 struct VertexBuffer {
     desc: VertexBufferDesc,
+    /// Its layout's number among the backend's ([`Layouts`]).
+    layout: LayoutId,
     buffer: wgpu::Buffer,
     /// A sphere around its positions (object space), for shadow culling;
     /// `None` when unknown (casts everywhere).
@@ -215,9 +221,44 @@ enum BlendKind {
     Additive,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// A vertex layout's number among the backend's ([`Layouts`]):
+/// pipeline keys hold it rather than the layout, so a draw's key is
+/// copied and hashed without the layout's list of elements (a heap copy
+/// and a long hash for each draw, twice when it casts a shadow, and a
+/// hash for each draw in the glow pass: 6 ms of a 1440p frame's CPU in
+/// the bench).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct LayoutId(u32);
+
+/// The vertex layouts of the buffers made so far, each once, numbered
+/// in the order first seen.
+#[derive(Debug, Default)]
+struct Layouts {
+    all: Vec<VertexLayout>,
+    ids: HashMap<VertexLayout, LayoutId>,
+}
+
+impl Layouts {
+    /// `layout`'s number, numbering it if new.
+    fn id(&mut self, layout: &VertexLayout) -> LayoutId {
+        if let Some(&id) = self.ids.get(layout) {
+            return id;
+        }
+        let id = LayoutId(self.all.len() as u32);
+        self.all.push(layout.clone());
+        self.ids.insert(layout.clone(), id);
+        id
+    }
+
+    /// The layout numbered `id`.
+    fn get(&self, id: LayoutId) -> &VertexLayout {
+        &self.all[id.0 as usize]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct PipelineKey {
-    layout: VertexLayout,
+    layout: LayoutId,
     topology: Topology,
     strip_index: Option<IndexFormat>,
     blend: BlendKind,
@@ -302,9 +343,9 @@ struct FrameUniforms {
 }
 
 /// What a shadow pipeline depends on.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ShadowKey {
-    layout: VertexLayout,
+    layout: LayoutId,
     topology: Topology,
     strip_index: Option<IndexFormat>,
     /// Alpha-tested: runs a fragment stage to cut out.
@@ -472,10 +513,11 @@ pub struct WgpuBackend {
     default_material: wgpu::BindGroup,
 
     shaders: HashMap<VertexLayout, wgpu::ShaderModule>,
-    pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
+    layouts: Layouts,
+    pipelines: FastMap<PipelineKey, wgpu::RenderPipeline>,
     /// The glow layer's pipelines for additive and translucent keys.
-    glow_pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
-    shadow_pipelines: HashMap<ShadowKey, wgpu::RenderPipeline>,
+    glow_pipelines: FastMap<PipelineKey, wgpu::RenderPipeline>,
+    shadow_pipelines: FastMap<ShadowKey, wgpu::RenderPipeline>,
     /// When the backend started, for animated surfaces.
     started: std::time::Instant,
     /// Bloom, exposure and grade after the world.
@@ -487,7 +529,7 @@ pub struct WgpuBackend {
     vertex_buffers: Slots<VertexBuffer>,
     index_buffers: Slots<IndexBuffer>,
     textures: Slots<Texture>,
-    materials: HashMap<MaterialId, Material>,
+    materials: FastMap<MaterialId, Material>,
 
     frame: Option<OpenFrame>,
     /// Frames ended so far, which is also the number of the open frame.
@@ -1054,9 +1096,10 @@ impl WgpuBackend {
             samplers,
             white,
             shaders: HashMap::new(),
-            pipelines: HashMap::new(),
-            glow_pipelines: HashMap::new(),
-            shadow_pipelines: HashMap::new(),
+            layouts: Layouts::default(),
+            pipelines: FastMap::default(),
+            glow_pipelines: FastMap::default(),
+            shadow_pipelines: FastMap::default(),
             cascades: std::cell::Cell::new(None),
             started: std::time::Instant::now(),
             post,
@@ -1065,7 +1108,7 @@ impl WgpuBackend {
             vertex_buffers: Slots::default(),
             index_buffers: Slots::default(),
             textures: Slots::default(),
-            materials: HashMap::new(),
+            materials: FastMap::default(),
             frame: None,
             frames: 0,
             timer,
@@ -1565,7 +1608,7 @@ impl WgpuBackend {
         };
         wgpu_topology(call.topology)?;
         Ok(PipelineKey {
-            layout: vb.desc.layout.clone(),
+            layout: vb.layout,
             topology: call.topology,
             strip_index,
             blend: match desc.blend {
@@ -1586,8 +1629,9 @@ impl WgpuBackend {
         // The world draws in floating point; the post pass brings it to
         // the frame.
         let color_format = post::HDR_FORMAT;
-        let attributes = vertex_attributes(&key.layout);
-        let module = self.shader_module(&key.layout).clone();
+        let layout = self.layouts.get(key.layout).clone();
+        let attributes = vertex_attributes(&layout);
+        let module = self.shader_module(&layout).clone();
         let module = &module;
         let device = &self.device;
         let translucent = matches!(key.blend, BlendKind::Translucent | BlendKind::Additive);
@@ -1617,7 +1661,7 @@ impl WgpuBackend {
                     entry_point: Some("vs_main"),
                     compilation_options: Default::default(),
                     buffers: &[Some(wgpu::VertexBufferLayout {
-                        array_stride: u64::from(key.layout.stride()),
+                        array_stride: u64::from(layout.stride()),
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &attributes,
                     })],
@@ -1684,11 +1728,12 @@ impl WgpuBackend {
             )),
             _ => None,
         };
+        debug_assert_eq!(glow.is_some(), in_glow_layer(key.blend));
         let pipeline = make("fs_main", blend);
         if let Some(glow) = glow {
-            self.glow_pipelines.insert(key.clone(), glow);
+            self.glow_pipelines.insert(*key, glow);
         }
-        self.pipelines.insert(key.clone(), pipeline);
+        self.pipelines.insert(*key, pipeline);
         Ok(())
     }
 
@@ -1713,7 +1758,7 @@ impl WgpuBackend {
             return Ok(None);
         }
         let pipeline = ShadowKey {
-            layout: key.layout.clone(),
+            layout: key.layout,
             topology: key.topology,
             strip_index: key.strip_index,
             masked: key.blend == BlendKind::Masked,
@@ -1760,8 +1805,9 @@ impl WgpuBackend {
             return Ok(());
         }
         let topology = wgpu_topology(key.topology)?;
-        let attributes = vertex_attributes(&key.layout);
-        let module = self.shader_module(&key.layout).clone();
+        let layout = self.layouts.get(key.layout).clone();
+        let attributes = vertex_attributes(&layout);
+        let module = self.shader_module(&layout).clone();
         let pipeline = self
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1772,7 +1818,7 @@ impl WgpuBackend {
                     entry_point: Some("vs_shadow"),
                     compilation_options: Default::default(),
                     buffers: &[Some(wgpu::VertexBufferLayout {
-                        array_stride: u64::from(key.layout.stride()),
+                        array_stride: u64::from(layout.stride()),
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &attributes,
                     })],
@@ -1807,7 +1853,7 @@ impl WgpuBackend {
                 multiview_mask: None,
                 cache: None,
             });
-        self.shadow_pipelines.insert(key.clone(), pipeline);
+        self.shadow_pipelines.insert(*key, pipeline);
         Ok(())
     }
 
@@ -1991,6 +2037,11 @@ impl WgpuBackend {
         let mut vertices_now = None;
         let mut indices_now = None;
         for d in draws {
+            // Skips the look-up for the many draws with no glow-layer
+            // pipeline.
+            if !in_glow_layer(d.pipeline.blend) {
+                continue;
+            }
             let Some(pipeline) = self.glow_pipelines.get(&d.pipeline) else {
                 continue;
             };
@@ -2498,9 +2549,11 @@ impl RenderBackend for WgpuBackend {
                 contents: &data,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
+        let layout = self.layouts.id(&desc.layout);
         Ok(VertexBufferHandle(self.vertex_buffers.insert(
             VertexBuffer {
                 desc: desc.clone(),
+                layout,
                 buffer,
                 bounds: initial.and_then(|b| shadow::bounds(&desc.layout, b)),
             },
@@ -2815,6 +2868,12 @@ impl RenderBackend for WgpuBackend {
         let given = |c: Option<[f32; 3]>| c.map_or([0.0; 4], |[r, g, b]| [r, g, b, 1.0]);
         uniforms.extend_from_slice(bytemuck::cast_slice(&given(call.surface.direct)));
         uniforms.extend_from_slice(bytemuck::cast_slice(&given(call.surface.specular)));
+        uniforms.extend_from_slice(bytemuck::cast_slice(&given(call.surface.ambient)));
+        uniforms.extend_from_slice(bytemuck::cast_slice(&given(call.surface.emissive)));
+        let rows = call.surface.uv.map_or([[0.0; 4]; 2], |[a, b]| {
+            [[a[0], a[1], a[2], 1.0], [b[0], b[1], b[2], 0.0]]
+        });
+        uniforms.extend_from_slice(bytemuck::cast_slice(&rows));
         let index = frame.draws.len() as u32;
         let first_slot = frame.slots.len() as u32;
         frame
@@ -3034,6 +3093,12 @@ impl WgpuBackend {
     }
 }
 
+/// Whether draws of `blend` have a pipeline in the glow layer
+/// (`encode_glows`): glows add themselves, translucent surfaces cover.
+fn in_glow_layer(blend: BlendKind) -> bool {
+    matches!(blend, BlendKind::Additive | BlendKind::Translucent)
+}
+
 /// What a frame does when the window gives it no picture to draw to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Missed {
@@ -3110,5 +3175,41 @@ mod missed_frame_tests {
         assert_eq!(on_missed_frame(&S::Outdated), Missed::Reconfigure);
         assert_eq!(on_missed_frame(&S::Timeout), Missed::Skip);
         assert_eq!(on_missed_frame(&S::Occluded), Missed::Skip);
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use crate::buffer::{VertexFormat, VertexSemantic};
+
+    fn layout(attributes: &[(VertexSemantic, VertexFormat)]) -> VertexLayout {
+        VertexLayout::packed(attributes).expect("valid layout")
+    }
+
+    #[test]
+    fn equal_layouts_share_a_number_and_different_ones_do_not() {
+        let a = layout(&[(VertexSemantic::Position, VertexFormat::Float3)]);
+        let b = layout(&[
+            (VertexSemantic::Position, VertexFormat::Float3),
+            (VertexSemantic::TexCoord(0), VertexFormat::Float2),
+        ]);
+        let mut layouts = Layouts::default();
+        let ia = layouts.id(&a);
+        let ib = layouts.id(&b);
+        assert_ne!(ia, ib);
+        assert_eq!(layouts.id(&a.clone()), ia);
+        assert_eq!(layouts.id(&b), ib);
+        assert_eq!(layouts.get(ia), &a);
+        assert_eq!(layouts.get(ib), &b);
+        assert_eq!(layouts.all.len(), 2);
+    }
+
+    #[test]
+    fn only_glows_and_translucent_surfaces_draw_in_the_glow_layer() {
+        assert!(in_glow_layer(BlendKind::Additive));
+        assert!(in_glow_layer(BlendKind::Translucent));
+        assert!(!in_glow_layer(BlendKind::Opaque));
+        assert!(!in_glow_layer(BlendKind::Masked));
     }
 }

@@ -1048,3 +1048,49 @@ fn a_draws_opacity_in_place_of_its_materials_hides_a_cut_out_quad() {
     b.end_frame().unwrap();
     assert_eq!(pixel(&b.read_pixels().unwrap(), 32, 32), [0, 0, 255, 255]);
 }
+
+#[test]
+fn a_draws_texture_transform_moves_its_coordinates() {
+    let Some(mut b) = backend() else { return };
+    let (vb, ib) = quad(&mut b);
+    let quadrant = |x: u32, y: u32| match (x < 4, y < 4) {
+        (true, true) => [255, 0, 0, 255],
+        (false, true) => [0, 255, 0, 255],
+        (true, false) => [255, 255, 255, 255],
+        (false, false) => [0, 0, 0, 255],
+    };
+    let texels: Vec<u8> = (0..64).flat_map(|i| quadrant(i % 8, i / 8)).collect();
+    let tex = b
+        .create_texture(
+            &TextureDesc {
+                width: 8,
+                height: 8,
+                format: TextureFormat::Rgba8Srgb,
+            },
+            &[&texels],
+        )
+        .unwrap();
+    b.set_material(
+        MaterialId(1),
+        &MaterialDesc {
+            texture: Some(tex),
+            lit: false,
+            ..MaterialDesc::default()
+        },
+    )
+    .unwrap();
+    // u' = u - 0.5: as scrolling half way, the quadrants swap sides.
+    b.begin_frame(&view()).unwrap();
+    b.draw(&DrawCall {
+        surface: m2_render::SurfaceOverride {
+            uv: Some([[1.0, 0.0, -0.5], [0.0, 1.0, 0.0]]),
+            ..m2_render::SurfaceOverride::NONE
+        },
+        ..draw(vb, ib, 1, Mat4::IDENTITY)
+    })
+    .unwrap();
+    b.end_frame().unwrap();
+    let rgba = b.read_pixels().unwrap();
+    assert_eq!(pixel(&rgba, 40, 24), [0, 255, 0, 255], "moved u 0, top");
+    assert_eq!(pixel(&rgba, 24, 24), [255, 0, 0, 255], "moved u 1, top");
+}

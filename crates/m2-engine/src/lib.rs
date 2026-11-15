@@ -53,11 +53,13 @@ pub mod hijack;
 pub mod human_state;
 pub mod ladder;
 pub mod lights;
+pub mod lip_sync;
 pub mod material_anim;
 pub mod melee;
 pub mod model;
 pub mod motion;
 pub mod music_source;
+pub mod node_health;
 pub mod on_foot;
 pub mod ordnance;
 pub mod osprey;
@@ -102,7 +104,9 @@ pub use ai::{AiFlags, AiProfile};
 pub use anim::{Animator, BoundClip, Gait, Locomotion, Pose, Skeleton};
 pub use assets::{AssetError, AssetSource, DecodedTexture, Install, ModelData};
 pub use atmosphere::Atmosphere;
-pub use audio::{Category, Mixer, Play, SoundBuffer, SoundLibrary, Streams, VoiceId, Voices};
+pub use audio::{
+    Category, MOVIE_GAIN, Mixer, Play, SoundBuffer, SoundLibrary, Streams, VoiceId, Voices,
+};
 pub use model::{
     CpuModel, GpuModel, Looks, MaterialCache, ModelParts, MorphedFace, PieceMorph, StateFx,
     StateMessage,
