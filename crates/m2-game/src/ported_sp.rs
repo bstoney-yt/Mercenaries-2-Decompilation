@@ -33,6 +33,25 @@ pub struct SpState {
     /// `Animation.SetUseBriefingLOD`: the briefing detail switch (global
     /// 0x83134483).
     pub briefing_lod: bool,
+    /// `Animation.BindFaceAnimSet` and `UnbindFaceAnimSet`, in order, for
+    /// the game to mount on the people's face rigs.
+    pub face_sets: Vec<FaceSetBind>,
+}
+
+/// One `Animation.BindFaceAnimSet(character, set)` (`bind`) or
+/// `UnbindFaceAnimSet(character, set)`. The 360 mounts the set on the
+/// face rig the character's record names (0x82315CF8, 0x82315E68), so it
+/// holds for everyone with that rig: the game resolves the rig from the
+/// character's template.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FaceSetBind {
+    pub character: u32,
+    /// The character's object's name (its template), when the scripts'
+    /// world knows the guid.
+    pub template: Option<String>,
+    /// The `facefxanimationset` asset's name hash.
+    pub set: u32,
+    pub bind: bool,
 }
 
 /// One `Animation.PlayFacialExpression(character, expression, a, b, flag)`.
@@ -64,6 +83,8 @@ pub(crate) fn install(
     let animation = lib("Animation")?;
     add(&animation, "PlayFacialExpression", play_facial_expression)?;
     add(&animation, "SetUseBriefingLOD", set_use_briefing_lod)?;
+    add(&animation, "BindFaceAnimSet", bind_face_anim_set)?;
+    add(&animation, "UnbindFaceAnimSet", unbind_face_anim_set)?;
     Ok(())
 }
 
@@ -184,6 +205,40 @@ fn play_facial_expression(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Re
     nothing()
 }
 
+/// `Animation.BindFaceAnimSet(character, set)` (0x82315CF8): `set` names
+/// a `facefxanimationset` asset (a name, or its hash). Returns whether it
+/// was mounted, which the 360 decides by both assets being loaded; here
+/// true, the game reading them from the archive when a line needs them
+/// (inferred). Nothing without a character and a set.
+fn bind_face_anim_set(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiValue> {
+    face_set(w, a, true)
+}
+
+/// `Animation.UnbindFaceAnimSet(character, set)` (0x82315E68): the same
+/// arguments and answer; takes the set off the rig.
+fn unbind_face_anim_set(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiValue> {
+    face_set(w, a, false)
+}
+
+fn face_set(w: &mut ScriptWorld, a: &[Value], bind: bool) -> mlua::Result<MultiValue> {
+    let set = match a.get(1) {
+        Some(Value::String(s)) => Some(m2_assets::name_hash(&s.to_string_lossy())),
+        Some(Value::Integer(i)) => Some(*i as u32),
+        _ => None,
+    };
+    let (Some(character), Some(set)) = (guid(a.first()), set) else {
+        return nothing();
+    };
+    let template = w.objects.get(&character).map(|o| o.name.clone());
+    w.sp.face_sets.push(FaceSetBind {
+        character,
+        template,
+        set,
+        bind,
+    });
+    one(Value::Boolean(true))
+}
+
 /// `Animation.SetUseBriefingLOD(on)` (0x823162b0): sets the switch;
 /// returns nothing, or nil without a boolean.
 fn set_use_briefing_lod(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiValue> {
@@ -235,6 +290,28 @@ mod tests {
             Some([false, true, true])
         );
         assert_eq!(got("Player.SetSeatMovementLocks(nil)"), Value::Nil);
+        // Face sets: mounted by name hash for the character's rig.
+        assert_eq!(
+            got(&format!(
+                "Animation.BindFaceAnimSet({me}, 'ALL01_Contract_Briefing_Chris')"
+            )),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            got(&format!(
+                "Animation.UnbindFaceAnimSet({me}, 'ALL01_Contract_Briefing_Chris')"
+            )),
+            Value::Boolean(true)
+        );
+        assert_eq!(n("Animation.BindFaceAnimSet(nil, 'x')"), 0);
+        {
+            let w = world.borrow();
+            let set = m2_assets::name_hash("ALL01_Contract_Briefing_Chris");
+            assert_eq!(w.sp.face_sets.len(), 2);
+            assert_eq!(w.sp.face_sets[0].set, set);
+            assert_eq!(w.sp.face_sets[0].template.as_deref(), Some("Mattias"));
+            assert!(w.sp.face_sets[0].bind && !w.sp.face_sets[1].bind);
+        }
         // Loading hints: false does nothing; nothing returned.
         assert_eq!(n("Gui.ShowLoadingHints(false)"), 0);
         assert!(!world.borrow().sp.loading_hints);

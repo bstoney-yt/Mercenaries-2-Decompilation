@@ -144,8 +144,6 @@ pub struct MissionView {
     /// The radar's objective blips (`Hud.Radar.AddObjective`), what the
     /// minimap shows.
     pub radar: Vec<RadarView>,
-    /// Discs on the ground (`Marker.AddDisc`): centre, radius, colour.
-    pub discs: Vec<(Vec3, f32, [u8; 3])>,
     /// The markers drawn as models: tripwires, `Marker.Add3D`'s and
     /// `Marker.Add`'s ([`crate::marker_models`]).
     pub models: Vec<crate::marker_models::MarkerModel>,
@@ -191,8 +189,9 @@ pub struct MissionView {
 pub struct RadarView {
     /// Where (world): its target's place plus its offset, or its own.
     pub at: Vec3,
-    /// Its texture (`objective_action`), from the scripts' radar icons.
-    pub icon: String,
+    /// Its texture (`objective_action`), from the scripts' radar icons;
+    /// `None` for a blip given none.
+    pub icon: Option<String>,
     /// RGBA.
     pub colour: [u8; 4],
     /// Kept on the rim while out of range (see [`m2_game::hud::Blip`]).
@@ -399,6 +398,21 @@ end
 /// for the game HUD, which runs in a Lua state of its
 /// own. Each call then goes on as it would. The groups and methods are
 /// those `MrxGuiInterface` gives `HudInterface`.
+///
+/// Inside such a call the scripts' `MrxGuiManager.ToggleHud` does nothing
+/// here: the HUD runs the same call in its own state, so its own copy of
+/// the widget puts the HUD to sleep and wakes it again as it closes. From
+/// the scripts (no executable read): `ToggleHud(p, false)` adds one to the
+/// player's `nHudState` and sleeps every HUD widget, `ToggleHud(p, true)`
+/// takes one off and wakes them only once it is back to 0 (`MrxGuiManager`
+/// `vz_73962eb2`, lines 146 to 197); `CommenceFanfare` hides the HUD if
+/// `GetHudState` says it shows and `_EndFanfare` shows it again on that
+/// note (`vz_da6af53d`, lines 635 to 638 and 954 to 955); the shop does the
+/// same (`vz_16316efa`, 401 to 403 and 718 to 719). This state's copy of
+/// the fanfare never closes (the HUD's callback reaches the mission's
+/// callback directly), so its hide, passed on as a `GuiManager` call, left
+/// the HUD's count at 1 and the HUD asleep once the contract's fanfare
+/// closed (VzaCon001's end, as she comes out at the PMC's hut).
 const HUD_CALLS: &str = r#"
 __m2_hud_calls = {}
 __m2_hud_call_count = 0
@@ -503,7 +517,16 @@ for group, names in pairs(methods) do
                     group = group, method = name, data = data,
                     callback = callback })
                 local r
-                if type(f) == "function" then r = f(self, t, ...) end
+                if type(f) == "function" then
+                    -- The HUD runs this call's widget code itself, and that
+                    -- puts its HUD to sleep and wakes it: see `HUD_CALLS`.
+                    local outer = __m2_in_hud_call
+                    __m2_in_hud_call = true
+                    local ok, out = pcall(f, self, t, ...)
+                    __m2_in_hud_call = outer
+                    if not ok then error(out, 0) end
+                    r = out
+                end
                 -- A message added here gets the call's number as its id,
                 -- for the HUD to tell its own message by: what the
                 -- scripts keep to take it down again (`MrxSubtitle`'s
@@ -678,10 +701,14 @@ end
 -- "briefing", which keeps the message box and subtitles) and shows it on
 -- leaving. A `GuiManager` `ToggleHud` call for the HUD, which runs its own
 -- `MrxGuiManager.ToggleHud`; the original then runs as it would.
+-- Not from inside a HUD call (see `HUD_CALLS`): the HUD's own copy of the
+-- widget (the fanfare's `CommenceFanfare`, the shop) hides its HUD and
+-- shows it again as it closes, where this state's copy never closes.
 local function toggling(m, name)
     local d = rawget(m, name)
     if type(d) ~= "function" or __m2_dialog_wrapped[d] then return end
     local f = function(player, on, reason, ...)
+        if __m2_in_hud_call then return end
         -- The bootstrap's calls the manager's: one call for the HUD.
         if __m2_toggling then return d(player, on, reason, ...) end
         __m2_hud_call_count = __m2_hud_call_count + 1
@@ -977,6 +1004,13 @@ enum State {
 /// The mission scripts and what they want shown.
 pub struct MissionLink {
     state: State,
+    /// `--check-node-damage <s>`: seconds of play left before the nearest
+    /// vehicle with node health has a node sent damage by the scripts'
+    /// `ObjectState.SendDamage` ([`check_node_damage`]).
+    pub check_node_damage: Option<f32>,
+    /// The face rigs and sets read, and the sets the scripts mounted
+    /// ([`m2_engine::lip_sync`]).
+    faces: m2_engine::lip_sync::Library,
     /// The nodes of the models of props with hardpoints the scripts use,
     /// by model: name hash and place in the model ([`prop_hardpoints`]).
     prop_nodes: HashMap<u32, Vec<(u32, Vec3)>>,
@@ -1001,6 +1035,9 @@ pub struct MissionLink {
     subtitles: bool,
     /// The player has the tutorial tips on.
     tutorials: bool,
+    /// The player's inverted Y, rumble and autosave, as the scripts read
+    /// them from her profile ([`m2_game::profile`]).
+    profile_options: (bool, bool, bool),
     /// Time not yet given to the scripts.
     lag: f32,
     /// The ten-second mark at which the scripts' place for her was last
@@ -1218,13 +1255,19 @@ impl MissionLink {
         };
         Self {
             state: State::Loading(rx),
+            check_node_damage: None,
             prop_nodes: HashMap::new(),
+            faces: Default::default(),
             movies: false,
             acts_logged: Default::default(),
             end_skip: false,
             script_join: false,
             subtitles: true,
             tutorials: true,
+            profile_options: {
+                let p = m2_game::profile::ProfileOptions::default();
+                (p.invert_y != 0, p.rumble != 0, p.autosave != 0)
+            },
             lag: 0.0,
             apart_logged: -1,
             log,
@@ -1511,14 +1554,18 @@ impl MissionLink {
         }
     }
 
-    /// The player's subtitles and tutorial tips, from now on (the pause
-    /// menu's options).
-    pub fn set_options(&mut self, subtitles: bool, tutorials: bool) {
-        self.subtitles = subtitles;
-        self.tutorials = tutorials;
+    /// The player's subtitles and tutorial tips, and her inverted Y,
+    /// rumble and autosave as the scripts read them, from now on (the
+    /// pause menu's options).
+    pub fn set_options(&mut self, o: &crate::config::GameOptions) {
+        self.subtitles = o.subtitles;
+        self.tutorials = o.tutorials;
+        self.profile_options = (o.invert_pad, o.rumble, o.autosave);
         if let State::Running(m) = &mut self.state {
-            m.set_subtitles(subtitles);
-            m.set_tutorials(tutorials);
+            m.set_subtitles(o.subtitles);
+            m.set_tutorials(o.tutorials);
+            let (invert, rumble, autosave) = self.profile_options;
+            m.set_profile_options(invert, rumble, autosave);
         }
     }
 
@@ -2256,12 +2303,90 @@ impl MissionLink {
                 face.play(name, f.a, f.b, [0.5, 0.25, 0.75, 0.5]);
             }
         }
-        for speech in mission.world().borrow_mut().vo.take_speech() {
+        // The face sets the scripts mounted, on the rig of each
+        // character's template (`Animation.BindFaceAnimSet`, 0x82315CF8:
+        // the set goes on the rig asset, so everyone with it has it).
+        let binds = std::mem::take(&mut mission.world().borrow_mut().sp.face_sets);
+        for b in binds {
+            let templates = game.scene.world.as_ref().map(|w| &w.index.template_db);
+            let rig = b
+                .template
+                .as_deref()
+                .and_then(|t| templates.and_then(|db| db.face_actor(t)));
+            match rig {
+                Some(rig) if b.bind => self.faces.bind(rig, b.set),
+                Some(rig) => self.faces.unbind(rig, b.set),
+                None => {}
+            }
+            eprintln!(
+                "facefx: {} set {:08x} {} {:#x} ({:?}, rig {})",
+                if b.bind { "bind" } else { "unbind" },
+                b.set,
+                if b.bind { "to" } else { "from" },
+                b.character,
+                b.template,
+                rig.map_or("none".to_owned(), |r| format!("{r:08x}"))
+            );
+        }
+        // The lines that started and stopped. In the voice manager's
+        // cinematic mode the 360 plays the speaker's face animation named
+        // by the line (0x822782D8 posts the line's hash, 0x8241D270 finds
+        // it in the sets mounted on their rig; [`m2_engine::lip_sync`]);
+        // out of it their mouth flaps while it plays (`Flap`). In it, a
+        // line with no face animation moves nothing ([`line_flaps`]).
+        let cinematic = mission.world().borrow().vo.cinematic;
+        let speeches = mission.world().borrow_mut().vo.take_speech();
+        for speech in speeches {
             let (on, speaker, cue) = match speech {
                 m2_game::vo::Speech::Started { speaker, cue, .. } => (true, speaker, cue),
                 m2_game::vo::Speech::Stopped { speaker, cue, .. } => (false, speaker, cue),
             };
             let Some(guid) = speaker else { continue };
+            let lip = if on && cinematic {
+                let template = mission
+                    .world()
+                    .borrow()
+                    .objects
+                    .get(&guid)
+                    .map(|o| o.name.clone())
+                    .or_else(|| {
+                        (guid == m2_game::mission::PLAYER)
+                            .then(|| game.scene.hero.template().to_owned())
+                    });
+                let templates = game.scene.world.as_ref().map(|w| &w.index.template_db);
+                let rig = template
+                    .as_deref()
+                    .and_then(|t| templates.and_then(|db| db.face_actor(t)));
+                let source = game.scene.source.as_mut();
+                match (rig, source) {
+                    (Some(rig), Some(source)) => {
+                        let lip = self.faces.find(rig, cue, |h, ty| source.asset(h, ty).ok());
+                        match &lip {
+                            Some(l) => eprintln!(
+                                "facefx: cue {cue:08x} anim {:08x} curves {} ({:.1} s, set {:08x}, rig {rig:08x}, speaker {guid:#x})",
+                                m2_assets::name_hash(&l.animation().name),
+                                l.curves(),
+                                l.animation().seconds(),
+                                l.set_hash
+                            ),
+                            None => eprintln!(
+                                "facefx: cue {cue:08x} has no animation in the {} sets on rig {rig:08x} (speaker {guid:#x}): the mouth stays still",
+                                self.faces.bound(rig).len()
+                            ),
+                        }
+                        lip
+                    }
+                    _ => {
+                        eprintln!(
+                            "facefx: cue {cue:08x}: speaker {guid:#x} ({template:?}) has no face rig: the mouth stays still"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let lips = lip.is_some();
             // Her own lines.
             if guid == m2_game::mission::PLAYER {
                 if let Some(p) = game.scene.player.as_mut() {
@@ -2269,7 +2394,14 @@ impl MissionLink {
                         "face: she {} speaking (line {cue:08x})",
                         if on { "starts" } else { "stops" }
                     );
-                    p.speak(on);
+                    if let Some((_, rig)) = &mut p.model
+                        && (lips || !on)
+                    {
+                        rig.lip = lip;
+                    }
+                    if line_flaps(cinematic) {
+                        p.speak(on);
+                    }
                 }
                 continue;
             }
@@ -2285,7 +2417,12 @@ impl MissionLink {
                         "face: {guid:#x} {} speaking (line {cue:08x})",
                         if on { "starts" } else { "stops" }
                     );
-                    n.speak(on);
+                    if lips || !on {
+                        n.rig.lip = lip;
+                    }
+                    if line_flaps(cinematic) {
+                        n.speak(on);
+                    }
                 }
                 None if on => {
                     eprintln!("face: line {cue:08x}'s speaker {guid:#x} is no person here")
@@ -3403,6 +3540,13 @@ impl MissionLink {
                     .filter_map(|n| Some((n.spawn?, n.character.velocity)));
                 report_speeds(mission, vehicles.chain(people));
             }
+            if let Some(left) = &mut self.check_node_damage {
+                *left -= dt;
+                if *left <= 0.0 {
+                    self.check_node_damage = None;
+                    check_node_damage(mission, game);
+                }
+            }
             // Targets to destroy: soldiers stand at those that are spawns,
             // and blasts close to the rest (gates, buildings) destroy them.
             // Those the contract's destroy objectives name with no marker
@@ -3615,6 +3759,7 @@ impl MissionLink {
             let (flown, burst) = crate::spans::time("scripts: strikes", || {
                 report_strikes(game, mission, &mut self.bombs)
             });
+            report_charges(game, mission);
             self.counts.flown += flown;
             self.counts.burst += burst;
             mission.set_player_reserve("C4", game.combat.charges);
@@ -4013,6 +4158,8 @@ impl MissionLink {
                 }
                 mission.set_subtitles(self.subtitles);
                 mission.set_tutorials(self.tutorials);
+                let (invert, rumble, autosave) = self.profile_options;
+                mission.set_profile_options(invert, rumble, autosave);
                 if let Some((to, briefing)) = &self.skip_to {
                     mission.set_skip_mission(to, *briefing);
                     self.write([format!("skip to: {to} (briefing {briefing})")]);
@@ -4990,7 +5137,7 @@ impl MissionLink {
         &self,
         w: &m2_game::api::ScriptWorld,
     ) -> Vec<crate::marker_models::MarkerModel> {
-        use crate::marker_models::{MarkerModel, PIN_MODEL, TRIPWIRE_MODEL};
+        use crate::marker_models::{DISC_MODEL, MarkerModel, PIN_MODEL, TRIPWIRE_MODEL};
         let hud = &w.hud;
         let place = |g: u32| -> Option<(Vec3, f32)> {
             let o = w.objects.get(&g)?;
@@ -5037,7 +5184,23 @@ impl MissionLink {
                 colour: p.colour,
             })
         });
-        wires.chain(models).chain(pins).collect()
+        // A disc: at its point, else where its target stands, lifted.
+        let discs = hud.discs.values().filter_map(|d| {
+            let at = match (d.at, d.target) {
+                (Some(p), _) => Vec3::from(p),
+                (None, Some(g)) => place(g)?.0,
+                (None, None) => return None,
+            };
+            Some(MarkerModel {
+                model: DISC_MODEL,
+                at: at + Vec3::Y * d.lift,
+                yaw: None,
+                scale: d.radius,
+                width: None,
+                colour: d.colour,
+            })
+        });
+        wires.chain(models).chain(pins).chain(discs).collect()
     }
 
     pub fn view(&self) -> MissionView {
@@ -5071,18 +5234,6 @@ impl MissionLink {
         let w = mission.world().borrow();
         let hud = &w.hud;
         let objectives = objective_texts(mission, hud);
-        let discs = hud
-            .discs
-            .values()
-            .filter_map(|d| {
-                let at = match (d.at, d.target.and_then(|g| w.objects.get(&g))) {
-                    (Some(p), _) => Vec3::from(p),
-                    (None, Some(o)) => Vec3::from(o.position),
-                    (None, None) => return None,
-                };
-                Some((at + Vec3::Y * d.lift, d.radius, d.colour))
-            })
-            .collect();
         let markers = hud
             .markers
             .values()
@@ -5128,7 +5279,6 @@ impl MissionLink {
             objectives,
             markers,
             radar,
-            discs,
             models,
             message,
             game_message,
@@ -5483,16 +5633,18 @@ fn radar_views(
                 }
                 None => (offset, None),
             };
+            // Its texture, else its icon's by index; else none, which
+            // the minimap draws as a square in its colour, outlined.
             let icon = b
                 .texture
                 .clone()
                 .or_else(|| {
                     name_of
                         .as_ref()
+                        .filter(|_| b.icon != m2_game::hud::NO_ICON)
                         .and_then(|f| f.call::<Option<String>>(b.icon).ok().flatten())
                 })
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "objective_action".to_owned());
+                .filter(|s| !s.is_empty());
             let [r, g, bl] = b.colour;
             Some(RadarView {
                 at,
@@ -5916,6 +6068,19 @@ return walk(m, 0)
 /// (`Player.GetAnyCharacter`, `GetAllCharacters`: 0xf0000000, 0xf0000001)
 /// is the players' characters, with one player `her`; anything else is
 /// itself.
+/// Whether a speaker's mouth flaps while their line plays: only out of
+/// the voice manager's cinematic mode.
+///
+/// **From the 360 code:** a line's start (0x822782D8) posts the face
+/// expression `Flap` (0xD388246C) at 1 until put off (-1, 0x82DE896C) when
+/// the mode's flag (0x82C4D0D8) is clear, else only the line's face
+/// animation (queue 0x8320A758); its end (0x82278440) puts `Flap` off, or
+/// in the mode stops the animation (0xE2EC63DD). So in the mode a line
+/// with no face animation leaves the mouth still.
+fn line_flaps(cinematic: bool) -> bool {
+    !cinematic
+}
+
 fn player_target(g: u32, her: Option<u32>) -> Option<u32> {
     match g {
         m2_game::events::ANY_CHARACTER | m2_game::events::ALL_CHARACTERS => her,
@@ -6170,6 +6335,71 @@ fn is_spawn(world: &m2_engine::World, guid: u32) -> bool {
 /// Tells the scripts how fast each of their objects among `moving` goes
 /// (`Mission::set_speed`): the length of its velocity, m/s. Those the
 /// scripts hold no object for are left out.
+/// `--check-node-damage`: the scripts' vehicle nearest her whose template
+/// gives node health to one of its model's damage parts has that node (the
+/// first with health left) sent a share of 1 (`ObjectState.SendDamage`, as
+/// the island fortress's script sends its slices). Logs the node's health
+/// before and after; the message it takes is logged as the command is
+/// carried out (`nodedamage:`). A node no part of the model is (the 668
+/// records naming `c851b695`, which no model has: the first contract's
+/// speed boat's only one) is passed over: on the 360 its message goes to
+/// no part ([`m2_engine::vehicle_damage::UNNAMED_WHOLE`]).
+fn check_node_damage(mission: &mut Mission, game: &Game) {
+    let at = game.focus();
+    let mut near: Vec<(f32, u32)> = {
+        let w = mission.world().borrow();
+        game.scene
+            .vehicles
+            .iter()
+            .filter(|v| v.parts.is_some())
+            .filter_map(|v| {
+                let g = v.guid?;
+                let o = w.objects.get(&g)?;
+                Some((Vec3::from(o.position).distance(at), g))
+            })
+            .collect()
+    };
+    near.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (d, guid) in near {
+        // The vehicle's damage parts: a node is checked only if one is it.
+        let part = |node: u32| {
+            game.scene
+                .vehicles
+                .iter()
+                .find(|v| v.guid == Some(guid))
+                .and_then(|v| v.spec.damage.as_deref())
+                .and_then(|dm| dm.part_named(node))
+                .is_some()
+        };
+        let node = {
+            let mut w = mission.world().borrow_mut();
+            let Some(t) = w.node_table(guid) else {
+                continue;
+            };
+            let Some(e) = t.entries().iter().find(|e| e.health > 0 && part(e.node)) else {
+                continue;
+            };
+            (e.node, e.health, e.most, t.entries().len())
+        };
+        let (n, before, most, count) = node;
+        let code = format!(
+            "ObjectState.SendDamage(Sys.StringToGuid('{guid:#x}'), Sys.StringToGuid('{n:#x}'), 1)"
+        );
+        let ran = mission.run(&code, "node damage check");
+        let after = mission
+            .world()
+            .borrow_mut()
+            .node_table(guid)
+            .map(|t| t.health(n));
+        eprintln!(
+            "nodedamage check: {guid:#x} at {d:.1} m, {count} nodes; node {n:#x} health {before}/{most} -> {after:?} ({})",
+            if ran.is_ok() { "ran" } else { "script error" }
+        );
+        return;
+    }
+    eprintln!("nodedamage check: no vehicle with node health on a damage part near");
+}
+
 fn report_speeds(mission: &mut Mission, moving: impl Iterator<Item = (u32, Vec3)>) {
     let known: Vec<(u32, f32)> = {
         let w = mission.world().borrow();
@@ -6312,6 +6542,11 @@ fn strike(game: &mut Game, c: &Command) {
             let thrown = ["Smoke", "Flare", "Beacon"]
                 .iter()
                 .any(|k| kind.contains(k));
+            game.scene.strikes.designator = if thrown {
+                designator_ammo(game, kind)
+            } else {
+                None
+            };
             let aimed = !thrown && game.support.equip(kind);
             eprintln!("mission: the scripts hand her a {kind} (thrown: {thrown}, aimed: {aimed})");
             game.combat.to_throw = thrown;
@@ -6325,6 +6560,47 @@ fn strike(game: &mut Game, c: &Command) {
         }
         _ => {}
     }
+}
+
+/// The template designator weapon `kind` (`"Beacon Designator"`) throws:
+/// its `WeaponThrown` ammunition's.
+fn designator_ammo(game: &Game, kind: &str) -> Option<String> {
+    let t = &game.scene.world.as_ref()?.index.template_db;
+    let ammo = t.arms.thrown(kind)?.ammo.template;
+    t.names.get(&ammo).cloned()
+}
+
+/// Her C4 as objects of the scripts' world: each made one as it leaves
+/// her hand (`C4 Projectile`, whose script blinks and beeps it), moved
+/// as it flies, and taken away once it has gone off.
+fn report_charges(game: &mut Game, mission: &mut Mission) {
+    let lying: Vec<(u32, u32, Vec3)> = game.combat.charges_lying().collect();
+    let guids = &mut game.combat.charge_guids;
+    for &(id, ammo, at) in &lying {
+        match guids.get(&id) {
+            Some(&g) => mission.ammo_moved(g, at.to_array()),
+            None => {
+                let name = game
+                    .scene
+                    .world
+                    .as_ref()
+                    .and_then(|w| w.index.template_db.names.get(&ammo).cloned());
+                if let Some(name) = name {
+                    let g = mission.ammo_spawned(&name, at.to_array());
+                    eprintln!("mission: her {name} is out ({g:#x})");
+                    guids.insert(id, g);
+                }
+            }
+        }
+    }
+    guids.retain(|id, g| {
+        let out = lying.iter().any(|l| l.0 == *id);
+        if !out {
+            eprintln!("mission: her charge {g:#x} is gone");
+            mission.ammo_gone(*g);
+        }
+        out
+    });
 }
 
 /// Tells the scripts of her designators thrown and come to rest, the
@@ -6341,21 +6617,45 @@ fn report_strikes(game: &mut Game, mission: &mut Mission, bombs: &mut Vec<Vec3>)
             t.ordnance.projectiles.get(&id)?.timer.map(|t| t.0)
         })
         .unwrap_or(MARKER_TIMER);
+    // What she throws: her designator's own ammunition (a beacon for
+    // the cruise missile and artillery), and its template's timer.
+    let what = game
+        .scene
+        .strikes
+        .designator
+        .clone()
+        .unwrap_or_else(|| MARKER.to_owned());
+    let timer = game.scene.world.as_ref().and_then(|w| {
+        let t = &w.index.template_db;
+        t.ordnance.timers.get(&t.id(&what)?).copied()
+    });
+    let settle = timer.map_or(settle, |t| t.seconds);
+    let mut gone = Vec::new();
     for t in &mut game.combat.thrown {
         match t.guid {
             None => {
-                let g = mission.designator_thrown(PLAYER, MARKER, t.at.to_array());
-                eprintln!("mission: she throws her marker ({g:#x})");
+                let g = mission.designator_thrown(PLAYER, &what, t.at.to_array());
+                eprintln!("mission: she throws her marker, {what} ({g:#x})");
                 t.guid = Some(g);
             }
             Some(g) if !t.settled && t.age >= settle => {
                 eprintln!("mission: her marker lies at {:.1}", t.at);
                 mission.designator_settled(g, t.at.to_array());
                 t.settled = true;
+                // Its timer's response takes it away (the beacon; the
+                // smoke stays): 0x8227ED30.
+                if timer.is_some_and(|t| t.removes) {
+                    eprintln!("mission: her marker {g:#x} goes");
+                    mission.ammo_gone(g);
+                    gone.push(g);
+                }
             }
             _ => {}
         }
     }
+    game.combat
+        .thrown
+        .retain(|t| !t.guid.is_some_and(|g| gone.contains(&g)));
     let strikes = &mut game.scene.strikes;
     let counts = (strikes.arrived.len() as u32, strikes.burst.len() as u32);
     // The planes in the air, where they are (their radar blips follow
@@ -7707,6 +8007,34 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
+        // `ObjectState.SendDamage`: the node's message goes to its part's
+        // state machine, as a vehicle's parts take theirs
+        // (`m2_engine::node_health`). Not yet: props' part states, and the
+        // object's share of the damage (logged).
+        Command::NodeDamage {
+            guid,
+            node,
+            damage,
+            health,
+            message,
+            pass_through,
+        } => {
+            let mut to = "no part";
+            if let (Some(i), Some(msg)) = (index(guid), message) {
+                let v = &mut game.scene.vehicles[i];
+                if let (Some(parts), Some(dm)) = (v.parts.as_mut(), v.spec.damage.as_deref())
+                    && let Some(k) = dm.part_named(*node)
+                {
+                    parts.send(dm, k, *msg);
+                    to = "vehicle part";
+                }
+            }
+            eprintln!(
+                "nodedamage: {guid:#x} node {node:#x} took {damage:.1}, health {health:?}, \
+                 message {message:x?} to {to}, object's share {pass_through:.1}"
+            );
+            return false;
+        }
         Command::Kill(guid) => {
             if let Some(i) = index(guid) {
                 game.scene.vehicles[i].wrecked = true;
@@ -8782,6 +9110,12 @@ fn send_pursuit_car(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_cinematic_line_moves_only_its_face_animation() {
+        assert!(super::line_flaps(false));
+        assert!(!super::line_flaps(true));
+    }
+
+    #[test]
     fn a_label_only_destroy_hunts_the_nearest_living_carriers() {
         use m2_math::glam::Vec3;
         let vz = [m2_assets::name_hash("VZ")];
@@ -9056,6 +9390,62 @@ mod tests {
                 ("mission".to_owned(), Some(false)),
                 ("other".to_owned(), None),
             ]
+        );
+    }
+
+    // The contract's fanfare hides the HUD as it commences (its widget's
+    // `CommenceFanfare`, inside `Hud.Fanfare:Commence`): the HUD's own
+    // copy does that and shows it again as it closes, so this state's copy
+    // passes nothing on and leaves its own count alone. The HQ's toggle
+    // outside any HUD call still goes over.
+    #[test]
+    fn a_toggle_inside_a_hud_call_stays_with_the_hud() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            ran = 0
+            MrxGuiManager = { ToggleHud = function(p, on, why) ran = ran + 1 end }
+            Hud = { Fanfare = {
+                Create = function() end,
+                AddItem = function() end,
+                Commence = function(self, t)
+                    MrxGuiManager.ToggleHud(1, false)
+                    if t.bBroken then error("broken") end
+                end,
+            } }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        lua.load(DIALOG_BOXES).exec().unwrap();
+        lua.load("Hud.Fanfare:Commence({ fCallback = function() end })")
+            .exec()
+            .unwrap();
+        let calls = hud_calls(&lua);
+        let groups: Vec<_> = calls
+            .iter()
+            .map(|c| (c.group.as_str(), c.method.as_str()))
+            .collect();
+        assert_eq!(groups, [("Fanfare", "Commence")]);
+        assert_eq!(lua.globals().get::<i64>("ran").unwrap(), 0);
+        // Out of the call again, a toggle goes over as before.
+        lua.load("MrxGuiManager.ToggleHud(1, true)").exec().unwrap();
+        let calls = hud_calls(&lua);
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[1].group, "GuiManager");
+        assert_eq!(lua.globals().get::<i64>("ran").unwrap(), 1);
+        // And an error inside the call does not leave toggles cut off.
+        let ok: bool = lua
+            .load("return (pcall(function() Hud.Fanfare:Commence({ bBroken = true }) end))")
+            .eval()
+            .unwrap();
+        assert!(!ok);
+        assert!(
+            !lua.globals()
+                .get::<Option<bool>>("__m2_in_hud_call")
+                .unwrap()
+                .unwrap_or(false)
         );
     }
 

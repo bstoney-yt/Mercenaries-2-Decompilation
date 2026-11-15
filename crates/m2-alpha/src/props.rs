@@ -160,6 +160,9 @@ pub struct Props {
     /// Node matrices of those that move on their own, by entity
     /// ([`crate::moving`]).
     poses: HashMap<u32, Vec<Mat4>>,
+    /// Node matrices of the emplaced gun she mans, turned and tilted to
+    /// where its turret has got ([`set_turned`](Self::set_turned)).
+    turned: HashMap<u32, Vec<Mat4>>,
     /// The gates opened or shut, by entity, until shut again.
     swings: HashMap<u32, Swing>,
     /// Those only a support strike brings down (a mission's gates): no
@@ -398,6 +401,20 @@ impl Props {
     /// with, by entity (those left out stand in their rest pose).
     pub fn set_poses(&mut self, poses: HashMap<u32, Vec<Mat4>>) {
         self.poses = poses;
+    }
+
+    /// Draws `entity` with the node matrices `nodes` (an emplaced gun's
+    /// turret turned, [`m2_engine::vehicle::Aimer::pose`]), or in its rest
+    /// pose again with `None`.
+    pub fn set_turned(&mut self, entity: u32, nodes: Option<Vec<Mat4>>) {
+        match nodes {
+            Some(n) => {
+                self.turned.insert(entity, n);
+            }
+            None => {
+                self.turned.remove(&entity);
+            }
+        }
     }
 
     /// Puts up the models of those of `entities` the state layers place
@@ -1786,14 +1803,16 @@ impl Props {
         }
         // Gates swing on; a shut one stands in the way again
         // ([`update`](Self::update) puts its collision back).
-        for s in self.swings.values_mut() {
+        // Each at its widest leaf's pace, a quarter turn where its model
+        // isn't in (invented).
+        for (e, s) in self.swings.iter_mut() {
             let to = if s.open { 1.0 } else { 0.0 };
-            let step = m2_engine::gate::SWING * dt;
-            s.at = if s.at < to {
-                (s.at + step).min(to)
-            } else {
-                (s.at - step).max(to)
-            };
+            let open = self
+                .shown
+                .get(e)
+                .and_then(|p| self.models.get(&p.model)?.as_ref()?.gate.as_ref())
+                .map_or(std::f32::consts::FRAC_PI_2, |g| g.gate.widest());
+            s.at = m2_engine::gate::swing(s.at, to, open, dt);
         }
         let shut: Vec<u32> = (self.swings.iter())
             .filter(|(_, s)| !s.open && s.at <= 0.0)
@@ -1922,7 +1941,10 @@ impl Props {
                 .filter(|_| !p.wrecked)
                 .map(|(s, g)| g.gate.nodes(s.at));
             match (
-                swung.as_ref().or(self.poses.get(e).filter(|_| !p.wrecked)),
+                swung
+                    .as_ref()
+                    .or(self.turned.get(e).filter(|_| !p.wrecked))
+                    .or(self.poses.get(e).filter(|_| !p.wrecked)),
                 self.parts_down.get(e),
             ) {
                 (Some(nodes), _) => m.gpu.draw_moved(queue, at, nodes, false, &[]),
@@ -2306,7 +2328,8 @@ mod tests {
         assert!(!physics.has_static(StaticKey::Entity(1)));
         props.advance(1.0);
         let at = props.gate_open(1).unwrap();
-        assert!((at - m2_engine::gate::SWING).abs() < 1e-6, "{at}");
+        let quarter = std::f32::consts::FRAC_PI_2;
+        assert!((at - m2_engine::gate::swing(0.0, 1.0, quarter, 1.0)).abs() < 1e-6);
         props.advance(5.0);
         assert_eq!(props.gate_open(1), Some(1.0));
         // Shut: back, then gone from the swings (its collision goes back

@@ -68,6 +68,11 @@
 //! drawn list in that order and takes deactivated ones off it; its draw
 //! (0x82380E50) draws the list in order but holds the Flash widgets (type
 //! 6) back until the rest are drawn.
+//!
+//! From the 360 code: which button glyph each control word in a text is
+//! (0x8238D2B8 reads the word, 0x8238EA80 gives its glyph); see
+//! [`button_glyph`]. Inferred: `[pda]`, `[pause]` and `[support]`, by
+//! picture.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -78,6 +83,9 @@ use mlua::{Function, IntoLuaMulti, Lua, MultiValue, Table, Value};
 
 use crate::gui::{Anchor, Correction, VIRTUAL_SIZE};
 use crate::script::{safe_function, show_arg};
+
+pub mod clock;
+pub use clock::Clock;
 
 /// The screen, shared by the natives and the host.
 pub type ScreenRef = Rc<RefCell<Screen>>;
@@ -171,6 +179,10 @@ pub struct Widget {
     pub sprite_run: Option<SpriteRun>,
     /// `SetImagePieSliceRender` arguments, as given.
     pub pie_slice: Option<Vec<f32>>,
+    /// Its clock wipe (`SetImageClockAnimation`, [`clock`]).
+    pub clock: Clock,
+    /// `SetImageClockCallback`: called once when the clock ends.
+    clock_callback: Option<u32>,
     /// Its text animation under way (`AnimateText`, [`crate::gui_anim`]).
     pub reveal: Option<crate::gui_anim::TextReveal>,
     pub text: String,
@@ -249,6 +261,8 @@ impl Widget {
             sprite_frame: 0,
             sprite_run: None,
             pie_slice: None,
+            clock: Clock::default(),
+            clock_callback: None,
             reveal: None,
             text: String::new(),
             font: String::new(),
@@ -728,7 +742,22 @@ impl Screen {
                 }
             }
         }
+        // Clocks turn; one that ends may hide its widget and calls back
+        // once (0x823856C8).
         let ids: Vec<u32> = self.widgets.keys().copied().collect();
+        for &id in &ids {
+            let Some(w) = self.widgets.get_mut(&id) else {
+                continue;
+            };
+            if let Some(hide) = w.clock.advance(dt) {
+                if let Some(cb) = w.clock_callback.take() {
+                    due.push((cb, Vec::new()));
+                }
+                if hide {
+                    self.set_visible(id, false);
+                }
+            }
+        }
         for id in ids {
             let Some(mut it) = self.widgets.get_mut(&id).and_then(|w| w.interp.take()) else {
                 continue;
@@ -1282,8 +1311,9 @@ fn colour_name(word: &str) -> Option<[f32; 3]> {
     })
 }
 
-/// The button page's glyphs below U+E014 that [`button_glyph`] gives no
-/// word: U+E00C is an empty black disc and U+E00F is not on the page.
+/// The button page's glyphs below U+E01C that [`button_glyph`] gives no
+/// word: U+E00C is an empty black disc and U+E00F is not on the page (the
+/// 360's text code gives it to a word it has no picture for).
 pub const UNMATCHED_GLYPHS: [char; 2] = ['\u{e00c}', '\u{e00f}'];
 
 /// The glyph a control word stands for on the PC (`[pfire] Shoot`): the
@@ -1291,50 +1321,64 @@ pub const UNMATCHED_GLYPHS: [char; 2] = ['\u{e00c}', '\u{e00f}'];
 /// (`english_18`'s second, `pc\common_18_buttons`), at private-use
 /// characters U+E000 on.
 ///
-/// Which pad button each word is comes from the game's data: the HUD
-/// movies' text formatter (`formatText` in `topbar` and `minimap`, vz.wad)
-/// swaps each word for a pad picture loaded by name, `[confirm]` for
-/// `button_A`, `[bash]`, `[honk]` and `[cancel]` for `button_B`,
-/// `[reload]` for `button_X`, `[action]` for `button_Y`, `[left stick]`
-/// for `button_joystick_L` (as `[move]`), `[sswitch]` for
-/// `button_Dpad_left`, `[support]` for `button_joystick_L_press`. Those
-/// are the console's pictures; the PC font page has its own, and the four
-/// round ones (U+E000 to U+E003, the only face-button discs on it) are
-/// taken to be A, B, X and Y in that order, the formatter's own order
-/// (`b1` to `b4`). The pictures agree where they can be read (U+E001 a
-/// fist for the bash, U+E002 a magazine for the reload), but no data ties
-/// a code point to a pad button: inferred, unchecked on the PC.
-/// `[jump]` is not in the formatter; it is given U+E000, the face disc
-/// no other word takes (`[confirm]` is the pistol on the PC, below).
-/// `[support]` is given the headset (U+E01C), the support radio, by
-/// picture: the page has no disc of its own for the left stick's press.
+/// From the 360 code: the text code reads a bracketed word by its name
+/// hash (0x8238D2B8) and swaps a control word for one character of the
+/// font's button page (0x8238EA80, called for every control word by
+/// 0x8238B390): `[jump]` U+E000, `[bash]` and `[honk]` U+E001, `[reload]`
+/// U+E002, `[action]` U+E003, `[crouch]` U+E004, `[pfire]` U+E005,
+/// `[sfire]` U+E006, `[pswitch]` U+E007, `[move]` and `[left stick]`
+/// U+E008, `[aim]` and `[right stick]` U+E009, `[sprint]` U+E00A,
+/// `[zoom]` U+E00B; the stick pushes `[l-stick left]`, `right`, `up`,
+/// `down` U+E010 to U+E013 (`[left stick up]` and the like are the same
+/// words: the hash switch gives both names one id), `[r-stick left]` to
+/// `down` U+E014 to U+E017; the d-pad's up, down, right and left U+E018
+/// to U+E01B (`[sswitch]` the left's); `[confirm]` U+E000 and `[cancel]`
+/// U+E001 (swapped when a setting at 0x82B7C5F8 is 8, unread; taken
+/// not to be for English). The PC font's page holds just those code
+/// points (U+E000 to U+E01B, no U+E00F) and two more (U+E01C, U+E01D), so
+/// it is taken to be drawn by the same table with the PC's pictures. So
+/// the PC's car text `[move] Steer [left stick up] Accelerate[n][left
+/// stick down] Brake/Reverse` shows three pictures. From footage (a PC
+/// frame of that prompt, 360 lines): "Steer" and "Accelerate" are 21
+/// pixels apart, about one 30-pixel glyph (at 720 lines) and its spaces,
+/// not the 70 or so the written word would take, and both lines' words
+/// start level, after glyphs of the same width (U+E008, U+E013).
 ///
-/// The rest are matched by picture: the PC footage's satellite help shows
-/// `[move]` as the four arrows and `[confirm]` as the pistol (the fire
-/// button confirms), and the others are the pictures that say what the
-/// words do. Words without a glyph show the key bound to them, if the
-/// host named it ([`Screen::set_key_names`]), else stay as written.
+/// Not from that table (inferred, by picture, as before): `[pda]` U+E00D
+/// and `[pause]` U+E00E (the 360 has them the other way round), and
+/// `[support]` the PC's headset U+E01C, a picture the 360's page has no
+/// code for (the 360 gives it the d-pad's up, U+E018).
+///
+/// Words without a glyph show the key bound to them, if the host named it
+/// ([`Screen::set_key_names`]), else stay as written.
 pub fn button_glyph(word: &str) -> Option<char> {
     Some(match word.to_ascii_lowercase().as_str() {
-        "jump" => '\u{e000}',
+        "jump" | "confirm" => '\u{e000}',
         "bash" | "honk" | "cancel" => '\u{e001}',
         "reload" => '\u{e002}',
         "action" => '\u{e003}',
         "crouch" => '\u{e004}',
-        // Fire, and what the fire button does.
-        "pfire" | "confirm" => '\u{e005}',
+        "pfire" => '\u{e005}',
         "sfire" => '\u{e006}',
         "pswitch" => '\u{e007}',
         "move" | "left stick" => '\u{e008}',
-        "aim" => '\u{e009}',
+        "aim" | "right stick" => '\u{e009}',
         "sprint" => '\u{e00a}',
         "zoom" => '\u{e00b}',
         "pda" => '\u{e00d}',
         "pause" => '\u{e00e}',
-        "dpad left" | "sswitch" => '\u{e010}',
-        "dpad right" => '\u{e011}',
-        "dpad up" => '\u{e012}',
-        "dpad down" => '\u{e013}',
+        "l-stick left" | "left stick left" => '\u{e010}',
+        "l-stick right" | "left stick right" => '\u{e011}',
+        "l-stick up" | "left stick up" => '\u{e012}',
+        "l-stick down" | "left stick down" => '\u{e013}',
+        "r-stick left" => '\u{e014}',
+        "r-stick right" => '\u{e015}',
+        "r-stick up" => '\u{e016}',
+        "r-stick down" => '\u{e017}',
+        "dpad up" => '\u{e018}',
+        "dpad down" => '\u{e019}',
+        "dpad right" => '\u{e01a}',
+        "dpad left" | "sswitch" => '\u{e01b}',
         "support" => '\u{e01c}',
         _ => return None,
     })
@@ -1430,11 +1474,12 @@ fn inline_icon(word: &str) -> Option<&'static str> {
 /// An image's pie slice, as `SetImagePieSliceRender(id, from, to)` gives
 /// it: `MrxGuiHudReticle` cuts the target-health ring to 130..230 (centred
 /// on 180, under the reticle as footage shows it) and shortens it from the
-/// first end as health falls.
+/// first end as health falls. Else, while its clock runs, the clock's
+/// wedge (0x82385570 draws a pie slice first).
 fn pie(w: &Widget) -> Option<[f32; 2]> {
     match w.pie_slice.as_deref() {
         Some([from, to, ..]) => Some([*from, *to]),
-        _ => None,
+        _ => w.clock.wedge(),
     }
 }
 
@@ -2211,8 +2256,10 @@ natives! {
         }
         Ok(MultiValue::new())
     },
+    // A pie slice also stops the image's clock (0x8231F3F8).
     "SetImagePieSliceRender" => |s, _, a| {
         if let Some(w) = s.widgets.get_mut(&a.id(0)) {
+            w.clock.state = 0;
             w.pie_slice = Some((1..a.0.len()).filter_map(|i| a.f(i)).collect());
         }
         Ok(MultiValue::new())
@@ -2305,13 +2352,47 @@ natives! {
         }
         Ok(MultiValue::new())
     },
+    // (image, start, seconds, keep, forwards): see [`clock`].
     "SetImageClockAnimation" => |s, _, a| {
-        s.log_unknown("SetImageClockAnimation (drawn whole)");
-        let _ = a;
+        let id = a.id(0);
+        let (Some(start), Some(seconds)) = (a.f(1), a.f(2)) else {
+            return Ok(MultiValue::new());
+        };
+        // Booleans only: forwards unless false; `keep` not given is read
+        // as false here (the 360 leaves it unset).
+        let flag = |i: usize, unset: bool| match a.get(i) {
+            Some(Value::Boolean(b)) => *b,
+            _ => unset,
+        };
+        let (keep, forwards) = (flag(3, false), flag(4, true));
+        let shows = match s.widgets.get_mut(&id) {
+            Some(w) if w.kind == Kind::Image => w.clock.start(start, seconds, keep, forwards),
+            _ => return Ok(MultiValue::new()),
+        };
+        s.set_visible(id, shows);
         Ok(MultiValue::new())
     },
-    "SetImageClockCallback" => |_, _, _| Ok(MultiValue::new()),
-    "GetImageClockElapsed" => |_, l, _| ret(l, 0),
+    // (image, function, data): called once when the clock ends; nil
+    // clears it (0x8231F1E0).
+    "SetImageClockCallback" => |s, l, a| {
+        let id = a.id(0);
+        if !s.widgets.get(&id).is_some_and(|w| w.kind == Kind::Image) {
+            return Ok(MultiValue::new());
+        }
+        let handle = keep_callback(s, l, a.get(1), a.get(2))?;
+        let old = s
+            .widgets
+            .get_mut(&id)
+            .and_then(|w| std::mem::replace(&mut w.clock_callback, handle));
+        if let Some(old) = old {
+            forget_callback(l, old)?;
+        }
+        Ok(MultiValue::new())
+    },
+    "GetImageClockElapsed" => |s, l, a| match s.widgets.get(&a.id(0)) {
+        Some(w) if w.kind == Kind::Image => ret(l, w.clock.elapsed()),
+        _ => Ok(MultiValue::new()),
+    },
     // Settings with nothing to draw differently here.
     "SetWidgetViewport" => |_, _, _| Ok(MultiValue::new()),
     // (widget, flag): the widget's ignores-pause flag; read back by
@@ -2720,6 +2801,17 @@ natives! {
     // vertical anchor, world x min, max, z min, max): makes the minimap,
     // its circle centred on (x, y), and answers its id
     // (`MinimapWidget:SetUpMinimap`).
+    // (minimap): the scripts' `MinimapWidget:Delete`. From the 360 code
+    // (0x82321C60): a minimap widget (type 3) is taken off the manager's
+    // list and its slot, and destroyed at once; any other widget is left
+    // as it is (the native answers with its error).
+    "MinimapDelete" => |s, _, a| {
+        let id = a.id(0);
+        if s.widgets.get(&id).is_some_and(|w| w.kind == Kind::Minimap) {
+            s.delete(id);
+        }
+        Ok(MultiValue::new())
+    },
     "MinimapCreate" => |s, l, a| {
         let id = s.create(Kind::Minimap, String::new());
         let (x, y, r) = (a.f(0).unwrap_or(0.0), a.f(1).unwrap_or(0.0), a.f(2).unwrap_or(0.0));
@@ -2967,6 +3059,26 @@ mod tests {
         assert_eq!(screen.borrow().order, [4, 1, 3, 2]);
     }
 
+    /// `MinimapDelete` takes a minimap away, and only a minimap.
+    #[test]
+    fn a_minimap_is_deleted_and_nothing_else() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            map = G.MinimapCreate(100, 100, 50)
+            pic = G.CreateImageWidget()
+            G.MinimapDelete(pic)
+            G.MinimapDelete(map)
+            "#,
+        );
+        let id = |name: &str| host.lua().globals().get::<u32>(name).unwrap();
+        let s = screen.borrow();
+        assert!(s.widget(id("map")).is_none(), "the minimap is gone");
+        assert!(s.widget(id("pic")).is_some(), "an image is not a minimap");
+    }
+
     /// The tutorial's typewriter: the text comes out a character each
     /// 1/30 s and the animation ends once it is all out.
     #[test]
@@ -3028,6 +3140,64 @@ mod tests {
         let halted = frame(spark);
         tick(host.lua(), 0.1);
         assert_eq!(frame(spark), halted);
+    }
+
+    #[test]
+    fn a_clock_wipes_its_image_and_calls_back_once() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            img = G.CreateImageWidget()
+            G.SetWidgetLocation(img, 100, 100, 140, 140, true)
+            G.SetImageTexture(img, "countdown_circle")
+            calls = 0
+            G.SetImageClockCallback(img, function(n) calls = calls + n end, { 7 })
+            -- Four seconds, hiding at the end, forwards.
+            G.SetImageClockAnimation(img, 0, 4, false, true)
+            "#,
+        );
+        added(&screen);
+        let pie = || {
+            let s = screen.borrow();
+            match s.draw_list(640.0, 480.0).first() {
+                Some(DrawItem::Quad { pie, .. }) => *pie,
+                other => panic!("{other:?}"),
+            }
+        };
+        let elapsed = || {
+            host.lua()
+                .load("return _GuiInternal.GetImageClockElapsed(img)")
+                .eval::<f32>()
+                .unwrap()
+        };
+        tick(host.lua(), 1.0);
+        // A quarter gone: the wedge still to sweep, from the hand at 90.
+        let [from, to] = pie().unwrap();
+        assert!((from - 90.0).abs() < 0.01 && to == 360.0, "{from} {to}");
+        assert!((elapsed() - 1.0).abs() < 1e-3);
+        tick(host.lua(), 3.5);
+        let calls = || host.lua().globals().get::<i64>("calls").unwrap();
+        assert_eq!(calls(), 7);
+        let img: u32 = host.lua().globals().get("img").unwrap();
+        assert!(!screen.borrow().widget(img).unwrap().visible);
+        // Stopped: the whole time; no second call.
+        assert!((elapsed() - 4.0).abs() < 1e-3);
+        tick(host.lua(), 1.0);
+        assert_eq!(calls(), 7);
+        // A pie slice wins over a clock and stops it.
+        run(
+            &host,
+            r#"
+            G = _GuiInternal
+            G.SetWidgetVisible(img, true)
+            G.SetImageClockAnimation(img, 0, 4, true)
+            G.SetImagePieSliceRender(img, 130, 230)
+            "#,
+        );
+        assert_eq!(pie(), Some([130.0, 230.0]));
+        assert_eq!(screen.borrow().widget(img).unwrap().clock.state, 0);
     }
 
     #[test]
@@ -3304,11 +3474,16 @@ mod tests {
             ("cancel", '\u{e001}'),
             ("action", '\u{e003}'),
             ("left stick", '\u{e008}'),
-            ("sswitch", '\u{e010}'),
+            ("right stick", '\u{e009}'),
+            ("sswitch", '\u{e01b}'),
             ("support", '\u{e01c}'),
+            // The 360's table: the confirm is the jump's face button.
+            ("confirm", '\u{e000}'),
         ] {
             assert_eq!(button_glyph(w), Some(g), "{w}");
         }
+        // One word for each of the page's glyphs the 360's table gives,
+        // U+E000 to U+E01B, each its own, and none of the unmatched ones.
         let words = [
             "jump",
             "bash",
@@ -3324,16 +3499,52 @@ mod tests {
             "zoom",
             "pda",
             "pause",
-            "dpad left",
-            "dpad right",
+            "l-stick left",
+            "l-stick right",
+            "l-stick up",
+            "l-stick down",
+            "r-stick left",
+            "r-stick right",
+            "r-stick up",
+            "r-stick down",
             "dpad up",
             "dpad down",
+            "dpad right",
+            "dpad left",
         ];
-        let given: Vec<char> = words.iter().filter_map(|w| button_glyph(w)).collect();
+        let mut given: Vec<char> = words.iter().filter_map(|w| button_glyph(w)).collect();
+        assert_eq!(given.len(), words.len());
         for g in UNMATCHED_GLYPHS {
             assert!(!given.contains(&g), "{g:?}");
         }
-        assert_eq!(given.len() + UNMATCHED_GLYPHS.len(), 0x14);
+        given.extend(UNMATCHED_GLYPHS);
+        given.sort_unstable();
+        let page: Vec<char> = ('\u{e000}'..='\u{e01b}').collect();
+        assert_eq!(given, page);
+    }
+
+    /// The PC's vehicle texts name the stick's pushes as `[left stick up]`
+    /// and `[left stick down]`, which the 360's text code takes as
+    /// `[l-stick up]` and `[l-stick down]`: their glyphs, not the words.
+    #[test]
+    fn the_pcs_vehicle_prompts_show_the_stick_pushes_as_glyphs() {
+        let s = Screen::default();
+        assert_eq!(
+            s.display_text(
+                "[move] Steer [left stick up] Accelerate[n][left stick down] Brake/Reverse"
+            ),
+            "\u{e008} Steer \u{e012} Accelerate\n\u{e013} Brake/Reverse"
+        );
+        for (a, b) in [
+            ("left stick left", "l-stick left"),
+            ("left stick right", "l-stick right"),
+            ("Left Stick Up", "l-stick up"),
+            ("left stick down", "L-Stick Down"),
+        ] {
+            assert_eq!(button_glyph(a), button_glyph(b), "{a}");
+            assert!(button_glyph(a).is_some(), "{a}");
+        }
+        assert_eq!(s.display_text("[r-stick down] Look"), "\u{e017} Look");
     }
 
     #[test]
@@ -3447,15 +3658,12 @@ mod tests {
     fn control_words_without_a_picture_name_their_keys() {
         let mut s = Screen::default();
         s.set_key_names([
-            ("L-Stick Up".to_owned(), "T".to_owned()),
+            ("Lean".to_owned(), "T".to_owned()),
             ("pfire".to_owned(), "F".to_owned()),
         ]);
-        assert_eq!(s.display_text("[l-stick up] Look up"), "[T] Look up");
+        assert_eq!(s.display_text("[lean] Lean"), "[T] Lean");
         // A word the fonts have a picture for keeps it; others as written.
-        assert_eq!(
-            s.display_text("[pfire] [l-stick down]"),
-            "\u{e005} [l-stick down]"
-        );
+        assert_eq!(s.display_text("[pfire] [peek]"), "\u{e005} [peek]");
     }
 
     #[test]
