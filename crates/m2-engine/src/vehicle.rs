@@ -220,6 +220,54 @@ pub struct Aimer {
 }
 
 impl Aimer {
+    /// Turret record `record` on a model of nodes `skeleton` (a prop's: an
+    /// emplaced gun's tripod), as [`VehicleSpec`] builds a vehicle's from
+    /// its node list: the yaw bone and every node under it turn, the pitch
+    /// bone and those under it tilt, each about its bone's rest origin.
+    /// `None` when the model has neither bone.
+    pub fn of_skeleton(
+        record: crate::seats::TurretRecord,
+        skeleton: &crate::Skeleton,
+    ) -> Option<Self> {
+        let index = |hash: u32| skeleton.name_hashes.iter().position(|&n| n == hash);
+        let yaw = record.bone_yaw.and_then(index);
+        let pitch = record.bone_pitch.and_then(index);
+        if yaw.is_none() && pitch.is_none() {
+            return None;
+        }
+        let n = skeleton.parents.len();
+        let under = |k: usize, top: Option<usize>| {
+            let Some(top) = top else { return false };
+            let mut at = Some(k);
+            for _ in 0..=n {
+                match at {
+                    Some(c) if c == top => return true,
+                    Some(c) => at = skeleton.parents.get(c).copied().flatten(),
+                    None => break,
+                }
+            }
+            false
+        };
+        let rest = skeleton.model_matrices(&skeleton.rest_pose());
+        let origin = |i: Option<usize>| i.and_then(|i| rest.get(i)).map(|m| m.w_axis.truncate());
+        Some(Self {
+            record,
+            yaw_nodes: (0..n).map(|k| under(k, yaw)).collect(),
+            pitch_nodes: (0..n).map(|k| under(k, pitch)).collect(),
+            yaw_pivot: origin(yaw),
+            pitch_pivot: origin(pitch),
+        })
+    }
+
+    /// Every node's matrix in the model (node to model) with it turned
+    /// `yaw` and tilted `pitch`, from the nodes' `rest` matrices.
+    pub fn pose(&self, rest: &[Mat4], yaw: f32, pitch: f32) -> Vec<Mat4> {
+        rest.iter()
+            .enumerate()
+            .map(|(i, m)| self.transform(i, yaw, pitch) * *m)
+            .collect()
+    }
+
     /// How node `i` moves with it turned `yaw` and tilted `pitch` radians
     /// (up positive), model space.
     pub fn transform(&self, i: usize, yaw: f32, pitch: f32) -> Mat4 {
@@ -1670,6 +1718,69 @@ fn fit_plane(points: &[(Vec3, f32)]) -> Option<(f32, f32, f32)> {
 mod tests {
     use super::*;
     use m2_assets::name_hash;
+
+    // An emplaced gun's tripod (the VZ MG's model df3b2fd1): body, the
+    // yaw bone 0.5 m up, the pitch bone 0.75 m over that, the weapon's
+    // hardpoint 0.3 m ahead of it, and the seat link behind the body.
+    // Turned, the hardpoint swings about the yaw bone and the seat stays;
+    // tilted up, the hardpoint rises about the pitch bone.
+    #[test]
+    fn an_emplaced_guns_turret_turns_its_mount_not_its_seat() {
+        use crate::anim::{Local, Skeleton};
+        let at = |x: f32, y: f32, z: f32| Local {
+            translation: Vec3::new(x, y, z),
+            rotation: Quat::IDENTITY,
+            scale: Vec3::ONE,
+        };
+        let skeleton = Skeleton {
+            name_hashes: vec![1, 0xc9f1_61f3, 0x5e99_f424, 0x59db_5579, 0x1b81_94a7],
+            parents: vec![None, Some(0), Some(1), Some(2), Some(0)],
+            rest: vec![
+                at(0.0, 0.0, 0.0),
+                at(0.0, 0.5, 0.0),
+                at(0.0, 0.75, 0.0),
+                at(0.0, 0.0, 0.3),
+                at(0.0, 0.0, -0.85),
+            ],
+            inverse_bind: vec![Mat4::IDENTITY; 5],
+        };
+        let record = crate::seats::TurretRecord {
+            name: 0x2afe_1fa8,
+            bone_yaw: Some(0xc9f1_61f3),
+            bone_pitch: Some(0x5e99_f424),
+            yaw: (-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2),
+            yaw_speed: 2.0943952,
+            pitch: (-0.34906584, std::f32::consts::FRAC_PI_6),
+            pitch_speed: 2.0943952,
+        };
+        let aimer = Aimer::of_skeleton(record, &skeleton).unwrap();
+        assert_eq!(aimer.yaw_nodes, [false, true, true, true, false]);
+        assert_eq!(aimer.pitch_nodes, [false, false, true, true, false]);
+        let rest = skeleton.model_matrices(&skeleton.rest_pose());
+        let place = |nodes: &[Mat4], i: usize| nodes[i].w_axis.truncate();
+        // A quarter turn: the hardpoint from ahead (+z) to the side (+x).
+        let turned = aimer.pose(&rest, std::f32::consts::FRAC_PI_2, 0.0);
+        assert!((place(&turned, 3) - Vec3::new(0.3, 1.25, 0.0)).length() < 1e-5);
+        assert_eq!(place(&turned, 4), Vec3::new(0.0, 0.0, -0.85));
+        // Tilted up 30 degrees: the hardpoint rises in front of its bone.
+        let up = aimer.pose(&rest, 0.0, std::f32::consts::FRAC_PI_6);
+        let p = place(&up, 3);
+        assert!(
+            (p - Vec3::new(0.0, 1.25 + 0.15, 0.3 * 0.866_025_4)).length() < 1e-4,
+            "{p}"
+        );
+        // Stepped at its speeds toward a want past its limits.
+        let (yaw, pitch) = aimer.step((0.0, 0.0), (3.0, 1.0), 0.5);
+        assert!((yaw - 2.0943952 * 0.5).abs() < 1e-5);
+        assert!((pitch - std::f32::consts::FRAC_PI_6).abs() < 1e-5);
+        // A model without either bone has none.
+        let bare = crate::seats::TurretRecord {
+            bone_yaw: Some(7),
+            bone_pitch: None,
+            ..record
+        };
+        assert!(Aimer::of_skeleton(bare, &skeleton).is_none());
+    }
 
     #[test]
     fn a_tank_stands_on_its_tracks_not_under_its_gun() {
