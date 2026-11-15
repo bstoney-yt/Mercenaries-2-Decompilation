@@ -123,6 +123,11 @@ const HINT_TIME: f64 = 12.0;
 /// The HUD and menu.
 pub struct Hud {
     pub ctx: egui::Context,
+    /// The loading screens' hint counter is the profile's (the playing
+    /// app; harnesses neither read nor write it).
+    pub profile: bool,
+    /// The loading screen took the profile's hint counter up.
+    hint_taken: bool,
     renderer: Option<Renderer>,
     /// Textures handed to the renderer and not freed (for `M2_PAINT_LOG`).
     uploaded: std::collections::HashSet<egui::TextureId>,
@@ -190,6 +195,8 @@ impl Hud {
             game: None,
             loading: None,
             wait: false,
+            profile: false,
+            hint_taken: false,
             dev: true,
             pause_settings: crate::pause::Settings::default(),
             pause_captured: Vec::new(),
@@ -406,8 +413,23 @@ impl Hud {
         // scripts' fades to black.
         let mut loading = self.loading.as_mut();
         if let Some(screen) = loading.as_deref_mut() {
+            // The profile's hint counter: taken up once, and kept when a
+            // screen that moved it on goes ([`crate::loading`]).
+            if self.profile && !self.hint_taken {
+                self.hint_taken = true;
+                screen
+                    .cycle
+                    .show_next(usize::from(config.options.loading_hint));
+            }
+            let was_up = screen.showing();
             let black = info.mission.as_ref().map_or(0.0, |m| m.black);
             screen.update(info.loading.is_some(), black, input.time.unwrap_or(0.0));
+            let counter = screen.cycle.counter();
+            if self.profile && counter != config.options.loading_hint && !screen.showing() && was_up
+            {
+                config.options.loading_hint = counter;
+                config.save("loading screen");
+            }
             for line in screen.take_log() {
                 eprintln!("{line}");
             }
@@ -749,8 +771,6 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>, covered: bool)
             entrance_markers(&painter, screen, vp, &info.entrance_markers, game);
         }
         if let (Some(m), Some(vp)) = (&info.mission, info.view_proj) {
-            let here = info.game.as_ref().and_then(|s| s.position).map(Vec3::from);
-            ground_discs(&painter, screen, vp, m, here);
             world_markers(&painter, screen, vp, m, game);
         }
         game.paint(&painter);
@@ -1440,45 +1460,6 @@ fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             14.0,
             colour,
         );
-    }
-}
-
-/// How far off a disc on the ground is drawn, metres (invented).
-const DISC_RANGE: f32 = 150.0;
-
-/// The scripts' discs on the ground (`Marker.AddDisc`: the wardrobe's, a
-/// delivery's drop-off): a ring of their radius in their colour, filled
-/// faintly, flat at its height. Drawn over the world as the markers are,
-/// so not hidden behind walls (inferred: the engine's own drawing of
-/// them isn't known); one partly behind the camera isn't drawn.
-fn ground_discs(
-    painter: &egui::Painter,
-    screen: egui::Rect,
-    view_proj: Mat4,
-    m: &MissionView,
-    here: Option<Vec3>,
-) {
-    const SIDES: usize = 48;
-    for &(at, radius, [r, g, b]) in &m.discs {
-        if here.is_some_and(|h| h.distance(at) > DISC_RANGE) {
-            continue;
-        }
-        let points: Option<Vec<egui::Pos2>> = (0..SIDES)
-            .map(|i| {
-                let a = i as f32 / SIDES as f32 * std::f32::consts::TAU;
-                project(
-                    view_proj,
-                    at + Vec3::new(a.cos(), 0.0, a.sin()) * radius,
-                    screen,
-                )
-            })
-            .collect();
-        let Some(points) = points else { continue };
-        painter.add(egui::Shape::convex_polygon(
-            points,
-            Color32::from_rgba_unmultiplied(r, g, b, 50),
-            Stroke::new(2.0, Color32::from_rgba_unmultiplied(r, g, b, 200)),
-        ));
     }
 }
 

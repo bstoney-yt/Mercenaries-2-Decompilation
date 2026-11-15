@@ -111,6 +111,9 @@ pub struct Rig {
     /// Which way the legs walk aiming ([`m2_engine::on_foot::AimLegs`]),
     /// set by whoever moves the rig (a soldier); forward when not.
     pub aim_walk: m2_engine::on_foot::AimLegs,
+    /// The FaceFX animation of the line being said, posing the face bones
+    /// over whatever the clips do ([`m2_engine::lip_sync`]).
+    pub lip: Option<m2_engine::lip_sync::LipSync>,
     /// A shuffle round playing on the legs ([`Rig::shuffle_legs`]):
     /// the aim reference keeps time with it, as the 360 times the
     /// shuffles' references alone (0x82809D60, nodes +0x5D4 and +0x624),
@@ -800,6 +803,7 @@ impl Rig {
             kick: Default::default(),
             aim_legs: false,
             aim_walk: Default::default(),
+            lip: None,
             shuffling: false,
             aim_clock: 0.0,
             arm: Default::default(),
@@ -925,6 +929,7 @@ impl Rig {
             kick: Default::default(),
             aim_legs: false,
             aim_walk: Default::default(),
+            lip: None,
             shuffling: false,
             aim_clock: 0.0,
             arm: Default::default(),
@@ -963,6 +968,7 @@ impl Rig {
             kick: Default::default(),
             aim_legs: false,
             aim_walk: Default::default(),
+            lip: None,
             shuffling: false,
             aim_clock: 0.0,
             animator: Animator::default(),
@@ -976,6 +982,16 @@ impl Rig {
 
     /// Plays on `dt` seconds, keeping the clips' events met for the
     /// taking ([`CUES_KEPT`] at most).
+    /// The line's face animation on `dt` seconds, ended past its last
+    /// key ([`m2_engine::lip_sync::LipSync::step`]).
+    pub fn step_lip(&mut self, dt: f32) {
+        if let Some(lip) = &mut self.lip
+            && !lip.step(dt)
+        {
+            self.lip = None;
+        }
+    }
+
     pub fn advance(&mut self, dt: f32) {
         self.animator.events_ahead(dt, &self.clips, &mut self.cues);
         let over = self.cues.len().saturating_sub(CUES_KEPT);
@@ -1382,6 +1398,10 @@ impl Rig {
                 .aimed_pose()
                 .unwrap_or_else(|| self.animator.pose(&self.skeleton, &self.clips)),
         };
+        let mut pose = pose;
+        if let Some(lip) = &self.lip {
+            m2_engine::lip_sync::apply(&mut pose.0, &self.skeleton.name_hashes, &lip.poses());
+        }
         let nodes = self.skeleton.model_matrices(&pose);
         let skin = nodes
             .iter()

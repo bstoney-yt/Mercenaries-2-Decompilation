@@ -5798,16 +5798,22 @@ fn minimap(
                 ));
             }
         }
-        let hash = name_hash(&b.icon);
-        want.push(hash);
-        let [w, h] = blip_half_size(b.size).map(|v| v * r / RADAR_RADIUS);
         let c = b.colour.map(|v| f32::from(v) / 255.0);
+        let scale = r / RADAR_RADIUS;
+        let turn = blip_turn(view, b);
+        let Some(icon) = &b.icon else {
+            out.extend(plain_blip([x, y], b.size, scale, c, turn));
+            continue;
+        };
+        let hash = name_hash(icon);
+        want.push(hash);
+        let [w, h] = blip_half_size(b.size).map(|v| v * scale);
         out.push(quad(
             Some(hash),
             [x - w, y - h, x + w, y + h],
             full,
             c,
-            blip_turn(view, b),
+            turn,
         ));
     }
     // Her: a white square, upright whichever way she faces (the map turns
@@ -5820,6 +5826,30 @@ fn minimap(
         white,
         0.0,
     ));
+}
+
+/// A blip with no texture, at `at` (screen), `scale` screen units to the
+/// radar's: from the 360 code (the icon's draw `0x823871F8`; the flag it
+/// tests is set by `0x82388580` when the blip has a texture), first an
+/// untextured opaque black quad 1 unit wider each way (its colour a
+/// static (0, 0, 0, 1)), then the blip's own quad untextured in its
+/// colour, both turned as the blip is.
+fn plain_blip(at: [f32; 2], size: [f32; 2], scale: f32, colour: [f32; 4], turn: f32) -> [Prim; 2] {
+    let [x, y] = at;
+    let [w, h] = blip_half_size(size);
+    let full = [0.0, 0.0, 1.0, 1.0];
+    let rect = |pad: f32| {
+        [
+            x - (w + pad) * scale,
+            y - (h + pad) * scale,
+            x + (w + pad) * scale,
+            y + (h + pad) * scale,
+        ]
+    };
+    [
+        quad(None, rect(1.0), full, [0.0, 0.0, 0.0, 1.0], turn),
+        quad(None, rect(0.0), full, colour, turn),
+    ]
 }
 
 /// The radar's radius in its own units (the [`BORDER`]'s minimap is 100
@@ -6818,6 +6848,28 @@ mod tests {
         );
     }
 
+    /// A blip with no texture: a black square a unit wider each way under
+    /// a plain square in its colour.
+    #[test]
+    fn a_blip_without_a_texture_is_a_square_outlined_in_black() {
+        let green = [0.0, 1.0, 0.0, 1.0];
+        let [outline, own] = plain_blip([50.0, 40.0], [3.0, 3.0], 2.0, green, 0.0);
+        assert_eq!((outline.texture, own.texture), (None, None));
+        assert_eq!(outline.colour, [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(own.colour, green);
+        let span = |p: &Prim| {
+            let xs = p.corners.map(|c| c[0]);
+            let ys = p.corners.map(|c| c[1]);
+            let lo = |v: [f32; 4]| v.into_iter().fold(f32::MAX, f32::min);
+            let hi = |v: [f32; 4]| v.into_iter().fold(f32::MIN, f32::max);
+            [lo(xs), lo(ys), hi(xs), hi(ys)]
+        };
+        // Half size 3 radar units, 2 screen units each: 6 each way; the
+        // outline 8.
+        assert_eq!(span(&own), [44.0, 34.0, 56.0, 46.0]);
+        assert_eq!(span(&outline), [42.0, 32.0, 58.0, 48.0]);
+    }
+
     #[test]
     fn pie_slices_keep_their_wedge() {
         // A quarter from straight up to the right: the top right quarter,
@@ -6996,7 +7048,7 @@ mod tests {
         };
         let blip = |yaw: Option<f32>, rotate: bool, oriented: bool| RadarView {
             at: Vec3::ZERO,
-            icon: String::new(),
+            icon: None,
             colour: [255; 4],
             sticky: false,
             sort: 5,

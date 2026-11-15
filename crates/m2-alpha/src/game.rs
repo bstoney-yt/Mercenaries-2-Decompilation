@@ -171,6 +171,9 @@ pub struct Game {
     props_up: bool,
     /// The driver's throttle last tick, -1 (reverse) to 1.
     pub throttle: f32,
+    /// Her steering last tick, -1 to 1, positive to the left (the
+    /// seated driver's pose follows it: [`crate::hijack`]).
+    pub steer: f32,
     /// What stops her vehicle dead, for the log ([`crate::halt`]).
     halts: crate::halt::Halts,
     /// Seconds to the next puffs of spray off boats going fast.
@@ -509,6 +512,7 @@ impl Game {
             arrival: None,
             props_up: false,
             throttle: 0.0,
+            steer: 0.0,
             halts: crate::halt::Halts::default(),
             spray_wait: 0.0,
             sky: AtmosphereMix::default(),
@@ -1629,6 +1633,7 @@ impl Game {
                     if self.honking && !was_honking {
                         self.honks += 1;
                     }
+                    self.steer = steer;
                     physics.drive(
                         id,
                         VehicleControls {
@@ -2099,6 +2104,35 @@ impl Game {
                     "crash: the {} hit by the {} at {closing:.1} m/s takes {damage:.1} ({:.0} of {:.0} left)",
                     v.spec.label,
                     self.scene.vehicles[other].spec.label,
+                    (v.most_health() - v.damage).max(0.0),
+                    v.most_health()
+                );
+            }
+            // Vehicles running into the world (the ground, rocks, walls,
+            // buildings) are hurt as by another vehicle, by the damage
+            // table's cell for what they met.
+            let terrain = m2_assets::name_hash(m2_engine::durability::TERRAIN_KEY);
+            let crashes = {
+                let index = &world.index;
+                let props = &self.scene.props;
+                let key_of = |k: StaticKey| match k {
+                    StaticKey::Cell(_) => Some(terrain),
+                    StaticKey::Object(i) | StaticKey::Member(i, _) => index
+                        .objects
+                        .get(i)
+                        .and_then(|o| index.template_db.modifiers.get(&o.template).copied()),
+                    StaticKey::Entity(e) => props
+                        .get(e)
+                        .and_then(|(p, _)| index.template_db.modifiers.get(&p.template).copied()),
+                };
+                self.combat
+                    .world_crashes(&mut world.physics, &mut self.scene.vehicles, key_of)
+            };
+            for (i, key, closing, damage) in crashes {
+                let v = &self.scene.vehicles[i];
+                eprintln!(
+                    "crash: the {} hit {key:?} at {closing:.1} m/s, takes {damage:.1} ({:.0} of {:.0} left)",
+                    v.spec.label,
                     (v.most_health() - v.damage).max(0.0),
                     v.most_health()
                 );
@@ -4340,6 +4374,26 @@ fn within_bed(place: Mat4, (lo, hi): (Vec3, Vec3), bed: Vec3, c: Vec3) -> bool {
 /// run into that their weight breaks ([`Destruction::crash`]: plants,
 /// bushes, fences, lampposts, the island's and the state layers'), going
 /// on through it.
+/// A vehicle's template's `SoundKey`: the template its label names that
+/// has one, else the lowest vehicle template of its `model` that has one
+/// (a traffic or mission vehicle whose label is no template's name).
+pub(crate) fn vehicle_sound_key(db: &m2_engine::Templates, label: &str, model: u32) -> Option<u32> {
+    db.ids(label)
+        .into_iter()
+        .find_map(|t| db.sound_keys.get(&t).copied())
+        .or_else(|| {
+            let mut by_model: Vec<u32> = db
+                .infos
+                .iter()
+                .filter(|(_, i)| i.model == Some(model) && i.vehicle.is_some())
+                .map(|(&t, _)| t)
+                .filter(|t| db.sound_keys.contains_key(t))
+                .collect();
+            by_model.sort_unstable();
+            by_model.first().and_then(|t| db.sound_keys.get(t).copied())
+        })
+}
+
 fn knock_loose(
     world: &mut World,
     props: &mut Props,
@@ -4366,6 +4420,7 @@ fn knock_loose(
                 bounds: v.model.bounds,
                 velocity: Vec3::ZERO,
                 mass: v.spec.mass,
+                sound: 0,
             };
             // What stands in its box with collision, and what has none
             // (PirCon004's organ boxes: none rode, and the truck left
@@ -4424,11 +4479,14 @@ fn knock_loose(
         let Some(place) = world.physics.vehicle_transform(id) else {
             continue;
         };
+        let db = &world.index.template_db;
+        let sound = vehicle_sound_key(db, &v.spec.label, v.spec.model).unwrap_or(0);
         let crasher = Crasher {
             place,
             bounds: v.model.bounds,
             velocity: before,
             mass,
+            sound,
         };
         let keys = world.physics.vehicle_statics(id);
         let (shifted, ploughed) = run_into(
@@ -5999,6 +6057,27 @@ mod tests {
     use m2_engine::TemplateInfo;
 
     use super::*;
+
+    #[test]
+    fn a_vehicles_sound_key_is_found_by_label_else_by_model() {
+        let mut db = m2_engine::Templates::default();
+        db.names.insert(5, "veh_jeep".into());
+        db.sound_keys.insert(5, 0xa1);
+        db.infos.insert(
+            9,
+            m2_engine::TemplateInfo {
+                model: Some(0x77),
+                vehicle: Some(m2_engine::VehicleKind::Car),
+                engine: None,
+                person: false,
+                human: false,
+            },
+        );
+        db.sound_keys.insert(9, 0xb2);
+        assert_eq!(vehicle_sound_key(&db, "veh_jeep", 0x77), Some(0xa1));
+        assert_eq!(vehicle_sound_key(&db, "RTR (crappy)", 0x77), Some(0xb2));
+        assert_eq!(vehicle_sound_key(&db, "RTR (crappy)", 0x78), None);
+    }
 
     #[test]
     fn an_arrival_loads_until_its_place_is_in_or_its_time_is_up() {
