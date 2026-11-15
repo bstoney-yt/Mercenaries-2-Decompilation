@@ -2872,6 +2872,12 @@ impl GameAudio {
                         .collect(),
                 }
             });
+            eprintln!(
+                "engine: set {:08x}, cue {}, speed measured against {:.2} m/s",
+                input.set,
+                looped.map_or("none".to_owned(), |k| format!("{k:08x}")),
+                input.top
+            );
             self.play_flat("engine start", Some(input.set), start);
             self.engine = Some(Engine {
                 cue,
