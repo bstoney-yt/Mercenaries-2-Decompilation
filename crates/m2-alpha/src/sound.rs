@@ -822,6 +822,40 @@ pub struct HeardEngine {
     /// Speed and top speed, m/s.
     pub speed: f32,
     pub top: f32,
+    /// Its engine's revs over its top (none for a tank), its sideways
+    /// speed (m/s), the surface's class under it, whether its driver
+    /// brakes, and whether it rolls backwards: the rest of what the
+    /// 360's wheeled engine controller fills ([`EngineInput`]), as for
+    /// her own.
+    pub revs: Option<f32>,
+    pub slide: f32,
+    pub surface: f32,
+    pub braking: bool,
+    pub reversing: bool,
+}
+
+impl HeardEngine {
+    /// The values its engine cue's curves read (see
+    /// [`Sound::others_engines`]). The load (its eased throttle) is left
+    /// out, its curves passed over as before: the drivers' throttle is
+    /// not to hand here.
+    pub fn params(&self) -> Vec<(u32, f32)> {
+        use m2_engine::audio::{
+            PARAM_BRAKE, PARAM_REVERSE, PARAM_REVS, PARAM_SLIDE, PARAM_SPEED, PARAM_SURFACE,
+        };
+        let top = self.top.max(1.0);
+        let mut p = vec![
+            (PARAM_SPEED, (self.speed.abs() / top).min(1.0)),
+            (PARAM_SLIDE, (self.slide.abs() * 2.5 / top).min(1.0)),
+            (PARAM_SURFACE, self.surface),
+            (PARAM_BRAKE, f32::from(self.braking)),
+            (PARAM_REVERSE, f32::from(self.reversing)),
+        ];
+        if let Some(r) = self.revs {
+            p.push((PARAM_REVS, r));
+        }
+        p
+    }
 }
 
 /// The engine of the vehicle being driven, as the game sees it.
@@ -3116,8 +3150,12 @@ impl GameAudio {
                 self.others.insert(n.id, (cue, voices));
             }
             if let Some((cue, voices)) = self.others.get(&n.id) {
-                let speed = (n.speed.abs() / n.top.max(1.0)).min(1.0);
-                let mix = cue.mix(&[(m2_engine::audio::PARAM_SPEED, speed)]);
+                // Every value the cue's curves read, not the speed alone:
+                // a curve whose value is not given is passed over, so the
+                // tyres' skid track (on the slide and the surface) had
+                // played under every car in traffic (playtest 2026-11-14:
+                // "traffic sounds like it brakes forever").
+                let mix = cue.mix(&n.params());
                 self.out.with(|m| {
                     for (id, (g, pitch)) in voices.iter().zip(mix) {
                         m.set_position(*id, n.at);
@@ -3390,6 +3428,40 @@ impl GameAudio {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn others_engines_hear_the_slide_brake_and_surface_too() {
+        use m2_engine::audio::{PARAM_BRAKE, PARAM_REVS, PARAM_SLIDE, PARAM_SPEED};
+        let n = HeardEngine {
+            id: 0,
+            at: Vec3::ZERO,
+            set: 1,
+            speed: 16.0,
+            top: 32.0,
+            revs: None,
+            slide: 0.0,
+            surface: 0.0,
+            braking: false,
+            reversing: false,
+        };
+        let p = n.params();
+        let get = |k: u32| p.iter().find(|x| x.0 == k).map(|x| x.1);
+        assert_eq!(get(PARAM_SPEED), Some(0.5));
+        // Rolling straight, off the brake: the skid track's curves read 0.
+        assert_eq!(get(PARAM_SLIDE), Some(0.0));
+        assert_eq!(get(PARAM_BRAKE), Some(0.0));
+        assert_eq!(get(PARAM_REVS), None, "no gearbox, no revs");
+        let skid = HeardEngine {
+            slide: 6.4,
+            braking: true,
+            revs: Some(0.4),
+            ..n
+        }
+        .params();
+        assert!(skid.contains(&(PARAM_SLIDE, 0.5)) && skid.contains(&(PARAM_BRAKE, 1.0)));
+        assert!(skid.contains(&(PARAM_REVS, 0.4)));
+    }
+
     use super::*;
 
     /// The grenade's blast as the data has it: set `701d113d`, whose
