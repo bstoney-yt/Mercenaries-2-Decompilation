@@ -48,6 +48,7 @@ fn call(vb: VertexBufferHandle, ib: IndexBufferHandle, material: u32) -> DrawCal
         uv_offset: [0.0; 2],
         tint: [1.0; 4],
         beams_lit: false,
+        surface: m2_render::SurfaceOverride::NONE,
     }
 }
 

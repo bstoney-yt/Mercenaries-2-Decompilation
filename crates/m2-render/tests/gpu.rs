@@ -140,6 +140,7 @@ fn draw(vb: VertexBufferHandle, ib: IndexBufferHandle, material: u32, world: Mat
         uv_offset: [0.0; 2],
         tint: [1.0; 4],
         beams_lit: false,
+        surface: m2_render::SurfaceOverride::NONE,
     }
 }
 
@@ -999,4 +1000,51 @@ fn overlays_draw_in_gamma() {
     let pixels = backend.read_pixels().unwrap();
     let p = pixel(&pixels, SIZE / 2, SIZE / 2);
     assert!((i32::from(p[0]) - 128).abs() <= 1, "{p:?}");
+}
+
+#[test]
+fn a_draws_opacity_in_place_of_its_materials_hides_a_cut_out_quad() {
+    let Some(mut b) = backend() else { return };
+    let (vb, ib) = quad(&mut b);
+    let white = vec![255u8; 64 * 4];
+    let tex = b
+        .create_texture(
+            &TextureDesc {
+                width: 8,
+                height: 8,
+                format: TextureFormat::Rgba8Srgb,
+            },
+            &[&white],
+        )
+        .unwrap();
+    b.set_material(
+        MaterialId(1),
+        &MaterialDesc {
+            texture: Some(tex),
+            lit: false,
+            blend: m2_render::BlendMode::Masked { cutoff: 0.5 },
+            ..MaterialDesc::default()
+        },
+    )
+    .unwrap();
+    // As it is: drawn.
+    b.begin_frame(&view()).unwrap();
+    b.draw(&draw(vb, ib, 1, Mat4::IDENTITY)).unwrap();
+    b.end_frame().unwrap();
+    assert_eq!(
+        pixel(&b.read_pixels().unwrap(), 32, 32),
+        [255, 255, 255, 255]
+    );
+    // At no opacity (a burnt leaf's last frame): cut out, the sky shows.
+    b.begin_frame(&view()).unwrap();
+    b.draw(&DrawCall {
+        surface: m2_render::SurfaceOverride {
+            opacity: Some(0.0),
+            ..m2_render::SurfaceOverride::NONE
+        },
+        ..draw(vb, ib, 1, Mat4::IDENTITY)
+    })
+    .unwrap();
+    b.end_frame().unwrap();
+    assert_eq!(pixel(&b.read_pixels().unwrap(), 32, 32), [0, 0, 255, 255]);
 }

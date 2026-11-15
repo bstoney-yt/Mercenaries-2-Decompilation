@@ -70,10 +70,38 @@ pub struct DrawCall {
     /// Multiplies the surface's colour and alpha (`[1.0; 4]`: as it is):
     /// a marker model's colour, as the scripts give it.
     pub tint: [f32; 4],
+    /// Values of its material's put in place of the material's own for
+    /// this draw (a material animation's: a burning tree's leaves going
+    /// black and fading out). [`SurfaceOverride::NONE`] draws the material
+    /// as it is.
+    pub surface: SurfaceOverride,
     /// A beam material on it shines whatever the hour: the searchlights'
     /// beams follow the night ([`Lighting::beam_gain`]), and a race's ring,
     /// drawn with the same kind of material, must not.
     pub beams_lit: bool,
+}
+
+/// A draw's material values in place of its material's own (see
+/// [`DrawCall::surface`]): each `None` keeps the material's.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SurfaceOverride {
+    /// The direct light's colour on the surface (`MaterialDesc::direct`).
+    pub direct: Option<[f32; 3]>,
+    /// The highlight's colour (`Specular::color`); nothing on a material
+    /// with no highlight.
+    pub specular: Option<[f32; 3]>,
+    /// The opacity the texture's alpha is scaled by (the alpha of
+    /// `MaterialDesc::color`).
+    pub opacity: Option<f32>,
+}
+
+impl SurfaceOverride {
+    /// The material as it is.
+    pub const NONE: Self = Self {
+        direct: None,
+        specular: None,
+        opacity: None,
+    };
 }
 
 /// How many [`PointLight`]s a frame draws (the game's shaders take 8).

@@ -1555,6 +1555,12 @@ pub struct GpuModel {
     /// The material each of its records got from the [`MaterialCache`],
     /// one hold each, given back by [`release`](Self::release).
     material_ids: Vec<MaterialId>,
+    /// Each record's material name hash, as [`material_ids`](Self::material_ids).
+    material_names: Vec<u32>,
+    /// Values put in place of its materials' own for the instance drawn
+    /// next ([`set_surfaces`](Self::set_surfaces)): a material
+    /// animation's, by material.
+    surfaces: std::cell::RefCell<Vec<(MaterialId, m2_render::SurfaceOverride)>>,
     /// Multiplies its surfaces' colour and alpha ([`DrawCall::tint`]):
     /// `[1.0; 4]` but for a marker model drawn in the scripts' colour.
     pub tint: [f32; 4],
@@ -1779,6 +1785,8 @@ impl GpuModel {
         }
         Ok(Self {
             material_ids: ids.clone(),
+            material_names: cpu.materials.iter().map(|m| m.name_hash).collect(),
+            surfaces: Default::default(),
             tint: [1.0; 4],
             beams_lit: false,
             hash: cpu.hash,
@@ -2208,12 +2216,35 @@ impl GpuModel {
                     },
                     tint: self.tint,
                     beams_lit: self.beams_lit,
+                    surface: self
+                        .surfaces
+                        .borrow()
+                        .iter()
+                        .find(|(m, _)| *m == material)
+                        .map_or(m2_render::SurfaceOverride::NONE, |s| s.1),
                 },
                 layer: Layer::WORLD,
                 translucent,
                 sort_origin: origin,
                 user: 0,
             });
+        }
+    }
+
+    /// Draws its materials named in `by_name` (material name hash) with
+    /// those values in place of their own until set again (empty: as they
+    /// are): an instance's material animation, set before drawing it.
+    pub fn set_surfaces(&self, by_name: &[(u32, m2_render::SurfaceOverride)]) {
+        let mut s = self.surfaces.borrow_mut();
+        s.clear();
+        for &(name, over) in by_name {
+            for (k, &n) in self.material_names.iter().enumerate() {
+                if n == name
+                    && let Some(&id) = self.material_ids.get(k)
+                {
+                    s.push((id, over));
+                }
+            }
         }
     }
 
