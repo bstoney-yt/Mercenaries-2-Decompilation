@@ -23,6 +23,7 @@
 //! `SoundKey` says (`_global_fencewoodpanel`'s `prop_sheetmetal_sml`), as
 //! a blast brings it down or a vehicle does ([`break_sound`]).
 
+use m2_engine::destroy_route as route;
 use std::collections::{HashMap, HashSet};
 
 use m2_engine::durability::{BlastPush, Crash, CrashHow};
@@ -367,7 +368,10 @@ pub struct Destruction {
     taken: HashMap<usize, f32>,
     /// Destroyed, put up as props, waiting for their models to load to
     /// come down: (object, what did it).
-    falling: Vec<(usize, Cause)>,
+    /// The island's objects destroyed whose props have yet to load:
+    /// what destroyed them, and whether it burns them
+    /// ([`m2_engine::destroy_route::blast_burns`]).
+    falling: Vec<(usize, Cause, bool)>,
     /// Destroyed, by placed object.
     pub destroyed: HashSet<usize>,
     /// What a vehicle's body touched and left standing, logged once each
@@ -396,6 +400,10 @@ pub struct Destruction {
     /// ([`crate::combat::Combat::set_off`]): where, its template, and
     /// what its model's `CollapseState` starts (effect name hash, where).
     pub set_off: Vec<(Vec3, u32, Shows)>,
+    /// Part states the props destroyed went to, for the scripts'
+    /// `OnStateChange` ([`take_state_changes`](Self::take_state_changes)):
+    /// (entity, state name hash), in order.
+    state_changes: Vec<(u32, u32)>,
     /// The island's objects destroyed whose links were followed
     /// ([`fall_linked`](Self::fall_linked)).
     linked: HashSet<usize>,
@@ -669,12 +677,35 @@ impl Destruction {
         }
         match key {
             StaticKey::Object(i) => match install {
-                Some(install) => self.bring_down(world, props, install, i, cause),
+                Some(install) => {
+                    let burns = matches!(cause, Cause::Blast(_)) && route::blast_burns(kind);
+                    self.bring_down(world, props, install, i, cause, burns)
+                }
                 None => return false,
             },
             StaticKey::Entity(e) => {
                 match cause {
-                    Cause::Blast(at) => props.wreck(&mut world.physics, e, Some(at)),
+                    Cause::Blast(at) => {
+                        // Blown up by an explosion, a model whose fire
+                        // state starts effects (a tree) burns down rather
+                        // than collapse (from the 360 code, 0x82289020:
+                        // [`m2_engine::destroy_route`]).
+                        let fire = props.state_effects(e, route::FIRE);
+                        let burns = route::blast_burns(kind) && !fire.is_empty();
+                        let mut shows = fire;
+                        shows.extend(props.state_effects(e, route::FIRE_DEBRIS));
+                        let broke = props.wreck(&mut world.physics, e, Some(at));
+                        if burns && broke {
+                            eprintln!(
+                                "destruct: {key:?} ({name}) burns down: {} effects",
+                                shows.len()
+                            );
+                            self.alight.push(shows);
+                            self.state_changes
+                                .extend(route::tree_states(true).map(|s| (e, s)));
+                        }
+                        broke
+                    }
                     Cause::Crash { velocity, mass, .. } => {
                         props.wreck_crashed(&mut world.physics, e, |shifted| {
                             crate::game::flung(velocity, mass, shifted)
@@ -769,13 +800,14 @@ impl Destruction {
         install: &Install,
         i: usize,
         cause: Cause,
+        burns: bool,
     ) {
         self.destroyed.insert(i);
         let o = world.index.objects[i];
         let loose = world.loose_mass(i);
         if world.object_model(i).is_some_and(|m| m.has_wreck()) && props.adopt(install, key(i), &o)
         {
-            self.falling.push((i, cause));
+            self.falling.push((i, cause, burns));
         } else if let Some(m) = loose {
             // No wreck to show, but it comes loose (a café chair, a
             // planter): it goes flying, as what is knocked loose does,
@@ -886,7 +918,7 @@ impl Destruction {
                         mass: vehicle.mass,
                         sound: vehicle.sound,
                     };
-                    self.bring_down(world, props, install, i, cause);
+                    self.bring_down(world, props, install, i, cause, false);
                     out.push(Crashed::Down(key));
                 }
                 Some(c) => out.push(c),
@@ -1145,7 +1177,14 @@ impl Destruction {
                 {
                     eprintln!("destruct: object {i} ({t:#x}) falls with {e:#x} (DestructionLink)");
                     let at = world.index.objects[i].position;
-                    self.bring_down(world, props, install, i, Cause::Blast(BlastPush::none(at)));
+                    self.bring_down(
+                        world,
+                        props,
+                        install,
+                        i,
+                        Cause::Blast(BlastPush::none(at)),
+                        false,
+                    );
                     self.linked.insert(i);
                     fallen.push(t);
                 }
@@ -1159,6 +1198,12 @@ impl Destruction {
     /// names points, if it has a building's collapse; one a vehicle ran
     /// into is knocked on by it. Either, with no building's collapse, is
     /// heard as its template's `SoundKey` says ([`break_sound`]).
+    /// The part states the props destroyed since the last call went to:
+    /// (entity, state name hash), in order.
+    pub fn take_state_changes(&mut self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut self.state_changes)
+    }
+
     pub fn update(
         &mut self,
         world: &mut World,
@@ -1200,7 +1245,7 @@ impl Destruction {
             }
             false
         });
-        self.falling.retain(|&(i, cause)| {
+        self.falling.retain(|&(i, cause, burns)| {
             let key = key(i);
             match props.get(key) {
                 Some((_, true)) => {}
@@ -1224,7 +1269,23 @@ impl Destruction {
                 .map(|&k| cause.heard(db.sound_table.as_ref(), k));
             match cause {
                 Cause::Blast(from) => {
+                    // As a state layer's prop does ([`Self::wear_by`]):
+                    // one whose fire state starts effects (a tree) burns.
+                    let fire = props.state_effects(key, route::FIRE);
+                    let burnt = burns && !fire.is_empty();
+                    let mut shows = fire;
+                    shows.extend(props.state_effects(key, route::FIRE_DEBRIS));
                     props.wreck(&mut world.physics, key, Some(from));
+                    if burnt {
+                        let entity = world.index.objects[i].entity;
+                        eprintln!(
+                            "destruct: object {i} ({template:08x}, entity {entity:#x}) burns down: {}                              effects",
+                            shows.len()
+                        );
+                        combat.state_shows(shows);
+                        self.state_changes
+                            .extend(route::tree_states(true).map(|s| (entity, s)));
+                    }
                     if props.broke_apart(key) && building {
                         if let Some(at) = props.centre(key) {
                             let sent =

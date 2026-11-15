@@ -37,6 +37,7 @@ pub mod car_attack;
 pub mod car_driver;
 pub mod collision_layers;
 pub mod death;
+pub mod destroy_route;
 pub mod durability;
 pub mod face_expression;
 pub mod face_graph;
