@@ -2119,26 +2119,6 @@ impl Game {
             let crashes = self
                 .combat
                 .vehicle_crashes(&mut world.physics, &mut self.scene.vehicles);
-            // Each pair is heard once, by the sound table's cue for the
-            // two vehicles' `SoundKey`s either way round (0x8235E850 ->
-            // 0x82398958); a pair with none is silent, as in the game.
-            let db = &world.index.template_db;
-            let key_of = |v: &ParkedVehicle| {
-                db.id(&v.spec.label)
-                    .and_then(|t| db.sound_keys.get(&t).copied())
-            };
-            for &(struck, other, _, _) in crashes.iter().filter(|c| c.0 < c.1) {
-                let (a, b) = (&self.scene.vehicles[struck], &self.scene.vehicles[other]);
-                let cue = match (key_of(a), key_of(b), db.sound_table.as_ref()) {
-                    (Some(ka), Some(kb), Some(t)) => t.either(ka, kb),
-                    _ => None,
-                };
-                if let (Some(cue), Some(at)) =
-                    (cue, a.id.and_then(|id| world.physics.vehicle_transform(id)))
-                {
-                    self.combat.broke(at.w_axis.truncate(), cue);
-                }
-            }
             for (struck, other, closing, damage) in crashes {
                 let v = &self.scene.vehicles[struck];
                 eprintln!(
@@ -2177,6 +2157,19 @@ impl Game {
                     (v.most_health() - v.damage).max(0.0),
                     v.most_health()
                 );
+            }
+            // Every new meeting of the two kinds above is heard, damaging or
+            // not (0x8235E3A8): the sound table's cue for the two sides'
+            // `SoundKey`s, three a frame.
+            let contacts = std::mem::take(&mut self.combat.contacts);
+            for (at, cue, level) in contact_cues(
+                &world.index,
+                &world.physics,
+                &self.scene.props,
+                &self.scene.vehicles,
+                contacts,
+            ) {
+                self.combat.contact(at, cue, level);
             }
             // What came down (to a vehicle, the traffic's too, or a blast
             // last tick) comes down whether she is on foot or the free
@@ -4437,6 +4430,79 @@ fn within_bed(place: Mat4, (lo, hi): (Vec3, Vec3), bed: Vec3, c: Vec3) -> bool {
 /// run into that their weight breaks ([`Destruction::crash`]: plants,
 /// bushes, fences, lampposts, the island's and the state layers'), going
 /// on through it.
+/// What `contacts`, a tick's new meetings of vehicles with each other
+/// and the world ([`combat::Contact`]), are heard as: the three of the
+/// most mass ([`combat::heard_contacts`]), each the sound table's cue
+/// ([`m2_engine::tuning::KeyTable::contact_cue`]) for the vehicle's
+/// `SoundKey` and what it met's: another vehicle's; the ground's, the
+/// word of the triangle met (its surface, as a round's: `TERRAIN_GRASS`);
+/// a placed object's or state layer prop's, its template's. At
+/// [`m2_engine::tuning::contact_level`] of its closing speed. Each where
+/// it met. From the 360 code: 0x8235E3A8 takes each side's key by
+/// 0x8235E600 (0x82399040: its template's sound key component
+/// 0x83654A5C, or for the ground, kind 13, the word of the material met,
+/// 0x8216F120) and plays 0x8235E798's cue at the event's place; a side
+/// with no key looks up as 0 (the table's first row or column).
+pub(crate) fn contact_cues(
+    index: &m2_engine::WorldIndex,
+    physics: &Physics,
+    props: &Props,
+    vehicles: &[ParkedVehicle],
+    contacts: Vec<combat::Contact>,
+) -> Vec<(Vec3, u32, f32)> {
+    let db = &index.template_db;
+    let Some(table) = db.sound_table.as_ref() else {
+        return Vec::new();
+    };
+    let vehicle_key =
+        |v: &ParkedVehicle| vehicle_sound_key(db, &v.spec.label, v.spec.model).unwrap_or(0);
+    let mut out = Vec::new();
+    for c in combat::heard_contacts(contacts) {
+        let Some(v) = vehicles.get(c.vehicle) else {
+            continue;
+        };
+        let other = match c.met {
+            combat::Met::Vehicle(j) => vehicles.get(j).map_or(0, vehicle_key),
+            combat::Met::Static(StaticKey::Cell(_)) => physics
+                .cast_ray_surface(c.at - c.normal * 0.5, c.normal, 1.0)
+                .map_or(0, |(.., surface)| surface),
+            combat::Met::Static(StaticKey::Object(i) | StaticKey::Member(i, _)) => index
+                .objects
+                .get(i)
+                .and_then(|o| db.sound_keys.get(&o.template).copied())
+                .unwrap_or(0),
+            combat::Met::Static(StaticKey::Entity(e)) => props
+                .get(e)
+                .and_then(|(p, _)| db.sound_keys.get(&p.template).copied())
+                .unwrap_or(0),
+        };
+        let own = vehicle_key(v);
+        let level = m2_engine::tuning::contact_level(c.closing);
+        match table.contact_cue(own, other, c.damaging) {
+            Some(cue) => {
+                eprintln!(
+                    "contact: the {} met {:?} at {:.1} m/s: keys {own:08x} x {other:08x}, {} -> \
+                     cue {cue:08x} at {level:.2}",
+                    v.spec.label,
+                    c.met,
+                    c.closing,
+                    if c.damaging {
+                        "damaging"
+                    } else {
+                        "not damaging"
+                    }
+                );
+                out.push((c.at, cue, level));
+            }
+            None => eprintln!(
+                "contact: the {} met {:?}: keys {own:08x} x {other:08x}: no cue, silent",
+                v.spec.label, c.met
+            ),
+        }
+    }
+    out
+}
+
 /// A vehicle's template's `SoundKey`: the template its label names that
 /// has one, else the lowest vehicle template of its `model` that has one
 /// (a traffic or mission vehicle whose label is no template's name).
