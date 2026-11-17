@@ -483,3 +483,46 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def map_entries(g: Guest, table: int) -> dict[int, int]:
+    """Every live entry of a keyed pool of the kind Object.GetHealth reads
+    (vtable 0x820E43D0; lookup 0x823DB8F0, traced 2026-11-17): capacity +0x8,
+    entry size +0xC (s16), page shift +0xE (s16), slots per page +0x10, the
+    key of each index at +0x1C (-1 when free), pages at +0x20. {key: addr}.
+    Object.GetHealth (0x8232E540) reads 0x83656558 (health at entry +4, by
+    the object's handle) first, else 0x83651338 (health at +0, keyed by
+    0x823F7B88(handle))."""
+    hb = g.read(table, 0x24)
+    if not hb:
+        return {}
+    cap = struct.unpack_from(">I", hb, 8)[0]
+    esz, shift = struct.unpack_from(">hh", hb, 0xC)
+    per, keys, pages = struct.unpack_from(">I", hb, 0x10)[0], *struct.unpack_from(">II", hb, 0x1C)
+    if not cap or cap > 1 << 18 or not per:
+        return {}
+    kb = g.read(keys, 4 * cap)
+    n_pages = (cap + per - 1) // per
+    pb = g.read(pages, 4 * n_pages)
+    if not kb or not pb:
+        return {}
+    pg = struct.unpack(f">{n_pages}I", pb)
+    out = {}
+    for i, k in enumerate(struct.unpack(f">{cap}I", kb)):
+        if k != 0xFFFFFFFF and pg[i >> shift]:
+            out[k] = pg[i >> shift] + (i & (per - 1)) * esz
+    return out
+
+
+HEALTH_TABLES = ((0x83656558, 4), (0x83651338, 0))
+
+
+def healths(g: Guest) -> dict[tuple[int, int], float]:
+    """{(table, handle): health} for both of GetHealth's tables."""
+    out = {}
+    for t, off in HEALTH_TABLES:
+        for k, a in map_entries(g, t).items():
+            b = g.read(a + off, 4)
+            if b:
+                out[(t, k)] = struct.unpack(">f", b)[0]
+    return out

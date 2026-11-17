@@ -40,6 +40,8 @@ Route files are one step per line (`#` comments):
     airwatch <dropx> <dropz> <secs> [<every_s> <name>]  log movers near a drop, camera on the fastest airborne one
     look <bearing> [<timeout>]     turn the camera to face that bearing (xmem.Camera)
     enter <cx> <cz> [<ring> <tries>]  get into the vehicle there (ring points, face it, Y)
+    healthlog start [<name>] | stop   log health changes (Object.GetHealth's tables)
+    pokef <table> <handle|hero> <off> <f>  set a float in a handle table entry (runtime data)
     poke <hex addr> <byte>         set a guest data byte (runtime flag only)
     trackhero                      follow the player's character by the 360 code's tables (xmem.Hero)
     trackfoot <x> <y> <z>|here     as track, for the hero on foot (here: where track was)
@@ -952,6 +954,69 @@ def run(args) -> int:
                         break
                 if not inside:
                     say("enter: NOT in after every ring point")
+            elif op == "healthlog":
+                # healthlog start [<name>] | stop: in the background, every 0.25 s,
+                # log each health in Object.GetHealth's two tables (xmem.healths)
+                # that changed by more than 0.01, and the hero's handle, to
+                # <out>/<name>.csv; the first read lists them all.
+                import csv, threading
+                import xmem
+
+                if w[1] == "start":
+                    name = w[2] if len(w) > 2 else "health"
+                    stop_h = threading.Event()
+                    gh = xmem.Guest(p.pid)
+                    fh = open(Path(args.out) / f"{name}.csv", "w", newline="")
+                    wr_h = csv.writer(fh)
+                    wr_h.writerow(["t", "table", "handle", "health", "hero"])
+                    fhh = open(Path(args.out) / f"{name}-hero.csv", "w", newline="")
+                    wr_hh = csv.writer(fhh)
+                    wr_hh.writerow(["t", "x", "y", "z", "health"])
+
+                    def hloop():
+                        last = {}
+                        while not stop_h.is_set():
+                            try:
+                                hero = xmem.Hero(gh).character()
+                                now = xmem.healths(gh)
+                            except Exception as e:  # noqa: BLE001
+                                say(f"healthlog: {e}")
+                                now = {}
+                            tt = time.time() - t0
+                            for k, v in now.items():
+                                if k not in last or abs(v - last[k]) > 0.01:
+                                    wr_h.writerow([f"{tt:.2f}", f"{k[0]:#x}", f"{k[1]:#x}", f"{v:.3f}", f"{hero or 0:#x}"])
+                            hp = xmem.Hero(gh).update()
+                            if hp:
+                                wr_hh.writerow([f"{tt:.2f}", *(f"{c:.2f}" for c in hp), f"{now.get((0x83656558, hero), -1):.2f}"])
+                            fh.flush()
+                            fhh.flush()
+                            last = now
+                            stop_h.wait(0.25)
+                        fh.close()
+                        fhh.close()
+
+                    th_h = threading.Thread(target=hloop, daemon=True)
+                    th_h.start()
+                    say(f"healthlog {name}: started (hero {xmem.Hero(gh).character()})")
+                else:
+                    stop_h.set()
+                    th_h.join(2)
+                    say("healthlog: stopped")
+            elif op == "pokef":
+                # pokef <table hex> <handle hex|hero> <offset> <float>: set one health
+                # (or other float) in a handle table entry; runtime data only.
+                import xmem
+
+                g = xmem.Guest(p.pid)
+                tbl = int(w[1], 16)
+                hnd = xmem.Hero(g).character() if w[2] == "hero" else int(w[2], 16)
+                a = xmem.map_entries(g, tbl).get(hnd)
+                if a is None:
+                    say(f"pokef: handle {hnd:#x} not in {tbl:#x}")
+                else:
+                    ok = g.write(a + int(w[3]), struct.pack(">f", float(w[4])))
+                    say(f"pokef {tbl:#x}[{hnd:#x}]+{w[3]} = {w[4]}: {'ok' if ok else 'FAILED'}")
             elif op == "poke":
                 # poke <guest hex address> <byte>: set one guest data byte, a
                 # runtime flag (never code, the XEX or files). E.g. 0x83134382 =
