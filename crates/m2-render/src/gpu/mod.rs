@@ -184,7 +184,11 @@ struct VertexBuffer {
     desc: VertexBufferDesc,
     /// Its layout's number among the backend's ([`Layouts`]).
     layout: LayoutId,
-    buffer: wgpu::Buffer,
+    /// Where its vertices are: a range of a shared page ([`Pool`]).
+    range: Range,
+    /// Its first vertex's number in the page (its offset over its
+    /// stride), added to every draw's vertices.
+    base_vertex: u32,
     /// A sphere around its positions (object space), for shadow culling;
     /// `None` when unknown (casts everywhere).
     bounds: Option<(Vec3, f32)>,
@@ -193,10 +197,173 @@ struct VertexBuffer {
 #[derive(Debug)]
 struct IndexBuffer {
     desc: IndexBufferDesc,
-    buffer: wgpu::Buffer,
+    /// Where its indices are: a range of a shared page ([`Pool`]).
+    range: Range,
+    /// Its first index's number in the page, added to every draw's.
+    first_index: u32,
     /// CPU copy, so writes not aligned to 4 bytes (odd runs of 16-bit
     /// indices) can be widened to an aligned upload.
     shadow: Vec<u8>,
+}
+
+/// Bytes in a page of a [`Pool`] (a buffer bigger than this has a page
+/// of its own).
+const PAGE_BYTES: u64 = 16 << 20;
+
+/// The free byte ranges of one page, taken first fit and merged again as
+/// they come back.
+#[derive(Debug, Clone, PartialEq)]
+struct FreeRanges {
+    size: u64,
+    /// (offset, length), by offset, none touching.
+    free: Vec<(u64, u64)>,
+}
+
+impl FreeRanges {
+    fn new(size: u64) -> Self {
+        Self {
+            size,
+            free: vec![(0, size)],
+        }
+    }
+
+    /// The offset of `len` free bytes starting at a multiple of `align`.
+    fn take(&mut self, len: u64, align: u64) -> Option<u64> {
+        for i in 0..self.free.len() {
+            let (at, n) = self.free[i];
+            let start = at.next_multiple_of(align);
+            if start + len > at + n {
+                continue;
+            }
+            let (before, after) = (start - at, at + n - (start + len));
+            match (before, after) {
+                (0, 0) => {
+                    self.free.remove(i);
+                }
+                (0, _) => self.free[i] = (start + len, after),
+                (_, 0) => self.free[i] = (at, before),
+                _ => {
+                    self.free[i] = (at, before);
+                    self.free.insert(i + 1, (start + len, after));
+                }
+            }
+            return Some(start);
+        }
+        None
+    }
+
+    /// Gives `len` bytes at `at` back.
+    fn give(&mut self, at: u64, len: u64) {
+        let i = self.free.partition_point(|&(o, _)| o < at);
+        self.free.insert(i, (at, len));
+        // Merged with the next, then the previous.
+        if i + 1 < self.free.len() && self.free[i].0 + self.free[i].1 == self.free[i + 1].0 {
+            self.free[i].1 += self.free[i + 1].1;
+            self.free.remove(i + 1);
+        }
+        if i > 0 && self.free[i - 1].0 + self.free[i - 1].1 == self.free[i].0 {
+            self.free[i - 1].1 += self.free[i].1;
+            self.free.remove(i);
+        }
+    }
+
+    /// Nothing in it is taken.
+    fn is_empty(&self) -> bool {
+        self.free == [(0, self.size)]
+    }
+}
+
+/// Where a buffer's bytes are in a [`Pool`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Range {
+    /// Its page's number, unique among all pools' pages (passes compare
+    /// it to see whether the bound page changes).
+    page: u32,
+    offset: u64,
+    len: u64,
+}
+
+/// Shared pages for buffers of one kind (vertices of one stride, indices
+/// of one format), so a pass binds a page once for many draws, which
+/// draw at their range's base vertex and first index.
+///
+/// Every mesh once had a buffer of its own, and a 1440p frame bound a
+/// vertex and an index buffer some 2,000 times each; with pages it binds
+/// a few. Their bytes, and so what is drawn, are as before.
+#[derive(Debug)]
+struct Pool {
+    usage: wgpu::BufferUsages,
+    pages: Vec<(u32, wgpu::Buffer, FreeRanges)>,
+}
+
+impl Pool {
+    fn new(usage: wgpu::BufferUsages) -> Self {
+        Self {
+            usage,
+            pages: Vec::new(),
+        }
+    }
+
+    /// Room for `len` bytes at a multiple of `align`, in a page with room
+    /// or a new one (numbered from `next_page`).
+    fn take(&mut self, device: &wgpu::Device, next_page: &mut u32, len: u64, align: u64) -> Range {
+        let len = len.next_multiple_of(4).max(4);
+        for (page, _, free) in &mut self.pages {
+            if let Some(offset) = free.take(len, align) {
+                return Range {
+                    page: *page,
+                    offset,
+                    len,
+                };
+            }
+        }
+        let size = PAGE_BYTES.max(len.next_multiple_of(align));
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("buffer page"),
+            size,
+            usage: self.usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut free = FreeRanges::new(size);
+        let offset = free.take(len, align).expect("a new page has room");
+        let page = *next_page;
+        *next_page += 1;
+        self.pages.push((page, buffer, free));
+        Range { page, offset, len }
+    }
+
+    /// Gives `range` back, dropping its page once empty (keeping one).
+    fn give(&mut self, range: Range) {
+        let Some(i) = self.pages.iter().position(|p| p.0 == range.page) else {
+            return;
+        };
+        self.pages[i].2.give(range.offset, range.len);
+        if self.pages[i].2.is_empty() && self.pages.len() > 1 {
+            let (_, buffer, _) = self.pages.remove(i);
+            buffer.destroy();
+        }
+    }
+
+    fn buffer(&self, page: u32) -> Option<&wgpu::Buffer> {
+        self.pages.iter().find(|p| p.0 == page).map(|p| &p.1)
+    }
+}
+
+/// The least common multiple of `a` and `b` (both above 0).
+fn lcm(a: u64, b: u64) -> u64 {
+    let (mut x, mut y) = (a, b);
+    while y != 0 {
+        (x, y) = (y, x % y);
+    }
+    a / x * b
+}
+
+/// Bytes an index of `format` takes.
+fn index_bytes(format: IndexFormat) -> u64 {
+    match format {
+        IndexFormat::U16 => 2,
+        IndexFormat::U32 => 4,
+    }
 }
 
 #[derive(Debug)]
@@ -658,6 +825,11 @@ pub struct WgpuBackend {
     /// The cascades the shadow map holds, as last drawn.
     cascades: std::cell::Cell<Option<shadow::Cascades>>,
     vertex_buffers: Slots<VertexBuffer>,
+    /// Pages of vertices by stride, of indices by format ([`Pool`]).
+    vertex_pools: FastMap<u32, Pool>,
+    index_pools: FastMap<IndexFormat, Pool>,
+    /// The next page's number.
+    next_page: u32,
     index_buffers: Slots<IndexBuffer>,
     textures: Slots<Texture>,
     materials: FastMap<MaterialId, Material>,
@@ -1240,6 +1412,9 @@ impl WgpuBackend {
             sky,
             cloud_layout,
             vertex_buffers: Slots::default(),
+            vertex_pools: FastMap::default(),
+            index_pools: FastMap::default(),
+            next_page: 0,
             index_buffers: Slots::default(),
             textures: Slots::default(),
             materials: FastMap::default(),
@@ -2115,39 +2290,7 @@ impl WgpuBackend {
                     pass.set_bind_group(4, &self.material_records.group, &[0]);
                     material_now = Some(MaterialId(u32::MAX));
                 }
-                if vertices_now != Some(d.vertex_buffer.0) {
-                    let vb = self.vertex_buffers.get(d.vertex_buffer.0)?;
-                    pass.set_vertex_buffer(0, vb.buffer.slice(..));
-                    vertices_now = Some(d.vertex_buffer.0);
-                }
-                match d.geometry {
-                    Geometry::Vertices { first, count } => {
-                        pass.draw(
-                            first..first + count,
-                            d.first_slot..d.first_slot + d.instances,
-                        );
-                    }
-                    Geometry::Indexed {
-                        buffer,
-                        first,
-                        count,
-                        base_vertex,
-                    } => {
-                        if indices_now != Some(buffer.0) {
-                            let ib = self.index_buffers.get(buffer.0)?;
-                            pass.set_index_buffer(
-                                ib.buffer.slice(..),
-                                wgpu_index_format(ib.desc.format),
-                            );
-                            indices_now = Some(buffer.0);
-                        }
-                        pass.draw_indexed(
-                            first..first + count,
-                            base_vertex,
-                            d.first_slot..d.first_slot + d.instances,
-                        );
-                    }
-                }
+                self.draw_geometry(&mut pass, d, &mut vertices_now, &mut indices_now)?;
             }
         }
         Ok(())
@@ -2249,38 +2392,59 @@ impl WgpuBackend {
                 );
                 material_now = Some(d.material);
             }
-            if vertices_now != Some(d.vertex_buffer.0) {
-                let vb = self.vertex_buffers.get(d.vertex_buffer.0)?;
-                pass.set_vertex_buffer(0, vb.buffer.slice(..));
-                vertices_now = Some(d.vertex_buffer.0);
+            self.draw_geometry(&mut pass, d, &mut vertices_now, &mut indices_now)?;
+        }
+        Ok(())
+    }
+
+    /// Draws `d`'s geometry, binding its vertex and index pages if they
+    /// aren't bound already (`vertices_now`, `indices_now`: the pages
+    /// bound).
+    fn draw_geometry(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        d: &RecordedDraw,
+        vertices_now: &mut Option<u32>,
+        indices_now: &mut Option<u32>,
+    ) -> Result<(), BackendError> {
+        let vb = self.vertex_buffers.get(d.vertex_buffer.0)?;
+        if *vertices_now != Some(vb.range.page) {
+            let page = self
+                .vertex_pools
+                .get(&vb.desc.layout.stride().max(1))
+                .and_then(|p| p.buffer(vb.range.page))
+                .ok_or(BackendError::Unsupported("vertex page gone"))?;
+            pass.set_vertex_buffer(0, page.slice(..));
+            *vertices_now = Some(vb.range.page);
+        }
+        let instances = d.first_slot..d.first_slot + d.instances;
+        match d.geometry {
+            Geometry::Vertices { first, count } => {
+                let first = first + vb.base_vertex;
+                pass.draw(first..first + count, instances);
             }
-            match d.geometry {
-                Geometry::Vertices { first, count } => {
-                    pass.draw(
-                        first..first + count,
-                        d.first_slot..d.first_slot + d.instances,
-                    );
+            Geometry::Indexed {
+                buffer,
+                first,
+                count,
+                base_vertex,
+            } => {
+                let ib = self.index_buffers.get(buffer.0)?;
+                if *indices_now != Some(ib.range.page) {
+                    let page = self
+                        .index_pools
+                        .get(&ib.desc.format)
+                        .and_then(|p| p.buffer(ib.range.page))
+                        .ok_or(BackendError::Unsupported("index page gone"))?;
+                    pass.set_index_buffer(page.slice(..), wgpu_index_format(ib.desc.format));
+                    *indices_now = Some(ib.range.page);
                 }
-                Geometry::Indexed {
-                    buffer,
-                    first,
-                    count,
-                    base_vertex,
-                } => {
-                    if indices_now != Some(buffer.0) {
-                        let ib = self.index_buffers.get(buffer.0)?;
-                        pass.set_index_buffer(
-                            ib.buffer.slice(..),
-                            wgpu_index_format(ib.desc.format),
-                        );
-                        indices_now = Some(buffer.0);
-                    }
-                    pass.draw_indexed(
-                        first..first + count,
-                        base_vertex,
-                        d.first_slot..d.first_slot + d.instances,
-                    );
-                }
+                let first = first + ib.first_index;
+                pass.draw_indexed(
+                    first..first + count,
+                    base_vertex + vb.base_vertex as i32,
+                    instances,
+                );
             }
         }
         Ok(())
@@ -2369,39 +2533,7 @@ impl WgpuBackend {
                 );
                 material_now = Some(d.material);
             }
-            if vertices_now != Some(d.vertex_buffer.0) {
-                let vb = self.vertex_buffers.get(d.vertex_buffer.0)?;
-                pass.set_vertex_buffer(0, vb.buffer.slice(..));
-                vertices_now = Some(d.vertex_buffer.0);
-            }
-            match d.geometry {
-                Geometry::Vertices { first, count } => {
-                    pass.draw(
-                        first..first + count,
-                        d.first_slot..d.first_slot + d.instances,
-                    );
-                }
-                Geometry::Indexed {
-                    buffer,
-                    first,
-                    count,
-                    base_vertex,
-                } => {
-                    if indices_now != Some(buffer.0) {
-                        let ib = self.index_buffers.get(buffer.0)?;
-                        pass.set_index_buffer(
-                            ib.buffer.slice(..),
-                            wgpu_index_format(ib.desc.format),
-                        );
-                        indices_now = Some(buffer.0);
-                    }
-                    pass.draw_indexed(
-                        first..first + count,
-                        base_vertex,
-                        d.first_slot..d.first_slot + d.instances,
-                    );
-                }
-            }
+            self.draw_geometry(&mut pass, d, &mut vertices_now, &mut indices_now)?;
         }
         Ok(())
     }
@@ -2745,19 +2877,26 @@ impl RenderBackend for WgpuBackend {
             Some(bytes) => padded(bytes),
             None => vec![0; size.next_multiple_of(4).max(4) as usize].into(),
         };
-        let buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("vertices"),
-                contents: &data,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            });
+        let stride = u64::from(desc.layout.stride().max(1));
+        let pool = self
+            .vertex_pools
+            .entry(stride as u32)
+            .or_insert_with(|| Pool::new(wgpu::BufferUsages::VERTEX));
+        let range = pool.take(
+            &self.device,
+            &mut self.next_page,
+            data.len() as u64,
+            lcm(stride, 4),
+        );
+        let buffer = pool.buffer(range.page).expect("just taken");
+        self.queue.write_buffer(buffer, range.offset, &data);
         let layout = self.layouts.id(&desc.layout);
         Ok(VertexBufferHandle(self.vertex_buffers.insert(
             VertexBuffer {
                 desc: desc.clone(),
                 layout,
-                buffer,
+                range,
+                base_vertex: (range.offset / stride) as u32,
                 bounds: initial.and_then(|b| shadow::bounds(&desc.layout, b)),
             },
         )))
@@ -2781,16 +2920,18 @@ impl RenderBackend for WgpuBackend {
         };
         let mut contents = shadow.clone();
         contents.resize(shadow.len().next_multiple_of(4).max(4), 0);
-        let buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("indices"),
-                contents: &contents,
-                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            });
+        let size = index_bytes(desc.format);
+        let pool = self
+            .index_pools
+            .entry(desc.format)
+            .or_insert_with(|| Pool::new(wgpu::BufferUsages::INDEX));
+        let range = pool.take(&self.device, &mut self.next_page, contents.len() as u64, 4);
+        let buffer = pool.buffer(range.page).expect("just taken");
+        self.queue.write_buffer(buffer, range.offset, &contents);
         Ok(IndexBufferHandle(self.index_buffers.insert(IndexBuffer {
             desc: *desc,
-            buffer,
+            range,
+            first_index: (range.offset / size) as u32,
             shadow,
         })))
     }
@@ -2814,7 +2955,14 @@ impl RenderBackend for WgpuBackend {
         }
         // Its positions may have moved anywhere.
         vb.bounds = None;
-        self.queue.write_buffer(&vb.buffer, offset, data);
+        let stride = vb.desc.layout.stride().max(1);
+        let range = vb.range;
+        let page = self
+            .vertex_pools
+            .get(&stride)
+            .and_then(|p| p.buffer(range.page));
+        let page = page.ok_or(BackendError::Unsupported("vertex page gone"))?;
+        self.queue.write_buffer(page, range.offset + offset, data);
         Ok(())
     }
 
@@ -2836,20 +2984,30 @@ impl RenderBackend for WgpuBackend {
         let stop = end.next_multiple_of(4);
         let mut upload = ib.shadow[start as usize..(stop.min(size)) as usize].to_vec();
         upload.resize((stop - start) as usize, 0);
-        self.queue.write_buffer(&ib.buffer, start, &upload);
+        let (format, range) = (ib.desc.format, ib.range);
+        let page = self
+            .index_pools
+            .get(&format)
+            .and_then(|p| p.buffer(range.page));
+        let page = page.ok_or(BackendError::Unsupported("index page gone"))?;
+        self.queue.write_buffer(page, range.offset + start, &upload);
         Ok(())
     }
 
     fn destroy_vertex_buffer(&mut self, buffer: VertexBufferHandle) -> Result<(), BackendError> {
-        self.vertex_buffers
-            .remove(buffer.0)
-            .map(|b| b.buffer.destroy())
+        let b = self.vertex_buffers.remove(buffer.0)?;
+        if let Some(pool) = self.vertex_pools.get_mut(&b.desc.layout.stride().max(1)) {
+            pool.give(b.range);
+        }
+        Ok(())
     }
 
     fn destroy_index_buffer(&mut self, buffer: IndexBufferHandle) -> Result<(), BackendError> {
-        self.index_buffers
-            .remove(buffer.0)
-            .map(|b| b.buffer.destroy())
+        let b = self.index_buffers.remove(buffer.0)?;
+        if let Some(pool) = self.index_pools.get_mut(&b.desc.format) {
+            pool.give(b.range);
+        }
+        Ok(())
     }
 
     fn create_texture(
@@ -3160,9 +3318,9 @@ impl WgpuBackend {
         }
         GpuMemory {
             vertex_buffers: self.vertex_buffers.live,
-            vertex_bytes: live(&self.vertex_buffers).map(|b| b.buffer.size()).sum(),
+            vertex_bytes: live(&self.vertex_buffers).map(|b| b.range.len).sum(),
             index_buffers: self.index_buffers.live,
-            index_bytes: live(&self.index_buffers).map(|b| b.buffer.size()).sum(),
+            index_bytes: live(&self.index_buffers).map(|b| b.range.len).sum(),
             textures: self.textures.live,
             texture_bytes: live(&self.textures).map(|t| t.bytes).sum(),
             materials: self.materials.len(),
@@ -3517,5 +3675,48 @@ mod material_slot_tests {
         assert_eq!(r.samp[0], 1);
         let r = WgpuBackend::material_uniforms(&MaterialDesc::default(), [0; 8]);
         assert_eq!((r.tex, r.samp[0]), ([0; 4], 0));
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    #[test]
+    fn ranges_are_taken_aligned_and_merge_when_given_back() {
+        let mut f = FreeRanges::new(1000);
+        assert_eq!(f.take(100, 4), Some(0));
+        // Aligned to a 52-byte stride: 100 rounds up to 104.
+        assert_eq!(f.take(52, 52), Some(104));
+        // The 4 bytes the alignment skipped are still free.
+        assert_eq!(f.take(10, 4), Some(156));
+        assert_eq!(f.take(4, 4), Some(100));
+        assert_eq!(f.take(2000, 4), None);
+        f.give(0, 100);
+        f.give(104, 52);
+        f.give(156, 10);
+        assert!(!f.is_empty());
+        f.give(100, 4);
+        assert!(f.is_empty(), "{:?}", f.free);
+    }
+
+    #[test]
+    fn a_freed_hole_is_filled_first() {
+        let mut f = FreeRanges::new(1000);
+        let a = f.take(200, 4).unwrap();
+        let _b = f.take(200, 4).unwrap();
+        f.give(a, 200);
+        assert_eq!(f.take(120, 4), Some(0));
+        assert_eq!(f.take(80, 4), Some(120));
+        assert_eq!(f.take(40, 4), Some(400));
+    }
+
+    #[test]
+    fn strides_align_to_whole_vertices_and_words() {
+        assert_eq!(lcm(52, 4), 52);
+        assert_eq!(lcm(6, 4), 12);
+        assert_eq!(lcm(4, 4), 4);
+        assert_eq!(index_bytes(IndexFormat::U16), 2);
+        assert_eq!(index_bytes(IndexFormat::U32), 4);
     }
 }
