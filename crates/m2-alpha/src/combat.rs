@@ -644,6 +644,11 @@ pub(crate) const BLAST_PUSH: (f32, f32) = (9.0, 6.0);
 /// How hard a rifle round shoves the one it kills, m/s.
 const SHOT_PUSH: f32 = 2.0;
 pub(crate) const REACH: f32 = 9.0;
+
+/// What she loses when the vehicle she is in is wrecked (health): from
+/// footage, the 360 in Xenia (100.1 and 100.5 lost, two runs, the
+/// Phoenix (Racing) with Mattias; [`Combat::her_vehicle_wrecked`]).
+pub(crate) const WRECK_RIDER_DAMAGE: f32 = 100.0;
 /// The satellite-guided bomb's blasts, from the template database's
 /// laser-guided bomb ("Explosion (Airstike Bomb)" 80008e3f, its frag
 /// "Explosion (Airstrike Frag)" 8000a3df, and its final strike 8000af7d
@@ -4141,24 +4146,22 @@ impl Combat {
         }
     }
 
-    /// `damage` done to her from `from`: the health she lost.
-    /// A blast at `at` of `DamageKey` `key` reached her: alive after it,
-    /// she staggers as the 360 has area damage do
-    /// ([`m2_engine::stagger`]: the long stagger, for the explosion keys
-    /// only). The way it travelled is taken as from the blast to her
-    /// (inferred).
-    /// The vehicle she is in was wrecked: she is put out of it, the
-    /// blast at its middle reaches her as on foot (the blasts here pass
-    /// over anyone in a vehicle, [`Combat::explode`]), and it knocks her
-    /// down (playtest 2026-11-14: she sat on unhurt in the burning wreck).
+    /// The vehicle she is in was wrecked: she is put out of it, beside
+    /// it at its door, and loses [`WRECK_RIDER_DAMAGE`]; she is not
+    /// thrown and not knocked down.
     ///
-    /// From the 360 code: a person who dies in a seat is first put out of
-    /// it, as the seat's mode says (0x82287EC0: mode 2 gets out by
-    /// 0x822A1280, then dies by 0x82287F98; 1 dies there as a ragdoll).
-    /// Inferred: that a living rider is put out of a dead vehicle too
-    /// (the vehicle's death, 0x82289F40, was not seen to do it), and the
-    /// blast: an `Explosion` at the vehicle's middle, by her own row of
-    /// the damage table ([`HeroDamage`]).
+    /// From the 360 code: the rider system hears the vehicle's death
+    /// (queue 0x831B21C0, 0x82299918 -> 0x822A5D98) and puts each rider
+    /// of a seat out by 0x822A1280 (deals no damage itself). From
+    /// footage (Xenia, the Phoenix (Racing) wrecked with Mattias in it,
+    /// two runs: one burnt out after crashes, one sunk): she is out
+    /// beside it (1.5 and 1.7 m from the wreck's middle), moved 0.3 m at
+    /// the blast with no throw arc, and lost 100.1 and 100.5 health in
+    /// the sample the car died in. Not established: which code deals the
+    /// 100 (the death 0x82289F40 spawns only the template's
+    /// `SpawnOnDeath`, which the Phoenix has none of), whether it is the
+    /// same for other heroes and vehicles, and whether she is knocked
+    /// down.
     fn her_vehicle_wrecked(&mut self, f: &mut Field<'_>) {
         let Some(i) = f.player.driving else {
             return;
@@ -4171,24 +4174,32 @@ impl Combat {
         };
         let (lo, hi) = v.spec.bounds;
         let middle = body.transform_point3((lo + hi) * 0.5);
-        eprintln!(
-            "wreck: the {} she is in is wrecked: she is thrown out",
-            v.spec.label
-        );
         crate::game::get_out(f.physics, v, None, f.player);
         if f.player.driving.is_some() {
             // Nowhere to put her: as before.
             return;
         }
         self.seat = 0;
-        let key = Some(m2_assets::name_hash("Explosion"));
-        let d = (f.player.character.position + Vec3::Y).distance(middle);
-        let damage = 100.0 * (1.0 - d / REACH).max(0.0);
-        self.tally.taken_blasts +=
-            self.hurt_player(f, damage * self.hero_damage.explosion, Some(middle));
-        Self::blast_staggers_her(f, middle, key);
+        let label = v.spec.label.clone();
+        let lost = self.hurt_player(f, WRECK_RIDER_DAMAGE, Some(middle));
+        self.tally.taken_blasts += lost;
+        let away = f
+            .player
+            .character
+            .position
+            .with_y(0.0)
+            .distance(middle.with_y(0.0));
+        eprintln!(
+            "wreck: the {label} she is in is wrecked: she is put out {away:.1} m from its \
+             middle, {lost:.1} health lost"
+        );
     }
 
+    /// A blast at `at` of `DamageKey` `key` reached her: alive after it,
+    /// she staggers as the 360 has area damage do
+    /// ([`m2_engine::stagger`]: the long stagger, for the explosion keys
+    /// only). The way it travelled is taken as from the blast to her
+    /// (inferred).
     fn blast_staggers_her(f: &mut Field<'_>, at: Vec3, key: Option<u32>) {
         let direction = (f.player.character.position - at).with_y(0.0);
         f.player.stagger(&m2_engine::stagger::Event {
@@ -4199,6 +4210,7 @@ impl Combat {
         });
     }
 
+    /// `damage` done to her from `from`: the health she lost.
     fn hurt_player(&mut self, f: &mut Field<'_>, damage: f32, from: Option<Vec3>) -> f32 {
         if self.down > 0.0 || self.invincible {
             return 0.0;
@@ -8132,7 +8144,7 @@ mod tests {
     }
 
     #[test]
-    fn she_is_thrown_out_of_her_wrecked_vehicle_and_hurt() {
+    fn her_wrecked_vehicle_puts_her_out_beside_it_100_down() {
         use m2_engine::tuning::VehicleTuning;
         let mut physics = ground();
         let dt = 1.0 / 60.0;
@@ -8165,7 +8177,11 @@ mod tests {
         player.driving = Some(0);
         let mut people = People::default();
         let arsenal = Arsenal::default();
-        let mut combat = Combat::default();
+        // Mattias's 120, as measured.
+        let mut combat = Combat {
+            hp: 120.0,
+            ..Combat::default()
+        };
         let full = combat.hp;
         let mut field = Field {
             physics: &mut physics,
@@ -8179,11 +8195,28 @@ mod tests {
         combat.step(&mut field, Trigger::default(), dt);
         assert_eq!(field.player.driving, Some(0));
         assert_eq!(combat.hp, full);
-        // Wrecked: out of it, hurt by its blast.
+        // Wrecked: out of it, beside it (not thrown), 100 down.
         field.vehicles[0].wrecked = true;
         combat.step(&mut field, Trigger::default(), dt);
         assert_eq!(field.player.driving, None);
-        assert!(combat.hp < full, "{} of {full}", combat.hp);
+        assert!(
+            (full - combat.hp - WRECK_RIDER_DAMAGE).abs() < 0.01,
+            "{} of {full}",
+            combat.hp
+        );
+        let middle = field
+            .physics
+            .vehicle_transform(id)
+            .unwrap()
+            .w_axis
+            .truncate();
+        let away = field
+            .player
+            .character
+            .position
+            .with_y(0.0)
+            .distance(middle.with_y(0.0));
+        assert!(away < 4.0, "{away} m from it");
     }
 
     #[test]
