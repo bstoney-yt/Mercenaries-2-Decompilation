@@ -288,6 +288,9 @@ m2-alpha [options]
                          who fights her (faction-check lines); <f>:watch
                          hurts nobody; a picture with the HUD 40 s on
                          (-faction40)
+  --check-node-damage <s> with --mission: <s> seconds into play, the scripts'
+                         vehicle nearest her with node health has a node sent
+                         ObjectState.SendDamage(o, node, 1) (nodedamage lines)
   --honk-every <s>       with --mission: driving, hold the horn half a second
                          every <s> seconds (horn, gate and disguise lines)
   --bash-target <s>      with --mission --after-contract: this long after the
