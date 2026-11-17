@@ -2302,6 +2302,7 @@ fn collect(player: &Player, id: ClipId, m: &Matrix, out: &mut Vec<Triangle>, nes
             colour: [1.0; 4],
             texture: None,
             multiply: false,
+            clamp: false,
         }));
     };
     match c.kind {
@@ -2331,6 +2332,7 @@ fn collect(player: &Player, id: ClipId, m: &Matrix, out: &mut Vec<Triangle>, nes
                 colour: [1.0; 4],
                 texture: None,
                 multiply: false,
+                clamp: false,
             });
         }
     }

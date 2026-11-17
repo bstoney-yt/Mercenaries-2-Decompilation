@@ -407,8 +407,6 @@ pub struct SupportHud {
     pub satellite: Option<(Vec3, f32, f32)>,
     /// The timing wheel.
     pub wheel: Option<WheelHud>,
-    /// Seconds until the bomb on its way lands.
-    pub inbound: Option<f32>,
     /// The PDA is open.
     pub pda: bool,
 }
@@ -1051,7 +1049,6 @@ impl Support {
             ),
             satellite,
             wheel,
-            inbound: self.inbound(),
             pda: self.pda,
         }
     }

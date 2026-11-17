@@ -63,6 +63,9 @@ fn main() -> Result<()> {
                     e.template,
                     e.crew
                 );
+                if let Some(r) = &e.region {
+                    println!("  region corners (x, z) {:?}", r.corners);
+                }
             }
         }
     }
