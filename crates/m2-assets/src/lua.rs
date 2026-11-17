@@ -118,6 +118,10 @@ pub enum NameUse {
     Field,
     /// A constant key read from a global table: `"Global.key"`.
     Member,
+    /// A constant key assigned in a table (`SETTABLE`): a module's
+    /// function (`function Mission.Start`) or an object's field
+    /// (`self.TimerEvent = ...`).
+    SetField,
 }
 
 struct Layout {
@@ -392,7 +396,8 @@ impl Function {
     }
 
     /// The names this function and its nested functions use: globals read
-    /// and written, and constant keys indexed or called as methods. A key
+    /// and written, constant keys indexed or called as methods, and
+    /// constant keys assigned. A key
     /// read from a register just loaded from a global comes back as
     /// [`NameUse::Member`] `"Global.key"`, so library calls such as
     /// `Objective.Add` read whole.
@@ -442,6 +447,16 @@ impl Function {
                     7 => {
                         if let Some(n) = f.constant_name(bx) {
                             out.push((NameUse::SetGlobal, n.to_owned()));
+                        }
+                    }
+                    // SETTABLE (9 in both): R(A)[RK(B)] = RK(C).
+                    9 => {
+                        let key = match version {
+                            Version::Lua51 => (b & 0x100 != 0).then_some((b & 0xff) as usize),
+                            Version::Lua50 => (b >= 250).then(|| (b - 250) as usize),
+                        };
+                        if let Some(n) = key.and_then(|k| f.constant_name(k)) {
+                            out.push((NameUse::SetField, n.to_owned()));
                         }
                     }
                     6 | 11 => {
@@ -867,6 +882,7 @@ mod tests {
             (NameUse::GetGlobal, "Objective_Add"),
             (NameUse::Member, "Hud.Show"),
             (NameUse::Field, "SetTimer"),
+            (NameUse::SetField, "Start"),
         ] {
             assert!(
                 names.iter().any(|(u, n)| *u == want.0 && n == want.1),

@@ -12,7 +12,7 @@
 //! and a readable account of the session in [`Mission::take_log`].
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
@@ -33,6 +33,10 @@ use crate::layers::{LayerOp, LayerState, finished, layer_name};
 use crate::library::{KNOWN_MODULES, LOADERS, Library};
 use crate::object_hooks::{ON_DEATH, ON_STATE_CHANGE, death_args, state_change_args};
 use crate::script::{ScriptError, ScriptHost};
+
+mod ammo;
+mod homing;
+pub use homing::{ANTI_AIR, HOMING_MISSILE, HomingKind, HomingPost};
 
 /// The script that starts the game (`Init`, then `LoadGame`).
 pub const BOOTSTRAP: u32 = 0xb442_0059;
@@ -354,9 +358,16 @@ pub struct GameData {
     /// The layers' `PhysicalLink` records by parent entity: (link name
     /// hash, child entity) ([`crate::links::physical_links`]).
     pub physical_links: HashMap<u32, Vec<(u32, u32)>>,
+    /// The child templates spawned with a template, by its name in lower
+    /// case: (link name hash, child template)
+    /// ([`crate::links::template_children`]).
+    pub template_children: HashMap<String, Vec<(u32, String)>>,
     /// Templates' `CashValue` (`Object.GetCashValue`) by the template's
     /// name in lower case.
     pub template_cash: HashMap<String, i32>,
+    /// Templates' `NodeHealth` records by name in lower case
+    /// ([`crate::node_damage::template_nodes`]).
+    pub template_nodes: HashMap<String, Vec<m2_engine::node_health::NodeRecord>>,
     /// Every template's name in the template database, in lower case:
     /// the names scripts look templates up by (`Pg.GetGuidByName("OC")`).
     pub template_names: std::collections::HashSet<String>,
@@ -473,6 +484,8 @@ impl GameData {
                 {
                     template_labels = labels_of(db.component("Label"));
                     data.template_cash = crate::cash::template_cash(&db);
+                    data.template_children = crate::links::template_children(&db);
+                    data.template_nodes = crate::node_damage::template_nodes(&db);
                     template_scripts = db.hashes("ObjectScript");
                     template_script_data = script_data(&db);
                     template_alarms = carriers(&db, "Alarm");
@@ -741,7 +754,9 @@ impl Mission {
             template_labels,
             template_scripts,
             physical_links,
+            template_children,
             template_cash,
+            template_nodes,
             template_names,
             template_drivers,
             template_passengers,
@@ -771,7 +786,9 @@ impl Mission {
                 .map(|(a, b, r)| ((a.to_ascii_lowercase(), b.to_ascii_lowercase()), r))
                 .collect();
             w.physical_links = physical_links;
+            w.template_children = template_children;
             w.template_cash = template_cash;
+            w.template_nodes = template_nodes;
             w.template_names = template_names;
             w.template_drivers = template_drivers;
             w.template_passengers = template_passengers;
@@ -815,14 +832,12 @@ impl Mission {
 
         let host = ScriptHost::new()?;
         host.stub_missing_globals()?;
-        host.script_names(library.scripts().iter().flat_map(|s| {
-            s.chunk
-                .main
-                .names(s.chunk.version)
-                .into_iter()
-                .filter(|(u, _)| *u == m2_assets::lua::NameUse::SetGlobal)
-                .map(|(_, n)| n)
-        }))?;
+        host.script_names(script_defined(
+            library
+                .scripts()
+                .iter()
+                .flat_map(|s| s.chunk.main.names(s.chunk.version)),
+        ))?;
         api::install(host.lua(), &world)?;
         host.complete_libraries(&api::LIBRARIES)?;
         let events = Events::default();
@@ -2034,6 +2049,8 @@ impl Mission {
             g
         };
         self.call_manager("OnActivate", guid, owner);
+        // What its template spawns with it: the beacon's light.
+        self.spawn_children(guid, what, at);
         guid
     }
 
@@ -2049,6 +2066,7 @@ impl Mission {
             }
             w.strikes.designators.get(&guid).copied()
         };
+        self.ammo_moved(guid, at);
         if let Some(owner) = owner {
             self.call_manager("OnTimer", guid, owner);
         }
@@ -2236,6 +2254,39 @@ impl Mission {
         }
     }
 
+    /// Makes world object `guid` (an island tree of the tree table,
+    /// which no layer places for the scripts) an object of the scripts'
+    /// with its template's `ObjectScript`, at `at`, and runs its
+    /// `OnActivate`, as a spawned object of template `template` is: false
+    /// if the template has no script the port runs. One already there is
+    /// left as it is (true).
+    pub fn adopt_scripted(&mut self, guid: u32, template: &str, at: [f32; 3]) -> bool {
+        let template = template.to_ascii_lowercase();
+        let record = {
+            let mut w = self.world.borrow_mut();
+            if w.objects.contains_key(&guid) {
+                return true;
+            }
+            let Some(&(script, data)) = w.template_scripts.get(&template) else {
+                return false;
+            };
+            if !OBJECT_SCRIPTS.iter().any(|(_, h)| *h == script) {
+                return false;
+            }
+            // In play where she is (it was just destroyed before her), so
+            // awake: what `Event.ObjectIsReady` waits for (inferred).
+            let mut o = Object::new(&template, at);
+            o.awake = true;
+            w.insert(guid, o);
+            w.scripted.insert(guid, script);
+            (script, data)
+        };
+        if let Some(Err(e)) = object_script(self.host.lua(), record.0, true, guid, record.1) {
+            self.log.push(format!("  {e} {template}"));
+        }
+        true
+    }
+
     /// One of object `guid`'s state machines (`machine`, its name's hash)
     /// went to another state (`state`, its name's hash): its object
     /// script's `OnStateChange` hears of it. To be called only when the
@@ -2383,6 +2434,16 @@ return true
     /// unless told).
     pub fn set_subtitles(&mut self, on: bool) {
         self.world.borrow_mut().subtitles_off = !on;
+    }
+
+    /// The player's inverted Y, rumble and autosave options, as the
+    /// natives read them from the profile (`Sys.YAxisInverted`,
+    /// `Sys.RumbleEnabled`, `Sys.IsAutosaveEnabled`).
+    pub fn set_profile_options(&mut self, invert_y: bool, rumble: bool, autosave: bool) {
+        self.world
+            .borrow_mut()
+            .sys_flags
+            .set_profile(invert_y, rumble, autosave);
     }
 
     /// Whether the player has the tutorial tips on
@@ -3163,7 +3224,11 @@ fn seat_crew(
 /// `repairpad` is the script of the helipads and the PMC's garage
 /// (0xcd561a19): awake, its lights are on (`Vehicle.SetParts` of
 /// `LightFront`), and they go out when it dies.
-pub const OBJECT_SCRIPTS: [(&str, u32); 14] = [
+///
+/// `C4` and `beacon` are the scripts of her stuck C4 and of the Beacon
+/// Designator's beacon light: they blink and, a second on, beep until
+/// they go ([`Mission::ammo_spawned`]).
+pub const OBJECT_SCRIPTS: [(&str, u32); 23] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3178,6 +3243,32 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 14] = [
     ("pmcgate", PMC_GATE),
     ("repairpad", REPAIR_PAD),
     ("pursuitcopter", PURSUIT_COPTER),
+    ("AntiAir", homing::ANTI_AIR),
+    ("HomingMissile", homing::HOMING_MISSILE),
+    ("C4", ammo::C4),
+    ("beacon", ammo::BEACON),
+    ("tree_2dc6b6ed", TREE_SCRIPTS[0]),
+    ("tree_e16dfae5", TREE_SCRIPTS[1]),
+    ("tree_396840f6", TREE_SCRIPTS[2]),
+    ("tree_6d5311e5", TREE_SCRIPTS[3]),
+    ("tree_bb6fc961", TREE_SCRIPTS[4]),
+];
+
+/// The trees' object scripts, unnamed in the archives (so named here
+/// `tree_` and their hash): the palms' (`2dc6b6ed`), the plaza and jungle
+/// trees' (`e16dfae5`, 34 placed), the plaza tree's (`6d5311e5`) and the
+/// canopies' (`396840f6`, `bb6fc961`). From samples (their Lua): on
+/// `OnStateChange` to `FireDebrisState` or `FireDestroyedState` each waits
+/// for the object to be ready (`Event.ObjectIsReady`) and plays its burnt
+/// material animation once (`Object.PlayMaterialAnimation`), the palms'
+/// `global_env_treepalm_anim`, the plaza tree's
+/// `global_env_treeplaza03_anim` and so on.
+pub const TREE_SCRIPTS: [u32; 5] = [
+    0x2dc6_b6ed,
+    0xe16d_fae5,
+    0x3968_40f6,
+    0x6d53_11e5,
+    0xbb6f_c961,
 ];
 
 /// `pursuitcopter`'s module hash.
@@ -3302,6 +3393,15 @@ fn object_script(
 ) -> Option<Result<(), String>> {
     let (module, _) = OBJECT_SCRIPTS.iter().find(|(_, s)| *s == script)?;
     let call = if load { "OnActivate" } else { "OnDeactivate" };
+    // A script defining no such hook (the trees' have only
+    // `OnStateChange`) has nothing to run.
+    let module_table = lua.globals().get::<mlua::Table>(*module).ok();
+    if module_table
+        .as_ref()
+        .is_some_and(|m| matches!(m.get::<mlua::Value>(call), Ok(mlua::Value::Nil)))
+    {
+        return None;
+    }
     Some(
         lua.globals()
             .get::<mlua::Table>(*module)
@@ -3309,6 +3409,36 @@ fn object_script(
             .and_then(|f| f.call::<()>((crate::events::guid_value(guid), mlua::Value::Nil, data)))
             .map_err(|err| format!("{module}.{call}: {}", first_lines(&err.to_string()))),
     )
+}
+
+/// The names the scripts define themselves, which read nil rather than a
+/// stub while unset ([`ScriptHost::script_names`]): those they assign as
+/// globals, and the keys they assign in tables that no script reads as a
+/// global. An object's field the scripts set only on some objects
+/// (`HomingMissile`'s `self.TimerEvent`) falls back through its class to
+/// the globals when unset; there it must read nil, as on the 360, or the
+/// script takes it as set.
+fn script_defined(
+    names: impl IntoIterator<Item = (m2_assets::lua::NameUse, String)>,
+) -> BTreeSet<String> {
+    use m2_assets::lua::NameUse;
+    let (mut globals, mut fields, mut read) = (BTreeSet::new(), BTreeSet::new(), HashSet::new());
+    for (u, n) in names {
+        match u {
+            NameUse::SetGlobal => {
+                globals.insert(n);
+            }
+            NameUse::SetField => {
+                fields.insert(n);
+            }
+            NameUse::GetGlobal => {
+                read.insert(n);
+            }
+            _ => {}
+        }
+    }
+    globals.extend(fields.into_iter().filter(|n| !read.contains(n)));
+    globals
 }
 
 /// The first lines of a (Lua) error, on one line.
@@ -3328,10 +3458,78 @@ pub(crate) fn is_exclusion(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    // A key set only in tables reads nil as a global unless some script
+    // reads it as one (then it may be a library not written yet).
+    #[test]
+    fn fields_set_in_tables_are_script_names() {
+        use m2_assets::lua::NameUse::*;
+        let names = script_defined([
+            (SetGlobal, "Init".to_owned()),
+            (SetField, "TimerEvent".to_owned()),
+            (SetField, "Marker".to_owned()),
+            (GetGlobal, "Marker".to_owned()),
+            (Field, "AddObjective".to_owned()),
+        ]);
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            ["Init", "TimerEvent"]
+        );
+    }
+
+    /// An island tree no layer places becomes an object of its template's
+    /// script as it burns, which then hears its states: the palms' script
+    /// plays its burnt material animation on `FireDebrisState`.
+    #[test]
+    fn a_burning_tree_runs_its_templates_script() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        m.world
+            .borrow_mut()
+            .template_scripts
+            .insert("_global_env_palmtree01".into(), (TREE_SCRIPTS[0], None));
+        m.lua()
+            .load(
+                r#"
+                tree_2dc6b6ed = {
+                    OnActivate = function(g) activated = g end,
+                    OnStateChange = function(g, machine, state)
+                        if state == String.GetHash("FireDebrisState") then
+                            Event.Create(Event.ObjectIsReady, { g }, function()
+                                Object.PlayMaterialAnimation(g, "global_env_treepalm_anim", false)
+                            end, {})
+                        end
+                    end,
+                }
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let tree = 0xf001_0002;
+        assert!(!m.adopt_scripted(tree, "_global_env_nothing", [0.0; 3]));
+        assert!(m.adopt_scripted(tree, "_GLOBAL_ENV_PALMTREE01", [1.0, 2.0, 3.0]));
+        assert_eq!(
+            m.lua().globals().get::<Value>("activated").unwrap(),
+            crate::events::guid_value(tree)
+        );
+        m.take_commands();
+        m.object_state_changed(tree, 0, 0x4c88_281b);
+        m.tick(0.25);
+        m.tick(0.25);
+        let played = m.take_commands().into_iter().any(|c| {
+            matches!(c, Command::MaterialAnimation { guid, ref name, looped: false }
+                if guid == tree && name == "global_env_treepalm_anim")
+        });
+        assert!(played);
+    }
+
     #[test]
     fn the_object_scripts_are_named_by_their_hash() {
+        // Unnamed in the archives: named by their hash.
         for (name, hash) in OBJECT_SCRIPTS {
-            assert_eq!(name_hash(name), hash, "{name}");
+            if name.starts_with("tree_") {
+                assert_eq!(name, format!("tree_{hash:08x}"));
+            } else {
+                assert_eq!(name_hash(name), hash, "{name}");
+            }
         }
     }
 

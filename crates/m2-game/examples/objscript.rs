@@ -11,15 +11,22 @@
 //! on a winch, lets it go and destroys it, printing the marker count
 //! after each. For `collectable` it stands her beside the first one and
 //! takes its context action; for `pmcgate` and `repairpad` it counts
-//! what they ask of the first one. Prints names, counts and the scripts'
-//! errors only.
+//! what they ask of the first one. For `AntiAir` it spawns a crewed
+//! `M113 AA (VZ) (Driver)` where the first stands, comes near it, has it
+//! lock on her and fire, and counts the radar calls the scripts make
+//! (`antiair:` lines). For `C4` and `beacon` it throws one (`C4
+//! Projectile`, `ammo_designator_beacon`), leaves it 3 s and takes it
+//! away, printing what the scripts ask of it (`thrown:` lines).
+//! For a `tree_` script it makes an island tree of a template that runs
+//! it, burns it down and prints the material animations it plays. Prints
+//! names, counts and the scripts' errors only.
 
 use std::fs::File;
 use std::io::BufReader;
 
 use m2_assets::WadArchive;
 use m2_game::api::Command;
-use m2_game::mission::{GameData, Mission, OBJECT_SCRIPTS};
+use m2_game::mission::{GameData, HomingKind, HomingPost, Mission, OBJECT_SCRIPTS};
 use m2_game::vehicle_state::VehicleCommand;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -121,6 +128,50 @@ fn main() -> Result<()> {
             alive(&mission)
         );
     }
+    if name.starts_with("tree_") {
+        // An island tree of a template that runs it, burnt down: what
+        // its script plays.
+        let template = mission
+            .world()
+            .borrow()
+            .template_scripts
+            .iter()
+            .find(|(_, (s, _))| s == hash)
+            .map(|(t, _)| t.clone());
+        println!("a template that runs it: {template:?}");
+        if let Some(template) = template {
+            let tree = 0xf001_0002;
+            mission.put_player([3.0, 0.0, 0.0]);
+            let adopted = mission.adopt_scripted(tree, &template, [0.0; 3]);
+            // As a burnt tree's part machines go (`m2_engine::part_runner`):
+            // a palm's trunk, then a canopy's crown, `Slice00`.
+            let trunk = 0x501d_5fd7; // the palm's trunk part's node
+            let crown = m2_assets::name_hash("Slice00");
+            for (machine, state) in [
+                (trunk, 0x0753_c8f7),
+                (trunk, 0x0046_41a5),
+                (crown, 0x3cc4_e770),
+                (crown, 0x0753_c8f7),
+            ] {
+                mission.object_state_changed(tree, machine, state);
+            }
+            let mut played = Vec::new();
+            for _ in 0..8 {
+                mission.tick(0.25);
+                for c in mission.take_commands() {
+                    if let Command::MaterialAnimation { name, looped, .. } = c {
+                        played.push((name, looped));
+                    }
+                }
+            }
+            println!("adopted {adopted}; burnt down, it plays {played:?}");
+        }
+    }
+    if name.eq_ignore_ascii_case("AntiAir")
+        && let Some(&(_, _, at)) = on.first()
+    {
+        antiair(&mut mission, at, &mut run)?;
+    }
     if ["pmcgate", "repairpad"].contains(&name.to_ascii_lowercase().as_str())
         && let Some(&(_, first, at)) = on.first()
     {
@@ -192,6 +243,175 @@ fn main() -> Result<()> {
             println!("{s}");
         }
     }
+    if ["c4", "beacon"].contains(&name.to_ascii_lowercase().as_str()) {
+        thrown(&mut mission, name);
+    }
     println!("{name} lines logged: {failures}");
+    Ok(())
+}
+
+/// `C4` and `beacon`: thrown as she throws them (`C4 Projectile`; the
+/// Beacon Designator's `ammo_designator_beacon`, whose light runs
+/// `beacon`), left lying 3 s, then gone. Prints, per object the scripts
+/// spoke to, what they asked for and when (`thrown:` lines), and the
+/// scripts' errors.
+fn thrown(mission: &mut Mission, name: &str) {
+    let template = if name.eq_ignore_ascii_case("c4") {
+        "C4 Projectile"
+    } else {
+        "ammo_designator_beacon"
+    };
+    mission.take_commands();
+    let start = mission.now();
+    let at = [100.0, 0.0, 100.0];
+    // C4 leaves her hand as itself; the beacon as her designator, the
+    // support manager's object (`m2-alpha`'s two paths).
+    let g = if template == "C4 Projectile" {
+        mission.ammo_spawned(template, at)
+    } else {
+        mission.designator_thrown(m2_game::mission::PLAYER, template, at)
+    };
+    let family: Vec<u32> = std::iter::once(g)
+        .chain(mission.world().borrow().links.children(g))
+        .collect();
+    for c in &family {
+        let o = mission
+            .world()
+            .borrow()
+            .objects
+            .get(c)
+            .map(|o| o.name.clone());
+        println!("thrown: {c:#x} {}", o.unwrap_or_default());
+    }
+    let mut lines = Vec::new();
+    let note = |m: &mut Mission, lines: &mut Vec<String>| {
+        let t = m.now() - start;
+        for c in m.take_commands() {
+            let line = match &c {
+                Command::MaterialAnimation { guid, name, looped } if family.contains(guid) => {
+                    format!("animation {name} looped {looped} on {guid:#x}")
+                }
+                Command::CueSound { at: Some(g), cue } if family.contains(g) => {
+                    format!("cue {cue} on {g:#x}")
+                }
+                Command::StopSound { at: Some(g), cue } if family.contains(g) => {
+                    format!("stop {cue} on {g:#x}")
+                }
+                Command::Ported(p) if format!("{p:?}").contains("StopMaterialAnimation") => {
+                    format!("{p:?}")
+                }
+                _ => continue,
+            };
+            lines.push(format!("thrown: t={t:.2} {line}"));
+        }
+        for l in m.take_log() {
+            lines.push(format!("thrown: log {l}"));
+        }
+    };
+    note(mission, &mut lines);
+    for _ in 0..12 {
+        mission.tick(0.25);
+        note(mission, &mut lines);
+    }
+    mission.ammo_gone(g);
+    for _ in 0..4 {
+        mission.tick(0.25);
+        note(mission, &mut lines);
+    }
+    let left = family
+        .iter()
+        .filter(|c| mission.world().borrow().objects.contains_key(c))
+        .count();
+    lines.push(format!("thrown: objects left after it went: {left}"));
+    for l in lines {
+        println!("{l}");
+    }
+}
+
+/// `AntiAir`: a crewed one (the layers' have no driver here, and only a
+/// hostile driver's is blipped: its other colours are `false`) with a VZ
+/// crew hostile to the PMC; she comes inside its `nAARange`; it locks on
+/// her for two seconds (`HomingLockUpdate` every 0.25 s, the share rising
+/// to 1); it fires a missile, which bursts after a second. Counts the
+/// scripts' `Hud.Radar:AddObjective` / `RemoveObjective` calls by blip
+/// (the game's own `MrxGuiInterface` takes them on to the HUD's widget,
+/// which is not run here).
+fn antiair(
+    mission: &mut Mission,
+    at: [f32; 3],
+    run: &mut impl FnMut(&mut Mission, f64),
+) -> Result<()> {
+    let aa = mission
+        .spawn("M113 AA (VZ) (Driver)", at)
+        .ok_or("no M113 AA (VZ) (Driver)")?;
+    let crew: Vec<u32> = mission
+        .world()
+        .borrow()
+        .objects
+        .iter()
+        .filter(|(_, o)| o.vehicle == Some(aa))
+        .map(|(g, _)| *g)
+        .collect();
+    for g in crew {
+        if let Some(o) = mission.world().borrow_mut().objects.get_mut(&g) {
+            o.faction = Some(m2_assets::name_hash("VZ"));
+        }
+    }
+    mission.run(
+        "Ai.SetRelation('VZ', 'PMC', -100)
+        __radar = {}
+        local function note(t, what)
+            local k = tostring(t.sName)
+            __radar[k] = (__radar[k] or '') .. what
+        end
+        local add, remove = Hud.Radar.AddObjective, Hud.Radar.RemoveObjective
+        Hud.Radar.AddObjective = function(s, t)
+            note(t, t.nR == 255 and t.nG == 255 and t.nB == 255 and 'F' or 'A')
+            return add(s, t)
+        end
+        Hud.Radar.RemoveObjective = function(s, t) note(t, 'R') return remove(s, t) end",
+        "antiair-check",
+    )?;
+    // The calls on a blip so far: A added in its colour, F in its flash
+    // colour (white), R removed.
+    let calls = |m: &Mission, g: u32| -> String {
+        m.lua()
+            .load("return __radar[tostring(...)] or ''")
+            .call::<String>(m2_game::events::guid_value(g))
+            .unwrap_or_default()
+    };
+    mission.put_player([at[0] + 30.0, at[1], at[2]]);
+    run(mission, 3.0);
+    println!(
+        "antiair: radar calls on it beside it: {:?}",
+        calls(mission, aa)
+    );
+    let post = |kind, ammo| HomingPost {
+        kind,
+        player: 1,
+        owner: aa,
+        vehicle: Some(aa),
+        ammo,
+    };
+    let mut ok = mission.homing_post(post(HomingKind::Start, None));
+    for step in 1..=8 {
+        ok &= mission.homing_post(post(HomingKind::Update(step as f32 / 8.0), None));
+        run(mission, 0.25);
+    }
+    println!(
+        "antiair: lock posts ran {ok}; radar calls on it: {:?}",
+        calls(mission, aa)
+    );
+    let round = mission.homing_round("AA Missile", [at[0], at[1] + 3.0, at[2]]);
+    ok = mission.homing_post(post(HomingKind::Clear, None));
+    ok &= mission.homing_post(post(HomingKind::Launched, Some(round)));
+    run(mission, 1.0);
+    println!(
+        "antiair: launch posts ran {ok}; radar calls on the missile: {:?}",
+        calls(mission, round)
+    );
+    mission.round_gone(round);
+    run(mission, 0.5);
+    println!("antiair: once it burst: {:?}", calls(mission, round));
     Ok(())
 }

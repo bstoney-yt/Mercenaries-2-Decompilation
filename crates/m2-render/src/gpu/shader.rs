@@ -175,6 +175,17 @@ struct Draw {
     uv: vec4<f32>,
     // Multiplies the surface's colour and alpha (a marker model's colour)
     tint: vec4<f32>,
+    // In place of the material's direct light colour, when w is 1
+    direct: vec4<f32>,
+    // In place of the material's highlight colour, when w is 1
+    specular: vec4<f32>,
+    // In place of the material's ambient and emitted colours, when w is 1
+    ambient: vec4<f32>,
+    emissive: vec4<f32>,
+    // The texture coordinates' transform, two rows over (u, v, 1), when
+    // the first's w is 1
+    uv_u: vec4<f32>,
+    uv_v: vec4<f32>,
 };
 
 struct Material {
@@ -250,10 +261,34 @@ struct Varyings {
     @location(6) tint: vec4<f32>,
     // Its beams shine whatever the hour (see `Draw`)
     @location(7) @interpolate(flat) beams_lit: f32,
+    // The draw's material values in place of its material's (see `Draw`)
+    @location(8) @interpolate(flat) over_direct: vec4<f32>,
+    @location(9) @interpolate(flat) over_specular: vec4<f32>,
+    // Negative: the material's own
+    @location(10) @interpolate(flat) over_opacity: f32,
+    @location(11) @interpolate(flat) over_ambient: vec4<f32>,
+    @location(12) @interpolate(flat) over_emissive: vec4<f32>,
 };
 "#;
 
 const FRAGMENT: &str = r#"
+// The material's direct light colour, highlight colour and opacity, or
+// the draw's in their place (a material animation's).
+fn surface_direct(v: Varyings) -> vec3<f32> {
+    return select(material.direct.rgb, v.over_direct.rgb, v.over_direct.w > 0.5);
+}
+fn surface_specular(v: Varyings) -> vec3<f32> {
+    return select(material.specular.rgb, v.over_specular.rgb, v.over_specular.w > 0.5);
+}
+fn surface_ambient(v: Varyings) -> vec3<f32> {
+    return select(material.ambient.rgb, v.over_ambient.rgb, v.over_ambient.w > 0.5);
+}
+fn surface_emissive(v: Varyings) -> vec3<f32> {
+    return select(material.emissive.rgb, v.over_emissive.rgb, v.over_emissive.w > 0.5);
+}
+fn surface_opacity(v: Varyings) -> f32 {
+    return select(material.color.a, v.over_opacity, v.over_opacity >= 0.0);
+}
 // The game's ambient cube: each axis's face, picked by the normal's sign,
 // weighted by that component squared.
 fn ambient_light(n: vec3<f32>) -> vec3<f32> {
@@ -715,7 +750,7 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
     let drift = vec2<f32>(0.021, 0.013) * frame.view_dir.w;
     let base_uv = select(v.uv, v.world_pos.xz * 0.15 + drift, water);
     let base_texel = textureSample(base_map, base_sampler, base_uv);
-    var base = select(base_texel, vec4<f32>(1.0), water) * material.color;
+    var base = select(base_texel, vec4<f32>(1.0), water) * vec4<f32>(material.color.rgb, surface_opacity(v));
     let ao = material.params.z > 0.5 && !ground;
     if ao {
         base.a = base.a * v.color.a;
@@ -799,8 +834,8 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
         // display values when surfaces are lit so), each scaled by the
         // material's diffuse and ambient colours.
         let light = light_from_display(
-            light_to_display(surface_sun()) * (max(dot(n, l), 0.0) * shade) * material.direct.rgb
-                + ambient_display(n) * material.ambient.rgb,
+            light_to_display(surface_sun()) * (max(dot(n, l), 0.0) * shade) * surface_direct(v)
+                + ambient_display(n) * surface_ambient(v),
         );
         let shallow = vec3<f32>(0.09, 0.30, 0.34);
         var body = mix(shallow, base.rgb, 1.0 - exp(-depth / 5.0)) * light;
@@ -826,7 +861,7 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
         let h = normalize(l + view);
         let sun = select(surface_sun(), frame.sun_color.rgb, frame.sky_fit.w > 0.5);
         let glint = select(0.0, 1.0, dot(n, l) > 0.0) * sun * shade
-            * pow(max(dot(n, h), 0.0), power) * material.specular.rgb * frame.glint_fit.x;
+            * pow(max(dot(n, h), 0.0), power) * surface_specular(v) * frame.glint_fit.x;
         body = body + glint;
         // Schlick's Fresnel from the material's reflectance facing the
         // eye, times its reflection strength, mixes in the sky mirrored.
@@ -910,7 +945,7 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
             // The point lights past the clamp: the game's shaders sum them
             // unclamped (an explosion's flash, 12 times white, blows out).
             let direct = clamp(sun, vec3<f32>(0.0), vec3<f32>(1.0)) + points;
-            lit = rgb * light_from_display(direct * material.direct.rgb + ambient_display(n) * material.ambient.rgb);
+            lit = rgb * light_from_display(direct * surface_direct(v) + ambient_display(n) * surface_ambient(v));
         }
         var tint = vec3<f32>(1.0);
         if material.maps.x > 0.5 {
@@ -921,7 +956,7 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
             let h = normalize(l + view);
             let n_dot_h = dot(n, h);
             if n_dot_h > 0.0 {
-                spec_light = surface_sun() * material.specular.rgb * tint * pow(n_dot_h, material.specular.a) * max(shade, 0.25);
+                spec_light = surface_sun() * surface_specular(v) * tint * pow(n_dot_h, material.specular.a) * max(shade, 0.25);
             }
         }
         shine = spec_light;
@@ -942,7 +977,7 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
     }
     rgb = rgb + shine;
     // Light the surface gives off, on top of what it reflects.
-    var glow = material.emissive.rgb;
+    var glow = surface_emissive(v);
     if material.emissive.w > 0.5 {
         glow = glow * spec_texel;
     }
@@ -1021,7 +1056,7 @@ fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
 // out as they cut themselves.
 @fragment
 fn fs_shadow(v: Varyings) {
-    var a = textureSample(base_map, base_sampler, v.uv).a * material.color.a;
+    var a = textureSample(base_map, base_sampler, v.uv).a * surface_opacity(v);
     if material.params.z > 0.5 && material.maps.w < 0.5 {
         a = a * v.color.a;
     }
@@ -1226,12 +1261,22 @@ fn place(v: VertexIn, instance: u32) -> Varyings {{
     out.clip = frame.view_proj * world;
     out.world_pos = world.xyz;
     out.normal = (model * vec4<f32>(normal, 0.0)).xyz;
-    out.uv = {uv} + draw.uv.xy;
+    let base_uv = {uv};
+    let moved_uv = vec2<f32>(
+        dot(draw.uv_u.xyz, vec3<f32>(base_uv, 1.0)),
+        dot(draw.uv_v.xyz, vec3<f32>(base_uv, 1.0)),
+    );
+    out.uv = select(base_uv, moved_uv, draw.uv_u.w > 0.5) + draw.uv.xy;
     out.color = {color};
     out.tangent = vec4<f32>((model * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w);
     out.haze = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     out.tint = draw.tint;
     out.beams_lit = draw.uv.z;
+    out.over_direct = draw.direct;
+    out.over_specular = draw.specular;
+    out.over_opacity = draw.uv.w;
+    out.over_ambient = draw.ambient;
+    out.over_emissive = draw.emissive;
     return out;
 }}
 
