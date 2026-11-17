@@ -645,9 +645,13 @@ pub(crate) const BLAST_PUSH: (f32, f32) = (9.0, 6.0);
 const SHOT_PUSH: f32 = 2.0;
 pub(crate) const REACH: f32 = 9.0;
 
-/// What she loses when the vehicle she is in is wrecked (health): from
-/// footage, the 360 in Xenia (100.1 and 100.5 lost, two runs, the
-/// Phoenix (Racing) with Mattias; [`Combat::her_vehicle_wrecked`]).
+/// What she loses when the vehicle she sits in is wrecked (health). From
+/// the 360 code: the rider system, putting a seated rider out of a dead
+/// vehicle (0x822A5D98, rider state 0), posts the player's character a
+/// damage message of 100.0 (0x820D9F18) on the damage queue 0x8318C480
+/// (other riders are killed instead, 0x831AD128). Footage agrees (Xenia,
+/// the Phoenix (Racing) with Mattias burnt out: 100.1 and 100.5 lost);
+/// [`Combat::her_vehicle_wrecked`].
 pub(crate) const WRECK_RIDER_DAMAGE: f32 = 100.0;
 /// The satellite-guided bomb's blasts, from the template database's
 /// laser-guided bomb ("Explosion (Airstike Bomb)" 80008e3f, its frag
@@ -4151,17 +4155,18 @@ impl Combat {
     /// thrown and not knocked down.
     ///
     /// From the 360 code: the rider system hears the vehicle's death
-    /// (queue 0x831B21C0, 0x82299918 -> 0x822A5D98) and puts each rider
-    /// of a seat out by 0x822A1280 (deals no damage itself). From
-    /// footage (Xenia, the Phoenix (Racing) wrecked with Mattias in it,
-    /// two runs: one burnt out after crashes, one sunk): she is out
-    /// beside it (1.5 and 1.7 m from the wreck's middle), moved 0.3 m at
-    /// the blast with no throw arc, and lost 100.1 and 100.5 health in
-    /// the sample the car died in. Not established: which code deals the
-    /// 100 (the death 0x82289F40 spawns only the template's
-    /// `SpawnOnDeath`, which the Phoenix has none of), whether it is the
-    /// same for other heroes and vehicles, and whether she is knocked
-    /// down.
+    /// (queue 0x831B21C0, 0x82299918 -> 0x822A5D98); a rider seated
+    /// (state 0) is put out by 0x822A1280 and, the player's character,
+    /// takes 100.0 (0x820D9F18) as a damage message. From footage
+    /// (Xenia, a car that burnt out with Mattias in it, two runs): out
+    /// beside it, 1.5 and 1.7 m from its middle, no throw, 100.1 and 100.5
+    /// lost. Not established: a car wrecked at once by a crash threw her
+    /// 7.5 to 11 m clear with no such loss there (Xenia round 2), as if
+    /// she were no longer seated when it died (rider state other than 0:
+    /// 0x822A5D98 then only puts her out, 0x822A3758 for state 1); what
+    /// takes her out of the seat in that crash, and the throw, are not
+    /// traced (the seat's `TossSpeedChange`, default -1, and
+    /// `MinDitchSpeed`, 5, reflected at 0x823F1988, are leads).
     fn her_vehicle_wrecked(&mut self, f: &mut Field<'_>) {
         let Some(i) = f.player.driving else {
             return;
