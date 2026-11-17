@@ -43,6 +43,8 @@ Route files are one step per line (`#` comments):
     healthlog start [<name>] | stop   log health changes (Object.GetHealth's tables)
     pokef <table> <handle|hero> <off> <f>  set a float in a handle table entry (runtime data)
     lowhp <health> <secs> <name>   hold her health there; shots, camera shake spread
+    nearlog start <x> <z> <r> <name> | stop  log what was within r m of a point (vehicle + cargo)
+    wreckwith <health|-> <drive s>  wreck her vehicle with her in it (health pokes); log her health
     poke <hex addr> <byte>         set a guest data byte (runtime flag only)
     trackhero                      follow the player's character by the 360 code's tables (xmem.Hero)
     trackfoot <x> <y> <z>|here     as track, for the hero on foot (here: where track was)
@@ -268,6 +270,7 @@ def run(args) -> int:
     held = (0, 0, 0, 0.0, 0.0, 0.0, 0.0)
     tracker = None
     airlog_state: dict = {}
+    nl_state: dict = {}
 
     def shot(name: str) -> Path | None:
         nonlocal n
@@ -1050,6 +1053,97 @@ def run(args) -> int:
                     say(f"lowhp {name}: end; camera spread x {sd[0]:.4f} y {sd[1]:.4f} z {sd[2]:.4f} m, yaw {sd[3]:.3f} deg over {len(cams)} samples")
                 else:
                     say(f"lowhp {name}: end; no camera samples")
+            elif op == "nearlog":
+                # nearlog start <x> <z> <r> <name> | nearlog stop: in the background,
+                # every 0.25 s, log the positions and rotations of the state-table
+                # entries that were within <r> m (flat) of (x, z) at the start (a
+                # vehicle and what rides on it), to <out>/<name>.csv.
+                import csv, math, threading
+                import xmem
+
+                if w[1] == "stop":
+                    nl_state["stop"].set()
+                    nl_state["thread"].join(3)
+                    say("nearlog: stopped")
+                else:
+                    nx, nz, nr, name = float(w[2]), float(w[3]), float(w[4]), w[5]
+                    gn = xmem.Guest(p.pid)
+                    hn = xmem.Hero(gn)
+                    ents = xmem.state_entries(gn)
+                    pick = sorted(i for i, v in ents.items() if math.hypot(v[0] - nx, v[2] - nz) <= nr)
+                    say(f"nearlog {name}: {len(pick)} entries: " + "; ".join(f"{i} ({ents[i][0]:.2f}, {ents[i][1]:.2f}, {ents[i][2]:.2f})" for i in pick[:24]))
+                    ev = threading.Event()
+
+                    def nloop(pick=pick, name=name, ev=ev):
+                        with open(Path(args.out) / f"{name}.csv", "w", newline="") as fh:
+                            wr = csv.writer(fh)
+                            wr.writerow(["t", "index", "x", "y", "z", "qx", "qy", "qz", "qw"])
+                            while not ev.is_set():
+                                tt = time.time() - t0
+                                for i in pick:
+                                    a = hn._slot(hn.STATES, i)
+                                    b = gn.read(a, 32)
+                                    if b and len(b) == 32:
+                                        f = struct.unpack(">3fI4f", b)
+                                        wr.writerow([f"{tt:.2f}", i, *(f"{c:.3f}" for c in f[0:3]), *(f"{c:.4f}" for c in f[4:8])])
+                                fh.flush()
+                                ev.wait(0.25)
+
+                    th_n = threading.Thread(target=nloop, daemon=True)
+                    th_n.start()
+                    nl_state.update(stop=ev, thread=th_n)
+            elif op == "wreckwith":
+                # wreckwith <hero health|-> <drive s>: she is in a vehicle. Its
+                # health record (the 0x83656558 entry whose state record is within
+                # 1 m of her, not hers) is set to 1 (runtime data); A is held for
+                # <drive s> (OilCon020's Phoenix: into the sea); her health is held
+                # at <hero health> until the vehicle's reaches 0, then her health and
+                # position are said every 0.1 s for 4 s.
+                import math
+                import xmem
+
+                g = xmem.Guest(p.pid)
+                hh = xmem.Hero(g)
+                here, hero = hh.update(), hh.character()
+                hm = xmem.map_entries(g, 0x83656558)
+                car = None
+                for k, a in hm.items():
+                    if hero - 1 <= k <= hero + 8:
+                        continue
+                    sa = hh.state_addr(k)
+                    if sa and math.dist(struct.unpack(">3f", g.read(sa, 12)), here) < 1.0:
+                        car = k
+                        break
+                hv = None if w[1] == "-" else float(w[1])
+                drive = float(w[2])
+                hmax, hcur = struct.unpack(">2f", g.read(hm[hero], 8))
+                if car is None:
+                    say("wreckwith: no vehicle record under her")
+                else:
+                    ca = hm[car]
+                    g.write(ca + 4, struct.pack(">f", 1.0))
+                    say(f"wreckwith: hero {hero:#x} health {hcur:.2f}/{hmax:.2f}; vehicle {car:#x} health set 1 (max {struct.unpack('>f', g.read(ca, 4))[0]:.0f}); hold her at {hv}")
+                    st = time.time()
+                    apply(BTN["a"])
+                    while time.time() - st < 60:
+                        if time.time() - st > drive:
+                            apply()
+                        if hv is not None:
+                            g.write(hm[hero] + 4, struct.pack(">f", hv))
+                        cv = struct.unpack(">f", g.read(ca + 4, 4))[0]
+                        if cv <= 0:
+                            break
+                        time.sleep(0.05)
+                    apply()
+                    before = struct.unpack(">f", g.read(hm[hero] + 4, 4))[0]
+                    say(f"wreckwith: vehicle health {cv:.2f} after {time.time() - st:.1f} s; her health then {before:.2f}, at {hh.update()}")
+                    for _ in range(40):
+                        time.sleep(0.1)
+                        hp_now = hh.update()
+                        hc = hh.character()
+                        cur = xmem.map_entries(g, 0x83656558).get(hc)
+                        v = struct.unpack(">f", g.read(cur + 4, 4))[0] if cur else float("nan")
+                        say(f"wreckwith: +{time.time() - st:.1f} s her health {v:.2f} at ({hp_now[0]:.2f}, {hp_now[1]:.2f}, {hp_now[2]:.2f}) char {hc and hex(hc)}")
             elif op == "poke":
                 # poke <guest hex address> <byte>: set one guest data byte, a
                 # runtime flag (never code, the XEX or files). E.g. 0x83134382 =
