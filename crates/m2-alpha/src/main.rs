@@ -10261,6 +10261,23 @@ impl Running {
         self.pad.pda = (self.game.support.pda || store) && !self.hud.menu;
         // Aiming in, the camera turns by its aimed presets.
         self.pad.aiming = self.game.scene.player.as_ref().is_some_and(|p| p.aiming);
+        // Her pitch, and the held item's camera row (its template's
+        // `HumanCameraModifier`; none known: row 0).
+        if let Some(p) = self.game.scene.player.as_ref() {
+            self.pad.pitch = p.pitch;
+        }
+        let held = match self.game.combat.weapon {
+            combat::Weapon::Rifle => self.game.combat.rifle.name.clone(),
+            combat::Weapon::Rpg => "RPG".to_owned(),
+            combat::Weapon::GrenadeLauncher => "Grenade Launcher".to_owned(),
+        };
+        self.pad.camera_row = self
+            .game
+            .scene
+            .world
+            .as_ref()
+            .and_then(|w| w.index.template_db.camera_row(&held))
+            .unwrap_or(0);
         let mut held = Input::default();
         let target = if dialog { &mut held } else { &mut self.input };
         let keys = self.pad.poll(target, mode, dt);

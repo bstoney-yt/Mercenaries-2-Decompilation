@@ -378,6 +378,10 @@ pub struct Pad {
     pub camera: m2_engine::pad_camera::LookCamera,
     /// She is aiming in: the camera's aimed presets.
     pub aiming: bool,
+    /// The held item's camera row ([`m2_engine::pad_camera::camera_row`]),
+    /// and her pitch now, radians (the camera's 0..1 is found from it).
+    pub camera_row: usize,
+    pub pitch: f32,
     /// The controller the window's events report (Android's).
     pub events: Events,
     /// The on-screen pad (a phone without a controller), read with the
@@ -614,11 +618,28 @@ impl Pad {
         use m2_engine::pad_camera as cam;
         let [x, y] = s.right_raw;
         let y = if self.invert { -y } else { y };
-        let row = cam::SENSITIVITY_ROW[0][usize::from(self.aiming)];
-        let sens = self.sensitivity.unwrap_or(0.5) * row;
-        let (yaw, pitch) = self.camera.step(cam::stick(x, y), sens, self.aiming, dt);
-        let range = cam::PITCH_RANGE[1] - cam::PITCH_RANGE[0];
-        (f64::from(yaw), f64::from(pitch * range))
+        let sens = self.sensitivity.unwrap_or(0.5);
+        let (yaw, step) = self.camera.step(
+            cam::stick(x, y),
+            sens,
+            self.camera_row,
+            self.aiming,
+            false,
+            dt,
+        );
+        // The camera's 0..1 moved, through its offsets' angles.
+        if step == 0.0 {
+            return (f64::from(yaw), 0.0);
+        }
+        let offsets = if self.aiming {
+            &cam::AIMING
+        } else {
+            &cam::STANDING
+        };
+        let t = (cam::t_at(self.pitch, offsets) + step).clamp(0.0, 1.0);
+        let pitch = cam::pitch_at(t, offsets) - self.pitch;
+        self.pitch += pitch;
+        (f64::from(yaw), f64::from(pitch))
     }
 
     /// Up and down as the left stick is pushed past half way that way

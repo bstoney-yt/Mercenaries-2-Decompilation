@@ -1030,8 +1030,21 @@ impl Player {
             (*seed >> 40) as f32 / (1u64 << 24) as f32
         });
         self.yaw += intent.look.x;
-        self.pitch = (self.pitch + intent.look.y).clamp(PITCH_RANGE[0], PITCH_RANGE[1]);
+        self.pitch =
+            (self.pitch + intent.look.y).clamp(self.pitch_limits()[0], self.pitch_limits()[1]);
         self.camera(physics);
+    }
+
+    /// How far she looks down and up, radians: the camera's offsets'
+    /// angles for her stance ([`m2_engine::pad_camera::pitch_at`]): -47.0
+    /// to +50.2 degrees standing, -33.2 to +50.7 aiming in.
+    fn pitch_limits(&self) -> [f32; 2] {
+        use m2_engine::pad_camera::{AIMING, pitch_at};
+        if self.aiming {
+            [pitch_at(0.0, &AIMING), pitch_at(1.0, &AIMING)]
+        } else {
+            PITCH_RANGE
+        }
     }
 
     pub fn update(&mut self, physics: &Physics, intent: Intent, dt: f32) {
@@ -1049,7 +1062,8 @@ impl Player {
             }
         }
         self.yaw += intent.look.x;
-        self.pitch = (self.pitch + intent.look.y).clamp(PITCH_RANGE[0], PITCH_RANGE[1]);
+        self.pitch =
+            (self.pitch + intent.look.y).clamp(self.pitch_limits()[0], self.pitch_limits()[1]);
 
         if let Some(l) = self.ladder {
             self.hang(l, dt);
