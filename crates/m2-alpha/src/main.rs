@@ -4645,6 +4645,7 @@ fn mission_for_screenshot(
     let mut was_driving = false;
     // `--mission-shots` pictured so far (they are kept sorted).
     let mut mission_shots_taken = 0;
+    let mut support_denials = 0u32;
     for i in 0..(seconds / tick).round() as u32 {
         lap.mark("loop: pictures and checks");
         let intent = match auto.as_mut().filter(|_| play_done.is_none()) {
@@ -4723,6 +4724,13 @@ fn mission_for_screenshot(
                     delivery_key = key;
                 }
                 a.deliveries = deliveries;
+                // A support call the scripts turned down since the last
+                // tick: the autoplay keeps off that call for its target.
+                let denials = link.support_denials();
+                if denials > support_denials {
+                    a.support_denied = true;
+                }
+                support_denials = denials;
                 let keep = link.kept_within();
                 if keep.len() != a.keep.len() {
                     eprintln!(
@@ -5307,13 +5315,6 @@ fn mission_for_screenshot(
                     continue;
                 }
                 boxed_seen = c.seq;
-                if c.group == "MessageBox"
-                    && c.method == "AddMessage"
-                    && let Some(a) = auto.as_mut()
-                    && autoplay::is_support_denial(&plain_text(&c.data))
-                {
-                    a.support_denied = true;
-                }
                 if c.callback && c.group == "MessageBox" && c.method == "AddMessage" {
                     boxed.push((now + message_seconds(&c.data), c.seq));
                 }
@@ -6730,21 +6731,6 @@ fn grapple_keys(game: &mut Game, input: &mut Input, allowed: bool) {
 
 /// How long the message box shows a message (its call's `nDuration`,
 /// seconds; 5 when not given, as the objectives' messages ask).
-/// The text a HUD call carries, its strings joined (a message box entry's
-/// `sText` and the like), for matching.
-fn plain_text(data: &gamehud::Plain) -> String {
-    use gamehud::Plain;
-    match data {
-        Plain::Text(t) => t.clone(),
-        Plain::Table(t) => t
-            .iter()
-            .map(|(_, v)| plain_text(v))
-            .collect::<Vec<_>>()
-            .join(" "),
-        _ => String::new(),
-    }
-}
-
 fn message_seconds(data: &gamehud::Plain) -> f32 {
     use gamehud::Plain;
     let Plain::Table(t) = data else {

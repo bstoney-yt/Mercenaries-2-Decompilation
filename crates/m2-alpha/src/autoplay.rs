@@ -932,10 +932,11 @@ pub struct Autoplay {
     /// The current contract's active deliveries (set each tick:
     /// [`crate::mission::MissionLink::deliveries`]).
     pub deliveries: Vec<Delivery>,
-    /// The scripts turned down her last support call ("[PDA.Support.denied.
-    /// ...]" in the message box: `MrxSupport` main.F33, script line 734, as
-    /// `TestAALevel` of the designator's `sAATestLevel` finds anti-air up;
-    /// set by the game loop, taken each tick).
+    /// The scripts turned down her last support call (`MrxSupport.
+    /// DenialMessage`, script line 733, as `TestAALevel` of the designator's
+    /// `sAATestLevel` finds anti-air up: "medium" for AllCon003's Chinese
+    /// AA, which puts nothing in the message box); set by the game loop,
+    /// taken each tick.
     pub support_denied: bool,
     /// What she is not to call support on again: what a call was turned
     /// down for (AllCon003's Chinese AA, "medium": 21 bunker busters
@@ -5787,13 +5788,6 @@ fn may_strike(denied: &[u32], target: u32) -> bool {
     !denied.contains(&target)
 }
 
-/// Whether a message the scripts put in the message box is a support call
-/// turned down (`MrxSupport`'s denial puts "[red][PDA.Support.denied.
-/// denied] " and the reason's text key in it).
-pub fn is_support_denial(text: &str) -> bool {
-    text.contains("[PDA.Support.denied.")
-}
-
 /// What she does first towards calling in a strike: driving, gets there
 /// in her vehicle; swimming, gets out of the water (she can't call support
 /// from it: AllCon003 on #631's check trod water 950 s by its third AA
@@ -7330,10 +7324,6 @@ mod tests {
     // 21 times in 2400 s; once turned down, not called on it again.
     #[test]
     fn a_strike_turned_down_is_not_called_again() {
-        assert!(is_support_denial(
-            "[red][PDA.Support.denied.denied] [PDA.Support.denied.medium]"
-        ));
-        assert!(!is_support_denial("[PDA.Support.called]"));
         assert!(may_strike(&[], 0xf9a92));
         assert!(!may_strike(&[0xf9a92], 0xf9a92));
         assert!(may_strike(&[0xf9a92], 0xf9aa3));

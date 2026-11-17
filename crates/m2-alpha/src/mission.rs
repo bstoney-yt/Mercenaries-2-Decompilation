@@ -5099,6 +5099,23 @@ impl MissionLink {
             .collect()
     }
 
+    /// How many support calls the scripts have turned down so far
+    /// (`MrxSupport.DenialMessage`, called with the reason as each is: the
+    /// anti-air level `TestAALevel` found up, "jammer", "nodrop", ...). The
+    /// count is kept by a wrapper put round it the first time this is read,
+    /// for the autoplay; the scripts' own call goes on unchanged.
+    pub fn support_denials(&self) -> u32 {
+        let State::Running(mission) = &self.state else {
+            return 0;
+        };
+        mission
+            .lua()
+            .load(SUPPORT_DENIALS)
+            .set_name("=support denials")
+            .eval::<u32>()
+            .unwrap_or(0)
+    }
+
     /// The names of the events the scripts wait for the game to post
     /// (`"PDA Open"`).
     pub fn awaited(&self) -> Vec<String> {
@@ -6100,6 +6117,23 @@ fn player_target(g: u32, her: Option<u32>) -> Option<u32> {
         g => Some(g),
     }
 }
+
+/// Counts the scripts' support denials ([`MissionLink::support_denials`]):
+/// wraps `MrxSupport.DenialMessage` once (the module's functions find it in
+/// the module's table, their environment) and returns the count.
+const SUPPORT_DENIALS: &str = r#"
+local s = rawget(_G, "MrxSupport")
+if type(s) ~= "table" or type(s.DenialMessage) ~= "function" then return 0 end
+if not rawget(s, "__m2_denials") then
+    local f = s.DenialMessage
+    rawset(s, "__m2_denials", 0)
+    s.DenialMessage = function(...)
+        rawset(s, "__m2_denials", rawget(s, "__m2_denials") + 1)
+        return f(...)
+    end
+end
+return rawget(s, "__m2_denials")
+"#;
 
 const CONTRACT_DELIVERIES: &str = r#"
 local ps = rawget(_G, "MrxPlayState")
@@ -9358,6 +9392,36 @@ mod tests {
         let exit_only = box_of("Display", "[Briefing.RootMenuDialog]", &["[Generic.Exit]"]);
         assert_eq!(contract_pick(&exit_only, &offered), None);
         assert_eq!(contract_pick(&menu, &[]), None);
+    }
+
+    // AllCon003: `MrxSupport.DenialMessage("medium")` for each bunker
+    // buster the Chinese AA turns down; counted, and still the scripts' own.
+    #[test]
+    fn the_scripts_support_denials_are_counted() {
+        let lua = mlua::Lua::new();
+        let count = |lua: &mlua::Lua| lua.load(SUPPORT_DENIALS).eval::<u32>().unwrap();
+        assert_eq!(count(&lua), 0, "no MrxSupport yet");
+        lua.load(
+            r#"
+            said = {}
+            MrxSupport = {}
+            function MrxSupport.DenialMessage(why) said[table.getn(said) + 1] = why end
+            "#,
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(count(&lua), 0);
+        lua.load(r#"MrxSupport.DenialMessage("medium"); MrxSupport.DenialMessage("jammer")"#)
+            .exec()
+            .unwrap();
+        assert_eq!(count(&lua), 2);
+        // Wrapped once only: a second read doesn't wrap the wrapper.
+        lua.load(r#"MrxSupport.DenialMessage("medium")"#)
+            .exec()
+            .unwrap();
+        assert_eq!(count(&lua), 3);
+        let said: Vec<String> = lua.load("return said").eval::<Vec<String>>().unwrap();
+        assert_eq!(said, ["medium", "jammer", "medium"]);
     }
 
     // The fail fanfare's answer reaches a contract's callback as the
