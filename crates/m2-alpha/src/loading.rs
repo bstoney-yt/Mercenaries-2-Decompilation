@@ -58,8 +58,13 @@
 //!   briefing's end raises the screen itself (`Net.SetLoadingScreen`).
 //! - Invented: which loads show a hint (all here; the footage's screen
 //!   after a failed mission has none, which the engine's choice is not
-//!   read for), and the counter starting at the first hint each run (the
-//!   360 keeps it in the profile).
+//!   read for). The counter is kept in the profile as the 360's is (a byte
+//!   of its profile, `+0x7C` of `0x83134474`: the hint shown is the
+//!   counter modulo the count, from `Loading.Set1.006`, and the counter
+//!   steps on, wrapping, `0x8236E248`); here the profile is the settings
+//!   file ([`crate::config::GameOptions::loading_hint`]), written when a
+//!   screen that moved the counter goes (Invented: when the 360 writes its
+//!   profile was not read).
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -162,9 +167,16 @@ pub struct Cycle {
 }
 
 impl Cycle {
-    /// Makes hint `n` the next one shown (the harness's `M2_LOADING_HINT`).
+    /// Makes hint `n` the next one shown (the profile's counter, or the
+    /// harness's `M2_LOADING_HINT`).
     pub fn show_next(&mut self, n: usize) {
         self.next = n;
+    }
+
+    /// The profile's counter now: the hint shown next, as the 360 keeps it
+    /// (`(counter + 1) mod count` after each, so within the hints).
+    pub fn counter(&self) -> u8 {
+        u8::try_from(self.next % HINTS).unwrap_or(0)
     }
 
     /// Whether a load wants the screen, `dt` seconds on: the island still
@@ -652,6 +664,23 @@ mod tests {
         c.update(true, 0.0, true);
         assert_eq!(c.update(true, FIRST_HINT, false), [Step::Hint(HINTS - 1)]);
         assert_eq!(c.update(true, HINT_SECONDS, false), [Step::Hint(0)]);
+    }
+
+    /// The profile's counter: a new run starts where it was kept, and after
+    /// each hint it is the next one, round past the last.
+    #[test]
+    fn the_counter_carries_on_from_the_profile() {
+        let mut c = Cycle::default();
+        c.show_next(usize::from(10u8));
+        assert_eq!(c.counter(), 10);
+        c.update(true, 0.0, true);
+        assert_eq!(c.update(true, FIRST_HINT, false), [Step::Hint(10)]);
+        assert_eq!(c.counter(), 11);
+        let mut last = Cycle::default();
+        last.show_next(HINTS - 1);
+        last.update(true, 0.0, true);
+        last.update(true, FIRST_HINT, false);
+        assert_eq!(last.counter(), 0);
     }
 
     /// A screen left up shows seven hints, ten seconds apart, and no more.

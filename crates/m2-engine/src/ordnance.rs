@@ -74,7 +74,31 @@ pub struct BlastInfo {
 pub struct Ordnance {
     pub projectiles: HashMap<u32, ProjectileInfo>,
     pub blasts: HashMap<u32, BlastInfo>,
+    /// Every template with a `TriggerOnTimer`, what its timer does
+    /// (thrown designators and charges among them, which are not
+    /// projectiles).
+    pub timers: HashMap<u32, TimerInfo>,
 }
+
+/// A template's `TriggerOnTimer` and what its `TimerResponse` does.
+///
+/// From the 360 code (the timer's response, 0x8227ED30): when the timer
+/// runs out, a response whose first word is a template id spawns that
+/// template where the object is; then the object's script hears
+/// `OnTimer`; then, if the response's second word is not 0, the object
+/// is queued for removal (0x822567D0 on 0x8357F9B8, the queue
+/// `Object.Remove` uses). From samples: the Smoke Grenade Projectile's
+/// is 0 (its smoke stays), the beacon's and C4's 1.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TimerInfo {
+    pub seconds: f32,
+    pub spawns: Option<u32>,
+    pub removes: bool,
+}
+
+/// `TimerResponse`'s second word (name unknown): the object goes once its
+/// timer has run out.
+const REMOVES: u32 = 0x8ae3_d3bd;
 
 impl Ordnance {
     /// The blasts `template` makes on going off, as a projectile (what it
@@ -179,9 +203,29 @@ pub fn read(db: &Layer<'_>) -> Ordnance {
             ))
         })
         .collect();
+    let timers = trigger
+        .templates()
+        .filter_map(|id| {
+            let (seconds, spawns) = timer(id)?;
+            let removes = response
+                .of_template(id)
+                .first()
+                .and_then(|r| response.word(r, REMOVES))
+                .is_some_and(|w| w != 0);
+            Some((
+                id,
+                TimerInfo {
+                    seconds,
+                    spawns,
+                    removes,
+                },
+            ))
+        })
+        .collect();
     Ordnance {
         projectiles,
         blasts,
+        timers,
     }
 }
 

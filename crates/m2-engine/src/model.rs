@@ -1054,6 +1054,9 @@ pub struct CpuModel {
     /// The effects its part states start (`StartEmitter`), by state
     /// ([`StateFx`]).
     pub state_fx: std::sync::Arc<Vec<StateFx>>,
+    /// Its part state machines and its nodes' name hashes, for running
+    /// them once its object is destroyed ([`crate::part_runner`]).
+    pub part_states: Option<std::sync::Arc<(m2_assets::model::PartStates, Vec<u32>)>>,
     /// The messages its part states send (`SendMessage`), by state
     /// ([`StateMessage`]).
     pub state_messages: std::sync::Arc<Vec<StateMessage>>,
@@ -1402,6 +1405,12 @@ impl CpuModel {
             breakup: None,
             parts,
             state_fx: std::sync::Arc::new(StateFx::of(model)),
+            part_states: model.states.as_ref().map(|st| {
+                std::sync::Arc::new((
+                    st.clone(),
+                    model.nodes.iter().map(|n| n.name_hash).collect(),
+                ))
+            }),
             state_messages: std::sync::Arc::new(StateMessage::of(model)),
             looks,
             lamp_nodes: lamp_nodes(&model.nodes),
@@ -1561,6 +1570,9 @@ pub struct GpuModel {
     forced: Vec<bool>,
     /// The effects its part states start ([`CpuModel::state_fx`]).
     pub state_fx: std::sync::Arc<Vec<StateFx>>,
+    /// Its part state machines and its nodes' name hashes, for running
+    /// them once its object is destroyed ([`crate::part_runner`]).
+    pub part_states: Option<std::sync::Arc<(m2_assets::model::PartStates, Vec<u32>)>>,
     /// The messages its part states send ([`CpuModel::state_messages`]).
     pub state_messages: std::sync::Arc<Vec<StateMessage>>,
     /// The looks a person model can take ([`CpuModel::looks`]); each
@@ -1575,6 +1587,14 @@ pub struct GpuModel {
     /// The material each of its records got from the [`MaterialCache`],
     /// one hold each, given back by [`release`](Self::release).
     material_ids: Vec<MaterialId>,
+    /// Each record's material name hash and constants, as
+    /// [`material_ids`](Self::material_ids).
+    material_names: Vec<u32>,
+    material_constants: Vec<[f32; m2_assets::model::MATERIAL_CONSTANTS]>,
+    /// Values put in place of its materials' own for the instance drawn
+    /// next ([`set_surfaces`](Self::set_surfaces)): a material
+    /// animation's, by material.
+    surfaces: std::cell::RefCell<Vec<(MaterialId, m2_render::SurfaceOverride)>>,
     /// Multiplies its surfaces' colour and alpha ([`DrawCall::tint`]):
     /// `[1.0; 4]` but for a marker model drawn in the scripts' colour.
     pub tint: [f32; 4],
@@ -1799,6 +1819,9 @@ impl GpuModel {
         }
         Ok(Self {
             material_ids: ids.clone(),
+            material_names: cpu.materials.iter().map(|m| m.name_hash).collect(),
+            material_constants: cpu.materials.iter().map(|m| m.constants).collect(),
+            surfaces: Default::default(),
             tint: [1.0; 4],
             beams_lit: false,
             hash: cpu.hash,
@@ -1813,6 +1836,7 @@ impl GpuModel {
             track_travel: 0.0,
             parts: cpu.parts.clone(),
             state_fx: cpu.state_fx.clone(),
+            part_states: cpu.part_states.clone(),
             state_messages: cpu.state_messages.clone(),
             parts_hidden: None,
             forced: Vec::new(),
@@ -2228,12 +2252,37 @@ impl GpuModel {
                     },
                     tint: self.tint,
                     beams_lit: self.beams_lit,
+                    surface: self
+                        .surfaces
+                        .borrow()
+                        .iter()
+                        .find(|(m, _)| *m == material)
+                        .map_or(m2_render::SurfaceOverride::NONE, |s| s.1),
                 },
                 layer: Layer::WORLD,
                 translucent,
                 sort_origin: origin,
                 user: 0,
             });
+        }
+    }
+
+    /// Draws its materials named in `by_name` (material name hash) with
+    /// those constants put in place of their own until set again (empty:
+    /// as they are): an instance's material animation, set before drawing
+    /// it ([`crate::material_anim::surface`]).
+    pub fn set_surfaces(&self, by_name: &[(u32, crate::material_anim::Constants)]) {
+        let mut s = self.surfaces.borrow_mut();
+        s.clear();
+        for (name, over) in by_name {
+            for (k, n) in self.material_names.iter().enumerate() {
+                if n == name
+                    && let (Some(&id), Some(base)) =
+                        (self.material_ids.get(k), self.material_constants.get(k))
+                {
+                    s.push((id, crate::material_anim::surface(base, over)));
+                }
+            }
         }
     }
 
