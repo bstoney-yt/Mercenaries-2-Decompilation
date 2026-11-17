@@ -42,6 +42,7 @@ Route files are one step per line (`#` comments):
     enter <cx> <cz> [<ring> <tries>]  get into the vehicle there (ring points, face it, Y)
     healthlog start [<name>] | stop   log health changes (Object.GetHealth's tables)
     pokef <table> <handle|hero> <off> <f>  set a float in a handle table entry (runtime data)
+    lowhp <health> <secs> <name>   hold her health there; shots, camera shake spread
     poke <hex addr> <byte>         set a guest data byte (runtime flag only)
     trackhero                      follow the player's character by the 360 code's tables (xmem.Hero)
     trackfoot <x> <y> <z>|here     as track, for the hero on foot (here: where track was)
@@ -1017,6 +1018,38 @@ def run(args) -> int:
                 else:
                     ok = g.write(a + int(w[3]), struct.pack(">f", float(w[4])))
                     say(f"pokef {tbl:#x}[{hnd:#x}]+{w[3]} = {w[4]}: {'ok' if ok else 'FAILED'}")
+            elif op == "lowhp":
+                # lowhp <health> <secs> <name>: hold the hero's health at <health>
+                # (Object.GetHealth's pool 0x83656558, entry +4; runtime data) for
+                # <secs>, stick released; mark the start/end on the route clock (for
+                # the audio), take a shot every 2 s from 1 s in, and log the camera's
+                # position/yaw every 0.05 s: their spread (shake) is said at the end.
+                import statistics
+                import xmem
+
+                g = xmem.Guest(p.pid)
+                val, secs, name = float(w[1]), float(w[2]), w[3]
+                hero = xmem.Hero(g).character()
+                addr = xmem.map_entries(g, 0x83656558).get(hero)
+                cam = xmem.Camera(g)
+                say(f"lowhp {name}: start, health {val} (hero {hero:#x}, entry {addr and hex(addr)})")
+                st, nxt, k, cams = time.time(), time.time() + 1.0, 0, []
+                while time.time() - st < secs:
+                    if addr:
+                        g.write(addr + 4, struct.pack(">f", val))
+                    cp, cy = cam.pos(), cam.yaw()
+                    if cp is not None and cy is not None:
+                        cams.append((*cp, cy))
+                    if time.time() >= nxt:
+                        nxt += 2.0
+                        shot(f"{name}-{k:02d}")
+                        k += 1
+                    time.sleep(0.05)
+                if len(cams) > 2:
+                    sd = [statistics.pstdev(c[i] for c in cams) for i in range(4)]
+                    say(f"lowhp {name}: end; camera spread x {sd[0]:.4f} y {sd[1]:.4f} z {sd[2]:.4f} m, yaw {sd[3]:.3f} deg over {len(cams)} samples")
+                else:
+                    say(f"lowhp {name}: end; no camera samples")
             elif op == "poke":
                 # poke <guest hex address> <byte>: set one guest data byte, a
                 # runtime flag (never code, the XEX or files). E.g. 0x83134382 =
