@@ -39,6 +39,7 @@ Route files are one step per line (`#` comments):
     fight <secs> [<every_s> <name>]  aim at the nearest slow ground mover and fire in bursts
     airwatch <dropx> <dropz> <secs> [<every_s> <name>]  log movers near a drop, camera on the fastest airborne one
     look <bearing> [<timeout>]     turn the camera to face that bearing (xmem.Camera)
+    enter <cx> <cz> [<ring> <tries>]  get into the vehicle there (ring points, face it, Y)
     poke <hex addr> <byte>         set a guest data byte (runtime flag only)
     trackhero                      follow the player's character by the 360 code's tables (xmem.Hero)
     trackfoot <x> <y> <z>|here     as track, for the hero on foot (here: where track was)
@@ -877,6 +878,80 @@ def run(args) -> int:
                     time.sleep(0.15)
                 apply(*held[:3], held[3], held[4], 0.0, 0.0)
                 say(f"look: camera yaw {cam.yaw()} (wanted {want:.0f})")
+            elif op == "enter":
+                # enter <cx> <cz> [<ring m> <tries>]: get into the vehicle whose
+                # middle is (cx, cz). The 360 offers an entrance (0x82440F30) only
+                # in front of the camera and within its UseDistance + 1 m, so at
+                # each of up to <tries> points on a ring round it (nearest first)
+                # she faces the middle, the prompt is read (OCR) and Y pressed;
+                # in = her record (xmem.Hero) snapped to within 1.5 m of a seat,
+                # i.e. moved over 0.6 m in the 2.5 s after the press with the
+                # stick released.
+                import math
+                import xmem
+
+                cx, cz = float(w[1]), float(w[2])
+                ring = float(w[3]) if len(w) > 3 else 2.5
+                tries = int(w[4]) if len(w) > 4 else 8
+                pos = tracker.update() if tracker else None
+                # centre on the 360's own record nearest the given point (not hers)
+                near = [(math.hypot(v[0] - cx, v[2] - cz), v) for v in xmem.state_entries(xmem.Guest(p.pid)).values()
+                        if not pos or math.dist(v, pos) > 0.5]
+                near.sort(key=lambda t: t[0])
+                say("enter: records near: " + "; ".join(f"({v[0]:.1f}, {v[1]:.1f}, {v[2]:.1f}) {d:.1f} m" for d, v in near[:5]))
+                if near and near[0][0] < 4.0:
+                    cx, cz = near[0][1][0], near[0][1][2]
+                a0 = math.atan2(pos[0] - cx, pos[2] - cz) if pos else 0.0
+                order = sorted(range(8), key=lambda k: abs(((k * math.pi / 4 - a0 + math.pi) % (2 * math.pi)) - math.pi))
+                inside = False
+                for k in order[:tries]:
+                    a = k * math.pi / 4
+                    px, pz = cx + ring * math.sin(a), cz + ring * math.cos(a)
+                    cam = xmem.Camera(xmem.Guest(p.pid))
+                    end = time.time() + 20
+                    while time.time() < end:
+                        q = tracker.update()
+                        yv = cam.yaw()
+                        if q is None or yv is None:
+                            time.sleep(0.1)
+                            continue
+                        if math.hypot(px - q[0], pz - q[2]) < 0.8:
+                            break
+                        want = math.degrees(math.atan2(px - q[0], pz - q[2]))
+                        err = (want - yv + 180) % 360 - 180
+                        apply(0, 0, 0, 0.0, 1.0 if abs(err) < 40 else 0.3, -cam_stick(err, fine=6.0), 0.0)
+                        time.sleep(0.1)
+                    apply()
+                    time.sleep(0.4)
+                    q = tracker.update()
+                    bearing = math.degrees(math.atan2(cx - q[0], cz - q[2]))
+                    end = time.time() + 6
+                    while time.time() < end:
+                        yv = cam.yaw()
+                        err = (bearing - yv + 180) % 360 - 180
+                        if abs(err) < 8:
+                            break
+                        apply(0, 0, 0, 0.0, 0.0, -cam_stick(err, fine=6.0), 0.0)
+                        time.sleep(0.1)
+                    apply()
+                    time.sleep(0.5)
+                    d = shot(f"enter-{k}")
+                    seen = ocr(d)[:200] if d else ""
+                    before = tracker.update()
+                    say(f"enter: try {k} at ({before[0]:.1f}, {before[2]:.1f}), {math.hypot(cx-before[0], cz-before[2]):.1f} m from the middle, cam {cam.yaw():.0f} want {bearing:.0f}; ocr: {seen}")
+                    apply(BTN["y"])
+                    time.sleep(0.3)
+                    apply()
+                    time.sleep(2.5)
+                    after = tracker.update()
+                    moved = math.dist(before, after)
+                    say(f"enter: after Y at ({after[0]:.1f}, {after[1]:.1f}, {after[2]:.1f}), moved {moved:.2f} m, {math.hypot(cx-after[0], cz-after[2]):.1f} m from the middle")
+                    if moved > 0.6:
+                        inside = True
+                        say(f"enter: IN from ring point {k} (bearing from the car {math.degrees(a):.0f})")
+                        break
+                if not inside:
+                    say("enter: NOT in after every ring point")
             elif op == "poke":
                 # poke <guest hex address> <byte>: set one guest data byte, a
                 # runtime flag (never code, the XEX or files). E.g. 0x83134382 =
