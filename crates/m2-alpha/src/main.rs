@@ -10259,6 +10259,8 @@ impl Running {
             .as_ref()
             .is_some_and(gamehud::GameHud::store_up);
         self.pad.pda = (self.game.support.pda || store) && !self.hud.menu;
+        // Aiming in, the camera turns by its aimed presets.
+        self.pad.aiming = self.game.scene.player.as_ref().is_some_and(|p| p.aiming);
         let mut held = Input::default();
         let target = if dialog { &mut held } else { &mut self.input };
         let keys = self.pad.poll(target, mode, dt);
@@ -10400,6 +10402,9 @@ impl Running {
         let o = &config.options;
         self.set_volumes([o.sfx_volume, o.music_volume, o.dialog_volume]);
         self.pad.look = Some(pause::pad_scale(o.pad_sensitivity));
+        // The on-foot camera's sensitivity: the menu's 0 to 100 over 100
+        // (inferred; 50 is the 360's start value, 0.5).
+        self.pad.sensitivity = Some((o.pad_sensitivity / 100.0).clamp(0.0, 1.0) as f32);
         self.pad.invert = o.invert_pad;
         self.pad.rumble_on = o.rumble;
         self.pad.table = Some(padtable::PadTable::from_names(&o.pad_buttons));
