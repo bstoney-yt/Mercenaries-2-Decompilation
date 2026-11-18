@@ -1553,12 +1553,30 @@ const PARKED_FAST: f32 = 3.0;
 /// back, metres.
 const RAGDOLL_SLACK: f32 = 0.02;
 
-/// The ragdoll's joint motors' stiffness (N m per radian) and damping
-/// (N m s per radian), the force they may use capped by the 360's
-/// ([`crate::ragdoll_launch::motor_force`]). Invented: the motor objects'
-/// own gains were not traced.
-const RAGDOLL_MOTOR_STIFFNESS: f32 = 1000.0;
-const RAGDOLL_MOTOR_DAMPING: f32 = 20.0;
+/// The ragdoll's joint motor (from the 360 code: the human ragdoll's
+/// builder 0x8218F980 makes one Havok position motor, 0x8262D0D8, that
+/// every joint shares, 0x826876C0): `tau` 0.8 (0x820B8034), damping 1.0
+/// (0x820BAEE8), proportional recovery velocity 1.0 rad/s per radian
+/// (0x820BAEE8), constant recovery velocity 0.5 rad/s (0x820D9EDC). Its
+/// force while on is [`crate::ragdoll_launch::motor_force`] (0x821914A0).
+const RAGDOLL_MOTOR_TAU: f32 = 0.8;
+const RAGDOLL_MOTOR_DAMPING: f32 = 1.0;
+const RAGDOLL_MOTOR_PROPORTIONAL: f32 = 1.0;
+const RAGDOLL_MOTOR_CONSTANT: f32 = 0.5;
+
+/// The speed, rad/s, a joint `angle` radians off its rest is driven back
+/// at over a step of `dt` (inferred from the Havok position motor's
+/// fields: recovering at the proportional rate times the angle plus the
+/// constant rate, never more than `tau` of the angle in the step).
+fn recovery_speed(angle: f32, dt: f32) -> f32 {
+    let off = angle.abs();
+    if off < 1e-5 {
+        return 0.0;
+    }
+    let speed = (RAGDOLL_MOTOR_PROPORTIONAL * off + RAGDOLL_MOTOR_CONSTANT)
+        .min(RAGDOLL_MOTOR_TAU * off / dt.max(1e-4));
+    -angle.signum() * speed
+}
 /// What the 360's body builder (0x8216A290) gives every body of a model's
 /// physics, the ragdoll's among them: angular damping at least 0.8
 /// (0x820B8034, over the record's +0x44), Havok's linear damping left at
@@ -4254,7 +4272,7 @@ impl Physics {
         doll.powered = on.then_some(0.0);
         if !on {
             let handles = doll.joint_handles.clone();
-            self.set_ragdoll_motors(&handles, None);
+            self.set_ragdoll_motors(&handles, None, 0.0);
         }
     }
 
@@ -4271,25 +4289,39 @@ impl Physics {
 
     /// Aims every free angle of the joints `handles` at its rest with at
     /// most `force` (none: motors off).
-    fn set_ragdoll_motors(&mut self, handles: &[r::ImpulseJointHandle], force: Option<f32>) {
+    fn set_ragdoll_motors(
+        &mut self,
+        handles: &[r::ImpulseJointHandle],
+        force: Option<f32>,
+        dt: f32,
+    ) {
         for &h in handles {
+            // How far the joint is off its rest, about each of its axes
+            // (the second body's frame against the first's).
+            let angles = self.world.impulse_joints.get(h).and_then(|j| {
+                let b1 = self.world.bodies.get(j.body1())?;
+                let b2 = self.world.bodies.get(j.body2())?;
+                let q = |p: &r::Pose| Quat::from_array(p.rotation.to_array());
+                let f1 = q(b1.position()) * q(&j.data.local_frame1);
+                let f2 = q(b2.position()) * q(&j.data.local_frame2);
+                Some((f1.inverse() * f2).to_scaled_axis())
+            });
             let Some(j) = self.world.impulse_joints.get_mut(h, true) else {
                 continue;
             };
-            for axis in [r::JointAxis::AngX, r::JointAxis::AngY, r::JointAxis::AngZ] {
+            for (k, axis) in [r::JointAxis::AngX, r::JointAxis::AngY, r::JointAxis::AngZ]
+                .into_iter()
+                .enumerate()
+            {
                 if j.data.locked_axes.contains(axis.into()) {
                     continue;
                 }
                 match force {
                     Some(f) => {
+                        let speed = recovery_speed(angles.map_or(0.0, |a| a[k]), dt);
                         j.data
                             .set_motor_model(axis, r::MotorModel::ForceBased)
-                            .set_motor_position(
-                                axis,
-                                0.0,
-                                RAGDOLL_MOTOR_STIFFNESS,
-                                RAGDOLL_MOTOR_DAMPING,
-                            )
+                            .set_motor_velocity(axis, speed, RAGDOLL_MOTOR_DAMPING / dt.max(1e-4))
                             .set_motor_max_force(axis, f);
                     }
                     None => {
@@ -4327,7 +4359,7 @@ impl Physics {
                 *t += dt;
                 let force = motor_force(*t);
                 let handles = doll.joint_handles.clone();
-                self.set_ragdoll_motors(&handles, Some(force));
+                self.set_ragdoll_motors(&handles, Some(force), dt);
             }
             if touching {
                 continue;
@@ -7588,6 +7620,16 @@ pub fn solved_walk(walk: Vec3, walls: &[Vec3]) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_joint_off_its_rest_is_driven_back_as_havoks_position_motor() {
+        // 0.5 rad off: 1.0 x 0.5 + 0.5 = 1 rad/s back (under tau's 24).
+        assert!((recovery_speed(0.5, 1.0 / 60.0) + 1.0).abs() < 1e-6);
+        // A hair off: tau's 0.8 of it in the step, not the constant 0.5.
+        let v = recovery_speed(-0.001, 1.0 / 60.0);
+        assert!((v - 0.8 * 0.001 * 60.0).abs() < 1e-5, "{v}");
+        assert_eq!(recovery_speed(0.0, 1.0 / 60.0), 0.0);
+    }
 
     // On its handbrake a boat slides across with less of the water's drag
     // (`HandBrakeAntiSideDrag`, by its share of its top speed) and the
