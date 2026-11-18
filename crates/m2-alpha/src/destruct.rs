@@ -1333,8 +1333,12 @@ impl Destruction {
                             combat.collapse(at, template, &sent);
                             props.heard_collapse(key);
                             // Who the coming-down catches (0x823977C8).
-                            if let Some(b) = props.world_box(key) {
-                                combat.collapse_catches(b);
+                            if let (Some(b), Some(m)) = (props.world_box(key), props.model_box(key))
+                            {
+                                combat.collapse_catches(crate::combat::CollapseBox {
+                                    world: b,
+                                    model: m,
+                                });
                             }
                         }
                         // What its model's `CollapseState` starts (a gate's

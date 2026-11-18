@@ -637,12 +637,68 @@ const BASH_HIGH: f32 = 1.2;
 const BASH_LOW: f32 = 0.45;
 /// Blasts kill within `KILL` metres and hurt to `REACH`.
 const KILL: f32 = 4.0;
-/// Whether a collapse of world box `b` catches what is at `p`: inside
-/// the box widened [`COLLAPSE_REACH`] across and above (0x823977C8).
-pub fn collapse_catches_at(b: (Vec3, Vec3), p: Vec3) -> bool {
-    let lo = b.0 - Vec3::new(COLLAPSE_REACH, 0.0, COLLAPSE_REACH);
-    let hi = b.1 + Vec3::splat(COLLAPSE_REACH);
-    p.cmpge(lo).all() && p.cmple(hi).all()
+/// A collapsing building: its world box (least, most) and its model's
+/// box (model to world, least and most in the model).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CollapseBox {
+    pub world: (Vec3, Vec3),
+    pub model: (Mat4, Vec3, Vec3),
+}
+
+/// The eight ways a collapse looks along from each body it found, level:
+/// along z, then x, then the diagonals (0x823977C8's table: 0.707 at
+/// 0x82DE8B6C, -0.707 at 0x820F8CE8).
+pub const COLLAPSE_WAYS: [Vec3; 8] = [
+    Vec3::new(0.0, 0.0, 1.0),
+    Vec3::new(0.0, 0.0, -1.0),
+    Vec3::new(1.0, 0.0, 0.0),
+    Vec3::new(-1.0, 0.0, 0.0),
+    Vec3::new(0.707, 0.0, 0.707),
+    Vec3::new(0.707, 0.0, -0.707),
+    Vec3::new(-0.707, 0.0, 0.707),
+    Vec3::new(-0.707, 0.0, -0.707),
+];
+
+/// Whether a collapse `c` catches what is at `p` (0x823977C8): among the
+/// bodies in its world box widened [`COLLAPSE_REACH`] across and above
+/// (0x82153F58), those from which a line [`COLLAPSE_REACH`] long along
+/// one of [`COLLAPSE_WAYS`] meets the collapsing object (0x8216E330,
+/// which tests the line in the object's own frame against its shape;
+/// here against its model's box).
+pub fn collapse_catches_at(c: &CollapseBox, p: Vec3) -> bool {
+    let lo = c.world.0 - Vec3::new(COLLAPSE_REACH, 0.0, COLLAPSE_REACH);
+    let hi = c.world.1 + Vec3::splat(COLLAPSE_REACH);
+    if !(p.cmpge(lo).all() && p.cmple(hi).all()) {
+        return false;
+    }
+    let (to_world, blo, bhi) = c.model;
+    let to_model = to_world.inverse();
+    let from = to_model.transform_point3(p);
+    COLLAPSE_WAYS.iter().any(|&way| {
+        let d = to_model.transform_vector3(way * COLLAPSE_REACH);
+        segment_meets_box(from, d, blo, bhi)
+    })
+}
+
+/// Whether the segment from `from` along `d` (its whole length) meets the
+/// box `lo`..`hi` (slabs).
+fn segment_meets_box(from: Vec3, d: Vec3, lo: Vec3, hi: Vec3) -> bool {
+    let (mut t0, mut t1) = (0.0f32, 1.0f32);
+    for i in 0..3 {
+        if d[i].abs() < 1e-8 {
+            if from[i] < lo[i] || from[i] > hi[i] {
+                return false;
+            }
+            continue;
+        }
+        let (a, b) = ((lo[i] - from[i]) / d[i], (hi[i] - from[i]) / d[i]);
+        t0 = t0.max(a.min(b));
+        t1 = t1.min(a.max(b));
+        if t0 > t1 {
+            return false;
+        }
+    }
+    true
 }
 
 /// How far beyond a collapsing building's box across and above it
@@ -1729,7 +1785,7 @@ pub struct Combat {
     pub knocked: Option<KnockedHer>,
     /// Buildings come down since the last step, by their world boxes, for
     /// whom they catch ([`Combat::collapse_catches`]).
-    collapses: Vec<(Vec3, Vec3)>,
+    collapses: Vec<CollapseBox>,
     /// Her template's `TossGetupSeconds`
     /// ([`m2_engine::melee::TOSS_GETUP_SECONDS`] without one).
     pub toss_getup: f32,
@@ -3130,7 +3186,7 @@ impl Combat {
     /// A building whose world box is `b` comes down: those it catches
     /// are hurt and knocked down at the next step
     /// ([`Combat::collapse_step`]).
-    pub fn collapse_catches(&mut self, b: (Vec3, Vec3)) {
+    pub fn collapse_catches(&mut self, b: CollapseBox) {
         self.collapses.push(b);
     }
 
@@ -3144,13 +3200,12 @@ impl Combat {
     /// (0xDC0A895F) cell for it times [`COLLAPSE_DAMAGE`] (not limp bodies
     /// or kind 0xE); a person (kind 1) is also knocked down, for
     /// [`m2_engine::durability::KNOCKDOWN_SECONDS`] through 0x82423848.
-    /// Inferred: "meets" (the 360 sweeps the collapsing shape along a set
-    /// of ways through 0x8216E330) is taken as standing inside the widened
-    /// box.
+    /// Who it meets: [`collapse_catches_at`] (the shape taken as the
+    /// model's box).
     fn collapse_step(&mut self, f: &mut Field<'_>) {
         let key = Some(m2_assets::name_hash("ExplosionLarge"));
-        for (lo, hi) in std::mem::take(&mut self.collapses) {
-            let inside = |p: Vec3| collapse_catches_at((lo, hi), p);
+        for c in std::mem::take(&mut self.collapses) {
+            let inside = |p: Vec3| collapse_catches_at(&c, p);
             for j in 0..f.people.npcs.len() {
                 let n = &f.people.npcs[j];
                 if !n.alive || !inside(n.chest()) {
@@ -7438,16 +7493,25 @@ fn lock_share(held: f32, time: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    /// A collapse catches what stands within 10 m of its box across and
-    /// above it, not below it.
+    /// A collapse catches what is within 10 m of the building along one
+    /// of its eight level ways, at the building's height: beside it, yes;
+    /// 10.5 m off, or above its roof, no.
     #[test]
-    fn a_collapse_catches_within_ten_metres_across_and_above() {
-        use super::collapse_catches_at;
-        let b = (Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, 8.0, 10.0));
-        assert!(collapse_catches_at(b, Vec3::new(-9.5, 1.0, 5.0)));
-        assert!(collapse_catches_at(b, Vec3::new(5.0, 17.5, 5.0)));
-        assert!(!collapse_catches_at(b, Vec3::new(-10.5, 1.0, 5.0)));
-        assert!(!collapse_catches_at(b, Vec3::new(5.0, -0.5, 5.0)));
+    fn a_collapse_catches_within_ten_metres_along_its_ways() {
+        use super::{CollapseBox, collapse_catches_at};
+        let (lo, hi) = (Vec3::ZERO, Vec3::new(10.0, 8.0, 10.0));
+        let c = CollapseBox {
+            world: (lo, hi),
+            model: (Mat4::IDENTITY, lo, hi),
+        };
+        assert!(collapse_catches_at(&c, Vec3::new(-9.5, 1.0, 5.0)));
+        assert!(collapse_catches_at(&c, Vec3::new(5.0, 1.0, 5.0)));
+        // Off a corner, along a diagonal: 7 m each way is 9.9 m.
+        assert!(collapse_catches_at(&c, Vec3::new(-7.0, 1.0, -7.0)));
+        assert!(!collapse_catches_at(&c, Vec3::new(-10.5, 1.0, 5.0)));
+        // On the roof's level above it: the level lines miss the box.
+        assert!(!collapse_catches_at(&c, Vec3::new(5.0, 12.0, 5.0)));
+        assert!(!collapse_catches_at(&c, Vec3::new(5.0, -0.5, 5.0)));
     }
 
     /// Knocked down for 5 s, she stands once that is past and her body

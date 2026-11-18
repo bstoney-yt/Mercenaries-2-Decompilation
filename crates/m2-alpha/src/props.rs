@@ -1218,6 +1218,20 @@ impl Props {
     /// `entity`'s model's box in the world, as the box round its eight
     /// corners (least and most); `None` unless it is shown and its model
     /// has loaded.
+    /// `entity`'s model's box: its model-to-world matrix and its least
+    /// and most corners in the model; `None` unless it is shown and its
+    /// model has loaded.
+    pub fn model_box(&self, entity: u32) -> Option<(Mat4, Vec3, Vec3)> {
+        let p = self.shown.get(&entity)?;
+        let m = self.models.get(&p.model)?.as_ref()?;
+        let (lo, hi) = m.gpu.bounds;
+        Some((
+            Mat4::from_rotation_translation(p.rotation, p.position),
+            lo,
+            hi,
+        ))
+    }
+
     pub fn world_box(&self, entity: u32) -> Option<(Vec3, Vec3)> {
         let p = self.shown.get(&entity)?;
         let m = self.models.get(&p.model)?.as_ref()?;

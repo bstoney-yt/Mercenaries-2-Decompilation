@@ -1386,6 +1386,12 @@ pub struct Npc {
     /// A civilian's casualty meter ([`CIV_METER`]): what hits take from
     /// it, a knockdown once it runs low ([`Npc::hurt`]).
     civ_meter: f32,
+    /// A civilian casualty for the scripts' faction manager, since last
+    /// taken ([`Npc::civilian_casualty`]).
+    pub casualty: bool,
+    /// Whether their object's labels hold `Civ` (0xDCC8B14D), once the
+    /// scripts' world has told (`None`: not known yet).
+    pub civ_label: Option<bool>,
     /// Scared while getting out of a vehicle's way: the seconds the
     /// `ThreatReaction` action has left ([`People::threat_seconds`]), or
     /// below 0 when its length isn't known (until they settle).
@@ -1607,6 +1613,8 @@ impl Npc {
             uid,
             face_seed: uid.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1,
             civ_meter: CIV_METER,
+            casualty: false,
+            civ_label: None,
             scared: None,
             stagger: None,
             since_stagger: None,
@@ -1893,14 +1901,22 @@ impl Npc {
     /// to 100 (0x820D9F18). Each damage event (0x82289650 → 0x822D9990)
     /// takes its amount from that meter while the person is not limp
     /// (`FULL`), the meter is at least 1 and the controller's +0xFF4 is
-    /// clear. When it falls under 1 the script event `ResolveCivCasualty`
-    /// (0xB2CEC5F5) is posted, and the controller's update (0x822D9C10)
+    /// clear. When it falls under 1 the engine calls the faction manager's
+    /// script (`MrxFactionManager`, hash 0xB2CEC5F5) `ResolveCivCasualty`
+    /// (0x823094F0, three arguments from the damage), and the
+    /// controller's update (0x822D9C10)
     /// knocks them down (`KnockDown`, time down 0x82423848(5.0, not
     /// disguised)) unless they are already limp.
-    /// Inferred: "Civ" is read as the people of no faction who are not
-    /// soldiers; +0xFF4 is not modelled; the script event is not sent.
+    /// The meter is theirs whose object's labels hold `Civ` as the 360
+    /// finds it (the object's labels, table 0x83653C4C; [`Npc::civ_label`]);
+    /// where the scripts' world has not told, the people of no faction
+    /// who are not soldiers (inferred). +0xFF4 is not modelled. The call
+    /// is made by the mission ([`Npc::casualty`]).
     fn civilian_casualty(&mut self, damage: f32) {
-        if self.soldier || self.faction.is_some() || self.down.is_some() || self.ragdoll.is_some() {
+        let civ = self
+            .civ_label
+            .unwrap_or(!self.soldier && self.faction.is_none());
+        if !civ || self.down.is_some() || self.ragdoll.is_some() {
             return;
         }
         if self.civ_meter < 1.0 {
@@ -1922,6 +1938,7 @@ impl Npc {
             self.spawn.unwrap_or(0)
         );
         self.knock_down_for(seconds, Vec3::ZERO);
+        self.casualty = true;
     }
 
     /// Takes `damage`; at no health left, falls: true if it killed.
