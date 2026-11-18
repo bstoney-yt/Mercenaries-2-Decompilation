@@ -338,6 +338,10 @@ pub struct Destruction {
     /// ([`crate::combat::Combat::set_off`]): where, its template, and
     /// what its model's `CollapseState` starts (effect name hash, where).
     pub set_off: Vec<(Vec3, u32, Shows)>,
+    /// The state layers' props worn through that blew up as their
+    /// template's blast and were taken away (a placed water mine: its
+    /// script hears of its death, [`crate::mines::report`]).
+    pub blew_up: HashSet<u32>,
     /// The island's objects destroyed whose links were followed
     /// ([`fall_linked`](Self::fall_linked)).
     linked: HashSet<usize>,
@@ -606,6 +610,7 @@ impl Destruction {
             eprintln!("destruct: {key:?} blows up at {centre:.1}");
             props.hide(&mut world.physics, [e]);
             self.set_off.push((centre, template, shows));
+            self.blew_up.insert(e);
             return true;
         }
         match key {

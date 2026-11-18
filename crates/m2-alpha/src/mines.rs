@@ -54,9 +54,12 @@ pub fn explosion_blast(db: &m2_engine::Templates, what: &str) -> Option<Blast> {
 }
 
 /// Whether a placed mine's prop (`shown`: wrecked, knocked loose; `None`
-/// while it is not shown) was brought down: run into or worn through.
-pub fn set_off(shown: Option<(bool, bool)>) -> bool {
-    shown.is_some_and(|(wrecked, knocked)| wrecked || knocked)
+/// while it is not shown) was brought down: run into or worn through, or
+/// worn through and blown up as its template's `SpawnOnDeath` blast
+/// (`blew_up`: the water mines' `Explosion (Water Mine)`; the prop is
+/// taken away then, [`crate::destruct::Destruction::blew_up`]).
+pub fn set_off(shown: Option<(bool, bool)>, blew_up: bool) -> bool {
+    blew_up || shown.is_some_and(|(wrecked, knocked)| wrecked || knocked)
 }
 
 /// The placed mines run into or blasted since the last look die (their
@@ -67,7 +70,7 @@ pub fn report(game: &mut Game, mission: &mut Mission) {
         let shown = props
             .get(g)
             .map(|(p, _)| (p.wrecked, props.knocked_loose(g).is_some()));
-        if set_off(shown) {
+        if set_off(shown, game.destruction.blew_up.contains(&g)) {
             eprintln!("mission: mine {g:#x} set off");
             mission.kill(g);
         }
@@ -218,7 +221,7 @@ impl MineCheck {
                 let durability = db.durability.get(&template).map_or(0.0, |d| d.health);
                 let goes = wear >= durability;
                 eprintln!(
-                    "mine-check: an RPG {CHECK_BLAST} m off: {wear:.1} of its {durability}                      health; it should {}",
+                    "mine-check: an RPG {CHECK_BLAST} m off: {wear:.1} of its {durability} health;                      it should {}",
                     if goes { "go off" } else { "stand" }
                 );
                 game.hit_world_with(Vec::new(), vec![from]);
@@ -285,10 +288,13 @@ mod tests {
 
     #[test]
     fn a_mine_goes_off_once_its_prop_is_brought_down() {
-        assert!(!set_off(None), "not shown: nothing has met it");
-        assert!(!set_off(Some((false, false))));
-        assert!(set_off(Some((true, false))), "wrecked");
-        assert!(set_off(Some((false, true))), "knocked loose");
+        assert!(!set_off(None, false), "not shown: nothing has met it");
+        assert!(!set_off(Some((false, false)), false));
+        assert!(set_off(Some((true, false)), false), "wrecked");
+        assert!(set_off(Some((false, true)), false), "knocked loose");
+        // A water mine worn through blows up as its template's blast, its
+        // prop taken away: set off all the same.
+        assert!(set_off(None, true), "blown up");
     }
 
     #[test]
