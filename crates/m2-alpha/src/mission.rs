@@ -6687,7 +6687,7 @@ impl PartDestroyCheck {
         self.hid += a.hidden.len();
         let hex = |v: &[u32]| v.iter().map(|n| format!("{n:08x}")).collect::<Vec<_>>();
         eprintln!(
-            "part-destroy-check: {:#x}'s states applied at step {} (message at step {}): the              break lands {after} step(s) after the message; shown {:?}, hidden {:?}; {} parts down",
+            "part-destroy-check: {:#x}'s states applied at step {} (message at step {}): the break lands {after} step(s) after the message; shown {:?}, hidden {:?}; {} parts down",
             a.entity,
             a.landed,
             a.sent,
@@ -6751,7 +6751,7 @@ impl PartDestroyCheck {
             self.done = true;
             self.shoot("after");
             let what = format!(
-                "{} part state changes, destroyed {destroyed}; states applied {} times one step                  after their message, {} otherwise, {} nodes hidden",
+                "{} part state changes, destroyed {destroyed}; states applied {} times one step after their message, {} otherwise, {} nodes hidden",
                 self.changes, self.on_time, self.late, self.hid
             );
             if self.changes > 0 && destroyed && self.on_time > 0 && self.late == 0 && self.hid > 0 {
