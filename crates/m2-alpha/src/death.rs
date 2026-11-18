@@ -10,11 +10,14 @@
 //!    (after the one rescue, until it cools down) her health can reach
 //!    nothing, and the game kills her object: the `ObjectDeath` event
 //!    `MrxPlayer.OnPlayerJoined` set on her runs `PlayerDied`.
-//! 2. `PlayerDied` (single player: no other hero alive) cancels the
-//!    contract under way (`mission:Cancel()`), clears her GPS, counts the
-//!    death (`MrxStatsManager.IncreaseDeathCounter`) and, 2 s on, calls
-//!    `_DialogBoxDismissed(1)`, which on the island (`vz`) calls
-//!    `MoveToSickbay`. No dialog box and no text: the "You Have Died"
+//! 2. `PlayerDied` (single player: no other hero alive) counts the death
+//!    (`MrxStatsManager.IncreaseDeathCounter`) and, with a contract under
+//!    way, only cancels it (`mission:Cancel()`): the contract's fail
+//!    fanfare then waits for her answer, and its end (`MrxTaskContract`,
+//!    2f0b1589, from its line 560) loads the retry save on Retry, else,
+//!    her character being dead, calls `MrxPlayer.MoveToSickbay`. With no
+//!    contract, 2 s on it calls `_DialogBoxDismissed(1)`, which on the
+//!    island (`vz`) calls `MoveToSickbay`, and clears her GPS. No dialog box and no text: the "You Have Died"
 //!    box (`_DisplayOnDeathDialogBox`) is not on this path. In co-op with
 //!    a hero alive her partner gets `[ContextAction.Revive]` instead, with
 //!    Fiona's nags every 30 s and a sickbay after 60 s.
