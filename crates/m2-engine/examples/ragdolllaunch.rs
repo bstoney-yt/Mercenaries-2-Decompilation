@@ -92,6 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect()
     };
     let mut downs = Vec::new();
+    let mut hurts: Vec<(f32, bool)> = Vec::new();
     for (away, jitter) in runs {
         let mut p = Physics::new();
         let half = 200.0;
@@ -118,11 +119,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let dt = 1.0 / 60.0;
         let mut top: f32 = 0.0;
         let mut first_down = None;
+        // Its falls as the 360's limp body measures them (0x82191560),
+        // by a `human`'s fall limits (2, 3 and 4 m: the defaults).
+        let mut watch = m2_engine::on_foot::LimpFallWatch::default();
+        let limits = m2_engine::on_foot::FallLimits::default();
+        let mut damage = 0.0f32;
+        let mut deadly = false;
         for k in 0..600 {
             if k == 0 {
                 p.launch_ragdoll(id, l.velocity, l.point);
             }
             p.step(dt);
+            if let (Some(touching), Some((at, v))) = (p.ragdoll_touching(id), p.ragdoll_root(id))
+                && let Some(d) = watch.step(touching, at.y, v.y)
+                && let Some(fell) = m2_engine::on_foot::fall_impact(&limits, d)
+            {
+                if fell.impact.is_none() {
+                    deadly = true;
+                } else {
+                    damage += fell.damage;
+                }
+            }
             let now = p.ragdoll_nodes(id).ok_or("gone")?[hips].w_axis.truncate();
             top = top.max(now.y);
             if first_down.is_none() && k > 10 && now.y < 0.3 {
@@ -130,6 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         downs.extend(first_down.map(|d| d.0));
+        hurts.push((damage, deadly));
         let end = p.ragdoll_nodes(id).ok_or("gone")?[hips].w_axis.truncate();
         println!(
             "blast {away} m away: launch {:.1} m/s, hips up to {:.2} m, first down {:.2?} (m, s), rests {:.2} m out",
@@ -137,6 +155,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             top,
             first_down,
             (end - start).with_y(0.0).length()
+        );
+    }
+    if throws > 0 {
+        let dead = hurts.iter().filter(|h| h.1).count();
+        let hurt: Vec<f32> = hurts
+            .iter()
+            .filter(|h| !h.1 && h.0 > 0.0)
+            .map(|h| h.0)
+            .collect();
+        println!(
+            "{} throws' falls (human limits): {dead} deadly, {} hurt (fall damage {:.0} to {:.0}), {} unhurt",
+            hurts.len(),
+            hurt.len(),
+            hurt.iter().copied().fold(f32::INFINITY, f32::min),
+            hurt.iter().copied().fold(0.0, f32::max),
+            hurts.len() - dead - hurt.len()
         );
     }
     if throws > 0 && !downs.is_empty() {
