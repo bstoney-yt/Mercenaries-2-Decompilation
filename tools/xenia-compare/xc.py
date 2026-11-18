@@ -1403,13 +1403,20 @@ def run(args) -> int:
                             while not ev.is_set():
                                 tt = time.time() - t0
                                 for k_ in picks:
-                                    sa = hp_.state_addr(k_)
+                                    try:
+                                        sa = hp_.state_addr(k_)
+                                    except Exception:  # noqa: BLE001
+                                        sa = None
                                     if not sa:
                                         continue
                                     b = gp.read(sa, 12)
                                     a_ = hm_.get(k_)
-                                    hv = struct.unpack(">f", gp.read(a_ + 4, 4))[0] if a_ else float("nan")
-                                    st_ = hp_.anim_state(k_) or (0, 0, 0)
+                                    hb_ = gp.read(a_ + 4, 4) if a_ else None
+                                    hv = struct.unpack(">f", hb_)[0] if hb_ and len(hb_) == 4 else float("nan")
+                                    try:
+                                        st_ = hp_.anim_state(k_) or (0, 0, 0)
+                                    except Exception:  # noqa: BLE001
+                                        st_ = (0, 0, 0)
                                     if b:
                                         wr.writerow([f"{tt:.3f}", f"{k_:#x}", *(f"{c:.3f}" for c in struct.unpack(">3f", b)), f"{hv:.2f}",
                                                      *(f"{x:#010x}" for x in st_)])
