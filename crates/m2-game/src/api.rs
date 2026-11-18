@@ -597,6 +597,9 @@ pub enum Command {
     /// The player can't be killed while on (`Player.SetHealthClamp`): her
     /// health stops short of nothing, for the survival system to step in.
     HealthClamp(bool),
+    /// Her survival mode on or off (`Player.SetSurvivalMode`): while on, the
+    /// 360 cuts the damage others do her (0x822889F8).
+    SurvivalMode(bool),
     /// A voice bank the scripts load (`true`) or let go (`false`) by its
     /// localised name (`vo_job_pmc.english`): `MrxSoundBanks.LoadTempBank`
     /// and `LoadSoundBank` for an HQ's briefings and a contract's lines,
@@ -1110,6 +1113,9 @@ pub struct ScriptWorld {
     pub script_removals: Vec<(u32, u32)>,
     /// Templates' cash values by name in lower case ([`crate::cash`]).
     pub template_cash: HashMap<String, i32>,
+    /// Templates carrying `Crusher` ([`crate::crusher`]), by name in
+    /// lower case.
+    pub template_crushers: HashMap<String, f32>,
     /// Templates' `NodeHealth` records by name in lower case, and the
     /// node tables built from them, by object ([`crate::node_damage`]).
     pub template_nodes: HashMap<String, Vec<m2_engine::node_health::NodeRecord>>,
@@ -3934,7 +3940,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([Value::Boolean(true)])
     })?;
     add(&player, "SetSurvivalMode", |w, _, a| {
-        w.survival_mode = matches!(a.get(1), Some(Value::Boolean(true)));
+        let on = matches!(a.get(1), Some(Value::Boolean(true)));
+        w.survival_mode = on;
+        // Every call goes to the game: the engine also turns survival
+        // mode on by itself (a hit the clamp caught), so "off" from the
+        // scripts must reach it even when they never turned it on.
+        w.commands.push(Command::SurvivalMode(on));
         // From the 360 code (0x8233d030): true.
         values([Value::Boolean(true)])
     })?;
@@ -9142,6 +9153,27 @@ mod tests {
             Value::Boolean(false)
         );
         assert!(ask("return Pg.SetPursuit(nil, 2)").is_nil());
+    }
+
+    /// Every `Player.SetSurvivalMode` reaches the game, off too: the
+    /// engine turns it on by itself when the clamp catches a hit.
+    #[test]
+    fn survival_mode_calls_reach_the_game() {
+        let (host, world) = setup();
+        let lua = host.lua();
+        lua.load("Player.SetSurvivalMode(1, false) Player.SetSurvivalMode(1, true)")
+            .exec()
+            .unwrap();
+        let got: Vec<_> = world
+            .borrow_mut()
+            .commands
+            .drain(..)
+            .filter(|c| matches!(c, Command::SurvivalMode(_)))
+            .collect();
+        assert_eq!(
+            got,
+            [Command::SurvivalMode(false), Command::SurvivalMode(true)]
+        );
     }
 
     #[test]

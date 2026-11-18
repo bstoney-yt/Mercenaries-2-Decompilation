@@ -42,6 +42,10 @@
 //!                      m2-alpha's `--skip-to` does
 //! ```
 //!
+//! With `M2_GUI_TICK` set, the scripts' widgets are advanced each tick
+//! too (`gui_runtime::tick`), as m2-alpha's HUD does: their fades and
+//! animations then run (the hero script's red survival fade).
+//!
 //! Every module some script loads is imported first, then every other
 //! script runs once, as in the `scripts` example; then the drivers and
 //! `--run` code, then play starts (unless `--no-start`), then the ticks. In
@@ -265,6 +269,9 @@ fn run(o: &Options) -> Result<()> {
             h.pad(&mut mission, now);
         }
         mission.tick(o.step);
+        if std::env::var_os("M2_GUI_TICK").is_some() {
+            m2_game::gui_runtime::tick(mission.lua(), o.step);
+        }
         match &mut hijack {
             Some(h) => h.follow(&mut mission, now),
             None => print(&mut mission),

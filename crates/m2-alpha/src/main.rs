@@ -89,6 +89,7 @@ mod keytable;
 mod ladders;
 mod loading;
 mod marker_models;
+mod mines;
 mod mission;
 mod movie;
 mod moving;
@@ -249,6 +250,9 @@ struct Options {
     /// With `--drive` and `--wreck` or `--shoot-up`: get out of the wreck,
     /// walk to the fuel can it left and take it (testing).
     fuel_check: bool,
+    /// `--survival-check`: her health clamp and survival mode on the
+    /// game's own code, offscreen ([`combat::survival_check`]); then exit.
+    survival_check: bool,
     /// With `--drive`: stop and put this many rifle rounds into its parts.
     shoot_up: Option<u32>,
     /// With `--drive`: fire from the next seat with a weapon.
@@ -305,6 +309,8 @@ struct Options {
     homing_check: bool,
     /// `--gravity-check`: measure the physics world's gravity ([`gravity_check`]).
     gravity_check: bool,
+    /// `--stagger-check`: her stagger's exemptions ([`stagger_check`]).
+    stagger_check: bool,
     /// `--disguise-check`: her vehicle disguise and a run-over
     /// ([`disguise_check`]).
     disguise_check: bool,
@@ -511,6 +517,10 @@ struct Options {
     /// swim her forward walking, at her pace and sprinting, logging how
     /// fast she goes (`swim-check:` lines).
     swim_check: bool,
+    /// `--mine-check`: in the mission, the nearest placed mine is blasted
+    /// by an RPG and, should it stand, run into by a jeep; logs
+    /// `mine-check:` lines ([`mines::MineCheck`]).
+    mine_check: bool,
     /// `--impact-check`: rounds struck into the ground round her, by
     /// surface ([`impact_check`]).
     impact_check: bool,
@@ -791,6 +801,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--plough" => o.plough = Some(value()?.to_ascii_lowercase()),
             "--wreck" => o.wreck = true,
             "--fuel-check" => o.fuel_check = true,
+            "--survival-check" => o.survival_check = true,
             "--shoot-up" => {
                 o.shoot_up = Some(
                     value()?
@@ -892,6 +903,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--seated" => o.seated = true,
             "--board" => o.board = true,
             "--swim-check" => o.swim_check = true,
+            "--mine-check" => {
+                o.mine_check = true;
+                o.mission = true;
+            }
             "--impact-check" => {
                 o.impact_check = true;
                 o.drive = true;
@@ -1055,6 +1070,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.gravity_check = true;
                 o.drive = true;
             }
+            "--stagger-check" => o.stagger_check = true,
             "--disguise-check" => o.disguise_check = true,
             "--look-pickup" => {
                 o.look_pickup = Some(value()?.parse().context("--look-pickup expects metres")?)
@@ -1304,6 +1320,10 @@ fn run(
 ) -> anyhow::Result<()> {
     spans::start_profiler();
     let mut options = parse_args(args)?;
+    if options.survival_check {
+        combat::survival_check();
+        return Ok(());
+    }
     let ignored = screenshot_only_ignored(args);
     if !ignored.is_empty() {
         eprintln!(
@@ -2388,6 +2408,8 @@ fn screenshot(
             stage,
             options.fight_wait,
         )?;
+    } else if options.stagger_check && game.on_foot && game.scene.player.is_some() {
+        stagger_check(&mut game);
     } else if options.disguise_check {
         disguise_check();
     } else if options.shuffle_test && game.on_foot && game.scene.player.is_some() {
@@ -4496,7 +4518,8 @@ fn mission_for_screenshot(
         .with_skip_mode_off(options.skip_mode_off)
         .with_script_join(options.script_join)
         .with_skip_to(options.skip_to.clone())
-        .with_job_near(options.job_near);
+        .with_job_near(options.job_near)
+        .with_mine_check(options.mine_check);
     link.check_node_damage = options.check_node_damage;
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
@@ -7071,6 +7094,55 @@ const HOMING_CHECK_SECONDS: f32 = 60.0;
 /// launcher up, and the run waits up to [`HOMING_CHECK_SECONDS`] for his
 /// lock, his shot and its hit. Logs `homing-check: PASS ...` or
 /// `homing-check: FAIL <why>`.
+/// `--stagger-check`: her stagger as the 360's picker (0x824220B0) has it
+/// for a player, run on her own clips: a grenade's blast behind her
+/// staggers her standing (control); not aimed in (`Crouched`); not while
+/// invincible (`Object.GetInvincible`, 0x8228CB80); a bash aimed in
+/// still does. Prints a line each and PASS or FAIL.
+fn stagger_check(game: &mut Game) {
+    use m2_engine::stagger::Event;
+    use m2_math::glam::Vec3;
+    let Some(p) = game.scene.player.as_mut() else {
+        eprintln!("stagger-check: FAIL no player");
+        return;
+    };
+    let blast = Event {
+        direction: Vec3::new(p.facing.sin(), 0.0, p.facing.cos()),
+        direct: false,
+        melee: false,
+        key: Some(m2_assets::name_hash("Explosion")),
+    };
+    let bash = Event {
+        direction: -Vec3::new(p.facing.sin(), 0.0, p.facing.cos()),
+        direct: true,
+        melee: true,
+        key: None,
+    };
+    let cases: [(&str, &Event, bool, bool, bool); 4] = [
+        ("standing, a blast behind her", &blast, false, false, true),
+        ("aimed in, a blast behind her", &blast, true, false, false),
+        ("invincible, a blast behind her", &blast, false, true, false),
+        ("aimed in, a bash from ahead", &bash, true, false, true),
+    ];
+    let mut all = true;
+    for (what, event, aimed, invincible, want) in cases {
+        p.forget_stagger();
+        p.aiming = aimed;
+        let got = p.stagger(event, invincible);
+        let ok = got == want;
+        all &= ok;
+        eprintln!(
+            "stagger-check: {what}: {}, want {}: {}",
+            if got { "staggers" } else { "no stagger" },
+            if want { "staggers" } else { "no stagger" },
+            if ok { "PASS" } else { "FAIL" }
+        );
+    }
+    p.aiming = false;
+    p.forget_stagger();
+    eprintln!("stagger-check: {}", if all { "PASS" } else { "FAIL" });
+}
+
 /// `--disguise-check`: her vehicle disguise against a run-over, on the
 /// game's own people and disguise code, offscreen: disguised as the VZ in
 /// their vehicle (scene vehicle 0), the car hits a passer-by of no
