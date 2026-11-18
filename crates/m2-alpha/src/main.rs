@@ -1511,7 +1511,7 @@ fn run(
         return Ok(());
     }
     if options.ragdoll_check {
-        std::process::exit(if game::ragdoll_check() { 0 } else { 1 });
+        errlog::exit(if game::ragdoll_check() { 0 } else { 1 });
     }
     let install = match &config.install {
         Some(dir) => Some(Install::find(dir)?),
