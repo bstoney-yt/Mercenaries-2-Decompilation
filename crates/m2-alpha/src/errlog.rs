@@ -147,6 +147,36 @@ pub fn finish() {
     piped::finish();
 }
 
+/// Ends the process with `code` once the log's last lines are out: the
+/// standard output flushed and [`finish`] done. Use this, never
+/// `std::process::exit` (which skips both): with standard error piped to
+/// a file, a check that exited straight after its `PASS`/`FAIL` lines
+/// lost them all (`--ragdoll-check`, `--binocular-check`) or their tail
+/// (`--camera-check`). Clippy holds the crate to it (`clippy.toml`).
+#[allow(clippy::disallowed_methods)]
+pub fn exit(code: i32) -> ! {
+    let _ = std::io::stdout().flush();
+    finish();
+    std::process::exit(code)
+}
+
+/// Lines [`check`] writes before its result.
+pub const CHECK_LINES: u32 = 5;
+
+/// `--log-check`: [`CHECK_LINES`] numbered lines and `log-check: RESULT
+/// PASS` to standard error, then [`exit`] at once, as a short check ends
+/// (`--ragdoll-check`): all of it must be in the log (the integration
+/// test `check_output` reads it). Measured: exiting this way without
+/// [`finish`], 6 runs in 6 wrote nothing at all, to a file or a pipe (the
+/// log thread had not read yet); with it, 6 in 6 wrote all 6 lines.
+pub fn check() -> ! {
+    for i in 0..CHECK_LINES {
+        eprintln!("log-check: line {i}");
+    }
+    eprintln!("log-check: RESULT PASS");
+    exit(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

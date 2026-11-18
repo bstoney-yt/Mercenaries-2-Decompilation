@@ -254,6 +254,8 @@ struct Options {
     /// `--survival-check`: her health clamp and survival mode on the
     /// game's own code, offscreen ([`combat::survival_check`]); then exit.
     survival_check: bool,
+    /// `--log-check`: the log's own check ([`errlog::check`]); then exit.
+    log_check: bool,
     /// With `--drive`: stop and put this many rifle rounds into its parts.
     shoot_up: Option<u32>,
     /// With `--drive`: fire from the next seat with a weapon.
@@ -824,6 +826,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--wreck" => o.wreck = true,
             "--fuel-check" => o.fuel_check = true,
             "--survival-check" => o.survival_check = true,
+            "--log-check" => o.log_check = true,
             "--shoot-up" => {
                 o.shoot_up = Some(
                     value()?
@@ -1192,7 +1195,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--write-config" => o.write_config = true,
             "-h" | "--help" => {
                 println!("{}", include_str!("usage.txt"));
-                std::process::exit(0);
+                errlog::exit(0);
             }
             _ => bail!("unknown argument {arg} (try --help)"),
         }
@@ -1452,9 +1455,12 @@ fn run(
 ) -> anyhow::Result<()> {
     spans::start_profiler();
     let mut options = parse_args(args)?;
+    if options.log_check {
+        errlog::check();
+    }
     if options.survival_check {
-        combat::survival_check();
-        return Ok(());
+        // Exit 1 on a failure, as the other checks do.
+        errlog::exit(if combat::survival_check() { 0 } else { 1 });
     }
     let ignored = screenshot_only_ignored(args);
     if !ignored.is_empty() {
