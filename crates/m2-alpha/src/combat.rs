@@ -4193,9 +4193,11 @@ impl Combat {
     /// her way from the blast across the ground plus as much up,
     /// normalised, at a random point of her body (0.5 m either way across,
     /// up to 1.75 m up: 0x824281C8), handed to that handler (vfunc 0x3C,
-    /// not traced); else by the rigid bodies' push (0x8215CBC8). Inferred:
-    /// the velocity it gives her, taken as the rigid bodies' push on her
-    /// capsule's box ([`wreck_throw`]: the same 45 degrees up), which
+    /// a ragdoll launch: 0x824282F8, 0x82428910, see the ragdoll thread's
+    /// notes); else by the rigid bodies' push (0x8215CBC8). Inferred, an
+    /// interim to be replaced by that ragdoll launch: the velocity it gives
+    /// her, taken as the rigid bodies' push on her capsule's box
+    /// ([`wreck_throw`]: the same 45 degrees up), which
     /// gives the footage's arc under the world's gravity
     /// ([`crate::player::Player::throw`]); from the wreck state's own
     /// effect, where its node is.
