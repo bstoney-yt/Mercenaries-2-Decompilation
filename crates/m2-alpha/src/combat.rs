@@ -4026,7 +4026,7 @@ impl Combat {
         let before = self.hp;
         self.hp = (self.hp - damage).max(floor.min(self.hp));
         let lost = (before - self.hp).max(0.0);
-        if self.hp <= 0.0 {
+        if self.hp < crate::death::DEATH_BELOW {
             self.tally.downs += 1;
             self.remarks.push(Remark::Down);
             // With the scripts running she stays down for their death
@@ -7740,8 +7740,10 @@ mod tests {
             arsenal: &arsenal,
             explosives: &mut explosives,
         };
-        combat.hurt_player(&mut field, 1.0e6, None);
-        assert!(field.player.down && combat.died);
+        // Left under 0.01 health she is dead, as the 360's health change
+        // has it (0x822889F8), not only at nothing.
+        combat.hurt_player(&mut field, combat.hp - 0.005, None);
+        assert!(field.player.down && combat.died, "{} left", combat.hp);
         let dt = 1.0 / 60.0;
         for _ in 0..60 * 5 {
             combat.step(&mut field, Trigger::default(), dt);

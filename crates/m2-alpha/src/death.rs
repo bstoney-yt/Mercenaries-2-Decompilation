@@ -31,6 +31,15 @@
 //!    (`_MoveToSickbayEnd`) takes `GetMedEvacCost` ($10,000) off her cash
 //!    under `[Generic.Medevacs]`.
 //!
+//! From the 360 code, step 1's engine side: the health change
+//! (0x822889F8) takes the hit from her health and, once it is under
+//! [`DEATH_BELOW`] (0x820B7AE0, 0.01), posts her object's death on the
+//! object-death queue 0x831AD128 (0x8217D8A0, naming the attacker) and
+//! marks it dead; 0x822885B0 can hold that back only for a vehicle (body
+//! kind 4) and its riders. The death itself runs in 0x82289F40 (her
+//! object's death spawns, out of her seat, its death event to the
+//! scripts on 0x831B21C0), which is what fires the scripts' `ObjectDeath`.
+//!
 //! The port runs those scripts as they are; the alpha's part is step 1's
 //! engine side: her death goes to the scripts ([`crate::combat::Combat::died`]
 //! to `m2_game::Mission::kill` of the player), she stays down
@@ -41,6 +50,11 @@
 //! health, where she fell); with them, should no revive come
 //! ([`SCRIPTS_WAIT`]: the PMC interior's own path, a script error) she
 //! gets up after 30 s as she did before.
+
+/// Her health under which she is dead: the 360's health change kills an
+/// object whose health falls under this (0x822889F8, its 0.01 at
+/// 0x820B7AE0), not only at nothing.
+pub const DEATH_BELOW: f32 = 0.01;
 
 /// Seconds she lies down without the scripts before the alpha stands her
 /// up again (Invented).
