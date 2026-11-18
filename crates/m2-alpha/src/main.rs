@@ -7498,7 +7498,7 @@ fn drive_for_screenshot(
         return Ok(());
     }
     if options.impact_check {
-        impact_check(game);
+        impact_check(game, tick);
         return Ok(());
     }
     if let Some(hold) = options.ladder_check {
@@ -8456,7 +8456,7 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 /// own pick did (`by its own pick`); then the vehicles' crash cues the
 /// sound table gives for every pair of the scene's vehicles. For the
 /// impact tables (#684): grass, dirt and water are seldom struck in play.
-fn impact_check(game: &mut Game) {
+fn impact_check(game: &mut Game, tick: f32) {
     use m2_math::glam::Vec3;
     use std::collections::BTreeMap;
     let here = game.focus();
@@ -8511,6 +8511,99 @@ fn impact_check(game: &mut Game) {
         "impact-check: {} surface words met, {} decided by the table",
         by.len(),
         by.values().filter(|v| v.1 > 0).count()
+    );
+    car_into_car(game, tick);
+}
+
+/// `--impact-check`'s car-into-car hit: she takes the nearest land
+/// vehicle if she is at no wheel (waiting up to 30 s for the parked ones),
+/// then the car she drives is driven at
+/// 8 m/s into another vehicle (the first other one loaded, put 10 m ahead
+/// of it, still), 3 s. Logs `impact-check: car into car: the <a> into
+/// the <b>: N vehicle contacts heard` (the heard ones log their own
+/// `contact: the … met Vehicle(…)` lines).
+fn car_into_car(game: &mut Game, tick: f32) {
+    use m2_math::glam::{Vec2, Vec3};
+    // Not at a wheel (the recipe's default spawn, no `--spawn`): she takes
+    // the nearest land vehicle that stands, once the parked ones are in.
+    if game
+        .scene
+        .player
+        .as_ref()
+        .is_some_and(|p| p.driving.is_none())
+    {
+        for _ in 0..(30.0 / tick) as u32 {
+            if !game.scene.vehicles_loading() && game.parking_done() {
+                break;
+            }
+            game.step(crate::player::Intent::default(), tick);
+        }
+        let here = game.focus();
+        let pick = game.scene.world.as_ref().and_then(|world| {
+            (game.scene.vehicles.iter().enumerate())
+                .filter(|(_, v)| !v.wrecked && !v.spec.is_boat())
+                .filter_map(|(i, v)| {
+                    let at = world.physics.vehicle_transform(v.id?)?.w_axis.truncate();
+                    Some((i, at.distance(here)))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        });
+        if let (Some(i), Some(p)) = (pick, game.scene.player.as_mut()) {
+            p.driving = Some(i);
+            p.landed = true;
+            game.take_from_driver(i);
+            eprintln!(
+                "impact-check: car into car: she takes the {} (not at a wheel)",
+                game.scene.vehicles[i].spec.label
+            );
+        }
+    }
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("impact-check: car into car: FAIL she drives nothing (no land vehicle loaded)");
+        return;
+    };
+    let Some(j) = (0..game.scene.vehicles.len()).find(|&j| {
+        j != i && !game.scene.vehicles[j].wrecked && !game.scene.vehicles[j].spec.is_boat()
+    }) else {
+        eprintln!("impact-check: car into car: FAIL no other vehicle loaded");
+        return;
+    };
+    let (Some(world), Some(a)) = (game.scene.world.as_mut(), game.scene.vehicles[i].id) else {
+        return;
+    };
+    let Some(at) = world.physics.vehicle_transform(a) else {
+        return;
+    };
+    let ahead = at
+        .transform_vector3(Vec3::Z)
+        .with_y(0.0)
+        .normalize_or(Vec3::Z);
+    let yaw = ahead.x.atan2(ahead.z);
+    let spot = at.w_axis.truncate() + ahead * 10.0 + Vec3::Y * 0.5;
+    let v = &mut game.scene.vehicles[j];
+    if let Some(id) = v.id.take() {
+        world.physics.remove_vehicle(id);
+    }
+    v.id = Some(world.physics.add_vehicle(&v.spec, spot, yaw));
+    let before = game.combat.vehicle_contacts_heard;
+    for _ in 0..(3.0 / tick) as u32 {
+        let speed = game
+            .scene
+            .world
+            .as_ref()
+            .map_or(0.0, |w| w.physics.vehicle_speed(a));
+        let intent = crate::player::Intent {
+            movement: Vec2::new(0.0, if speed < 8.0 { 1.0 } else { 0.0 }),
+            ..crate::player::Intent::default()
+        };
+        game.step(intent, tick);
+    }
+    eprintln!(
+        "impact-check: car into car: the {} into the {}: {} vehicle contacts heard",
+        game.scene.vehicles[i].spec.label,
+        game.scene.vehicles[j].spec.label,
+        game.combat.vehicle_contacts_heard - before
     );
 }
 

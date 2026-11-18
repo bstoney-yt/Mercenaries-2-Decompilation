@@ -1474,6 +1474,52 @@ pub enum Sound {
         at: Vec3,
         key: u32,
     },
+    /// Two things meeting: the sound table's cue `key`
+    /// ([`m2_engine::tuning::KeyTable::contact_cue`]) at `level` of its
+    /// usual ([`m2_engine::tuning::contact_level`]).
+    Contact {
+        at: Vec3,
+        key: u32,
+        level: f32,
+    },
+}
+
+/// What a vehicle met: another vehicle (its index) or a static.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Met {
+    Vehicle(usize),
+    Static(m2_engine::StaticKey),
+}
+
+/// A vehicle meeting something, new this tick: the collision event the
+/// 360 posts for every new contact (0x82162BB8 to queue 0x8320C6F0),
+/// which its sound pump hears (0x8235EFA0 -> 0x8235E3A8) whether or not
+/// it is hard enough to damage anything.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Contact {
+    /// The vehicle's index.
+    pub vehicle: usize,
+    pub met: Met,
+    /// Where (world).
+    pub at: Vec3,
+    /// The contact normal, from the vehicle toward what it met.
+    pub normal: Vec3,
+    /// The closing speed along the normal (m/s).
+    pub closing: f32,
+    /// The two bodies' mass (kg, a fixed body 0): which three of a
+    /// frame's are heard ([`m2_engine::tuning::CONTACTS_HEARD`]).
+    pub mass: f32,
+    /// The damage table's cell for the vehicle's key against what it met
+    /// is over 0 (the sound table's first word, else its second).
+    pub damaging: bool,
+}
+
+/// The `CONTACTS_HEARD` of `contacts` of the most mass, most first (the
+/// 360's three slots a frame, 0x82361CE8).
+pub fn heard_contacts(mut contacts: Vec<Contact>) -> Vec<Contact> {
+    contacts.sort_by(|a, b| b.mass.total_cmp(&a.mass));
+    contacts.truncate(m2_engine::tuning::CONTACTS_HEARD);
+    contacts
 }
 
 /// A blow or a round that landed on something of the world's rather than
@@ -2005,6 +2051,12 @@ pub struct Combat {
     pub impacts: (u32, u32),
     /// Of those named, how many the particle table decided.
     pub table_impacts: u32,
+    /// Every new meeting of a vehicle with another or with a static this
+    /// tick, damaging or not, for its sound ([`Contact`]).
+    pub contacts: Vec<Contact>,
+    /// Vehicle-against-vehicle contacts heard with a cue, all told (for
+    /// `--impact-check`).
+    pub vehicle_contacts_heard: u32,
     /// Those impacts by template.
     pub impact_kinds: std::collections::BTreeMap<&'static str, u32>,
     /// What the fighting has come to (for checking).
@@ -2318,6 +2370,8 @@ impl Default for Combat {
             cases: 0,
             impacts: (0, 0),
             table_impacts: 0,
+            contacts: Vec::new(),
+            vehicle_contacts_heard: 0,
             impact_kinds: std::collections::BTreeMap::new(),
             tally: Tally::default(),
             hurts: Vec::new(),
@@ -3255,6 +3309,12 @@ impl Combat {
     /// `at`: heard as its template's `SoundKey` `key` says.
     pub fn broke(&mut self, at: Vec3, key: u32) {
         self.sounds.push(Sound::Break { at, key });
+    }
+
+    /// Two things met at `at`, heard as the sound table's cue `key` at
+    /// `level` ([`Sound::Contact`]).
+    pub fn contact(&mut self, at: Vec3, key: u32, level: f32) {
+        self.sounds.push(Sound::Contact { at, key, level });
     }
 
     /// Where she is a target: her chest, or `None` while down, flying or
@@ -5609,6 +5669,22 @@ impl Combat {
             };
             let relative = physics.vehicle_velocity_before(a) - physics.vehicle_velocity_before(b);
             let closing = relative.dot(normal).abs();
+            // Heard whether or not it damages: the first vehicle's key's
+            // row against the second's column.
+            let column = vehicles[j].spec.tuning.key.unwrap_or(kind);
+            let damaging = match (self.damage_table.as_ref(), vehicles[i].spec.tuning.key) {
+                (Some(t), Some(row)) => t.scale(row, column).unwrap_or(0.0) > 0.0,
+                _ => false,
+            };
+            self.contacts.push(Contact {
+                vehicle: i,
+                met: Met::Vehicle(j),
+                at,
+                normal,
+                closing,
+                mass: vehicles[i].spec.mass + vehicles[j].spec.mass,
+                damaging,
+            });
             let size = m2_engine::durability::crash_size(
                 vehicles[i].spec.mass,
                 vehicles[j].spec.mass,
@@ -5691,16 +5767,25 @@ impl Combat {
         for (i, key, at, normal, mass) in met {
             let Some(a) = vehicles[i].id else { continue };
             let closing = physics.vehicle_velocity_before(a).dot(normal).max(0.0);
-            let size = d::crash_size(vehicles[i].spec.mass, mass, closing);
-            if size < d::CRASH_FLOOR {
-                continue;
-            }
             let column = key_of(key).unwrap_or(any);
             let cell = match (self.damage_table.as_ref(), vehicles[i].spec.tuning.key) {
                 (Some(t), Some(row)) => t.scale(row, column).or_else(|| t.scale(row, any)),
                 _ => None,
             }
             .unwrap_or(0.0);
+            self.contacts.push(Contact {
+                vehicle: i,
+                met: Met::Static(key),
+                at,
+                normal,
+                closing,
+                mass: vehicles[i].spec.mass + mass,
+                damaging: cell > 0.0,
+            });
+            let size = d::crash_size(vehicles[i].spec.mass, mass, closing);
+            if size < d::CRASH_FLOOR {
+                continue;
+            }
             let damage = d::crash_damage(size, cell);
             if damage > 0.0 {
                 let v = &mut vehicles[i];
@@ -7564,6 +7649,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn three_contacts_a_frame_are_heard_those_of_most_mass() {
+        let c = |vehicle: usize, mass: f32| Contact {
+            vehicle,
+            met: Met::Vehicle(9),
+            at: Vec3::ZERO,
+            normal: Vec3::X,
+            closing: 1.0,
+            mass,
+            damaging: false,
+        };
+        let heard = heard_contacts(vec![c(0, 1000.0), c(1, 30000.0), c(2, 500.0), c(3, 2000.0)]);
+        let order: Vec<usize> = heard.iter().map(|c| c.vehicle).collect();
+        assert_eq!(order, [1, 3, 0]);
+    }
 
     // The emplaced MG's turret (its record's limits and speeds, bones
     // straight up a stick): she looks off to her right and up; it gets
