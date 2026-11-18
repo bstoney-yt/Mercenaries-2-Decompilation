@@ -1698,6 +1698,32 @@ pub fn human_animation_sets(db: &Layer<'_>) -> HashMap<u32, (u32, u32)> {
 /// pick its camera row ([`crate::pad_camera::camera_row`]). From samples:
 /// every weapon's category is 3, its yaw speed 0.35 (the RPG) to 1.5 (the
 /// pistols).
+/// Each template's turret camera, by id: its first `CameraTurret`
+/// record's speeds, limits and inertias (an emplaced gun's, a gunner
+/// seat's; [`crate::pad_camera::TurretLook`]).
+pub fn turret_cameras(db: &Layer<'_>) -> HashMap<u32, crate::pad_camera::TurretLookTuning> {
+    let table = Table::new(db, "CameraTurret");
+    table
+        .templates()
+        .filter_map(|t| {
+            let r = table.of_template(t).first()?;
+            let f = |n: &str| table.float(r, name_hash(n));
+            let (yaw_in, pitch_in) = (f("YawInputInertia")?, f("PitchInputInertia")?);
+            Some((
+                t,
+                crate::pad_camera::TurretLookTuning {
+                    yaw_speed: f("YawSpeed")?,
+                    pitch_speed: f("PitchSpeed")?,
+                    yaw: (f("YawMin")?, f("YawMax")?),
+                    pitch: (f("PitchMin")?, f("PitchMax")?),
+                    yaw_keep: [yaw_in, yaw_in, f("YawNoInputInertia")?],
+                    pitch_keep: [pitch_in, pitch_in, f("PitchNoInputInertia")?],
+                },
+            ))
+        })
+        .collect()
+}
+
 pub fn camera_modifiers(db: &Layer<'_>) -> HashMap<u32, (u32, f32)> {
     let table = Table::new(db, "HumanCameraModifier");
     let (category, yaw) = (name_hash("RotationSpeed"), name_hash("YawSpeed"));

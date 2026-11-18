@@ -382,6 +382,10 @@ pub struct Pad {
     /// `CameraTank`) and its state ([`Mode::Tank`]).
     pub tank_tuning: Option<m2_engine::pad_camera::TankLookTuning>,
     pub tank_camera: m2_engine::pad_camera::TankLook,
+    /// An emplaced gun's: its turret camera's tuning while she mans one
+    /// with a `CameraTurret`, and its state.
+    pub turret_tuning: Option<m2_engine::pad_camera::TurretLookTuning>,
+    pub turret_camera: m2_engine::pad_camera::TurretLook,
     /// She is aiming in: the camera's aimed presets.
     pub aiming: bool,
     /// The held item's camera row ([`m2_engine::pad_camera::camera_row`]),
@@ -601,7 +605,15 @@ impl Pad {
         }
         // Look. On foot as the 360's camera turns ([`look_on_foot`]);
         // elsewhere squared, so small pushes aim finely.
-        if mode == Mode::OnFoot {
+        if let (Mode::OnFoot, Some(t)) = (mode, self.turret_tuning) {
+            // Manning a gun, as the 360's turret camera turns
+            // ([`m2_engine::pad_camera::TurretLook`]).
+            let [x, y] = s.right_raw;
+            let y = if self.invert { -y } else { y };
+            let stick = m2_engine::pad_camera::stick(x, y);
+            let (yaw, pitch) = self.turret_camera.step(stick, &t, dt as f32);
+            input.pad_turn(f64::from(yaw), f64::from(pitch));
+        } else if mode == Mode::OnFoot {
             let (yaw, pitch) = self.look_on_foot(&s, dt as f32);
             input.pad_turn(yaw, pitch);
         } else if let (Mode::Tank, Some(t)) = (mode, self.tank_tuning) {

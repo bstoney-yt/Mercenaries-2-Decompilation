@@ -10261,6 +10261,15 @@ impl Running {
         self.pad.pda = (self.game.support.pda || store) && !self.hud.menu;
         // Aiming in, the camera turns by its aimed presets.
         self.pad.aiming = self.game.scene.player.as_ref().is_some_and(|p| p.aiming);
+        // An emplaced gun's turret camera, while she mans one.
+        let turret = self.game.combat.manned.as_ref().and_then(|m| {
+            let w = self.game.scene.world.as_ref()?;
+            w.index.template_db.turret_cameras.get(&m.template).copied()
+        });
+        if turret != self.pad.turret_tuning {
+            self.pad.turret_camera = Default::default();
+        }
+        self.pad.turret_tuning = turret;
         // A tank's seat camera's look tuning, while she drives one.
         let tank = self
             .game
