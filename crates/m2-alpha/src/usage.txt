@@ -218,9 +218,11 @@ m2-alpha [options]
                          stands hit (unseen walls, steps in the ground)
   --wreck                with --drive: wreck the vehicle at speed at the
                          end and log how it comes to rest
-  --seat-check           with --screenshot (no --drive needed): stand at the
-                         nearest parked vehicle's gunner's own entrance
-                         (--vehicle narrows it), press use with getting in
+  --seat-check           with --screenshot (no --drive needed): park a
+                         --vehicle (default M151) with a gunner's own
+                         entrance near her if none is (trying its models one
+                         at a time), stand at that entrance, press use with
+                         getting in
                          locked, then unlocked, then use with getting out
                          locked, then unlocked; prints seat-check: PASS or
                          FAIL lines and seat-check: RESULT PASS/FAIL

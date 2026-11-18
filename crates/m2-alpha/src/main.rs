@@ -908,6 +908,8 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.drive = true;
                 o.board = true;
                 o.seat_check = true;
+                // The M151 unless `--vehicle` names another (either order).
+                o.vehicle.get_or_insert_with(|| "m151".to_owned());
             }
             "--swim-check" => o.swim_check = true,
             "--mine-check" => {
@@ -7368,13 +7370,21 @@ fn drive_for_screenshot(
     for _ in 0..90 {
         game.step(Intent::default(), tick);
     }
-    // A vehicle asked for that isn't parked here: one is parked.
+    // A vehicle asked for that isn't parked here: one is parked. With
+    // `--seat-check` it must have a gunner's own entrance (the island's
+    // own M151 Softtop has none), so the start position doesn't matter.
     if let Some(want) = &options.vehicle {
-        let have = |game: &Game| {
-            game.scene.vehicles.iter().any(|v| {
-                v.id.is_some() && v.spec.label.to_ascii_lowercase().contains(want.as_str())
-            })
+        let fits = |v: &crate::scene::ParkedVehicle| {
+            v.id.is_some()
+                && v.spec.label.to_ascii_lowercase().contains(want.as_str())
+                && (!options.seat_check
+                    || v.spec
+                        .seating
+                        .as_deref()
+                        .and_then(m2_engine::seats::gunner_entrance)
+                        .is_some())
         };
+        let have = |game: &Game| game.scene.vehicles.iter().any(fits);
         if !have(game) {
             let models: Vec<m2_engine::CatalogueEntry> = game
                 .scene
@@ -7396,7 +7406,45 @@ fn drive_for_screenshot(
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            if !models.is_empty() {
+            if options.seat_check {
+                // One model at a time: the first parked has a gunner's
+                // entrance, or the next is tried (its seats come from the
+                // first of its model's templates that has any).
+                for m in models {
+                    let placed = |game: &Game| {
+                        game.scene
+                            .vehicles
+                            .iter()
+                            .filter(|v| v.id.is_some())
+                            .count()
+                    };
+                    let before = placed(game);
+                    let label = m.label.clone();
+                    game.park_more(vec![m]);
+                    let waited = Instant::now();
+                    while placed(game) == before && waited.elapsed() < Duration::from_secs(30) {
+                        game.step(Intent::default(), tick);
+                        render(backend, game, fov, aspect, None)?;
+                    }
+                    for _ in 0..90 {
+                        game.step(Intent::default(), tick);
+                    }
+                    let ok = have(game);
+                    eprintln!(
+                        "seat-check: parked {label}: {}",
+                        if placed(game) == before {
+                            "not placed in 30 s"
+                        } else if ok {
+                            "has a gunner's own entrance"
+                        } else {
+                            "no gunner's own entrance, trying the next"
+                        }
+                    );
+                    if ok {
+                        break;
+                    }
+                }
+            } else if !models.is_empty() {
                 game.park_more(models);
                 let waited = Instant::now();
                 while !have(game) && waited.elapsed() < Duration::from_secs(90) {
@@ -7985,7 +8033,7 @@ fn seat_check(game: &mut Game, tick: f32, i: usize) {
         want_seat.camera.is_some(),
         format!("seat {:08x} has its CameraTurret record", want_seat.name),
     );
-    if label.contains("M151") {
+    if label.to_ascii_lowercase().contains("m151") {
         check(
             want_seat.name == M151_GUNNER.0 && want_seat.camera == Some(M151_GUNNER.1),
             format!(
