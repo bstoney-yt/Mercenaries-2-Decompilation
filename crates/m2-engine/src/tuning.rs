@@ -1262,6 +1262,77 @@ pub struct DamageTable {
     cells: Vec<f32>,
 }
 
+/// One of the game's other key-against-key tables, in the damage
+/// table's asset type ([`DAMAGE_TABLE_TYPE`]): `ParticleKey` (what
+/// effect a hit throws up, by the struck thing's `ParticleKey` row and
+/// the hit's column: `Vegetation` struck by a `Vehicle` throws
+/// `global_particle_impact_bullet_leaves`) and `SoundKey` (what is heard
+/// as two `SoundKey`s meet). Each cell is two words, the first a template
+/// or cue name hash (0 for none).
+///
+/// From the 360 code: one asset holds a table of a kind its `INFO`
+/// chunk says (0x821AF2F0: 1 the damage table, 2 the particle table,
+/// 3 the sound table, 4 to 6 others); the rows' count, the columns',
+/// their keys, then the cells two words each (0x823993F8 for the
+/// particle table; the same layout as the damage table's, at the same
+/// offsets here). A key the table lacks finds its first row or column
+/// (0x82398890). The sound table is looked up by both keys one way, then
+/// the other where that gives none (0x8235E850 -> 0x82398958).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct KeyTable {
+    rows: Vec<u32>,
+    columns: Vec<u32>,
+    cells: Vec<(u32, u32)>,
+}
+
+/// The particle table's asset name.
+pub const PARTICLE_TABLE: &str = "ParticleKey";
+/// The sound table's asset name.
+pub const SOUND_TABLE: &str = "SoundKey";
+
+impl KeyTable {
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        let word = |at: usize| -> Option<u32> {
+            let b = data.get(at..at + 4)?;
+            Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        let (rows, columns) = (word(0x48)? as usize, word(0x4c)? as usize);
+        if rows == 0 || columns == 0 || rows * columns > 1 << 16 {
+            return None;
+        }
+        let keys = |from: usize, n: usize| {
+            (0..n)
+                .map(|i| word(from + 4 * i))
+                .collect::<Option<Vec<_>>>()
+        };
+        let cells = 0x50 + 4 * (rows + columns);
+        Some(Self {
+            rows: keys(0x50, rows)?,
+            columns: keys(0x50 + 4 * rows, columns)?,
+            cells: (0..rows * columns)
+                .map(|i| Some((word(cells + 8 * i)?, word(cells + 8 * i + 4)?)))
+                .collect::<Option<Vec<_>>>()?,
+        })
+    }
+
+    /// Cell `row` by `column` (keys missing find the first row or column,
+    /// as the 360's lookup does), its first word; `None` for 0.
+    pub fn get(&self, row: u32, column: u32) -> Option<u32> {
+        let r = self.rows.iter().position(|&k| k == row).unwrap_or(0);
+        let c = self.columns.iter().position(|&k| k == column).unwrap_or(0);
+        self.cells
+            .get(r * self.columns.len() + c)
+            .map(|c| c.0)
+            .filter(|&v| v != 0)
+    }
+
+    /// The cell for keys `a` and `b` one way, else the other (the sound
+    /// table's lookup).
+    pub fn either(&self, a: u32, b: u32) -> Option<u32> {
+        self.get(a, b).or_else(|| self.get(b, a))
+    }
+}
+
 /// The damage table's asset type.
 pub const DAMAGE_TABLE_TYPE: u32 = 0xde98_2d61;
 /// The damage table's asset name.
@@ -2234,6 +2305,30 @@ pub fn cover_hints(db: &Layer<'_>) -> HashMap<u32, Vec<crate::ai_cover::Hint>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_key_table_finds_its_cell_and_either_way_round() {
+        // Two rows, two columns, two words a cell, as the asset lays it out.
+        let mut d = vec![0u8; 0x48];
+        for w in [2u32, 2, 0xa, 0xb, 0xc, 0xd, 1, 0, 2, 0, 0, 0, 4, 0] {
+            d.extend(w.to_le_bytes());
+        }
+        let t = KeyTable::parse(&d).unwrap();
+        assert_eq!(t.get(0xa, 0xc), Some(1));
+        assert_eq!(t.get(0xa, 0xd), Some(2));
+        assert_eq!(t.get(0xb, 0xc), None, "0 is none");
+        assert_eq!(t.get(0xb, 0xd), Some(4));
+        // A key it lacks finds the first row or column.
+        assert_eq!(t.get(0x99, 0xd), Some(2));
+        // Either way round: one way, else the other.
+        assert_eq!(t.either(0xb, 0xd), Some(4));
+        assert_eq!(
+            t.either(0xd, 0xb),
+            Some(1),
+            "neither key there: the first row and column"
+        );
+    }
+
     use super::*;
 
     // The field names hash to the keys the AMX-30's components use.

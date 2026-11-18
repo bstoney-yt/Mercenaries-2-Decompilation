@@ -52,15 +52,47 @@ pub struct SubmitStats {
 }
 
 /// Collects one frame's primitives and submits them in sort order.
+type Lists = (Vec<(SortKey, Primitive)>, Vec<(SortKey, u32)>);
+
+thread_local! {
+    /// The lists of the last [`DrawQueue`] dropped on this thread.
+    static SPARE: std::cell::Cell<Option<Lists>> = const { std::cell::Cell::new(None) };
+}
+
 #[derive(Debug, Default)]
 pub struct DrawQueue {
     entries: Vec<(SortKey, Primitive)>,
+    /// Once sorted: each entry's key and place in `entries`, in draw
+    /// order. The entries stay where they were pushed: moving a few
+    /// thousand draw calls of some 200 bytes about in a stable sort cost
+    /// more than sorting these pairs.
+    order: Vec<(SortKey, u32)>,
     stage: Stage,
 }
 
+impl Drop for DrawQueue {
+    fn drop(&mut self) {
+        let lists = (
+            std::mem::take(&mut self.entries),
+            std::mem::take(&mut self.order),
+        );
+        SPARE.set(Some(lists));
+    }
+}
+
 impl DrawQueue {
+    /// An empty queue, with the lists of the last queue dropped on this
+    /// thread if any: a frame's queue grows to megabytes, and growing it
+    /// from nothing each frame copies and maps it afresh.
     pub fn new() -> Self {
-        Self::default()
+        let (mut entries, mut order) = SPARE.take().unwrap_or_default();
+        entries.clear();
+        order.clear();
+        Self {
+            entries,
+            order,
+            stage: Stage::Collecting,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -97,14 +129,27 @@ impl DrawQueue {
         if self.stage == Stage::Collecting {
             return Err(QueueError::NotKeyed);
         }
-        self.entries.sort_by_key(|&(key, _)| key);
+        self.order.clear();
+        self.order.extend(
+            self.entries
+                .iter()
+                .enumerate()
+                .map(|(i, &(key, _))| (key, i as u32)),
+        );
+        // Unstable is safe: no two pairs are equal, and an equal key's
+        // place breaks the tie, so equal keys keep their push order.
+        self.order.sort_unstable();
         self.stage = Stage::Sorted;
         Ok(())
     }
 
     /// Keys in their current order.
-    pub fn keys(&self) -> impl Iterator<Item = SortKey> + '_ {
-        self.entries.iter().map(|&(key, _)| key)
+    pub fn keys(&self) -> Box<dyn Iterator<Item = SortKey> + '_> {
+        if self.stage == Stage::Sorted {
+            Box::new(self.order.iter().map(|&(key, _)| key))
+        } else {
+            Box::new(self.entries.iter().map(|&(key, _)| key))
+        }
     }
 
     /// Sends every primitive to `backend` in order and empties the queue,
@@ -118,7 +163,9 @@ impl DrawQueue {
         }
         let mut stats = SubmitStats::default();
         let mut last_material: Option<MaterialId> = None;
-        let result = self.entries.iter().try_for_each(|(_, p)| {
+        let entries = &self.entries;
+        let result = self.order.iter().try_for_each(|&(_, i)| {
+            let p = &entries[i as usize].1;
             backend.draw(&p.call)?;
             stats.draws += 1;
             if last_material != Some(p.call.material) {
@@ -128,6 +175,7 @@ impl DrawQueue {
             Ok(())
         });
         self.entries.clear();
+        self.order.clear();
         self.stage = Stage::Collecting;
         result.map(|()| stats)
     }

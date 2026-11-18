@@ -319,6 +319,26 @@ pub fn sound_keys(db: &Layer<'_>) -> HashMap<u32, u32> {
         .collect()
 }
 
+/// Each template's `ParticleKey`, by id: the whole object's (its record
+/// with no `Name`), else its first: what a hit on it throws up by the
+/// particle table ([`crate::tuning::KeyTable`]; `Vegetation` on the
+/// bushes and plants, `Vehicle` on every vehicle checked).
+pub fn particle_keys(db: &Layer<'_>) -> HashMap<u32, u32> {
+    let t = Table::new(db, "ParticleKey");
+    let (field, name) = (name_hash("ParticleKey"), name_hash("Name"));
+    t.templates()
+        .filter_map(|id| {
+            let records = t.of_template(id);
+            let r = records
+                .iter()
+                .find(|r| t.word(r, name).unwrap_or(0) == 0)
+                .or_else(|| records.first())?;
+            let key = t.word(r, field)?;
+            (key != 0).then_some((id, key))
+        })
+        .collect()
+}
+
 /// `OSMParameter`'s value field (name unknown): with `Name` `PropTemplate`
 /// or `DebrisTemplate`, the name hash of a template.
 const OSM_VALUE: u32 = 0x255f_12c0;
@@ -523,6 +543,11 @@ pub fn crash_damage(size: f32, cell: f32) -> f32 {
 pub fn crash_base(size: f32) -> f32 {
     if size < CRASH_FLOOR { 0.0 } else { size * 0.01 }
 }
+
+/// The key the ground's side of a crash has (the damage table's
+/// `Terrain` column). From the 360 code: the collision event takes
+/// 0x19FC10AC, `name_hash("Terrain")`, for a body of kind 13 (0x82162BB8).
+pub const TERRAIN_KEY: &str = "Terrain";
 
 /// A ram's kind of damage where its vehicle's template names none: `Car`,
 /// the damage table's column every vehicle template that names a
