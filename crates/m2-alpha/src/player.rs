@@ -2256,6 +2256,7 @@ mod tests {
             height: 1.4,
             pitch: -0.15,
             pitch_range: (-0.4, 0.45),
+            look: None,
         });
         let rig = ChaseRig::of(&spec);
         assert!(

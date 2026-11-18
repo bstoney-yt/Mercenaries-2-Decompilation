@@ -10261,6 +10261,18 @@ impl Running {
         self.pad.pda = (self.game.support.pda || store) && !self.hud.menu;
         // Aiming in, the camera turns by its aimed presets.
         self.pad.aiming = self.game.scene.player.as_ref().is_some_and(|p| p.aiming);
+        // A tank's seat camera's look tuning, while she drives one.
+        let tank = self
+            .game
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| p.driving)
+            .and_then(|i| self.game.scene.vehicles.get(i)?.spec.tuning.camera?.look);
+        if tank != self.pad.tank_tuning {
+            self.pad.tank_camera = Default::default();
+        }
+        self.pad.tank_tuning = tank;
         // Her pitch, and the held item's camera row (its template's
         // `HumanCameraModifier`; none known: row 0).
         if let Some(p) = self.game.scene.player.as_ref() {

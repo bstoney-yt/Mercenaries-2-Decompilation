@@ -1422,6 +1422,9 @@ pub struct TankCamera {
     /// `MaxPitch`).
     pub pitch: f32,
     pub pitch_range: (f32, f32),
+    /// How the right stick turns it ([`crate::pad_camera::TankLook`]):
+    /// `YawSpeed`, `PitchSpeed` and the input inertias.
+    pub look: Option<crate::pad_camera::TankLookTuning>,
 }
 
 /// A main gun: the weapon its `PhysicalLink` mounts, the ammunition that
@@ -1940,6 +1943,18 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                             camera.float(r, name_hash("MinPitch"))?,
                             camera.float(r, name_hash("MaxPitch"))?,
                         ),
+                        look: (|| {
+                            let f = |n: &str| camera.float(r, name_hash(n));
+                            Some(crate::pad_camera::TankLookTuning {
+                                yaw_speed: f("YawSpeed")?,
+                                pitch_speed: f("PitchSpeed")?,
+                                keep: [
+                                    f("InputInertiaDefault")?,
+                                    f("InputInertiaDifferentSign")?,
+                                    f("InputInertiaNoInput")?,
+                                ],
+                            })
+                        })(),
                     })
                 })(),
                 // Its main gun: of the weapons it mounts, the slowest to
