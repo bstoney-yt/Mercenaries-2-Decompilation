@@ -23,8 +23,8 @@ use std::rc::Rc;
 
 use super::text::{EditText, Font, FontBook, layout};
 use super::{
-    Bits, ColourTransform, Corners, Image, Matrix, MorphShape, Shape, ShapeTriangle, Triangle,
-    bounds, draw_shape, tags,
+    Bits, ColourTransform, Corners, Fill, GradientImage, Image, Matrix, MorphShape, Shape,
+    ShapeTriangle, Triangle, bounds, draw_shape, tags,
 };
 use crate::gfx::{Character, Movie, tag};
 
@@ -214,9 +214,27 @@ pub struct Library {
     /// `DoInitAction` scripts: the sprite they belong to, and the bytes.
     pub init_scripts: Vec<(u16, Rc<[u8]>)>,
     pub root: Rc<Timeline>,
+    /// The exporter's textures for its gradients, by gradient number, when
+    /// its exporter info says gradients were exported (flag 0x02).
+    pub gradient_images: HashMap<u16, GradientImage>,
+    /// Gradient records its shapes have read so far.
+    pub(super) gradients_read: u16,
 }
 
 impl Library {
+    /// A shape of this movie's drawn through `matrix` and `colour`, its
+    /// bitmap fills from the images the movie names ([`super::draw_shape`]).
+    pub fn draw_shape(
+        &self,
+        shape: &Shape,
+        mesh: &[ShapeTriangle],
+        matrix: &Matrix,
+        colour: &ColourTransform,
+        out: &mut Vec<Triangle>,
+    ) {
+        draw_shape(shape, mesh, &self.images, matrix, colour, None, out);
+    }
+
     /// What `movie` defines.
     pub fn new(movie: &Movie) -> Self {
         let (w, h) = movie.frame_size.size_px();
@@ -285,6 +303,20 @@ impl Library {
         for (_, id, name) in summary.imports {
             lib.font_imports.push((id, name));
         }
+        // The exporter's gradient textures stand in for the movie's
+        // gradients when its flags say so (0x8279A640, 0x827864C8).
+        let exported = summary.exporter.as_ref().is_some_and(|x| x.1 & 2 != 0);
+        if exported {
+            for t in movie
+                .tags
+                .iter()
+                .filter(|t| t.code == tag::GFX_DEFINE_EXTERNAL_GRADIENT)
+            {
+                if let Some((id, image)) = external_gradient(movie.data(t)) {
+                    lib.gradient_images.insert(id, image);
+                }
+            }
+        }
         let tags: Vec<(u16, &[u8])> = movie.tags.iter().map(|t| (t.code, movie.data(t))).collect();
         lib.add(&tags);
         lib.root = Rc::new(Timeline::parse(&tags));
@@ -345,11 +377,37 @@ impl Library {
                 }
                 _ => continue,
             };
-            let (id, shape) = Shape::parse(data, version);
+            let (id, mut shape) = Shape::parse(data, version);
+            for f in &mut shape.fills {
+                if let Fill::Gradient(g) = f {
+                    let n = self.gradients_read.wrapping_add(g.index);
+                    g.image = self.gradient_images.get(&n).cloned();
+                }
+            }
+            self.gradients_read = self.gradients_read.wrapping_add(shape.gradients);
             let mesh = shape.mesh();
             self.shapes.insert(id, (shape, mesh));
         }
     }
+}
+
+/// A `DefineExternalGradient` tag's gradient number and texture: the
+/// number, the bitmap format, the size and the file's name (a length byte
+/// and its characters).
+fn external_gradient(data: &[u8]) -> Option<(u16, GradientImage)> {
+    let word = |i: usize| data.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let id = word(0)?;
+    let size = word(4)?;
+    let len = usize::from(*data.get(6)?);
+    let name = std::str::from_utf8(data.get(7..7 + len)?).ok()?;
+    let texture = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    Some((
+        id,
+        GradientImage {
+            texture: texture.to_owned(),
+            size,
+        },
+    ))
 }
 
 /// Where scripts see the timeline's depths: depth 1 of a timeline is

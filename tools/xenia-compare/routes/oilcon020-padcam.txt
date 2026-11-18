@@ -1,0 +1,43 @@
+# OilCon020 by the game's Mission skip, then get into the Phoenix (Racing) 19 m away.
+wait 25
+pokestr 83133F98 OilCon020
+poke 82B7C953 0
+tap_until start Continue_without 90
+wait 2
+press up 0.3
+wait 1
+press a 0.3
+until NOTICE 30 2
+press a 0.3
+until new_game 60 2
+press a 0.3
+until Mattias 30 2
+press a 0.3
+until Tough_Merc 30 2
+press a 0.3
+tap_until a Steal 150
+trackhero
+mark OilCon020 start
+wait 4
+ocr start
+stickresp2 rifle
+press rs 0.15
+wait 1.5
+ocr aim
+stickresp2 aim y1 y-1 x0.75
+press rs 0.15
+wait 1
+ocr unaim
+press rb 0.2
+wait 2
+ocr w1
+stickresp2 w1 x0.75
+press rb 0.2
+wait 2
+ocr w2
+stickresp2 w2 x0.75
+press rb 0.2
+wait 2
+ocr w3
+stickresp2 w3 x0.75
+mark done

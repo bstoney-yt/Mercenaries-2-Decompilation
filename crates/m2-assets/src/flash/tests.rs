@@ -355,6 +355,7 @@ fn a_mask_shows_through_its_shape_not_its_box() {
         colour: [1.0; 4],
         texture: Some("t".into()),
         multiply: true,
+        clamp: false,
     };
     let content = [
         square([0.0, 0.0], [20.0, 0.0], [20.0, 20.0]),
@@ -1436,4 +1437,214 @@ fn the_stage_answers_the_movies_own_size() {
     let mut rt = run(&a, Vec::new());
     assert_eq!(number(&var(&mut rt, "w")), 100.0);
     assert_eq!(number(&var(&mut rt, "h")), 100.0);
+}
+
+/// A `DefineShape3` (id 7) with one gradient fill of fill type `kind`:
+/// its square scaled to `side` twips and moved by `tx` twips, the
+/// interpolation-and-count byte `head`, the stops, a focal point if
+/// focal; then a `side`-twip square filled with it.
+fn gradient_shape(kind: u8, side: i32, tx: i32, head: u8, stops: &[(u8, [u8; 4])]) -> Vec<u8> {
+    let mut w = Writer::default();
+    w.u16(7);
+    w.rect(0, side, 0, side);
+    w.u8(1);
+    w.u8(kind);
+    // MATRIX: scale side / 32768 both ways (16.16), no rotation, moved.
+    w.align();
+    w.ub(1, 1);
+    w.ub(5, 20);
+    let scale = (i64::from(side) * 65536 / 32768) as i32;
+    w.sb(20, scale);
+    w.sb(20, scale);
+    w.ub(1, 0);
+    w.ub(5, 16);
+    w.sb(16, tx);
+    w.sb(16, 0);
+    w.u8(head);
+    for (ratio, c) in stops {
+        w.u8(*ratio);
+        for v in c {
+            w.u8(*v);
+        }
+    }
+    if kind == 0x13 {
+        // -0.5 in 8.8.
+        w.u16((-128i16) as u16);
+    }
+    w.u8(0);
+    w.align();
+    w.ub(4, 2);
+    w.ub(4, 0);
+    w.style_change(Some((0, 0)), None, Some(1));
+    w.line_to(side, 0);
+    w.line_to(0, side);
+    w.line_to(-side, 0);
+    w.line_to(0, -side);
+    w.end();
+    w.bytes
+}
+
+#[test]
+fn a_gradient_fill_reads_its_stops_mode_and_square() {
+    let stops = [(0, [255, 0, 0, 255]), (255, [0, 0, 255, 128])];
+    // Reflect spread (0x40) and linear RGB (0x10), two stops.
+    let data = gradient_shape(0x13, 200, 100, 0x40 | 0x10 | 2, &stops);
+    let (id, s) = Shape::parse(&data, 3);
+    assert_eq!(id, 7);
+    assert_eq!(s.gradients, 1);
+    let Fill::Gradient(g) = &s.fills[1] else {
+        panic!("not a gradient: {:?}", s.fills[1]);
+    };
+    assert_eq!(g.kind, GradientKind::Focal(-0.5));
+    assert!(g.linear_rgb);
+    assert_eq!(g.stops, stops.to_vec());
+    assert_eq!(g.index, 0);
+    assert_eq!(g.image, None);
+    // The unit square spans the 10 px shape: -1 at 0 px, 1 at 10 px.
+    assert_eq!(g.matrix.apply([-1.0, -1.0]), [0.0, -5.0]);
+    assert_eq!(g.matrix.apply([1.0, 1.0]), [10.0, 5.0]);
+    // Its mesh is drawn with a texture made from it, clamped.
+    let mut out = Vec::new();
+    draw_shape(
+        &s,
+        &s.mesh(),
+        &HashMap::new(),
+        &Matrix::IDENTITY,
+        &ColourTransform::IDENTITY,
+        None,
+        &mut out,
+    );
+    assert!(!out.is_empty());
+    for t in &out {
+        assert_eq!(t.texture.as_deref(), Some(g.texture_name().as_str()));
+        assert!(t.clamp);
+        assert_eq!(t.colour, [1.0; 4]);
+    }
+}
+
+#[test]
+fn a_linear_gradient_runs_across_its_square() {
+    let stops = [(0, [0, 0, 0, 255]), (255, [255, 255, 255, 255])];
+    let data = gradient_shape(0x10, 200, 100, 2, &stops);
+    let (_, s) = Shape::parse(&data, 3);
+    let mut out = Vec::new();
+    draw_shape(
+        &s,
+        &s.mesh(),
+        &HashMap::new(),
+        &Matrix::IDENTITY,
+        &ColourTransform::IDENTITY,
+        None,
+        &mut out,
+    );
+    // u is x / 10 px across the 256-texel ramp.
+    for t in &out {
+        for (p, uv) in t.corners.iter().zip(t.uv) {
+            assert!((uv[0] - p[0] / 10.0).abs() < 1e-5, "{p:?} {uv:?}");
+            assert_eq!(uv[1], 0.5);
+        }
+    }
+}
+
+/// A tag's header and body.
+fn tag_bytes(code: u16, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    if body.len() < 0x3f {
+        out.extend((code << 6 | body.len() as u16).to_le_bytes());
+    } else {
+        out.extend((code << 6 | 0x3f).to_le_bytes());
+        out.extend((body.len() as u32).to_le_bytes());
+    }
+    out.extend_from_slice(body);
+    out
+}
+
+/// A movie with the given exporter flags, an exported gradient texture
+/// `m_G0` for gradient 0, and a solid shape (8) before a gradient shape
+/// (7).
+fn exported_gradient_movie(flags: u32) -> crate::gfx::Movie {
+    use crate::gfx::tag;
+    let mut info = Vec::new();
+    info.extend(0x10au16.to_le_bytes());
+    info.extend(flags.to_le_bytes());
+    info.extend(13u16.to_le_bytes());
+    info.push(0);
+    info.push(1);
+    info.push(b'm');
+    let mut external = Vec::new();
+    external.extend(0u16.to_le_bytes());
+    external.extend(13u16.to_le_bytes());
+    external.extend(256u16.to_le_bytes());
+    external.push(8);
+    external.extend_from_slice(b"m_G0.tga");
+    let solid = {
+        // A shape tag with no gradients, read before the gradient one.
+        let mut w = Writer::default();
+        w.u16(8);
+        w.rect(0, 20, 0, 20);
+        w.u8(0);
+        w.u8(0);
+        w.align();
+        w.ub(4, 0);
+        w.ub(4, 0);
+        w.end();
+        w.bytes
+    };
+    let stops = [(0, [0, 0, 0, 255]), (255, [255, 255, 255, 255])];
+    let mut tags = Vec::new();
+    tags.extend(tag_bytes(tag::GFX_EXPORTER_INFO, &info));
+    tags.extend(tag_bytes(tag::GFX_DEFINE_EXTERNAL_GRADIENT, &external));
+    tags.extend(tag_bytes(tag::DEFINE_SHAPE3, &solid));
+    tags.extend(tag_bytes(
+        tag::DEFINE_SHAPE3,
+        &gradient_shape(0x10, 200, 100, 2, &stops),
+    ));
+    tags.extend(tag_bytes(tag::END, &[]));
+    let mut header = Writer::default();
+    header.rect(0, 200, 0, 200);
+    header.u16(30 << 8);
+    header.u16(1);
+    let mut bytes = b"FWS".to_vec();
+    bytes.push(8);
+    let len = 8 + header.bytes.len() + tags.len();
+    bytes.extend((len as u32).to_le_bytes());
+    bytes.extend(header.bytes);
+    bytes.extend(tags);
+    crate::gfx::Movie::parse(&bytes).expect("movie")
+}
+
+#[test]
+fn exported_gradients_are_drawn_with_the_exporters_texture() {
+    let lib = Library::new(&exported_gradient_movie(0x13));
+    assert_eq!(
+        lib.gradient_images.get(&0),
+        Some(&GradientImage {
+            texture: "m_G0".into(),
+            size: 256,
+        })
+    );
+    let (s, mesh) = &lib.shapes[&7];
+    let Fill::Gradient(g) = &s.fills[1] else {
+        panic!("not a gradient");
+    };
+    assert_eq!(g.texture_name(), "m_G0");
+    let mut out = Vec::new();
+    lib.draw_shape(
+        s,
+        mesh,
+        &Matrix::IDENTITY,
+        &ColourTransform::IDENTITY,
+        &mut out,
+    );
+    assert!(
+        out.iter()
+            .all(|t| t.texture.as_deref() == Some("m_G0") && t.clamp)
+    );
+    // Without the exporter flag 0x02 the player makes its own.
+    let lib = Library::new(&exported_gradient_movie(0x11));
+    assert!(lib.gradient_images.is_empty());
+    let Fill::Gradient(g) = &lib.shapes[&7].0.fills[1] else {
+        panic!("not a gradient");
+    };
+    assert!(g.texture_name().starts_with(gradient::MADE_PREFIX));
 }
