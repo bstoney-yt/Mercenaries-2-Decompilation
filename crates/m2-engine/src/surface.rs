@@ -72,6 +72,11 @@ const BULLET_IMPACTS: [(&str, &str); 20] = [
 /// Named surface words with no bullet impact of their own.
 const OTHER_WORDS: [&str; 3] = ["FABRIC", "RUBBER", "NONE"];
 
+/// The named surface words.
+pub fn words() -> impl Iterator<Item = &'static str> {
+    BULLET_IMPACTS.iter().map(|(w, _)| *w).chain(OTHER_WORDS)
+}
+
 /// A surface's word, if it is one of the named ones.
 pub fn word(surface: u32) -> Option<&'static str> {
     BULLET_IMPACTS

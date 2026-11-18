@@ -378,6 +378,10 @@ pub struct Pad {
     pub camera: m2_engine::pad_camera::LookCamera,
     /// A car's or a boat's chase camera's look ([`Mode::Car`]).
     pub car_camera: m2_engine::pad_camera::CarLook,
+    /// A tank's: its seat's look tuning (set while she drives one with a
+    /// `CameraTank`) and its state ([`Mode::Tank`]).
+    pub tank_tuning: Option<m2_engine::pad_camera::TankLookTuning>,
+    pub tank_camera: m2_engine::pad_camera::TankLook,
     /// She is aiming in: the camera's aimed presets.
     pub aiming: bool,
     /// The held item's camera row ([`m2_engine::pad_camera::camera_row`]),
@@ -600,6 +604,14 @@ impl Pad {
         if mode == Mode::OnFoot {
             let (yaw, pitch) = self.look_on_foot(&s, dt as f32);
             input.pad_turn(yaw, pitch);
+        } else if let (Mode::Tank, Some(t)) = (mode, self.tank_tuning) {
+            // As the 360's tank camera turns: its seat's speeds and
+            // inertia, linear ([`m2_engine::pad_camera::TankLook`]).
+            let [x, y] = s.right_raw;
+            let y = if self.invert { -y } else { y };
+            let stick = m2_engine::pad_camera::stick(x, y);
+            let (yaw, pitch) = self.tank_camera.step(stick, &t, dt as f32);
+            input.pad_turn(f64::from(yaw), f64::from(pitch));
         } else if mode == Mode::Car {
             // As the 360's car camera turns: the camera's own dead zone,
             // eased, linear ([`m2_engine::pad_camera::CarLook`]).

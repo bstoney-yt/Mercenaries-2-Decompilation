@@ -605,9 +605,128 @@ impl CarLook {
     }
 }
 
+/// A tank seat's camera's stick look, as the 360's (the `CameraTank`
+/// camera, class 0x820F0338, built by 0x824C8500 from the seat's record,
+/// 0x8243EAC0): its `YawSpeed` and `PitchSpeed` and its input inertias
+/// (`InputInertiaDefault`, `...DifferentSign`, `...NoInput`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TankLookTuning {
+    pub yaw_speed: f32,
+    pub pitch_speed: f32,
+    pub keep: [f32; 3],
+}
+
+/// The tank camera's rate scale: its speeds are per thirtieth of a
+/// second (0x820BB1F8, 30, in 0x824C86E0).
+pub const TANK_RATE_SCALE: f32 = 30.0;
+
+/// An axis's input inertia with three keeps (0x824B9BD8): with input of
+/// the same sign as its value the first, of the other sign (or from
+/// rest) the second (unless it is 0: then the value starts from 0 at the
+/// first), with none after none the third.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Inertia3 {
+    pub value: f32,
+    idle: bool,
+}
+
+impl Inertia3 {
+    pub fn step(&mut self, input: f32, keep: &[f32; 3], dt: f32) {
+        let none = input == 0.0;
+        let k = if none && self.idle {
+            keep[2]
+        } else if self.value * input <= 0.0 {
+            if keep[1] == 0.0 {
+                self.value = 0.0;
+                keep[0]
+            } else {
+                keep[1]
+            }
+        } else {
+            keep[0]
+        };
+        self.value = approach(self.value, input, k, dt);
+        self.idle = none;
+    }
+}
+
+/// A tank seat's camera's stick look (0x824C86E0).
+///
+/// From the 360 code: its handler (0x824C8AD0) keeps the look-yaw input
+/// (the stick's x after [`stick`]) at +0x604 and the look-pitch (its y)
+/// at +0x600; each update eases each through [`Inertia3`] with the
+/// seat's keeps (+0x610, +0x628) and turns the yaw by `YawSpeed` (+0x644)
+/// and the pitch by `PitchSpeed` (+0x648) times the eased input times
+/// the time times 30 ([`TANK_RATE_SCALE`]): no curve. The pitch is held
+/// to `MinPitch`..`MaxPitch` from the hull's (+0x64C, +0x650).
+///
+/// **Inferred**: the pitch's sign (the stick's up looks up, as on foot).
+/// **Not ported**: the approach back inside the limits when the hull
+/// tilts the view out of them (by `0.99 (1 - yaw input^2)`), and the
+/// reset that lines the view up again (+0x640).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TankLook {
+    pub yaw: Inertia3,
+    pub pitch: Inertia3,
+}
+
+impl TankLook {
+    /// A step of `dt` seconds with the stick at `stick` (after
+    /// [`stick`]): the yaw turned and the pitch moved, radians.
+    pub fn step(&mut self, stick: [f32; 2], t: &TankLookTuning, dt: f32) -> (f32, f32) {
+        self.yaw.step(stick[0], &t.keep, dt);
+        self.pitch.step(stick[1], &t.keep, dt);
+        (
+            t.yaw_speed * self.yaw.value * dt * TANK_RATE_SCALE,
+            t.pitch_speed * self.pitch.value * dt * TANK_RATE_SCALE,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tank_camera_turns_at_its_seats_speed_eased_by_its_inertia() {
+        // The LAV III's seat: 0.1 and 0.1, keeps 0.975, 0.9 and 0.8.
+        let lav = TankLookTuning {
+            yaw_speed: 0.1,
+            pitch_speed: 0.1,
+            keep: [0.975, 0.9, 0.8],
+        };
+        let dt = 1.0 / 60.0;
+        let rate = |tilt: f32, secs: f32| {
+            let mut c = TankLook::default();
+            let mut last = 0.0;
+            for _ in 0..(secs / dt).round() as usize {
+                last = c.step(stick(tilt, 0.0), &lav, dt).0;
+            }
+            last.to_degrees() / dt
+        };
+        // Full: 3 rad/s (172 deg/s) once eased; slow to ease, a starting
+        // stick taking the other-sign keep 0.9 then the same-sign 0.975.
+        assert!((rate(1.0, 5.0) - 171.9).abs() < 1.0, "{}", rate(1.0, 5.0));
+        assert!(
+            rate(1.0, 0.5) < 160.0 && rate(1.0, 0.5) > 60.0,
+            "{}",
+            rate(1.0, 0.5)
+        );
+        // Linear past the dead zone: 0.75 tilt 0.554 of it.
+        assert!((rate(0.75, 5.0) - 95.2).abs() < 1.0, "{}", rate(0.75, 5.0));
+        assert_eq!(rate(0.4, 2.0), 0.0);
+        // An AMX-30's 0.04: 69 deg/s.
+        let amx = TankLookTuning {
+            yaw_speed: 0.04,
+            ..lav
+        };
+        let mut c = TankLook::default();
+        let mut a = 0.0;
+        for _ in 0..600 {
+            a = c.step(stick(1.0, 0.0), &amx, dt).0;
+        }
+        assert!((a.to_degrees() / dt - 68.75).abs() < 0.5);
+    }
 
     /// The car camera held at `tilt` along x (or y) for `secs`: degrees
     /// a second over the last half second.
