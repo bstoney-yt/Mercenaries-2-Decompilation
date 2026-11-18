@@ -6771,6 +6771,7 @@ pub(crate) mod tests {
             tiny_members: Vec::new(),
             sinks: Vec::new(),
             breakup: None,
+            node_pieces: None,
             parts: None,
             state_fx: Default::default(),
             part_states: None,

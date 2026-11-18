@@ -1048,6 +1048,10 @@ pub struct CpuModel {
     /// [`from_data`](Self::from_data) nor [`build`](Self::build) works it
     /// out (the island's thousands of models have no use for it).
     pub breakup: Option<std::sync::Arc<crate::Breakup>>,
+    /// The parts its states send off as objects of their own, for those
+    /// who want them ([`crate::node_debris::NodePieces::of`]); as
+    /// [`breakup`](Self::breakup), not worked out by `from_data`.
+    pub node_pieces: Option<std::sync::Arc<crate::node_debris::NodePieces>>,
     /// Its parts a vehicle breaks one at a time, when its state machine
     /// has more than one ([`ModelParts`]).
     pub parts: Option<std::sync::Arc<ModelParts>>,
@@ -1403,6 +1407,7 @@ impl CpuModel {
                 .filter(|s| !s.collapsing.is_empty())
                 .map_or_else(Vec::new, |s| s.sinking(&model.nodes)),
             breakup: None,
+            node_pieces: None,
             parts,
             state_fx: std::sync::Arc::new(StateFx::of(model)),
             part_states: model.states.as_ref().map(|st| {

@@ -162,10 +162,10 @@ impl Runner {
                 self.deliver_to(other, message, depth + 1);
             }
         }
-        for &(to, node) in &acts.creates {
-            if let Some(other) = self.by_node(node) {
+        for c in &acts.creates {
+            if let Some(other) = self.by_node(c.node) {
                 self.machines[other].sent_off = true;
-                self.enter(other, to, depth + 1);
+                self.enter(other, c.state, depth + 1);
             }
         }
         for &(to, node, a, b) in &acts.delayed {
@@ -344,7 +344,11 @@ mod tests {
                 (
                     COLLAPSE_FIRE,
                     StateActs {
-                        creates: vec![(FIRE_DEBRIS, 14)],
+                        creates: vec![m2_assets::model::Create {
+                            state: FIRE_DEBRIS,
+                            node: 14,
+                            ..Default::default()
+                        }],
                         ..Default::default()
                     },
                 ),
