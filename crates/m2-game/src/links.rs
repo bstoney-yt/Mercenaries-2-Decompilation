@@ -138,6 +138,44 @@ pub fn physical_links(layer: &m2_assets::layer::Layer<'_>) -> Vec<(u32, (u32, u3
         .collect()
 }
 
+/// The child templates a template's own `PhysicalLink` records name, by
+/// the parent template's name in lower case: (link name hash, child
+/// template name). `ammo_designator_beacon` (the Beacon Designator's
+/// thrown ammo) names `ammo_designator_beacon_light`, which carries the
+/// `beacon` script.
+///
+/// From the 360 code: spawning a template (0x82409AA8) takes the next
+/// guid and instances it (0x82408C30). The instancing walks the
+/// template's records in store 0x83653EC0 and, for each whose first word
+/// is a template id (high bit set), spawns that template the same way
+/// (0x82409AA8) and links it to the new object: one entry in store
+/// 0x83656100 and one in the link table 0x83656008, keyed by the parent
+/// with the child as second key and the record's second word as the
+/// entry's. That 0x83653EC0 holds the template database's `PhysicalLink`
+/// records is from samples: they have the same layout (child +0, name
+/// +4) as the layers' (store 0x8365136C, read the same way into the
+/// same table), and the beacon's names a template there.
+pub fn template_children(
+    db: &m2_assets::layer::Layer<'_>,
+) -> std::collections::HashMap<String, Vec<(u32, String)>> {
+    let names = db.names();
+    let mut out: std::collections::HashMap<String, Vec<(u32, String)>> =
+        std::collections::HashMap::new();
+    for (parent, (key, child)) in physical_links(db) {
+        // Only a template id is spawned (the 360's sign test).
+        if child & 0x8000_0000 == 0 {
+            continue;
+        }
+        let (Some(p), Some(c)) = (names.get(&parent), names.get(&child)) else {
+            continue;
+        };
+        out.entry(p.to_ascii_lowercase())
+            .or_default()
+            .push((key, (*c).to_owned()));
+    }
+    out
+}
+
 pub(crate) fn install(
     lib: &dyn Fn(&str) -> mlua::Result<Table>,
     add: &dyn Fn(&Table, &str, Handler) -> mlua::Result<()>,

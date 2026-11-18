@@ -2,6 +2,7 @@
 //! controller, with a third-person camera behind her.
 
 use m2_engine::on_foot::{self, AimLegs, HumanMotion, Pace, RunStop, Start, StopEvent, Turn};
+use m2_engine::pad_camera::PITCH_RANGE;
 use m2_engine::{Character, Gait, GpuModel, Physics, VehicleId, VehicleSpec};
 use m2_math::glam::{Mat4, Vec2, Vec3};
 use m2_render::View;
@@ -119,6 +120,9 @@ pub struct ChaseRig {
     /// How far above the camera's line the crosshair (and the gun's aim)
     /// sits, radians.
     pub aim_lift: f32,
+    /// A car's or a boat's 360 camera preset: its drift back behind it and
+    /// its pitch, as the 360's ([`m2_engine::pad_camera::CarFollow`]).
+    pub car: Option<m2_engine::pad_camera::CarPreset>,
 }
 
 /// How far above the middle of the screen a tank's crosshair sits,
@@ -147,6 +151,7 @@ impl ChaseRig {
                 pitch_range: (-1.2, 0.9),
                 follows_aim: false,
                 aim_lift: 0.0,
+                car: None,
             };
         }
         match spec.tuning.camera {
@@ -157,15 +162,28 @@ impl ChaseRig {
                 pitch_range: c.pitch_range,
                 follows_aim: true,
                 aim_lift: TANK_AIM_LIFT,
+                car: None,
             },
-            None => Self {
-                pivot: Vec3::Y * 2.0,
-                distance: (spec.bounds.1.z - spec.bounds.0.z) * 0.9 + 3.0,
-                pitch: None,
-                pitch_range: (-1.2, 0.9),
-                follows_aim: spec.tracked,
-                aim_lift: 0.0,
-            },
+            None => {
+                // A car or a boat with its 360 camera preset: its
+                // `DefaultPitch` and the camera's pitch limits
+                // ([`m2_engine::pad_camera::CAR_PITCH_LIMITS`]).
+                let car = spec.tuning.car_camera.filter(|_| !spec.tracked);
+                let [low, high] = m2_engine::pad_camera::CAR_PITCH_LIMITS;
+                Self {
+                    pivot: Vec3::Y * 2.0,
+                    distance: (spec.bounds.1.z - spec.bounds.0.z) * 0.9 + 3.0,
+                    pitch: car.map(|c| c.default_pitch),
+                    pitch_range: if car.is_some() {
+                        (low, high)
+                    } else {
+                        (-1.2, 0.9)
+                    },
+                    follows_aim: spec.tracked,
+                    aim_lift: 0.0,
+                    car,
+                }
+            }
         }
     }
 }
@@ -237,11 +255,12 @@ impl Intent {
 
     pub fn from_input(input: &mut Input, config: &CameraConfig, mouse_look: bool) -> Self {
         let (dx, dy) = input.take_look(mouse_look);
+        let (yaw, pitch) = input.take_pad_turn();
         let invert = if config.invert_y { -1.0 } else { 1.0 };
         // Turning right turns the yaw (from +z towards +x) back.
         let look = Vec2::new(
-            -dx as f32 * config.mouse_sensitivity,
-            -dy as f32 * config.mouse_sensitivity * invert,
+            -dx as f32 * config.mouse_sensitivity - yaw as f32,
+            -dy as f32 * config.mouse_sensitivity * invert + pitch as f32 * invert,
         );
         Self {
             movement: Vec2::new(
@@ -324,6 +343,8 @@ pub struct Player {
     camera_distance: f32,
     /// Seconds since the mouse last turned the camera.
     look_still: f32,
+    /// A car camera's drift back behind it ([`ChaseRig::car`]).
+    car_follow: m2_engine::pad_camera::CarFollow,
     /// While driving: the point the chase camera turns about, and how far
     /// behind it the camera sits ([`ChaseRig`]).
     pub chase_target: Option<(Vec3, f32)>,
@@ -462,6 +483,9 @@ pub struct Player {
     /// (pitch and roll as well as heading) with her clip's origin on the
     /// seat ([`model_matrix`](Self::model_matrix)).
     pub seat_frame: Option<Mat4>,
+    /// On an emplaced gun she mans, seated by its seat's clip
+    /// ([`crate::hijack::Hijacks::seat`]).
+    pub manning: bool,
     /// Her clips for each class of weapon she can hold, a switch's and
     /// the pickup's ([`crate::held`]).
     pub moves: Moves,
@@ -634,6 +658,7 @@ impl Player {
             chase_target: None,
             aim_lift: 0.0,
             look_still: 0.0,
+            car_follow: Default::default(),
             landed: false,
             land_from: None,
             streaming: false,
@@ -695,6 +720,7 @@ impl Player {
             },
             face_seed: 0x2545_f491_4f6c_dd1d,
             seat_frame: None,
+            manning: false,
             moves: Moves::default(),
             in_hand: InHand::default(),
             shown: InHand::default(),
@@ -1011,6 +1037,36 @@ impl Player {
     }
 
     /// One fixed tick of `dt` seconds.
+    /// Seated on an emplaced gun she mans ([`crate::combat::Manned`],
+    /// placed and posed by [`crate::hijack::Hijacks::seat`]): she only
+    /// looks, as [`update`](Self::update) turns the view, and her face
+    /// goes on; nothing moves her or plays her on-foot clips.
+    pub fn look(&mut self, physics: &Physics, intent: Intent, dt: f32) {
+        let seed = &mut self.face_seed;
+        self.face.step(dt, || {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            (*seed >> 40) as f32 / (1u64 << 24) as f32
+        });
+        self.yaw += intent.look.x;
+        self.pitch =
+            (self.pitch + intent.look.y).clamp(self.pitch_limits()[0], self.pitch_limits()[1]);
+        self.camera(physics);
+    }
+
+    /// How far she looks down and up, radians: the camera's offsets'
+    /// angles for her stance ([`m2_engine::pad_camera::pitch_at`]): -47.0
+    /// to +50.2 degrees standing, -33.2 to +50.7 aiming in.
+    fn pitch_limits(&self) -> [f32; 2] {
+        use m2_engine::pad_camera::{AIMING, pitch_at};
+        if self.aiming {
+            [pitch_at(0.0, &AIMING), pitch_at(1.0, &AIMING)]
+        } else {
+            PITCH_RANGE
+        }
+    }
+
     pub fn update(&mut self, physics: &Physics, intent: Intent, dt: f32) {
         // Her face goes on while she is up; down, it stays as it was.
         if !self.down {
@@ -1021,9 +1077,13 @@ impl Player {
                 *seed ^= *seed << 17;
                 (*seed >> 40) as f32 / (1u64 << 24) as f32
             });
+            if let Some((_, rig)) = &mut self.model {
+                rig.step_lip(dt);
+            }
         }
         self.yaw += intent.look.x;
-        self.pitch = (self.pitch + intent.look.y).clamp(-1.2, 0.9);
+        self.pitch =
+            (self.pitch + intent.look.y).clamp(self.pitch_limits()[0], self.pitch_limits()[1]);
 
         if let Some(l) = self.ladder {
             self.hang(l, dt);
@@ -2006,6 +2066,7 @@ impl Player {
         let f = transform.transform_vector3(Vec3::Z);
         let heading = f.x.atan2(f.z);
         if self.chase_target.is_none() {
+            self.car_follow = Default::default();
             if let Some(pitch) = rig.pitch {
                 self.pitch = pitch;
             }
@@ -2024,7 +2085,18 @@ impl Player {
         } else {
             0.0
         };
-        if !rig.follows_aim && self.look_still > CHASE_HOLD && speed.abs() > 2.0 {
+        if let Some(preset) = &rig.car {
+            // The 360's drift back behind it: a turn of the stick's yaw
+            // over its threshold holds the look (taken from the turn's
+            // rate: over the car camera's 2 rad/s at the threshold).
+            let held = look.x.abs()
+                > m2_engine::pad_camera::CAR_RATES[0]
+                    * m2_engine::pad_camera::CAR_YAW_THRESHOLD
+                    * dt;
+            self.yaw = self
+                .car_follow
+                .step(preset, self.yaw, heading, speed, held, dt);
+        } else if !rig.follows_aim && self.look_still > CHASE_HOLD && speed.abs() > 2.0 {
             let mut turn = (heading - self.yaw).rem_euclid(std::f32::consts::TAU);
             if turn > std::f32::consts::PI {
                 turn -= std::f32::consts::TAU;
@@ -2108,7 +2180,7 @@ impl Player {
     pub fn model_matrix(&self) -> Mat4 {
         if let Some(seat) = self
             .seat_frame
-            .filter(|_| self.seated && self.driving.is_some())
+            .filter(|_| self.seated && (self.driving.is_some() || self.manning))
         {
             return seat;
         }

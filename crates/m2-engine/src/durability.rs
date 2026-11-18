@@ -319,6 +319,26 @@ pub fn sound_keys(db: &Layer<'_>) -> HashMap<u32, u32> {
         .collect()
 }
 
+/// Each template's `ParticleKey`, by id: the whole object's (its record
+/// with no `Name`), else its first: what a hit on it throws up by the
+/// particle table ([`crate::tuning::KeyTable`]; `Vegetation` on the
+/// bushes and plants, `Vehicle` on every vehicle checked).
+pub fn particle_keys(db: &Layer<'_>) -> HashMap<u32, u32> {
+    let t = Table::new(db, "ParticleKey");
+    let (field, name) = (name_hash("ParticleKey"), name_hash("Name"));
+    t.templates()
+        .filter_map(|id| {
+            let records = t.of_template(id);
+            let r = records
+                .iter()
+                .find(|r| t.word(r, name).unwrap_or(0) == 0)
+                .or_else(|| records.first())?;
+            let key = t.word(r, field)?;
+            (key != 0).then_some((id, key))
+        })
+        .collect()
+}
+
 /// `OSMParameter`'s value field (name unknown): with `Name` `PropTemplate`
 /// or `DebrisTemplate`, the name hash of a template.
 const OSM_VALUE: u32 = 0x255f_12c0;
@@ -365,7 +385,8 @@ pub fn piece_masses(db: &Layer<'_>, names: &HashMap<u32, &str>) -> HashMap<u32, 
         .collect()
 }
 
-/// `_PropPhysics`'s field read as a flag (name unknown; 1 on 102
+/// `_PropPhysics`'s `HasRealPhysics` (named by the 360's reader,
+/// 0x823EA6B0; read here as a heavy flag: 1 on 102
 /// templates' records only for the heavy ones: shipping containers
 /// (20,000 kg), dumpsters, fuel and propane tanks (10,000 kg), the
 /// explosive barrel, car ruins (1,000 to 2,000 kg), the large cash case;
@@ -400,6 +421,74 @@ impl PropPhysics {
         self.mass
             .unwrap_or(if self.heavy { HEAVY_KG } else { PROP_KG })
     }
+}
+
+/// How much of a "fake physics" prop a real body feels when they meet:
+/// its `_PropPhysics` record's `FakeToRealMassRatio` and
+/// `FakeToHumanMassRatio`, and whether the prop is fake at all.
+///
+/// From the 360 code:
+/// - The record is read by 0x823EA6B0: `Mass`, `HasRealPhysics` (the
+///   field [`PROP_HEAVY`] reads), `FakeToHumanMassRatio`,
+///   `FakeToRealMassRatio`, each -1 where it gives none. A prop is fake
+///   (0x8218EDA0 answers 1) where its `Mass` isn't 0 and `HasRealPhysics`
+///   is false.
+/// - Its bodies carry the two ratios as properties 0x2008 and 0x2009
+///   (0x82186498), a ratio under 0 reading 0.02 and 4.
+/// - Where a fake prop's body meets a real one that moves, the contact
+///   gets a mass changer (0x82163308 -> 0x821620F0, Havok's
+///   `hkpMassChangerModifierConstraintAtom`): the real body's side is
+///   scaled by `min(1, m_real / m_prop * FakeToRealMassRatio)` (none for
+///   a prop of 1e-4 kg or less; a ratio of 0 drops the contact,
+///   0x82163568). That is the prop felt as
+///   `min(m_prop, ratio * m_real)` ([`FakeMass::felt`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FakeMass {
+    pub fake: bool,
+    pub to_real: f32,
+    pub to_human: f32,
+}
+
+/// [`FakeMass::to_real`] where the record gives none (0x820D9F1C).
+pub const FAKE_TO_REAL: f32 = 0.02;
+/// [`FakeMass::to_human`] where the record gives none (0x820B7B6C).
+pub const FAKE_TO_HUMAN: f32 = 4.0;
+const FAKE_TO_HUMAN_FIELD: u32 = 0x720a_c101;
+const FAKE_TO_REAL_FIELD: u32 = 0xddaf_b8b6;
+
+impl FakeMass {
+    /// The mass, kg, a real body of `real` kg feels a prop of `prop` kg
+    /// as: all of a real prop, at most `to_real` of the body's for a fake
+    /// one.
+    pub fn felt(&self, prop: f32, real: f32) -> f32 {
+        if self.fake && prop > 1e-4 {
+            prop.min(self.to_real.max(0.0) * real)
+        } else {
+            prop
+        }
+    }
+}
+
+/// Each `_PropPhysics` template's [`FakeMass`], by id.
+pub fn fake_masses(db: &Layer<'_>) -> HashMap<u32, FakeMass> {
+    let t = Table::new(db, "_PropPhysics");
+    let mass = name_hash("Mass");
+    t.templates()
+        .filter_map(|id| {
+            let r = t.of_template(id).first()?;
+            let m = t.float(r, mass).unwrap_or(-1.0);
+            let real = t.word(r, PROP_HEAVY) == Some(1);
+            let or = |field: u32, d: f32| t.float(r, field).filter(|v| *v >= 0.0).unwrap_or(d);
+            Some((
+                id,
+                FakeMass {
+                    fake: m != 0.0 && !real,
+                    to_real: or(FAKE_TO_REAL_FIELD, FAKE_TO_REAL),
+                    to_human: or(FAKE_TO_HUMAN_FIELD, FAKE_TO_HUMAN),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// Each template's `_PropPhysics`, by id.
@@ -523,6 +612,11 @@ pub fn crash_damage(size: f32, cell: f32) -> f32 {
 pub fn crash_base(size: f32) -> f32 {
     if size < CRASH_FLOOR { 0.0 } else { size * 0.01 }
 }
+
+/// The key the ground's side of a crash has (the damage table's
+/// `Terrain` column). From the 360 code: the collision event takes
+/// 0x19FC10AC, `name_hash("Terrain")`, for a body of kind 13 (0x82162BB8).
+pub const TERRAIN_KEY: &str = "Terrain";
 
 /// A ram's kind of damage where its vehicle's template names none: `Car`,
 /// the damage table's column every vehicle template that names a
@@ -695,6 +789,32 @@ mod tests {
 
     // Each side takes a hundredth of the size times its cell, only once a
     // crash reaches 5 and only past 1 damage.
+    #[test]
+    fn a_fake_prop_is_felt_as_at_most_its_share_of_the_real_body() {
+        let fake = FakeMass {
+            fake: true,
+            to_real: FAKE_TO_REAL,
+            to_human: FAKE_TO_HUMAN,
+        };
+        // A 200 kg planter against a 1,500 kg jeep: 30 kg; against a
+        // 32 t tank all of its 200.
+        assert!((fake.felt(200.0, 1500.0) - 30.0).abs() < 1e-3);
+        assert_eq!(fake.felt(200.0, 32_000.0), 200.0);
+        let real = FakeMass {
+            fake: false,
+            ..fake
+        };
+        assert_eq!(real.felt(10_000.0, 1500.0), 10_000.0);
+        assert_eq!(
+            FakeMass {
+                to_real: 0.0,
+                ..fake
+            }
+            .felt(50.0, 1500.0),
+            0.0
+        );
+    }
+
     #[test]
     fn a_crash_hurts_past_the_floor_and_past_one() {
         assert_eq!(crash_damage(4.9, 100.0), 0.0, "under the floor");

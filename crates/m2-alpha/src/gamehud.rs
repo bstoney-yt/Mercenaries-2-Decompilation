@@ -1288,6 +1288,8 @@ pub struct Prim {
     pub colour: [f32; 4],
     /// Multiplies what is under it (Flash's multiply blend mode).
     pub multiply: bool,
+    /// Its texture is clamped at the edges (Flash gradients), not tiled.
+    pub clamp: bool,
 }
 
 /// RGBA8 pixels.
@@ -1796,6 +1798,14 @@ impl GameHud {
     }
 
     fn upload(&mut self, ctx: &egui::Context) {
+        // Gradients' textures are clamped at their edges (the game's
+        // Scaleform pads them), the rest tile.
+        let clamped: HashSet<u32> = self
+            .prims
+            .iter()
+            .filter(|p| p.clamp)
+            .filter_map(|p| p.texture)
+            .collect();
         for (hash, image) in self.pending.drain(..) {
             if let Some(i) = &image {
                 self.pixels.insert(
@@ -1813,11 +1823,12 @@ impl GameHud {
                     &i.rgba,
                 );
                 // Tiled widgets repeat their texture.
-                ctx.load_texture(
-                    format!("hud {hash:08x}"),
-                    image,
-                    TextureOptions::LINEAR_REPEAT,
-                )
+                let options = if clamped.contains(&hash) {
+                    TextureOptions::LINEAR
+                } else {
+                    TextureOptions::LINEAR_REPEAT
+                };
+                ctx.load_texture(format!("hud {hash:08x}"), image, options)
             });
             self.textures.insert(hash, handle);
         }
@@ -3157,6 +3168,15 @@ impl Thread {
 
     /// Texture `hash` from the archive (or the language archive).
     fn decode(&mut self, hash: u32, log: &mut Vec<String>) -> Option<Image> {
+        // A gradient's texture is made, not read.
+        let made = MADE_GRADIENTS.with_borrow(|m| m.get(&hash).cloned());
+        if let Some((width, height, rgba)) = made.and_then(|n| flash::gradient::made_pixels(&n)) {
+            return Some(Image {
+                width,
+                height,
+                rgba,
+            });
+        }
         let found = self.assets.texture(hash, MAX_TEXTURE).or_else(|e| {
             self.language
                 .as_mut()
@@ -3963,7 +3983,7 @@ impl Thread {
                 eprintln!(
                     "hud text: no button picture matched for {}: on the PC, which of \
                      english_18's button page (pc\\common_18_buttons) glyphs {} (or past \
-                     U+E013) is each",
+                     U+E01B) is each",
                     keyed.join(", "),
                     gui_runtime::UNMATCHED_GLYPHS
                         .iter()
@@ -5218,6 +5238,7 @@ fn quad(texture: Option<u32>, r: [f32; 4], uv: [f32; 4], colour: [f32; 4], degre
         ],
         colour,
         multiply: false,
+        clamp: false,
     }
 }
 
@@ -5580,6 +5601,13 @@ fn show_all(rect: [f32; 4], size: [f32; 2]) -> [f32; 4] {
     [x, y, x + sw, y + sh]
 }
 
+thread_local! {
+    /// Textures the HUD thread makes for Flash gradients, by name hash:
+    /// their names, which say how to make them
+    /// ([`flash::gradient::made_pixels`]).
+    static MADE_GRADIENTS: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::new());
+}
+
 /// Triangles as prims (quads with the last corner doubled), asking for
 /// their textures.
 fn triangle_prims(triangles: &[flash::Triangle], out: &mut Vec<Prim>, want: &mut Vec<u32>) {
@@ -5588,6 +5616,9 @@ fn triangle_prims(triangles: &[flash::Triangle], out: &mut Vec<Prim>, want: &mut
         let texture = t.texture.as_deref().map(|name| {
             *textures.entry(name).or_insert_with(|| {
                 let hash = name_hash(name);
+                if name.starts_with(flash::gradient::MADE_PREFIX) {
+                    MADE_GRADIENTS.with_borrow_mut(|m| m.insert(hash, name.to_owned()));
+                }
                 want.push(hash);
                 hash
             })
@@ -5600,6 +5631,7 @@ fn triangle_prims(triangles: &[flash::Triangle], out: &mut Vec<Prim>, want: &mut
             uv: [ua, ub, uc, uc],
             colour: t.colour,
             multiply: t.multiply,
+            clamp: t.clamp,
         });
     }
 }
@@ -5783,6 +5815,7 @@ fn minimap(
             uv: [centre_uv, ua, ub, ub],
             colour: white,
             multiply: false,
+            clamp: false,
         });
     }
     road_strokes(view, roads, out, want);
@@ -5824,16 +5857,22 @@ fn minimap(
                 ));
             }
         }
-        let hash = name_hash(&b.icon);
-        want.push(hash);
-        let [w, h] = blip_half_size(b.size).map(|v| v * r / RADAR_RADIUS);
         let c = b.colour.map(|v| f32::from(v) / 255.0);
+        let scale = r / RADAR_RADIUS;
+        let turn = blip_turn(view, b);
+        let Some(icon) = &b.icon else {
+            out.extend(plain_blip([x, y], b.size, scale, c, turn));
+            continue;
+        };
+        let hash = name_hash(icon);
+        want.push(hash);
+        let [w, h] = blip_half_size(b.size).map(|v| v * scale);
         out.push(quad(
             Some(hash),
             [x - w, y - h, x + w, y + h],
             full,
             c,
-            blip_turn(view, b),
+            turn,
         ));
     }
     // Her: a white square, upright whichever way she faces (the map turns
@@ -5846,6 +5885,30 @@ fn minimap(
         white,
         0.0,
     ));
+}
+
+/// A blip with no texture, at `at` (screen), `scale` screen units to the
+/// radar's: from the 360 code (the icon's draw `0x823871F8`; the flag it
+/// tests is set by `0x82388580` when the blip has a texture), first an
+/// untextured opaque black quad 1 unit wider each way (its colour a
+/// static (0, 0, 0, 1)), then the blip's own quad untextured in its
+/// colour, both turned as the blip is.
+fn plain_blip(at: [f32; 2], size: [f32; 2], scale: f32, colour: [f32; 4], turn: f32) -> [Prim; 2] {
+    let [x, y] = at;
+    let [w, h] = blip_half_size(size);
+    let full = [0.0, 0.0, 1.0, 1.0];
+    let rect = |pad: f32| {
+        [
+            x - (w + pad) * scale,
+            y - (h + pad) * scale,
+            x + (w + pad) * scale,
+            y + (h + pad) * scale,
+        ]
+    };
+    [
+        quad(None, rect(1.0), full, [0.0, 0.0, 0.0, 1.0], turn),
+        quad(None, rect(0.0), full, colour, turn),
+    ]
 }
 
 /// The radar's radius in its own units (the [`BORDER`]'s minimap is 100
@@ -5973,6 +6036,7 @@ fn road_strokes(view: &MapView, roads: &[Road], out: &mut Vec<Prim>, want: &mut 
                     uv: [[u, 0.0], [u2, 0.0], [u2, 1.0], [u, 1.0]],
                     colour,
                     multiply: false,
+                    clamp: false,
                 });
             };
             if road.paved {
@@ -6222,6 +6286,7 @@ fn fan(poly: &[[f32; 2]], colour: [f32; 4], out: &mut Vec<Prim>) {
             uv: [[0.0; 2]; 4],
             colour,
             multiply: false,
+            clamp: false,
         });
     }
 }
@@ -6272,6 +6337,7 @@ fn stroke(a: [f32; 2], b: [f32; 2], width: f32, colour: [f32; 4]) -> Prim {
         uv: [[0.0; 2]; 4],
         colour,
         multiply: false,
+        clamp: false,
     }
 }
 
@@ -6341,6 +6407,7 @@ fn wedge(
                 uv: points.map(uv_at),
                 colour,
                 multiply: false,
+                clamp: false,
             }
         })
         .collect()
@@ -6874,6 +6941,28 @@ mod tests {
         );
     }
 
+    /// A blip with no texture: a black square a unit wider each way under
+    /// a plain square in its colour.
+    #[test]
+    fn a_blip_without_a_texture_is_a_square_outlined_in_black() {
+        let green = [0.0, 1.0, 0.0, 1.0];
+        let [outline, own] = plain_blip([50.0, 40.0], [3.0, 3.0], 2.0, green, 0.0);
+        assert_eq!((outline.texture, own.texture), (None, None));
+        assert_eq!(outline.colour, [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(own.colour, green);
+        let span = |p: &Prim| {
+            let xs = p.corners.map(|c| c[0]);
+            let ys = p.corners.map(|c| c[1]);
+            let lo = |v: [f32; 4]| v.into_iter().fold(f32::MAX, f32::min);
+            let hi = |v: [f32; 4]| v.into_iter().fold(f32::MIN, f32::max);
+            [lo(xs), lo(ys), hi(xs), hi(ys)]
+        };
+        // Half size 3 radar units, 2 screen units each: 6 each way; the
+        // outline 8.
+        assert_eq!(span(&own), [44.0, 34.0, 56.0, 46.0]);
+        assert_eq!(span(&outline), [42.0, 32.0, 58.0, 48.0]);
+    }
+
     #[test]
     fn pie_slices_keep_their_wedge() {
         // A quarter from straight up to the right: the top right quarter,
@@ -7052,7 +7141,7 @@ mod tests {
         };
         let blip = |yaw: Option<f32>, rotate: bool, oriented: bool| RadarView {
             at: Vec3::ZERO,
-            icon: String::new(),
+            icon: None,
             colour: [255; 4],
             sticky: false,
             sort: 5,

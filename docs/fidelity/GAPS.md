@@ -42,6 +42,7 @@ available, (6) Correction, (7) Verification and (8) Risk.
 | [A8](#a8) | Decoder residuals: wavelet seam steps on 14 clips, unknown header fields | Visual | P3 | Data, Ghidra |
 | [P5](#p5) | Collision materials: friction and restitution per surface not read | Behavioral | P3 | Data, Ghidra |
 | [P6](#p6) | Projectile guidance law, drag and range not established from code | Behavioral | P3 | Ghidra |
+| [P7](#p7) | Props stand static until knocked loose; a vehicle's spin restored when one gives way (invented) | Behavioral | P2 | Ghidra |
 | [U6](#u6) | Flash text: one color per field, no kerning, HTML reduced to `<font color>` | Visual | P3 | Data census |
 | [M4](#m4) | Swimming depths, float height, speed and stroke rate invented | Animation/movement | P3 | Footage, Ghidra |
 
@@ -655,6 +656,19 @@ P2
    Report path error and time of flight.
 8. **Risk:** Medium. Autoplay's anti-vehicle and helicopter fights depend
    on hit rates, so re-run the contracts that use launchers.
+
+### P7
+
+**Props as static bodies until touched** · Behavioral discrepancy · P2
+
+1. **Original:** From the 360 code (partly traced): a prop with physics is a Havok rigid body from the start. A vehicle meeting it is a contact between two bodies. Crashable records, the mass changer and the blast's per-body push (0x8215CBC8) all act on that body. *Unknown:* the functions that create a prop's body and wake it on first touch are not yet named.
+2. **Ours:** Props stand as static collision until something knocks them loose (`Props::knock`, `Destruction::crash`). Only then are they made loose bodies. A vehicle that knocks one loose loses speed by the mass shifted (`game::flung`). It gets back its spin in the same share before the step (#676, merged: the pre-step spin restore). **Invented:** that restore is the port's own correction for the static-then-loose props. The 360 has nothing to restore, because its props are bodies from the first contact.
+3. **Difference:** Not measured. A car clipping a prop may turn differently from the 360's, where the contact itself is solved.
+4. **Likely cause:** The port's choice to keep the island's thousands of props static for cost.
+5. **Evidence:** 360 code: the prop's physics setup (0x821831B0 for rigid bodies), its activation, and the contact solver's mass changer.
+6. **Correction:** Make props loose bodies from first contact, as the 360 does. A scoping note on the cost (a town's worth of props) comes first; no code before a decision.
+7. **Verification:** A car at 10 m/s clipping a crate and a lamppost: heading change and speed loss against footage or an emulator of the traced code.
+8. **Risk:** Medium to high. The cost per frame, and every crash, push and cargo behaviour built on static props.
 
 ## UI
 

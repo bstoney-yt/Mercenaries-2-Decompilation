@@ -46,8 +46,18 @@ pub use winch_cable::{CARGO_TILT, CableId, HALF_LINK, LINK_MASS, LINK_RADIUS, MI
 pub const STEP_HEIGHT: f32 = 0.5;
 /// Steepest slope a character walks up, radians (50 degrees).
 pub const MAX_SLOPE: f32 = 50.0 * std::f32::consts::PI / 180.0;
-/// Downward acceleration, m/s².
+/// Downward acceleration, m/s², of what the Beta moves by its own sums
+/// rather than the physics world (characters without a template, the
+/// fight's rounds and lobs, falling crates): see [`WORLD_GRAVITY`] for the
+/// world's.
 pub const GRAVITY: f32 = 9.81;
+/// The physics world's gravity, m/s² downward: every rigid body's pull
+/// (vehicles, debris, props, ragdolls). From the 360 code: the world's
+/// set-up (0x82164A58, from the physics manager's init 0x821523B8) builds
+/// its `hkpWorldCinfo` (0x82630380) and loads its gravity from 0x820F9710,
+/// (0, -9, 0); its broadphase from the two vectors after it (+-4096 across,
+/// +-1000 up).
+pub const WORLD_GRAVITY: f32 = 9.0;
 /// The gravity the 360 car code pulls with where it works its own, m/s²
 /// (the constant at 0x82DE8C30, -10, that the gravity factor's pull at
 /// 0x8219EE4C and 14 other physics routines read).
@@ -1484,7 +1494,7 @@ fn preloads(spec: &VehicleSpec, strength: impl Fn(bool) -> f32, mass_z: f32) -> 
                 (1.0 - front_share, nr)
             };
             let k = strength(w.steers).max(1.0);
-            (GRAVITY * share / (n.max(1) as f32 * k)).min(1.0)
+            (WORLD_GRAVITY * share / (n.max(1) as f32 * k)).min(1.0)
         })
         .collect()
 }
@@ -1574,7 +1584,11 @@ pub const FLOAT_DEPTH: f32 = 0.35;
 /// metres: where its float springs hold it ([`BoatFloat::rest_depth`];
 /// its template's, else the 360 record's defaults).
 pub fn float_depth(spec: &VehicleSpec) -> f32 {
-    spec.tuning.boat.unwrap_or(BOAT).float.rest_depth(GRAVITY)
+    spec.tuning
+        .boat
+        .unwrap_or(BOAT)
+        .float
+        .rest_depth(WORLD_GRAVITY)
 }
 const BOAT_ROCK: f32 = 2.5;
 const BOAT_TOP: f32 = 18.0;
@@ -1725,6 +1739,8 @@ struct VehicleBody {
     held: bool,
     /// Its velocity before the last step, m/s: what it hit things with.
     before: Vec3,
+    /// Its spin before the last step, radians a second about each axis.
+    spin_before: Vec3,
     /// A boat's: it floats instead of rolling on wheels.
     hull: Option<Hull>,
     /// A helicopter's: it flies.
@@ -2216,6 +2232,10 @@ pub struct Character {
     /// Downward acceleration it falls at, m/s² ([`GRAVITY`] unless its
     /// template gives its own `_HumanPhysics` `Gravity`).
     pub gravity: f32,
+    /// The upright surface it last pushed against (its flat normal), kept
+    /// while it goes on pushing, as a proxy keeps its contacts from step
+    /// to step ([`Physics::move_character`]).
+    pub wall: Option<Vec3>,
 }
 
 impl Character {
@@ -2228,6 +2248,7 @@ impl Character {
             radius: 0.35,
             height: 1.8,
             gravity: GRAVITY,
+            wall: None,
         }
     }
 
@@ -3375,7 +3396,10 @@ impl Physics {
             ..KinematicCharacterController::default()
         };
         Self {
-            world: r::PhysicsWorld::default(),
+            world: r::PhysicsWorld {
+                gravity: r::Vector::new(0.0, -WORLD_GRAVITY, 0.0),
+                ..r::PhysicsWorld::default()
+            },
             statics: HashMap::new(),
             keys: HashMap::new(),
             surfaces: HashMap::new(),
@@ -3555,6 +3579,10 @@ impl Physics {
                 .bodies
                 .get(v.controller.chassis)
                 .map_or(Vec3::ZERO, |b| vec3(b.linvel()));
+            v.spin_before = w
+                .bodies
+                .get(v.controller.chassis)
+                .map_or(Vec3::ZERO, |b| vec3(b.angvel()));
             if v.held {
                 continue;
             }
@@ -3677,7 +3705,7 @@ impl Physics {
             let ahead = (turn * Vec3::Z).with_y(0.0).normalize_or_zero();
             let wet = if v.wrecked {
                 let n = hull.points.len().max(1) as f32;
-                let lift = GRAVITY * v.mass / n * dt;
+                let lift = WORLD_GRAVITY * v.mass / n * dt;
                 let mut wet = 0.0;
                 for &q in &hull.points {
                     let p = at + turn * q;
@@ -3783,7 +3811,7 @@ impl Physics {
                 vec3(b.angvel()),
                 p.translation.y,
                 b.mass(),
-                GRAVITY,
+                WORLD_GRAVITY,
                 dt,
             );
             if let Some((x, z)) = flown.spin_across {
@@ -4667,6 +4695,7 @@ impl Physics {
             hinge,
             held: false,
             before: Vec3::ZERO,
+            spin_before: Vec3::ZERO,
             hull,
             rotor,
         }));
@@ -4991,9 +5020,9 @@ impl Physics {
             // up while it is near level.
             if gripping && v.tank.is_none() {
                 let up = body.position().rotation * r::Vector::Y;
-                let down = r::Vector::new(0.0, -GRAVITY, 0.0);
+                let down = r::Vector::new(0.0, -WORLD_GRAVITY, 0.0);
                 let along = down - up * down.dot(up);
-                let steep = along.length() / GRAVITY;
+                let steep = along.length() / WORLD_GRAVITY;
                 let held = (CLIMB_TRACKED.sin() / steep.max(1e-3)).min(1.0);
                 body.apply_impulse(-along * held * mass * dt, true);
             }
@@ -5491,6 +5520,74 @@ impl Physics {
         out
     }
 
+    /// The statics a vehicle's body is in contact with (its wheels'
+    /// contacts aside): the terrain's cells, placed objects, buildings and
+    /// a state layer's models, each once, with the deepest point of
+    /// contact, the contact normal from the vehicle toward it (world
+    /// space) and its mass (0 for a fixed one, as the 360's collision
+    /// event's size takes it: [`crate::durability::crash_size`]).
+    pub fn vehicle_static_hits(&self, id: VehicleId) -> Vec<(StaticKey, Vec3, Vec3, f32)> {
+        let Some(body) = self
+            .vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .and_then(|v| self.world.bodies.get(v.controller.chassis))
+        else {
+            return Vec::new();
+        };
+        let mut out: Vec<(StaticKey, Vec3, Vec3, f32)> = Vec::new();
+        for &c in body.colliders() {
+            let Some(mine) = self.world.colliders.get(c) else {
+                continue;
+            };
+            for pair in self.world.narrow_phase.contact_pairs_with(c) {
+                if !pair.has_any_active_contact() {
+                    continue;
+                }
+                let first = pair.collider1 == c;
+                let other = if first {
+                    pair.collider2
+                } else {
+                    pair.collider1
+                };
+                let Some(&key) = self.keys.get(&other) else {
+                    continue;
+                };
+                if out.iter().any(|(k, ..)| *k == key) {
+                    continue;
+                }
+                let Some((manifold, deepest)) = pair
+                    .manifolds()
+                    .iter()
+                    .flat_map(|m| m.points.iter().map(move |p| (m, p)))
+                    .min_by(|a, b| a.1.dist.total_cmp(&b.1.dist))
+                else {
+                    continue;
+                };
+                let (local, normal) = if first {
+                    (deepest.local_p1, vec3(manifold.data.normal))
+                } else {
+                    (deepest.local_p2, -vec3(manifold.data.normal))
+                };
+                let mass = self
+                    .world
+                    .colliders
+                    .get(other)
+                    .and_then(|o| o.parent())
+                    .and_then(|b| self.world.bodies.get(b))
+                    .filter(|b| b.is_dynamic())
+                    .map_or(0.0, |b| b.mass());
+                out.push((
+                    key,
+                    vec3(mine.position().transform_point(local)),
+                    normal.normalize_or_zero(),
+                    mass,
+                ));
+            }
+        }
+        out
+    }
+
     /// The other vehicles a vehicle's body is in contact with, body to
     /// body, each once, with the deepest point of contact and the contact
     /// normal from this one toward the other (world space).
@@ -5877,6 +5974,25 @@ impl Physics {
             .map_or(Vec3::ZERO, |v| v.before)
     }
 
+    /// A vehicle's spin before the last step, radians a second about each
+    /// axis.
+    pub fn vehicle_spin_before(&self, id: VehicleId) -> Vec3 {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map_or(Vec3::ZERO, |v| v.spin_before)
+    }
+
+    /// Sets a vehicle's spin, radians a second about each axis.
+    pub fn set_vehicle_spin(&mut self, id: VehicleId, spin: Vec3) {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
+            body.set_angvel(vector(spin), true);
+        }
+    }
+
     /// Sets a vehicle's velocity, m/s (as it was before something it hit
     /// gave way).
     pub fn set_vehicle_velocity(&mut self, id: VehicleId, velocity: Vec3) {
@@ -6258,13 +6374,14 @@ impl Physics {
         radius: f32,
         skip: Option<VehicleId>,
     ) -> Option<f32> {
-        let mut filter = solid();
-        if let Some(v) = skip
-            .and_then(|v| self.vehicles.get(v.0))
-            .and_then(Option::as_ref)
-        {
-            filter = filter.exclude_rigid_body(v.controller.chassis);
-        }
+        // All of the vehicle: its turret's and gun's bodies too (a light
+        // tank's camera turns about a point inside its turret: the
+        // M551's is 0.4 m over the ring, playtest 2026-11-14's camera
+        // inside the cheat's tank).
+        let own = self.bodies_of(skip);
+        let keep =
+            |_: r::ColliderHandle, c: &r::Collider| c.parent().is_none_or(|p| !own.contains(&p));
+        let filter = solid().predicate(&keep);
         let ball = r::Ball::new(radius.max(1e-3));
         let options = rapier3d::parry::query::ShapeCastOptions {
             max_time_of_impact: max,
@@ -6820,6 +6937,14 @@ impl Physics {
     /// Moves `character` for `dt` seconds: horizontally at `walk` (m/s; its
     /// y is ignored), jumping at `jump` m/s if given while grounded, falling
     /// under gravity otherwise.
+    ///
+    /// Its velocity afterwards is the walk the walls it met leave it
+    /// ([`solved_walk`]), as a character proxy's is, and not the distance
+    /// the controller moved it: pushed against a wall the controller
+    /// nudges it in and out by up to 0.1 m/s a tick, which the 360's
+    /// locomotion node, standing at 0.01 m/s of its proxy's velocity
+    /// ([`crate::blend::STILL`]), would read as setting off. Over a step
+    /// it climbed, or meeting nothing upright, it is the distance moved.
     pub fn move_character(
         &self,
         character: &mut Character,
@@ -6834,27 +6959,94 @@ impl Physics {
         vertical -= character.gravity * dt;
         let desired = Vec3::new(walk.x, 0.0, walk.z) * dt + Vec3::Y * (vertical * dt);
         let shape = r::Capsule::new_y(character.half_height(), character.radius);
+        let mut hits: Vec<(r::ColliderHandle, Vec3, Vec3)> = Vec::new();
         let movement = self.controller.move_shape(
             dt,
             &self.world.query_pipeline_with_filter(solid()),
             &shape,
             &pose(character.centre(), Quat::IDENTITY),
             vector(desired),
-            |_| {},
+            |hit| {
+                let n = vec3(hit.hit.normal1);
+                if n.y.abs() < WALL_NORMAL_Y {
+                    hits.push((hit.handle, vec3(hit.hit.witness1), n));
+                }
+            },
         );
+        // Each upright face met, by its own normal (the contact's tilts
+        // where the capsule meets a triangle's edge, and a step's edge is no
+        // wall), turned to face the walk and laid flat.
+        let mut walls: Vec<Vec3> = hits
+            .iter()
+            .filter_map(|&(handle, at, n)| {
+                let only = |h: r::ColliderHandle, _: &r::Collider| h == handle;
+                let ray = r::Ray::new(vector(at + n * 0.05), vector(-n));
+                let (_, hit) = self
+                    .world
+                    .query_pipeline_with_filter(solid().predicate(&only))
+                    .cast_ray_and_get_normal(&ray, 0.1, true)?;
+                let face = vec3(hit.normal);
+                if face.y.abs() >= WALL_NORMAL_Y {
+                    return None;
+                }
+                let flat = Vec3::new(face.x, 0.0, face.z).normalize_or_zero();
+                Some(if flat.dot(walk) > 0.0 { -flat } else { flat })
+            })
+            .collect();
         let moved = vec3(movement.translation);
         character.position += moved;
         character.grounded = movement.grounded;
+        let flat = Vec3::new(walk.x, 0.0, walk.z);
+        // A move that met no wall yet fell short of the walk is still at
+        // the last one (the controller holds off it by its offset).
+        let short = Vec3::new(moved.x, 0.0, moved.z).length() < flat.length() * dt * SHORT;
+        match (walls.last(), character.wall) {
+            (Some(&n), _) => character.wall = Some(n),
+            (None, Some(n)) if short && flat.dot(n) < 0.0 => walls.push(n),
+            _ => character.wall = None,
+        }
+        let climbed = movement.grounded && moved.y > CLIMBED;
+        let along = if climbed || walls.is_empty() {
+            Vec3::new(moved.x / dt, 0.0, moved.z / dt)
+        } else {
+            solved_walk(flat, &walls)
+        };
         character.velocity = Vec3::new(
-            moved.x / dt,
+            along.x,
             if movement.grounded { 0.0 } else { vertical },
-            moved.z / dt,
+            along.z,
         );
         // Landing on something while rising (a ceiling) stops the climb.
         if !movement.grounded && vertical > 0.0 && moved.y < desired.y * 0.5 {
             character.velocity.y = 0.0;
         }
     }
+}
+
+/// Normals flatter than this (their up part, of 1) are walls a walk
+/// pushes against rather than ground under it.
+const WALL_NORMAL_Y: f32 = 0.7;
+/// Risen at least this far in a grounded move, metres: a step climbed.
+const CLIMBED: f32 = 1e-3;
+/// A move this share of the walk or less fell short of it.
+const SHORT: f32 = 0.9;
+
+/// What is left of the flat walk `walk` once each wall it pushes into
+/// (`walls`, their flat normals) takes away the part into it: a character
+/// proxy's solved velocity (Havok's proxy, whose velocity the 360's
+/// locomotion reads through 0x8268E030; that it holds the solved walk is
+/// inferred, the library's own behaviour, not read in the program).
+pub fn solved_walk(walk: Vec3, walls: &[Vec3]) -> Vec3 {
+    let mut v = walk;
+    for _ in 0..2 {
+        for &n in walls {
+            let into = v.dot(n);
+            if into < 0.0 {
+                v -= n * into;
+            }
+        }
+    }
+    v
 }
 
 #[cfg(test)]
@@ -7224,6 +7416,24 @@ mod tests {
         let alone = p.add_vehicle(&car(), Vec3::new(10.0, 0.5, 0.0), 0.0);
         assert!((p.vehicle_mass(alone).unwrap() - car().mass).abs() < 1.0);
         assert_eq!(p.vehicle_mass(VehicleId(99)), None);
+    }
+
+    /// Her camera's ball passes through all of the tank she drives: its
+    /// hull and its turret on a body of its own (playtest 2026-11-14: the
+    /// camera of the M551, which turns about a point inside its turret,
+    /// sat inside the tank). Another vehicle still stops it.
+    #[test]
+    fn the_camera_passes_through_her_own_tank_s_turret() {
+        let mut p = Physics::new();
+        let id = p.add_vehicle(&gun_tank(), Vec3::new(0.0, 0.5, 0.0), 0.0);
+        p.step(1.0 / 60.0);
+        let at = p.vehicle_transform(id).unwrap();
+        // From behind it at the turret's height, toward it.
+        let from = at.transform_point3(Vec3::new(0.0, 2.0, -6.0));
+        let ahead = at.transform_vector3(Vec3::Z);
+        assert_eq!(p.cast_sphere(from, ahead, 12.0, 0.2, Some(id)), None);
+        let d = p.cast_sphere(from, ahead, 12.0, 0.2, None).unwrap();
+        assert!(d > 4.0 && d < 5.2, "{d}");
     }
 
     /// A shot from a tank's own gun passes through all of it: its hull,
@@ -7901,6 +8111,65 @@ mod tests {
         assert!(c.position.y.abs() < 0.1, "{}", c.position.y);
     }
 
+    /// Pushed against a wall a character's velocity is the walk the wall
+    /// leaves it, every tick: none pushed square on (the 360's locomotion
+    /// stands it, at 0.01 m/s), the part along the wall pushed at a slant;
+    /// standing still, none. The controller alone moved it in and out by
+    /// up to 0.1 m/s a tick, flipping it between standing and walking 120
+    /// times in 6 s.
+    #[test]
+    fn a_character_pushing_into_a_wall_has_the_walk_it_leaves() {
+        let mut p = ready();
+        let wall = CollisionShape::mesh(
+            &[
+                Vec3::new(0.0, 0.0, -5.0),
+                Vec3::new(0.0, 0.0, 5.0),
+                Vec3::new(0.0, 1.5, 5.0),
+                Vec3::new(0.0, 1.5, -5.0),
+            ],
+            &[[0, 1, 2], [0, 2, 3]],
+        )
+        .unwrap();
+        p.add_static(
+            StaticKey::Object(0),
+            &wall,
+            Vec3::new(5.0, 0.0, -10.0),
+            Quat::IDENTITY,
+        );
+        p.step(DT);
+        for (start, walking, along) in [
+            (Vec3::ZERO, Vec3::ZERO, 0.0),
+            (Vec3::new(0.0, 0.0, -10.0), Vec3::new(4.0, 0.0, 0.0), 0.0),
+            (Vec3::new(0.0, 0.0, -10.0), Vec3::new(4.0, 0.0, 0.3), 0.3),
+        ] {
+            let mut c = Character::new(start);
+            walk(&p, &mut c, walking, 3.0);
+            for _ in 0..360 {
+                p.move_character(&mut c, walking, None, DT);
+                let speed = m2_math::glam::Vec2::new(c.velocity.x, c.velocity.z).length();
+                assert!((speed - along).abs() < 1e-3, "{walking}: {speed} m/s");
+            }
+        }
+    }
+
+    #[test]
+    fn a_wall_takes_the_part_of_a_walk_into_it() {
+        let wall = Vec3::NEG_X;
+        assert_eq!(solved_walk(Vec3::new(4.0, 0.0, 0.0), &[wall]), Vec3::ZERO);
+        assert_eq!(
+            solved_walk(Vec3::new(4.0, 0.0, 1.0), &[wall]),
+            Vec3::new(0.0, 0.0, 1.0)
+        );
+        // Walking away from it, nothing.
+        assert_eq!(
+            solved_walk(Vec3::new(-4.0, 0.0, 1.0), &[wall]),
+            Vec3::new(-4.0, 0.0, 1.0)
+        );
+        // Into a corner, nowhere.
+        let corner = solved_walk(Vec3::new(4.0, 0.0, 4.0), &[wall, Vec3::NEG_Z]);
+        assert!(corner.length() < 1e-6, "{corner}");
+    }
+
     #[test]
     fn climbs_a_step_but_not_a_wall() {
         let mut p = ready();
@@ -7925,7 +8194,15 @@ mod tests {
         p.step(DT);
 
         let mut c = Character::new(Vec3::new(0.0, 0.0, 0.0));
-        walk(&p, &mut c, Vec3::new(0.0, 0.0, 4.0), 3.0);
+        // Over the step it is moving all but the ten ticks the controller
+        // holds it at the step's lip before stepping up (it moves it no
+        // distance then: measured, the same as by the distance moved).
+        let mut stopped = 0;
+        for _ in 0..(3.0 / DT) as usize {
+            p.move_character(&mut c, Vec3::new(0.0, 0.0, 4.0), None, DT);
+            stopped += usize::from(c.velocity.z < 1.0);
+        }
+        assert!(stopped <= 10, "stood {stopped} ticks");
         assert!(c.position.z > 8.0, "stopped at {}", c.position);
         assert!(
             (c.position.y - 0.4).abs() < 0.1,
@@ -8952,10 +9229,10 @@ mod tests {
             p.step(DT);
         }
         // Afloat, level, its origin as deep as its springs hold it: their
-        // bottoms at its origin, 9.81 / (4 x 5) m under the water.
+        // bottoms at its origin, 9.0 / (4 x 5) m under the water.
         let m = place(&p);
         let y = m.w_axis.y;
-        assert!((float_depth(&spec) - 0.49).abs() < 0.01);
+        assert!((float_depth(&spec) - 0.45).abs() < 0.01);
         assert!(
             (y - (water - float_depth(&spec))).abs() < 0.05,
             "floats at {y}"
@@ -9784,7 +10061,8 @@ mod tests {
         // villa.
         let (slid, touching, (dropped, _)) = parked_tank(Some(0.38), 0.0, Some(0.0));
         assert!(dropped < 0.05, "dropped {dropped} m");
-        assert!(slid < 0.1, "slid {slid} m");
+        // Under 0.1 m with 9.81 m/s^2; 0.106 m with the world's 9.0.
+        assert!(slid < 0.12, "slid {slid} m");
         assert_eq!(touching, 6);
     }
 
@@ -9917,6 +10195,43 @@ mod tests {
         let back = p.vehicle_bumps(b);
         assert_eq!(back.first().map(|m| m.0), Some(a));
         assert!(back[0].2.z < -0.9, "and back the other way");
+    }
+
+    #[test]
+    fn a_car_driven_into_a_wall_hits_it_and_the_ground_is_known() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
+        let wall = StaticKey::Object(7);
+        p.add_static(
+            wall,
+            &CollisionShape::cuboid(Vec3::new(5.0, 2.0, 0.5)),
+            Vec3::new(0.0, 2.0, 10.0),
+            Quat::IDENTITY,
+        );
+        p.step(DT);
+        let a = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        for _ in 0..60 {
+            p.step(DT);
+        }
+        assert!(
+            p.vehicle_static_hits(a).iter().all(|h| h.0 != wall),
+            "apart, it doesn't touch the wall"
+        );
+        let up = p.vehicle_velocity(a).y;
+        p.set_vehicle_velocity(a, Vec3::new(0.0, up, 10.0));
+        let mut met = None;
+        for _ in 0..120 {
+            p.step(DT);
+            if let Some(&h) = p.vehicle_static_hits(a).iter().find(|h| h.0 == wall) {
+                met = Some(h);
+                break;
+            }
+        }
+        let (_, at, normal, mass) = met.expect("it never met the wall");
+        // Its front bumper on the wall's face, 9.5 m on; toward it; fixed.
+        assert!((at.z - 9.5).abs() < 0.5, "met at {at:?}");
+        assert!(normal.z > 0.9, "normal {normal:?}");
+        assert_eq!(mass, 0.0);
     }
 
     #[test]
@@ -10142,7 +10457,7 @@ mod tests {
             for _ in 0..300 {
                 p.step(DT);
             }
-            let want = f * GRAVITY / (4.0 * k);
+            let want = f * WORLD_GRAVITY / (4.0 * k);
             let sag = p.vehicle_suspension(id);
             let mean = sag.iter().sum::<f32>() / 4.0;
             // Within 5%: Rapier's springs settle 2 to 4% short of what
@@ -10276,7 +10591,7 @@ mod tests {
         };
         // An M151's 25 and 1.7: 9.8 cm down, back up after 0.34 s.
         let (sag, t) = ride(25.0, 1.7);
-        assert!((sag - 9.81 / 100.0).abs() < 0.01, "{sag}");
+        assert!((sag - WORLD_GRAVITY / 100.0).abs() < 0.01, "{sag}");
         assert!((t - half(25.0, 1.7)).abs() < 0.04, "{t}");
         // A sports car's 60 and 3: 4.1 cm, 0.22 s.
         let (sag, t) = ride(60.0, 3.0);
