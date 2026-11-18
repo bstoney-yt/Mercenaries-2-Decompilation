@@ -204,7 +204,7 @@ m2-alpha [options]
                          her right side, to see her hands
   --pda                  with --screenshot: the picture with her PDA open
   --binoculars <zoom>    with --screenshot: the picture through her
-                         binoculars at zoom 1..7, their screen up
+                         binoculars at zoom 2..7, their screen up
   --pda-click <x,y>      a left click there (screen pixels) among the
                          --pda-keys typed into the pause menu
   --pause                with --screenshot: the picture with the game's
