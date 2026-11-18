@@ -703,7 +703,11 @@ fn blast_push_vehicle(
     body: Mat4,
     push: m2_engine::durability::BlastPush,
 ) {
-    let (lo, hi) = world_box(body, v.spec.bounds);
+    // Sized by its body's collision, as the 360 sizes the Havok body it
+    // pushes; its drawn box without one.
+    let (lo, hi) = physics
+        .vehicle_body_box(id)
+        .unwrap_or_else(|| world_box(body, v.spec.bounds));
     for (per_kg, point) in push.rigid_pushes(lo, hi, fudge(v)) {
         physics.push_vehicle(id, per_kg * v.spec.mass, point);
     }
