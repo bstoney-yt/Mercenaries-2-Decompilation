@@ -45,6 +45,7 @@ Route files are one step per line (`#` comments):
     lowhp <health> <secs> <name>   hold her health there; shots, camera shake spread
     nearlog start <x> <z> <r> <name> | stop  log what was within r m of a point (vehicle + cargo)
     wreckwith <health|-> <drive s> [<car health, 0 = leave>]  wreck her vehicle with her in it (health pokes); log her health
+    killnear <r> <x,y,z;...>       set health 0 near the points (runtime data)
     poke <hex addr> <byte>         set a guest data byte (runtime flag only)
     trackhero                      follow the player's character by the 360 code's tables (xmem.Hero)
     trackfoot <x> <y> <z>|here     as track, for the hero on foot (here: where track was)
@@ -817,11 +818,24 @@ def run(args) -> int:
                 hb = next((parse_buttons(t[4:])[0] for t in w if t.startswith("btn=")), 0)
                 w = [t for t in w if not (t.startswith("hold=") or t.startswith("after=") or t.startswith("btn=") or t == "nolevel")]
                 # the on-foot camera object (vtable 0x820F0290) and its fields, logged per sample
-                cobj = xmem.scan_word(gs, 0x820F0290, lo=0x40000000, hi=0x1_0000_0000, limit=8)
-                say(f"stickresp2 {name}: camera objects (vtable 0x820F0290) at {[hex(a) for a in cobj]}")
-                cobj = cobj[0] if cobj else None
+                fset = next((t[7:] for t in w if t.startswith("fields=")), "foot")
+                w = [t for t in w if not t.startswith("fields=")]
+                if fset == "car":
+                    # player 0's active camera (camera manager table 0x83457050, stride 0x620)
+                    ab = gs.read(0x83457050, 4)
+                    cobj = struct.unpack(">I", ab)[0] if ab else None
+                    vt = gs.read(cobj, 4) if cobj else None
+                    say(f"stickresp2 {name}: active camera {cobj and hex(cobj)}, vtable {vt and hex(struct.unpack('>I', vt)[0])}")
+                else:
+                    cobj = xmem.scan_word(gs, 0x820F0290, lo=0x40000000, hi=0x1_0000_0000, limit=8)
+                    say(f"stickresp2 {name}: camera objects (vtable 0x820F0290) at {[hex(a) for a in cobj]}")
+                    cobj = cobj[0] if cobj else None
+                F_CAR = tuple((f"o{off:03X}", off, "f") for off in (0x604, 0x600, 0x630, 0x634, 0x668, 0x66C, 0x610, 0x62C, 0x63C, 0x658, 0x65C,
+                                                                0x618, 0x61C, 0x620, 0x624, 0x628, 0x640)) + (("o614", 0x614, "b"), ("o644", 0x644, "b"), ("o608", 0x608, "b"))
                 F_OFF = tuple((f"o{off:03X}", off, "f") for off in (0x600, 0x610, 0x618, 0x61C, 0x620, 0x624, 0x628, 0x62C, 0x638, 0x63C, 0x640,
                                                                 0x750, 0x770, 0x9E0, 0x9E4, 0x648, 0x658, 0x65C, 0x664, 0x670)) + (("aim", 0x7CD, "b"),)
+                if fset == "car":
+                    F_OFF = F_CAR
 
                 def fields():
                     out = []
@@ -837,6 +851,11 @@ def run(args) -> int:
                             out.append(blk[off - 0x600])
                     hh2.update()
                     out.append(hh2.facing() if hh2.quat else float("nan"))
+                    mb = gs.read(cobj + 0x18, 0x40) if cobj else None
+                    out.extend(struct.unpack(">3f", mb[0x20:0x2C]) if mb and len(mb) == 0x40 else (float("nan"),) * 3)
+                    for ga in (0x82B7C730, 0x83133EF0):
+                        b = gs.read(ga, 4)
+                        out.append(struct.unpack(">f", b)[0] if b else float("nan"))
                     for ga in (0x8380EE90, 0x8380EE88):
                         b = gs.read(ga, 4)
                         out.append(struct.unpack(">f", b)[0] if b else float("nan"))
@@ -845,7 +864,7 @@ def run(args) -> int:
                 vals = w[2:] or ["x0.5", "x0.75", "x1", "x-1", "y0.5", "y0.75", "y1", "y-0.5", "y-0.75", "y-1"]
                 with open(Path(args.out) / f"{name}.csv", "w", newline="") as fh:
                     wr = csv.writer(fh)
-                    wr.writerow(["hold", "t", "yaw", "pitch", "sens", *(f[0] for f in F_OFF), "her_facing", "g8380EE90", "g8380EE88"])
+                    wr.writerow(["hold", "t", "yaw", "pitch", "sens", *(f[0] for f in F_OFF), "her_facing", "m_r2x", "m_r2y", "m_r2z", "dt82B7C730", "g83133EF0", "g8380EE90", "g8380EE88"])
                     for hv in vals:
                         axis, v = hv[0], float(hv[1:])
                         lv = time.time() + 10
@@ -1234,6 +1253,33 @@ def run(args) -> int:
                         csa = hh.state_addr(car)
                         cp = struct.unpack(">3f", g.read(csa, 12)) if csa else (float("nan"),) * 3
                         say(f"wreckwith: +{time.time() - st:.1f} s her health {v:.2f} at ({hp_now[0]:.2f}, {hp_now[1]:.2f}, {hp_now[2]:.2f}) vehicle at ({cp[0]:.2f}, {cp[1]:.2f}, {cp[2]:.2f})")
+            elif op == "killnear":
+                # killnear <r> <x,y,z;...>: set to 0 (runtime data, Object.GetHealth's
+                # pool 0x83656558 +4) the health of every object whose state record
+                # lies within <r> m of one of the points (not hers); says which.
+                import math
+                import xmem
+
+                g = xmem.Guest(p.pid)
+                hh = xmem.Hero(g)
+                hero = hh.character()
+                r = float(w[1])
+                pts = [tuple(float(c) for c in q.split(",")) for q in " ".join(w[2:]).split(";") if q.strip()]
+                hm = xmem.map_entries(g, 0x83656558)
+                n = 0
+                for k, a in hm.items():
+                    if hero - 1 <= k <= hero + 8:
+                        continue
+                    sa = hh.state_addr(k)
+                    if not sa:
+                        continue
+                    pos = struct.unpack(">3f", g.read(sa, 12))
+                    if any(math.dist(pos, q) <= r for q in pts):
+                        mx, cur = struct.unpack(">2f", g.read(a, 8))
+                        g.write(a + 4, struct.pack(">f", 0.0))
+                        n += 1
+                        say(f"killnear: {k:#x} at ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}) health {cur:.1f}/{mx:.0f} -> 0")
+                say(f"killnear: {n} set")
             elif op == "poke":
                 # poke <guest hex address> <byte>: set one guest data byte, a
                 # runtime flag (never code, the XEX or files). E.g. 0x83134382 =
