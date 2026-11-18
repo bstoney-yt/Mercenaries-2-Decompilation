@@ -116,6 +116,7 @@ pub enum HijackCommand {
     /// Shake the pad for `seconds`.
     Rumble {
         guid: u32,
+        strength: f32,
         seconds: f32,
     },
     /// Shake the camera.
@@ -747,10 +748,19 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
 
     let pg = lib("Pg")?;
     add(&pg, "Rumble", |w, _, a| {
+        // From the 360 code (`lua_Pg_Rumble`, 0x82338D70): the rumble
+        // queue's record (0x82206860) takes the second argument as its
+        // strength (0.25 without one) and the third as its seconds (1.0
+        // without one); the fall impact sends the same record with
+        // strengths 0.15, 0.5 and 1.0 for 1 s (0x82205F20).
         if let Some(guid) = id(a.first()) {
-            let seconds = num(a.get(1)).unwrap_or(0.0);
-            w.commands
-                .push(Command::Hijack(HijackCommand::Rumble { guid, seconds }));
+            let strength = num(a.get(1)).unwrap_or(0.25);
+            let seconds = num(a.get(2)).unwrap_or(1.0);
+            w.commands.push(Command::Hijack(HijackCommand::Rumble {
+                guid,
+                strength,
+                seconds,
+            }));
         }
         Ok(MultiValue::new())
     })?;

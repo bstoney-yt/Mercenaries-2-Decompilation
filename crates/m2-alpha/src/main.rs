@@ -10342,7 +10342,7 @@ impl Running {
                 }),
         };
         let rumble = std::mem::take(&mut self.game.rumble);
-        self.pad.rumble(rumble);
+        self.pad.rumble(rumble.strength, rumble.seconds);
         // A dialog box the scripts put up has the pad: its stick and
         // buttons step and take the box, not move her (playtest: at
         // Fiona's contract menu the stick walked her about). So does the

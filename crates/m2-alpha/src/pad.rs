@@ -392,8 +392,9 @@ pub struct Pad {
     /// The pause menu's Vibration (`gameRumbleVar`): off, [`Pad::rumble`]
     /// shakes nothing.
     pub rumble_on: bool,
-    /// Seconds of shaking left ([`Pad::rumble`]).
+    /// Seconds of shaking left, and how hard ([`Pad::rumble`]).
     shaking: f64,
+    strength: f32,
     /// The left stick's pushes up and down step a menu as the d-pad
     /// does ([`Pad::stick_steps`]): set while a dialog box is up.
     pub stick_menu: bool,
@@ -412,30 +413,32 @@ pub struct Pad {
     captured: Option<Button>,
 }
 
-/// How hard the motors run while the scripts shake the pad, left (heavy)
-/// and right (light), 0 to 1 (invented: `Pg.Rumble` names only who and
-/// for how long).
-pub const RUMBLE: [f32; 2] = [0.6, 0.6];
-
 impl Pad {
-    /// The scripts shake the player's pad for `seconds` (`Pg.Rumble`, the
-    /// hijack scripts' failed press: 0.3 s and 1 s); a longer shake
-    /// already going keeps going.
-    pub fn rumble(&mut self, seconds: f64) {
-        if self.rumble_on && seconds > 0.0 {
+    /// Shakes the player's pad `strength` hard (0 to 1) for `seconds`
+    /// (the rumble queue: `Pg.Rumble`, the hijack scripts' failed press;
+    /// a fall's impact); a longer or stronger shake already going keeps
+    /// going. Both motors run at the strength (invented: the queue's
+    /// reader was not traced to the motors).
+    pub fn rumble(&mut self, strength: f32, seconds: f64) {
+        if self.rumble_on && seconds > 0.0 && strength > 0.0 {
+            if self.shaking <= 0.0 {
+                self.strength = 0.0;
+            }
             self.shaking = self.shaking.max(seconds);
+            self.strength = self.strength.max(strength.clamp(0.0, 1.0));
         }
     }
 
     /// The motors' speeds for the next `dt` seconds, and the shake's
-    /// count down: [`RUMBLE`] while shaking, else stopped.
+    /// count down: the shake's strength on both while shaking, else
+    /// stopped.
     fn shake(&mut self, dt: f64) -> [f32; 2] {
         if !self.rumble_on {
             self.shaking = 0.0;
         }
         if self.shaking > 0.0 {
             self.shaking = (self.shaking - dt).max(0.0);
-            RUMBLE
+            [self.strength; 2]
         } else {
             [0.0; 2]
         }
@@ -862,17 +865,18 @@ mod tests {
     #[test]
     fn the_scripts_shake_runs_its_seconds_and_only_with_vibration_on() {
         let mut p = Pad::default();
-        p.rumble(1.0);
+        p.rumble(0.3, 1.0);
         assert_eq!(p.shake(0.1), [0.0; 2]);
         p.rumble_on = true;
-        p.rumble(0.3);
-        p.rumble(1.0);
-        p.rumble(0.3);
+        // The hijack's failed press (`Pg.Rumble(who, 0.3)`: 0.3 hard for
+        // the default second), then a light fall's 0.15.
+        p.rumble(0.3, 1.0);
+        p.rumble(0.15, 1.0);
         for _ in 0..4 {
-            assert_eq!(p.shake(0.25), RUMBLE);
+            assert_eq!(p.shake(0.25), [0.3; 2]);
         }
         assert_eq!(p.shake(0.25), [0.0; 2]);
-        p.rumble(1.0);
+        p.rumble(1.0, 1.0);
         p.rumble_on = false;
         assert_eq!(p.shake(0.1), [0.0; 2]);
     }
