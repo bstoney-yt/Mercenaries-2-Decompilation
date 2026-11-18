@@ -3973,8 +3973,8 @@ impl Physics {
     /// meeting vehicles' hulls and other props as the 360's props do (gap
     /// P7; the port's props are fixed until knocked loose). For the
     /// props benchmark (`propbench`); nothing in play makes these yet.
-    pub fn add_prop_body(&mut self, piece: &LoosePiece, at: Mat4) -> DebrisId {
-        self.add_piece(
+    pub fn add_prop_body(&mut self, piece: &LoosePiece, at: Mat4, asleep: bool) -> DebrisId {
+        let id = self.add_piece(
             piece,
             at,
             Vec3::ZERO,
@@ -3984,7 +3984,13 @@ impl Physics {
                 r::Group::ALL.difference(RUBBLE),
                 r::InteractionTestMode::And,
             ),
-        )
+        );
+        // Put to sleep where it is placed (`asleep`): it stays until
+        // something touches it, as a prop at rest in its layer.
+        if asleep && let Some(b) = self.debris[id.0].and_then(|h| self.world.bodies.get_mut(h)) {
+            b.sleep();
+        }
+        id
     }
 
     /// As [`add_debris`](Self::add_debris), a piece of goods riding loose
