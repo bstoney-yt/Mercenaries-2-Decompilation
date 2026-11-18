@@ -3065,6 +3065,26 @@ impl Combat {
         )
     }
 
+    /// What a round from `from` along `dir` striking the world `t` metres
+    /// on throws up ([`strike_world`](Self::strike_world)): the word of the
+    /// surface it struck, and whether the particle table decided its
+    /// effect (for `--impact-check`).
+    pub fn impact_probe(
+        &mut self,
+        physics: &Physics,
+        from: Vec3,
+        dir: Vec3,
+        t: f32,
+    ) -> (u32, bool) {
+        let before = self.table_impacts;
+        let surface = physics
+            .cast_ray_surface(from, dir, t + 0.05)
+            .map_or(0, |(.., surface)| surface);
+        self.strike_world(physics, from, dir, t);
+        self.game_fx.clear();
+        (surface, self.table_impacts > before)
+    }
+
     /// A round from `from` along `dir` striking the world `t` metres on:
     /// it throws up the impact for what the triangle it struck is made of
     /// ([`m2_engine::surface::bullet_impact`]), and this is what it
@@ -5433,7 +5453,7 @@ impl Combat {
     /// the hundredth from a car or a tank, a `Tank` none, and nothing
     /// under size 5 or past no more than 1. The part where they met takes the same. Returns the
     /// crashes, for the log: (struck vehicle, the other, closing speed,
-    /// damage it took). From the 360 code: the size, floor, hundredth and
+    /// damage it took, where they met: the deepest point of contact). From the 360 code: the size, floor, hundredth and
     /// cells (0x82162BB8, 0x82163758, 0x8228B5F0, 0x82287CF8). Inferred:
     /// one crash per meeting (the 360 sends one for each new contact),
     /// and the `DamageModifier` multiplier (a body landing on another
@@ -5442,7 +5462,7 @@ impl Combat {
         &mut self,
         physics: &mut Physics,
         vehicles: &mut [ParkedVehicle],
-    ) -> Vec<(usize, usize, f32, f32)> {
+    ) -> Vec<(usize, usize, f32, f32, Vec3)> {
         let mut now = std::collections::HashSet::new();
         let mut met = Vec::new();
         for (i, v) in vehicles.iter().enumerate() {
@@ -5503,7 +5523,7 @@ impl Combat {
                 };
                 let damage = m2_engine::durability::crash_damage(size, cell);
                 if damage <= 0.0 {
-                    out.push((struck, other, closing, 0.0));
+                    out.push((struck, other, closing, 0.0, at));
                     continue;
                 }
                 let v = &mut vehicles[struck];
@@ -5511,7 +5531,7 @@ impl Combat {
                     v.hit_parts(body, at, damage);
                 }
                 self.hurt_vehicle(physics, v, struck, damage);
-                out.push((struck, other, closing, damage));
+                out.push((struck, other, closing, damage, at));
             }
         }
         out

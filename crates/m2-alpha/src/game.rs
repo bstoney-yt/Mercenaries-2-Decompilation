@@ -2119,7 +2119,7 @@ impl Game {
             let crashes = self
                 .combat
                 .vehicle_crashes(&mut world.physics, &mut self.scene.vehicles);
-            for (struck, other, closing, damage) in crashes {
+            for (struck, other, closing, damage, _) in crashes {
                 let v = &self.scene.vehicles[struck];
                 eprintln!(
                     "crash: the {} hit by the {} at {closing:.1} m/s takes {damage:.1} ({:.0} of {:.0} left)",
