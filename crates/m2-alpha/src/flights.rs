@@ -75,6 +75,11 @@ const LOAD_HEIGHT: f32 = 2.0;
 /// The ground found under the drop point counts if within this far of
 /// the scripts' height for it, metres.
 const GROUND_SLACK: f32 = 15.0;
+/// A falling crate looks for what it lands on from this far over where
+/// it was the step before, metres: what is under it, not the helicopter
+/// that let it go hovering over it (a look from high above met that
+/// first, and the crate stood on it, 10 m up).
+const FLOOR_REACH: f32 = 1.0;
 /// Downward acceleration of a crate let go, m/s².
 const GRAVITY: f32 = 9.81;
 /// A delivered crate's health (the first contract's supply drop's
@@ -1186,8 +1191,9 @@ impl Flights {
                 continue;
             };
             *speed += GRAVITY * dt;
+            let was = c.at;
             c.at.y -= *speed * dt;
-            let floor = ground(physics, c.at + Vec3::Y * 2.0);
+            let floor = floor_under(physics, was, was.y - c.at.y);
             if let Some(g) = floor
                 && c.at.y <= g
             {
@@ -1443,6 +1449,19 @@ fn world_box(place: Mat4, bounds: (Vec3, Vec3)) -> (Vec3, Vec3) {
         })
 }
 
+/// The height of the first solid thing a crate falling `fall` metres from
+/// `was` (its underside) this step meets, if it meets one: a look down
+/// from [`FLOOR_REACH`] over it to [`FLOOR_REACH`] under where it ends.
+/// The 360 lets a winched load go as a body of its own (0x82195FF8 drops
+/// the winch's hold on it and wakes it), and it falls and comes to rest on
+/// what is under it; the helicopter over it plays no part.
+fn floor_under(physics: &Physics, was: Vec3, fall: f32) -> Option<f32> {
+    let top = was + Vec3::Y * FLOOR_REACH;
+    physics
+        .cast_ray(top, Vec3::NEG_Y, 2.0 * FLOOR_REACH + fall.max(0.0))
+        .map(|(t, _)| top.y - t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1576,6 +1595,77 @@ mod tests {
         assert_eq!(broke.iter().map(|b| b.0).collect::<Vec<_>>(), [4]);
         assert_eq!(flights.take_broken().len(), 2);
         assert!(flights.take_broken().is_empty());
+    }
+
+    #[test]
+    fn a_crate_let_go_lands_on_the_ground_not_on_what_hovers_over_it() {
+        let mut physics = Physics::new();
+        let floor = CollisionShape::cuboid(Vec3::new(500.0, 1.0, 500.0));
+        physics.add_static(
+            StaticKey::Cell(1),
+            &floor,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        physics.step(1.0 / 60.0);
+        let mut flights = Flights::default();
+        let to = Vec3::new(0.0, 0.0, 60.0);
+        let load = Load {
+            guid: 3,
+            model: Some(99),
+            leaves: Vec::new(),
+        };
+        flights.start(COPTER, vec![load], Vec3::new(0.0, 30.0, 0.0), to);
+        let dt = 1.0 / 60.0;
+        let mut overhead = false;
+        for _ in 0..60 * 60 {
+            let released = !flights
+                .step(dt, &mut physics, &mut [], Vec3::ZERO)
+                .is_empty();
+            if released && !overhead {
+                // The helicopter (here a slab) still over the crate it let
+                // go, 8 to 9 m up.
+                let hull = CollisionShape::cuboid(Vec3::new(3.0, 0.5, 3.0));
+                physics.add_static(
+                    StaticKey::Cell(2),
+                    &hull,
+                    to + Vec3::Y * 8.5,
+                    Quat::IDENTITY,
+                );
+                physics.step(dt);
+                overhead = true;
+            }
+            if flights.crate_standing(3).is_some() {
+                break;
+            }
+        }
+        assert!(overhead, "let go");
+        // Down on the floor (y 0) where it fell, not up on the hull.
+        let at = flights
+            .crates
+            .iter()
+            .find(|c| c.guid == 3)
+            .expect("down")
+            .at;
+        assert!(at.y.abs() < 0.05, "stands at {at}");
+        assert!(at.with_y(0.0).distance(to) < 1.0, "{at}");
+    }
+
+    #[test]
+    fn a_crate_falling_meets_the_first_thing_under_it() {
+        let mut physics = Physics::new();
+        let slab = CollisionShape::cuboid(Vec3::new(5.0, 0.5, 5.0));
+        // Ground with its top at y 0, and something over it from y 8 to 9.
+        physics.add_static(StaticKey::Cell(1), &slab, Vec3::Y * -0.5, Quat::IDENTITY);
+        physics.add_static(StaticKey::Cell(2), &slab, Vec3::Y * 8.5, Quat::IDENTITY);
+        physics.step(1.0 / 60.0);
+        let at = |y| floor_under(&physics, Vec3::new(0.0, y, 0.0), 0.1);
+        // 0.5 m over the ground: the ground, not the slab 8 m over it.
+        assert!((at(0.5).expect("ground") - 0.0).abs() < 1e-3);
+        // Nothing within reach yet, high in the air.
+        assert_eq!(at(5.0), None);
+        // Over the slab, it lands on the slab.
+        assert!((at(9.3).expect("slab") - 9.0).abs() < 1e-3);
     }
 
     #[test]

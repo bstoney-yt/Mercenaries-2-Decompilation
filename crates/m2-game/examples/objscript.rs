@@ -14,9 +14,13 @@
 //! what they ask of the first one. For `AntiAir` it spawns a crewed
 //! `M113 AA (VZ) (Driver)` where the first stands, comes near it, has it
 //! lock on her and fire, and counts the radar calls the scripts make
-//! (`antiair:` lines). For `C4` and `beacon` it throws one (`C4
+//! (`antiair:` lines). For `autogunship` it flies the gunship over her
+//! with a hostile vehicle near her and prints the shells it fires
+//! (`gunship:` lines). For `C4` and `beacon` it throws one (`C4
 //! Projectile`, `ammo_designator_beacon`), leaves it 3 s and takes it
-//! away, printing what the scripts ask of it (`thrown:` lines). Prints
+//! away, printing what the scripts ask of it (`thrown:` lines).
+//! For a `tree_` script it makes an island tree of a template that runs
+//! it, burns it down and prints the material animations it plays. Prints
 //! names, counts and the scripts' errors only.
 
 use std::fs::File;
@@ -140,6 +144,45 @@ fn main() -> Result<()> {
             alive(&mission)
         );
     }
+    if name.starts_with("tree_") {
+        // An island tree of a template that runs it, burnt down: what
+        // its script plays.
+        let template = mission
+            .world()
+            .borrow()
+            .template_scripts
+            .iter()
+            .find(|(_, (s, _))| s == hash)
+            .map(|(t, _)| t.clone());
+        println!("a template that runs it: {template:?}");
+        if let Some(template) = template {
+            let tree = 0xf001_0002;
+            mission.put_player([3.0, 0.0, 0.0]);
+            let adopted = mission.adopt_scripted(tree, &template, [0.0; 3]);
+            // As a burnt tree's part machines go (`m2_engine::part_runner`):
+            // a palm's trunk, then a canopy's crown, `Slice00`.
+            let trunk = 0x501d_5fd7; // the palm's trunk part's node
+            let crown = m2_assets::name_hash("Slice00");
+            for (machine, state) in [
+                (trunk, 0x0753_c8f7),
+                (trunk, 0x0046_41a5),
+                (crown, 0x3cc4_e770),
+                (crown, 0x0753_c8f7),
+            ] {
+                mission.object_state_changed(tree, machine, state);
+            }
+            let mut played = Vec::new();
+            for _ in 0..8 {
+                mission.tick(0.25);
+                for c in mission.take_commands() {
+                    if let Command::MaterialAnimation { name, looped, .. } = c {
+                        played.push((name, looped));
+                    }
+                }
+            }
+            println!("adopted {adopted}; burnt down, it plays {played:?}");
+        }
+    }
     if name.eq_ignore_ascii_case("AntiAir")
         && let Some(&(_, _, at)) = on.first()
     {
@@ -215,6 +258,10 @@ fn main() -> Result<()> {
         for s in seen.iter().rev().take(40).rev() {
             println!("{s}");
         }
+    }
+    if name.eq_ignore_ascii_case("autogunship") {
+        let level = args.get(3).is_some_and(|a| a == "level");
+        autogunship(&mut mission, args.get(2).map(String::as_str), level)?;
     }
     if ["c4", "beacon"].contains(&name.to_ascii_lowercase().as_str()) {
         thrown(&mut mission, name);
@@ -318,6 +365,100 @@ fn planted(mission: &mut Mission) {
             mission.world().borrow().objects.contains_key(&g)
         );
     }
+}
+
+/// `autogunship`: she stands at (100, 0, 100) with a hostile vehicle
+/// (`target`, default `M113 AA (VZ) (Driver)`) 60 m off; the gunship is
+/// flown over her
+/// as AllCon003 flies it (`Airstrike.Flyby` from 300 m north of her to
+/// her, 100 m up, at 40 m/s, and on past her on the 360 flyby path, or
+/// level with `level` as the fourth argument), and 30 s pass. Prints each
+/// `Gunship Shell` it fires (`gunship:` lines: when, from, which way)
+/// and the scripts' errors.
+fn autogunship(mission: &mut Mission, target: Option<&str>, level: bool) -> Result<()> {
+    let target = target.unwrap_or("M113 AA (VZ) (Driver)");
+    mission.put_player([100.0, 0.0, 100.0]);
+    let tank = mission.spawn(target, [160.0, 0.0, 100.0]);
+    let labels: String = mission
+        .lua()
+        .load(
+            "local t = ... local s = ''              for _, l in ipairs({'Vehicle', 'VZ', 'China', 'Guerilla'}) do                if Object.HasLabel(t, l) then s = s .. l .. ' ' end end              return s .. #Pg.FastCollectGroundVehicles(100, 0, 100, 200) .. ' near her'",
+        )
+        .call(tank.map(m2_game::events::guid_value))
+        .unwrap_or_default();
+    println!("gunship: target {target} {tank:?}: {labels}");
+    mission.take_commands();
+    mission.take_log();
+    let start = mission.now();
+    // AllCon003's call: from 50 m west and 300 m north of her to her, 100
+    // m over her, at 40 m/s.
+    mission.run(
+        "local x, y, z = Object.GetPosition(Player.GetLocalCharacter())          __gunship = Airstrike.Flyby('Support Vehicle (Autogunship)',          x - 50, z + 300, x, z, y + 100, 40)",
+        "gunship-check",
+    )?;
+    let gunship: Option<u32> = mission
+        .lua()
+        .load("return __gunship")
+        .eval::<mlua::Value>()
+        .ok()
+        .and_then(|v| m2_game::events::as_guid(&v));
+    let (from, to) = ([50.0_f32, 100.0, 400.0], [100.0_f32, 100.0, 100.0]);
+    let len = ((to[0] - from[0]).powi(2) + (to[2] - from[2]).powi(2)).sqrt();
+    let mut shells = 0;
+    let mut gunship = gunship;
+    while mission.now() < start + 30.0 {
+        // Flown at 40 m/s: level to her, then on past her. `level`: level,
+        // gone 1500 m past (the port before); else the 360's path (climbing
+        // one in four, gone at twice its run-in past her).
+        if let Some(g) = gunship {
+            let s = 40.0 * (mission.now() - start) as f32;
+            let (flat, up) = if s <= len || level {
+                (s, 0.0)
+            } else {
+                let past = (s - len) / (1.0f32 + 0.0625).sqrt();
+                (len + past, 0.25 * past)
+            };
+            let k = flat / len;
+            let at = [
+                from[0] + (to[0] - from[0]) * k,
+                100.0 + up,
+                from[2] + (to[2] - from[2]) * k,
+            ];
+            let fly_on = if level { 1500.0 } else { 2.0 * len };
+            if flat - len >= fly_on {
+                println!("gunship: t={:.2} gone at {at:.0?}", mission.now() - start);
+                mission.flyby_gone(g);
+                gunship = None;
+            } else {
+                mission.place(g, at, 0.0);
+            }
+        }
+        mission.tick(0.25);
+        for c in mission.take_commands() {
+            if let Command::Ordnance {
+                what, at, launch, ..
+            } = &c
+            {
+                shells += 1;
+                if shells <= 12 {
+                    println!(
+                        "gunship: t={:.2} {what} at {at:?} {launch:?}",
+                        mission.now() - start
+                    );
+                }
+            }
+        }
+        for l in mission.take_log() {
+            if l.contains("rror") || l.contains("SALVO") || l.contains("target") {
+                println!("gunship: log {}", l.chars().take(160).collect::<String>());
+            }
+        }
+    }
+    println!(
+        "gunship: {shells} shells in 30 s ({})",
+        if level { "level" } else { "360 path" }
+    );
+    Ok(())
 }
 
 /// `C4` and `beacon`: thrown as she throws them (`C4 Projectile`; the

@@ -161,6 +161,57 @@ function unpack(t, i, j)
 end
 "##;
 
+/// Makes a script thread that dies with an error say so in the log.
+///
+/// The game's scripts run their own threads (`coroutine.resume`,
+/// `coroutine.wrap`) and drop the `false, err` a failed resume returns,
+/// so a thread that dies on an error the host can't answer (a missing
+/// engine call, say) used to vanish without a word: one waiting on a
+/// load that never finished left an endless loading screen and nothing
+/// in the log. This wraps both: a resume that fails writes
+/// `script thread died: <err>` and the thread's traceback through `log`,
+/// once per thread (resuming a dead thread again fails again), and gives
+/// back what the stock function gave. `coroutine.wrap`'s error still goes
+/// on to its caller, as the stock one's does.
+///
+/// Invented: the game's own Lua does not log this (a host-side
+/// diagnostic, it changes nothing the scripts see).
+const THREAD_ERRORS: &str = r##"
+local log = ...
+local resume0, create, status = coroutine.resume, coroutine.create, coroutine.status
+local traceback = debug and debug.traceback or function() return "(no traceback)" end
+local tostring, error = tostring, error
+local told = setmetatable({}, { __mode = "k" })
+local function report(co, ok, ...)
+    if not ok and not told[co] then
+        told[co] = true
+        log("script thread died: " .. tostring((...)) .. "\n" .. traceback(co))
+    end
+    return ok, ...
+end
+function coroutine.resume(co, ...)
+    return report(co, resume0(co, ...))
+end
+local function pass(ok, ...)
+    if ok then return ... end
+    error((...), 0)
+end
+function coroutine.wrap(f)
+    local co = create(f)
+    return function(...)
+        return pass(report(co, resume0(co, ...)))
+    end
+end
+"##;
+
+/// Installs [`THREAD_ERRORS`] in `lua`, writing through `log`.
+pub(crate) fn report_dead_threads(lua: &Lua, log: Function) -> mlua::Result<()> {
+    lua.load(THREAD_ERRORS)
+        .set_name("=m2-thread-errors")
+        .set_mode(ChunkMode::Text)
+        .call(log)
+}
+
 impl ScriptHost {
     pub fn new() -> Result<Self, ScriptError> {
         // SAFETY: loading precompiled chunks needs the unsafe constructor.
@@ -189,6 +240,11 @@ impl ScriptHost {
             .set_name("=m2-compat-getn")
             .set_mode(ChunkMode::Text)
             .exec()?;
+        let log_to_stderr = lua.create_function(|_, line: mlua::String| {
+            eprintln!("{}", line.to_string_lossy());
+            Ok(())
+        })?;
+        report_dead_threads(&lua, log_to_stderr)?;
         let stub_meta = lua.create_table()?;
         stub_meta.set(
             "__index",
@@ -884,6 +940,101 @@ mod tests {
 
     /// See `m2-assets`' Lua tests for the source.
     const LUA51: &[u8] = include_bytes!("../../m2-assets/tests/data/mission51.luac");
+
+    /// A VM with the debug library, as the host's has.
+    fn with_debug() -> Lua {
+        // SAFETY: only the tests' own source text is loaded.
+        unsafe { Lua::unsafe_new() }
+    }
+
+    /// A thread's error, as [`report_dead_threads`] logs it, into `lines`.
+    fn logged(lua: &Lua) -> Rc<RefCell<Vec<String>>> {
+        let lines: Rc<RefCell<Vec<String>>> = Rc::default();
+        let into = Rc::clone(&lines);
+        let log = lua
+            .create_function(move |_, l: String| {
+                into.borrow_mut().push(l);
+                Ok(())
+            })
+            .unwrap();
+        report_dead_threads(lua, log).unwrap();
+        lines
+    }
+
+    #[test]
+    fn a_failed_resume_is_logged_once_and_returned_unchanged() {
+        let lua = with_debug();
+        let lines = logged(&lua);
+        let (ok, err, again_ok, again_err): (bool, String, bool, String) = lua
+            .load(
+                "local co = coroutine.create(function() local x = nil; x.y = 1 end) \
+                 local ok, err = coroutine.resume(co) \
+                 local again_ok, again_err = coroutine.resume(co) \
+                 return ok, err, again_ok, again_err",
+            )
+            .set_name("=t")
+            .eval()
+            .unwrap();
+        assert!(!ok);
+        assert!(err.contains("attempt to index"), "{err}");
+        assert_eq!(
+            (again_ok, again_err.as_str()),
+            (false, "cannot resume dead coroutine")
+        );
+        let lines = lines.borrow();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("script thread died: t:1: attempt to index"));
+        assert!(lines[0].contains("stack traceback:"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn a_resume_that_works_is_not_logged_and_passes_values() {
+        let lua = with_debug();
+        let lines = logged(&lua);
+        let got: (bool, i64, bool, i64) = lua
+            .load(
+                "local co = coroutine.create(function(a) local b = coroutine.yield(a + 1) return b * 2 end) \
+                 local ok1, v1 = coroutine.resume(co, 1) \
+                 local ok2, v2 = coroutine.resume(co, 5) \
+                 return ok1, v1, ok2, v2",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(got, (true, 2, true, 10));
+        assert!(lines.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_wrapped_thread_logs_and_still_raises() {
+        let lua = with_debug();
+        let lines = logged(&lua);
+        let (ok, err, yielded): (bool, String, i64) = lua
+            .load(
+                "local y = coroutine.wrap(function() coroutine.yield(7) end)() \
+                 local f = coroutine.wrap(function() error('boom') end) \
+                 local ok, err = pcall(f) \
+                 return ok, err, y",
+            )
+            .set_name("=w")
+            .eval()
+            .unwrap();
+        assert_eq!(yielded, 7);
+        assert!(!ok);
+        assert!(err.ends_with("boom"), "{err}");
+        assert_eq!(lines.borrow().len(), 1);
+        assert!(lines.borrow()[0].starts_with("script thread died: w:1: boom"));
+    }
+
+    #[test]
+    fn the_host_installs_the_thread_report() {
+        let host = ScriptHost::new().unwrap();
+        let wrapped: bool = host
+            .lua()
+            .load("return debug.getinfo(coroutine.resume, 'S').what == 'Lua'")
+            .eval()
+            .unwrap();
+        assert!(wrapped);
+    }
 
     #[test]
     fn a_contracts_own_global_reads_nil_until_set() {
