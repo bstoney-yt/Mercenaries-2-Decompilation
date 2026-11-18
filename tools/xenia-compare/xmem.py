@@ -223,8 +223,22 @@ class Hero:
                 return self._u32(obj + 0x14)
         return None
 
-    def state_addr(self, handle: int) -> int | None:
-        t, m = self.STATES, self.STATES + 0x34
+    def anim_state(self, handle: int):
+        """(stance hash, action hash, action mode hash) of the person's state
+        machine: table 0x83657B94 (looked up like the state table, 0x823DA2A0)
+        holds a pointer to it, S; S+4 stance (KnockedDown 0x35365D24), S+8 action
+        (Idle 0xB4DA003B), *(S+0x1C)+0x24 mode (FULL 0x4294EBA2, ON_END 0x7AC501F8,
+        NONE 0x4FF9F863). None when the person has no entry."""
+        a = self.state_addr(handle, 0x83657B94)
+        sp = self._u32(a) if a else 0
+        if not sp:
+            return None
+        rec = self._u32(sp + 0x1C)
+        return self._u32(sp + 4), self._u32(sp + 8), (self._u32(rec + 0x24) if rec else 0)
+
+    def state_addr(self, handle: int, table: int | None = None) -> int | None:
+        tbl = self.STATES if table is None else table
+        t, m = tbl, tbl + 0x34
         if not self._u32(m):
             return None
         size, mult = self._u32(m + 8), self._u32(m + 0xC)

@@ -1397,7 +1397,7 @@ def run(args) -> int:
                     def ploop(picks=picks, name=name, ev=ev):
                         with open(Path(args.out) / f"{name}.csv", "w", newline="") as fh:
                             wr = csv.writer(fh)
-                            wr.writerow(["t", "handle", "x", "y", "z", "health"])
+                            wr.writerow(["t", "handle", "x", "y", "z", "health", "stance", "action", "mode"])
                             hm_ = xmem.map_entries(gp, 0x83656558)
                             while not ev.is_set():
                                 tt = time.time() - t0
@@ -1408,8 +1408,10 @@ def run(args) -> int:
                                     b = gp.read(sa, 12)
                                     a_ = hm_.get(k_)
                                     hv = struct.unpack(">f", gp.read(a_ + 4, 4))[0] if a_ else float("nan")
+                                    st_ = hp_.anim_state(k_) or (0, 0, 0)
                                     if b:
-                                        wr.writerow([f"{tt:.3f}", f"{k_:#x}", *(f"{c:.3f}" for c in struct.unpack(">3f", b)), f"{hv:.2f}"])
+                                        wr.writerow([f"{tt:.3f}", f"{k_:#x}", *(f"{c:.3f}" for c in struct.unpack(">3f", b)), f"{hv:.2f}",
+                                                     *(f"{x:#010x}" for x in st_)])
                                 fh.flush()
                                 ev.wait(0.04)
 
