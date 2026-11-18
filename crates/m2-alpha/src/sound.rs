@@ -284,6 +284,11 @@ pub struct GameAudio {
     /// Breaks heard before their key's sounds were read: the key, where,
     /// and when (played once read, if still fresh).
     key_waiting: Vec<(u32, Vec3, Instant)>,
+    /// Flat cues the interface's tables don't have, waiting for the
+    /// world's cue tables to be read for them (the survival mode's
+    /// `sfx_survival_lp`, a mixed cue of the world's): the cue and its
+    /// key.
+    ui_key_waiting: Vec<(String, u32)>,
     /// Which cue each gun's sound set fires with (the `Sounds` table),
     /// and the shot cues heard so far (each logged once).
     gun_cues: GunCues,
@@ -1454,6 +1459,7 @@ impl GameAudio {
             key_asked: HashSet::new(),
             key_tables: Arc::default(),
             key_waiting: Vec::new(),
+            ui_key_waiting: Vec::new(),
             gun_cues: install.map_or_else(GunCues::default, |install| {
                 match GunCues::read(install) {
                     Ok(c) => {
@@ -1631,7 +1637,53 @@ impl GameAudio {
                     self.out.with(|m| m.stop(old));
                 }
             }
-            None => eprintln!("ui sound: {cue} not found"),
+            // Not the interface's: the 360's `Sound.CueSound` (0x82340F08)
+            // queues any cue by its name hash to the sound system, which
+            // finds it in whatever cue tables are loaded; here, the
+            // world's ([`KeySounds::resolve`]), read on a thread.
+            None => {
+                let key = m2_assets::name_hash(cue);
+                match self.keys.get(&key) {
+                    Some(Some(found)) => {
+                        let found = found.clone();
+                        self.play_flat_key(cue, &found);
+                    }
+                    Some(None) => eprintln!("ui sound: {cue} not found"),
+                    None => {
+                        eprintln!("ui sound: {cue} not the interface's; reading the world's cues");
+                        self.ask_key(key);
+                        self.ui_key_waiting.push((cue.to_owned(), key));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Plays world cue `cue` (read as `found`) flat, as the interface's:
+    /// one of its takes, at its volume, looped when its name says so
+    /// ([`named_loop`]).
+    fn play_flat_key(&mut self, cue: &str, found: &KeySounds) {
+        if found.sounds.is_empty() {
+            eprintln!("ui sound: {cue} not found");
+            return;
+        }
+        let pick = self.random();
+        let i = ((pick * found.sounds.len() as f32) as usize).min(found.sounds.len() - 1);
+        let buffer = found.sounds[i].0.clone();
+        let looped = named_loop(cue);
+        eprintln!(
+            "ui sound: {cue} ({:.2} s{}, the world's: {})",
+            buffer.seconds(),
+            if looped { ", looped" } else { "" },
+            found.how
+        );
+        let mut play = Play::flat(buffer).gain(found.volume.clamp(0.0, 2.0)).ui();
+        if looped {
+            play = play.looped();
+        }
+        let voice = self.out.with(|m| m.play(play));
+        if let Some(old) = self.ui_playing.insert(cue.to_ascii_lowercase(), voice) {
+            self.out.with(|m| m.stop(old));
         }
     }
 
@@ -1661,6 +1713,9 @@ impl GameAudio {
 
     /// Stops interface sound `cue` if it plays (`Sound.StopSound`).
     pub fn stop_ui_sound(&mut self, cue: &str) {
+        // Stopped before it was read: it never starts.
+        self.ui_key_waiting
+            .retain(|(c, _)| !c.eq_ignore_ascii_case(cue));
         if let Some(voice) = self.ui_playing.remove(&cue.to_ascii_lowercase()) {
             eprintln!("ui sound: {cue} stopped");
             self.out.with(|m| m.stop(voice));
@@ -2778,6 +2833,14 @@ impl GameAudio {
     fn keys_loaded(&mut self) {
         while let Ok((key, found)) = self.key_loads.1.try_recv() {
             self.keys.insert(key, found.map(Arc::new));
+        }
+        let waiting = std::mem::take(&mut self.ui_key_waiting);
+        for (cue, key) in waiting {
+            match self.keys.get(&key).cloned() {
+                Some(Some(found)) => self.play_flat_key(&cue, &found),
+                Some(None) => eprintln!("ui sound: {cue} not found"),
+                None => self.ui_key_waiting.push((cue, key)),
+            }
         }
         let now = Instant::now();
         let waiting = std::mem::take(&mut self.key_waiting);

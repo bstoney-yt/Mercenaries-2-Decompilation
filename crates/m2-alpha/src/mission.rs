@@ -3926,6 +3926,16 @@ impl MissionLink {
                         eprintln!("mission: health clamp {on}");
                         game.combat.health_clamp = *on;
                     }
+                    Command::SurvivalMode(on) => {
+                        eprintln!("mission: survival mode {on}");
+                        if *on != game.combat.survival {
+                            eprintln!(
+                                "combat: survival mode {} (the scripts)",
+                                if *on { "on" } else { "off" }
+                            );
+                        }
+                        game.combat.survival = *on;
+                    }
                     Command::SetHealth { guid, health } if *guid == PLAYER => {
                         eprintln!(
                             "mission: scripts set her health {:.1} -> {health:.1}",

@@ -250,6 +250,9 @@ struct Options {
     /// With `--drive` and `--wreck` or `--shoot-up`: get out of the wreck,
     /// walk to the fuel can it left and take it (testing).
     fuel_check: bool,
+    /// `--survival-check`: her health clamp and survival mode on the
+    /// game's own code, offscreen ([`combat::survival_check`]); then exit.
+    survival_check: bool,
     /// With `--drive`: stop and put this many rifle rounds into its parts.
     shoot_up: Option<u32>,
     /// With `--drive`: fire from the next seat with a weapon.
@@ -795,6 +798,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--plough" => o.plough = Some(value()?.to_ascii_lowercase()),
             "--wreck" => o.wreck = true,
             "--fuel-check" => o.fuel_check = true,
+            "--survival-check" => o.survival_check = true,
             "--shoot-up" => {
                 o.shoot_up = Some(
                     value()?
@@ -1312,6 +1316,10 @@ fn run(
 ) -> anyhow::Result<()> {
     spans::start_profiler();
     let mut options = parse_args(args)?;
+    if options.survival_check {
+        combat::survival_check();
+        return Ok(());
+    }
     let ignored = screenshot_only_ignored(args);
     if !ignored.is_empty() {
         eprintln!(
