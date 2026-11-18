@@ -221,6 +221,14 @@ m2-alpha [options]
   --binocular-check      offscreen, no world: the binoculars' camera driven by
                          a scripted look and zoom; binocular-check: PASS or
                          FAIL lines and a RESULT line (exit 1 on a failure)
+  --seat-check           with --screenshot (no --drive needed): park a
+                         --vehicle (default M151) with a gunner's own
+                         entrance near her if none is (trying its models one
+                         at a time), stand at that entrance, press use with
+                         getting in
+                         locked, then unlocked, then use with getting out
+                         locked, then unlocked; prints seat-check: PASS or
+                         FAIL lines and seat-check: RESULT PASS/FAIL
   --survival-check       check: her health clamp and survival mode on the
                          game's own code (clamp, a crusher's hit, the cut);
                          PASS/FAIL, then exit
@@ -232,6 +240,9 @@ m2-alpha [options]
                          against the 360's 9.0 m/s^2: a block dropped 20 m,
                          the vehicle she gets in driven off a 10 m ledge,
                          a parked boat settling on still water; PASS/FAIL
+  --disguise-check       check: (offscreen) her vehicle disguise: a VZ jeep
+                         she rides hits a passer-by at 10 m/s and gives it
+                         away; parked, it holds; PASS/FAIL
   --stagger-check        check: (on foot) her stagger's exemptions on her own
                          clips: a blast behind her staggers her standing,
                          not aimed in, not while invincible; a bash aimed
@@ -309,6 +320,12 @@ m2-alpha [options]
   --check-node-damage <s> with --mission: <s> seconds into play, the scripts'
                          vehicle nearest her with node health has a node sent
                          ObjectState.SendDamage(o, node, 1) (nodedamage lines)
+  --check-building-damage <s>
+                         with --mission: <s> seconds into play, the scripts'
+                         object nearest her (not a vehicle) with node health
+                         has every node sent ObjectState.SendDamage(o, node,
+                         1), one at a time (buildingdamage lines: node and
+                         object health, and whether it was destroyed)
   --honk-every <s>       with --mission: driving, hold the horn half a second
                          every <s> seconds (horn, gate and disguise lines)
   --bash-target <s>      with --mission --after-contract: this long after the

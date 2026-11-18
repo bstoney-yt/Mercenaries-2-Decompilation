@@ -371,7 +371,7 @@ pub struct GameData {
     pub template_crushers: HashMap<String, f32>,
     /// Templates' `NodeHealth` records by name in lower case
     /// ([`crate::node_damage::template_nodes`]).
-    pub template_nodes: HashMap<String, Vec<m2_engine::node_health::NodeRecord>>,
+    pub template_nodes: HashMap<String, crate::node_damage::TemplateNodes>,
     /// Every template's name in the template database, in lower case:
     /// the names scripts look templates up by (`Pg.GetGuidByName("OC")`).
     pub template_names: std::collections::HashSet<String>,
@@ -942,6 +942,17 @@ impl Mission {
         };
         mission.settle("set-up");
         Ok(mission)
+    }
+
+    /// The first entity of any layer (loaded or not) whose object script
+    /// is `script`: its layer's name, its guid and where it stands.
+    pub fn entity_with_script(&self, script: u32) -> Option<(String, u32, [f32; 3])> {
+        self.layers.iter().find_map(|(layer, entities)| {
+            entities
+                .iter()
+                .find(|e| e.script == Some(script))
+                .map(|e| (layer.clone(), e.guid, e.at))
+        })
     }
 
     /// Puts the layers whose names contain `part` (any case) in the world
@@ -3108,6 +3119,18 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             }
             if let Some(t) = &e.template {
                 w.placed_as.insert(e.guid, t.clone());
+                // Placed, an object with node health takes its template's
+                // `Health` (the 360's Health component, which placing
+                // fills: 0x8222D850), so the scripts and the checks read
+                // it from the start ([`crate::node_damage`]).
+                let most = w
+                    .template_nodes
+                    .get(&t.to_ascii_lowercase())
+                    .and_then(|n| n.health);
+                if let (Some(most), Some(o)) = (most, w.objects.get_mut(&e.guid)) {
+                    o.max_health = most;
+                    o.health = most;
+                }
             }
         } else {
             w.crews.remove(&e.guid);
@@ -3238,7 +3261,7 @@ fn seat_crew(
 ///
 /// `mine` and `proximitymine` are the placed mines' and her planted
 /// mine's ([`Mission::placed_mines`]).
-pub const OBJECT_SCRIPTS: [(&str, u32); 26] = [
+pub const OBJECT_SCRIPTS: [(&str, u32); 27] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3265,6 +3288,7 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 26] = [
     ("tree_396840f6", TREE_SCRIPTS[2]),
     ("tree_6d5311e5", TREE_SCRIPTS[3]),
     ("tree_bb6fc961", TREE_SCRIPTS[4]),
+    ("islandfortress", ISLAND_FORTRESS),
 ];
 
 /// The trees' object scripts, unnamed in the archives (so named here
@@ -3288,6 +3312,14 @@ pub const TREE_SCRIPTS: [u32; 5] = [
 /// (Autogunship)`, the gunship AllCon003 flies over her
 /// (`Airstrike.Flyby`). Its name is from the hash (`autogunship`).
 pub const AUTOGUNSHIP: u32 = 0x9ae4_b2ec;
+
+/// `islandfortress`'s module hash: the script of the island fortress
+/// (`_island_bld_fortress01`'s `ObjectScript`). Its `OnStateChange` hears
+/// the part of node `cf37044a` go to state `694683eb` and brings the
+/// fortress down slice by slice (`KillNode`: `Object.GetNodeHealth`, then
+/// `ObjectState.SendDamage` of 1 and a timer for the slices next to it,
+/// [`crate::node_damage`]).
+pub const ISLAND_FORTRESS: u32 = 0x37b3_668c;
 
 /// `pursuitcopter`'s module hash.
 pub const PURSUIT_COPTER: u32 = 0x3e29_6216;
@@ -3423,8 +3455,11 @@ fn object_script(
     Some(
         lua.globals()
             .get::<mlua::Table>(*module)
-            .and_then(|m| m.get::<mlua::Function>(call))
-            .and_then(|f| f.call::<()>((crate::events::guid_value(guid), mlua::Value::Nil, data)))
+            .and_then(|m| m.get::<Option<mlua::Function>>(call))
+            .and_then(|f| match f {
+                Some(f) => f.call::<()>((crate::events::guid_value(guid), mlua::Value::Nil, data)),
+                None => Ok(()),
+            })
             .map_err(|err| format!("{module}.{call}: {}", first_lines(&err.to_string()))),
     )
 }
@@ -3549,6 +3584,47 @@ mod tests {
                 if guid == tree && name == "global_env_treepalm_anim")
         });
         assert!(played);
+    }
+
+    // Placed, an object with node health has its template's Health before
+    // anything asks for its table.
+    #[test]
+    fn a_placed_object_with_node_health_takes_its_templates_health() {
+        let mut data = GameData::default();
+        let mut e = villa_tank();
+        e.template = Some("_island_bld_fortress01".into());
+        let guid = e.guid;
+        data.layers.insert("test_layer".into(), vec![e]);
+        data.template_nodes.insert(
+            "_island_bld_fortress01".into(),
+            crate::node_damage::TemplateNodes {
+                records: Vec::new(),
+                health: Some(4000.0),
+            },
+        );
+        let mut m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
+        m.preload("test_layer");
+        let w = m.world().borrow();
+        assert_eq!(
+            (w.objects[&guid].health, w.objects[&guid].max_health),
+            (4000.0, 4000.0)
+        );
+        assert!(w.node_tables.is_empty());
+    }
+
+    #[test]
+    fn an_entity_is_found_by_its_script_in_any_layer() {
+        let mut data = GameData::default();
+        let mut e = villa_tank();
+        e.script = Some(ISLAND_FORTRESS);
+        let (guid, at) = (e.guid, e.at);
+        data.layers.insert("vz_q3".into(), vec![e]);
+        let m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
+        assert_eq!(
+            m.entity_with_script(ISLAND_FORTRESS),
+            Some(("vz_q3".into(), guid, at))
+        );
+        assert_eq!(m.entity_with_script(0x1234), None);
     }
 
     #[test]
