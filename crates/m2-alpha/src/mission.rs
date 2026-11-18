@@ -3911,13 +3911,16 @@ impl MissionLink {
                         eprintln!("mission: health clamp {on}");
                         game.combat.health_clamp = *on;
                     }
-                    Command::SurvivalMode(on) => {
+                    Command::SurvivalMode { on, beat } => {
                         eprintln!("mission: survival mode {on}");
                         if *on != game.combat.survival {
                             eprintln!(
                                 "combat: survival mode {} (the scripts)",
                                 if *on { "on" } else { "off" }
                             );
+                            // The beat flag goes with a change only
+                            // (0x8243AED8).
+                            game.combat.survival_beat = *beat;
                         }
                         game.combat.survival = *on;
                     }

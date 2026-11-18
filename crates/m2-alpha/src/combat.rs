@@ -1745,6 +1745,10 @@ pub struct Combat {
     /// would have taken her under its floor, or when the scripts turn it
     /// on; while on, hits from someone do [`SURVIVAL_DAMAGE`].
     pub survival: bool,
+    /// Whether her survival mode beats the screen (the player's +0x188,
+    /// 0x8243AED8): set with each change of the mode, true from the clamp
+    /// and unless the scripts' `Player.SetSurvivalMode` gives false.
+    pub survival_beat: bool,
     /// A second player has joined (the clamp's floor is lower).
     pub coop: bool,
     /// Seconds into the survival beat (the player's +0x184), and the
@@ -2194,6 +2198,7 @@ impl Default for Combat {
             run_overs: (0, 0.0),
             health_clamp: false,
             survival: false,
+            survival_beat: true,
             coop: false,
             beat: 0.0,
             beat_left: 0.0,
@@ -4217,10 +4222,14 @@ impl Combat {
                 0.0
             })
         };
-        if self.survival {
+        if self.survival && self.survival_beat {
             let b = beat();
             self.beat_left = (-0.1 * b).clamp(-0.1, 0.01);
             (5.0 * b).clamp(MOTION_BLUR, 5.0)
+        } else if self.survival {
+            // In survival mode without the beat (+0x188 clear), 0x82439B98
+            // leaves the blur as it is.
+            MOTION_BLUR
         } else {
             if self.beat_left != 0.0 {
                 let b = beat();
@@ -4258,6 +4267,7 @@ impl Combat {
             if self.hp - damage < self.clamp_floor() && !self.survival {
                 eprintln!("combat: survival mode on (the clamp caught a hit)");
                 self.survival = true;
+                self.survival_beat = true;
             }
             damage
         } else if self.survival && attacked {
@@ -7348,6 +7358,32 @@ pub fn survival_check() -> bool {
     println!(
         "survival-check: survival on, clamp off, 8 hp, a 30 hit from someone: {} hp: {}",
         cut.hp,
+        verdict(ok)
+    );
+    // The beat (0x82439B98): with the beat flag, the blur beats up to 2.5
+    // within its 0.6 s; without it (the scripts' third argument false),
+    // it stays at the game's 0.25.
+    let peak = |beat: bool| {
+        let mut c = Combat {
+            survival: true,
+            survival_beat: beat,
+            ..Combat::default()
+        };
+        (0..12)
+            .map(|_| c.survival_blur(0.05))
+            .fold(0.0f32, f32::max)
+    };
+    let (with, without) = (peak(true), peak(false));
+    let ok = (with - 2.5).abs() < 1e-3;
+    all &= ok;
+    println!(
+        "survival-check: survival on with the beat: blur peaks at {with:.2} in 0.6 s: {}",
+        verdict(ok)
+    );
+    let ok = (without - MOTION_BLUR).abs() < 1e-6;
+    all &= ok;
+    println!(
+        "survival-check: survival on without the beat: blur stays at {without:.2}: {}",
         verdict(ok)
     );
     println!("survival-check: {}", verdict(all));
