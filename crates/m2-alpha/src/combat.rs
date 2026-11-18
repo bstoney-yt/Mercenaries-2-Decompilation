@@ -2049,6 +2049,9 @@ pub struct Combat {
     /// gun's where only that is known; 0 none): what [`Hit::round`]
     /// names.
     firing: u32,
+    /// Vehicle-against-vehicle contacts heard with a cue, all told (for
+    /// `--impact-check`).
+    pub vehicle_contacts_heard: u32,
     /// Those impacts by template.
     pub impact_kinds: std::collections::BTreeMap<&'static str, u32>,
     /// What the fighting has come to (for checking).
@@ -2357,6 +2360,7 @@ impl Default for Combat {
             contacts: Vec::new(),
             hit_events: Vec::new(),
             firing: 0,
+            vehicle_contacts_heard: 0,
             impact_kinds: std::collections::BTreeMap::new(),
             tally: Tally::default(),
             hurts: Vec::new(),
