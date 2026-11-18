@@ -809,21 +809,34 @@ def run(args) -> int:
 
                 cam = xmem.Camera(xmem.Guest(p.pid))
                 gs = xmem.Guest(p.pid)
+                hh2 = xmem.Hero(gs)
                 name = w[1]
+                hold_s = next((float(t[5:]) for t in w if t.startswith("hold=")), 3.0)
+                after_s = next((float(t[6:]) for t in w if t.startswith("after=")), 0.0)
+                level = not any(t == "nolevel" for t in w)
+                hb = next((parse_buttons(t[4:])[0] for t in w if t.startswith("btn=")), 0)
+                w = [t for t in w if not (t.startswith("hold=") or t.startswith("after=") or t.startswith("btn=") or t == "nolevel")]
                 # the on-foot camera object (vtable 0x820F0290) and its fields, logged per sample
-                cobj = xmem.scan_word(gs, 0x820F0290, limit=8)
+                cobj = xmem.scan_word(gs, 0x820F0290, lo=0x40000000, hi=0x1_0000_0000, limit=8)
                 say(f"stickresp2 {name}: camera objects (vtable 0x820F0290) at {[hex(a) for a in cobj]}")
                 cobj = cobj[0] if cobj else None
-                F_OFF = (("ramp", 0x750, "f"), ("pull", 0x770, "f"), ("row9e0", 0x9E0, "f"), ("row9e4", 0x9E4, "f"),
-                         ("fyaw", 0x610, "f"), ("fpitch", 0x648, "f"), ("yawx", 0x638, "f"), ("aim", 0x7CD, "b"))
+                F_OFF = tuple((f"o{off:03X}", off, "f") for off in (0x600, 0x610, 0x618, 0x61C, 0x620, 0x624, 0x628, 0x62C, 0x638, 0x63C, 0x640,
+                                                                0x750, 0x770, 0x9E0, 0x9E4, 0x648, 0x658, 0x65C, 0x664, 0x670)) + (("aim", 0x7CD, "b"),)
 
                 def fields():
                     out = []
                     sens = gs.read(0x83457484, 4)
                     out.append(struct.unpack(">f", sens)[0] if sens else float("nan"))
+                    blk = gs.read(cobj + 0x600, 0x400) if cobj else None  # one read: +0x600..+0x9FF
                     for _, off, k in F_OFF:
-                        b = gs.read(cobj + off, 4 if k == "f" else 1) if cobj else None
-                        out.append(float("nan") if not b else (struct.unpack(">f", b)[0] if k == "f" else b[0]))
+                        if not blk or len(blk) < 0x400:
+                            out.append(float("nan"))
+                        elif k == "f":
+                            out.append(struct.unpack_from(">f", blk, off - 0x600)[0])
+                        else:
+                            out.append(blk[off - 0x600])
+                    hh2.update()
+                    out.append(hh2.facing() if hh2.quat else float("nan"))
                     for ga in (0x8380EE90, 0x8380EE88):
                         b = gs.read(ga, 4)
                         out.append(struct.unpack(">f", b)[0] if b else float("nan"))
@@ -832,11 +845,11 @@ def run(args) -> int:
                 vals = w[2:] or ["x0.5", "x0.75", "x1", "x-1", "y0.5", "y0.75", "y1", "y-0.5", "y-0.75", "y-1"]
                 with open(Path(args.out) / f"{name}.csv", "w", newline="") as fh:
                     wr = csv.writer(fh)
-                    wr.writerow(["hold", "t", "yaw", "pitch", "sens", *(f[0] for f in F_OFF), "g8380EE90", "g8380EE88"])
+                    wr.writerow(["hold", "t", "yaw", "pitch", "sens", *(f[0] for f in F_OFF), "her_facing", "g8380EE90", "g8380EE88"])
                     for hv in vals:
                         axis, v = hv[0], float(hv[1:])
                         lv = time.time() + 10
-                        while time.time() < lv:
+                        while level and time.time() < lv:
                             pv = cam.pitch()
                             if pv is None or abs(pv) < 2:
                                 break
@@ -846,8 +859,10 @@ def run(args) -> int:
                         apply()
                         time.sleep(1.0)
                         t_s, smp, uy, last = time.time(), [], 0.0, None
-                        apply(0, 0, 0, 0.0, 0.0, v if axis == "x" else 0.0, v if axis == "y" else 0.0)
-                        while time.time() - t_s < 3.0:
+                        apply(hb, 0, 0, 0.0, 0.0, v if axis == "x" else 0.0, v if axis == "y" else 0.0)
+                        while time.time() - t_s < hold_s + after_s:
+                            if time.time() - t_s >= hold_s and (held[5], held[6]) != (0.0, 0.0):
+                                apply(hb)  # released: the rest logs the drift back
                             yv, pv = cam.yaw(), cam.pitch()
                             if yv is not None and pv is not None:
                                 if last is not None:
@@ -863,7 +878,7 @@ def run(args) -> int:
                             seg = [x for x in smp if a <= x[0] <= b]
                             return (seg[-1][i] - seg[0][i]) / (seg[-1][0] - seg[0][0]) if len(seg) >= 2 and seg[-1][0] > seg[0][0] else float("nan")
 
-                        hz = len(smp) / 3.0
+                        hz = len(smp) / (hold_s + after_s)
                         say(f"stickresp2 {name} {hv}: {hz:.0f} Hz; yaw {rate(0, .5, 1):+6.1f} {rate(.5, 1, 1):+6.1f} {rate(2.5, 3, 1):+6.1f} deg/s; "
                             f"pitch {rate(0, .5, 2):+6.1f} {rate(.5, 1, 2):+6.1f} {rate(2.5, 3, 2):+6.1f} deg/s; pitch at end {smp[-1][2] if smp else float('nan'):+.1f}")
                         time.sleep(1.0)
