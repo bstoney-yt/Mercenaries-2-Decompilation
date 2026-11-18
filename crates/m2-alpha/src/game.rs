@@ -2426,7 +2426,14 @@ impl Game {
                 explosives: &mut scene.explosives,
             };
             // Loose pieces coming down on the limp (0x8228B5F0).
-            for (who, damage, crushed) in self.combat.limp_crushes(&mut field) {
+            // A piece not registered as it went off (broken apart or
+            // knocked loose whole): by the template it goes as.
+            let (props, db) = (&scene.props, &world.index.template_db);
+            let crusher_of = |d: m2_engine::DebrisId| {
+                let (_, t) = props.sent_off_as(d)?;
+                db.crushers.get(&t?).copied()
+            };
+            for (who, damage, crushed) in self.combat.limp_crushes(&mut field, crusher_of) {
                 eprintln!(
                     "crush: {} takes {damage:.1} from a falling piece{}",
                     who.map_or("she".to_string(), |i| format!("person {i}")),

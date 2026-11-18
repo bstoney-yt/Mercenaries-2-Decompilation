@@ -4407,24 +4407,24 @@ impl Combat {
     /// attacker of hers. A living person's body is a shape phantom on the
     /// 360 (0x82176F38, +0x2B4) and has no such contacts. Returns each
     /// hit: (the person, `None` for her; the damage; whether a crusher).
-    pub fn limp_crushes(&mut self, f: &mut Field<'_>) -> Vec<(Option<usize>, f32, bool)> {
+    ///
+    /// `crusher_of` answers for a piece not yet in
+    /// [`debris_crushers`](Self::debris_crushers): a broken-apart or
+    /// knocked-loose prop's piece, by the template it goes as
+    /// (`Props::sent_off_as`); its answer is kept.
+    pub fn limp_crushes(
+        &mut self,
+        f: &mut Field<'_>,
+        crusher_of: impl Fn(m2_engine::DebrisId) -> Option<f32>,
+    ) -> Vec<(Option<usize>, f32, bool)> {
         let cell = self.human_crush_cell();
         let mut out = Vec::new();
-        let struck = |physics: &mut Physics, id: m2_engine::RagdollId| {
-            physics
-                .ragdoll_debris_hits(id)
-                .into_iter()
-                .filter_map(|h| {
-                    let m = self.debris_crushers.get(&h.debris).copied().unwrap_or(1.0);
-                    let c = m2_engine::crush::crush_hit(&h, m)?;
-                    let damage = m2_engine::crush::crush_damage(&c, cell);
-                    (damage > 0.0).then_some((damage, c.crusher.is_some(), h))
-                })
-                .collect::<Vec<_>>()
-        };
-        for (i, n) in f.people.npcs.iter_mut().enumerate() {
-            let Some(id) = n.ragdoll else { continue };
-            for (damage, crushed, _) in struck(f.physics, id) {
+        for i in 0..f.people.npcs.len() {
+            let Some(id) = f.people.npcs[i].ragdoll else {
+                continue;
+            };
+            for (damage, crushed, _) in self.crush_hits(f.physics, id, &crusher_of, cell) {
+                let n = &mut f.people.npcs[i];
                 if n.alive {
                     n.hurt_by_nobody(damage);
                 }
@@ -4432,7 +4432,7 @@ impl Combat {
             }
         }
         if let Some(id) = f.player.ragdoll {
-            for (damage, crushed, h) in struck(f.physics, id) {
+            for (damage, crushed, h) in self.crush_hits(f.physics, id, &crusher_of, cell) {
                 let from = f.player.character.position + h.normal;
                 if crushed {
                     self.hurt_player_crushed(f, damage, from);
@@ -4443,6 +4443,31 @@ impl Combat {
             }
         }
         out
+    }
+
+    /// The new hits of loose pieces on ragdoll `id`
+    /// ([`Physics::ragdoll_debris_hits`]) that do damage: (damage, whether
+    /// a crusher's, the hit). A piece's modifier is looked up once.
+    fn crush_hits(
+        &mut self,
+        physics: &mut Physics,
+        id: m2_engine::RagdollId,
+        crusher_of: &impl Fn(m2_engine::DebrisId) -> Option<f32>,
+        cell: f32,
+    ) -> Vec<(f32, bool, m2_engine::physics::DebrisHit)> {
+        physics
+            .ragdoll_debris_hits(id)
+            .into_iter()
+            .filter_map(|h| {
+                let m = *self
+                    .debris_crushers
+                    .entry(h.debris)
+                    .or_insert_with(|| crusher_of(h.debris).unwrap_or(1.0));
+                let c = m2_engine::crush::crush_hit(&h, m)?;
+                let damage = m2_engine::crush::crush_damage(&c, cell);
+                (damage > 0.0).then_some((damage, c.crusher.is_some(), h))
+            })
+            .collect()
     }
 
     pub fn hurt_player_crushed(&mut self, f: &mut Field<'_>, damage: f32, from: Vec3) -> f32 {
@@ -8731,6 +8756,13 @@ mod tests {
     type Crushed = (Vec<(Option<usize>, f32, bool)>, f32, bool);
 
     fn crushed_limp(her: bool, modifier: Option<f32>) -> Crushed {
+        crushed_limp_by(her, modifier, false)
+    }
+
+    /// As [`crushed_limp`], the piece's modifier given up front
+    /// (`debris_crushers`) or, `looked_up`, only by the lookup
+    /// `limp_crushes` is handed (a broken-apart or knocked-loose piece).
+    fn crushed_limp_by(her: bool, modifier: Option<f32>, looked_up: bool) -> Crushed {
         let mut physics = ground();
         let mut player = Player::new(0.0, 0.0, 0.0, None);
         let mut people = People::default();
@@ -8771,7 +8803,9 @@ mod tests {
             health_clamp: true,
             ..Combat::default()
         };
-        if let Some(m) = modifier {
+        if let Some(m) = modifier
+            && !looked_up
+        {
             combat.debris_crushers.insert(piece, m);
         }
         let arsenal = Arsenal::default();
@@ -8788,7 +8822,9 @@ mod tests {
                 arsenal: &arsenal,
                 explosives: &mut explosives,
             };
-            hits.extend(combat.limp_crushes(&mut field));
+            let lookup =
+                |d: m2_engine::DebrisId| (looked_up && d == piece).then_some(modifier).flatten();
+            hits.extend(combat.limp_crushes(&mut field, lookup));
         }
         let health = if her { combat.hp } else { people.npcs[0].hp };
         (hits, health, combat.survival)
@@ -8805,6 +8841,11 @@ mod tests {
         let (hits, hp, _) = crushed_limp(true, None);
         assert!(hits.iter().all(|h| !h.2), "{hits:?}");
         assert!(hp > 90.0, "{hp}");
+        // A piece known only by the lookup (broken apart or knocked loose)
+        // crushes the same.
+        let (hits, hp, survival) = crushed_limp_by(true, Some(1000.0), true);
+        assert!(matches!(hits.as_slice(), [(None, _, true)]), "{hits:?}");
+        assert!(hp <= 0.0 && !survival, "{hp} {survival}");
         let (hits, hp, _) = crushed_limp(false, Some(1000.0));
         assert!(matches!(hits.as_slice(), [(Some(0), _, true)]), "{hits:?}");
         assert!(hp <= 0.0, "{hp}");
