@@ -1012,6 +1012,8 @@ pub struct MissionLink {
     /// nearest object (not a vehicle) with node health has its nodes sent
     /// damage ([`check_building_damage`]).
     pub check_building_damage: Option<f32>,
+    /// `--part-destroy-check` ([`PartDestroyCheck`]).
+    pub part_destroy_check: Option<PartDestroyCheck>,
     /// The face rigs and sets read, and the sets the scripts mounted
     /// ([`m2_engine::lip_sync`]).
     faces: m2_engine::lip_sync::Library,
@@ -1263,6 +1265,7 @@ impl MissionLink {
             state: State::Loading(rx),
             check_node_damage: None,
             check_building_damage: None,
+            part_destroy_check: None,
             prop_nodes: HashMap::new(),
             faces: Default::default(),
             movies: false,
@@ -3575,6 +3578,9 @@ impl MissionLink {
                     check_node_damage(mission, game);
                 }
             }
+            if let Some(c) = &mut self.part_destroy_check {
+                c.tick(game, mission, dt);
+            }
             if let Some(left) = &mut self.check_building_damage {
                 *left -= dt;
                 if *left <= 0.0 {
@@ -4104,6 +4110,9 @@ impl MissionLink {
                 let changed = part_state_changes(game, &c);
                 if obey(game, mission, &mut self.vehicles, &c) {
                     self.ashore = ASHORE_TRIES;
+                }
+                if let Some(c) = &mut self.part_destroy_check {
+                    c.changes += changed.len() as u32;
                 }
                 for (g, machine, state) in changed {
                     eprintln!(
@@ -6499,12 +6508,19 @@ fn check_node_damage(mission: &mut Mission, game: &Game) {
 /// each node's health and the object's after it, and at the end whether
 /// the whole object was destroyed and by which node.
 fn check_building_damage(mission: &mut Mission, game: &Game) {
+    check_building_damage_on(mission, game, None);
+}
+
+/// [`check_building_damage`] on object `only` if given, else the nearest.
+/// True if it destroyed one.
+fn check_building_damage_on(mission: &mut Mission, game: &Game, only: Option<u32>) -> bool {
     let at = game.focus();
     let mut near: Vec<(f32, u32, String)> = {
         let w = mission.world().borrow();
         w.objects
             .iter()
             .filter(|(g, o)| o.alive && !game.scene.vehicles.iter().any(|v| v.guid == Some(**g)))
+            .filter(|(g, _)| only.is_none_or(|o| o == **g))
             .map(|(g, o)| (Vec3::from(o.position).distance(at), *g, o.name.clone()))
             .collect()
     };
@@ -6524,7 +6540,7 @@ fn check_building_damage(mission: &mut Mission, game: &Game) {
                 .map_or((0.0, 0.0), |o| (o.max_health, o.health))
         };
         eprintln!(
-            "buildingdamage check: {guid:#x} {name} at {d:.1} m, {} nodes, object health              {before:.1}/{most:.1}",
+            "buildingdamage check: {guid:#x} {name} at {d:.1} m, {} nodes, object health {before:.1}/{most:.1}",
             nodes.len()
         );
         let mut by = None;
@@ -6547,7 +6563,7 @@ fn check_building_damage(mission: &mut Mission, game: &Game) {
                 .get(&guid)
                 .map_or((0.0, false), |o| (o.health, o.alive));
             eprintln!(
-                "buildingdamage: node {i} {n:#x} health {left} -> 0, object health {health:.1},                  alive {alive} ({})",
+                "buildingdamage: node {i} {n:#x} health {left} -> 0, object health {health:.1}, alive {alive} ({})",
                 if ran.is_ok() { "ran" } else { "script error" }
             );
             if !alive {
@@ -6568,9 +6584,91 @@ fn check_building_damage(mission: &mut Mission, game: &Game) {
                 _ => "not destroyed".to_owned(),
             }
         );
-        return;
+        return !alive;
     }
     eprintln!("buildingdamage check: no object with node health near");
+    false
+}
+
+/// `--part-destroy-check`: the island fortress (the scripts' object whose
+/// script is `islandfortress`, else the nearest object with node health)
+/// is found 10 s in and she is put 40 m from it, so its model streams in;
+/// 15 s on, its nodes are destroyed one at a time by the scripts'
+/// `ObjectState.SendDamage` ([`check_building_damage`]), each node's
+/// `DestroyMsg` going through its part's state machine
+/// ([`part_state_changes`]). 15 s after that it logs `part-destroy-check:
+/// PASS <n> part state changes, destroyed` if any part changed state and
+/// the object died, else `FAIL`.
+#[derive(Debug, Default)]
+pub struct PartDestroyCheck {
+    t: f32,
+    target: Option<u32>,
+    sent: Option<bool>,
+    changes: u32,
+    done: bool,
+}
+
+impl PartDestroyCheck {
+    fn tick(&mut self, game: &mut Game, mission: &mut Mission, dt: f32) {
+        if self.done {
+            return;
+        }
+        self.t += dt;
+        if self.target.is_none() && self.t >= 10.0 {
+            let pick = {
+                let mut w = mission.world().borrow_mut();
+                let fortress = w
+                    .objects
+                    .iter()
+                    .find(|(_, o)| o.alive && o.name.to_ascii_lowercase().contains("fortress"))
+                    .map(|(g, o)| (*g, o.position));
+                fortress.filter(|(g, _)| w.node_table(*g).is_some())
+            };
+            match pick {
+                Some((g, at)) => {
+                    let at = Vec3::from(at);
+                    eprintln!("part-destroy-check: {g:#x} at {at:.0}, she is put 40 m off");
+                    if let Some(p) = game.scene.player.as_mut() {
+                        p.driving = None;
+                        p.drop_at(at + Vec3::new(40.0, 5.0, 0.0));
+                    }
+                    game.ride = None;
+                    game.on_foot = true;
+                    self.target = Some(g);
+                }
+                None => {
+                    self.done = true;
+                    eprintln!("part-destroy-check: FAIL no fortress with node health");
+                }
+            }
+            return;
+        }
+        if let Some(g) = self.target
+            && self.sent.is_none()
+            && self.t >= 25.0
+        {
+            let shown = game.scene.props.model_parts(g).is_some();
+            eprintln!("part-destroy-check: its model's parts in: {shown}");
+            self.sent = Some(check_building_damage_on(mission, game, Some(g)));
+            return;
+        }
+        if let Some(destroyed) = self.sent
+            && self.t >= 40.0
+        {
+            self.done = true;
+            if self.changes > 0 && destroyed {
+                eprintln!(
+                    "part-destroy-check: PASS {} part state changes, destroyed",
+                    self.changes
+                );
+            } else {
+                eprintln!(
+                    "part-destroy-check: FAIL {} part state changes, destroyed {destroyed}",
+                    self.changes
+                );
+            }
+        }
+    }
 }
 
 fn report_speeds(mission: &mut Mission, moving: impl Iterator<Item = (u32, Vec3)>) {

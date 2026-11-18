@@ -446,6 +446,10 @@ struct Options {
     /// one at a time, until it is destroyed; `buildingdamage` lines log
     /// its node and object health and whether it was.
     check_building_damage: Option<f32>,
+    /// `--part-destroy-check`: the island fortress's nodes destroyed by
+    /// the scripts, each part's `DestroyMsg` through its state machine
+    /// ([`mission::PartDestroyCheck`]).
+    part_destroy_check: bool,
     /// `--check-shots <s>,<s>...` with `--screenshot` on foot: the scene
     /// is pictured at those seconds in too (`<out>-at<s>.ppm`).
     check_shots: Vec<f32>,
@@ -1089,6 +1093,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--gates" => o.gates = true,
             "--marker-test" => o.marker_test = true,
             "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
+            "--part-destroy-check" => {
+                o.part_destroy_check = true;
+                o.mission = true;
+            }
             "--check-building-damage" => {
                 o.check_building_damage = Some(
                     value()?
@@ -4521,6 +4529,9 @@ fn mission_for_screenshot(
         .with_mine_check(options.mine_check);
     link.check_node_damage = options.check_node_damage;
     link.check_building_damage = options.check_building_damage;
+    if options.part_destroy_check {
+        link.part_destroy_check = Some(mission::PartDestroyCheck::default());
+    }
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
