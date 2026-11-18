@@ -1560,12 +1560,26 @@ def run(args) -> int:
                         now = time.time()
                         trail = [(t_, q_) for t_, q_ in trail if now - t_ < 0.5] + [(now, hp_)]
                         lx = 0.0
+                        want = math.degrees(math.atan2(tp[0] - hp_[0], tp[2] - hp_[2]))
                         if len(trail) >= 2 and math.dist(trail[0][1], trail[-1][1]) > 0.5:
                             (_, a0), (_, a1) = trail[0], trail[-1]
                             head = math.degrees(math.atan2(a1[0] - a0[0], a1[2] - a0[2]))
-                            want = math.degrees(math.atan2(tp[0] - hp_[0], tp[2] - hp_[2]))
-                            err = (want - head + 180) % 360 - 180
-                            lx = max(-1.0, min(1.0, -err / 30.0))
+                        else:
+                            head = hh.facing() or want  # not moving yet (npchit2 stalled): the car's own facing
+                        err = (want - head + 180) % 360 - 180
+                        lx = max(-1.0, min(1.0, -err / 30.0))
+                        stuck_t = getattr(hh, "_ram_stuck", None)
+                        if len(trail) >= 2 and math.dist(trail[0][1], trail[-1][1]) < 0.3:
+                            if stuck_t is None:
+                                hh._ram_stuck = now
+                            elif now - stuck_t > 2.0:  # blocked: back off 1.5 s with the wheel the other way
+                                say("ram: stuck, backing off")
+                                apply(BTN["x"], 0, 0, -lx or 1.0, 0.0, 0.0, 0.0)
+                                time.sleep(1.5)
+                                hh._ram_stuck = None
+                                continue
+                        else:
+                            hh._ram_stuck = None
                         apply(BTN["a"], 0, 0, lx, 0.0, 0.0, 0.0)
                         if now - last_say > 1.0:
                             last_say = now
