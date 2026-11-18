@@ -9,7 +9,8 @@
 //! and `camera-check: RESULT PASS` (or `FAIL`) at the end.
 //!
 //! Kinds: `tank` (the tank camera, [`m2_engine::pad_camera::TankLook`]),
-//! `turret` (an emplaced gun's, [`m2_engine::pad_camera::TurretLook`]).
+//! `turret` (an emplaced gun's, [`m2_engine::pad_camera::TurretLook`]),
+//! `heli` (a helicopter pilot's, [`m2_engine::pad_camera::HeliLook`]).
 
 use std::collections::HashMap;
 
@@ -168,7 +169,8 @@ pub fn run(install: &Install, kind: &str) -> anyhow::Result<bool> {
     match kind {
         "tank" => tank(&records, &mut t),
         "turret" => turret(&records, &mut t),
-        other => anyhow::bail!("--camera-check: no kind {other:?} (tank, turret)"),
+        "heli" => heli(&records, &mut t),
+        other => anyhow::bail!("--camera-check: no kind {other:?} (tank, turret, heli)"),
     }
     Ok(t.finish())
 }
@@ -230,5 +232,86 @@ fn turret(records: &Records, t: &mut Tally) {
         f64::from(-low.to_degrees()),
         22.9,
         0.01,
+    );
+}
+
+/// The right stick held at `stick` for `seconds` in a helicopter with the
+/// view's pitch kept at `pitch` (radians up) each frame (`Some`) or let
+/// move (`None`, from the pad's own): the last frame's pitch rate
+/// (degrees a second) and the pitch reached (degrees).
+fn heli_hold(
+    tuning: m2_engine::pad_camera::HeliLookTuning,
+    stick: [f32; 2],
+    seconds: f64,
+    start: f32,
+    held: bool,
+) -> (f64, f64) {
+    let mut pad = Pad::default();
+    pad.heli_tuning = Some(tuning);
+    pad.pitch = start;
+    let mut input = Input::default();
+    let s = PadState {
+        right_raw: stick,
+        ..PadState::default()
+    };
+    let mut rate = 0.0;
+    for _ in 0..(seconds / DT).round() as usize {
+        if held {
+            pad.pitch = start;
+        }
+        pad.feed(&mut input, s, Mode::Helicopter, DT);
+        let (yaw, pitch) = input.take_pad_turn();
+        input.take_pad_look();
+        rate = (pitch.abs() + yaw.abs()).to_degrees() / DT;
+    }
+    (rate, f64::from(pad.pitch.to_degrees()))
+}
+
+/// #706's recipe: an MD-500's pilot camera, the stick up from its default
+/// view (0.25 rad down) about 71 deg/s at first, stopping at 28.6 deg up;
+/// down from level about 94 deg/s at first, stopping at 57.3 down; the
+/// stick's x turns nothing.
+fn heli(records: &Records, t: &mut Tally) {
+    let Some((name, tuning)) = records
+        .find("md500", |v| v.heli_camera)
+        .or_else(|| records.find("md-500", |v| v.heli_camera))
+    else {
+        t.missing("heli md500");
+        return;
+    };
+    let (rate, _) = heli_hold(tuning, [0.0, 1.0], 1.0, -0.25, true);
+    t.near(
+        &format!("heli {name} stick up from 0.25 rad down: deg/s at first"),
+        rate,
+        71.0,
+        0.05,
+    );
+    let (_, reached) = heli_hold(tuning, [0.0, 1.0], 6.0, -0.25, false);
+    t.near(
+        &format!("heli {name} stick up held: pitch reached deg"),
+        reached,
+        28.6,
+        0.02,
+    );
+    let (rate, _) = heli_hold(tuning, [0.0, -1.0], 1.0, 0.0, true);
+    t.near(
+        &format!("heli {name} stick down from level: deg/s at first"),
+        rate,
+        94.0,
+        0.05,
+    );
+    let (_, reached) = heli_hold(tuning, [0.0, -1.0], 6.0, 0.0, false);
+    t.near(
+        &format!("heli {name} stick down held: pitch reached deg (down)"),
+        -reached,
+        57.3,
+        0.02,
+    );
+    let (rate, _) = heli_hold(tuning, [1.0, 0.0], 1.0, 0.0, true);
+    t.near(
+        &format!("heli {name} stick x: camera turn deg/s"),
+        rate,
+        0.0,
+        0.0,
     );
 }
