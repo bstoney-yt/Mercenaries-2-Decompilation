@@ -158,6 +158,52 @@ pub struct FallWatch {
     left_at: f32,
 }
 
+/// How far a limp body fell: from the highest it reached in the air to
+/// where it came down.
+///
+/// From the 360 code (0x82191560, each update of a limp body from
+/// 0x82190470): touching nothing, it starts watching at its height then
+/// and raises that to the highest it reaches; touching something (its
+/// contact count this update) while its vertical speed is over
+/// [`LIMP_LANDING_SPEED`], it has landed: the highest less its height
+/// now is sent as a fall (kind 7, when over 0) and the watch ends.
+/// Touching while still going down faster, it keeps watching. So a body
+/// thrown up falls from the top of its arc, and one made in the air from
+/// where it was made.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct LimpFallWatch {
+    watching: bool,
+    highest: f32,
+}
+
+/// A limp body touching something has landed once its vertical speed is
+/// over this, m/s (0x82DE8960).
+pub const LIMP_LANDING_SPEED: f32 = -5.0;
+
+impl LimpFallWatch {
+    /// One update: `touching` something, at height `y`, going up at
+    /// `vy` m/s. Returns the distance fallen on the update it lands.
+    pub fn step(&mut self, touching: bool, y: f32, vy: f32) -> Option<f32> {
+        if !self.watching {
+            if !touching {
+                self.watching = true;
+                self.highest = y;
+            }
+            return None;
+        }
+        if touching {
+            if vy > LIMP_LANDING_SPEED {
+                self.watching = false;
+                let fell = self.highest - y;
+                return (fell > 0.0).then_some(fell);
+            }
+            return None;
+        }
+        self.highest = self.highest.max(y);
+        None
+    }
+}
+
 impl FallWatch {
     /// One step: `airborne` now, at height `y`. Returns the distance
     /// fallen on the step the person comes down.
@@ -706,6 +752,26 @@ mod tests {
         // The messages' names hash to the program's words.
         assert_eq!(m2_assets::name_hash(FallImpact::Light.name()), 0x9e1b_18f4);
         assert_eq!(m2_assets::name_hash(FallImpact::Heavy.name()), 0x5648_2a61);
+    }
+
+    #[test]
+    fn a_limp_body_falls_from_the_top_of_its_arc_once_slow_enough() {
+        let mut w = LimpFallWatch::default();
+        // Lying: nothing.
+        assert_eq!(w.step(true, 0.2, 0.0), None);
+        // Thrown: up from 1.0 to 4.6, down again.
+        assert_eq!(w.step(false, 1.0, 9.0), None);
+        assert_eq!(w.step(false, 4.6, 0.0), None);
+        assert_eq!(w.step(false, 2.0, -8.0), None);
+        // Touching while still falling fast: not yet.
+        assert_eq!(w.step(true, 0.4, -7.0), None);
+        // Slower: landed, from the top.
+        let d = w.step(true, 0.3, -2.0).unwrap();
+        assert!((d - 4.3).abs() < 1e-5, "{d}");
+        assert_eq!(w.step(true, 0.3, 0.0), None);
+        // A hop that comes down higher: no fall.
+        assert_eq!(w.step(false, 0.3, 1.0), None);
+        assert_eq!(w.step(true, 0.5, 0.0), None);
     }
 
     #[test]

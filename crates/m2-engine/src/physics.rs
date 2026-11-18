@@ -6572,6 +6572,42 @@ impl Physics {
         Some(out)
     }
 
+    /// Whether any limb of ragdoll `id` touches something not of itself
+    /// this step (the 360's limp body counts its contacts each update,
+    /// 0x82190470); `None` once removed.
+    pub fn ragdoll_touching(&self, id: RagdollId) -> Option<bool> {
+        let doll = self.ragdolls.get(id.0)?.as_ref()?;
+        let own: Vec<r::ColliderHandle> = doll
+            .bodies
+            .iter()
+            .flatten()
+            .filter_map(|h| self.world.bodies.get(*h))
+            .flat_map(|b| b.colliders().iter().copied())
+            .collect();
+        Some(own.iter().any(|&c| {
+            self.world.narrow_phase.contact_pairs_with(c).any(|p| {
+                let other = if p.collider1 == c {
+                    p.collider2
+                } else {
+                    p.collider1
+                };
+                p.has_any_active_contact() && !own.contains(&other)
+            })
+        }))
+    }
+
+    /// Where ragdoll `id`'s first limb (its root's) is and how fast it
+    /// goes, m and m/s; `None` once removed.
+    pub fn ragdoll_root(&self, id: RagdollId) -> Option<(Vec3, Vec3)> {
+        let doll = self.ragdolls.get(id.0)?.as_ref()?;
+        let b = doll
+            .bodies
+            .iter()
+            .flatten()
+            .find_map(|h| self.world.bodies.get(*h))?;
+        Some((vec3(b.translation()), vec3(b.linvel())))
+    }
+
     /// The speed of a ragdoll's fastest limb, m/s; `None` once removed.
     pub fn ragdoll_speed(&self, id: RagdollId) -> Option<f32> {
         let doll = self.ragdolls.get(id.0)?.as_ref()?;

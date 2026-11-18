@@ -1434,6 +1434,8 @@ pub struct Npc {
     pub motion: m2_engine::on_foot::HumanMotion,
     /// Where a fall started, for its damage ([`m2_engine::on_foot::fall_impact`]).
     fall: m2_engine::on_foot::FallWatch,
+    /// Where their limp body's fall started ([`m2_engine::on_foot::LimpFallWatch`]).
+    limp_fall: m2_engine::on_foot::LimpFallWatch,
     ground: Vec2,
     /// The speed they last moved at (m/s): what a stall is judged by.
     pushed: f32,
@@ -1691,6 +1693,7 @@ impl Npc {
             cover_retry: 0.0,
             motion: m2_engine::on_foot::HumanMotion::default(),
             fall: m2_engine::on_foot::FallWatch::default(),
+            limp_fall: m2_engine::on_foot::LimpFallWatch::default(),
             ground: Vec2::ZERO,
             pushed: 0.0,
             dither: Default::default(),
@@ -5458,8 +5461,28 @@ impl People {
                     let still = physics.ragdoll_speed(id).is_none_or(|v| v < LIMP_AT_REST);
                     npc.limp.0 = if still { npc.limp.0 + dt } else { 0.0 };
                     npc.limp.1 += dt;
+                    // A limp body's fall (0x82191560): from the top of its
+                    // arc, landed when touching something no faster than
+                    // 5 m/s down; its damage as any fall's (0x82205F20),
+                    // the impact's message (a clip) skipped as they are
+                    // limp (`FULL`); a deadly one kills.
+                    if let (Some(touching), Some((at, v))) =
+                        (physics.ragdoll_touching(id), physics.ragdoll_root(id))
+                        && let Some(d) = npc.limp_fall.step(touching, at.y, v.y)
+                        && let Some(fell) = m2_engine::on_foot::fall_impact(&npc.motion.falls, d)
+                    {
+                        eprintln!(
+                            "people: {:08x} limp falls {d:.1} m for {} damage",
+                            npc.spawn.unwrap_or(0),
+                            fell.damage
+                        );
+                        npc.hurt(fell.damage, Vec3::ZERO);
+                    }
                 }
-                None => npc.limp = (0.0, 0.0),
+                None => {
+                    npc.limp = (0.0, 0.0);
+                    npc.limp_fall = m2_engine::on_foot::LimpFallWatch::default();
+                }
             }
             // Up from a knockdown (or subdued): where the limp body lay,
             // on the ground under it.
