@@ -2,6 +2,7 @@
 //! controller, with a third-person camera behind her.
 
 use m2_engine::on_foot::{self, AimLegs, HumanMotion, Pace, RunStop, Start, StopEvent, Turn};
+use m2_engine::pad_camera::PITCH_RANGE;
 use m2_engine::{Character, Gait, GpuModel, Physics, VehicleId, VehicleSpec};
 use m2_math::glam::{Mat4, Vec2, Vec3};
 use m2_render::View;
@@ -237,11 +238,12 @@ impl Intent {
 
     pub fn from_input(input: &mut Input, config: &CameraConfig, mouse_look: bool) -> Self {
         let (dx, dy) = input.take_look(mouse_look);
+        let (yaw, pitch) = input.take_pad_turn();
         let invert = if config.invert_y { -1.0 } else { 1.0 };
         // Turning right turns the yaw (from +z towards +x) back.
         let look = Vec2::new(
-            -dx as f32 * config.mouse_sensitivity,
-            -dy as f32 * config.mouse_sensitivity * invert,
+            -dx as f32 * config.mouse_sensitivity - yaw as f32,
+            -dy as f32 * config.mouse_sensitivity * invert + pitch as f32 * invert,
         );
         Self {
             movement: Vec2::new(
@@ -1028,7 +1030,7 @@ impl Player {
             (*seed >> 40) as f32 / (1u64 << 24) as f32
         });
         self.yaw += intent.look.x;
-        self.pitch = (self.pitch + intent.look.y).clamp(-1.2, 0.9);
+        self.pitch = (self.pitch + intent.look.y).clamp(PITCH_RANGE[0], PITCH_RANGE[1]);
         self.camera(physics);
     }
 
@@ -1047,7 +1049,7 @@ impl Player {
             }
         }
         self.yaw += intent.look.x;
-        self.pitch = (self.pitch + intent.look.y).clamp(-1.2, 0.9);
+        self.pitch = (self.pitch + intent.look.y).clamp(PITCH_RANGE[0], PITCH_RANGE[1]);
 
         if let Some(l) = self.ladder {
             self.hang(l, dt);

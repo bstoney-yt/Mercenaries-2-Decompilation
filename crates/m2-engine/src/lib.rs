@@ -64,6 +64,7 @@ pub mod on_foot;
 pub mod ordnance;
 pub mod osprey;
 pub mod osprey_mesh;
+pub mod pad_camera;
 pub mod part_runner;
 pub mod particles;
 pub mod path_move;
