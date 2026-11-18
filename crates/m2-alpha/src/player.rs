@@ -353,7 +353,7 @@ pub struct Player {
     /// Set as she lands after her floor went (taken by the log of what
     /// stands there).
     pub floor_landed: bool,
-    /// Thrown clear of a wrecked vehicle ([`crate::combat::WRECK_THROW`]):
+    /// Thrown clear of a wrecked vehicle ([`crate::combat::wreck_throw`]):
     /// she keeps the throw's speed, not steering, falling under the
     /// world's gravity rather than her own, until she lands ([`Player::throw`]).
     pub thrown: bool,
@@ -2291,9 +2291,15 @@ mod tests {
         }
         assert!(p.landed);
         let from = p.character.position;
-        // A wrecked car's throw, as Combat::her_vehicle_wrecked gives it.
-        let (out, up) = crate::combat::WRECK_THROW;
-        p.throw(Vec3::X * out + Vec3::Y * up);
+        // A wrecked car's blast at its body's middle, 2 m from her feet
+        // put out at its door, as Combat::her_vehicle_wrecked gives it.
+        let v = crate::combat::wreck_throw(
+            from - Vec3::X * 2.0,
+            (7.0, 300.0),
+            from,
+            (p.character.radius, p.character.height),
+        );
+        p.throw(v);
         let mut top = 0.0f32;
         let mut t = 0.0;
         loop {

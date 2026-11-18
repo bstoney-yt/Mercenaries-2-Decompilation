@@ -645,14 +645,27 @@ pub(crate) const BLAST_PUSH: (f32, f32) = (9.0, 6.0);
 const SHOT_PUSH: f32 = 2.0;
 pub(crate) const REACH: f32 = 9.0;
 
-/// How she leaves the vehicle she sits in when it is wrecked: thrown
-/// clear, `(away, up)` m/s, away from its middle. From footage (Xenia,
-/// round 3, six wrecks, instant and slower, health 50 to 100): thrown
-/// 7.5 to 11 m sideways, 1.6 to 2.9 m up, landing 1.3 to 1.7 s later,
-/// with no health lost at the wreck; 6 and 7 m/s land her about 8.5 m
-/// out, 2.5 m up at the top, 1.4 s later. Not established in code (see
-/// [`Combat::her_vehicle_wrecked`]).
-pub(crate) const WRECK_THROW: (f32, f32) = (6.0, 7.0);
+/// How the blast of a vehicle's wreck throws her, put out at `at` (her
+/// feet), her capsule `radius` and `height` (m): the blast's push
+/// ([`m2_engine::durability::BlastPush::throw`], the 360's 0x8215CBC8) on
+/// her body's box, from where it went off (`blast`), its `Radius` and
+/// `MaxForce`. `fx_Explosion_Large` (7 m, 300) 1.5 to 2 m from her
+/// gives 7.1 to 6.4 m/s out and as much up.
+pub(crate) fn wreck_throw(
+    blast: Vec3,
+    (radius, force): (f32, f32),
+    at: Vec3,
+    (r, height): (f32, f32),
+) -> Vec3 {
+    let push = m2_engine::durability::BlastPush {
+        at: blast,
+        radius,
+        force,
+    };
+    let lo = at - Vec3::new(r, 0.0, r);
+    let hi = at + Vec3::new(r, height, r);
+    push.throw(lo, hi, 1.0).0
+}
 /// The satellite-guided bomb's blasts, from the template database's
 /// laser-guided bomb ("Explosion (Airstike Bomb)" 80008e3f, its frag
 /// "Explosion (Airstrike Frag)" 8000a3df, and its final strike 8000af7d
@@ -1786,6 +1799,9 @@ pub struct Combat {
     /// the stream at `0x82B5E588`, from its start-up seed.
     knock_rng: m2_game::script_math::EngineRng,
     pub blasts: u32,
+    /// The effects that are explosions, by name hash: their `Radius` and
+    /// `MaxForce` (a wreck's blast, [`Combat::her_vehicle_wrecked`]).
+    pub blast_effects: std::collections::HashMap<u32, (f32, f32)>,
     /// Where the last one went off, and what it pushes what it breaks
     /// with, where known.
     pub last_blast: Option<Vec3>,
@@ -2189,6 +2205,7 @@ impl Default for Combat {
             hits: 0,
             knock_rng: m2_game::script_math::EngineRng::default(),
             blasts: 0,
+            blast_effects: std::collections::HashMap::new(),
             last_blast: None,
             last_push: None,
             went_off: Vec::new(),
@@ -4151,8 +4168,8 @@ impl Combat {
     }
 
     /// The vehicle she is in was wrecked: she is put out of it at its
-    /// door and thrown clear ([`WRECK_THROW`]), hurt only by her landing
-    /// (her fall's own damage).
+    /// door, and its wreck's blast throws her clear ([`wreck_throw`]);
+    /// she is hurt only by her landing (her fall's own damage).
     ///
     /// From the 360 code: the rider system hears the vehicle's death
     /// (queue 0x831B21C0, 0x82299918 -> 0x822A5D98) and puts a seated
@@ -4164,10 +4181,14 @@ impl Combat {
     /// so it is taken as blocked while she is still the vehicle's rider
     /// (0x822889F8 passes nothing to a rider whose seat isn't
     /// `bIsPlayerVulnerable`; inferred, the order not traced) and not
-    /// dealt. What throws her is not established: the car's wreck blast
-    /// (`fx_Explosion_Large`, started by its body's wreck state) lifts the
-    /// car about 5 m in the footage and may be what throws her too; the
-    /// throw is from footage.
+    /// dealt. The car's body's wreck state starts `fx_Explosion_Large`
+    /// (an `Explosive`: 7 m, `MaxForce` 300); a blast pushes what it
+    /// reaches by the Havok explosion action the explosion record makes
+    /// (0x82291B88 -> vtable 0x820C79B0 slot 5, 0x82154F60 ->
+    /// 0x8215C110; the push 0x8215CBC8). Inferred: that it pushes her, put
+    /// out, as a body of her capsule's box (it gives the footage's arc
+    /// under the world's gravity: [`crate::player::Player::throw`]); from
+    /// the wreck state's own effect, where its node is.
     fn her_vehicle_wrecked(&mut self, f: &mut Field<'_>) {
         let Some(i) = f.player.driving else {
             return;
@@ -4187,17 +4208,35 @@ impl Combat {
         }
         self.seat = 0;
         let label = v.spec.label.clone();
-        let side = body.x_axis.truncate().with_y(0.0).normalize_or(Vec3::X);
-        let away = (f.player.character.position - middle)
-            .with_y(0.0)
-            .normalize_or(side);
-        f.player
-            .throw(away * WRECK_THROW.0 + Vec3::Y * WRECK_THROW.1);
-        let (out, up) = WRECK_THROW;
+        // Its wreck's blast: an effect its model's states start that is an
+        // explosion's, where its node is (else the vehicle's middle).
+        let blast = v.spec.damage.as_deref().and_then(|dm| {
+            dm.states
+                .machines
+                .iter()
+                .flat_map(|m| &m.acts)
+                .flat_map(|a| &a.emitters)
+                .find_map(|&(fx, node)| {
+                    let b = self.blast_effects.get(&fx)?;
+                    let at = node.map_or(middle, |n| body.transform_point3(dm.node_at(n)));
+                    Some((at, *b))
+                })
+        });
+        let Some((at, push)) = blast else {
+            eprintln!("wreck: the {label} she is in is wrecked: she is put out (no wreck blast)");
+            return;
+        };
+        let c = &f.player.character;
+        let velocity = wreck_throw(at, push, c.position, (c.radius, c.height));
+        f.player.throw(velocity);
         eprintln!(
-            "wreck: the {label} she is in is wrecked: she is put out and thrown, {out:.1} m/s \
-             away, {up:.1} m/s up, from {:.1}",
-            f.player.character.position
+            "wreck: the {label} she is in is wrecked: she is put out and thrown by its blast \
+             ({:.0} m, push {:.0}) {:.1} m off: {:.1} m/s out, {:.1} m/s up",
+            push.0,
+            push.1,
+            f.player.character.position.distance(at),
+            velocity.with_y(0.0).length(),
+            velocity.y
         );
     }
 
@@ -8150,6 +8189,24 @@ mod tests {
     }
 
     #[test]
+    fn a_wreck_blast_throws_her_as_the_footage_has_it() {
+        // fx_Explosion_Large (7 m, push 300) 1.5 and 2 m from her feet,
+        // level: out and up alike, 7.07 and 6.43 m/s.
+        let blast = (7.0, 300.0);
+        let near = wreck_throw(Vec3::ZERO, blast, Vec3::X * 1.5, (0.3, 1.8));
+        let far = wreck_throw(Vec3::ZERO, blast, Vec3::X * 2.0, (0.3, 1.8));
+        assert!(
+            (near.y - 7.5 * 300.0 * 0.004 * (1.0 - 1.2 / 7.0)).abs() < 0.01,
+            "{near}"
+        );
+        assert!(
+            (near.x - near.y).abs() < 1e-4 && near.z.abs() < 1e-4,
+            "{near}"
+        );
+        assert!(far.y < near.y && far.y > 6.0, "{far}");
+    }
+
+    #[test]
     fn her_wrecked_vehicle_throws_her_clear_unhurt() {
         use m2_engine::tuning::VehicleTuning;
         let mut physics = ground();
@@ -8206,9 +8263,6 @@ mod tests {
         combat.step(&mut field, Trigger::default(), dt);
         assert_eq!(field.player.driving, None);
         assert_eq!(combat.hp, full, "no health lost at the wreck");
-        let v = field.player.character.velocity;
-        assert!((v.y - WRECK_THROW.1).abs() < 1e-3, "{v}");
-        assert!((v.with_y(0.0).length() - WRECK_THROW.0).abs() < 1e-3, "{v}");
         let middle = field
             .physics
             .vehicle_transform(id)

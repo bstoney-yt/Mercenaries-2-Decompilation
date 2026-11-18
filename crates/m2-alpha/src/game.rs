@@ -463,6 +463,16 @@ impl Game {
         if let Some(arms) = scene.arms() {
             combat.arm(arms, scene.damage_table());
         }
+        if let Some(w) = &scene.world {
+            let db = &w.index.template_db;
+            combat.blast_effects = db
+                .explosions
+                .iter()
+                .filter_map(|(t, e)| {
+                    Some((m2_assets::name_hash(db.names.get(t)?), (e.radius, e.force)))
+                })
+                .collect();
+        }
         own_explosives(&mut combat, scene.hero_explosives());
         eprintln!(
             "hero: carries {} grenades, {} C4, {} mines; launcher {} ({:?})",
