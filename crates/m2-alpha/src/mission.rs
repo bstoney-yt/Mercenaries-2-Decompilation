@@ -2296,6 +2296,10 @@ impl MissionLink {
         // The scripts' own expressions (`Animation.PlayFacialExpression`,
         // 0x82316078): the same table as the engine's, by the
         // expression's name; a name not in it does nothing (0x8241DF40).
+        // The scripts' seat movement locks, once set (0x8233DAD8).
+        if let Some(locks) = mission.world().borrow().sp.seat_movement_locks {
+            game.seat_locks = locks;
+        }
         let facial = std::mem::take(&mut mission.world().borrow_mut().sp.facial);
         for f in facial {
             let name = m2_assets::name_hash(&f.expression);

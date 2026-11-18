@@ -263,6 +263,12 @@ pub struct Game {
     pub boarding: Option<crate::boarding::Boarding>,
     /// A helicopter's bail-out prompt ([`crate::action_prompt::ExitConfirm`]).
     pub exit_confirm: crate::action_prompt::ExitConfirm,
+    /// `Player.SetSeatMovementLocks`' three locks (the player record's
+    /// +0x44D, +0x44E, +0x44F), true letting her: get into a vehicle
+    /// (the use picker 0x82432F68 offers entrances only while +0x44D is
+    /// set), get out (the vehicle input 0x8242E7A0 sends an exit only
+    /// while +0x44E is), and a third that nothing in the 360 code reads.
+    pub seat_locks: [bool; 3],
     /// Got in by a boarding entrance (`EntranceParameters` `bBoarding`, a
     /// boat's from the water): the vehicle, and the seat it gave her,
     /// which she is put out of onto the deck once in
@@ -560,6 +566,7 @@ impl Game {
             ride: None,
             boarding: None,
             exit_confirm: Default::default(),
+            seat_locks: [true; 3],
             onto_deck: None,
             support_hp: 0.0,
             lens: (60.0, 16.0 / 9.0),
@@ -1348,8 +1355,14 @@ impl Game {
                     // nearest entrance.
                     let man_it = manning.is_some()
                         && (gun.is_none() || picked.is_some_and(|(i, _)| i == EMPLACED));
-                    let manning = manning.filter(|_| man_it);
-                    let picked = picked.filter(|&(i, _)| i != EMPLACED);
+                    // Locked in place by a script: no entrance (0x82432F68
+                    // gathers none without +0x44D).
+                    let may_enter = self.seat_locks[0];
+                    if !may_enter && (manning.is_some() || picked.is_some()) {
+                        eprintln!("use: getting in is locked (Player.SetSeatMovementLocks)");
+                    }
+                    let manning = manning.filter(|_| man_it && may_enter);
+                    let picked = picked.filter(|&(i, _)| i != EMPLACED && may_enter);
                     // Of a gun lying there (or else an emplaced gun) and a
                     // vehicle's entrance, the one she faces
                     // ([`crate::action_prompt::faced`], 0x82432CF0).
@@ -1377,6 +1390,11 @@ impl Game {
                     }
                     let manning = manning.filter(|_| !to_car);
                     match player.driving {
+                        // Kept in by a script: no exit asked (0x8242E7A0
+                        // reads +0x44E before the bail-out prompt).
+                        Some(_) if !self.seat_locks[1] => {
+                            eprintln!("use: getting out is locked (Player.SetSeatMovementLocks)");
+                        }
                         // Out over deep water she swims (`Player::update_swim`).
                         // A helicopter up high asks first (0x8242FA70).
                         Some(i)
