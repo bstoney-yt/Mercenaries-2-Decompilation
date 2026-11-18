@@ -892,7 +892,9 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--camera-check" => o.camera_check = Some(value()?),
             "--seated" => o.seated = true,
             "--board" => o.board = true,
+            // Needs no `--drive`: it runs where `--board` does.
             "--seat-check" => {
+                o.drive = true;
                 o.board = true;
                 o.seat_check = true;
             }
@@ -7801,9 +7803,133 @@ fn drive_for_screenshot(
 /// exit the rules chose.
 fn board_for_check(game: &mut Game, options: &Options, tick: f32) -> anyhow::Result<()> {
     let Some((i, at)) = board_stand(game, options, tick) else {
+        if options.seat_check {
+            eprintln!("seat-check: FAIL no parked vehicle with a gunner's own entrance");
+            eprintln!("seat-check: RESULT FAIL");
+        }
         return Ok(());
     };
+    if options.seat_check {
+        seat_check(game, tick, i);
+        return Ok(());
+    }
     board_pressed(game, options, tick, i, at)
+}
+
+/// The M151's gunner's seat and its `CameraTurret` record, as the data
+/// and the 360 give them (#717's recipe): seat `1b217b8a`, 2.0 and 1.8
+/// rad/s, yaw -1.25..1.25, pitch -0.19..0.85, keeps 0.95/0.91 and
+/// 0.97/0.9.
+const M151_GUNNER: (u32, m2_engine::seats::SeatCamera) = (
+    0x1b21_7b8a,
+    m2_engine::seats::SeatCamera {
+        yaw_speed: 2.0,
+        pitch_speed: 1.8,
+        yaw: (-1.25, 1.25),
+        pitch: (-0.19, 0.85),
+        yaw_keep: [0.95, 0.91],
+        pitch_keep: [0.97, 0.9],
+    },
+);
+
+/// `--seat-check`, standing at vehicle `i`'s gunner's own entrance
+/// ([`board_stand`]): the use key with getting in locked, then unlocked;
+/// her seat, its turret and camera record; the use key with getting out
+/// locked, then unlocked. Prints `seat-check: PASS ...` or `FAIL ...` for
+/// each and `seat-check: RESULT PASS` when all pass.
+fn seat_check(game: &mut Game, tick: f32, i: usize) {
+    let mut ok = true;
+    let mut check = |pass: bool, what: String| {
+        ok &= pass;
+        eprintln!("seat-check: {} {what}", if pass { "PASS" } else { "FAIL" });
+    };
+    let use_key = Intent {
+        use_pressed: true,
+        ..Intent::default()
+    };
+    let label = game.scene.vehicles[i].spec.label.clone();
+    let seating = game.scene.vehicles[i].spec.seating.clone();
+    let Some((want, entrance)) = seating
+        .as_deref()
+        .and_then(m2_engine::seats::gunner_entrance)
+    else {
+        check(false, format!("the {label} has no gunner's own entrance"));
+        eprintln!("seat-check: RESULT FAIL");
+        return;
+    };
+    let seats = seating.as_deref().map_or(&[][..], |s| &s.seats[..]);
+    let want_seat = seats[want].clone();
+    let driving = |game: &Game| game.scene.player.as_ref().and_then(|p| p.driving);
+    // Waits up to `limit` seconds for `done`.
+    let wait = |game: &mut Game, limit: f32, done: &dyn Fn(&Game) -> bool| {
+        let mut t = 0.0;
+        while t < limit && !done(game) {
+            game.step(Intent::default(), tick);
+            t += tick;
+        }
+        done(game)
+    };
+    // Getting in locked (+0x44D clear): the use key seats her nowhere.
+    game.seat_locks = [false, true, true];
+    game.step(use_key, tick);
+    let held_out = !wait(game, 2.0, &|g| driving(g).is_some());
+    check(
+        held_out,
+        format!("enter lock: use at entrance {entrance:08x} with +0x44D clear leaves her out"),
+    );
+    // Unlocked: she gets in by the gunner's entrance, into the gunner's seat.
+    game.seat_locks = [true; 3];
+    game.step(use_key, tick);
+    let boarded = wait(game, 6.0, &|g| {
+        driving(g) == Some(i) && g.boarding.is_none()
+    });
+    let seat = game.ride.filter(|r| r.0 == i).map(|r| r.1);
+    check(
+        boarded && seat == Some(want_seat.name),
+        format!(
+            "boarded the {label} by entrance {entrance:08x}: seat {seat:08x?}, expected {:08x} ({:?})",
+            want_seat.name,
+            want_seat.role()
+        ),
+    );
+    check(
+        want_seat.role() == m2_engine::seats::Role::Gunner,
+        format!("seat {:08x} is a gunner's seat", want_seat.name),
+    );
+    eprintln!(
+        "seat-check: seat {:08x} turret {:08x?} camera {:?}",
+        want_seat.name, want_seat.turret, want_seat.camera
+    );
+    check(
+        want_seat.camera.is_some(),
+        format!("seat {:08x} has its CameraTurret record", want_seat.name),
+    );
+    if label.contains("M151") {
+        check(
+            want_seat.name == M151_GUNNER.0 && want_seat.camera == Some(M151_GUNNER.1),
+            format!(
+                "M151 gunner seat {:08x} and camera match 1b217b8a, 2.0/1.8 rad/s, yaw -1.25..1.25, pitch -0.19..0.85",
+                want_seat.name
+            ),
+        );
+    }
+    // Getting out locked (+0x44E clear): the use key keeps her in.
+    game.seat_locks = [true, false, true];
+    game.step(use_key, tick);
+    let kept_in = !wait(game, 2.0, &|g| driving(g).is_none());
+    check(
+        kept_in,
+        "exit lock: use with +0x44E clear keeps her in".to_owned(),
+    );
+    // Unlocked: out.
+    game.seat_locks = [true; 3];
+    game.step(use_key, tick);
+    let out = wait(game, 6.0, &|g| driving(g).is_none() && g.boarding.is_none());
+    check(
+        out,
+        "exit: use with the locks clear gets her out".to_owned(),
+    );
+    eprintln!("seat-check: RESULT {}", if ok { "PASS" } else { "FAIL" });
 }
 
 /// `--board --seated`: as `--board`, with the clips of her getting in and
