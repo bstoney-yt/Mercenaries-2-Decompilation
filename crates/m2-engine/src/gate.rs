@@ -16,18 +16,58 @@
 //! notes); its leaf is the part the constraint holds, with every node
 //! under it.
 //!
-//! Invented: how fast a leaf swings ([`SWING`]); the 360 drives it with a
-//! motor (the template's `PoweredGate` `MotorStrength`) whose rate isn't
-//! traced. Slides (7 of the 1,564 models) are not moved.
+//! - How fast a leaf swings ([`swing`]): when the joints are made
+//!   (0x82160FF8), each gets a position motor (0x821617B8; Havok's
+//!   position constraint motor, built by 0x8262D0D8 with the library's
+//!   defaults tau 0.8, damping 1, recovery 2 and 1). A hinge's is given a
+//!   maximum force of the larger of 5000 (0x820F8C8C) and its leaf's mass
+//!   times 50 (0x820B7FB8), tau 0.6 (0x82B7D82C), damping 1, a
+//!   proportional recovery velocity of 1 a second and a constant one of
+//!   0.1 rad/s ([`RECOVERY`], [`RECOVERY_CONSTANT`]). OpenGate and
+//!   CloseGate only move the target, so the leaf goes to it at the
+//!   recovery velocity, `1 * error + 0.1` radians a second: a quarter
+//!   turn takes about 2.8 s, slowing as it closes in.
+//!
+//! **Inferred**: that the motor holds the leaf to its recovery velocity
+//! (the library's behaviour, its force limit not reached by a gate's
+//! leaf, and tau's softening left out), stepped at 60 a second; and one
+//! pace for all of a gate's leaves, its widest one's, where each of the
+//! 360's has its own. Slides (7 of the 1,564 models) are not moved.
 
 use m2_assets::physics::{Constraint, HINGE, Physics};
 use m2_math::glam::{Mat4, Quat, Vec3};
 
 use crate::anim::Skeleton;
 
-/// How fast a gate swings open or shut, of the way a second (invented:
-/// a leaf a quarter turn open takes 2.5 s).
-pub const SWING: f32 = 0.4;
+/// The hinge motor's proportional recovery velocity, per second
+/// (0x821617B8 sets 1.0 at +0x1C).
+pub const RECOVERY: f32 = 1.0;
+/// Its constant recovery velocity, radians a second (0.1 at +0x20,
+/// 0x820BB468).
+pub const RECOVERY_CONSTANT: f32 = 0.1;
+/// The physics steps the motor's speed is taken over, seconds.
+const STEP: f32 = 1.0 / 60.0;
+
+/// How far open a leaf `open` radians wide is after `dt` seconds, from
+/// `at` (0 shut, 1 open) going to `to`: at the motor's recovery velocity,
+/// `RECOVERY * error + RECOVERY_CONSTANT`, step by step, not past it.
+pub fn swing(at: f32, to: f32, open: f32, dt: f32) -> f32 {
+    let open = open.abs().max(1e-3);
+    let mut at = at;
+    let mut left = dt;
+    while left > 0.0 && at != to {
+        let h = left.min(STEP);
+        left -= h;
+        let error = (to - at).abs() * open;
+        let step = ((RECOVERY * error + RECOVERY_CONSTANT) * h).min(error) / open;
+        at = if at < to {
+            (at + step).min(to)
+        } else {
+            (at - step).max(to)
+        };
+    }
+    at
+}
 
 /// One hinged leaf.
 #[derive(Clone, Debug, PartialEq)]
@@ -66,6 +106,16 @@ impl Gate {
     /// Every node's matrix in the model, its leaves `open` of the way
     /// open (0 shut, 1 open).
     pub fn nodes(&self, open: f32) -> Vec<Mat4> {
+        self.posed(open)
+    }
+
+    /// Its widest leaf's open angle, radians: the gate's pace
+    /// ([`swing`]).
+    pub fn widest(&self) -> f32 {
+        self.leaves.iter().map(|l| l.open.abs()).fold(0.0, f32::max)
+    }
+
+    fn posed(&self, open: f32) -> Vec<Mat4> {
         let mut out = self.rest.clone();
         let open = open.clamp(0.0, 1.0);
         for l in &self.leaves {
@@ -112,6 +162,23 @@ fn leaf(skeleton: &Skeleton, phy2: &Physics, c: &Constraint) -> Option<Leaf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_leaf_swings_at_its_motors_recovery_velocity() {
+        let quarter = std::f32::consts::FRAC_PI_2;
+        // A second from shut: dθ/dt = θ_left + 0.1 from 1.571, so about
+        // (1.671)(1 - e^-1) = 1.056 rad, two thirds of the way.
+        let at = swing(0.0, 1.0, quarter, 1.0);
+        assert!((at * quarter - 1.056).abs() < 0.02, "{}", at * quarter);
+        // The first step goes 1.671 rad/s, the last ones 0.1.
+        let first = swing(0.0, 1.0, quarter, STEP);
+        assert!((first * quarter / STEP - 1.671).abs() < 1e-3);
+        // All the way in ln(1.671 / 0.1) = 2.8 s, never past.
+        assert!(swing(0.0, 1.0, quarter, 2.7) < 1.0);
+        assert_eq!(swing(0.0, 1.0, quarter, 2.9), 1.0);
+        // Shutting, the same back.
+        assert!((swing(1.0, 0.0, quarter, 1.0) - (1.0 - at)).abs() < 1e-4);
+    }
     use m2_assets::physics::Part;
 
     fn skeleton() -> Skeleton {

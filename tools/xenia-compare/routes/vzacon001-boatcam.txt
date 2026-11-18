@@ -1,0 +1,25 @@
+# From boot to the wheel of VzaCon001's speedboat (Mattias, no profile).
+# Needs Xenia started with --headless=true (it answers its own sign-in
+# dialogs) and --apu=sdl (xenia-route.ps1 -Audio). About 3 to 4 minutes.
+wait 25
+tap_until start Continue_without 90      # title screen -> profile prompt
+wait 2
+press up 0.3                              # "Continue without saving"
+wait 1
+press a 0.3
+until NOTICE 30 2                         # "You need to be signed into Xbox LIVE..."
+press a 0.3
+until new_game 60 2                       # main menu, "Start a new game."
+press a 0.3
+until Mattias 30 2                        # character select
+press a 0.3
+until Tough_Merc 30 2                     # Mattias's card
+press a 0.3
+tap_until a Accelerate 400                # loading, villa movie (A skips), boat
+mark at the speedboat
+trackhero
+wait 3
+stickresp2 boat x0.5 x0.75 x1 y0.5 y0.75 y1 y-1 hold=1 after=5
+stickresp2 boatlim y1 y-1 hold=3 after=3
+stickresp2 boatdrive x1 x-1 hold=1 after=8 btn=a nolevel
+mark done
