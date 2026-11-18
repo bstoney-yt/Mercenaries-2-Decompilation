@@ -3861,6 +3861,21 @@ impl MissionLink {
             // and 28).
             m2_game::gui_runtime::tick(mission.lua(), f64::from(STEP));
             lines.extend(mission.take_log());
+            // The parts' states applied last step: what they hid no
+            // longer keeps the object alive (0x82289020's shown-piece
+            // test), what they showed does again.
+            for a in game.scene.props.take_applied() {
+                if let Some(c) = &mut self.part_destroy_check {
+                    c.landed(&a);
+                }
+                let w = mission.world();
+                let mut w = w.borrow_mut();
+                let hidden = w.hidden_nodes.entry(a.entity).or_default();
+                hidden.extend(a.hidden.iter().copied());
+                for n in &a.shown {
+                    hidden.remove(n);
+                }
+            }
             let commands = mission.take_commands();
             if let Some(h) = &mut self.hijack
                 && !h.follow(game, mission, &commands)
@@ -4113,6 +4128,9 @@ impl MissionLink {
                 }
                 if let Some(c) = &mut self.part_destroy_check {
                     c.changes += changed.len() as u32;
+                    for &(g, machine, state) in &changed {
+                        c.entered(game, g, machine, state);
+                    }
                 }
                 for (g, machine, state) in changed {
                     eprintln!(
@@ -6596,19 +6614,90 @@ fn check_building_damage_on(mission: &mut Mission, game: &Game, only: Option<u32
 /// 15 s on, its nodes are destroyed one at a time by the scripts'
 /// `ObjectState.SendDamage` ([`check_building_damage`]), each node's
 /// `DestroyMsg` going through its part's state machine
-/// ([`part_state_changes`]). 15 s after that it logs `part-destroy-check:
-/// PASS <n> part state changes, destroyed` if any part changed state and
-/// the object died, else `FAIL`.
+/// ([`part_state_changes`]). Each change logs what the state entered
+/// shows and hides (`part-destroy-check: ... enters ...`), and each
+/// object's states applied log the nodes that showed and hid and how many
+/// steps after the message that was (`... the break lands 1 step after
+/// the message`: [`Props::apply_states`](crate::props::Props::apply_states)).
+/// It pictures the fortress a second before (`<out>-fortress-before.ppm`),
+/// as its states first land (`-fortress-parts`) and at the end
+/// (`-fortress-after`), the pictures kept by the machine. 15 s after the
+/// messages it logs `part-destroy-check: PASS ...` if some part changed
+/// state, the object died, and every application hid some node and
+/// landed exactly one step after its message; else `FAIL`.
 #[derive(Debug, Default)]
 pub struct PartDestroyCheck {
     t: f32,
     target: Option<u32>,
+    at: Option<Vec3>,
     sent: Option<bool>,
-    changes: u32,
+    pub(crate) changes: u32,
+    /// States applied one step after their message, and otherwise; how
+    /// many nodes they hid.
+    on_time: u32,
+    late: u32,
+    hid: usize,
+    /// Pictures due: (name, where the fortress is).
+    shots: Vec<(&'static str, Vec3)>,
+    pictured: HashSet<&'static str>,
     done: bool,
 }
 
 impl PartDestroyCheck {
+    /// Pictures due since last asked: (name, where to look).
+    pub fn take_shots(&mut self) -> Vec<(&'static str, Vec3)> {
+        std::mem::take(&mut self.shots)
+    }
+
+    fn shoot(&mut self, name: &'static str) {
+        if let Some(at) = self.at
+            && self.pictured.insert(name)
+        {
+            self.shots.push((name, at));
+        }
+    }
+
+    /// Part `machine` of `g` went to `state` on a message: what entering
+    /// it shows and hides.
+    fn entered(&self, game: &Game, g: u32, machine: u32, state: u32) {
+        let list = game
+            .scene
+            .props
+            .model_parts(g)
+            .map(|p| p.entered(machine, state))
+            .unwrap_or_default();
+        let (shows, hides): (Vec<_>, Vec<_>) = list.iter().partition(|x| x.1);
+        let names =
+            |v: &[&(u32, bool)]| v.iter().map(|x| format!("{:08x}", x.0)).collect::<Vec<_>>();
+        eprintln!(
+            "part-destroy-check: {g:#x} part {machine:08x} enters {state:08x}: shows {:?}, hides {:?}",
+            names(&shows),
+            names(&hides)
+        );
+    }
+
+    /// `a`'s states were applied.
+    fn landed(&mut self, a: &crate::props::Applied) {
+        let after = a.landed.saturating_sub(a.sent);
+        if after == 1 {
+            self.on_time += 1;
+        } else {
+            self.late += 1;
+        }
+        self.hid += a.hidden.len();
+        let hex = |v: &[u32]| v.iter().map(|n| format!("{n:08x}")).collect::<Vec<_>>();
+        eprintln!(
+            "part-destroy-check: {:#x}'s states applied at step {} (message at step {}): the              break lands {after} step(s) after the message; shown {:?}, hidden {:?}; {} parts down",
+            a.entity,
+            a.landed,
+            a.sent,
+            hex(&a.shown),
+            hex(&a.hidden),
+            a.down
+        );
+        self.shoot("parts");
+    }
+
     fn tick(&mut self, game: &mut Game, mission: &mut Mission, dt: f32) {
         if self.done {
             return;
@@ -6635,6 +6724,7 @@ impl PartDestroyCheck {
                     game.ride = None;
                     game.on_foot = true;
                     self.target = Some(g);
+                    self.at = Some(at);
                 }
                 None => {
                     self.done = true;
@@ -6642,6 +6732,9 @@ impl PartDestroyCheck {
                 }
             }
             return;
+        }
+        if self.target.is_some() && self.t >= 24.0 {
+            self.shoot("before");
         }
         if let Some(g) = self.target
             && self.sent.is_none()
@@ -6656,16 +6749,15 @@ impl PartDestroyCheck {
             && self.t >= 40.0
         {
             self.done = true;
-            if self.changes > 0 && destroyed {
-                eprintln!(
-                    "part-destroy-check: PASS {} part state changes, destroyed",
-                    self.changes
-                );
+            self.shoot("after");
+            let what = format!(
+                "{} part state changes, destroyed {destroyed}; states applied {} times one step                  after their message, {} otherwise, {} nodes hidden",
+                self.changes, self.on_time, self.late, self.hid
+            );
+            if self.changes > 0 && destroyed && self.on_time > 0 && self.late == 0 && self.hid > 0 {
+                eprintln!("part-destroy-check: PASS {what}");
             } else {
-                eprintln!(
-                    "part-destroy-check: FAIL {} part state changes, destroyed {destroyed}",
-                    self.changes
-                );
+                eprintln!("part-destroy-check: FAIL {what}");
             }
         }
     }
@@ -8319,8 +8411,12 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
         // destroying it): its message goes to its part's state machine, as
         // a vehicle's parts take theirs (`m2_engine::node_health`). A
         // prop's part (a building's slice) a destroying message reaches
-        // breaks alone (`Props::wreck_part`; inferred: its state's own
-        // wreck shown as a vehicle's crash shows it). The object's share
+        // has gone to the state its machine sends it to
+        // (`part_state_changes`), which shows and hides its nodes a step
+        // on (`Props::apply_states`, as the 360's 0x8222D2F0); one whose
+        // parts take no messages breaks alone (`Props::wreck_part`;
+        // inferred: its state's own wreck shown as a vehicle's crash
+        // shows it). The object's share
         // is already off its health (`m2_game::node_damage`); its death
         // follows as `Kill`.
         Command::NodeDamage {
@@ -8341,6 +8437,8 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                     parts.send(dm, k, *msg);
                     to = "vehicle part";
                 }
+            } else if message.is_some() && game.scene.props.parts_by_state(*guid) {
+                to = "prop part (its state shows a step on)";
             } else if let Some(msg) = message
                 && (*msg == m2_assets::model::DESTROY_MSG
                     || *msg == m2_engine::node_health::DESTROY_OTHER_MSG)

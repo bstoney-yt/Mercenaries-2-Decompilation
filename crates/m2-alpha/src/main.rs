@@ -5091,6 +5091,23 @@ fn mission_for_screenshot(
         lap.mark("loop: before the step");
         spans::time("game", || game.step(intent, tick));
         spans::time("scripts", || link.tick(game, tick));
+        // `--part-destroy-check`'s pictures of the fortress, from above
+        // and off its side.
+        let shots = (link.part_destroy_check.as_mut()).map_or_else(Vec::new, |c| c.take_shots());
+        for (name, at) in shots {
+            let eye = at + m2_math::glam::Vec3::new(70.0, 45.0, 30.0);
+            delivery_picture(
+                backend,
+                game,
+                fov,
+                aspect,
+                at,
+                at,
+                Some(eye),
+                &picture(format!("fortress-{name}")),
+            )?;
+            eprintln!("part-destroy-check: pictured the fortress {name}");
+        }
         if let Some(audio) = &mut audio {
             spans::time("sound", || {
                 mission_sounds(audio, &mut link);

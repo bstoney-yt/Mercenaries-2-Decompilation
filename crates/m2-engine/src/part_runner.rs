@@ -211,6 +211,12 @@ impl Runner {
         self.machines.iter().find(|m| m.name == name)?.current
     }
 
+    /// The state each part is in, in the order of its object's machines
+    /// ([`PartStates::machines`]): `None` for one never put in any.
+    pub fn states(&self) -> Vec<Option<u32>> {
+        self.machines.iter().map(|m| m.current).collect()
+    }
+
     /// Whether nothing more is due.
     pub fn settled(&self) -> bool {
         self.timers.is_empty()
@@ -340,6 +346,13 @@ mod tests {
             assert!((3.0..=12.1).contains(&down), "{down}");
             assert!((2.9..=4.2).contains(&(out - down)), "{out} {down}");
             assert!(r.settled());
+            // Each part's state, in its machines' order, as the last
+            // change left it.
+            let states = r.states();
+            assert_eq!(states.len(), canopy().machines.len());
+            assert!(r.state_of(TRUNK).is_some());
+            assert!(states.contains(&r.state_of(TRUNK)));
+            assert!(states.contains(&r.state_of(SLICE00)));
         }
     }
 

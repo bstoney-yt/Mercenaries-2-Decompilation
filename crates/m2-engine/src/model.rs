@@ -1264,6 +1264,59 @@ impl ModelParts {
             .hidden_parts(&self.nodes, |k| wrecked.get(k).copied().unwrap_or(false))
     }
 
+    /// Per node, whether it is hidden with each part in the state `state`
+    /// names for it (a state's name hash, by part; `None`, or a state the
+    /// part has not, leaves it intact): what the states entered show and
+    /// hide. The 360 rebuilds an object's shown nodes from its parts'
+    /// states a step after a state changes (0x8222D2F0 -> 0x821C7648).
+    pub fn hidden_in_states(&self, state: impl Fn(usize) -> Option<u32>) -> Vec<bool> {
+        self.states.hidden_in(&self.nodes, |k, m| {
+            state(k)
+                .and_then(|s| m.states.iter().position(|x| x.0 == s))
+                .or_else(|| m2_assets::model::PartStates::intact_state(m))
+        })
+    }
+
+    /// Which parts are down with the nodes `hidden` marks hidden: those
+    /// that show something of their own intact, none of it shown now.
+    pub fn down_in(&self, hidden: &[bool]) -> Vec<bool> {
+        self.shows
+            .iter()
+            .map(|s| {
+                !s.is_empty()
+                    && s.iter()
+                        .all(|&n| hidden.get(usize::from(n)).copied().unwrap_or(false))
+            })
+            .collect()
+    }
+
+    /// The name hash of node `n`.
+    pub fn node_name(&self, n: usize) -> Option<u32> {
+        self.nodes.get(n).map(|x| x.name_hash)
+    }
+
+    /// What entering state `state` of the part whose machine is named
+    /// `machine` (its node's name hash) shows and hides, in order: (node
+    /// name hash, shown). Empty for no such part or state.
+    pub fn entered(&self, machine: u32, state: u32) -> Vec<(u32, bool)> {
+        let Some(m) = self.states.machines.iter().find(|m| {
+            m.node
+                .and_then(|n| self.node_name(usize::from(n)))
+                .is_some_and(|h| h == machine)
+        }) else {
+            return Vec::new();
+        };
+        m.states
+            .iter()
+            .find(|x| x.0 == state)
+            .map(|x| {
+                x.1.iter()
+                    .filter_map(|&(n, shown)| Some((self.node_name(usize::from(n))?, shown)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Its collision with the parts `wrecked` marks taken away: `None` if
     /// nothing is left, or if its collision has no shapes of its own (one
     /// cut from its drawn triangles stays whole until all of it breaks).
@@ -2424,6 +2477,58 @@ mod tests {
         });
         assert_eq!(parts.hidden_by(0), [0xcf37_044a, 0x26c4_7dc0]);
         assert!(parts.hidden_by(1).is_empty());
+    }
+
+    // Two slices of a building, each its own part: the states they are
+    // in say what shows (0x821C7648 rebuilds the shown nodes from them),
+    // and a slice whose own nodes are all hidden is down.
+    #[test]
+    fn what_shows_follows_the_states_the_parts_are_in() {
+        use m2_assets::model::{PartMachine, PartStates, STATE_INTACT, STATE_WRECKED};
+        // Nodes: 0 root, 1 and 2 the slices intact, 3 and 4 their rubble.
+        let slice = |node: u16, rubble: u16| PartMachine {
+            node: Some(node),
+            states: vec![
+                (STATE_INTACT, vec![(node, true), (rubble, false)]),
+                (STATE_WRECKED, vec![(node, false), (rubble, true)]),
+            ],
+            starts: [None, None],
+            acts: Vec::new(),
+        };
+        let nodes = (0..5u32)
+            .map(|i| m2_assets::model::Node {
+                name_hash: 0x100 + i,
+                parent: (i > 0).then_some(0),
+                ..Default::default()
+            })
+            .collect();
+        let parts = ModelParts {
+            states: PartStates {
+                switchable: vec![1, 2, 3, 4],
+                machines: vec![slice(1, 3), slice(2, 4)],
+                ..Default::default()
+            },
+            nodes,
+            shows: vec![vec![1], vec![2]],
+            boxes: vec![None, None],
+            meshes: Vec::new(),
+        };
+        // Never sent anywhere: both intact.
+        let intact = parts.hidden_in_states(|_| None);
+        assert_eq!(intact, [false, false, false, true, true]);
+        assert_eq!(parts.down_in(&intact), [false, false]);
+        // The first destroyed: its slice hidden, its rubble shown.
+        let one = parts.hidden_in_states(|k| (k == 0).then_some(STATE_WRECKED));
+        assert_eq!(one, [false, true, false, false, true]);
+        assert_eq!(parts.down_in(&one), [true, false]);
+        // A state the part hasn't leaves it intact.
+        assert_eq!(parts.hidden_in_states(|_| Some(0xdead)), intact);
+        // What entering the wreck shows and hides, by name.
+        assert_eq!(
+            parts.entered(0x101, STATE_WRECKED),
+            [(0x101, false), (0x103, true)]
+        );
+        assert!(parts.entered(0x109, STATE_WRECKED).is_empty());
     }
 
     #[test]
