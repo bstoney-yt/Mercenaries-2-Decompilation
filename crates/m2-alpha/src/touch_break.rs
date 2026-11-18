@@ -123,6 +123,8 @@ pub fn check(
         Vec3::new(0.0, 0.4, 0.0),
         Quat::IDENTITY,
     );
+    // The statics are in the world's queries once it has stepped.
+    physics.step(1.0 / 60.0);
     let mut her = Character::new(Vec3::new(-3.0, 0.0, 0.0));
     let dt = 1.0 / 60.0;
     let mut broke = Vec::new();
