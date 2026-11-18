@@ -4146,18 +4146,10 @@ impl Combat {
             self.run_overs.0 += 1;
             self.run_overs.1 += lost;
             eprintln!("run over: a vehicle ran into her for {damage:.1} ({lost:.1} health lost)");
-            // A vehicle's hit of at least 2 on someone alive knocks them
-            // down (0x824203F0, 0x82422480): for her, a player's time down
-            // ([`HER_PLAYER_RECORD`]).
-            if damage >= m2_engine::durability::KNOCKDOWN_DAMAGE && self.hp > 0.01 {
-                let r = self.knock_rng.unit();
-                let seconds = m2_engine::melee::knockdown_seconds(
-                    m2_engine::durability::KNOCKDOWN_SECONDS,
-                    HER_PLAYER_RECORD,
-                    r,
-                );
-                self.knock_her_down(f, seconds);
-            }
+            // No knockdown for her: the 360's knockdown on a vehicle's hit
+            // (0x82422480) is for those without a player record (0x8222C3E8
+            // on 0x83657FA8), and the stagger picker gives a player none
+            // for a direct hit that is not a melee bash (0x824220B0).
         }
     }
 
