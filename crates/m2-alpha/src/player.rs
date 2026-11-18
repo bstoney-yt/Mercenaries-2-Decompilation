@@ -2089,26 +2089,30 @@ impl Player {
         use m2_engine::projection::{FAR, NEAR, fov_y};
         // `fov_degrees` is the game's field of view (the picture's width
         // at 4:3); the picture's height follows from the screen's shape
-        // ([`m2_engine::projection`]). Scope and binoculars narrow that
-        // height, as before.
-        let tall = fov_y(fov_degrees.to_radians(), aspect).to_degrees();
+        // ([`m2_engine::projection`]). Scope and binoculars divide that
+        // field by their zoom (the 360's binocular camera, 0x824BF700).
         // Through her scope, from the camera's pivot as through her
         // binoculars, magnified.
         if let Some(z) = self.scope.filter(|_| self.driving.is_none()) {
             return View::perspective(
                 self.look_at(),
                 self.camera_forward(),
-                crate::binoculars::magnified(tall, z).to_radians(),
+                fov_y(
+                    crate::binoculars::magnified(fov_degrees.to_radians(), z),
+                    aspect,
+                ),
                 aspect,
                 NEAR,
                 FAR,
             );
         }
+        // Through her binoculars, the 360's binocular camera's view: from
+        // 2 m above her feet, with its lens.
         if let Some(b) = self.binoculars.filter(|_| self.driving.is_none()) {
             return View::perspective(
-                self.look_at(),
-                self.camera_forward(),
-                b.fov(tall).to_radians(),
+                b.camera.eye(self.character.position, false),
+                b.camera.forward(),
+                fov_y(b.camera.fov(fov_degrees.to_radians()), aspect),
                 aspect,
                 NEAR,
                 FAR,

@@ -2804,8 +2804,8 @@ fn screenshot(
     if let Some(zoom) = options.binoculars
         && let Some(p) = game.scene.player.as_mut()
     {
-        let mut b = binoculars::Binoculars::default();
-        b.step(i32::from(zoom) - i32::from(b.zoom));
+        let mut b = binoculars::Binoculars::up(p.yaw, p.pitch);
+        b.camera.zoom = f32::from(zoom).clamp(b.camera.params.min, b.camera.params.max);
         p.binoculars = Some(b);
     }
     if options.pda {

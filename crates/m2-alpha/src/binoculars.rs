@@ -29,11 +29,17 @@
 //! degrees up; the heading is the one the compass gets (degrees, growing
 //! turning left), wrapped to -180..180.
 //!
-//! Invented: the start at 2x; the wheel (and Tab, the pad's right
-//! bumper, which step up and round) changing it a level a notch; the
-//! view from the camera's pivot above her head, with her body left out;
-//! the narrower lens for a magnification ([`View::fov`]); the look slowed
-//! by it; that she stands and does not fire while they are up. What the
+//! The camera through them is the 360's binocular camera (class
+//! 0x820EC8D8, [`m2_engine::binocular_camera`]): from 2x to 7x, starting
+//! at 2x, zoomed continuously with the left stick's (here the movement
+//! keys') up and down; the lens the game's field of view over the zoom;
+//! the look at most 1/zoom rad/s, eased, held to 1.5 rad either side of
+//! where they came up and to its pitch limits; from 2 m above her feet.
+//!
+//! Invented: a wheel notch zooms as a quarter second of full stick; the
+//! mouse's turn is read as the stick's push (a half turn a second is
+//! full); her body is left out; she stands and does not fire while they
+//! are up. What the
 //! reticle is on is told as [`Focus`]: from the 360 code (0x8243B250,
 //! 0x82443160) a ray of [`FOCUS_RANGE`] from the camera, the object's
 //! `FactionMarker` texture as `FactionTexture` and its `LocalizedName`
@@ -49,59 +55,55 @@
 //! through it (gap-list sweep; the screen's sniper tree not compared with
 //! footage: none found).
 
-/// The zoom levels the zoom meter spans.
-pub const MIN_ZOOM: u8 = 1;
-pub const MAX_ZOOM: u8 = 7;
-/// The level they come up at (invented).
-pub const START_ZOOM: u8 = 2;
+use m2_engine::binocular_camera::{BINOCULARS, BinocularCamera};
 
-/// The binoculars up: how far they magnify.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A mouse turn a second read as the stick pushed all the way, radians
+/// (invented: the 360 reads the stick).
+pub const LOOK_FULL: f32 = std::f32::consts::PI;
+/// A wheel notch zooms as this long of full stick, seconds (invented).
+pub const NOTCH: f32 = 0.25;
+
+/// The binoculars up: their camera.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Binoculars {
-    pub zoom: u8,
-}
-
-impl Default for Binoculars {
-    fn default() -> Self {
-        Self { zoom: START_ZOOM }
-    }
+    pub camera: BinocularCamera,
 }
 
 impl Binoculars {
-    /// Zoom in (`by` > 0) or out a level per step, held to the meter.
-    pub fn step(&mut self, by: i32) {
-        let z = (i32::from(self.zoom) + by).clamp(i32::from(MIN_ZOOM), i32::from(MAX_ZOOM));
-        self.zoom = z as u8;
+    /// Put up while she looks along `heading` and `pitch` (radians).
+    pub fn up(heading: f32, pitch: f32) -> Self {
+        Self {
+            camera: BinocularCamera::start(BINOCULARS, heading, pitch),
+        }
     }
 
-    /// Up a level, and from the top back to the bottom.
-    pub fn cycle(&mut self) {
-        self.zoom = if self.zoom >= MAX_ZOOM {
-            MIN_ZOOM
-        } else {
-            self.zoom + 1
-        };
+    /// How far they magnify now.
+    pub fn zoom(&self) -> f32 {
+        self.camera.zoom
     }
 
-    /// The lens through them, degrees: `fov` (the plain view's) narrowed
-    /// so what is seen is `zoom` times as large.
-    pub fn fov(&self, fov: f32) -> f32 {
-        let half = (fov.to_radians() * 0.5).tan() / f32::from(self.zoom.max(1));
-        (2.0 * half.atan()).to_degrees()
-    }
-
-    /// How much the look is slowed: by the magnification, so a mouse
-    /// count moves the picture as far as without them.
-    pub fn look_scale(&self) -> f32 {
-        1.0 / f32::from(self.zoom.max(1))
+    /// A step of `dt` seconds with her look's turn `look` (radians this
+    /// step, x turning the heading up, y up), the movement's up-down
+    /// `axis` and `notches` of the wheel.
+    pub fn step(&mut self, look: [f32; 2], axis: f32, notches: i32, dt: f32) {
+        let full = (LOOK_FULL * dt).max(1e-6);
+        // The stick's +x turns the heading down.
+        self.camera.input = [
+            (-look[0] / full).clamp(-1.0, 1.0),
+            (look[1] / full).clamp(-1.0, 1.0),
+        ];
+        let wheel = notches as f32 * NOTCH / dt.max(1e-6);
+        self.camera.zoom_axis = axis.clamp(-1.0, 1.0) + wheel;
+        self.camera.step(dt);
+        self.camera.zoom_axis = 0.0;
     }
 }
 
-/// The lens, degrees, for `fov` (the plain view's) magnified `zoom`
-/// times: what is seen is `zoom` times as large.
+/// The lens, radians, for the game's field of view `fov` (radians)
+/// magnified `zoom` times: the 360's binocular and scope camera divides
+/// the angle itself (0x824BF700).
 pub fn magnified(fov: f32, zoom: f32) -> f32 {
-    let half = (fov.to_radians() * 0.5).tan() / zoom.max(1.0);
-    (2.0 * half.atan()).to_degrees()
+    fov / zoom.max(1e-4)
 }
 
 /// What the binocular screen is told each frame.
@@ -109,7 +111,7 @@ pub fn magnified(fov: f32, zoom: f32) -> f32 {
 pub struct View {
     /// What the reticle is on.
     pub focus: Option<Focus>,
-    pub zoom: u8,
+    pub zoom: f32,
     /// Her gun's scope, not her binoculars (`bSniper`).
     pub sniper: bool,
     /// Degrees, growing turning left, -180..180 ([`wrap_degrees`]).
@@ -225,15 +227,16 @@ mod tests {
 
     #[test]
     fn every_zoom_level_keeps_its_pointer_on_the_meter() {
-        for z in MIN_ZOOM..=MAX_ZOOM {
+        for z in 1..=7u8 {
             let at = zoom_meter(f32::from(z));
             assert!((-0.5..=0.5).contains(&at), "{z}: {at}");
         }
-        // The ends of the range are the meter's ends; one more is off it.
-        assert_eq!(zoom_meter(f32::from(MIN_ZOOM)), 0.5);
-        assert_eq!(zoom_meter(f32::from(MAX_ZOOM)), -0.5);
-        assert!(zoom_meter(f32::from(MAX_ZOOM + 1)) < -0.5);
-        assert!(zoom_meter(f32::from(MIN_ZOOM - 1)) > 0.5);
+        // The meter spans 1 to 7; one more is off it. The binoculars'
+        // camera keeps to 2 to 7 of it.
+        assert_eq!(zoom_meter(1.0), 0.5);
+        assert_eq!(zoom_meter(BINOCULARS.max), -0.5);
+        assert!(zoom_meter(8.0) < -0.5);
+        assert!(zoom_meter(0.0) > 0.5);
     }
 
     #[test]
@@ -246,24 +249,28 @@ mod tests {
     }
 
     #[test]
-    fn zoom_steps_and_cycles_within_the_meter() {
-        let mut b = Binoculars::default();
-        assert_eq!(b.zoom, START_ZOOM);
-        b.step(-5);
-        assert_eq!(b.zoom, MIN_ZOOM);
-        b.step(20);
-        assert_eq!(b.zoom, MAX_ZOOM);
-        b.cycle();
-        assert_eq!(b.zoom, MIN_ZOOM);
+    fn they_come_up_at_2x_and_zoom_with_the_stick_and_wheel() {
+        let dt = 1.0 / 60.0;
+        let mut b = Binoculars::up(0.0, 0.0);
+        assert_eq!(b.zoom(), 2.0);
+        // Two notches in: half a second of full stick, about e^0.5.
+        b.step([0.0; 2], 0.0, 2, dt);
+        assert!(b.zoom() > 2.0 && b.zoom() < 7.0, "{}", b.zoom());
+        for _ in 0..600 {
+            b.step([0.0; 2], 1.0, 0, dt);
+        }
+        assert_eq!(b.zoom(), 7.0);
+        // The mouse to the right: the heading goes down, at most 1/7 rad/s.
+        for _ in 0..120 {
+            b.step([-1.0, 0.0], 0.0, 0, dt);
+        }
+        let before = b.camera.yaw;
+        b.step([-1.0, 0.0], 0.0, 0, dt);
+        assert!(((before - b.camera.yaw) / dt - 1.0 / 7.0).abs() < 1e-3);
     }
 
     #[test]
-    fn the_lens_magnifies_by_the_zoom() {
-        let b = Binoculars { zoom: 4 };
-        let fov = b.fov(60.0);
-        let ratio = (30f32.to_radians().tan()) / (fov.to_radians() * 0.5).tan();
-        assert!((ratio - 4.0).abs() < 1e-4, "{fov} {ratio}");
-        assert!((Binoculars { zoom: 1 }.fov(60.0) - 60.0).abs() < 1e-3);
-        assert_eq!(b.look_scale(), 0.25);
+    fn the_lens_divides_the_angle_by_the_zoom() {
+        assert!((magnified(0.95975, 4.0) - 0.2399375).abs() < 1e-6);
     }
 }

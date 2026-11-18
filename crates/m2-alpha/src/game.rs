@@ -868,7 +868,7 @@ impl Game {
             let zoom = i32::from(input.take_pressed(Action::ZoomIn))
                 - i32::from(input.take_pressed(Action::ZoomOut));
             let switch = input.take_pressed(Action::SwitchWeapon);
-            if self.binoculars(toggle, zoom, switch, &mut intent) {
+            if self.binoculars(toggle, zoom, switch, &mut intent, dt) {
                 self.step(intent, dt);
                 return;
             }
@@ -933,7 +933,14 @@ impl Game {
     /// when that changes or the support menu or PDA is asked for. While
     /// they are up she stands and only looks, slower by the zoom: `intent`
     /// is cut down to that, and true is returned.
-    fn binoculars(&mut self, toggle: bool, zoom: i32, switch: bool, intent: &mut Intent) -> bool {
+    fn binoculars(
+        &mut self,
+        toggle: bool,
+        zoom: i32,
+        switch: bool,
+        intent: &mut Intent,
+        dt: f32,
+    ) -> bool {
         let busy = self.support.busy() || self.support.pda;
         let Some(player) = self.scene.player.as_mut() else {
             return false;
@@ -942,21 +949,19 @@ impl Game {
         let wanted = intent.trigger.support || intent.trigger.pda;
         player.binoculars = match player.binoculars {
             Some(_) if toggle || !free || wanted => None,
-            None if toggle && free => Some(Binoculars::default()),
+            None if toggle && free => Some(Binoculars::up(player.yaw, player.pitch)),
             b => b,
         };
         let Some(b) = &mut player.binoculars else {
             return false;
         };
-        b.step(zoom);
-        if switch && zoom == 0 {
-            b.cycle();
-        }
-        let look = intent.look * b.look_scale();
-        *intent = Intent {
-            look,
-            ..Intent::default()
-        };
+        // The 360's binocular camera turns the view
+        // ([`m2_engine::binocular_camera`]); the movement's up-down zooms.
+        let _ = switch;
+        b.step([intent.look.x, intent.look.y], intent.movement.y, zoom, dt);
+        player.yaw = b.camera.yaw;
+        player.pitch = b.camera.pitch;
+        *intent = Intent::default();
         true
     }
 
