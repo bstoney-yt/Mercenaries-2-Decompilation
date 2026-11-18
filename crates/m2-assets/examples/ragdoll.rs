@@ -52,6 +52,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             r.mass(),
             r.joints.len()
         );
+        // The check line: the game's one human ragdoll, by its asset's
+        // name hash, as the 360 reads it (0x8218F980): 12 bodies, 11
+        // joints.
+        let ok = e.name_hash == 0xb9ba_c8b5 && r.bones.len() == 12 && r.joints.len() == 11;
+        println!(
+            "ragdoll-check: asset {:08x}: {} bones, {} joints: {}",
+            e.name_hash,
+            r.bones.len(),
+            r.joints.len(),
+            if ok { "PASS" } else { "FAIL" }
+        );
         for (i, b) in r.bones.iter().enumerate() {
             println!(
                 "bone {i:2} node {:2} {:08x} {:<13} parent {:?} {:.3} kg {:?}",
