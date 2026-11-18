@@ -52,6 +52,13 @@ pub struct SubmitStats {
 }
 
 /// Collects one frame's primitives and submits them in sort order.
+type Lists = (Vec<(SortKey, Primitive)>, Vec<(SortKey, u32)>);
+
+thread_local! {
+    /// The lists of the last [`DrawQueue`] dropped on this thread.
+    static SPARE: std::cell::Cell<Option<Lists>> = const { std::cell::Cell::new(None) };
+}
+
 #[derive(Debug, Default)]
 pub struct DrawQueue {
     entries: Vec<(SortKey, Primitive)>,
@@ -63,9 +70,29 @@ pub struct DrawQueue {
     stage: Stage,
 }
 
+impl Drop for DrawQueue {
+    fn drop(&mut self) {
+        let lists = (
+            std::mem::take(&mut self.entries),
+            std::mem::take(&mut self.order),
+        );
+        SPARE.set(Some(lists));
+    }
+}
+
 impl DrawQueue {
+    /// An empty queue, with the lists of the last queue dropped on this
+    /// thread if any: a frame's queue grows to megabytes, and growing it
+    /// from nothing each frame copies and maps it afresh.
     pub fn new() -> Self {
-        Self::default()
+        let (mut entries, mut order) = SPARE.take().unwrap_or_default();
+        entries.clear();
+        order.clear();
+        Self {
+            entries,
+            order,
+            stage: Stage::Collecting,
+        }
     }
 
     pub fn len(&self) -> usize {

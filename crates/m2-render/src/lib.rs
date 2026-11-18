@@ -24,6 +24,7 @@
 
 pub mod backend;
 pub mod buffer;
+pub mod fasthash;
 #[cfg(feature = "wgpu")]
 pub mod gpu;
 pub mod key;
