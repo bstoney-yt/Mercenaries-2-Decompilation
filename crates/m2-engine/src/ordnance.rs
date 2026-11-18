@@ -11,6 +11,7 @@
 //! falls at 80 m/s and leaves "Explosion (Cluster Bomb)" (5 m, 160
 //! damage, at least 50 within reach, with a grenade's frag).
 
+use m2_math::glam::Vec3;
 use std::collections::HashMap;
 
 use m2_assets::{Layer, name_hash};
@@ -259,5 +260,93 @@ mod tests {
         // 9 is a light or an effect: no blast.
         assert_eq!(o.blasts_of(1), vec![2, 3]);
         assert_eq!(o.blasts_of(3), vec![3, 2]);
+    }
+}
+
+/// The longest sub-step the 360's ordnance step takes, seconds
+/// (0x82DE8B68, read by 0x82295DF0).
+pub const SUB_STEP: f32 = 0.08;
+
+/// Flies a round `dt` seconds on, as the 360's ordnance step does
+/// (0x82295DF0): in sub-steps of at most [`SUB_STEP`], its velocity is its
+/// heading times its speed plus the world's gravity (`gravity`, m/s^2
+/// down) times its `GravityScale` (`scale`) times the sub-step; it moves
+/// by that and turns to face along it. Its speed stays as it was: gravity
+/// only bends its path. With `scale` 0 it flies straight. Returns where
+/// it is and its velocity (heading times speed).
+pub fn step(at: Vec3, velocity: Vec3, scale: f32, gravity: f32, dt: f32) -> (Vec3, Vec3) {
+    let speed = velocity.length();
+    if scale == 0.0 || speed <= 0.0 {
+        return (at + velocity * dt, velocity);
+    }
+    let mut at = at;
+    let mut heading = velocity / speed;
+    let mut left = dt;
+    while left > 0.0 {
+        let s = left.min(SUB_STEP);
+        let v = heading * speed - Vec3::Y * (gravity * scale * s);
+        at += v * s;
+        heading = v.normalize_or(heading);
+        left -= s;
+    }
+    (at, heading * speed)
+}
+
+/// Where a round fired at `speed` and `elevation` (radians, above level)
+/// lands back at its own height, by the 360's step ([`step`]) taken
+/// continuously: it keeps its speed and turns at `g cos(theta) / speed`,
+/// so it comes down at minus its elevation, `2 theta v^2 / g` out, after
+/// `(2 v / g) ln(sec theta + tan theta)` seconds, for `g` the world's
+/// gravity times its scale. `None` where it does not fall.
+pub fn landing(speed: f32, elevation: f32, g: f32) -> Option<(f32, f32)> {
+    if g <= 0.0 {
+        return None;
+    }
+    let range = 2.0 * elevation * speed * speed / g;
+    let time = 2.0 * speed / g * (1.0 / elevation.cos() + elevation.tan()).ln();
+    Some((range, time))
+}
+
+#[cfg(test)]
+mod step_tests {
+    use super::*;
+
+    #[test]
+    fn a_round_without_gravity_flies_straight() {
+        let (at, v) = step(Vec3::ZERO, Vec3::new(0.0, 0.0, 30.0), 0.0, 9.0, 0.5);
+        assert_eq!(
+            (at, v),
+            (Vec3::new(0.0, 0.0, 15.0), Vec3::new(0.0, 0.0, 30.0))
+        );
+    }
+
+    /// A round keeps its speed, and lands where the closed form says.
+    #[test]
+    fn a_round_keeps_its_speed_and_lands_as_the_closed_form_says() {
+        let (speed, elev) = (20.0f32, 30f32.to_radians());
+        let mut at = Vec3::ZERO;
+        let mut v = Vec3::new(0.0, elev.sin(), elev.cos()) * speed;
+        let mut t = 0.0;
+        let dt = 1.0 / 600.0;
+        while at.y >= 0.0 || t == 0.0 {
+            (at, v) = step(at, v, 1.0, 9.0, dt);
+            t += dt;
+        }
+        assert!((v.length() - speed).abs() < 1e-3);
+        let (range, time) = landing(speed, elev, 9.0).unwrap();
+        assert!((at.z - range).abs() < 0.1, "{} vs {range}", at.z);
+        assert!((t - time).abs() < 0.01, "{t} vs {time}");
+    }
+
+    #[test]
+    fn a_long_tick_is_taken_in_sub_steps() {
+        let v = Vec3::new(0.0, 10.0, 10.0);
+        let (one, _) = step(Vec3::ZERO, v, 1.0, 9.0, 0.24);
+        let mut at = Vec3::ZERO;
+        let mut w = v;
+        for _ in 0..3 {
+            (at, w) = step(at, w, 1.0, 9.0, 0.08);
+        }
+        assert!((one - at).length() < 1e-4);
     }
 }

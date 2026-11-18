@@ -1546,6 +1546,9 @@ enum Projectile {
         /// A homing missile fired on a lock on her vehicle: its number
         /// for the scripts ([`crate::homing::ScriptSide`]).
         round: Option<u32>,
+        /// Its round's `GravityScale`: how much of the world's gravity
+        /// bends its path ([`m2_engine::ordnance::step`]).
+        gravity: f32,
     },
     Grenade {
         at: Vec3,
@@ -1561,6 +1564,11 @@ enum Projectile {
         velocity: Vec3,
         flown: f32,
         blast: Option<Blast>,
+        /// Its round's `GravityScale`, flown by the 360's ordnance step
+        /// ([`m2_engine::ordnance::step`]); `None` for a bomb let go from a
+        /// bay, which falls freely (inferred: the bay's `Bomb` template has
+        /// a scale of 0 and no speed, so the step would hold it still).
+        gravity: Option<f32>,
     },
     /// A thrown charge or mine: it sticks where it lands (C4) or lies
     /// there; C4 waits for the detonator (or its timer), a mine arms after
@@ -1759,9 +1767,9 @@ pub struct Combat {
     /// Every gun's shots' sound set and muzzle flash, by template (for
     /// the guns people carry, [`arm`](Self::arm)).
     feels: std::collections::HashMap<u32, Feel>,
-    /// Every gun's round's blast and `DamageKey`, by template (a tank
-    /// gun's shell, [`arm`](Self::arm)).
-    shells: std::collections::HashMap<u32, (Option<Blast>, Option<u32>)>,
+    /// Every gun's round's blast, `DamageKey` and `GravityScale`, by
+    /// template (a tank gun's shell, [`arm`](Self::arm)).
+    shells: std::collections::HashMap<u32, (Option<Blast>, Option<u32>, f32)>,
     /// Sounds made since the last call to [`take_sounds`](Self::take_sounds).
     sounds: Vec<Sound>,
     /// Wrecks smoke: (vehicle index, seconds to the next puff).
@@ -2536,7 +2544,7 @@ impl Combat {
         self.shells = arms
             .weapons
             .iter()
-            .map(|(&id, w)| (id, (w.ammo.burst(), w.ammo.key)))
+            .map(|(&id, w)| (id, (w.ammo.burst(), w.ammo.key, w.ammo.gravity)))
             .collect();
         if let Some(c) = arms.named("Carbine") {
             self.carbine = Rifle::from_spec(c);
@@ -3515,12 +3523,12 @@ impl Combat {
             m2_engine::weapons::Flight::Lobbed => {
                 let goal = Self::aim_point(f.physics, f.people, f.player, None);
                 let speed = ammo.velocity.max(1.0);
-                let velocity = lob_velocity(from, goal, speed, m2_engine::physics::WORLD_GRAVITY)
-                    .unwrap_or(aim * speed);
+                let velocity = lob_round(from, goal, speed, ammo.gravity).unwrap_or(aim * speed);
                 self.projectiles.push(Projectile::Round {
                     at: from,
                     velocity,
                     flown: 0.0,
+                    gravity: Some(ammo.gravity),
                     blast: ammo.burst(),
                 });
                 self.sounds.push(Sound::Lob {
@@ -3542,6 +3550,7 @@ impl Combat {
                     key: ammo.key,
                     army: false,
                     round: None,
+                    gravity: ammo.gravity,
                 });
                 self.effect(
                     Effect::Flash {
@@ -3900,6 +3909,7 @@ impl Combat {
             key: l.ammo.key,
             army: true,
             round,
+            gravity: l.ammo.gravity,
         });
         self.effect(
             Effect::Flash {
@@ -4317,6 +4327,7 @@ impl Combat {
             key: self.launcher.ammo.and_then(|a| a.key),
             army: false,
             round: None,
+            gravity: self.launcher.ammo.map_or(0.0, |a| a.gravity),
         });
         self.effect(
             Effect::Flash {
@@ -4370,14 +4381,15 @@ impl Combat {
         );
         let goal = cast_shot(f.physics, f.people, eye, dir, ROCKET_RANGE, None, None)
             .map_or(eye + dir * ROCKET_RANGE, |h| eye + dir * h.0);
-        let gravity = m2_engine::physics::WORLD_GRAVITY;
+        let scale = self.launcher.ammo.map_or(1.0, |a| a.gravity);
         let speed = self.launcher.speed(LOB_SPEED);
-        let velocity = lob_velocity(from, goal, speed, gravity)
-            .unwrap_or_else(|| farthest(goal - from, speed));
+        let velocity =
+            lob_round(from, goal, speed, scale).unwrap_or_else(|| farthest(goal - from, speed));
         self.projectiles.push(Projectile::Round {
             at: from,
             velocity,
             flown: 0.0,
+            gravity: Some(self.launcher.ammo.map_or(1.0, |a| a.gravity)),
             blast: self.launcher.blast(),
         });
         self.effect(
@@ -4414,6 +4426,7 @@ impl Combat {
             velocity: f.physics.vehicle_velocity(id),
             flown: 0.0,
             blast: bay.blast,
+            gravity: None,
         });
         eprintln!("bomb bay: bomb {} dropped at {at:.1}", self.bombs_dropped);
     }
@@ -4573,12 +4586,12 @@ impl Combat {
             }
             m2_engine::weapons::Flight::Lobbed => {
                 let speed = ammo.velocity.max(1.0);
-                let velocity = lob_velocity(from, goal, speed, m2_engine::physics::WORLD_GRAVITY)
-                    .unwrap_or(aim * speed);
+                let velocity = lob_round(from, goal, speed, ammo.gravity).unwrap_or(aim * speed);
                 self.projectiles.push(Projectile::Round {
                     at: from,
                     velocity,
                     flown: 0.0,
+                    gravity: Some(ammo.gravity),
                     blast: ammo.burst(),
                 });
                 self.sounds.push(Sound::Lob {
@@ -4614,6 +4627,7 @@ impl Combat {
                     key: ammo.key,
                     army: self.crew_firing,
                     round,
+                    gravity: ammo.gravity,
                 });
                 self.effect(
                     Effect::Flash {
@@ -5174,9 +5188,11 @@ impl Combat {
             let burn = gun.and_then(|g| g.flash).unwrap_or(CANNON_FLASH_TIME);
             // Its gun template's round's blast and kind (a tank shell's
             // explosion); without one, the alpha's own blast.
-            let (blast, key) = gun
+            // Its shell's `GravityScale` too (0 on the AMX-30's and the
+            // other cannon shells; 1 on the Blast Cannon's).
+            let (blast, key, gravity) = gun
                 .and_then(|g| self.shells.get(&g.weapon).copied())
-                .unwrap_or((None, None));
+                .unwrap_or((None, None, 0.0));
             // A main gun that is a TOW (the M2A3's) flies on its wire.
             let homing = tow_of(v, self.seat)
                 .and_then(|(_, h)| h)
@@ -5195,6 +5211,7 @@ impl Combat {
                 key,
                 army: self.crew_firing,
                 round: None,
+                gravity,
             });
             if let Some(v) = f.vehicles.get_mut(i) {
                 v.fired += 1;
@@ -6026,6 +6043,7 @@ impl Combat {
                 key,
                 army,
                 round: _,
+                gravity,
             } => {
                 // Turning after the vehicle it locked on, no faster than its
                 // turn rate; one gone, or too far off its nose, is lost and
@@ -6064,7 +6082,14 @@ impl Combat {
                         }
                     }
                 }
-                let step = *velocity * dt;
+                let (next, bent) = m2_engine::ordnance::step(
+                    *at,
+                    *velocity,
+                    *gravity,
+                    m2_engine::physics::WORLD_GRAVITY,
+                    dt,
+                );
+                let step = next - *at;
                 let len = step.length();
                 let hit = cast_shot(f.physics, f.people, *at, step, len, None, *owner);
                 if let Some((d, _)) = hit {
@@ -6081,6 +6106,7 @@ impl Combat {
                     puffs.push((*at, *velocity));
                 }
                 *at += step;
+                *velocity = bent;
                 *flown += len;
                 if *flown > ROCKET_RANGE {
                     if *army {
@@ -6096,9 +6122,26 @@ impl Combat {
                 velocity,
                 flown,
                 blast,
+                gravity,
             } => {
-                velocity.y -= m2_engine::physics::WORLD_GRAVITY * dt;
-                let step = *velocity * dt;
+                let (step, bent) = match *gravity {
+                    Some(scale) => {
+                        let (next, bent) = m2_engine::ordnance::step(
+                            *at,
+                            *velocity,
+                            scale,
+                            m2_engine::physics::WORLD_GRAVITY,
+                            dt,
+                        );
+                        (next - *at, bent)
+                    }
+                    None => {
+                        let mut v = *velocity;
+                        v.y -= m2_engine::physics::WORLD_GRAVITY * dt;
+                        (v * dt, v)
+                    }
+                };
+                *velocity = bent;
                 let len = step.length();
                 if let Some((d, _)) = cast_shot(f.physics, f.people, *at, step, len, None, None) {
                     blasts.push((*at + step.normalize_or_zero() * d, *blast, None));
@@ -6162,8 +6205,7 @@ impl Combat {
                 blast,
                 army,
             } => {
-                velocity.y -= m2_engine::physics::WORLD_GRAVITY * dt;
-                let step = *velocity * dt;
+                let step = grenade_move(velocity, dt);
                 if let Some((d, normal)) = f.physics.cast_ray(*at, step, step.length()) {
                     *at += step.normalize_or_zero() * (d - 0.05).max(0.0);
                     *velocity = (*velocity - normal * 2.0 * velocity.dot(normal)) * BOUNCE;
@@ -6948,13 +6990,67 @@ fn ground_under(physics: &Physics, at: Vec3) -> Option<Vec3> {
         .map(|(d, _)| from - Vec3::Y * d)
 }
 
-/// The velocity at `speed` that lobs a round from `from` down onto `to`
-/// under `gravity`: the lower of its two arcs, if it reaches.
-fn lob_velocity(from: Vec3, to: Vec3, speed: f32, gravity: f32) -> Option<Vec3> {
-    lob_velocities(from, to, speed, gravity).map(|(low, _)| low)
+/// The velocity at `speed` that lands a round of `GravityScale` `scale`
+/// from `from` on `to`, as the 360's ordnance step flies it
+/// ([`m2_engine::ordnance::step`]: its speed kept, its path bent by the
+/// world's gravity times the scale): the lower arc, found by halving the
+/// elevation's range; `None` where even 45 degrees up does not reach.
+/// A round of no scale is aimed straight at it.
+pub(crate) fn lob_round(from: Vec3, to: Vec3, speed: f32, scale: f32) -> Option<Vec3> {
+    let d = to - from;
+    let flat = d.with_y(0.0);
+    let x = flat.length();
+    if scale <= 0.0 || x < 1e-3 {
+        return Some(d.normalize_or(Vec3::NEG_Y) * speed);
+    }
+    let way = flat / x;
+    let aim = |up: f32| way * (speed * up.cos()) + Vec3::Y * (speed * up.sin());
+    // Its height above `from` where it has come `x` across, flown at the
+    // game's tick; `None` if it comes down past `d.y` short of that.
+    let height_at = |up: f32| -> Option<f32> {
+        const DT: f32 = 1.0 / 120.0;
+        let (mut at, mut v) = (Vec3::ZERO, aim(up));
+        for _ in 0..2400 {
+            let (next, bent) =
+                m2_engine::ordnance::step(at, v, scale, m2_engine::physics::WORLD_GRAVITY, DT);
+            let (a, b) = (at.dot(way), next.dot(way));
+            if b >= x {
+                let t = ((x - a) / (b - a).max(1e-6)).clamp(0.0, 1.0);
+                return Some(at.y + (next.y - at.y) * t);
+            }
+            if next.y < d.y - 50.0 || b < a {
+                return None;
+            }
+            (at, v) = (next, bent);
+        }
+        None
+    };
+    let (mut lo, mut hi) = (-1.2f32, std::f32::consts::FRAC_PI_4);
+    if height_at(hi).is_none_or(|h| h < d.y) {
+        return None;
+    }
+    for _ in 0..30 {
+        let mid = 0.5 * (lo + hi);
+        if height_at(mid).is_some_and(|h| h >= d.y) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    Some(aim(hi))
 }
 
-/// Both arcs at `speed` that lob a round from `from` down onto `to`
+/// A thrown grenade's move over `dt`: the world's gravity on its
+/// velocity, then that velocity's step. A grenade is a physics prop
+/// (`Grenade Projectile`: `_PropPhysics` 8 kg, no gravity scaler; from
+/// samples), falling under the world's gravity, not flown by the ordnance
+/// step (inferred from the data).
+pub(crate) fn grenade_move(velocity: &mut Vec3, dt: f32) -> Vec3 {
+    velocity.y -= m2_engine::physics::WORLD_GRAVITY * dt;
+    *velocity * dt
+}
+
+/// Both arcs at `speed` that lob a thrown thing from `from` down onto `to`
 /// under `gravity`, the lower first, if it reaches.
 fn lob_velocities(from: Vec3, to: Vec3, speed: f32, gravity: f32) -> Option<(Vec3, Vec3)> {
     let d = to - from;
@@ -8630,29 +8726,35 @@ mod tests {
     fn a_lobbed_round_comes_down_where_it_is_aimed() {
         let g = m2_engine::physics::WORLD_GRAVITY;
         let from = Vec3::new(0.0, 1.5, 0.0);
-        for to in [
-            Vec3::new(0.0, 0.0, 25.0),
-            Vec3::new(10.0, 4.0, 10.0),
-            Vec3::new(0.0, -6.0, 3.0),
-        ] {
-            let v = lob_velocity(from, to, LOB_SPEED, g).expect("in reach");
-            assert!((v.length() - LOB_SPEED).abs() < 1e-3);
-            // Flown in small steps, it passes within a hand of the mark.
-            let (mut at, mut vel, mut closest) = (from, v, f32::MAX);
-            for _ in 0..4000 {
-                vel.y -= g * 0.001;
-                at += vel * 0.001;
-                closest = closest.min(at.distance(to));
+        for scale in [1.0, 0.65] {
+            for to in [
+                Vec3::new(0.0, 0.0, 25.0),
+                Vec3::new(10.0, 4.0, 10.0),
+                Vec3::new(0.0, -6.0, 3.0),
+            ] {
+                let v = lob_round(from, to, LOB_SPEED, scale).expect("in reach");
+                assert!((v.length() - LOB_SPEED).abs() < 1e-3);
+                // Flown by the ordnance step, it passes within a hand of
+                // the mark.
+                let (mut at, mut vel, mut closest) = (from, v, f32::MAX);
+                for _ in 0..4000 {
+                    (at, vel) = m2_engine::ordnance::step(at, vel, scale, g, 0.001);
+                    closest = closest.min(at.distance(to));
+                }
+                assert!(closest < 0.15, "{scale} {to}: {closest}");
+                // The lower arc: no higher than it need be.
+                assert!(v.y < LOB_SPEED * 0.75, "{to}: {v}");
             }
-            assert!(closest < 0.1, "{to}: {closest}");
-            // The lower arc: no higher than it need be.
-            assert!(v.y < LOB_SPEED * 0.75, "{to}: {v}");
         }
-        // Beyond its reach (about 40 m on the level): nothing; then it is
-        // lobbed as far as it goes.
-        assert!(lob_velocity(from, Vec3::new(0.0, 0.0, 60.0), LOB_SPEED, g).is_none());
+        // Beyond its reach (pi/2 v^2/g, about 70 m on the level at 20 m/s):
+        // nothing; then it is lobbed as far as it goes.
+        assert!(lob_round(from, Vec3::new(0.0, 0.0, 90.0), LOB_SPEED, 1.0).is_none());
         let far = farthest(Vec3::Z * 60.0, LOB_SPEED);
         assert!((far.y - far.z).abs() < 1e-4 && far.x == 0.0);
+        // A round of no scale is aimed straight.
+        let to = Vec3::new(0.0, 0.0, 30.0);
+        let v = lob_round(from, to, LOB_SPEED, 0.0).unwrap();
+        assert!((v.normalize() - (to - from).normalize()).length() < 1e-5);
     }
 
     #[test]
