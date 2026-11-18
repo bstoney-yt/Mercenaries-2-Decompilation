@@ -5003,7 +5003,9 @@ fn blast_loose(world: &mut World, props: &mut Props, pushes: &[BlastPush], strik
                 .placed_bounds(e)
                 .map_or((p, p), |(at, bounds)| crate::props::box_around(at, bounds));
             let (velocity, spin) = push.throw(lo, hi, fudge(db, template));
-            props.knock(&mut world.physics, e, velocity, spin, strike);
+            if props.knock(&mut world.physics, e, velocity, spin, strike) {
+                props.blast_thrown(&mut world.physics, e);
+            }
         }
     }
 }

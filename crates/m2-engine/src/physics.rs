@@ -2274,11 +2274,12 @@ impl Character {
 /// through them.
 const RAGDOLL: r::Group = r::Group::GROUP_2;
 
-/// The collision group of loose pieces: they land on the world and people
-/// but not on each other (a broken prop's pieces start touching: boxes
-/// round them overlap), and vehicles drive through them (round 90's tank
-/// sat lifted on three pieces of what it had knocked down, two tracks off
-/// the ground).
+/// The collision group of loose pieces: they land on the world, people
+/// and vehicles' hulls (as the 360's loose objects meet everything), but
+/// not on each other (a broken prop's pieces start touching: boxes round
+/// them overlap). Round 90's tank once sat lifted on three pieces of what
+/// it had knocked down; that was with the pieces kept tumbling, not
+/// asleep.
 const DEBRIS: r::Group = r::Group::GROUP_3;
 
 /// The collision group of vehicles' hulls and turrets.
@@ -3358,9 +3359,6 @@ pub struct Physics {
     human_ragdoll: Option<std::sync::Arc<m2_assets::ragdoll::HumanRagdoll>>,
     /// Loose props' pieces, oldest first.
     debris: Vec<Option<r::RigidBodyHandle>>,
-    /// Loose pieces tumbling at once at most ([`MAX_DEBRIS`]; a benchmark
-    /// raises it, [`set_debris_cap`](Physics::set_debris_cap)).
-    debris_cap: usize,
     /// Props that are bodies of their own from the start
     /// ([`add_prop_body`](Self::add_prop_body)): each sleeps by the 360's
     /// rule ([`Rest`]), as a tank's body does.
@@ -3386,9 +3384,6 @@ pub struct Physics {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DebrisId(usize);
 
-/// Loose pieces tumbling at once at most: past this many the oldest are
-/// held where they lie.
-const MAX_DEBRIS: usize = 160;
 /// A loose piece this far down has fallen through the island (its ground
 /// streamed out) and is held.
 const DEBRIS_FLOOR: f32 = -500.0;
@@ -3443,7 +3438,6 @@ impl Physics {
             ragdolls: Vec::new(),
             human_ragdoll: None,
             debris: Vec::new(),
-            debris_cap: MAX_DEBRIS,
             prop_rest: HashMap::new(),
             prop_sleep: Vec::new(),
             last_step_ms: 0.0,
@@ -3916,10 +3910,11 @@ impl Physics {
         }
     }
 
-    /// Holds loose pieces fallen through the island, and the oldest past
-    /// [`MAX_DEBRIS`] still tumbling.
+    /// Holds loose pieces fallen through the island. The 360 holds no
+    /// count of them tumbling: what a blast throws is kept in check by
+    /// taking whole objects away ([`crate::disposer`]), and the rest
+    /// sleeps by the world's rule.
     fn settle_debris(&mut self) {
-        let mut tumbling = 0;
         for h in self.debris.iter().rev().flatten() {
             let Some(b) = self.world.bodies.get_mut(*h) else {
                 continue;
@@ -3927,8 +3922,7 @@ impl Physics {
             if !b.is_dynamic() {
                 continue;
             }
-            tumbling += 1;
-            if tumbling > self.debris_cap || b.translation().y < DEBRIS_FLOOR {
+            if b.translation().y < DEBRIS_FLOOR {
                 b.set_body_type(r::RigidBodyType::Fixed, false);
             }
         }
@@ -3985,7 +3979,7 @@ impl Physics {
             spin,
             r::InteractionGroups::new(
                 DEBRIS,
-                r::Group::ALL.difference(DEBRIS).difference(VEHICLE),
+                r::Group::ALL.difference(DEBRIS),
                 r::InteractionTestMode::And,
             ),
         );
@@ -4237,12 +4231,6 @@ impl Physics {
                     .is_some_and(|b| b.is_dynamic() && !b.is_sleeping())
             })
             .count()
-    }
-
-    /// How many loose pieces may tumble at once before the oldest are held
-    /// ([`MAX_DEBRIS`] by default).
-    pub fn set_debris_cap(&mut self, cap: usize) {
-        self.debris_cap = cap;
     }
 
     pub fn remove_debris(&mut self, id: DebrisId) {
@@ -11453,8 +11441,9 @@ mod tests {
         assert!(lamp.distance(Vec3::new(101.0, 1.1, 0.0)) < 1e-4, "{lamp}");
     }
 
+    // Was `vehicles_drive_through_loose_pieces` (invented, round 90).
     #[test]
-    fn vehicles_drive_through_loose_pieces() {
+    fn a_vehicles_hull_meets_loose_pieces() {
         let mut p = Physics::new();
         floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
         // A heavy beam lying across the way 10 m ahead, settled.
@@ -11491,14 +11480,14 @@ mod tests {
             p.step(DT);
             highest = highest.max(p.vehicle_transform(id).unwrap().w_axis.y);
         }
-        let at = p.vehicle_transform(id).unwrap().w_axis.truncate();
-        assert!(at.z > 16.0, "drove past the beam to {at}");
-        assert!(highest < rest + 0.1, "rode up from {rest} to {highest}");
-        // And the beam lies where it was.
+        // The hull meets it, as the 360's loose objects meet everything:
+        // the beam is shoved on or ridden over, not passed through.
         let beam_at = p.debris_place(d).unwrap().w_axis.truncate();
+        let shoved = beam_at.distance(Vec3::new(0.0, 0.3, 10.0));
         assert!(
-            beam_at.distance(Vec3::new(0.0, 0.3, 10.0)) < 0.2,
-            "{beam_at}"
+            shoved > 0.3 || highest > rest + 0.1,
+            "the beam moved {shoved} m, the car rose {} m",
+            highest - rest
         );
     }
 

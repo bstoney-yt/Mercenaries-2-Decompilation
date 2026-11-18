@@ -514,6 +514,9 @@ struct Options {
     /// `--prop-bodies-check`: props that come loose whole as bodies of
     /// their own from the start (gap P7, [`prop_bodies_check`]).
     prop_bodies_check: bool,
+    /// `--prop-limits-check`: what blasts throw, kept in check by the
+    /// disposer, and hulls meeting loose pieces ([`prop_limits_check`]).
+    prop_limits_check: bool,
     /// `--mine-check`: in the mission, the nearest placed mine is blasted
     /// by an RPG and, should it stand, run into by a jeep; logs
     /// `mine-check:` lines ([`mines::MineCheck`]).
@@ -901,6 +904,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--swim-check" => o.swim_check = true,
             "--prop-bodies-check" => {
                 o.prop_bodies_check = true;
+                o.drive = true;
+            }
+            "--prop-limits-check" => {
+                o.prop_limits_check = true;
                 o.drive = true;
             }
             "--mine-check" => {
@@ -7417,6 +7424,9 @@ fn drive_for_screenshot(
         prop_bodies_check(game, tick);
         return Ok(());
     }
+    if options.prop_limits_check {
+        return prop_limits_check(backend, game, fov, aspect, tick);
+    }
     if options.swim_check {
         swim_check(game, tick);
         return Ok(());
@@ -12149,4 +12159,142 @@ fn prop_bodies_check(game: &mut Game, tick: f32) {
             bodies.len()
         );
     }
+}
+
+/// `--prop-limits-check` (it turns on `--drive`; a town: `--spawn`): 5 s
+/// at rest, then a blast every half second for 20 s, each 8 m from the
+/// last round her in rings 15 to 60 m out, throwing what loose props are
+/// there (the disposer takes each, [`m2_engine::disposer`]). Logs how many
+/// the blasts threw, the most the disposer held at once and how many it
+/// took away, and the physics step's median and worst milliseconds. Then
+/// the car she drives is put 12 m short of the nearest piece still lying
+/// knocked loose, facing it, and driven at it for 4 s (hulls meet loose
+/// pieces now): how far the piece moved. `prop-limits-check: PASS` when
+/// over 40 were thrown, the disposer never held over 40, it took away at
+/// least one, and the car moved the piece over half a metre; else `FAIL`.
+fn prop_limits_check(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    tick: f32,
+) -> anyhow::Result<()> {
+    use m2_math::glam::{Vec2, Vec3};
+    let mut ms = Vec::new();
+    let mut step = |game: &mut Game, intent: Intent, ms: &mut Vec<f32>| -> anyhow::Result<()> {
+        game.step(intent, tick);
+        render(backend, game, fov, aspect, None)?;
+        if let Some(w) = game.scene.world.as_ref() {
+            ms.push(w.physics.last_step_ms);
+        }
+        Ok(())
+    };
+    for _ in 0..(5.0 / tick) as u32 {
+        step(game, Intent::default(), &mut ms)?;
+    }
+    ms.clear();
+    let centre = game.focus();
+    let (mut most, mut disposed) = (0, 0);
+    let every = (0.5 / tick).round().max(1.0) as u32;
+    for i in 0..(20.0 / tick) as u32 {
+        if i % every == 0 {
+            // Rings 15, 30, 45 and 60 m out, 8 m between blasts.
+            let n = i / every;
+            let ring = 15.0 * (1 + n % 4) as f32;
+            let turn = n as f32 * 8.0 / ring;
+            let at = centre + Vec3::new(turn.cos(), 0.0, turn.sin()) * ring;
+            let ground = game.scene.world.as_ref().and_then(|w| {
+                let top = at + Vec3::Y * 200.0;
+                w.physics
+                    .cast_ray(top, Vec3::NEG_Y, 400.0)
+                    .map(|(t, _)| top - Vec3::Y * t)
+            });
+            game.combat.set_off(ground.unwrap_or(at), None);
+        }
+        step(game, Intent::default(), &mut ms)?;
+        most = most.max(game.scene.props.disposer_held());
+        disposed += game.scene.props.take_disposed().len();
+    }
+    ms.sort_by(f32::total_cmp);
+    let thrown = game.scene.props.blast_thrown_count();
+    let (median, worst) = (
+        ms.get(ms.len() / 2).copied().unwrap_or(0.0),
+        ms.last().copied().unwrap_or(0.0),
+    );
+    eprintln!(
+        "prop-limits-check: 40 blasts threw {thrown} props; the disposer held at most {most}, \
+         took {disposed} away; physics step median {median:.2} ms, worst {worst:.2} ms"
+    );
+    // The car at the nearest piece lying loose.
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("prop-limits-check: FAIL she drives nothing");
+        return Ok(());
+    };
+    let Some(world) = game.scene.world.as_ref() else {
+        eprintln!("prop-limits-check: FAIL no island");
+        return Ok(());
+    };
+    let here = game.scene.vehicles[i]
+        .id
+        .and_then(|c| world.physics.vehicle_transform(c))
+        .map_or(centre, |m| m.w_axis.truncate());
+    let target = game
+        .scene
+        .props
+        .knocked_pieces()
+        .into_iter()
+        .filter_map(|id| Some((id, world.physics.debris_place(id)?.w_axis.truncate())))
+        .min_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)));
+    let Some((id, at)) = target else {
+        eprintln!("prop-limits-check: FAIL no piece lies knocked loose");
+        return Ok(());
+    };
+    let way = (at - here).with_y(0.0).normalize_or(Vec3::Z);
+    let start = at - way * 12.0;
+    let yaw = way.x.atan2(way.z);
+    if let Some(world) = game.scene.world.as_mut() {
+        let v = &mut game.scene.vehicles[i];
+        if let Some(old) = v.id.take() {
+            world.physics.remove_vehicle(old);
+        }
+        v.id = Some(
+            world
+                .physics
+                .add_vehicle(&v.spec, start + Vec3::Y * 0.5, yaw),
+        );
+    }
+    let Some(car) = game.scene.vehicles[i].id else {
+        return Ok(());
+    };
+    for _ in 0..(4.0 / tick) as u32 {
+        let speed = game
+            .scene
+            .world
+            .as_ref()
+            .map_or(0.0, |w| w.physics.vehicle_speed(car));
+        let intent = Intent {
+            movement: Vec2::new(0.0, if speed < 12.0 { 1.0 } else { 0.0 }),
+            ..Intent::default()
+        };
+        step(game, intent, &mut ms)?;
+    }
+    let moved = game
+        .scene
+        .world
+        .as_ref()
+        .and_then(|w| w.physics.debris_place(id))
+        .map_or(0.0, |m| m.w_axis.truncate().distance(at));
+    eprintln!(
+        "prop-limits-check: the {} driven at a piece lying loose: it moved {moved:.1} m",
+        game.scene.vehicles[i].spec.label
+    );
+    if thrown > 40 && most <= 40 && disposed > 0 && moved > 0.5 {
+        eprintln!("prop-limits-check: PASS");
+    } else {
+        eprintln!(
+            "prop-limits-check: FAIL thrown {thrown}, held at most {most}, took away {disposed}, \
+             the piece moved {moved:.1} m"
+        );
+    }
+    Ok(())
 }

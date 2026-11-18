@@ -206,6 +206,17 @@ pub struct Props {
     /// Wrecked since [`take_fallen`](Self::take_fallen): what falls with
     /// them is brought down too (`DestructionLink`).
     fallen: Vec<u32>,
+    /// What blasts threw, kept in check: past the 360's 40 the lightest
+    /// is taken away ([`m2_engine::disposer`]).
+    disposer: m2_engine::disposer::Disposer,
+    /// Seconds played ([`advance`](Self::advance)), and the eye's last
+    /// place ([`update`](Self::update)): what the disposer weighs by.
+    clock: f32,
+    eye: Vec3,
+    /// Taken away by the disposer since last asked.
+    disposed: Vec<u32>,
+    /// How many props blasts have thrown.
+    thrown: usize,
 }
 
 /// Which parts of a prop are broken ([`m2_engine::ModelParts`]), and the
@@ -941,6 +952,81 @@ impl Props {
     }
 
     fn wreck_by(&mut self, physics: &mut Physics, entity: u32, hit: Hit) -> bool {
+        let broke = self.wreck_hit(physics, entity, hit);
+        if broke && matches!(hit, Hit::Blast(..)) {
+            self.blast_thrown(physics, entity);
+        }
+        broke
+    }
+
+    /// A blast threw `entity` (broke it apart, or knocked it loose): it
+    /// goes to the disposer as the 360's blast puts every object it
+    /// pushes there (0x82289F40 -> 0x82246A08, [`m2_engine::disposer`]).
+    /// One the disposer takes away to make room is hidden, its pieces
+    /// gone.
+    pub fn blast_thrown(&mut self, physics: &mut Physics, entity: u32) {
+        self.thrown += 1;
+        let seen = self.seen(physics, entity).unwrap_or(0.0);
+        match self.disposer.admit(entity, self.clock, seen) {
+            m2_engine::disposer::Admit::Disposing(old) => {
+                eprintln!(
+                    "props: the disposer takes {old:#x} away for {entity:#x} ({} held)",
+                    self.disposer.len()
+                );
+                self.hide(physics, [old]);
+                self.disposed.push(old);
+            }
+            m2_engine::disposer::Admit::Refused => {}
+            m2_engine::disposer::Admit::Taken => {}
+        }
+    }
+
+    /// How big `entity` looks from the eye ([`m2_engine::disposer::seen_size`]):
+    /// its first loose piece's place (where it was, if none) and half its
+    /// model's box. `None` once it is gone.
+    fn seen(&self, physics: &Physics, entity: u32) -> Option<f32> {
+        let p = self.shown.get(&entity)?;
+        let m = self.models.get(&p.model)?.as_ref()?;
+        let (lo, hi) = m.gpu.bounds;
+        let first = self
+            .knocked
+            .get(&entity)
+            .or_else(|| self.broken.get(&entity))
+            .and_then(|v| v.first().copied());
+        let at = first
+            .and_then(|d| physics.debris_place(d))
+            .map_or(p.position, |m| m.w_axis.truncate());
+        Some(m2_engine::disposer::seen_size(
+            (hi - lo).length() * 0.5,
+            at.distance(self.eye),
+        ))
+    }
+
+    /// Those the disposer took away since last asked.
+    pub fn take_disposed(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.disposed)
+    }
+
+    /// How many the disposer holds.
+    pub fn disposer_held(&self) -> usize {
+        self.disposer.len()
+    }
+
+    /// How many props blasts have thrown ([`blast_thrown`](Self::blast_thrown)).
+    pub fn blast_thrown_count(&self) -> usize {
+        self.thrown
+    }
+
+    /// Every piece lying knocked loose (not a body from the start).
+    pub fn knocked_pieces(&self) -> Vec<DebrisId> {
+        self.knocked
+            .iter()
+            .filter(|(e, _)| !self.as_body.contains(e))
+            .flat_map(|(_, v)| v.iter().copied())
+            .collect()
+    }
+
+    fn wreck_hit(&mut self, physics: &mut Physics, entity: u32, hit: Hit) -> bool {
         // Its box in the world, for a blast's push on it whole.
         let whole = self
             .placed_bounds(entity)
@@ -1549,6 +1635,14 @@ impl Props {
         reach: f32,
     ) -> anyhow::Result<()> {
         self.reach = reach;
+        // The disposer weighs what it holds again.
+        self.eye = focus;
+        let seen: HashMap<u32, f32> = self
+            .disposer
+            .keys()
+            .filter_map(|e| Some((e, self.seen(physics, e)?)))
+            .collect();
+        self.disposer.update(self.clock, |e| seen.get(&e).copied());
         // Gates swung open: their collision with their leaves open; one
         // whose model came in without a hinge stops swinging.
         let mut unhinged = Vec::new();
@@ -1857,6 +1951,7 @@ impl Props {
 
     /// Moves on `dt` seconds: what breaks apart sinks.
     pub fn advance(&mut self, dt: f32) {
+        self.clock += dt;
         for a in self.material_anims.values_mut() {
             a.advance(dt);
         }
