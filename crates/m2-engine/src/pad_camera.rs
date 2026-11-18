@@ -511,9 +511,11 @@ pub const CAR_LOOK_FADE: f32 = 0.5;
 /// From the 360 code: a yaw input over [`CAR_YAW_THRESHOLD`] sets the look
 /// timer (+0x63C) to the preset's `YawResetTime` plus [`CAR_LOOK_FADE`];
 /// with none it runs down while the car goes faster than 2 m/s
-/// (0x820C77A4), or while it is over the fade (parked, it stops there:
-/// the look stays). While it runs the follow heading (+0x624) is the way
-/// the car goes; once it is out, a spring pulls the follow heading there
+/// (0x820C77A4), or while it is over the fade (parked it stalls a step
+/// inside it: the 360's log, 0.47). The follow heading's target is the way
+/// the car goes once it moves over 1 m/s (0x820BAEE8), else the view's own
+/// heading (0x824C0040), so parked the look stays. While the timer runs
+/// the follow heading is its target; once it is out, a spring pulls it there
 /// (velocity += strength * the turn left - dampening * velocity, heading +=
 /// velocity * dt, angles wrapped). The view's yaw is the follow heading
 /// plus its own turn from it times the timer over the fade, clamped to 1,
@@ -524,9 +526,7 @@ pub const CAR_LOOK_FADE: f32 = 0.5;
 /// **Inferred**: the spring stepped 30 times a second (the 360 steps it
 /// once an update, its velocity's change not scaled by the time), the
 /// fade's compounding taken a step of ours at a time (the 360's an update),
-/// the parked countdown stopping at the fade itself (the 360's last step
-/// can land under it, which compounding would turn into a drift; the 360
-/// shows none parked in 5 s), and the
+/// and the
 /// way the car goes its heading (the 360's target turns to face back
 /// while reversing, +0x644, not ported); the air time that softens the
 /// spring (+0x640) taken as none.
@@ -561,22 +561,23 @@ impl CarFollow {
         }
         if held {
             self.timer = p.yaw_reset_time + CAR_LOOK_FADE;
-        } else if speed.abs() > 2.0 {
+        } else if speed.abs() > 2.0 || self.timer > CAR_LOOK_FADE {
             self.timer = (self.timer - dt).max(0.0);
-        } else if self.timer > CAR_LOOK_FADE {
-            // Parked it runs down to the fade and stops there (the 360's
-            // step can land a little under it; see the inferences).
-            self.timer = (self.timer - dt).max(CAR_LOOK_FADE);
         }
+        // What the follow heading goes to (0x824C0040): the way the car
+        // goes once it moves over 1 m/s, else the view's own heading, so
+        // parked (the timer stalled a step inside the fade) nothing pulls
+        // the view.
+        let target = if speed.abs() > 1.0 { heading } else { yaw };
         if self.timer > 1e-4 {
             self.velocity = 0.0;
-            self.follow = heading;
+            self.follow = target;
         } else {
             const STEP: f32 = 1.0 / 30.0;
             self.carry += dt;
             while self.carry >= STEP {
                 self.carry -= STEP;
-                let off = wrap(heading - self.follow);
+                let off = wrap(target - self.follow);
                 self.velocity += p.spring_strength * off - p.spring_dampening * self.velocity;
                 self.follow = wrap(self.follow + self.velocity * STEP);
             }
@@ -678,12 +679,26 @@ mod tests {
         assert!(mid < 1.2 && mid > 0.3, "{mid}");
         let end = at(0.4, &mut yaw, &mut f);
         assert!(end.abs() < 1e-3, "{end}");
-        // Parked, the look stays.
+        // The swing starts as the timer enters the fade, 2 s after the
+        // stick (the 360's log: 2.10 s).
+        let mut f = CarFollow::default();
+        let mut yaw = f.step(&p, 1.5, 0.0, 10.0, true, dt);
+        for _ in 0..119 {
+            yaw = f.step(&p, yaw, 0.0, 10.0, false, dt);
+        }
+        assert!((yaw - 1.5).abs() < 1e-4, "{yaw} {}", f.timer);
+        for _ in 0..3 {
+            yaw = f.step(&p, yaw, 0.0, 10.0, false, dt);
+        }
+        assert!(yaw < 1.45, "{yaw}");
+        // Parked: the timer stalls a step inside the fade (the 360's 0.47)
+        // and, its follow heading the view's own, the look stays 12 s on.
         let mut f = CarFollow::default();
         let mut yaw = f.step(&p, 1.5, 0.0, 0.0, true, dt);
-        for _ in 0..600 {
+        for _ in 0..720 {
             yaw = f.step(&p, yaw, 0.0, 0.0, false, dt);
         }
+        assert!(f.timer < CAR_LOOK_FADE && f.timer > 0.45, "{}", f.timer);
         assert!((yaw - 1.5).abs() < 1e-4, "{yaw}");
         // The car turns: the follow heading's spring catches up.
         let mut f = CarFollow::default();
