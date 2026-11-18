@@ -964,6 +964,27 @@ impl Player {
         self.floor_gone = false;
     }
 
+    /// Out of a vehicle into the air (a ditch or toss, 0x822A1B70): at
+    /// `at` (0.5 m over her exit's place, [`m2_engine::seats::DITCH_RISE`])
+    /// going at `velocity` ([`m2_engine::seats::ditch_velocity`]), off the
+    /// ground in her `Jump` (`InAir`), to land as from a jump
+    /// (`JumpLandStationary` or `JumpLandMoving`). Unlike
+    /// [`drop_at`](Self::drop_at) she is not put down on what is under her
+    /// first: the world is already in under her.
+    pub fn launch(&mut self, at: Vec3, velocity: Vec3) {
+        self.character.position = at;
+        self.character.velocity = velocity;
+        self.character.grounded = false;
+        self.ground = Vec2::ZERO;
+        self.run_stop = RunStop::default();
+        self.leap = Leap::Air(0.0);
+        self.air_looped = true;
+        if let (Some((_, rig)), Some(air)) = (&mut self.model, self.clips.jump) {
+            rig.animator
+                .play_action(air, false, m2_engine::blend::action::JUMP);
+        }
+    }
+
     /// The floor she stands on was taken down (a state layer went): she
     /// stays where she is until the layers' models coming in have loaded
     /// (at most [`LAND_WAIT`]), then lands on the floor nearest under her.

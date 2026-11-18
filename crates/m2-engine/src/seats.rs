@@ -681,6 +681,10 @@ pub fn clear_points(centre: Vec3, yaw: f32, radius: f32) -> [Vec3; 8] {
     })
 }
 
+/// How far over her exit's place she is put as she ditches out, m: up
+/// 0.5 (0x822A1B70: the world's up, 0x82B5E578, times 0x82B7C118).
+pub const DITCH_RISE: f32 = 0.5;
+
 /// Her speed as she ditches out (0x822A1B70): 2 m/s along the vehicle's
 /// way of travel, 1.5 up and 1.5 out through the exit (`out`, from the
 /// vehicle towards her).

@@ -6157,13 +6157,18 @@ pub(crate) fn get_out(
         use m2_engine::seats::ExitKind;
         let velocity = physics.vehicle_velocity(id);
         let (kind, place) = exit_plan(physics, v, seat, at, velocity);
-        // At the hull's height: onto the ground by the door, not onto a
-        // boulder or roof over it.
-        player.drop_at(place);
         if matches!(kind, ExitKind::Ditch | ExitKind::Toss) {
+            // Ditching (0x822A1B70): half a metre over the exit's place,
+            // pushed off, in the air: she lands as from a jump.
             let out = place - at.transform_point3(Vec3::ZERO);
-            player.character.velocity =
-                m2_engine::seats::ditch_velocity(velocity, Vec3::new(out.x, 0.0, out.z));
+            player.launch(
+                place + Vec3::Y * m2_engine::seats::DITCH_RISE,
+                m2_engine::seats::ditch_velocity(velocity, Vec3::new(out.x, 0.0, out.z)),
+            );
+        } else {
+            // At the hull's height: onto the ground by the door, not onto
+            // a boulder or roof over it.
+            player.drop_at(place);
         }
         let f = at.transform_vector3(Vec3::Z);
         player.facing = f.x.atan2(f.z);
