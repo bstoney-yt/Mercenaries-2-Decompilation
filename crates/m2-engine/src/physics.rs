@@ -8233,6 +8233,112 @@ mod tests {
         }
     }
 
+    /// A hip, a thigh on a ragdoll joint and a shin on a knee, as the
+    /// game's ragdoll asset gives them, bound standing along -y.
+    fn leg_doll() -> m2_assets::ragdoll::HumanRagdoll {
+        use m2_assets::ragdoll::{BoneShape, HumanRagdoll, JointLimits, RagdollBone, RagdollJoint};
+        let bone = |hash: u32, parent: Option<usize>, mass: f32, y: f32| RagdollBone {
+            node: hash - 0x100,
+            node_hash: hash,
+            parent,
+            mass,
+            centre_of_mass: [0.0, -0.2, 0.0],
+            friction: 0.3,
+            angular_damping: 0.3,
+            shape: Some(BoneShape::Capsule {
+                radius: 0.1,
+                a: [0.0, -0.05, 0.0],
+                b: [0.0, -0.35, 0.0],
+            }),
+            shape_place: ([0.0; 3], [0.0, 0.0, 0.0, 1.0]),
+            bind: Mat4::from_translation(Vec3::new(0.0, y, 0.0)).to_cols_array(),
+        };
+        HumanRagdoll {
+            bones: vec![
+                bone(0x101, None, 19.2, 1.0),
+                bone(0x102, Some(0), 8.9, 0.9),
+                bone(0x103, Some(1), 17.4, 0.5),
+            ],
+            joints: vec![
+                RagdollJoint {
+                    bone: 1,
+                    other: 0,
+                    pivot: [0.0; 3],
+                    friction: 0.0,
+                    limits: JointLimits::Ragdoll {
+                        axes: [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0]],
+                        twist: (-15.0, 15.0),
+                        cone: (-60.0, 60.0),
+                        plane: (-30.0, 15.0),
+                    },
+                },
+                RagdollJoint {
+                    bone: 2,
+                    other: 1,
+                    pivot: [0.0; 3],
+                    friction: 0.0,
+                    limits: JointLimits::Hinge {
+                        axis: [1.0, 0.0, 0.0],
+                        min: -110.0,
+                        max: 0.0,
+                        limited: true,
+                    },
+                },
+            ],
+        }
+    }
+
+    /// The game's ragdoll is built with the asset's masses and limits on
+    /// the skeleton's nodes of the same names, and falls in one piece; a
+    /// skeleton without its bones, or a world without the asset, goes
+    /// limp on its own bones instead.
+    #[test]
+    fn the_games_ragdoll_keeps_its_masses_and_limits() {
+        let doll = leg_doll();
+        let mut p = ready();
+        // A root, then the leg's three nodes, 2 m up.
+        let hashes = [0x100, 0x101, 0x102, 0x103];
+        let parents = [None, Some(0), Some(1), Some(2)];
+        let nodes: Vec<Mat4> = [2.2, 2.0, 1.9, 1.5]
+            .iter()
+            .map(|&y| Mat4::from_translation(Vec3::new(0.0, y, 0.0)))
+            .collect();
+        // Without the asset: the skeleton's own build, no limits.
+        let own = p.add_ragdoll_named(&hashes, &parents, &nodes, Vec3::ZERO);
+        assert_eq!(p.ragdoll_joint_limits(own), Some(Vec::new()));
+        p.remove_ragdoll(own);
+        p.set_human_ragdoll(std::sync::Arc::new(doll.clone()));
+        // Pushed over: balanced on end, a stiff leg would stand.
+        let id = p.add_ragdoll_named(&hashes, &parents, &nodes, Vec3::new(1.5, 0.0, 0.0));
+        let masses = p.ragdoll_masses(id).unwrap();
+        assert_eq!(masses.iter().map(|m| m.0).collect::<Vec<_>>(), [1, 2, 3]);
+        let total: f32 = masses.iter().map(|m| m.1).sum();
+        assert!((total - doll.mass()).abs() < 1e-3, "{total}");
+        assert!((masses[2].1 - 17.4).abs() < 1e-3);
+        let r = |v: f32| v.to_radians();
+        let limits = p.ragdoll_joint_limits(id).unwrap();
+        let near = |a: Option<[f32; 2]>, b: [f32; 2]| {
+            a.is_some_and(|a| (a[0] - b[0]).abs() < 1e-5 && (a[1] - b[1]).abs() < 1e-5)
+        };
+        assert!(near(limits[0][0], [r(-15.0), r(15.0)]), "{limits:?}");
+        assert!(near(limits[0][1], [r(-30.0), r(15.0)]), "{limits:?}");
+        assert!(near(limits[0][2], [r(-60.0), r(60.0)]), "{limits:?}");
+        assert!(near(limits[1][0], [r(-110.0), 0.0]), "{limits:?}");
+        assert_eq!((limits[1][1], limits[1][2]), (None, None));
+        for _ in 0..240 {
+            p.step(DT);
+        }
+        let now = p.ragdoll_nodes(id).unwrap();
+        for m in &now[1..] {
+            assert!(m.w_axis.y > -0.1 && m.w_axis.y < 0.6, "{}", m.w_axis);
+        }
+        assert!(now[1].w_axis.distance(now[2].w_axis) < 0.3);
+        assert!(now[2].w_axis.distance(now[3].w_axis) < 0.6);
+        // A skeleton without the shin's node: its own build.
+        let short = p.add_ragdoll_named(&hashes[..3], &parents[..3], &nodes[..3], Vec3::ZERO);
+        assert_eq!(p.ragdoll_joint_limits(short), Some(Vec::new()));
+    }
+
     #[test]
     fn ragdolls_fall_to_the_ground_and_rays_pass_them() {
         let mut p = ready();
