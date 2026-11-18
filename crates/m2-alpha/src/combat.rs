@@ -1781,8 +1781,10 @@ pub struct Combat {
     /// with, where known.
     pub last_blast: Option<Vec3>,
     pub last_push: Option<m2_engine::durability::BlastPush>,
-    /// Where blasts went off in the last step.
-    pub went_off: Vec<Vec3>,
+    /// Where blasts went off in the last step, and which explosion
+    /// template each was, where known: what it wears down of the world is
+    /// as its own `DamageKey` says (`crate::game::hit_world`).
+    pub went_off: Vec<(Vec3, Option<Blasted>)>,
     /// The island's explosives whose models enter a state this step, to
     /// show what it starts: (placed object, state name hash).
     pub explosive_states: Vec<(usize, u32)>,
@@ -6306,7 +6308,7 @@ impl Combat {
     fn burst(&mut self, at: Vec3, size: f32, of: Option<Blasted>) {
         self.blasts += 1;
         self.last_blast = Some(at);
-        self.went_off.push(at);
+        self.went_off.push((at, of));
         self.sounds.push(Sound::Explosion { at, of });
         self.effect(
             Effect::Fire {
@@ -6593,20 +6595,26 @@ impl Combat {
     pub fn bomb(&mut self, f: &mut Field<'_>, at: Vec3) {
         self.blasts += 1;
         self.last_blast = Some(at);
-        self.went_off.push(at);
+        self.went_off.push((at, Some(Blasted::Named(fx::BOMB))));
         self.sounds.push(Sound::Bomb {
             at,
             of: Some(Blasted::Named(fx::BOMB)),
         });
         let hers = self.hero_damage;
-        self.harm(f, at, BOMB, false, (hers.explosion_large, "ExplosionLarge"));
+        self.harm(
+            f,
+            at,
+            BOMB,
+            false,
+            (hers.explosion_large, m2_assets::name_hash("ExplosionLarge")),
+        );
         self.show_fx(fx::BOMB, at);
         self.harm(
             f,
             at + Vec3::Y,
             BOMB_FRAG,
             true,
-            (hers.bullet_large, "BulletLarge"),
+            (hers.bullet_large, m2_assets::name_hash("BulletLarge")),
         );
         self.effect(
             Effect::Fire {
@@ -6666,20 +6674,20 @@ impl Combat {
         at: Vec3,
         radius: f32,
         damage: f32,
-        template: Option<u32>,
+        (template, key): (Option<u32>, u32),
     ) {
         let of = template.map(Blasted::Id);
         self.blasts += 1;
         self.last_blast = Some(at);
-        self.went_off.push(at);
+        self.went_off.push((at, of));
         self.sounds.push(if radius >= BOMB.0 {
             Sound::Bomb { at, of }
         } else {
             Sound::Explosion { at, of }
         });
-        // The strikes' ordnance keys aren't read yet: an `Explosion`.
-        let hers = self.hero_damage.explosion;
-        self.harm(f, at, (radius, damage), false, (hers, "Explosion"));
+        // Of its own column (the template's `DamageKey`, 0x82291640).
+        let hers = self.hers(key);
+        self.harm(f, at, (radius, damage), false, (hers, key));
         self.show_fx(
             if radius >= BOMB.0 {
                 fx::BOMB
@@ -6722,26 +6730,56 @@ impl Combat {
         at: Vec3,
         radius: f32,
         damage: f32,
-        template: u32,
+        (template, key): (u32, u32),
     ) {
         self.sounds.push(Sound::Frag {
             at,
             of: Blasted::Id(template),
         });
-        // Frag, as the satellite bomb's: a `BulletLarge`.
-        let hers = self.hero_damage.bullet_large;
-        self.harm(f, at, (radius, damage), false, (hers, "BulletLarge"));
+        self.went_off.push((at, Some(Blasted::Id(template))));
+        // Of its own column (the template's `DamageKey`: the strikes'
+        // frag a `BulletLarge`).
+        let hers = self.hers(key);
+        self.harm(f, at, (radius, damage), false, (hers, key));
+    }
+
+    /// What she takes of damage of `DamageKey` `key` (0 for none): her
+    /// row of the damage table, as [`HeroDamage`] has it for the kinds it
+    /// keeps, else the table's own cell (0x823987D0, a column the table
+    /// lacks finding its first), else an `Explosion`'s.
+    pub fn hers(&self, key: u32) -> f32 {
+        let h = self.hero_damage;
+        let key = if key == 0 {
+            m2_engine::tuning::DEFAULT_DAMAGE_KEY
+        } else {
+            key
+        };
+        match key {
+            k if k == m2_assets::name_hash("Explosion") => h.explosion,
+            k if k == m2_assets::name_hash("ExplosionLarge") => h.explosion_large,
+            k if k == m2_assets::name_hash("BulletLarge") => h.bullet_large,
+            k => self
+                .damage_table
+                .as_ref()
+                .map_or(h.explosion, |t| t.cell(m2_assets::name_hash("Hero"), k)),
+        }
     }
 
     /// The bomb's final strike at `at`, after it lands.
     pub fn final_strike(&mut self, f: &mut Field<'_>, at: Vec3) {
-        self.went_off.push(at);
+        self.went_off.push((at, Some(Blasted::Named(fx::FINAL))));
         self.sounds.push(Sound::Explosion {
             at,
             of: Some(Blasted::Named(fx::FINAL)),
         });
         let hers = self.hero_damage.explosion_large;
-        self.harm(f, at, BOMB_FINAL, false, (hers, "ExplosionLarge"));
+        self.harm(
+            f,
+            at,
+            BOMB_FINAL,
+            false,
+            (hers, m2_assets::name_hash("ExplosionLarge")),
+        );
         self.show_fx(fx::FINAL, at);
         self.effect(
             Effect::Fire {
@@ -6767,9 +6805,13 @@ impl Combat {
         at: Vec3,
         (radius, damage): (f32, f32),
         cover: bool,
-        (hers, key): (f32, &str),
+        (hers, key): (f32, u32),
     ) {
-        let key = Some(m2_assets::name_hash(key));
+        let key = Some(if key == 0 {
+            m2_engine::tuning::DEFAULT_DAMAGE_KEY
+        } else {
+            key
+        });
         let physics: &Physics = f.physics;
         let shielded = |to: Vec3| {
             let way = to - at;

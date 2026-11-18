@@ -506,6 +506,10 @@ struct Options {
     /// swim her forward walking, at her pace and sprinting, logging how
     /// fast she goes (`swim-check:` lines).
     swim_check: bool,
+    /// `--blast-check`: a few explosions' columns and damage against the
+    /// nearest prop that wears, and the first that breaks it set off
+    /// (`blast-check:` lines, [`blast_check`]).
+    blast_check: bool,
     /// With `--board`: the entrance she stands at, by name or hash
     /// (`entrance_driver`, `8efe45f3`); else the front right one.
     entrance: Option<u32>,
@@ -884,6 +888,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--seated" => o.seated = true,
             "--board" => o.board = true,
             "--swim-check" => o.swim_check = true,
+            "--blast-check" => {
+                o.blast_check = true;
+                o.drive = true;
+            }
             "--ladder-check" => {
                 o.ladder_check = Some(
                     value()?
@@ -7328,6 +7336,10 @@ fn drive_for_screenshot(
         }
         return board_for_check(game, options, tick);
     }
+    if options.blast_check {
+        blast_check(game, tick);
+        return Ok(());
+    }
     if options.swim_check {
         swim_check(game, tick);
         return Ok(());
@@ -8275,6 +8287,115 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 /// `--swim-check`: she is put in the nearest water over 4 m deep (looked
 /// for in rings out to 600 m) and swims forward for 4 s walking, at her
 /// pace and sprinting, through the game's tick; logs her speed each time.
+/// The explosions `--blast-check` tries, each of its own `DamageKey`.
+const BLAST_CHECK_KINDS: [&str; 8] = [
+    "Explosion (Handheld RPG)",
+    "Explosion (Hand Grenade)",
+    "Explosion (Hand Grenade Frag)",
+    "Explosion (AT Mine)",
+    "Explosion (Airstike Bomb)",
+    "Explosion (Bunker Buster Stage 2)",
+    "Explosion (Fuel Air Bomb)",
+    "global_particle_explosion_vehicle_air",
+];
+
+/// `--blast-check` (it turns on `--drive`): once the world round her has
+/// streamed in (3 s), the nearest state layer prop with `Health` that
+/// some of [`BLAST_CHECK_KINDS`] would break and some not is the target.
+/// For each, logs its column (`DamageKey`), the target row's cell for it
+/// ([`destruct::blast_cell`]), its damage 1 m off the target's box and
+/// whether that wears its health through. Then the first that breaks it
+/// (not the RPG, an RPG's by name) goes off 1 m from it through the
+/// world's own wear ([`Game::hit_world_with`]): `blast-check: PASS` once
+/// the prop is down, else `FAIL`.
+fn blast_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::Vec3;
+    for _ in 0..(3.0 / tick) as u32 {
+        game.step(Intent::default(), tick);
+    }
+    let here = game.focus();
+    let Some(world) = game.scene.world.as_ref() else {
+        eprintln!("blast-check: FAIL no world");
+        return;
+    };
+    let db = &world.index.template_db;
+    let kinds: Vec<(&str, u32, m2_engine::durability::Explosion)> = BLAST_CHECK_KINDS
+        .iter()
+        .filter_map(|n| {
+            let id = db.id(n)?;
+            Some((*n, id, *db.explosions.get(&id)?))
+        })
+        .collect();
+    let props = &game.scene.props;
+    let mut candidates: Vec<(u32, Vec3, f32, u32, f32)> = props
+        .shown()
+        .filter(|(_, p)| !p.wrecked)
+        .filter_map(|(e, p)| {
+            let health = db
+                .durability
+                .get(&p.template)
+                .filter(|d| !d.invincible)?
+                .health;
+            let (at, (lo, hi)) = props.placed_bounds(e)?;
+            let centre = at.transform_point3((lo + hi) * 0.5);
+            (health > 0.0).then_some((e, centre, (hi - lo).length() * 0.5, p.template, health))
+        })
+        .collect();
+    candidates.sort_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)));
+    // 1 m from its box, as the wear measures it (`Destruction::blast`).
+    let wear = |template: u32, e: &m2_engine::durability::Explosion| {
+        let cell = destruct::blast_cell(db, template, e.kind);
+        let damage = m2_engine::durability::blast_damage(e.damage, e.least, e.radius, 1.0);
+        (cell, damage, damage * cell)
+    };
+    let pick = candidates.into_iter().find(|&(_, _, _, t, health)| {
+        let breaks = |k: &(&str, u32, m2_engine::durability::Explosion)| wear(t, &k.2).2 >= health;
+        kinds.iter().any(breaks) && !kinds.iter().all(breaks)
+    });
+    let Some((e, centre, half, template, health)) = pick else {
+        eprintln!("blast-check: FAIL no prop near {here:.0} that only some of the blasts break");
+        return;
+    };
+    eprintln!(
+        "blast-check: target {e:#x} ({}) at {centre:.1}, row {:08x}, {health} health",
+        db.names.get(&template).map_or("?", String::as_str),
+        db.modifiers
+            .get(&template)
+            .copied()
+            .unwrap_or(m2_engine::tuning::DEFAULT_DAMAGE_KEY)
+    );
+    let mut first = None;
+    for (name, id, ex) in &kinds {
+        let (cell, damage, worn) = wear(template, ex);
+        let breaks = worn >= health;
+        eprintln!(
+            "blast-check: {name}: column {:08x}, cell {cell}, {damage:.0} damage 1 m off,              {worn:.1} worn: {}",
+            ex.kind,
+            if breaks { "breaks it" } else { "it stands" }
+        );
+        let rocket = name.contains("RPG");
+        if breaks && !rocket && first.is_none() {
+            first = Some((*name, *id));
+        }
+    }
+    let Some((name, id)) = first else {
+        eprintln!("blast-check: FAIL only the RPG's blast breaks it");
+        return;
+    };
+    let from = centre + Vec3::X * (half + 1.0);
+    game.hit_world_with(Vec::new(), vec![(from, Some(combat::Blasted::Id(id)))]);
+    for _ in 0..(0.5 / tick) as u32 {
+        game.step(Intent::default(), tick);
+    }
+    let props = &game.scene.props;
+    let down = props.get(e).is_none_or(|(p, _)| p.wrecked) || props.knocked_loose(e).is_some();
+    if down {
+        eprintln!("blast-check: PASS {name} set off 1 m from it brought it down");
+    } else {
+        eprintln!("blast-check: FAIL {name} set off 1 m from it left it standing");
+    }
+}
+
 fn swim_check(game: &mut Game, tick: f32) {
     use m2_math::glam::{Vec2, Vec3};
     let here = game.focus();

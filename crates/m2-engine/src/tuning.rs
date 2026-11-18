@@ -1333,6 +1333,11 @@ impl KeyTable {
     }
 }
 
+/// The `DamageKey` an entity without one has (0x82398FC0 returns it
+/// where the entity has no `DamageKey` component): the damage table's
+/// first row and first column.
+pub const DEFAULT_DAMAGE_KEY: u32 = 0xed05_7225;
+
 /// The damage table's asset type.
 pub const DAMAGE_TABLE_TYPE: u32 = 0xde98_2d61;
 /// The damage table's asset name.
@@ -1371,6 +1376,19 @@ impl DamageTable {
         let r = self.rows.iter().position(|&k| k == target)?;
         let c = self.columns.iter().position(|&k| k == damage)?;
         self.cells.get(r * self.columns.len() + c).copied()
+    }
+
+    /// The cell as the 360's lookup finds it (0x823987D0): row `target`
+    /// by column `damage`, a key the table lacks finding its first row or
+    /// column (the table's first row and column are
+    /// [`DEFAULT_DAMAGE_KEY`]'s). 0 for an empty table.
+    pub fn cell(&self, target: u32, damage: u32) -> f32 {
+        let r = self.rows.iter().position(|&k| k == target).unwrap_or(0);
+        let c = self.columns.iter().position(|&k| k == damage).unwrap_or(0);
+        self.cells
+            .get(r * self.columns.len() + c)
+            .copied()
+            .unwrap_or(0.0)
     }
 
     /// Its targets' keys (rows) and its damage kinds' keys (columns).
@@ -2305,6 +2323,24 @@ pub fn cover_hints(db: &Layer<'_>) -> HashMap<u32, Vec<crate::ai_cover::Hint>> {
 
 #[cfg(test)]
 mod tests {
+
+    // The 360's damage lookup: a row or column the table lacks finds its
+    // first (the default key's), where `scale` finds none.
+    #[test]
+    fn the_damage_cell_falls_back_to_the_first_row_and_column() {
+        let d = super::DEFAULT_DAMAGE_KEY;
+        let t = super::DamageTable {
+            rows: vec![d, 0xa],
+            columns: vec![d, 0xc],
+            cells: vec![1.0, 0.5, 0.25, 2.0],
+        };
+        assert_eq!(t.cell(0xa, 0xc), 2.0);
+        assert_eq!(t.cell(0xa, 0x99), 0.25);
+        assert_eq!(t.cell(0x99, 0xc), 0.5);
+        assert_eq!(t.cell(0x99, 0x99), 1.0);
+        assert_eq!(t.scale(0x99, 0xc), None);
+        assert_eq!(super::DamageTable::default().cell(0xa, 0xc), 0.0);
+    }
 
     #[test]
     fn a_key_table_finds_its_cell_and_either_way_round() {

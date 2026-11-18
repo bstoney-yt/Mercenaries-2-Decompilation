@@ -107,23 +107,14 @@ impl Makeup {
     }
 
     /// What blasts doing `damage` of kind `kind` each (a `DamageKey`'s
-    /// name hash; 0 taken in full) do to template `t`'s objects, all
-    /// told: each as much as its `ModifierKey` row of the damage table
-    /// takes of that kind (none without a row).
+    /// name hash; 0 for none) do to template `t`'s objects, all told:
+    /// each as much as the damage table's cell for its row and the
+    /// blast's column, as the world is worn
+    /// ([`crate::destruct::blast_cell`]).
     pub fn blasted(templates: &Templates, t: u32, blasts: &[(f32, u32)]) -> f32 {
-        let row = templates.modifiers.get(&t).copied();
         blasts
             .iter()
-            .map(|&(damage, kind)| {
-                let scale = match kind {
-                    0 => 1.0,
-                    _ => row
-                        .zip(templates.damage.as_ref())
-                        .and_then(|(r, d)| d.scale(r, kind))
-                        .unwrap_or(0.0),
-                };
-                damage * scale
-            })
+            .map(|&(damage, kind)| damage * crate::destruct::blast_cell(templates, t, kind))
             .sum()
     }
 
@@ -554,7 +545,7 @@ pub fn check(
                 }
                 HitKind::Blast => {
                     let at = centre - forward * (half + BLAST_OFF);
-                    game.hit_world_with(Vec::new(), vec![at.with_y(floor + 0.3)]);
+                    game.hit_world_with(Vec::new(), vec![(at.with_y(floor + 0.3), None)]);
                 }
             }
             run(game, SETTLE);
