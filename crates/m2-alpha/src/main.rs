@@ -865,7 +865,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--seated" => o.seated = true,
             "--board" => o.board = true,
             "--swim-check" => o.swim_check = true,
-            "--cargo-check" => o.cargo_check = true,
+            "--cargo-check" => {
+                o.cargo_check = true;
+                o.drive = true;
+            }
             "--ladder-check" => {
                 o.ladder_check = Some(
                     value()?
