@@ -7613,6 +7613,7 @@ pub(crate) mod tests {
                 homing: None,
                 model: None,
                 sticky: false,
+                noise: None,
             },
             feel: Default::default(),
         }

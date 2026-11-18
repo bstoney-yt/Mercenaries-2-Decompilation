@@ -10081,6 +10081,7 @@ mod tests {
                 homing: None,
                 model: None,
                 sticky: false,
+                noise: None,
             },
             lock_on: None,
             seeker: None,

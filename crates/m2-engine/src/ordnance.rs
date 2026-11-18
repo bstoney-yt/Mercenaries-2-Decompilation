@@ -11,7 +11,7 @@
 //! falls at 80 m/s and leaves "Explosion (Cluster Bomb)" (5 m, 160
 //! damage, at least 50 within reach, with a grenade's frag).
 
-use m2_math::glam::Vec3;
+use m2_math::glam::{Quat, Vec3};
 use std::collections::HashMap;
 
 use m2_assets::{Layer, name_hash};
@@ -49,6 +49,8 @@ pub struct ProjectileInfo {
     /// `TriggerOnTimer`: it goes off this long after it is made (seconds),
     /// leaving `TimerResponse`'s template, if any.
     pub timer: Option<(f32, Option<u32>)>,
+    /// `FlightNoise`: how it wobbles ([`FlightNoise`]).
+    pub noise: Option<FlightNoise>,
 }
 
 /// An explosion's reach and force.
@@ -136,6 +138,7 @@ pub fn read(db: &Layer<'_>) -> Ordnance {
     let explosive = Table::new(db, "Explosive");
     let shake = Table::new(db, "CameraShake");
     let link = Table::new(db, "PhysicalLink");
+    let noise = Table::new(db, "FlightNoise");
     let nonzero = |v: Option<u32>| v.filter(|&v| v != 0);
     let timer = |id: u32| -> Option<(f32, Option<u32>)> {
         let r = trigger.of_template(id).first()?;
@@ -172,6 +175,7 @@ pub fn read(db: &Layer<'_>) -> Ordnance {
                         .filter_map(|r| nonzero(spawn.word(r, SPAWNS)))
                         .collect(),
                     timer: timer(id),
+                    noise: FlightNoise::of(&noise, id),
                 },
             ))
         })
@@ -292,6 +296,165 @@ pub fn step(at: Vec3, velocity: Vec3, scale: f32, gravity: f32, dt: f32) -> (Vec
     (at, heading * speed)
 }
 
+/// `FlightNoise`'s last field (name unknown; 1 on every record): whether
+/// the wobble is drawn afresh each sub-step (`true`) or a fixed turn
+/// drawn once at launch.
+const NOISE_RANDOM: u32 = 0x448d_0a0d;
+
+/// A round's `FlightNoise`: how far it wobbles off its line.
+///
+/// From the 360 code: a projectile template with a `FlightNoise` record
+/// (table 0x836529C0) is launched with flag 0x4000000 (0x822980C8) and a
+/// wobble record (0x82298208), which its ordnance step turns it by every
+/// sub-step (0x82295DF0). Field names from the 360's strings: `Pitch`,
+/// `Yaw`, `Roll` (degrees; 0x82298208 multiplies them by π/180),
+/// `Damping`, `CrouchModifier` (the angles' multiplier when the firer's
+/// +0x414 is 1, read as crouched). PC data: AT Missile 15°, Dumb Rocket
+/// 60°, RPG Rocket 20° (CrouchModifier 0.5), Vehicle AA Missile 90°,
+/// Rocket 30°, Fuel Air Trail 30°, AA Missile 120°, each the same on all
+/// three axes, Damping 0 to 5.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FlightNoise {
+    /// `Pitch`, `Yaw`, `Roll`, radians.
+    pub angles: Vec3,
+    pub damping: f32,
+    pub crouch: f32,
+    /// [`NOISE_RANDOM`].
+    pub random: bool,
+}
+
+impl FlightNoise {
+    /// The `FlightNoise` record of template `id`, if it has one.
+    pub(crate) fn of(table: &Table<'_>, id: u32) -> Option<Self> {
+        let r = *table.of_template(id).first()?;
+        let f = |n: &str| table.float(r, name_hash(n)).unwrap_or(0.0);
+        Some(Self {
+            angles: Vec3::new(f("Pitch"), f("Yaw"), f("Roll")) * std::f32::consts::PI / 180.0,
+            damping: f("Damping"),
+            crouch: table.float(r, name_hash("CrouchModifier")).unwrap_or(1.0),
+            random: table.word(r, NOISE_RANDOM).is_some_and(|w| w != 0),
+        })
+    }
+}
+
+/// A launched round's wobble (0x82298208's record in table 0x836563DC):
+/// its noise's angles, its turn so far, and the round's own orientation,
+/// which the wobble turns (+Z forward; world up kept by a round that
+/// falls, as 0x822879D0 faces it along its path each sub-step).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Wobble {
+    pub angles: Vec3,
+    pub damping: f32,
+    pub random: bool,
+    /// Its turn so far (radians about its own x, y, z).
+    pub offset: Vec3,
+    pub facing: Quat,
+}
+
+/// A rotation facing +Z along `heading`, world up kept.
+fn facing_along(heading: Vec3) -> Quat {
+    let f = heading.normalize_or(Vec3::Z);
+    let right = Vec3::Y.cross(f);
+    if right.length_squared() < 1e-8 {
+        return Quat::from_rotation_arc(Vec3::Z, f);
+    }
+    let right = right.normalize();
+    Quat::from_mat3(&m2_math::glam::Mat3::from_cols(right, f.cross(right), f))
+}
+
+/// Three numbers each in [-1, 1) from `rand` (uniform in [0, 1)): the
+/// 360's random vector (0x8215E160, (u - 0.5) x 2 each).
+fn random_vector(rand: &mut impl FnMut() -> f32) -> Vec3 {
+    let mut c = || (rand() - 0.5) * 2.0;
+    Vec3::new(c(), c(), c())
+}
+
+impl Wobble {
+    /// The wobble a round of `noise` starts with, heading along
+    /// `heading`, from a firer `crouched` or not (0x82298208): its angles
+    /// times `CrouchModifier` if crouched; one drawn afresh each sub-step
+    /// starts with no turn, a fixed one with a random half of its angles.
+    pub fn launch(
+        noise: FlightNoise,
+        heading: Vec3,
+        crouched: bool,
+        rand: &mut impl FnMut() -> f32,
+    ) -> Self {
+        let angles = if crouched {
+            noise.angles * noise.crouch
+        } else {
+            noise.angles
+        };
+        let offset = if noise.random {
+            Vec3::ZERO
+        } else {
+            random_vector(rand) * 0.5 * angles
+        };
+        Self {
+            angles,
+            damping: noise.damping,
+            random: noise.random,
+            offset,
+            facing: facing_along(heading),
+        }
+    }
+
+    /// Its turn for a sub-step of `s` seconds (0x82295DF0): a fixed one
+    /// turns by its offset each sub-step; a random one draws a target of
+    /// its angles times a random vector times half the sub-step, turns by
+    /// that less its offset's distance from it times `Damping` times the
+    /// sub-step (clamped to ±1), and adds the turn to its offset.
+    fn turn(&mut self, s: f32, rand: &mut impl FnMut() -> f32) -> Vec3 {
+        if !self.random {
+            return self.offset;
+        }
+        let target = self.angles * random_vector(rand) * (s * 0.5);
+        let k = (self.damping * s).clamp(-1.0, 1.0);
+        let d = target - (self.offset - target) * k;
+        self.offset += d;
+        d
+    }
+}
+
+/// [`step`], for a round that wobbles: each sub-step it first turns by
+/// its wobble ([`Wobble`]; about its own x, then y, then z, 0x82854680),
+/// then flies on along where it now faces (0x82295DF0).
+pub fn step_wobbling(
+    at: Vec3,
+    velocity: Vec3,
+    scale: f32,
+    gravity: f32,
+    dt: f32,
+    wobble: &mut Wobble,
+    rand: &mut impl FnMut() -> f32,
+) -> (Vec3, Vec3) {
+    let speed = velocity.length();
+    if speed <= 0.0 {
+        return (at + velocity * dt, velocity);
+    }
+    let mut at = at;
+    let mut left = dt;
+    while left > 0.0 {
+        let s = left.min(SUB_STEP);
+        let d = wobble.turn(s, rand);
+        wobble.facing = (wobble.facing
+            * Quat::from_rotation_x(d.x)
+            * Quat::from_rotation_y(d.y)
+            * Quat::from_rotation_z(d.z))
+        .normalize();
+        let heading = wobble.facing * Vec3::Z;
+        if scale == 0.0 {
+            at += heading * speed * s;
+        } else {
+            let v = heading * speed - Vec3::Y * (gravity * scale * s);
+            at += v * s;
+            wobble.facing = facing_along(v);
+        }
+        left -= s;
+    }
+    (at, (wobble.facing * Vec3::Z) * speed)
+}
+
 /// Where a round fired at `speed` and `elevation` (radians, above level)
 /// lands back at its own height, by the 360's step ([`step`]) taken
 /// continuously: it keeps its speed and turns at `g cos(theta) / speed`,
@@ -348,5 +511,61 @@ mod step_tests {
             (at, w) = step(at, w, 1.0, 9.0, 0.08);
         }
         assert!((one - at).length() < 1e-4);
+    }
+}
+
+#[cfg(test)]
+mod wobble_tests {
+    use super::*;
+
+    fn rng(mut seed: u64) -> impl FnMut() -> f32 {
+        move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / (1u64 << 24) as f32
+        }
+    }
+
+    fn noise(degrees: f32, damping: f32) -> FlightNoise {
+        FlightNoise {
+            angles: Vec3::splat(degrees.to_radians()),
+            damping,
+            crouch: 0.5,
+            random: true,
+        }
+    }
+
+    /// With no angles a wobbling round flies as the plain step has it.
+    #[test]
+    fn a_still_wobble_flies_as_the_plain_step() {
+        let v = Vec3::new(0.0, 5.0, 25.0);
+        let mut r = rng(7);
+        let mut w = Wobble::launch(noise(0.0, 5.0), v, false, &mut r);
+        let (a, b) = step_wobbling(Vec3::ZERO, v, 1.0, 9.0, 0.5, &mut w, &mut r);
+        let (c, d) = step(Vec3::ZERO, v, 1.0, 9.0, 0.5);
+        assert!(
+            (a - c).length() < 1e-3 && (b - d).length() < 1e-3,
+            "{a} {c}"
+        );
+    }
+
+    /// The RPG's 20 degrees: it keeps its speed and strays off its line,
+    /// a little, not round; crouched, its angles are halved.
+    #[test]
+    fn a_wobbling_rocket_keeps_its_speed_and_strays_a_little() {
+        let v = Vec3::new(0.0, 0.0, 25.0);
+        let mut r = rng(11);
+        let mut w = Wobble::launch(noise(20.0, 0.0), v, false, &mut r);
+        let (mut at, mut vel) = (Vec3::ZERO, v);
+        for _ in 0..60 {
+            (at, vel) = step_wobbling(at, vel, 0.0, 9.0, 1.0 / 30.0, &mut w, &mut r);
+        }
+        assert!((vel.length() - 25.0).abs() < 1e-3);
+        let off = at.with_z(0.0).length();
+        assert!(off > 0.01 && off < 10.0, "{at}");
+        assert!(at.z > 40.0, "{at}");
+        let c = Wobble::launch(noise(20.0, 0.0), v, true, &mut r);
+        assert!((c.angles.x - 10f32.to_radians()).abs() < 1e-6);
     }
 }

@@ -1549,6 +1549,10 @@ enum Projectile {
         /// Its round's `GravityScale`: how much of the world's gravity
         /// bends its path ([`m2_engine::ordnance::step`]).
         gravity: f32,
+        /// Its round's `FlightNoise`, and the wobble it flies with once
+        /// launched ([`m2_engine::ordnance::step_wobbling`]).
+        noise: Option<m2_engine::ordnance::FlightNoise>,
+        wobble: Option<m2_engine::ordnance::Wobble>,
     },
     Grenade {
         at: Vec3,
@@ -3551,6 +3555,8 @@ impl Combat {
                     army: false,
                     round: None,
                     gravity: ammo.gravity,
+                    noise: ammo.noise,
+                    wobble: None,
                 });
                 self.effect(
                     Effect::Flash {
@@ -3910,6 +3916,8 @@ impl Combat {
             army: true,
             round,
             gravity: l.ammo.gravity,
+            noise: l.ammo.noise,
+            wobble: None,
         });
         self.effect(
             Effect::Flash {
@@ -4328,6 +4336,8 @@ impl Combat {
             army: false,
             round: None,
             gravity: self.launcher.ammo.map_or(0.0, |a| a.gravity),
+            noise: self.launcher.ammo.and_then(|a| a.noise),
+            wobble: None,
         });
         self.effect(
             Effect::Flash {
@@ -4628,6 +4638,8 @@ impl Combat {
                     army: self.crew_firing,
                     round,
                     gravity: ammo.gravity,
+                    noise: ammo.noise,
+                    wobble: None,
                 });
                 self.effect(
                     Effect::Flash {
@@ -5212,6 +5224,8 @@ impl Combat {
                 army: self.crew_firing,
                 round: None,
                 gravity,
+                noise: None,
+                wobble: None,
             });
             if let Some(v) = f.vehicles.get_mut(i) {
                 v.fired += 1;
@@ -6031,6 +6045,7 @@ impl Combat {
             )
             .collect();
         let wires = self.wires.clone();
+        let mut seed = self.seed;
         self.projectiles.retain_mut(|p| match p {
             Projectile::Rocket {
                 at,
@@ -6044,6 +6059,8 @@ impl Combat {
                 army,
                 round: _,
                 gravity,
+                noise,
+                wobble,
             } => {
                 // Turning after the vehicle it locked on, no faster than its
                 // turn rate; one gone, or too far off its nose, is lost and
@@ -6082,13 +6099,35 @@ impl Combat {
                         }
                     }
                 }
-                let (next, bent) = m2_engine::ordnance::step(
-                    *at,
-                    *velocity,
-                    *gravity,
-                    m2_engine::physics::WORLD_GRAVITY,
-                    dt,
-                );
+                // A round with a `FlightNoise` wobbles as it flies, its
+                // wobble drawn at its first step (its firer's stance is
+                // not passed: never crouched).
+                if let (Some(n), None) = (*noise, &wobble) {
+                    *wobble = Some(m2_engine::ordnance::Wobble::launch(
+                        n,
+                        *velocity,
+                        false,
+                        &mut || unit_random(&mut seed),
+                    ));
+                }
+                let (next, bent) = match wobble {
+                    Some(w) => m2_engine::ordnance::step_wobbling(
+                        *at,
+                        *velocity,
+                        *gravity,
+                        m2_engine::physics::WORLD_GRAVITY,
+                        dt,
+                        w,
+                        &mut || unit_random(&mut seed),
+                    ),
+                    None => m2_engine::ordnance::step(
+                        *at,
+                        *velocity,
+                        *gravity,
+                        m2_engine::physics::WORLD_GRAVITY,
+                        dt,
+                    ),
+                };
                 let step = next - *at;
                 let len = step.length();
                 let hit = cast_shot(f.physics, f.people, *at, step, len, None, *owner);
@@ -6223,6 +6262,7 @@ impl Combat {
                 true
             }
         });
+        self.seed = seed;
         for (k, (at, velocity)) in puffs.into_iter().enumerate() {
             self.effect(Effect::Smoke { at, size: 0.4 }, 0.8);
             // Rockets have no id: the k-th in flight (one at a time, as a
@@ -7038,6 +7078,15 @@ pub(crate) fn lob_round(from: Vec3, to: Vec3, speed: f32, scale: f32) -> Option<
         }
     }
     Some(aim(hi))
+}
+
+/// The next of [`Combat`]'s random numbers from `seed`, in [0, 1) (as
+/// `Combat::random`, shifted up by a half).
+fn unit_random(seed: &mut u64) -> f32 {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 7;
+    *seed ^= *seed << 17;
+    (*seed >> 40) as f32 / (1u64 << 24) as f32
 }
 
 /// A thrown grenade's move over `dt`: the world's gravity on its
@@ -8861,6 +8910,7 @@ mod tests {
             homing: None,
             model: None,
             sticky: false,
+            noise: None,
         };
         let mut combat = Combat {
             carbine: Rifle {
