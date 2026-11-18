@@ -2341,16 +2341,9 @@ fn follow(
                 over = true;
             }
             // A missed press shakes her pad (`Pg.Rumble(hijacker, s)`).
-            HijackCommand::Rumble {
-                guid,
-                strength,
-                seconds,
-            } if guid == a.hero => {
-                eprintln!("hijack: pad shakes {strength:.2} for {seconds:.1} s");
-                game.rumble = game.rumble.with(crate::game::Rumble {
-                    strength,
-                    seconds: f64::from(seconds),
-                });
+            HijackCommand::Rumble { guid, seconds } if guid == a.hero => {
+                eprintln!("hijack: pad shakes {seconds:.1} s");
+                game.rumble.push(f64::from(seconds));
             }
             _ => {}
         }

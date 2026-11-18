@@ -148,7 +148,7 @@ impl RideHijack {
         });
         let (going, rumble) = self.step(mission, commands, alongside);
         if let Some(r) = rumble {
-            game.rumble = game.rumble.with(r);
+            game.rumble.push(r);
         }
         going
     }
@@ -161,7 +161,7 @@ impl RideHijack {
         mission: &mut Mission,
         commands: &[Command],
         alongside: Option<f64>,
-    ) -> (bool, Option<crate::game::Rumble>) {
+    ) -> (bool, Option<f64>) {
         let now = mission.now();
         let mut over = false;
         let mut rumble = None;
@@ -190,16 +190,9 @@ impl RideHijack {
                     );
                     over = true;
                 }
-                Command::Hijack(HijackCommand::Rumble {
-                    guid,
-                    strength,
-                    seconds,
-                }) if *guid == PLAYER => {
-                    eprintln!("hijack: pad shakes {strength:.2} for {seconds:.1} s");
-                    rumble = Some(crate::game::Rumble {
-                        strength: *strength,
-                        seconds: f64::from(*seconds),
-                    });
+                Command::Hijack(HijackCommand::Rumble { guid, seconds }) if *guid == PLAYER => {
+                    eprintln!("hijack: pad shakes {seconds:.1} s");
+                    rumble = Some(f64::from(*seconds));
                 }
                 _ => {}
             }

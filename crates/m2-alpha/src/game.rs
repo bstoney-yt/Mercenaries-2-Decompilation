@@ -333,9 +333,9 @@ pub struct Game {
     kicks: Vec<(m2_engine::VehicleId, String, f32, f32)>,
     /// Her vehicle disguise ([`crate::disguise`]).
     pub disguise: crate::disguise::Disguise,
-    /// How hard and how many seconds her pad is asked to shake (the
-    /// rumble queue: `Pg.Rumble`, a fall's impact), for the pad to take.
-    pub rumble: Rumble,
+    /// The shakes her pad is asked for (the rumble queue: `Pg.Rumble`, a
+    /// fall's impact), each its seconds, for the pad to take.
+    pub rumble: Vec<f64>,
     /// Keyed actions the scripts asked for (`Human.DoAction`: the player's
     /// verify photo `VerifyCamera`), each with its seconds left, ended for the
     /// scripts' `HumanActionComplete` ([`crate::mission`]).
@@ -452,30 +452,11 @@ fn own_explosives(combat: &mut Combat, explosives: Vec<(String, u32)>) {
     }
 }
 
-/// A fall's shake of her pad: light, heavy and deadly strengths
-/// (0x820BB49C, 0.5 at 0x820D9EDC, 1.0 at 0x820BAEE8), for 1 s (0x82205F20).
-pub const FALL_RUMBLE: [f32; 3] = [0.15, 0.5, 1.0];
-pub const FALL_RUMBLE_SECONDS: f64 = 1.0;
-
-/// A shake of her pad: how hard (0 to 1) and for how many seconds. From
-/// the 360 code: the rumble queue's record (0x82206860, at 0x8322E820) is
-/// who, strength and seconds; `Pg.Rumble` sends it (0x82338D70) and so
-/// does a fall's impact (0x82205F20: 0.15, 0.5 or 1.0 for 1 s).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Rumble {
-    pub strength: f32,
-    pub seconds: f64,
-}
-
-impl Rumble {
-    /// This and `other` together: the stronger and the longer.
-    pub fn with(self, other: Rumble) -> Rumble {
-        Rumble {
-            strength: self.strength.max(other.strength),
-            seconds: self.seconds.max(other.seconds),
-        }
-    }
-}
+/// A fall's shake of her pad, seconds: light, heavy and deadly (0.15 at
+/// 0x820BB49C, 0.5 at 0x820D9EDC, 1.0 at 0x820BAEE8; 0x82205F20 sends
+/// them to the rumble queue, whose reader takes them as the shake's
+/// length, 0x8226F070).
+pub const FALL_RUMBLE: [f64; 3] = [0.15, 0.5, 1.0];
 
 impl Game {
     pub fn new(scene: Scene, camera: FlyCamera) -> Self {
@@ -605,7 +586,7 @@ impl Game {
             kicks: Vec::new(),
             semi_gain: crate::config::SEMI_ENGINE_GAIN,
             disguise: crate::disguise::Disguise::default(),
-            rumble: Rumble::default(),
+            rumble: Vec::new(),
             actions: Vec::new(),
             scripts_seated: false,
         }
@@ -1734,18 +1715,14 @@ impl Game {
                         } else {
                             player.update(physics, intent, dt);
                         }
-                        // A fall that hurt her shakes her pad: 0.15 light,
-                        // 0.5 heavy, 1.0 deadly, for 1 s (0x82205F20 sends
+                        // A fall that hurt her shakes her pad: for 0.15 s
+                        // light, 0.5 s heavy, 1 s deadly (0x82205F20 sends
                         // it to the rumble queue before the damage).
                         if let Some(fell) = &player.fell {
-                            let strength = match fell.impact {
+                            self.rumble.push(match fell.impact {
                                 Some(m2_engine::on_foot::FallImpact::Light) => FALL_RUMBLE[0],
                                 Some(m2_engine::on_foot::FallImpact::Heavy) => FALL_RUMBLE[1],
                                 None => FALL_RUMBLE[2],
-                            };
-                            self.rumble = self.rumble.with(Rumble {
-                                strength,
-                                seconds: FALL_RUMBLE_SECONDS,
                             });
                         }
                         if let Some(m) = &mut self.combat.manned
