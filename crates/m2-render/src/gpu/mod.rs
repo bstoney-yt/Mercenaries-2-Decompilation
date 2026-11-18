@@ -16,7 +16,6 @@
 //! Clean-room. Written against wgpu's public API and general rendering
 //! practice; nothing here comes from the original executable.
 
-mod fasthash;
 mod post;
 mod shader;
 mod shadow;
@@ -24,7 +23,7 @@ pub mod timer;
 
 use std::collections::HashMap;
 
-use fasthash::FastMap;
+use crate::fasthash::FastMap;
 
 use ::wgpu::util::DeviceExt;
 use m2_math::glam::{Mat4, Vec3};
@@ -185,7 +184,11 @@ struct VertexBuffer {
     desc: VertexBufferDesc,
     /// Its layout's number among the backend's ([`Layouts`]).
     layout: LayoutId,
-    buffer: wgpu::Buffer,
+    /// Where its vertices are: a range of a shared page ([`Pool`]).
+    range: Range,
+    /// Its first vertex's number in the page (its offset over its
+    /// stride), added to every draw's vertices.
+    base_vertex: u32,
     /// A sphere around its positions (object space), for shadow culling;
     /// `None` when unknown (casts everywhere).
     bounds: Option<(Vec3, f32)>,
@@ -194,10 +197,173 @@ struct VertexBuffer {
 #[derive(Debug)]
 struct IndexBuffer {
     desc: IndexBufferDesc,
-    buffer: wgpu::Buffer,
+    /// Where its indices are: a range of a shared page ([`Pool`]).
+    range: Range,
+    /// Its first index's number in the page, added to every draw's.
+    first_index: u32,
     /// CPU copy, so writes not aligned to 4 bytes (odd runs of 16-bit
     /// indices) can be widened to an aligned upload.
     shadow: Vec<u8>,
+}
+
+/// Bytes in a page of a [`Pool`] (a buffer bigger than this has a page
+/// of its own).
+const PAGE_BYTES: u64 = 16 << 20;
+
+/// The free byte ranges of one page, taken first fit and merged again as
+/// they come back.
+#[derive(Debug, Clone, PartialEq)]
+struct FreeRanges {
+    size: u64,
+    /// (offset, length), by offset, none touching.
+    free: Vec<(u64, u64)>,
+}
+
+impl FreeRanges {
+    fn new(size: u64) -> Self {
+        Self {
+            size,
+            free: vec![(0, size)],
+        }
+    }
+
+    /// The offset of `len` free bytes starting at a multiple of `align`.
+    fn take(&mut self, len: u64, align: u64) -> Option<u64> {
+        for i in 0..self.free.len() {
+            let (at, n) = self.free[i];
+            let start = at.next_multiple_of(align);
+            if start + len > at + n {
+                continue;
+            }
+            let (before, after) = (start - at, at + n - (start + len));
+            match (before, after) {
+                (0, 0) => {
+                    self.free.remove(i);
+                }
+                (0, _) => self.free[i] = (start + len, after),
+                (_, 0) => self.free[i] = (at, before),
+                _ => {
+                    self.free[i] = (at, before);
+                    self.free.insert(i + 1, (start + len, after));
+                }
+            }
+            return Some(start);
+        }
+        None
+    }
+
+    /// Gives `len` bytes at `at` back.
+    fn give(&mut self, at: u64, len: u64) {
+        let i = self.free.partition_point(|&(o, _)| o < at);
+        self.free.insert(i, (at, len));
+        // Merged with the next, then the previous.
+        if i + 1 < self.free.len() && self.free[i].0 + self.free[i].1 == self.free[i + 1].0 {
+            self.free[i].1 += self.free[i + 1].1;
+            self.free.remove(i + 1);
+        }
+        if i > 0 && self.free[i - 1].0 + self.free[i - 1].1 == self.free[i].0 {
+            self.free[i - 1].1 += self.free[i].1;
+            self.free.remove(i);
+        }
+    }
+
+    /// Nothing in it is taken.
+    fn is_empty(&self) -> bool {
+        self.free == [(0, self.size)]
+    }
+}
+
+/// Where a buffer's bytes are in a [`Pool`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Range {
+    /// Its page's number, unique among all pools' pages (passes compare
+    /// it to see whether the bound page changes).
+    page: u32,
+    offset: u64,
+    len: u64,
+}
+
+/// Shared pages for buffers of one kind (vertices of one stride, indices
+/// of one format), so a pass binds a page once for many draws, which
+/// draw at their range's base vertex and first index.
+///
+/// Every mesh once had a buffer of its own, and a 1440p frame bound a
+/// vertex and an index buffer some 2,000 times each; with pages it binds
+/// a few. Their bytes, and so what is drawn, are as before.
+#[derive(Debug)]
+struct Pool {
+    usage: wgpu::BufferUsages,
+    pages: Vec<(u32, wgpu::Buffer, FreeRanges)>,
+}
+
+impl Pool {
+    fn new(usage: wgpu::BufferUsages) -> Self {
+        Self {
+            usage,
+            pages: Vec::new(),
+        }
+    }
+
+    /// Room for `len` bytes at a multiple of `align`, in a page with room
+    /// or a new one (numbered from `next_page`).
+    fn take(&mut self, device: &wgpu::Device, next_page: &mut u32, len: u64, align: u64) -> Range {
+        let len = len.next_multiple_of(4).max(4);
+        for (page, _, free) in &mut self.pages {
+            if let Some(offset) = free.take(len, align) {
+                return Range {
+                    page: *page,
+                    offset,
+                    len,
+                };
+            }
+        }
+        let size = PAGE_BYTES.max(len.next_multiple_of(align));
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("buffer page"),
+            size,
+            usage: self.usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut free = FreeRanges::new(size);
+        let offset = free.take(len, align).expect("a new page has room");
+        let page = *next_page;
+        *next_page += 1;
+        self.pages.push((page, buffer, free));
+        Range { page, offset, len }
+    }
+
+    /// Gives `range` back, dropping its page once empty (keeping one).
+    fn give(&mut self, range: Range) {
+        let Some(i) = self.pages.iter().position(|p| p.0 == range.page) else {
+            return;
+        };
+        self.pages[i].2.give(range.offset, range.len);
+        if self.pages[i].2.is_empty() && self.pages.len() > 1 {
+            let (_, buffer, _) = self.pages.remove(i);
+            buffer.destroy();
+        }
+    }
+
+    fn buffer(&self, page: u32) -> Option<&wgpu::Buffer> {
+        self.pages.iter().find(|p| p.0 == page).map(|p| &p.1)
+    }
+}
+
+/// The least common multiple of `a` and `b` (both above 0).
+fn lcm(a: u64, b: u64) -> u64 {
+    let (mut x, mut y) = (a, b);
+    while y != 0 {
+        (x, y) = (y, x % y);
+    }
+    a / x * b
+}
+
+/// Bytes an index of `format` takes.
+fn index_bytes(format: IndexFormat) -> u64 {
+    match format {
+        IndexFormat::U16 => 2,
+        IndexFormat::U32 => 4,
+    }
 }
 
 #[derive(Debug)]
@@ -210,7 +376,133 @@ struct Texture {
 #[derive(Debug)]
 struct Material {
     desc: MaterialDesc,
-    bind_group: wgpu::BindGroup,
+    /// Its record's place in the material buffer ([`Materials`]).
+    slot: u32,
+    /// The places in the texture array its maps hold ([`TextureSlots`]),
+    /// in [`MaterialUniforms`]' order: base, detail, specular, normal,
+    /// then the four ground layers.
+    textures: [u32; 8],
+}
+
+/// Most textures a frame's materials can use at once: the size of the
+/// texture array they are drawn with ([`TextureSlots`]).
+const MAX_TEXTURES: u32 = 1 << 16;
+
+/// The places textures hold in the texture array every material draws
+/// from, kept while any material uses them. Place 0 is the white
+/// stand-in for a map a material has not got. A texture destroyed while
+/// a material still uses it keeps its place (and its GPU memory) until
+/// the last such material goes, as a material's own bind group kept it
+/// before.
+///
+/// Every material once had a group of its uniforms and eleven textures
+/// and samplers, and a 1440p frame switched material some 5,300 times;
+/// wgpu's cost to set a group grows with its entries, so switching now
+/// sets a one-entry group at another offset (see `Materials`) while the
+/// textures are bound once a pass.
+#[derive(Debug)]
+struct TextureSlots<V> {
+    /// Per place: its texture, view and the materials' holds on it.
+    slots: Vec<Option<(Option<TextureHandle>, V, u32)>>,
+    by_handle: FastMap<TextureHandle, u32>,
+    free: Vec<u32>,
+    /// A place was given a new texture since the array was last bound.
+    changed: bool,
+}
+
+impl<V: Clone> TextureSlots<V> {
+    fn new(white: V) -> Self {
+        Self {
+            slots: vec![Some((None, white, u32::MAX))],
+            by_handle: FastMap::default(),
+            free: Vec::new(),
+            changed: true,
+        }
+    }
+
+    /// `handle`'s place (0 for none), giving it one if new, with one more
+    /// hold on it.
+    fn acquire(&mut self, handle: Option<TextureHandle>, view: impl FnOnce() -> V) -> u32 {
+        let Some(handle) = handle else {
+            return 0;
+        };
+        if let Some(&slot) = self.by_handle.get(&handle) {
+            if let Some(Some(entry)) = self.slots.get_mut(slot as usize) {
+                entry.2 += 1;
+            }
+            return slot;
+        }
+        if self.free.is_empty() && self.slots.len() >= MAX_TEXTURES as usize {
+            // The array is full: drawn with the stand-in (never seen: a
+            // frame holds a few thousand).
+            eprintln!("textures: more than {MAX_TEXTURES} in use, one drawn white");
+            return 0;
+        }
+        let entry = Some((Some(handle), view(), 1));
+        let slot = match self.free.pop() {
+            Some(slot) => {
+                self.slots[slot as usize] = entry;
+                slot
+            }
+            None => {
+                self.slots.push(entry);
+                (self.slots.len() - 1) as u32
+            }
+        };
+        self.by_handle.insert(handle, slot);
+        self.changed = true;
+        slot
+    }
+
+    /// Lets go of one hold on place `slot`, freeing it with the last.
+    fn release(&mut self, slot: u32) {
+        if slot == 0 {
+            return;
+        }
+        let Some(cell) = self.slots.get_mut(slot as usize) else {
+            return;
+        };
+        if let Some(entry) = cell {
+            entry.2 -= 1;
+            if entry.2 == 0 {
+                if let Some(h) = entry.0 {
+                    self.by_handle.remove(&h);
+                }
+                *cell = None;
+                self.free.push(slot);
+            }
+        }
+    }
+
+    /// The view at each place, the stand-in in free ones.
+    fn views(&self) -> Vec<&V> {
+        let white = &self.slots[0].as_ref().expect("place 0 is never freed").1;
+        self.slots
+            .iter()
+            .map(|s| s.as_ref().map_or(white, |e| &e.1))
+            .collect()
+    }
+}
+
+/// Every material's [`MaterialUniforms`] in one uniform buffer, each at
+/// its place's offset; place 0 is the default material (drawn for a
+/// material not set).
+#[derive(Debug)]
+struct Materials {
+    records: Vec<MaterialUniforms>,
+    free: Vec<u32>,
+    /// Bytes from one record to the next (the device's offset alignment).
+    stride: u64,
+    buffer: wgpu::Buffer,
+    /// Group 4: the buffer, bound at a record's offset (the last group:
+    /// wgpu applies a changed group again with every group after it).
+    group: wgpu::BindGroup,
+}
+
+/// Bytes from one material record to the next: its size, rounded up to
+/// the device's uniform offset alignment.
+fn material_stride(alignment: u32) -> u64 {
+    (std::mem::size_of::<MaterialUniforms>() as u64).next_multiple_of(u64::from(alignment.max(1)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -361,7 +653,7 @@ struct Caster {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct MaterialUniforms {
     color: [f32; 4],
     params: [f32; 4],
@@ -386,15 +678,13 @@ struct MaterialUniforms {
     reflection: [f32; 4],
     /// x: open water.
     water: [f32; 4],
-}
-
-/// Texture views a material binds besides its uniforms.
-struct MaterialViews<'a> {
-    base: &'a wgpu::TextureView,
-    detail: &'a wgpu::TextureView,
-    specular: &'a wgpu::TextureView,
-    normal: &'a wgpu::TextureView,
-    layers: [&'a wgpu::TextureView; 4],
+    /// Its maps' places in the texture array: base, detail, specular,
+    /// normal ([`TextureSlots`]).
+    tex: [u32; 4],
+    /// Its ground layers' places.
+    layer_tex: [u32; 4],
+    /// x: its base map's sampler (0: repeating, 1: clamped).
+    samp: [u32; 4],
 }
 
 /// A 2D float texture binding visible to the fragment stage.
@@ -412,6 +702,9 @@ fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 }
 
 /// A frame between `begin_frame` and `end_frame`.
+/// An [`OpenFrame`]'s lists kept between frames.
+type Spare = (Vec<RecordedDraw>, Vec<u8>, Vec<[u32; 2]>, Vec<[f32; 16]>);
+
 #[derive(Debug)]
 struct OpenFrame {
     view: View,
@@ -510,7 +803,12 @@ pub struct WgpuBackend {
     /// Repeating, then clamping.
     samplers: [wgpu::Sampler; 2],
     white: wgpu::TextureView,
-    default_material: wgpu::BindGroup,
+    /// Every material's record ([`Materials`]).
+    material_records: Materials,
+    /// Group 2: the texture array and samplers ([`TextureSlots`]).
+    texture_slots: TextureSlots<wgpu::TextureView>,
+    maps_layout: wgpu::BindGroupLayout,
+    maps_group: wgpu::BindGroup,
 
     shaders: HashMap<VertexLayout, wgpu::ShaderModule>,
     layouts: Layouts,
@@ -527,11 +825,18 @@ pub struct WgpuBackend {
     /// The cascades the shadow map holds, as last drawn.
     cascades: std::cell::Cell<Option<shadow::Cascades>>,
     vertex_buffers: Slots<VertexBuffer>,
+    /// Pages of vertices by stride, of indices by format ([`Pool`]).
+    vertex_pools: FastMap<u32, Pool>,
+    index_pools: FastMap<IndexFormat, Pool>,
+    /// The next page's number.
+    next_page: u32,
     index_buffers: Slots<IndexBuffer>,
     textures: Slots<Texture>,
     materials: FastMap<MaterialId, Material>,
 
     frame: Option<OpenFrame>,
+    /// The last frame's lists, emptied, for the next ([`Spare`]).
+    spare: Option<Spare>,
     /// Frames ended so far, which is also the number of the open frame.
     frames: u64,
     /// The GPU time of each frame's stages, where the device can tell.
@@ -792,28 +1097,35 @@ impl WgpuBackend {
         });
         let material_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("material"),
+            // One material's record, at its offset in the buffer of them
+            // all (see `Materials`).
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: std::num::NonZeroU64::new(
+                        std::mem::size_of::<MaterialUniforms>() as u64,
+                    ),
+                },
+                count: None,
+            }],
+        });
+        // Every material's textures, and the samplers (see `TextureSlots`).
+        let maps_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("material maps"),
             entries: &[
-                uniform_entry(0, false),
-                texture_entry(1),
                 wgpu::BindGroupLayoutEntry {
-                    binding: 2,
+                    count: std::num::NonZeroU32::new(MAX_TEXTURES),
+                    ..texture_entry(0)
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
+                    count: std::num::NonZeroU32::new(2),
                 },
-                texture_entry(3),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                texture_entry(5),
-                texture_entry(6),
-                texture_entry(7),
-                texture_entry(8),
-                texture_entry(9),
-                texture_entry(10),
             ],
         });
         // Depth beneath and colour to mirror, for water: copies of the
@@ -849,8 +1161,9 @@ impl WgpuBackend {
             bind_group_layouts: &[
                 Some(&frame_layout),
                 Some(&draw_layout),
-                Some(&material_layout),
+                Some(&maps_layout),
                 Some(&scene_layout),
+                Some(&material_layout),
             ],
             immediate_size: 0,
         });
@@ -860,6 +1173,8 @@ impl WgpuBackend {
                 bind_group_layouts: &[
                     Some(&shadow_frame_layout),
                     Some(&draw_layout),
+                    Some(&maps_layout),
+                    None,
                     Some(&material_layout),
                 ],
                 immediate_size: 0,
@@ -1059,19 +1374,10 @@ impl WgpuBackend {
         };
         let post = post::Post::new(&device, output, width, height, &depth.view);
         Self {
-            default_material: Self::material_group(
-                &device,
-                &material_layout,
-                &samplers,
-                &MaterialViews {
-                    base: &white,
-                    detail: &white,
-                    specular: &white,
-                    normal: &white,
-                    layers: [&white; 4],
-                },
-                &MaterialDesc::default(),
-            ),
+            material_records: Self::materials(&device, &material_layout, 1),
+            texture_slots: TextureSlots::new(white.clone()),
+            maps_group: Self::maps_group(&device, &maps_layout, &[&white], &samplers),
+            maps_layout,
             adapter,
             device,
             queue,
@@ -1106,10 +1412,14 @@ impl WgpuBackend {
             sky,
             cloud_layout,
             vertex_buffers: Slots::default(),
+            vertex_pools: FastMap::default(),
+            index_pools: FastMap::default(),
+            next_page: 0,
             index_buffers: Slots::default(),
             textures: Slots::default(),
             materials: FastMap::default(),
             frame: None,
+            spare: None,
             frames: 0,
             timer,
             submitted: [None, None],
@@ -1246,19 +1556,14 @@ impl WgpuBackend {
     }
 
     /// `samplers` are the repeating and clamping ones.
-    fn material_group(
-        device: &wgpu::Device,
-        layout: &wgpu::BindGroupLayout,
-        samplers: &[wgpu::Sampler; 2],
-        views: &MaterialViews<'_>,
-        desc: &MaterialDesc,
-    ) -> wgpu::BindGroup {
+    /// `desc`'s record, its maps at places `textures` (see [`Material`]).
+    fn material_uniforms(desc: &MaterialDesc, textures: [u32; 8]) -> MaterialUniforms {
         let cutoff = match desc.blend {
             BlendMode::Masked { cutoff } => cutoff,
             _ => 0.0,
         };
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
-        let uniforms = MaterialUniforms {
+        MaterialUniforms {
             color: desc.color,
             params: [
                 cutoff,
@@ -1330,62 +1635,122 @@ impl WgpuBackend {
                 desc.water_waves,
                 desc.water_fade,
             ],
-        };
-        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("material uniforms"),
-            contents: bytemuck::bytes_of(&uniforms),
-            usage: wgpu::BufferUsages::UNIFORM,
+            tex: [textures[0], textures[1], textures[2], textures[3]],
+            layer_tex: [textures[4], textures[5], textures[6], textures[7]],
+            samp: [u32::from(desc.clamp), 0, 0, 0],
+        }
+    }
+
+    /// The material buffer with room for `records` records, the default
+    /// material's first.
+    fn materials(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        records: usize,
+    ) -> Materials {
+        let stride = material_stride(device.limits().min_uniform_buffer_offset_alignment);
+        let records = records.max(1);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("materials"),
+            size: stride * records as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
+        let group = Self::material_records_group(device, layout, &buffer);
+        let default = Self::material_uniforms(&MaterialDesc::default(), [0; 8]);
+        Materials {
+            records: vec![default],
+            free: Vec::new(),
+            stride,
+            buffer,
+            group,
+        }
+    }
+
+    fn material_records_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        buffer: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("material"),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(std::mem::size_of::<MaterialUniforms>() as u64),
+                }),
+            }],
+        })
+    }
+
+    /// Group 2: `views` by place, and the repeating and clamped samplers.
+    fn maps_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        views: &[&wgpu::TextureView],
+        samplers: &[wgpu::Sampler; 2],
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("material maps"),
             layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureViewArray(views),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(views.base),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&samplers[usize::from(desc.clamp)]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(views.detail),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&samplers[0]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(views.specular),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::TextureView(views.normal),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: wgpu::BindingResource::TextureView(views.layers[0]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: wgpu::BindingResource::TextureView(views.layers[1]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: wgpu::BindingResource::TextureView(views.layers[2]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: wgpu::BindingResource::TextureView(views.layers[3]),
+                    resource: wgpu::BindingResource::SamplerArray(&[&samplers[0], &samplers[1]]),
                 },
             ],
         })
+    }
+
+    /// Writes material place `slot`'s record, growing the buffer if it
+    /// has no room.
+    fn write_material(&mut self, slot: u32, record: MaterialUniforms) {
+        let m = &mut self.material_records;
+        let slot = slot as usize;
+        if slot >= m.records.len() {
+            m.records.resize(slot + 1, record);
+        }
+        m.records[slot] = record;
+        if (slot as u64 + 1) * m.stride > m.buffer.size() {
+            let records = (slot + 1).next_power_of_two();
+            let grown = Self::materials(&self.device, &self.material_layout, records);
+            m.buffer = grown.buffer;
+            m.group = grown.group;
+            let mut bytes = vec![0u8; m.records.len() * m.stride as usize];
+            for (i, r) in m.records.iter().enumerate() {
+                let at = i * m.stride as usize;
+                bytes[at..at + std::mem::size_of::<MaterialUniforms>()]
+                    .copy_from_slice(bytemuck::bytes_of(r));
+            }
+            self.queue.write_buffer(&m.buffer, 0, &bytes);
+        } else {
+            self.queue.write_buffer(
+                &m.buffer,
+                slot as u64 * m.stride,
+                bytemuck::bytes_of(&record),
+            );
+        }
+    }
+
+    /// Frees a removed material's place and its holds on its maps.
+    fn let_go(&mut self, old: &Material) {
+        for &t in &old.textures {
+            self.texture_slots.release(t);
+        }
+        self.material_records.free.push(old.slot);
+    }
+
+    /// The offset of `id`'s record (the default material's for one not set).
+    fn material_offset(&self, id: MaterialId) -> u32 {
+        let slot = self.materials.get(&id).map_or(0, |m| m.slot);
+        (u64::from(slot) * self.material_records.stride) as u32
     }
 
     /// The GPU and graphics API in use.
@@ -1893,6 +2258,7 @@ impl WgpuBackend {
             });
             pass.set_bind_group(0, group, &[]);
             pass.set_bind_group(1, &self.draw_group, &[]);
+            pass.set_bind_group(2, &self.maps_group, &[]);
             let mut pipeline_now: Option<&ShadowKey> = None;
             let mut material_now = None;
             let mut vertices_now = None;
@@ -1912,51 +2278,19 @@ impl WgpuBackend {
                     pipeline_now = Some(&caster.pipeline);
                 }
                 if caster.pipeline.masked && material_now != Some(d.material) {
-                    let material = self
-                        .materials
-                        .get(&d.material)
-                        .map_or(&self.default_material, |m| &m.bind_group);
-                    pass.set_bind_group(2, material, &[]);
+                    pass.set_bind_group(
+                        4,
+                        &self.material_records.group,
+                        &[self.material_offset(d.material)],
+                    );
                     material_now = Some(d.material);
                 } else if material_now.is_none() {
                     // Opaque casters run no fragment stage, but the layout
                     // still wants a material group bound.
-                    pass.set_bind_group(2, &self.default_material, &[]);
+                    pass.set_bind_group(4, &self.material_records.group, &[0]);
                     material_now = Some(MaterialId(u32::MAX));
                 }
-                if vertices_now != Some(d.vertex_buffer.0) {
-                    let vb = self.vertex_buffers.get(d.vertex_buffer.0)?;
-                    pass.set_vertex_buffer(0, vb.buffer.slice(..));
-                    vertices_now = Some(d.vertex_buffer.0);
-                }
-                match d.geometry {
-                    Geometry::Vertices { first, count } => {
-                        pass.draw(
-                            first..first + count,
-                            d.first_slot..d.first_slot + d.instances,
-                        );
-                    }
-                    Geometry::Indexed {
-                        buffer,
-                        first,
-                        count,
-                        base_vertex,
-                    } => {
-                        if indices_now != Some(buffer.0) {
-                            let ib = self.index_buffers.get(buffer.0)?;
-                            pass.set_index_buffer(
-                                ib.buffer.slice(..),
-                                wgpu_index_format(ib.desc.format),
-                            );
-                            indices_now = Some(buffer.0);
-                        }
-                        pass.draw_indexed(
-                            first..first + count,
-                            base_vertex,
-                            d.first_slot..d.first_slot + d.instances,
-                        );
-                    }
-                }
+                self.draw_geometry(&mut pass, d, &mut vertices_now, &mut indices_now)?;
             }
         }
         Ok(())
@@ -2032,6 +2366,7 @@ impl WgpuBackend {
         pass.set_bind_group(0, &self.frame_group, &[]);
         pass.set_bind_group(1, &self.draw_group, &[]);
         pass.set_bind_group(3, &self.depth.group, &[]);
+        pass.set_bind_group(2, &self.maps_group, &[]);
         let mut pipeline_now: Option<&PipelineKey> = None;
         let mut material_now = None;
         let mut vertices_now = None;
@@ -2050,45 +2385,66 @@ impl WgpuBackend {
                 pipeline_now = Some(&d.pipeline);
             }
             if material_now != Some(d.material) {
-                let material = self
-                    .materials
-                    .get(&d.material)
-                    .map_or(&self.default_material, |m| &m.bind_group);
-                pass.set_bind_group(2, material, &[]);
+                pass.set_bind_group(
+                    4,
+                    &self.material_records.group,
+                    &[self.material_offset(d.material)],
+                );
                 material_now = Some(d.material);
             }
-            if vertices_now != Some(d.vertex_buffer.0) {
-                let vb = self.vertex_buffers.get(d.vertex_buffer.0)?;
-                pass.set_vertex_buffer(0, vb.buffer.slice(..));
-                vertices_now = Some(d.vertex_buffer.0);
+            self.draw_geometry(&mut pass, d, &mut vertices_now, &mut indices_now)?;
+        }
+        Ok(())
+    }
+
+    /// Draws `d`'s geometry, binding its vertex and index pages if they
+    /// aren't bound already (`vertices_now`, `indices_now`: the pages
+    /// bound).
+    fn draw_geometry(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        d: &RecordedDraw,
+        vertices_now: &mut Option<u32>,
+        indices_now: &mut Option<u32>,
+    ) -> Result<(), BackendError> {
+        let vb = self.vertex_buffers.get(d.vertex_buffer.0)?;
+        if *vertices_now != Some(vb.range.page) {
+            let page = self
+                .vertex_pools
+                .get(&vb.desc.layout.stride().max(1))
+                .and_then(|p| p.buffer(vb.range.page))
+                .ok_or(BackendError::Unsupported("vertex page gone"))?;
+            pass.set_vertex_buffer(0, page.slice(..));
+            *vertices_now = Some(vb.range.page);
+        }
+        let instances = d.first_slot..d.first_slot + d.instances;
+        match d.geometry {
+            Geometry::Vertices { first, count } => {
+                let first = first + vb.base_vertex;
+                pass.draw(first..first + count, instances);
             }
-            match d.geometry {
-                Geometry::Vertices { first, count } => {
-                    pass.draw(
-                        first..first + count,
-                        d.first_slot..d.first_slot + d.instances,
-                    );
+            Geometry::Indexed {
+                buffer,
+                first,
+                count,
+                base_vertex,
+            } => {
+                let ib = self.index_buffers.get(buffer.0)?;
+                if *indices_now != Some(ib.range.page) {
+                    let page = self
+                        .index_pools
+                        .get(&ib.desc.format)
+                        .and_then(|p| p.buffer(ib.range.page))
+                        .ok_or(BackendError::Unsupported("index page gone"))?;
+                    pass.set_index_buffer(page.slice(..), wgpu_index_format(ib.desc.format));
+                    *indices_now = Some(ib.range.page);
                 }
-                Geometry::Indexed {
-                    buffer,
-                    first,
-                    count,
-                    base_vertex,
-                } => {
-                    if indices_now != Some(buffer.0) {
-                        let ib = self.index_buffers.get(buffer.0)?;
-                        pass.set_index_buffer(
-                            ib.buffer.slice(..),
-                            wgpu_index_format(ib.desc.format),
-                        );
-                        indices_now = Some(buffer.0);
-                    }
-                    pass.draw_indexed(
-                        first..first + count,
-                        base_vertex,
-                        d.first_slot..d.first_slot + d.instances,
-                    );
-                }
+                let first = first + ib.first_index;
+                pass.draw_indexed(
+                    first..first + count,
+                    base_vertex + vb.base_vertex as i32,
+                    instances,
+                );
             }
         }
         Ok(())
@@ -2152,6 +2508,7 @@ impl WgpuBackend {
         }
         pass.set_bind_group(1, &self.draw_group, &[]);
         pass.set_bind_group(3, &self.depth.group, &[]);
+        pass.set_bind_group(2, &self.maps_group, &[]);
         // State is set only when it changes: the queue has sorted the
         // draws so neighbours share pipelines, materials and buffers, and
         // each command costs time to record and submit.
@@ -2169,46 +2526,14 @@ impl WgpuBackend {
                 pipeline_now = Some(&d.pipeline);
             }
             if material_now != Some(d.material) {
-                let material = self
-                    .materials
-                    .get(&d.material)
-                    .map_or(&self.default_material, |m| &m.bind_group);
-                pass.set_bind_group(2, material, &[]);
+                pass.set_bind_group(
+                    4,
+                    &self.material_records.group,
+                    &[self.material_offset(d.material)],
+                );
                 material_now = Some(d.material);
             }
-            if vertices_now != Some(d.vertex_buffer.0) {
-                let vb = self.vertex_buffers.get(d.vertex_buffer.0)?;
-                pass.set_vertex_buffer(0, vb.buffer.slice(..));
-                vertices_now = Some(d.vertex_buffer.0);
-            }
-            match d.geometry {
-                Geometry::Vertices { first, count } => {
-                    pass.draw(
-                        first..first + count,
-                        d.first_slot..d.first_slot + d.instances,
-                    );
-                }
-                Geometry::Indexed {
-                    buffer,
-                    first,
-                    count,
-                    base_vertex,
-                } => {
-                    if indices_now != Some(buffer.0) {
-                        let ib = self.index_buffers.get(buffer.0)?;
-                        pass.set_index_buffer(
-                            ib.buffer.slice(..),
-                            wgpu_index_format(ib.desc.format),
-                        );
-                        indices_now = Some(buffer.0);
-                    }
-                    pass.draw_indexed(
-                        first..first + count,
-                        base_vertex,
-                        d.first_slot..d.first_slot + d.instances,
-                    );
-                }
-            }
+            self.draw_geometry(&mut pass, d, &mut vertices_now, &mut indices_now)?;
         }
         Ok(())
     }
@@ -2515,9 +2840,19 @@ async fn open(
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("m2"),
-            // Timestamps for the frame timer, where the adapter has them.
-            required_features: adapter.features() & timer::features(),
-            required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
+            // Timestamps for the frame timer, where the adapter has them;
+            // arrays of textures for the materials' maps (`TextureSlots`).
+            required_features: (adapter.features() & timer::features()) | maps_features(),
+            // Five groups: frame, draw, material, scene and the materials'
+            // maps.
+            required_limits: wgpu::Limits {
+                max_bind_groups: 5,
+                // The textures and the two samplers.
+                max_binding_array_elements_per_shader_stage: MAX_TEXTURES + 2,
+                max_binding_array_sampler_elements_per_shader_stage: 2,
+                ..wgpu::Limits::default()
+            }
+            .using_resolution(adapter.limits()),
             ..Default::default()
         })
         .await
@@ -2542,19 +2877,26 @@ impl RenderBackend for WgpuBackend {
             Some(bytes) => padded(bytes),
             None => vec![0; size.next_multiple_of(4).max(4) as usize].into(),
         };
-        let buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("vertices"),
-                contents: &data,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            });
+        let stride = u64::from(desc.layout.stride().max(1));
+        let pool = self
+            .vertex_pools
+            .entry(stride as u32)
+            .or_insert_with(|| Pool::new(wgpu::BufferUsages::VERTEX));
+        let range = pool.take(
+            &self.device,
+            &mut self.next_page,
+            data.len() as u64,
+            lcm(stride, 4),
+        );
+        let buffer = pool.buffer(range.page).expect("just taken");
+        self.queue.write_buffer(buffer, range.offset, &data);
         let layout = self.layouts.id(&desc.layout);
         Ok(VertexBufferHandle(self.vertex_buffers.insert(
             VertexBuffer {
                 desc: desc.clone(),
                 layout,
-                buffer,
+                range,
+                base_vertex: (range.offset / stride) as u32,
                 bounds: initial.and_then(|b| shadow::bounds(&desc.layout, b)),
             },
         )))
@@ -2578,16 +2920,18 @@ impl RenderBackend for WgpuBackend {
         };
         let mut contents = shadow.clone();
         contents.resize(shadow.len().next_multiple_of(4).max(4), 0);
-        let buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("indices"),
-                contents: &contents,
-                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            });
+        let size = index_bytes(desc.format);
+        let pool = self
+            .index_pools
+            .entry(desc.format)
+            .or_insert_with(|| Pool::new(wgpu::BufferUsages::INDEX));
+        let range = pool.take(&self.device, &mut self.next_page, contents.len() as u64, 4);
+        let buffer = pool.buffer(range.page).expect("just taken");
+        self.queue.write_buffer(buffer, range.offset, &contents);
         Ok(IndexBufferHandle(self.index_buffers.insert(IndexBuffer {
             desc: *desc,
-            buffer,
+            range,
+            first_index: (range.offset / size) as u32,
             shadow,
         })))
     }
@@ -2611,7 +2955,14 @@ impl RenderBackend for WgpuBackend {
         }
         // Its positions may have moved anywhere.
         vb.bounds = None;
-        self.queue.write_buffer(&vb.buffer, offset, data);
+        let stride = vb.desc.layout.stride().max(1);
+        let range = vb.range;
+        let page = self
+            .vertex_pools
+            .get(&stride)
+            .and_then(|p| p.buffer(range.page));
+        let page = page.ok_or(BackendError::Unsupported("vertex page gone"))?;
+        self.queue.write_buffer(page, range.offset + offset, data);
         Ok(())
     }
 
@@ -2633,20 +2984,30 @@ impl RenderBackend for WgpuBackend {
         let stop = end.next_multiple_of(4);
         let mut upload = ib.shadow[start as usize..(stop.min(size)) as usize].to_vec();
         upload.resize((stop - start) as usize, 0);
-        self.queue.write_buffer(&ib.buffer, start, &upload);
+        let (format, range) = (ib.desc.format, ib.range);
+        let page = self
+            .index_pools
+            .get(&format)
+            .and_then(|p| p.buffer(range.page));
+        let page = page.ok_or(BackendError::Unsupported("index page gone"))?;
+        self.queue.write_buffer(page, range.offset + start, &upload);
         Ok(())
     }
 
     fn destroy_vertex_buffer(&mut self, buffer: VertexBufferHandle) -> Result<(), BackendError> {
-        self.vertex_buffers
-            .remove(buffer.0)
-            .map(|b| b.buffer.destroy())
+        let b = self.vertex_buffers.remove(buffer.0)?;
+        if let Some(pool) = self.vertex_pools.get_mut(&b.desc.layout.stride().max(1)) {
+            pool.give(b.range);
+        }
+        Ok(())
     }
 
     fn destroy_index_buffer(&mut self, buffer: IndexBufferHandle) -> Result<(), BackendError> {
-        self.index_buffers
-            .remove(buffer.0)
-            .map(|b| b.buffer.destroy())
+        let b = self.index_buffers.remove(buffer.0)?;
+        if let Some(pool) = self.index_pools.get_mut(&b.desc.format) {
+            pool.give(b.range);
+        }
+        Ok(())
     }
 
     fn create_texture(
@@ -2713,45 +3074,61 @@ impl RenderBackend for WgpuBackend {
     }
 
     fn remove_material(&mut self, id: MaterialId) -> Result<(), BackendError> {
-        self.materials.remove(&id);
+        if let Some(old) = self.materials.remove(&id) {
+            self.let_go(&old);
+        }
         Ok(())
     }
 
     fn set_material(&mut self, id: MaterialId, desc: &MaterialDesc) -> Result<(), BackendError> {
-        let view = |t: Option<TextureHandle>| -> Result<&wgpu::TextureView, BackendError> {
-            match t {
-                Some(t) => Ok(&self.textures.get(t.0)?.view),
-                None => Ok(&self.white),
+        // Its maps, in `Material::textures`' order; every one must exist
+        // before any place is taken.
+        let handles = [
+            desc.texture,
+            desc.detail.map(|d| d.texture),
+            desc.specular
+                .and_then(|s| s.map)
+                .or(desc.emissive.and_then(|e| e.map)),
+            desc.normal_map.map(|n| n.texture),
+            desc.layers[0].map(|l| l.texture),
+            desc.layers[1].map(|l| l.texture),
+            desc.layers[2].map(|l| l.texture),
+            desc.layers[3].map(|l| l.texture),
+        ];
+        for h in handles.iter().flatten() {
+            self.textures.get(h.0)?;
+        }
+        let mut textures = [0u32; 8];
+        for (slot, h) in textures.iter_mut().zip(handles) {
+            let view = h
+                .and_then(|h| self.textures.get(h.0).ok())
+                .map(|t| t.view.clone());
+            *slot = self
+                .texture_slots
+                .acquire(h, || view.expect("checked above"));
+        }
+        let old = self.materials.remove(&id);
+        let slot = match &old {
+            Some(old) => old.slot,
+            None => match self.material_records.free.pop() {
+                Some(slot) => slot,
+                None => self.material_records.records.len() as u32,
+            },
+        };
+        if let Some(old) = &old {
+            // Its old maps' holds, after the new ones were taken (a map it
+            // keeps keeps its place).
+            for &t in &old.textures {
+                self.texture_slots.release(t);
             }
-        };
-        let views = MaterialViews {
-            base: view(desc.texture)?,
-            detail: view(desc.detail.map(|d| d.texture))?,
-            specular: view(
-                desc.specular
-                    .and_then(|s| s.map)
-                    .or(desc.emissive.and_then(|e| e.map)),
-            )?,
-            normal: view(desc.normal_map.map(|n| n.texture))?,
-            layers: [
-                view(desc.layers[0].map(|l| l.texture))?,
-                view(desc.layers[1].map(|l| l.texture))?,
-                view(desc.layers[2].map(|l| l.texture))?,
-                view(desc.layers[3].map(|l| l.texture))?,
-            ],
-        };
-        let bind_group = Self::material_group(
-            &self.device,
-            &self.material_layout,
-            &self.samplers,
-            &views,
-            desc,
-        );
+        }
+        self.write_material(slot, Self::material_uniforms(desc, textures));
         self.materials.insert(
             id,
             Material {
                 desc: *desc,
-                bind_group,
+                slot,
+                textures,
             },
         );
         Ok(())
@@ -2769,12 +3146,15 @@ impl RenderBackend for WgpuBackend {
         if self.frame.is_some() {
             return Err(BackendError::FrameAlreadyOpen);
         }
+        // The last frame's lists, emptied, so a frame doesn't grow them
+        // from nothing (megabytes copied and mapped afresh each frame).
+        let (draws, uniforms, slots, palette) = self.spare.take().unwrap_or_default();
         self.frame = Some(OpenFrame {
             view: *view,
-            draws: Vec::new(),
-            uniforms: Vec::new(),
-            slots: Vec::new(),
-            palette: Vec::new(),
+            draws,
+            uniforms,
+            slots,
+            palette,
         });
         Ok(())
     }
@@ -2938,9 +3318,9 @@ impl WgpuBackend {
         }
         GpuMemory {
             vertex_buffers: self.vertex_buffers.live,
-            vertex_bytes: live(&self.vertex_buffers).map(|b| b.buffer.size()).sum(),
+            vertex_bytes: live(&self.vertex_buffers).map(|b| b.range.len).sum(),
             index_buffers: self.index_buffers.live,
-            index_bytes: live(&self.index_buffers).map(|b| b.buffer.size()).sum(),
+            index_bytes: live(&self.index_buffers).map(|b| b.range.len).sum(),
             textures: self.textures.live,
             texture_bytes: live(&self.textures).map(|t| t.bytes).sum(),
             materials: self.materials.len(),
@@ -3030,6 +3410,15 @@ impl WgpuBackend {
             self.queue
                 .write_buffer(&self.palette_buffer, 0, bytemuck::cast_slice(&palette));
         }
+        if self.texture_slots.changed {
+            self.texture_slots.changed = false;
+            self.maps_group = Self::maps_group(
+                &self.device,
+                &self.maps_layout,
+                &self.texture_slots.views(),
+                &self.samplers,
+            );
+        }
         let size = self.size();
         let format = self.overlay_format();
         let over = |target: &wgpu::TextureView,
@@ -3089,8 +3478,31 @@ impl WgpuBackend {
                 }
             }
         }
+        self.keep_spare(draws, uniforms, slots, palette);
         Ok(())
     }
+
+    /// Keeps a finished frame's lists, emptied, for the next frame.
+    fn keep_spare(
+        &mut self,
+        mut draws: Vec<RecordedDraw>,
+        mut uniforms: Vec<u8>,
+        mut slots: Vec<[u32; 2]>,
+        mut palette: Vec<[f32; 16]>,
+    ) {
+        draws.clear();
+        uniforms.clear();
+        slots.clear();
+        palette.clear();
+        self.spare = Some((draws, uniforms, slots, palette));
+    }
+}
+
+/// What the materials' texture array needs of the device
+/// ([`TextureSlots`]): every D3D12 and Vulkan desktop GPU this runs on has
+/// it (checked on the Quadro P2000 under both and on WARP).
+fn maps_features() -> wgpu::Features {
+    wgpu::Features::TEXTURE_BINDING_ARRAY | wgpu::Features::PARTIALLY_BOUND_BINDING_ARRAY
 }
 
 /// Whether draws of `blend` have a pipeline in the glow layer
@@ -3211,5 +3623,100 @@ mod layout_tests {
         assert!(in_glow_layer(BlendKind::Translucent));
         assert!(!in_glow_layer(BlendKind::Opaque));
         assert!(!in_glow_layer(BlendKind::Masked));
+    }
+}
+
+#[cfg(test)]
+mod material_slot_tests {
+    use super::*;
+    use crate::buffer::RawHandle;
+
+    fn texture(index: u32) -> TextureHandle {
+        TextureHandle(RawHandle {
+            index,
+            generation: 0,
+        })
+    }
+
+    #[test]
+    fn a_map_holds_one_place_while_any_material_uses_it() {
+        let mut slots = TextureSlots::new("white");
+        assert_eq!(slots.acquire(None, || "never"), 0);
+        let a = slots.acquire(Some(texture(5)), || "a");
+        assert_eq!(slots.acquire(Some(texture(5)), || "again"), a);
+        let b = slots.acquire(Some(texture(6)), || "b");
+        assert_ne!(a, b);
+        assert_eq!(slots.views(), [&"white", &"a", &"b"]);
+        slots.changed = false;
+        slots.release(a);
+        assert_eq!(slots.views()[a as usize], &"a", "still held once");
+        slots.release(a);
+        assert_eq!(slots.views()[a as usize], &"white", "freed");
+        // Freeing needs no new array; a new map in the freed place does.
+        assert!(!slots.changed);
+        assert_eq!(slots.acquire(Some(texture(7)), || "c"), a);
+        assert!(slots.changed);
+        // The stand-in is never let go.
+        slots.release(0);
+        assert_eq!(slots.views()[0], &"white");
+    }
+
+    #[test]
+    fn records_are_aligned_and_name_their_maps_and_sampler() {
+        assert_eq!(material_stride(256) % 256, 0);
+        assert!(material_stride(256) >= std::mem::size_of::<MaterialUniforms>() as u64);
+        let desc = MaterialDesc {
+            clamp: true,
+            ..MaterialDesc::default()
+        };
+        let r = WgpuBackend::material_uniforms(&desc, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(r.tex, [1, 2, 3, 4]);
+        assert_eq!(r.layer_tex, [5, 6, 7, 8]);
+        assert_eq!(r.samp[0], 1);
+        let r = WgpuBackend::material_uniforms(&MaterialDesc::default(), [0; 8]);
+        assert_eq!((r.tex, r.samp[0]), ([0; 4], 0));
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    #[test]
+    fn ranges_are_taken_aligned_and_merge_when_given_back() {
+        let mut f = FreeRanges::new(1000);
+        assert_eq!(f.take(100, 4), Some(0));
+        // Aligned to a 52-byte stride: 100 rounds up to 104.
+        assert_eq!(f.take(52, 52), Some(104));
+        // The 4 bytes the alignment skipped are still free.
+        assert_eq!(f.take(10, 4), Some(156));
+        assert_eq!(f.take(4, 4), Some(100));
+        assert_eq!(f.take(2000, 4), None);
+        f.give(0, 100);
+        f.give(104, 52);
+        f.give(156, 10);
+        assert!(!f.is_empty());
+        f.give(100, 4);
+        assert!(f.is_empty(), "{:?}", f.free);
+    }
+
+    #[test]
+    fn a_freed_hole_is_filled_first() {
+        let mut f = FreeRanges::new(1000);
+        let a = f.take(200, 4).unwrap();
+        let _b = f.take(200, 4).unwrap();
+        f.give(a, 200);
+        assert_eq!(f.take(120, 4), Some(0));
+        assert_eq!(f.take(80, 4), Some(120));
+        assert_eq!(f.take(40, 4), Some(400));
+    }
+
+    #[test]
+    fn strides_align_to_whole_vertices_and_words() {
+        assert_eq!(lcm(52, 4), 52);
+        assert_eq!(lcm(6, 4), 12);
+        assert_eq!(lcm(4, 4), 4);
+        assert_eq!(index_bytes(IndexFormat::U16), 2);
+        assert_eq!(index_bytes(IndexFormat::U32), 4);
     }
 }

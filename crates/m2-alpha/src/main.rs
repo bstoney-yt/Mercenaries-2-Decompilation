@@ -38,6 +38,15 @@
 //! in the nearest parked vehicle instead and drives it forward; with
 //! `--fight` she shoots the nearest soldier, fires a rocket at a vehicle and
 //! throws a grenade.
+//!
+//! Built with `--features windowed` (the play builds) it is a windowed
+//! program: Windows opens no console with it, the log goes to
+//! `last-run.log` ([`errlog`]) and a start that fails says so in a message
+//! box. Without it (the default, for the dev scripts) it stays a console
+//! program.
+
+// No console window with a windowed build.
+#![cfg_attr(all(windows, feature = "windowed"), windows_subsystem = "windows")]
 
 mod action_prompt;
 mod aim;
@@ -65,6 +74,7 @@ mod flights;
 mod flow;
 mod frametimes;
 mod game;
+mod game_icon;
 mod gamehud;
 mod grapple;
 mod gunships;
@@ -400,6 +410,10 @@ struct Options {
     /// is done at which the scene and the game's HUD are pictured
     /// (`<out>-late<s>.ppm`), for comparing its end screens.
     late_shots: Vec<f32>,
+    /// `--mission-shots <s>,<s>...` with `--mission --screenshot`: the
+    /// scene at those seconds of play (`<out>-t<s>.ppm`, zero-padded so
+    /// they sort), for side-by-side comparisons with footage.
+    mission_shots: Vec<f32>,
     /// With `--screenshot` on foot and `--gait`: she goes on this long
     /// (seconds, default 3), logging where she is each second.
     walk_seconds: Option<f32>,
@@ -495,6 +509,10 @@ struct Options {
     /// With `--board`: the entrance she stands at, by name or hash
     /// (`entrance_driver`, `8efe45f3`); else the front right one.
     entrance: Option<u32>,
+    /// `--seat-check`: as `--board`, by the first gunner's seat's own
+    /// entrance of the nearest vehicle that has one; logs the seat she
+    /// sits in and its turret camera record.
+    seat_check: bool,
     /// With `--board`: how far out from the entrance she is put, metres
     /// (0.6 when not given; further, off a boat, she swims).
     board_off: Option<f32>,
@@ -832,6 +850,14 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                     .map(str::parse)
                     .collect::<Result<_, _>>()?
             }
+            "--mission-shots" => {
+                o.mission_shots = value()?
+                    .split(',')
+                    .map(|s| s.trim().parse())
+                    .collect::<Result<_, _>>()
+                    .context("--mission-shots expects seconds")?;
+                o.mission_shots.sort_by(f32::total_cmp);
+            }
             "--medevac" => o.medevac = Some(value()?.parse()?),
             "--visit-faction" => o.visit_faction = Some(value()?),
             "--call-extraction" => o.call_extraction = Some(value()?.parse()?),
@@ -861,6 +887,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--seated" => o.seated = true,
             "--board" => o.board = true,
+            "--seat-check" => {
+                o.board = true;
+                o.seat_check = true;
+            }
             "--swim-check" => o.swim_check = true,
             "--ladder-check" => {
                 o.ladder_check = Some(
@@ -1156,6 +1186,7 @@ const SCREENSHOT_ONLY: &[&str] = &[
     "--autoplay-avoid",
     "--movies",
     "--sound",
+    "--mission-shots",
 ];
 
 /// Those of [`SCREENSHOT_ONLY`] given without `--screenshot`, in the order
@@ -1188,11 +1219,20 @@ fn keep_crash_reports() {
             env!("CARGO_PKG_VERSION"),
             std::backtrace::Backtrace::force_capture()
         );
-        if std::fs::write(&path, report).is_ok() {
+        let written = std::fs::write(&path, &report).is_ok();
+        if written {
             eprintln!("crash report written to {}", path.display());
         }
         // The process ends here (panics abort): the log's last lines out.
         errlog::finish();
+        if errlog::own_file().is_some() {
+            let whence = if written {
+                format!("\n\nThe report is in {}.", path.display())
+            } else {
+                String::new()
+            };
+            error_box(&format!("The game crashed: {info}{whence}"));
+        }
     }));
 }
 
@@ -1225,8 +1265,26 @@ fn main() -> anyhow::Result<()> {
     errlog::start();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let out = run(&args, EventLoop::new);
+    if let (Err(e), Some(log)) = (&out, errlog::own_file()) {
+        // A windowed build has no console to show the error in.
+        eprintln!("error: {e:#}");
+        errlog::finish();
+        error_box(&format!(
+            "The game could not start: {e:#}\n\nThe log is in {}.",
+            log.display()
+        ));
+    }
     errlog::finish();
     out
+}
+
+/// Tells the player, in a message box, why the game stopped (Windows only;
+/// a windowed build has nowhere else to say it).
+fn error_box(text: &str) {
+    #[cfg(windows)]
+    m2_sys::stdio::error_box("Mercenaries 2 (beta)", text);
+    #[cfg(not(windows))]
+    let _ = text;
 }
 
 /// The game, given its arguments and how to make its event loop (the
@@ -2958,6 +3016,9 @@ const BENCH_EVERY: f32 = 10.0;
 /// milliseconds a frame in the tick, streaming, building the draws,
 /// submitting and waiting for the GPU, the GPU's in each stage, and draws
 /// a frame.
+/// A bench frame this slow (ms) logs a `bench hitch:` line.
+const BENCH_HITCH_MS: f32 = 50.0;
+
 fn run_bench(
     backend: &mut WgpuBackend,
     game: &mut Game,
@@ -3014,6 +3075,21 @@ fn run_bench(
         let ms = start.elapsed().as_secs_f32() * 1000.0;
         all.push(ms);
         span.push(ms);
+        // A slow frame says where its time went, which the 1% low can't.
+        let spent = spans::take_frame();
+        if ms >= BENCH_HITCH_MS {
+            eprintln!(
+                "bench hitch: {t:.1} s, {ms:.0} ms; cpu ms {}; spans ms {}",
+                PARTS
+                    .iter()
+                    .zip(cpu)
+                    .filter(|(_, v)| *v >= 1.0)
+                    .map(|(name, v)| format!("{name} {v:.0}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                spans::describe(&spent, 1.0, 8)
+            );
+        }
         for i in 0..PARTS.len() {
             cpu_all[i] += cpu[i];
             cpu_span[i] += cpu[i];
@@ -4575,6 +4651,9 @@ fn mission_for_screenshot(
         audio
     });
     let mut was_driving = false;
+    // `--mission-shots` pictured so far (they are kept sorted).
+    let mut mission_shots_taken = 0;
+    let mut support_denials = 0u32;
     for i in 0..(seconds / tick).round() as u32 {
         lap.mark("loop: pictures and checks");
         let intent = match auto.as_mut().filter(|_| play_done.is_none()) {
@@ -4653,6 +4732,13 @@ fn mission_for_screenshot(
                     delivery_key = key;
                 }
                 a.deliveries = deliveries;
+                // A support call the scripts turned down since the last
+                // tick: the autoplay keeps off that call for its target.
+                let denials = link.support_denials();
+                if denials > support_denials {
+                    a.support_denied = true;
+                }
+                support_denials = denials;
                 let keep = link.kept_within();
                 if keep.len() != a.keep.len() {
                     eprintln!(
@@ -5278,6 +5364,21 @@ fn mission_for_screenshot(
                 shop_pressed = 4;
                 eprintln!("shop-key: shop open 3 s after: {}", link.shop_open());
             }
+        }
+        // `--mission-shots`: the scene (without the game's HUD, which only
+        // runs once the contract is done) at those seconds of play, each
+        // once, on the first tick that gets here at or after it.
+        let now = i as f32 * tick;
+        while let Some(&s) = options
+            .mission_shots
+            .get(mission_shots_taken)
+            .filter(|&&s| now >= s)
+        {
+            mission_shots_taken += 1;
+            render(backend, game, fov, aspect, None)?;
+            let path = out.with_file_name(format!("{stem}-t{s:05.1}.ppm"));
+            write_ppm(backend, &path)?;
+            eprintln!("mission-shot: {s} s: {}", path.display());
         }
         lap.mark("loop: late hud");
         // After the contract (--after-contract) the game's HUD runs too:
@@ -7813,6 +7914,14 @@ fn board_stand(
         .enumerate()
         .filter(|(_, v)| v.spec.label.to_ascii_lowercase().contains(want))
         .filter(|(_, v)| !v.spec.entrances.is_empty())
+        .filter(|(_, v)| {
+            !options.seat_check
+                || v.spec
+                    .seating
+                    .as_deref()
+                    .and_then(m2_engine::seats::gunner_entrance)
+                    .is_some()
+        })
         .filter_map(|(i, v)| {
             let at = world?.physics.vehicle_transform(v.id?)?;
             Some((i, at, at.transform_point3(Vec3::ZERO).distance(here)))
@@ -7823,8 +7932,24 @@ fn board_stand(
         return None;
     };
     let spec = &game.scene.vehicles[i].spec;
+    // `--seat-check`: the gunner's seat's own entrance.
+    let gunner = options
+        .seat_check
+        .then(|| {
+            spec.seating
+                .as_deref()
+                .and_then(m2_engine::seats::gunner_entrance)
+        })
+        .flatten();
+    if let (Some((seat, e)), Some(s)) = (gunner, spec.seating.as_deref()) {
+        eprintln!(
+            "seat-check: the {}: gunner's seat {:08x} by its entrance {e:08x}",
+            spec.label, s.seats[seat].name
+        );
+    }
     let right = options
         .entrance
+        .or(gunner.map(|g| g.1))
         .unwrap_or_else(|| m2_assets::name_hash("entrance_front_right"));
     let &(e, local) = spec
         .entrances
@@ -7946,6 +8071,23 @@ fn board_pressed(
         game.combat.seat,
         game.hud_info(None).driving.map(|d| d.0)
     );
+    if options.seat_check {
+        let v = &game.scene.vehicles[i];
+        let seat = game.ride.filter(|r| r.0 == i).and_then(|r| {
+            let s = v.spec.seating.as_deref()?;
+            s.seats.get(s.seat(r.1)?)
+        });
+        match seat {
+            Some(s) => eprintln!(
+                "seat-check: she sits in {:08x} ({:?}), aiming turret {:08x?}, its camera {:?}",
+                s.name,
+                s.role(),
+                s.turret,
+                s.camera
+            ),
+            None => eprintln!("seat-check: she sits in no seat of the {}", v.spec.label),
+        }
+    }
     // `--look`: the camera swung, and the turret her seat aims following
     // (to the end of its arc, at its pace).
     if options.look != 0.0 {
@@ -9734,10 +9876,21 @@ impl App {
         // settings keep it ([`display`]).
         let (full, how) =
             display::fullscreen_for(monitor.clone(), w.mode, (w.width, w.height), w.refresh);
-        let attributes = Window::default_attributes()
+        let mut attributes = Window::default_attributes()
             .with_title("Mercenaries 2 (beta)")
             .with_inner_size(display::fit((w.width, w.height), monitor.as_ref()))
             .with_fullscreen(full);
+        // The original game's icon, from the install.
+        if let Some(icons) = self.install.as_ref().and_then(|i| game_icon::load(&i.root)) {
+            #[cfg(windows)]
+            {
+                use winit::platform::windows::WindowAttributesExtWindows;
+                attributes = attributes.with_taskbar_icon(Some(icons.taskbar));
+            }
+            #[cfg(not(windows))]
+            let _ = icons.taskbar;
+            attributes = attributes.with_window_icon(Some(icons.window));
+        }
         let window = Arc::new(event_loop.create_window(attributes)?);
         let display = display::Display::new(w);
         eprintln!("display: start {how}: {}", display::describe(&window));
@@ -11513,6 +11666,18 @@ mod tests {
         let o = parse_args(&args(&["--autoplay-avoid", "OilCon020,PmcCon031"])).unwrap();
         assert_eq!(o.autoplay_avoid, ["OilCon020", "PmcCon031"]);
         assert!(parse_args(&args(&[])).unwrap().autoplay_avoid.is_empty());
+    }
+
+    #[test]
+    fn mission_shots_are_seconds_of_play() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let o = parse_args(&args(&["--mission-shots", "12.5,5, 30"])).unwrap();
+        assert_eq!(o.mission_shots, [5.0, 12.5, 30.0]);
+        assert!(parse_args(&args(&["--mission-shots", "5,x"])).is_err());
+        assert_eq!(
+            screenshot_only_ignored(&args(&["--mission", "--mission-shots", "5"])),
+            ["--mission-shots"]
+        );
     }
 
     #[test]
