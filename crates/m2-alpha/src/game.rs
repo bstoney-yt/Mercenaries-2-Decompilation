@@ -461,6 +461,9 @@ impl Game {
             combat.hp = hp;
         }
         combat.hero_damage = scene.hero_damage();
+        if let Some(t) = scene.hero_toss_getup() {
+            combat.toss_getup = t;
+        }
         if let Some(rifle) = scene.hero_rifle() {
             combat.take_own_rifle(rifle);
         }
@@ -5928,6 +5931,9 @@ pub(crate) fn get_out(
         // At the hull's height: onto the ground by the door, not onto a
         // boulder or roof over it.
         player.drop_at(place);
+        // Tossed, she is knocked down ([`crate::combat::Combat`] takes
+        // it up: 0x822A1B70 sets her time down from `TossGetupSeconds`).
+        player.tossed = kind == ExitKind::Toss;
         if matches!(kind, ExitKind::Ditch | ExitKind::Toss) {
             let out = place - at.transform_point3(Vec3::ZERO);
             player.character.velocity =

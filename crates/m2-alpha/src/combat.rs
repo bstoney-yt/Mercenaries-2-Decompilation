@@ -1710,6 +1710,11 @@ pub struct Combat {
     /// Seconds before a vehicle can hurt her again by running into her
     /// ([`crate::npc::RAM_GAP`]).
     pub rammed: f32,
+    /// Knocked down: lying limp until she gets up ([`KnockedHer`]).
+    pub knocked: Option<KnockedHer>,
+    /// Her template's `TossGetupSeconds`
+    /// ([`m2_engine::melee::TOSS_GETUP_SECONDS`] without one).
+    pub toss_getup: f32,
     /// Vehicles that ran into her, and the health they took.
     pub run_overs: (u32, f32),
     /// The scripts keep her from dying (`Player.SetHealthClamp`): her
@@ -2151,6 +2156,8 @@ impl Default for Combat {
             down: 0.0,
             invincible: false,
             rammed: 0.0,
+            knocked: None,
+            toss_getup: m2_engine::melee::TOSS_GETUP_SECONDS,
             run_overs: (0, 0.0),
             health_clamp: false,
             scripted_health: false,
@@ -3146,6 +3153,7 @@ impl Combat {
         }
         self.went_off.clear();
         self.struck.clear();
+        self.knocked_step(f, dt);
         // Up again (revived, respawned, or put on her feet by a script):
         // her limp body goes. The state table's `Resurrect` leads from
         // `Die` and `Dead` straight to `Upright` `Idle`.
@@ -4138,7 +4146,95 @@ impl Combat {
             self.run_overs.0 += 1;
             self.run_overs.1 += lost;
             eprintln!("run over: a vehicle ran into her for {damage:.1} ({lost:.1} health lost)");
+            // A vehicle's hit of at least 2 on someone alive knocks them
+            // down for about 5 s (0x824203F0, 0x82422480; she is never
+            // disguised here).
+            if damage >= m2_engine::durability::KNOCKDOWN_DAMAGE && self.hp > 0.01 {
+                let r = self.knock_rng.unit();
+                let seconds = m2_engine::melee::knockdown_seconds(
+                    m2_engine::durability::KNOCKDOWN_SECONDS,
+                    false,
+                    r,
+                );
+                self.knock_her_down(f, seconds);
+            }
         }
+    }
+
+    /// Knocks her down for `seconds` (0x82423848's time down): the state
+    /// table's `KnockDown` and `KnockedDown` `Idle` are of the mode `FULL`,
+    /// so she goes limp where she stands and lies, her controls dropped,
+    /// until [`KnockedHer::stands`]. Not while down already, nor seated.
+    pub fn knock_her_down(&mut self, f: &mut Field<'_>, seconds: f32) {
+        if f.player.down || f.player.driving.is_some() || f.player.seated || self.hp <= 0.0 {
+            return;
+        }
+        let body = f.player.model_matrix();
+        let Some((_, rig)) = &mut f.player.model else {
+            return;
+        };
+        rig.animator.set_upper(None);
+        rig.two_handed = false;
+        let (nodes, _) = rig.posed();
+        let world: Vec<Mat4> = nodes.iter().map(|m| body * *m).collect();
+        let id = f.physics.add_ragdoll_named(
+            &rig.skeleton.name_hashes,
+            &rig.skeleton.parents,
+            &world,
+            f.player.character.velocity,
+        );
+        f.player.ragdoll = Some(id);
+        f.player.down = true;
+        f.player.aiming = false;
+        eprintln!("knockdown: she is down for {seconds:.1} s");
+        self.knocked = Some(KnockedHer {
+            seconds,
+            ..KnockedHer::default()
+        });
+    }
+
+    /// A step of her knockdown: counting her time down and how her limp
+    /// body lies; up when [`KnockedHer::stands`], where the body lay,
+    /// facing along it.
+    fn knocked_step(&mut self, f: &mut Field<'_>, dt: f32) {
+        if f.player.tossed {
+            f.player.tossed = false;
+            let r = self.knock_rng.unit();
+            let seconds = m2_engine::melee::knockdown_seconds(self.toss_getup, false, r);
+            self.knock_her_down(f, seconds);
+        }
+        let Some(k) = &mut self.knocked else {
+            return;
+        };
+        let Some(id) = f.player.ragdoll else {
+            self.knocked = None;
+            return;
+        };
+        let speed = f.physics.ragdoll_speed(id);
+        k.step(speed, dt);
+        if !k.stands() {
+            return;
+        }
+        self.knocked = None;
+        let nodes = f.physics.ragdoll_nodes(id);
+        if let Some(at) = nodes.as_deref().and_then(crate::npc::limp_middle) {
+            let from = at + Vec3::Y;
+            let y = f
+                .physics
+                .cast_ray(from, -Vec3::Y, 6.0)
+                .map_or(f.player.character.position.y, |(d, _)| from.y - d + 0.05);
+            f.player.character.position = Vec3::new(at.x, y, at.z);
+            f.player.character.velocity = Vec3::ZERO;
+        }
+        if let (Some(n), Some((_, rig))) = (nodes.as_deref(), &f.player.model)
+            && let Some(yaw) = crate::npc::getup_yaw(n, &rig.skeleton.name_hashes)
+        {
+            f.player.facing = yaw;
+        }
+        f.physics.remove_ragdoll(id);
+        f.player.ragdoll = None;
+        f.player.down = false;
+        eprintln!("knockdown: she gets up");
     }
 
     /// `damage` done to her from `from`: the health she lost.
@@ -4193,7 +4289,10 @@ impl Combat {
             // `InVehicle` `Die` (ragdoll mode `NONE`), then `Dead`: she
             // stays in the seat, animated, playing the seat's own clips
             // ([`crate::hijack::seated_death`]).
-            let on_foot = f.player.driving.is_none() && !f.player.seated;
+            // Knocked down, she lies limp already: the same body dies.
+            self.knocked = None;
+            let on_foot =
+                f.player.driving.is_none() && !f.player.seated && f.player.ragdoll.is_none();
             let body = f.player.model_matrix();
             if let Some((_, rig)) = &mut f.player.model {
                 rig.animator.set_upper(None);
@@ -7035,6 +7134,47 @@ fn arc_clear(physics: &Physics, from: Vec3, velocity: Vec3, to: Vec3, gravity: f
     false
 }
 
+/// Her knockdown: her time down (0x82423848, the human state record's
+/// +0x38) and how her limp body has lain.
+///
+/// From the 360 code (0x8225CAE0, for a person in `KnockedDown` `Idle`):
+/// `Stand` is posted once she has been down longer than her time down
+/// and, her body being limp (kind 0xC), it has lain still over 0.5 s or
+/// been limp over 19 s, as for the people ([`crate::npc`]'s `LIMP_STILL`
+/// and `LIMP_LONGEST`). Inferred, as for the people: those floats are the
+/// seconds still and limp, still being under 0.2 m/s; her time counts
+/// from the knockdown (the fall's own moment is not separated); she
+/// rises where the body lay with no get-up clip (not ported).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct KnockedHer {
+    pub seconds: f32,
+    pub down_for: f32,
+    pub still: f32,
+    pub limp: f32,
+}
+
+impl KnockedHer {
+    /// Seconds still and limp over which she may stand (0x820D9EDC,
+    /// 0x820F8C84), and the speed under which the body is still.
+    const STILL: f32 = 0.5;
+    const LONGEST: f32 = 19.0;
+    const AT_REST: f32 = 0.2;
+
+    /// A step of `dt` with her limp body moving at `speed` (None: not
+    /// known).
+    pub fn step(&mut self, speed: Option<f32>, dt: f32) {
+        self.down_for += dt;
+        self.limp += dt;
+        let still = speed.is_none_or(|v| v < Self::AT_REST);
+        self.still = if still { self.still + dt } else { 0.0 };
+    }
+
+    /// Whether she gets up now (0x8225CAE0).
+    pub fn stands(&self) -> bool {
+        self.down_for > self.seconds && (self.still > Self::STILL || self.limp > Self::LONGEST)
+    }
+}
+
 /// The velocity at `speed` that lobs a round furthest along `way`: 45
 /// degrees up.
 fn farthest(way: Vec3, speed: f32) -> Vec3 {
@@ -7183,6 +7323,33 @@ fn lock_share(held: f32, time: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    /// Knocked down for 5 s, she stands once that is past and her body
+    /// has lain still half a second; tumbling, not before 19 s limp.
+    #[test]
+    fn she_gets_up_after_her_time_down_once_still() {
+        use super::KnockedHer;
+        let mut k = KnockedHer {
+            seconds: 5.0,
+            ..KnockedHer::default()
+        };
+        for _ in 0..50 {
+            k.step(Some(0.0), 0.1);
+        }
+        assert!(!k.stands(), "{k:?}");
+        k.step(Some(0.0), 0.11);
+        assert!(k.stands());
+        let mut rolling = KnockedHer {
+            seconds: 5.0,
+            ..KnockedHer::default()
+        };
+        for _ in 0..189 {
+            rolling.step(Some(1.0), 0.1);
+        }
+        assert!(!rolling.stands());
+        rolling.step(Some(1.0), 0.2);
+        assert!(rolling.stands());
+    }
+
     /// A knockdown's length is spread by the engine's own random draws
     /// from its start-up seed, not by how many blows have landed: from a
     /// fresh start the first two fell for about 6.66 and 6.21 seconds

@@ -632,7 +632,8 @@ pub const RAM_KIND: &str = "Car";
 /// event's amount is at least the float at 0x82DE887C, 2.0 in the image.
 /// The knockdown happens when the attacker is an object of kind 2, 3, 4,
 /// 8 or 10 (2 is `_CarPhysicsV2`, 10 the boats) and the person is not
-/// player-kind; it posts `KnockDown` (0x9C9F3F13) and sets the time down
+/// disguised (table 0x83657FA8, the disguise records) nor in a list at
+/// 0x82F13B80; it posts `KnockDown` (0x9C9F3F13) and sets the time down
 /// by 0x82423848 from 5.0 (the float at 0x820BAF84).
 ///
 /// **Inferred**: kinds 3, 4 and 8 read as the other vehicles (not

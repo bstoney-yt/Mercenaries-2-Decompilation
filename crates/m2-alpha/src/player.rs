@@ -459,8 +459,10 @@ pub struct Player {
     pub bashing: Option<Bash>,
     /// The launcher is up (not the rifle): it rides on her shoulder.
     pub launcher: bool,
-    /// Down (out of health): she lies where she fell.
+    /// Down (out of health, or knocked down): she lies where she fell.
     pub down: bool,
+    /// Thrown off a vehicle (exit 3, 0x822A1B70): to be knocked down.
+    pub tossed: bool,
     /// How far she falls, from leaving the ground to coming down
     /// ([`on_foot::FallWatch`]), and a fall that hurt her this step, for
     /// the fight to take from her health.
@@ -704,6 +706,7 @@ impl Player {
             bashing: None,
             launcher: false,
             down: false,
+            tossed: false,
             fall: on_foot::FallWatch::default(),
             fell: None,
             seated: false,

@@ -626,7 +626,7 @@ pub fn getup_yaw(nodes: &[Mat4], hashes: &[u32]) -> Option<f32> {
     (line.length_squared() > 1e-8).then(|| line.x.atan2(line.z))
 }
 
-fn limp_middle(nodes: &[Mat4]) -> Option<Vec3> {
+pub(crate) fn limp_middle(nodes: &[Mat4]) -> Option<Vec3> {
     if nodes.is_empty() {
         return None;
     }

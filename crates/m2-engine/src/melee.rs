@@ -163,6 +163,10 @@ pub fn shove(low: bool, from: Vec3, to: Vec3, mass: f32) -> Vec3 {
 /// code: the flag is 0x82467B70's answer, the person's record in table
 /// 0x83657FA8, which `Object.IsDisguised` and
 /// `Player.GetVehicleDisguiseState` read; it is not "is the player".
+/// `TossGetupSeconds`' registered default (0x823EAE98), and its value on
+/// every human template.
+pub const TOSS_GETUP_SECONDS: f32 = 3.0;
+
 pub fn knockdown_seconds(seconds: f32, disguised: bool, r: f32) -> f32 {
     let base = if disguised { 0.5 } else { seconds }.max(1e-4);
     (((r - 0.5) * 0.4 + 1.0) * base).max(1e-4)

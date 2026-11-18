@@ -1639,6 +1639,23 @@ pub fn human_motion(db: &Layer<'_>) -> HashMap<u32, crate::on_foot::HumanMotion>
         .collect()
 }
 
+/// Every person template's `_HumanPhysics` `TossGetupSeconds` (+0x80; 3.0
+/// on every human template, PC data), by id: how long someone thrown off
+/// a vehicle lies before getting up (0x822A1B70's toss, through
+/// [`crate::melee::knockdown_seconds`]).
+pub fn toss_getup_seconds(db: &Layer<'_>) -> HashMap<u32, f32> {
+    let physics = Table::new(db, "_HumanPhysics");
+    let field = name_hash("TossGetupSeconds");
+    physics
+        .records
+        .keys()
+        .filter_map(|&id| {
+            let record = physics.of_template(id).first()?;
+            Some((id, physics.float(record, field)?))
+        })
+        .collect()
+}
+
 /// `_HumanPhysics`'s swimming speeds, m/s: `SwimWalkSpeed`,
 /// `SwimJogSpeed`, `SwimRunSpeed` and `SwimSprintSpeed` (field names from
 /// the exe's reflection registration of `_HumanPhysics`, 0x823EAE98,
