@@ -10273,11 +10273,25 @@ impl Running {
             self.pad.heli_camera = Default::default();
         }
         self.pad.heli_tuning = heli;
-        // An emplaced gun's turret camera, while she mans one.
-        let turret = self.game.combat.manned.as_ref().and_then(|m| {
+        // An emplaced gun's turret camera while she mans one (its limits
+        // about its facing), else the turret camera of the seat she drives
+        // from, if it has one (no limits held here).
+        let manned = self.game.combat.manned.as_ref().and_then(|m| {
             let w = self.game.scene.world.as_ref()?;
-            w.index.template_db.turret_cameras.get(&m.template).copied()
+            Some((
+                *w.index.template_db.turret_cameras.get(&m.template)?,
+                m.facing,
+            ))
         });
+        let driven = self
+            .game
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| p.driving)
+            .and_then(|i| self.game.scene.vehicles.get(i)?.spec.tuning.driver_turret);
+        self.pad.turret_base = manned.map(|(_, facing)| facing);
+        let turret = manned.map(|(t, _)| t).or(driven);
         if turret != self.pad.turret_tuning {
             self.pad.turret_camera = Default::default();
         }
@@ -10300,6 +10314,7 @@ impl Running {
             // Without a helicopter's nose lift: its stick pitch is the
             // camera's own ([`m2_engine::pad_camera::HeliFollow`]).
             self.pad.pitch = p.pitch - p.heli_lift;
+            self.pad.yaw = p.yaw;
         }
         let held = match self.game.combat.weapon {
             combat::Weapon::Rifle => self.game.combat.rifle.name.clone(),

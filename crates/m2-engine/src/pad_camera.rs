@@ -742,15 +742,37 @@ impl TurretLook {
         )
     }
 
-    /// At a limit, pushing on: that axis's eased value dropped
-    /// (0x824C9538), yaw or pitch, by which way it pushes (+ the stick's
-    /// +x or +y).
-    pub fn stop(&mut self, yaw: Option<f32>, pitch: Option<f32>) {
-        for (axis, way) in [(&mut self.yaw, yaw), (&mut self.pitch, pitch)] {
-            if way.is_some_and(|w| axis.value * w > 0.0) {
-                axis.value = 0.0;
-            }
+    /// At a limit with the stick pushing on past it: that axis's eased
+    /// value dropped before the step (0x824C9058 on 0x824C9538's flags).
+    /// `yaw_at` and `pitch_at` are [`turret_at`]'s: which limit the view
+    /// is at, -1 its low and +1 its high, in the angle's own sense (yaw
+    /// this crate's heading, which the stick's +x turns down; pitch up
+    /// positive, which its +y turns up).
+    pub fn hold(&mut self, stick: [f32; 2], yaw_at: Option<f32>, pitch_at: Option<f32>) {
+        if yaw_at.is_some_and(|w| stick[0] * -w > 0.0) {
+            self.yaw.value = 0.0;
         }
+        if pitch_at.is_some_and(|w| stick[1] * w > 0.0) {
+            self.pitch.value = 0.0;
+        }
+    }
+}
+
+/// Which of its limits (radians about `base`) `angle` is at (0x824C9538:
+/// within 1e-4 of the low, -1, or of the high, +1); none for limits all
+/// the way round.
+pub fn turret_at(angle: f32, base: f32, limits: (f32, f32)) -> Option<f32> {
+    use std::f32::consts::{PI, TAU};
+    if limits.1 - limits.0 >= TAU {
+        return None;
+    }
+    let off = (angle - base + PI).rem_euclid(TAU) - PI;
+    if off - 1e-4 < limits.0 {
+        Some(-1.0)
+    } else if limits.1 < off + 1e-4 {
+        Some(1.0)
+    } else {
+        None
     }
 }
 
@@ -1067,12 +1089,25 @@ mod tests {
         let (p, way) = turret_clamp(0.7, 0.0, quad.pitch_up());
         assert_eq!((p, way), (0.5, Some(1.0)));
         // Held there, pushing on drops its eased value; easing off doesn't.
+        assert_eq!(turret_at(0.5, 0.0, quad.pitch_up()), Some(1.0));
+        assert_eq!(way, Some(1.0));
         c.pitch.value = 0.8;
-        c.stop(None, way);
+        c.hold([0.0, 1.0], None, Some(1.0));
         assert_eq!(c.pitch.value, 0.0);
         c.pitch.value = -0.8;
-        c.stop(None, way);
+        c.hold([0.0, -1.0], None, Some(1.0));
         assert_eq!(c.pitch.value, -0.8);
+        // The yaw at its low limit: the stick's right (which turns the
+        // heading down) drops it, its left doesn't.
+        let cutter = (-1.5, 2.0);
+        assert_eq!(turret_at(-1.5, 0.0, cutter), Some(-1.0));
+        c.yaw.value = 0.7;
+        c.hold([1.0, 0.0], Some(-1.0), None);
+        assert_eq!(c.yaw.value, 0.0);
+        c.yaw.value = -0.7;
+        c.hold([-1.0, 0.0], Some(-1.0), None);
+        assert_eq!(c.yaw.value, -0.7);
+        assert_eq!(turret_at(0.0, 0.0, cutter), None);
     }
 
     #[test]

@@ -95,6 +95,9 @@ pub struct VehicleTuning {
     /// `PitchSpeed`, `MinPitch`/`MaxPitch`, `PitchLimitCushion` and pitch
     /// inertias).
     pub heli_camera: Option<crate::pad_camera::HeliLookTuning>,
+    /// The driver's seat's turret camera, where its driver aims its gun
+    /// (the M113 AA's `CameraTurret` on `seat_driver`).
+    pub driver_turret: Option<crate::pad_camera::TurretLookTuning>,
 }
 
 /// How a tracked vehicle drives, from its `_TankPhysics` (names from the
@@ -1709,23 +1712,22 @@ pub fn turret_cameras(db: &Layer<'_>) -> HashMap<u32, crate::pad_camera::TurretL
     let table = Table::new(db, "CameraTurret");
     table
         .templates()
-        .filter_map(|t| {
-            let r = table.of_template(t).first()?;
-            let f = |n: &str| table.float(r, name_hash(n));
-            let (yaw_in, pitch_in) = (f("YawInputInertia")?, f("PitchInputInertia")?);
-            Some((
-                t,
-                crate::pad_camera::TurretLookTuning {
-                    yaw_speed: f("YawSpeed")?,
-                    pitch_speed: f("PitchSpeed")?,
-                    yaw: (f("YawMin")?, f("YawMax")?),
-                    pitch: (f("PitchMin")?, f("PitchMax")?),
-                    yaw_keep: [yaw_in, yaw_in, f("YawNoInputInertia")?],
-                    pitch_keep: [pitch_in, pitch_in, f("PitchNoInputInertia")?],
-                },
-            ))
-        })
+        .filter_map(|t| Some((t, turret_look(&table, table.of_template(t).first()?)?)))
         .collect()
+}
+
+/// A `CameraTurret` record's look ([`crate::pad_camera::TurretLookTuning`]).
+fn turret_look(table: &Table<'_>, r: &[u8]) -> Option<crate::pad_camera::TurretLookTuning> {
+    let f = |n: &str| table.float(r, name_hash(n));
+    let (yaw_in, pitch_in) = (f("YawInputInertia")?, f("PitchInputInertia")?);
+    Some(crate::pad_camera::TurretLookTuning {
+        yaw_speed: f("YawSpeed")?,
+        pitch_speed: f("PitchSpeed")?,
+        yaw: (f("YawMin")?, f("YawMax")?),
+        pitch: (f("PitchMin")?, f("PitchMax")?),
+        yaw_keep: [yaw_in, yaw_in, f("YawNoInputInertia")?],
+        pitch_keep: [pitch_in, pitch_in, f("PitchNoInputInertia")?],
+    })
 }
 
 pub fn camera_modifiers(db: &Layer<'_>) -> HashMap<u32, (u32, f32)> {
@@ -1885,6 +1887,7 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
     let pilot = Table::new(db, "AiHelicopter");
     let heli_camera = Table::new(db, "CameraHelicopter");
     let car_link = Table::new(db, "CameraCarPresetLink");
+    let turret_camera = Table::new(db, "CameraTurret");
     let car_preset = Table::new(db, "CameraCarPreset");
     let guns = Guns {
         weapon: Table::new(db, "WeaponProjectileBase"),
@@ -2302,6 +2305,14 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         pitch_amp: f("PitchAmp")?,
                         pitch_lag: f("PitchLag")?,
                     })
+                })(),
+                driver_turret: (|| {
+                    let seat = name_hash("SeatName");
+                    let r = turret_camera
+                        .of_template(id)
+                        .iter()
+                        .find(|r| turret_camera.word(r, seat) == Some(name_hash("seat_driver")))?;
+                    turret_look(&turret_camera, r)
                 })(),
                 car_camera: (|| {
                     // The driver's seat's link, else its first; its
