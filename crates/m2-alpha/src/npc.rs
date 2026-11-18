@@ -2465,9 +2465,9 @@ impl Npc {
         // someone not limp (their action's mode not `FULL`), posts
         // `FallImpactLight` or `FallImpactHeavy`, whose clip they play
         // whole, doing nothing else (mode `NONE`). The 360 also skips a
-        // fall altogether for a person whose disguise record's state is 1
-        // or 2 (0x82467B70's record +0x40): the people here are never
-        // disguised.
+        // fall altogether for a person whose player record (0x82467B70,
+        // table 0x83657FA8) has state +0x40 at 1 or 2: the people here
+        // have no player record.
         if let Some((d, fell)) = self
             .fall
             .step(!self.character.grounded, now.y)
