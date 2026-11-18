@@ -2191,11 +2191,13 @@ impl Game {
             // not (0x8235E3A8): the sound table's cue for the two sides'
             // `SoundKey`s, three a frame.
             let hits = std::mem::take(&mut self.combat.hit_events);
+            let hero = self.scene.hero.template().to_owned();
             for (at, cue) in hit_cues(
                 &world.index,
                 &self.scene.props,
                 &self.scene.vehicles,
                 &self.scene.people,
+                &hero,
                 hits,
             ) {
                 self.combat.contact(at, cue, 1.0);
@@ -4478,6 +4480,14 @@ fn within_bed(place: Mat4, (lo, hi): (Vec3, Vec3), bed: Vec3, c: Vec3) -> bool {
 /// run into that their weight breaks ([`Destruction::crash`]: plants,
 /// bushes, fences, lampposts, the island's and the state layers'), going
 /// on through it.
+/// Her `SoundKey`: her hero template's (`SoundMaterial (hum_hero_mattias)`
+/// on Mattias), 0 for none.
+fn her_sound_key(db: &m2_engine::Templates, hero: &str) -> u32 {
+    db.id(hero)
+        .and_then(|t| db.sound_keys.get(&t).copied())
+        .unwrap_or(0)
+}
+
 /// A round's `SoundKey`: its template's, else (a gun's template) the
 /// ammunition the gun fires's.
 fn round_sound_key(db: &m2_engine::Templates, round: u32) -> u32 {
@@ -4500,7 +4510,8 @@ fn round_sound_key(db: &m2_engine::Templates, round: u32) -> u32 {
 /// ([`round_sound_key`]: `projectile_bullet_rifle` on the rifles'
 /// rounds), damaging when the damage table's cell for the two is over 0,
 /// at its full level, where it struck. What it struck: a person, their
-/// template's (`hum_soldier`, `hum_civ`); a vehicle, its template's; the
+/// template's (`hum_soldier`, `hum_civ`); her, her hero template's
+/// (`hum_hero_mattias`, `hum_hero_jen`, `hum_hero_chris`); a vehicle, its template's; the
 /// ground, the word of the triangle (`TERRAIN_GRASS`); a placed object
 /// or prop, its template's. From the 360 code: 0x8235E190 takes the
 /// struck side's key and the round's by 0x8235E600, the damage cell by
@@ -4513,6 +4524,7 @@ pub(crate) fn hit_cues(
     props: &Props,
     vehicles: &[ParkedVehicle],
     people: &crate::npc::People,
+    hero: &str,
     hits: Vec<combat::Hit>,
 ) -> Vec<(Vec3, u32)> {
     let db = &index.template_db;
@@ -4556,6 +4568,7 @@ pub(crate) fn hit_cues(
                 .get(j)
                 .and_then(|n| people.kinds.get(n.kind))
                 .map_or(0, |k| template_key(db.id(&k.role))),
+            combat::Struck::Her => her_sound_key(db, hero),
             combat::Struck::Vehicle(i) => vehicles.get(i).map_or(0, |v| {
                 vehicle_sound_key(db, &v.spec.label, v.spec.model).unwrap_or(0)
             }),
@@ -6367,6 +6380,15 @@ mod tests {
     use m2_engine::TemplateInfo;
 
     use super::*;
+
+    #[test]
+    fn she_is_heard_struck_by_her_hero_templates_sound_key() {
+        let mut db = m2_engine::Templates::default();
+        db.names.insert(3, "mattias".into());
+        db.sound_keys.insert(3, 0x68ec_ad2a);
+        assert_eq!(her_sound_key(&db, "Mattias"), 0x68ec_ad2a);
+        assert_eq!(her_sound_key(&db, "Jennifer"), 0);
+    }
 
     #[test]
     fn a_round_is_heard_by_its_own_sound_key_else_its_ammunitions() {
