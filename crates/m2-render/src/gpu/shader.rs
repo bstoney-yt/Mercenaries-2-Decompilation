@@ -253,7 +253,9 @@ var<private> draw: Draw;
 @group(3) @binding(1) var scene_color: texture_2d<f32>;
 
 struct Varyings {
-    @builtin(position) clip: vec4<f32>,
+    // Invariant: the depth pre-pass and the shading after it place every
+    // vertex alike, so the depths they test agree exactly.
+    @builtin(position) @invariant clip: vec4<f32>,
     @location(0) world_pos: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,

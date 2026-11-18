@@ -284,6 +284,40 @@ fn nearer_draws_hide_farther_ones() {
 }
 
 #[test]
+fn of_opaque_surfaces_as_near_the_last_drawn_shows() {
+    // As with the depth test alone, the depth pre-pass keeps the later of
+    // two coplanar opaque surfaces, and one drawn behind a nearer one
+    // stays hidden whichever comes first.
+    let Some(mut b) = backend() else { return };
+    let (vb, ib) = quad(&mut b);
+    let colour = |c: [f32; 4]| MaterialDesc {
+        color: c,
+        lit: false,
+        ..MaterialDesc::default()
+    };
+    b.set_material(MaterialId(1), &colour([1.0, 0.0, 0.0, 1.0]))
+        .unwrap();
+    b.set_material(MaterialId(2), &colour([0.0, 1.0, 0.0, 1.0]))
+        .unwrap();
+    b.set_material(MaterialId(3), &colour([0.0, 0.0, 1.0, 1.0]))
+        .unwrap();
+    b.begin_frame(&view()).unwrap();
+    b.draw(&draw(vb, ib, 1, Mat4::IDENTITY)).unwrap();
+    b.draw(&draw(vb, ib, 2, Mat4::IDENTITY)).unwrap();
+    b.draw(&draw(
+        vb,
+        ib,
+        3,
+        Mat4::from_translation(Vec3::new(0.0, 0.0, 50.0)) * Mat4::from_scale(Vec3::splat(40.0)),
+    ))
+    .unwrap();
+    b.end_frame().unwrap();
+    let rgba = b.read_pixels().unwrap();
+    assert_eq!(pixel(&rgba, 32, 32), [0, 255, 0, 255]);
+    assert_eq!(pixel(&rgba, 2, 2), [0, 0, 255, 255]);
+}
+
+#[test]
 fn many_draws_grow_the_uniform_buffer() {
     let Some(mut b) = backend() else { return };
     let (vb, ib) = quad(&mut b);

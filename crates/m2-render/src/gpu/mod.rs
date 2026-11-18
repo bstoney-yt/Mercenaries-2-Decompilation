@@ -815,6 +815,13 @@ pub struct WgpuBackend {
     pipelines: FastMap<PipelineKey, wgpu::RenderPipeline>,
     /// The glow layer's pipelines for additive and translucent keys.
     glow_pipelines: FastMap<PipelineKey, wgpu::RenderPipeline>,
+    /// Opaque keys' depth pre-pass pipelines and their shading at the
+    /// depth it left ([`WgpuBackend::encode_world`]).
+    depth_pipelines: FastMap<PipelineKey, wgpu::RenderPipeline>,
+    equal_pipelines: FastMap<PipelineKey, wgpu::RenderPipeline>,
+    /// Opaque surfaces' depth is laid first, so each pixel is shaded
+    /// once (`M2_PREPASS=off` draws without).
+    prepass: bool,
     shadow_pipelines: FastMap<ShadowKey, wgpu::RenderPipeline>,
     /// When the backend started, for animated surfaces.
     started: std::time::Instant,
@@ -1405,6 +1412,9 @@ impl WgpuBackend {
             layouts: Layouts::default(),
             pipelines: FastMap::default(),
             glow_pipelines: FastMap::default(),
+            depth_pipelines: FastMap::default(),
+            equal_pipelines: FastMap::default(),
+            prepass: !std::env::var("M2_PREPASS").is_ok_and(|v| v == "off"),
             shadow_pipelines: FastMap::default(),
             cascades: std::cell::Cell::new(None),
             started: std::time::Instant::now(),
@@ -2017,13 +2027,29 @@ impl WgpuBackend {
             _ => None,
         };
         let topology = wgpu_topology(key.topology)?;
-        let make = |entry: &str, blend: Option<wgpu::BlendState>| {
+        // A world pipeline shading with `entry` (none: depth alone, from
+        // the shadow casters' vertex stage, which places vertices exactly
+        // as `vs_main` does), its depth written or not and tested with
+        // `compare`.
+        let make_with = |entry: Option<&str>,
+                         blend: Option<wgpu::BlendState>,
+                         write: bool,
+                         compare: wgpu::CompareFunction| {
+            let targets = [Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            })];
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(entry),
+                label: Some(entry.unwrap_or("depth")),
                 layout: Some(&self.pipeline_layout),
                 vertex: wgpu::VertexState {
                     module,
-                    entry_point: Some("vs_main"),
+                    entry_point: Some(if entry.is_some() {
+                        "vs_main"
+                    } else {
+                        "vs_shadow"
+                    }),
                     compilation_options: Default::default(),
                     buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: u64::from(layout.stride()),
@@ -2042,8 +2068,8 @@ impl WgpuBackend {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(!translucent),
-                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                    depth_write_enabled: Some(write),
+                    depth_compare: Some(compare),
                     stencil: Default::default(),
                     // Depth is reversed, so a positive bias is towards the camera.
                     bias: if key.depth_bias {
@@ -2057,20 +2083,32 @@ impl WgpuBackend {
                     },
                 }),
                 multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
+                fragment: entry.map(|entry| wgpu::FragmentState {
                     module,
                     entry_point: Some(entry),
                     compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: color_format,
-                        blend,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
+                    targets: &targets,
                 }),
                 multiview_mask: None,
                 cache: None,
             })
         };
+        let make = |entry: &str, blend: Option<wgpu::BlendState>| {
+            make_with(
+                Some(entry),
+                blend,
+                !translucent,
+                wgpu::CompareFunction::GreaterEqual,
+            )
+        };
+        // Opaque surfaces' depth pre-pass and their shading after it, at
+        // the depth it left (see `encode_world`).
+        let prepass = (key.blend == BlendKind::Opaque).then(|| {
+            (
+                make_with(None, None, true, wgpu::CompareFunction::GreaterEqual),
+                make_with(Some("fs_main"), blend, false, wgpu::CompareFunction::Equal),
+            )
+        });
         // The glow layer's (see `encode_glows`): a glow adds itself, by its
         // alpha, in display values; a translucent surface hides what lies
         // behind it by its alpha.
@@ -2097,6 +2135,10 @@ impl WgpuBackend {
         let pipeline = make("fs_main", blend);
         if let Some(glow) = glow {
             self.glow_pipelines.insert(*key, glow);
+        }
+        if let Some((depth, equal)) = prepass {
+            self.depth_pipelines.insert(*key, depth);
+            self.equal_pipelines.insert(*key, equal);
         }
         self.pipelines.insert(*key, pipeline);
         Ok(())
@@ -2460,6 +2502,15 @@ impl WgpuBackend {
         draws: &[RecordedDraw],
         clear: bool,
     ) -> Result<(), BackendError> {
+        // The first pass lays the opaque surfaces' depth first, so their
+        // shading runs once a pixel: each is drawn again where its depth is
+        // the depth laid (the nearest, or the last drawn of those as near),
+        // which is the surface the depth test kept before. Cut-out and
+        // translucent ones draw as before, tested against it.
+        let prepass = clear && self.prepass;
+        if prepass {
+            self.encode_depth(encoder, draws)?;
+        }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("world"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2485,7 +2536,7 @@ impl WgpuBackend {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &self.depth.view,
                 depth_ops: Some(wgpu::Operations {
-                    load: if clear {
+                    load: if clear && !prepass {
                         wgpu::LoadOp::Clear(0.0)
                     } else {
                         wgpu::LoadOp::Load
@@ -2522,7 +2573,11 @@ impl WgpuBackend {
                 continue;
             }
             if pipeline_now != Some(&d.pipeline) {
-                pass.set_pipeline(&self.pipelines[&d.pipeline]);
+                let pipeline = match self.equal_pipelines.get(&d.pipeline) {
+                    Some(equal) if prepass => equal,
+                    _ => &self.pipelines[&d.pipeline],
+                };
+                pass.set_pipeline(pipeline);
                 pipeline_now = Some(&d.pipeline);
             }
             if material_now != Some(d.material) {
@@ -2532,6 +2587,49 @@ impl WgpuBackend {
                     &[self.material_offset(d.material)],
                 );
                 material_now = Some(d.material);
+            }
+            self.draw_geometry(&mut pass, d, &mut vertices_now, &mut indices_now)?;
+        }
+        Ok(())
+    }
+
+    /// The depth pre-pass: the opaque draws among `draws`, depth alone,
+    /// clearing it first (see `encode_world`).
+    fn encode_depth(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        draws: &[RecordedDraw],
+    ) -> Result<(), BackendError> {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("depth"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_bind_group(0, &self.frame_group, &[]);
+        pass.set_bind_group(1, &self.draw_group, &[]);
+        pass.set_bind_group(2, &self.maps_group, &[]);
+        pass.set_bind_group(3, &self.depth.group, &[]);
+        pass.set_bind_group(4, &self.material_records.group, &[0]);
+        let mut pipeline_now: Option<&PipelineKey> = None;
+        let mut vertices_now = None;
+        let mut indices_now = None;
+        for d in draws {
+            let Some(pipeline) = self.depth_pipelines.get(&d.pipeline) else {
+                continue;
+            };
+            if pipeline_now != Some(&d.pipeline) {
+                pass.set_pipeline(pipeline);
+                pipeline_now = Some(&d.pipeline);
             }
             self.draw_geometry(&mut pass, d, &mut vertices_now, &mut indices_now)?;
         }
