@@ -1038,7 +1038,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--riders" => o.riders = true,
             "--take" => o.take = true,
             "--fire" => o.fire = true,
-            "--homing-check" => o.homing_check = true,
+            "--homing-check" => {
+                o.homing_check = true;
+                o.drive = true;
+            }
             "--look-pickup" => {
                 o.look_pickup = Some(value()?.parse().context("--look-pickup expects metres")?)
             }
@@ -7047,7 +7050,7 @@ const HOMING_CHECK_RANGE: f32 = 40.0;
 /// How long `--homing-check` waits for the lock, the shot and the hit, s.
 const HOMING_CHECK_SECONDS: f32 = 60.0;
 
-/// `--homing-check` (with `--drive`): her vehicle parked, the nearest
+/// `--homing-check` (it turns on `--drive`): her vehicle parked, the nearest
 /// soldier is put [`HOMING_CHECK_RANGE`] in front of it holding a locking
 /// launcher up, and the run waits up to [`HOMING_CHECK_SECONDS`] for his
 /// lock, his shot and its hit. Logs `homing-check: PASS ...` or
@@ -7154,6 +7157,7 @@ fn homing_check(game: &mut Game, tick: f32) {
             .map_or(at, |b| b.transform_point3((lo + hi) * 0.5))
     };
     let fired = game.combat.homing_fired;
+    let bursts = game.combat.homing_bursts;
     let (mut locked, mut shot) = (None, None);
     let mut damage = game.scene.vehicles[vi].damage;
     let ticks = (HOMING_CHECK_SECONDS / tick).round() as usize;
@@ -7224,8 +7228,13 @@ fn homing_check(game: &mut Game, tick: f32) {
         if let (Some(from), Some(fire)) = (locked, shot)
             && hurt > 0.0
         {
+            let how = if game.combat.homing_bursts > bursts {
+                "burst by its proximity radius"
+            } else {
+                "on contact"
+            };
             eprintln!(
-                "homing-check: PASS lock {:.2} s, hit {:.2} s after the shot ({hurt:.0} damage)",
+                "homing-check: PASS lock {:.2} s, hit {:.2} s after the shot ({hurt:.0} damage,                  {how})",
                 fire - from,
                 now - fire
             );

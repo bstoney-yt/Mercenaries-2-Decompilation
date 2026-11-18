@@ -399,12 +399,16 @@ pub fn armed_seats(v: &ParkedVehicle) -> Vec<u32> {
 /// soldier does, `npc::LOOK_EVERY`; inferred).
 const CREW_LOOK: f32 = 0.2;
 
+/// A round's `HomingProjectile`: turn rate and widest angle (degrees),
+/// proximity radius (metres).
+type HomingRecord = (f32, f32, f32);
+
 /// Vehicle `v`'s armed seat `seat`'s wire-guided weapon, if one: its
 /// `HomingWeapon` record and its round's `HomingProjectile`.
 fn tow_of(
     v: &crate::scene::ParkedVehicle,
     seat: usize,
-) -> Option<(m2_engine::weapons::Seeker, Option<(f32, f32)>)> {
+) -> Option<(m2_engine::weapons::Seeker, Option<HomingRecord>)> {
     let &mount = armed_seats(v).get(seat)?;
     v.spec
         .armed
@@ -1905,6 +1909,9 @@ pub struct Combat {
     /// Homing shots fired at her vehicle once locked (soldiers' and
     /// crews'), for the `--homing-check` log.
     pub homing_fired: u32,
+    /// Homing missiles burst by their proximity radius (0x82293280), for
+    /// the `--homing-check` log.
+    pub homing_bursts: u32,
     gunner_wait: Vec<f32>,
     /// Rounds left in each such gunner's burst.
     gunner_burst: Vec<u32>,
@@ -2231,6 +2238,7 @@ impl Default for Combat {
             homing_targets: Vec::new(),
             homing_check: false,
             homing_fired: 0,
+            homing_bursts: 0,
             gunner_wait: Vec::new(),
             gunner_burst: Vec::new(),
             gunner_clips: Vec::new(),
@@ -5999,6 +6007,7 @@ impl Combat {
         let mut streaks = Vec::new();
         // Where soldiers' rockets and grenades burst.
         let mut armies = Vec::new();
+        let mut proximity_bursts = 0;
         // Where people and vehicles are, for mines.
         let near: Vec<Vec3> = f
             .people
@@ -6056,11 +6065,29 @@ impl Combat {
                         }
                         Guide::Wire(_) => wire.flatten(),
                     };
-                    match goal.and_then(|g| h.steer(*at, *velocity, g, dt)) {
-                        Some(v) => *velocity = v,
-                        None => {
+                    use crate::homing::Steer;
+                    match goal.map_or(Steer::Lost, |g| h.steer(*at, *velocity, g, dt)) {
+                        Steer::Fly(v) => *velocity = v,
+                        Steer::Lost => {
                             eprintln!("homing: a missile lost its target");
                             *homing = None;
+                        }
+                        // Near enough its goal: it bursts where it is
+                        // (0x82293280, its `HomingProjectile` +8). Its
+                        // death (0x82289F40) spawns its `SpawnOnDeath` at
+                        // its own matrix (0x823F8370, copied by
+                        // 0x82856358 to the spawn 0x82409B38).
+                        Steer::Burst => {
+                            eprintln!(
+                                "homing: a missile bursts within {:.1} m of its goal",
+                                h.proximity
+                            );
+                            proximity_bursts += 1;
+                            if *army {
+                                armies.push(*at);
+                            }
+                            blasts.push((*at, *blast, *key));
+                            return false;
                         }
                     }
                 }
@@ -6181,6 +6208,7 @@ impl Combat {
                 true
             }
         });
+        self.homing_bursts += proximity_bursts;
         for (k, (at, velocity)) in puffs.into_iter().enumerate() {
             self.effect(Effect::Smoke { at, size: 0.4 }, 0.8);
             // Rockets have no id: the k-th in flight (one at a time, as a
