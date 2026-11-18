@@ -565,6 +565,8 @@ const BODY_RADIUS: f32 = 0.3;
 /// How far ahead of his shoulder a soldier's rocket starts, m: past his
 /// body's radius (invented: the 360's projectile skips its owner).
 const LAUNCH_CLEAR: f32 = BODY_RADIUS + 0.2;
+/// What she loses put out of a vehicle sunk under her ([`Combat::sank_out`]).
+pub const SANK_OUT: f32 = 100.0;
 /// Health comes back after this many quiet seconds, at this rate a second.
 const REGEN_AFTER: f32 = 4.0;
 const REGEN_RATE: f32 = 25.0;
@@ -5319,18 +5321,15 @@ impl Combat {
         }
     }
 
-    /// Wrecks vehicle `i`, `v`, if it isn't already: it burns and can't be
-    /// driven.
-    /// Vehicle `v` sank ([`crate::game::Game`]'s sinking): lost as a
-    /// wreck is, without its blast, fire or remark (invented: the 360's
-    /// sinking only takes its floats' lift and tells the scripts).
-    pub fn sink(&mut self, physics: &mut Physics, v: &mut ParkedVehicle) {
-        if v.wrecked {
-            return;
-        }
-        v.wrecked = true;
-        if let Some(id) = v.id {
-            physics.wreck_vehicle(id);
+    /// She is put out of a vehicle that sank under her: 100 of her health
+    /// (from footage: Xenia, 120 -> 19.6 as the seat lets her go, three
+    /// runs 100.1-100.5; what posts it in the 360 code is not traced),
+    /// never below 1 here (invented: she swam away in all three). The
+    /// vehicle itself is not wrecked: it stays whole at the bottom.
+    pub fn sank_out(&mut self) {
+        self.hurt_from(SANK_OUT, Vec3::ZERO);
+        if let Some(h) = self.hurts.last_mut() {
+            h.1 = None;
         }
     }
 

@@ -3606,8 +3606,9 @@ impl Game {
     /// Vehicles in the water `dt` seconds more: each but a boat with a
     /// quarter or more of its box under the sea counts its time there,
     /// and once that reaches its template's `Buoyancy` delay (5 s
-    /// without one) it sinks: it is lost (wrecked, without a blast), she
-    /// gets out if she is in it, and a mission vehicle's
+    /// without one) it sinks: it stays whole (the 360's sinking only takes
+    /// its lift; Xenia: 100/100 for 60 s on the bottom), she is put out
+    /// with 100 of her health gone ([`Combat::sank_out`]) if she is in it, and a mission vehicle's
     /// `VehicleSinking` goes to the scripts. From the 360 code: the time,
     /// the share and the event ([`m2_engine::durability::Buoyancy`]). The
     /// boats float by their own hulls here ([`m2_engine::Physics`]'s
@@ -3666,10 +3667,10 @@ impl Game {
             if let Some(g) = v.guid {
                 self.sunk_guids.push(g);
             }
-            self.combat.sink(&mut world.physics, v);
             if let Some(p) = self.scene.player.as_mut()
                 && p.driving == Some(i)
             {
+                self.combat.sank_out();
                 let seat = self.ride.filter(|r| r.0 == i).map(|r| r.1);
                 get_out(&world.physics, &self.scene.vehicles[i], seat, p);
                 self.ride = None;
