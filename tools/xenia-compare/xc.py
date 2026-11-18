@@ -279,6 +279,7 @@ def run(args) -> int:
     nl_state: dict = {}
     pl_state: dict = {}
     cl_state: dict = {}
+    remembered_veh = None
 
     def shot(name: str) -> Path | None:
         nonlocal n
@@ -827,7 +828,7 @@ def run(args) -> int:
                 # the on-foot camera object (vtable 0x820F0290) and its fields, logged per sample
                 fset = next((t[7:] for t in w if t.startswith("fields=")), "foot")
                 w = [t for t in w if not t.startswith("fields=")]
-                if fset == "car":
+                if fset in ("car", "tank"):
                     # player 0's active camera (camera manager table 0x83457050, stride 0x620)
                     ab = gs.read(0x83457050, 4)
                     cobj = struct.unpack(">I", ab)[0] if ab else None
@@ -843,6 +844,8 @@ def run(args) -> int:
                                                                 0x750, 0x770, 0x9E0, 0x9E4, 0x648, 0x658, 0x65C, 0x664, 0x670)) + (("aim", 0x7CD, "b"),)
                 if fset == "car":
                     F_OFF = F_CAR
+                elif fset == "tank":  # CameraTank (vtable 0x820F0338): eased stick +0x620/+0x638, yaw/pitch speeds +0x644/+0x648
+                    F_OFF = tuple((f"o{off:03X}", off, "f") for off in (0x620, 0x624, 0x638, 0x63C, 0x644, 0x648, 0x600, 0x604, 0x610, 0x614))
 
                 def fields():
                     out = []
@@ -1434,14 +1437,23 @@ def run(args) -> int:
                 import math
                 import xmem
 
-                tx, tz, secs = float(w[1]), float(w[2]), float(w[3])
                 wv = next((float(t[7:]) for t in w if t.startswith("weaken=")), None)
                 g = xmem.Guest(p.pid)
                 hh = xmem.Hero(g)
                 cam = xmem.Camera(g)
                 hero = hh.character()
                 best = None
-                for k_, a_ in xmem.map_entries(g, 0x83656558).items():
+                if w[1] == "veh":  # shootat veh <secs>: the vehicle `rememberveh` noted
+                    k_ = remembered_veh
+                    a_ = xmem.map_entries(g, 0x83656558).get(k_) if k_ else None
+                    sa = hh.state_addr(k_) if k_ else None
+                    pos_ = struct.unpack(">3f", g.read(sa, 12)) if sa else (0.0, 0.0, 0.0)
+                    tx, tz, secs = pos_[0], pos_[2], float(w[2])
+                    if a_ and sa:
+                        best = (0.0, k_, a_, sa)
+                else:
+                    tx, tz, secs = float(w[1]), float(w[2]), float(w[3])
+                for k_, a_ in (xmem.map_entries(g, 0x83656558).items() if best is None else ()):
                     if hero - 1 <= k_ <= hero + 8:
                         continue
                     sa = hh.state_addr(k_)
@@ -1586,6 +1598,24 @@ def run(args) -> int:
                             say(f"ram: {math.dist(tp, hp_):.0f} m, stick {lx:+.2f}")
                         time.sleep(0.04)
                     apply()
+            elif op == "rememberveh":
+                # rememberveh: note the handle of the vehicle she sits in (the health-pool record within 1 m of her,
+                # not hers), for `shootat veh`.
+                import math
+                import xmem
+
+                g = xmem.Guest(p.pid)
+                hh = xmem.Hero(g)
+                here, hero = hh.update(), hh.character()
+                remembered_veh = None
+                for k_ in xmem.map_entries(g, 0x83656558):
+                    if hero - 1 <= k_ <= hero + 8:
+                        continue
+                    sa = hh.state_addr(k_)
+                    if sa and math.dist(struct.unpack(">3f", g.read(sa, 12)), here) < 1.0:
+                        remembered_veh = k_
+                        break
+                say(f"rememberveh: {remembered_veh and hex(remembered_veh)}")
             elif op == "poke":
                 # poke <guest hex address> <byte>: set one guest data byte, a
                 # runtime flag (never code, the XEX or files). E.g. 0x83134382 =
