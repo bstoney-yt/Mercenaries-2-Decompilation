@@ -1552,6 +1552,14 @@ const PARKED_FAST: f32 = 3.0;
 /// How far a ragdoll's limb may drift off its joint before it is put
 /// back, metres.
 const RAGDOLL_SLACK: f32 = 0.02;
+/// What the 360's body builder (0x8216A290) gives every body of a model's
+/// physics, the ragdoll's among them: angular damping at least 0.8
+/// (0x820B8034, over the record's +0x44), Havok's linear damping left at
+/// its default (none), no bounce, and speed limits of 132 m/s
+/// (0x820F9628) and 3 pi radians a second (0x820F8CC4).
+const RAGDOLL_ANGULAR_DAMPING: f32 = 0.8;
+const RAGDOLL_MAX_SPEED: f32 = 132.0;
+const RAGDOLL_MAX_SPIN: f32 = 9.424_778;
 /// How quickly a wreck stops sliding and spinning, how hard its hull
 /// drags on the ground, and how far down its wheels' rims reach (of the
 /// radius from the centre): invented.
@@ -3674,6 +3682,7 @@ impl Physics {
         self.cap_debris_speeds();
         self.weigh_down_ragdolls(dt);
         self.world.step_with_events(&HavokFriction, &());
+        self.cap_ragdoll_speeds();
         self.hold_ragdolls_together();
         self.settle_debris();
     }
@@ -4117,6 +4126,29 @@ impl Physics {
         }
         if let Some(h) = self.debris.get_mut(id.0).and_then(Option::take) {
             self.world.remove_body_with_colliders(h, true);
+        }
+    }
+
+    /// The game's ragdolls' bodies are held to Havok's speed limits the
+    /// 360's body builder gives them ([`RAGDOLL_MAX_SPEED`],
+    /// [`RAGDOLL_MAX_SPIN`]); rapier has none of its own.
+    fn cap_ragdoll_speeds(&mut self) {
+        for doll in self.ragdolls.iter().flatten() {
+            if doll.joint_handles.is_empty() {
+                continue;
+            }
+            for h in doll.bodies.iter().flatten() {
+                if let Some(b) = self.world.bodies.get_mut(*h) {
+                    let v = vec3(b.linvel());
+                    if v.length() > RAGDOLL_MAX_SPEED {
+                        b.set_linvel(vector(v * (RAGDOLL_MAX_SPEED / v.length())), true);
+                    }
+                    let w = vec3(b.angvel());
+                    if w.length() > RAGDOLL_MAX_SPIN {
+                        b.set_angvel(vector(w * (RAGDOLL_MAX_SPIN / w.length())), true);
+                    }
+                }
+            }
         }
     }
 
@@ -6234,7 +6266,7 @@ impl Physics {
                 r::RigidBodyBuilder::dynamic()
                     .pose(pose(p, q))
                     .linvel(vector(velocity))
-                    .angular_damping(bone.angular_damping)
+                    .angular_damping(bone.angular_damping.max(RAGDOLL_ANGULAR_DAMPING))
                     .ccd_enabled(true),
             );
             let (place, turn) = bone.shape_place;
@@ -8430,6 +8462,27 @@ mod tests {
         p.launch_ragdoll(id, v, Vec3::new(0.0, 1.3, 0.0));
         let fastest = p.ragdoll_speed(id).unwrap();
         assert!((fastest - 0.3 * v.length()).abs() < 1e-3, "{fastest}");
+    }
+
+    /// From the 360 code (0x8216A290): the game's ragdoll's bodies never
+    /// go faster than 132 m/s.
+    #[test]
+    fn the_games_ragdoll_keeps_to_havoks_speed_limit() {
+        let mut p = ready();
+        p.set_human_ragdoll(std::sync::Arc::new(leg_doll()));
+        let nodes: Vec<Mat4> = [2.2, 2.0, 1.9, 1.5]
+            .iter()
+            .map(|&y| Mat4::from_translation(Vec3::new(0.0, y, 0.0)))
+            .collect();
+        let id = p.add_ragdoll_named(
+            &[0x100, 0x101, 0x102, 0x103],
+            &[None, Some(0), Some(1), Some(2)],
+            &nodes,
+            Vec3::new(400.0, 0.0, 0.0),
+        );
+        p.step(DT);
+        let fastest = p.ragdoll_speed(id).unwrap();
+        assert!(fastest <= RAGDOLL_MAX_SPEED + 1e-3, "{fastest}");
     }
 
     #[test]

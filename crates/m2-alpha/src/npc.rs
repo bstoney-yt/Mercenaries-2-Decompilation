@@ -601,6 +601,31 @@ const USE_GIVE_UP: f32 = 30.0;
 
 /// Where a limp body lies: the middle of its nodes over the ground
 /// plane, at their lowest. `None` for no nodes.
+/// The way someone faces as they get up from a limp body whose nodes
+/// (world space) are `nodes`, named by `hashes`: along the ground from
+/// `Bone_Hips` to `Bone_Chest`, turned round unless they lie face down.
+///
+/// From the 360 code (the ragdoll's end, 0x824279F8): she is turned along
+/// the hips-to-chest line across the ground, the other way when a value
+/// of the ragdoll's is over -0.6 (0x820F97A4). **Inferred**: that value is
+/// how far the hips' forward (+z) points up, so lying face down (forward
+/// down) keeps the line and anything else turns it round.
+pub fn getup_yaw(nodes: &[Mat4], hashes: &[u32]) -> Option<f32> {
+    use m2_assets::ragdoll::{CHEST, HIPS};
+    let at = |h: u32| {
+        hashes
+            .iter()
+            .position(|&x| x == h)
+            .and_then(|i| nodes.get(i))
+    };
+    let (hips, chest) = (at(HIPS)?, at(CHEST)?);
+    let mut line = (chest.w_axis - hips.w_axis).truncate().with_y(0.0);
+    if hips.z_axis.y > -0.6 {
+        line = -line;
+    }
+    (line.length_squared() > 1e-8).then(|| line.x.atan2(line.z))
+}
+
 fn limp_middle(nodes: &[Mat4]) -> Option<Vec3> {
     if nodes.is_empty() {
         return None;
@@ -5364,13 +5389,20 @@ impl People {
                 && npc.alive
                 && let Some(id) = npc.ragdoll.take()
             {
-                if let Some(at) = physics.ragdoll_nodes(id).and_then(|n| limp_middle(&n)) {
+                let nodes = physics.ragdoll_nodes(id);
+                if let Some(at) = nodes.as_deref().and_then(limp_middle) {
                     let from = at + Vec3::Y;
                     let y = physics
                         .cast_ray(from, -Vec3::Y, 6.0)
                         .map_or(npc.character.position.y, |(d, _)| from.y - d + 0.05);
                     npc.character.position = Vec3::new(at.x, y, at.z);
                     npc.character.velocity = Vec3::ZERO;
+                }
+                if let Some(yaw) = nodes
+                    .as_deref()
+                    .and_then(|n| getup_yaw(n, &npc.rig.skeleton.name_hashes))
+                {
+                    npc.facing = yaw;
                 }
                 physics.remove_ragdoll(id);
             }
