@@ -482,13 +482,6 @@ pub const DEATH_CLIPS: [(u32, &[u32]); 14] = [
     (0xd9f6_4e93, &[0x10d0_d774]),
 ];
 
-/// The clips of the landing's impact actions, `FallImpactLight` and
-/// `FallImpactHeavy` (`Upright`). From samples: the stance and action
-/// table's handles aaa7ed8d and 9504ae5e give these for anyone holding a
-/// pistol, a rifle or a rocket launcher (`handle_clip`), and nothing
-/// unarmed.
-pub const FALL_IMPACT_CLIPS: [u32; 2] = [0x580a_a328, 0x1897_ecf1];
-
 /// The clips of the staggers a living person hit plays
 /// ([`m2_engine::stagger`]), by stagger and direction. From samples: each
 /// is one `Upright` row of the stance and action table whose handle has
@@ -1870,41 +1863,7 @@ impl Npc {
         self.hurt_by_her = by_her;
         self.killed_by_her = killed_by_her;
         self.alert = alert;
-        if !killed && let Some(impact) = fell.impact {
-            self.fall_impact(impact);
-        }
         killed
-    }
-
-    /// Plays the landing's impact action ([`FALL_IMPACT_CLIPS`]), alive
-    /// after a fall that hurt. From the 360 code: the fall rule
-    /// (0x82205F20) posts `FallImpactLight` (0x9E1B18F4) under
-    /// `FallDistanceHeavy`, else `FallImpactHeavy` (0x56482A61), to the
-    /// person's action queue (0x8323F3C8), unless their action state is
-    /// the ragdoll's `FULL` (0x4294EBA2); a deadly fall posts none.
-    fn fall_impact(&mut self, impact: m2_engine::on_foot::FallImpact) {
-        if self.down.is_some() || self.ragdoll.is_some() {
-            return;
-        }
-        // Unarmed the table has no row for either: nothing is played.
-        if self.gun.is_none() {
-            return;
-        }
-        let want = FALL_IMPACT_CLIPS[usize::from(impact == m2_engine::on_foot::FallImpact::Heavy)];
-        let hash = self.rig.their_clip(want);
-        let Some(clip) = self.rig.clips.iter().position(|r| r.hash == hash) else {
-            return;
-        };
-        eprintln!(
-            "people: {:08x} lands hard: {} ({:08x})",
-            self.spawn.unwrap_or(0),
-            impact.name(),
-            hash
-        );
-        self.rig.animator.set_upper(None);
-        self.rig
-            .animator
-            .play_action(clip, true, m2_assets::name_hash(impact.name()));
     }
 
     /// Takes `damage`; at no health left, falls: true if it killed.
@@ -9120,16 +9079,6 @@ pub(crate) mod tests {
     // A paratrooper (gravity x 0.2) made 20 m up falls from there, slower
     // than a man would, and the landing takes the deadly fall's damage
     // (a soldier's limits: 4 m or more), which the scripts hear.
-    // The landing's impact actions are the ones the 360's fall rule
-    // posts (0x82205F20: 0x9E1B18F4 light, 0x56482A61 heavy), light first.
-    #[test]
-    fn the_fall_impacts_are_the_actions_the_fall_rule_posts() {
-        use m2_engine::on_foot::FallImpact;
-        assert_eq!(m2_assets::name_hash(FallImpact::Light.name()), 0x9e1b_18f4);
-        assert_eq!(m2_assets::name_hash(FallImpact::Heavy.name()), 0x5648_2a61);
-        assert_eq!(FALL_IMPACT_CLIPS, [0x580a_a328, 0x1897_ecf1]);
-    }
-
     #[test]
     fn a_dropped_man_falls_slowly_and_the_landing_hurts() {
         let physics = ground();
