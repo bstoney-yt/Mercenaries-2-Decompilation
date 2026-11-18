@@ -808,20 +808,41 @@ def run(args) -> int:
                 import xmem
 
                 cam = xmem.Camera(xmem.Guest(p.pid))
+                gs = xmem.Guest(p.pid)
                 name = w[1]
+                # the on-foot camera object (vtable 0x820F0290) and its fields, logged per sample
+                cobj = xmem.scan_word(gs, 0x820F0290, limit=8)
+                say(f"stickresp2 {name}: camera objects (vtable 0x820F0290) at {[hex(a) for a in cobj]}")
+                cobj = cobj[0] if cobj else None
+                F_OFF = (("ramp", 0x750, "f"), ("pull", 0x770, "f"), ("row9e0", 0x9E0, "f"), ("row9e4", 0x9E4, "f"),
+                         ("fyaw", 0x610, "f"), ("fpitch", 0x648, "f"), ("yawx", 0x638, "f"), ("aim", 0x7CD, "b"))
+
+                def fields():
+                    out = []
+                    sens = gs.read(0x83457484, 4)
+                    out.append(struct.unpack(">f", sens)[0] if sens else float("nan"))
+                    for _, off, k in F_OFF:
+                        b = gs.read(cobj + off, 4 if k == "f" else 1) if cobj else None
+                        out.append(float("nan") if not b else (struct.unpack(">f", b)[0] if k == "f" else b[0]))
+                    for ga in (0x8380EE90, 0x8380EE88):
+                        b = gs.read(ga, 4)
+                        out.append(struct.unpack(">f", b)[0] if b else float("nan"))
+                    return out
+
                 vals = w[2:] or ["x0.5", "x0.75", "x1", "x-1", "y0.5", "y0.75", "y1", "y-0.5", "y-0.75", "y-1"]
                 with open(Path(args.out) / f"{name}.csv", "w", newline="") as fh:
                     wr = csv.writer(fh)
-                    wr.writerow(["hold", "t", "yaw", "pitch"])
+                    wr.writerow(["hold", "t", "yaw", "pitch", "sens", *(f[0] for f in F_OFF), "g8380EE90", "g8380EE88"])
                     for hv in vals:
                         axis, v = hv[0], float(hv[1:])
-                        lv = time.time() + 6
+                        lv = time.time() + 10
                         while time.time() < lv:
                             pv = cam.pitch()
                             if pv is None or abs(pv) < 2:
                                 break
-                            apply(0, 0, 0, 0.0, 0.0, 0.0, max(-1.0, min(1.0, -pv / 25)) if abs(pv) > 6 else (-0.6 if pv > 0 else 0.6))
-                            time.sleep(0.03)
+                            # the stick's dead zone is about 0.5: step it (1.0 far, 0.75 near)
+                            apply(0, 0, 0, 0.0, 0.0, 0.0, (-1.0 if pv > 0 else 1.0) * (1.0 if abs(pv) > 10 else 0.75))
+                            time.sleep(0.01)
                         apply()
                         time.sleep(1.0)
                         t_s, smp, uy, last = time.time(), [], 0.0, None
@@ -834,7 +855,7 @@ def run(args) -> int:
                                 last = yv
                                 tt = time.time() - t_s
                                 smp.append((tt, uy, pv))
-                                wr.writerow([hv, f"{tt:.3f}", f"{uy:.3f}", f"{pv:.3f}"])
+                                wr.writerow([hv, f"{tt:.3f}", f"{uy:.3f}", f"{pv:.3f}", *(f"{x:.5g}" for x in fields())])
                             time.sleep(0.01)
                         apply()
 

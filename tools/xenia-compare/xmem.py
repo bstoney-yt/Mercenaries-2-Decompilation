@@ -526,3 +526,20 @@ def healths(g: Guest) -> dict[tuple[int, int], float]:
             if b:
                 out[(t, k)] = struct.unpack(">f", b)[0]
     return out
+
+
+def scan_word(g: Guest, word: int, lo: int = 0, hi: int = 0xA000_0000, limit: int = 16) -> list[int]:
+    """Guest addresses (4-aligned) holding the big-endian 32-bit word (e.g. a vtable)."""
+    hits = []
+    for base, size in g.regions(lo, hi):
+        for off in range(0, size, 1 << 24):
+            n = min(1 << 24, size - off)
+            b = g.read(base + off, n)
+            if not b or len(b) < 4:
+                continue
+            u = np.frombuffer(b[: len(b) // 4 * 4], dtype=">u4")
+            for i in np.nonzero(u == word)[0]:
+                hits.append(base + off + 4 * int(i))
+                if len(hits) >= limit:
+                    return hits
+    return hits
