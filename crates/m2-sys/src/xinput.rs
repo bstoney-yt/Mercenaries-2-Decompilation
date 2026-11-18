@@ -13,6 +13,9 @@ pub struct PadState {
     /// dead zones they read 0.
     pub left: [f32; 2],
     pub right: [f32; 2],
+    /// The right stick before any dead zone, -1..=1 (the raw axes over
+    /// 32767), for a reader with its own (the game's camera).
+    pub right_raw: [f32; 2],
     /// The triggers, 0..=1; under XInput's threshold they read 0.
     pub left_trigger: f32,
     pub right_trigger: f32,
@@ -87,6 +90,10 @@ pub fn poll() -> Option<PadState> {
                 buttons: g.wButtons.0,
                 left: stick(g.sThumbLX, g.sThumbLY, LEFT_DEAD_ZONE),
                 right: stick(g.sThumbRX, g.sThumbRY, RIGHT_DEAD_ZONE),
+                right_raw: [
+                    (f32::from(g.sThumbRX) / 32767.0).max(-1.0),
+                    (f32::from(g.sThumbRY) / 32767.0).max(-1.0),
+                ],
                 left_trigger: trigger(g.bLeftTrigger),
                 right_trigger: trigger(g.bRightTrigger),
             }

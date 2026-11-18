@@ -310,10 +310,54 @@ pub struct Constraint {
     pub axis: [f32; 3],
     /// A slide's shut and open places (+0x98, minus +0x9C).
     pub slide: (f32, f32),
+    /// A hinge is limited (+0x5C non-zero): it turns from `open - limit`
+    /// to `open` degrees (the 360's hinge builder 0x8216A5D8, which makes
+    /// a plain hinge when the word is 0).
+    pub limited: bool,
+    /// The joint's friction (+0x58): the limited hinge's and the ragdoll
+    /// joint's most friction torque.
+    pub friction: f32,
+    /// A ragdoll joint's ([`RAGDOLL`]) two axes, model space: +0x40 and
+    /// +0x4C.
+    pub ragdoll_axes: [[f32; 3]; 2],
+    /// A ragdoll joint's six angles, degrees, by offset: +0x28 and +0x2C,
+    /// +0x30 and +0x34, +0x38 and +0x3C ([`Constraint::twist`],
+    /// [`Constraint::cone`], [`Constraint::plane`]).
+    pub ragdoll_angles: [f32; 6],
+}
+
+impl Constraint {
+    /// A ragdoll joint's twist limits, degrees (+0x28, +0x2C): the 360's
+    /// builder (0x8216AD30) stores them in radians at its Havok
+    /// constraint's +0x104 and +0x108. Naming as twist, cone and plane is
+    /// inferred (the order of a Havok ragdoll constraint's limits).
+    pub fn twist(&self) -> (f32, f32) {
+        (self.ragdoll_angles[0], self.ragdoll_angles[1])
+    }
+
+    /// A ragdoll joint's cone pair, degrees (+0x30, +0x34): the builder
+    /// passes them negated, in radians, to 0x8262FDF0.
+    pub fn cone(&self) -> (f32, f32) {
+        (self.ragdoll_angles[2], self.ragdoll_angles[3])
+    }
+
+    /// A ragdoll joint's plane limits, degrees (+0x38, +0x3C): stored in
+    /// radians at +0x12C and +0x130.
+    pub fn plane(&self) -> (f32, f32) {
+        (self.ragdoll_angles[4], self.ragdoll_angles[5])
+    }
+
+    /// A limited hinge's range, degrees: `open - limit` to `open`.
+    pub fn hinge_range(&self) -> (f32, f32) {
+        (self.open - self.limit, self.open)
+    }
 }
 
 /// The hinge kind of [`Constraint::kind`].
 pub const HINGE: u32 = 4;
+/// The ragdoll joint kind (the 360's builder 0x8216B350 makes it with
+/// 0x8216AD30): the human ragdoll's shoulders, hips, neck and spine.
+pub const RAGDOLL: u32 = 5;
 /// The slide kind.
 pub const SLIDE: u32 = 7;
 
@@ -407,6 +451,17 @@ fn constraints(
             open: float(o + 0x64)?,
             axis: v3(o + 0x68)?,
             slide: (float(o + 0x98)?, -float(o + 0x9C)?),
+            limited: word(o + 0x5C)? != 0,
+            friction: float(o + 0x58)?,
+            ragdoll_axes: [v3(o + 0x40)?, v3(o + 0x4C)?],
+            ragdoll_angles: [
+                float(o + 0x28)?,
+                float(o + 0x2C)?,
+                float(o + 0x30)?,
+                float(o + 0x34)?,
+                float(o + 0x38)?,
+                float(o + 0x3C)?,
+            ],
         });
     }
     Some(out)
@@ -1016,6 +1071,10 @@ mod tests {
                 limit: 180.0,
                 axis: [0.0, -1.0, 0.0],
                 slide: (0.0, -0.0),
+                limited: false,
+                friction: 0.0,
+                ragdoll_axes: [[0.0; 3]; 2],
+                ragdoll_angles: [0.0; 6],
             }]
         );
         put(&mut b, at + CONSTRAINT_LEN - 4, 0);

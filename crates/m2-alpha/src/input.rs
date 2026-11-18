@@ -414,6 +414,8 @@ pub struct Input {
     stick: [f32; 2],
     /// The right stick's turn since the last tick, in mouse counts.
     pad_look: (f64, f64),
+    /// The pad's on-foot camera turn, radians (yaw right, pitch up).
+    pad_turn: (f64, f64),
 }
 
 impl Input {
@@ -498,6 +500,18 @@ impl Input {
     }
 
     /// The right stick turned the view by this many mouse counts.
+    /// The pad's on-foot camera turned: yaw radians to the right, pitch
+    /// radians up ([`crate::pad::Pad`]).
+    pub fn pad_turn(&mut self, yaw: f64, pitch: f64) {
+        self.pad_turn.0 += yaw;
+        self.pad_turn.1 += pitch;
+    }
+
+    /// The pad's turn since the last call ([`pad_turn`](Self::pad_turn)).
+    pub fn take_pad_turn(&mut self) -> (f64, f64) {
+        std::mem::take(&mut self.pad_turn)
+    }
+
     pub fn pad_look(&mut self, dx: f64, dy: f64) {
         self.pad_look.0 += dx;
         self.pad_look.1 += dy;
@@ -541,6 +555,7 @@ impl Input {
         self.stick_pushes.clear();
         self.stick = [0.0; 2];
         self.pad_look = (0.0, 0.0);
+        self.pad_turn = (0.0, 0.0);
     }
 
     pub fn held(&self, action: Action) -> bool {
