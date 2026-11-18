@@ -2127,19 +2127,19 @@ impl Game {
                 db.id(&v.spec.label)
                     .and_then(|t| db.sound_keys.get(&t).copied())
             };
-            for &(struck, other, _, _) in crashes.iter().filter(|c| c.0 < c.1) {
+            // Heard where they met (the contact's point: the 360 plays a
+            // contact's cue at the collision event's place, 0x8235E3A8).
+            for &(struck, other, _, _, at) in crashes.iter().filter(|c| c.0 < c.1) {
                 let (a, b) = (&self.scene.vehicles[struck], &self.scene.vehicles[other]);
                 let cue = match (key_of(a), key_of(b), db.sound_table.as_ref()) {
                     (Some(ka), Some(kb), Some(t)) => t.either(ka, kb),
                     _ => None,
                 };
-                if let (Some(cue), Some(at)) =
-                    (cue, a.id.and_then(|id| world.physics.vehicle_transform(id)))
-                {
-                    self.combat.broke(at.w_axis.truncate(), cue);
+                if let Some(cue) = cue {
+                    self.combat.broke(at, cue);
                 }
             }
-            for (struck, other, closing, damage) in crashes {
+            for (struck, other, closing, damage, _) in crashes {
                 let v = &self.scene.vehicles[struck];
                 eprintln!(
                     "crash: the {} hit by the {} at {closing:.1} m/s takes {damage:.1} ({:.0} of {:.0} left)",

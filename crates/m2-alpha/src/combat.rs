@@ -5397,7 +5397,7 @@ impl Combat {
     /// the hundredth from a car or a tank, a `Tank` none, and nothing
     /// under size 5 or past no more than 1. The part where they met takes the same. Returns the
     /// crashes, for the log: (struck vehicle, the other, closing speed,
-    /// damage it took). From the 360 code: the size, floor, hundredth and
+    /// damage it took, where they met: the deepest point of contact). From the 360 code: the size, floor, hundredth and
     /// cells (0x82162BB8, 0x82163758, 0x8228B5F0, 0x82287CF8). Inferred:
     /// one crash per meeting (the 360 sends one for each new contact),
     /// and the `DamageModifier` multiplier (a body landing on another
@@ -5406,7 +5406,7 @@ impl Combat {
         &mut self,
         physics: &mut Physics,
         vehicles: &mut [ParkedVehicle],
-    ) -> Vec<(usize, usize, f32, f32)> {
+    ) -> Vec<(usize, usize, f32, f32, Vec3)> {
         let mut now = std::collections::HashSet::new();
         let mut met = Vec::new();
         for (i, v) in vehicles.iter().enumerate() {
@@ -5451,7 +5451,7 @@ impl Combat {
                 };
                 let damage = m2_engine::durability::crash_damage(size, cell);
                 if damage <= 0.0 {
-                    out.push((struck, other, closing, 0.0));
+                    out.push((struck, other, closing, 0.0, at));
                     continue;
                 }
                 let v = &mut vehicles[struck];
@@ -5459,7 +5459,7 @@ impl Combat {
                     v.hit_parts(body, at, damage);
                 }
                 self.hurt_vehicle(physics, v, struck, damage);
-                out.push((struck, other, closing, damage));
+                out.push((struck, other, closing, damage, at));
             }
         }
         out
