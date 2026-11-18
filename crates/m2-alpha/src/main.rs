@@ -249,6 +249,9 @@ struct Options {
     /// With `--drive` and `--wreck` or `--shoot-up`: get out of the wreck,
     /// walk to the fuel can it left and take it (testing).
     fuel_check: bool,
+    /// `--binocular-check`: the binoculars driven by a scripted look and
+    /// zoom, offscreen, PASS/FAIL against the 360 ([`binoculars::check`]).
+    binocular_check: bool,
     /// With `--drive`: stop and put this many rifle rounds into its parts.
     shoot_up: Option<u32>,
     /// With `--drive`: fire from the next seat with a weapon.
@@ -783,6 +786,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--plough" => o.plough = Some(value()?.to_ascii_lowercase()),
             "--wreck" => o.wreck = true,
             "--fuel-check" => o.fuel_check = true,
+            "--binocular-check" => o.binocular_check = true,
             "--shoot-up" => {
                 o.shoot_up = Some(
                     value()?
@@ -1330,6 +1334,9 @@ fn run(
     if options.write_config {
         print!("{}", config.to_toml());
         return Ok(());
+    }
+    if options.binocular_check {
+        std::process::exit(if binoculars::check() { 0 } else { 1 });
     }
     let install = match &config.install {
         Some(dir) => Some(Install::find(dir)?),

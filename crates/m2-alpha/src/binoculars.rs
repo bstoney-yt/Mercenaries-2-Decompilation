@@ -99,6 +99,95 @@ impl Binoculars {
     }
 }
 
+/// `--binocular-check`: the binoculars driven the way the game drives
+/// them ([`Binoculars::step`]) by a scripted look, zoom axis and wheel,
+/// offscreen and without a world, against #724's 360 numbers. Prints
+/// `binocular-check: PASS ...` or `FAIL ...` lines and
+/// `binocular-check: RESULT PASS` (or `FAIL`); whether all passed.
+pub fn check() -> bool {
+    use m2_engine::binocular_camera::{PITCH_LIMITS, YAW_LIMIT};
+    use m2_math::glam::Vec3;
+    let dt = 1.0 / 60.0;
+    let mut ok = true;
+    let mut line = |pass: bool, what: String| {
+        ok &= pass;
+        eprintln!(
+            "binocular-check: {} {what}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+    };
+    let frames = |s: f32| (s / dt).round() as usize;
+    let mut b = Binoculars::up(0.0, 0.0);
+    line(
+        b.zoom() == 2.0,
+        format!("up: zoom {:.3} (360: 2.0, +0x600)", b.zoom()),
+    );
+    let lens = b.camera.fov(m2_engine::projection::FOV);
+    line(
+        (lens - 0.479_875).abs() < 1e-5,
+        format!("up: lens {lens:.5} rad (360: 0.95975 / 2 = 0.47988, +0x5D8)"),
+    );
+    let eye = b.camera.eye(Vec3::ZERO, false);
+    line(
+        (eye - Vec3::new(0.0, 2.0, 0.2)).length() < 1e-5,
+        format!("up: eye {eye:.2?} from her feet (360: 2 m up, 0.2 m ahead)"),
+    );
+    for _ in 0..frames(1.0) {
+        b.step([0.0; 2], 1.0, 0, dt);
+    }
+    line(
+        ((b.zoom() - 5.414) / 5.414).abs() < 0.01,
+        format!(
+            "zoom axis full 1 s: zoom {:.3} (360: 2 x (1 + 1/60)^60 = 5.41, about 2e; +-1%)",
+            b.zoom()
+        ),
+    );
+    for _ in 0..frames(2.0) {
+        b.step([0.0; 2], 1.0, 0, dt);
+    }
+    line(
+        b.zoom() == 7.0,
+        format!("zoom axis full 3 s: zoom {:.3} (360: held at 7)", b.zoom()),
+    );
+    // The look turning right as fast as counts as full stick.
+    let full = std::f32::consts::PI * dt;
+    for _ in 0..frames(2.0) {
+        b.step([-full, 0.0], 0.0, 0, dt);
+    }
+    let before = b.camera.yaw;
+    b.step([-full, 0.0], 0.0, 0, dt);
+    let rate = (before - b.camera.yaw) / dt;
+    line(
+        (rate - 1.0 / 7.0).abs() < 1e-3,
+        format!("full right at 7x: {rate:.4} rad/s (360: 1/zoom = 0.1429)"),
+    );
+    for _ in 0..frames(60.0) {
+        b.step([-full, 0.0], 0.0, 0, dt);
+    }
+    line(
+        (b.camera.yaw + YAW_LIMIT).abs() < 1e-4,
+        format!(
+            "full right 60 s: heading {:.4} rad (360: held 1.5 from where they came up)",
+            b.camera.yaw
+        ),
+    );
+    for _ in 0..frames(60.0) {
+        b.step([0.0, full], 0.0, 0, dt);
+    }
+    line(
+        (b.camera.pitch - PITCH_LIMITS.1).abs() < 1e-5,
+        format!(
+            "full up 60 s: pitch {:.5} rad (360: held at 0.90425)",
+            b.camera.pitch
+        ),
+    );
+    eprintln!(
+        "binocular-check: RESULT {}",
+        if ok { "PASS" } else { "FAIL" }
+    );
+    ok
+}
+
 /// The lens, radians, for the game's field of view `fov` (radians)
 /// magnified `zoom` times: the 360's binocular and scope camera divides
 /// the angle itself (0x824BF700).
