@@ -645,14 +645,14 @@ pub(crate) const BLAST_PUSH: (f32, f32) = (9.0, 6.0);
 const SHOT_PUSH: f32 = 2.0;
 pub(crate) const REACH: f32 = 9.0;
 
-/// What she loses when the vehicle she sits in is wrecked (health). From
-/// the 360 code: the rider system, putting a seated rider out of a dead
-/// vehicle (0x822A5D98, rider state 0), posts the player's character a
-/// damage message of 100.0 (0x820D9F18) on the damage queue 0x8318C480
-/// (other riders are killed instead, 0x831AD128). Footage agrees (Xenia,
-/// the Phoenix (Racing) with Mattias burnt out: 100.1 and 100.5 lost);
-/// [`Combat::her_vehicle_wrecked`].
-pub(crate) const WRECK_RIDER_DAMAGE: f32 = 100.0;
+/// How she leaves the vehicle she sits in when it is wrecked: thrown
+/// clear, `(away, up)` m/s, away from its middle. From footage (Xenia,
+/// round 3, six wrecks, instant and slower, health 50 to 100): thrown
+/// 7.5 to 11 m sideways, 1.6 to 2.9 m up, landing 1.3 to 1.7 s later,
+/// with no health lost at the wreck; 6 and 7 m/s land her about 8.5 m
+/// out, 2.5 m up at the top, 1.4 s later. Not established in code (see
+/// [`Combat::her_vehicle_wrecked`]).
+pub(crate) const WRECK_THROW: (f32, f32) = (6.0, 7.0);
 /// The satellite-guided bomb's blasts, from the template database's
 /// laser-guided bomb ("Explosion (Airstike Bomb)" 80008e3f, its frag
 /// "Explosion (Airstrike Frag)" 8000a3df, and its final strike 8000af7d
@@ -4150,23 +4150,24 @@ impl Combat {
         }
     }
 
-    /// The vehicle she is in was wrecked: she is put out of it, beside
-    /// it at its door, and loses [`WRECK_RIDER_DAMAGE`]; she is not
-    /// thrown and not knocked down.
+    /// The vehicle she is in was wrecked: she is put out of it at its
+    /// door and thrown clear ([`WRECK_THROW`]), hurt only by her landing
+    /// (her fall's own damage).
     ///
     /// From the 360 code: the rider system hears the vehicle's death
-    /// (queue 0x831B21C0, 0x82299918 -> 0x822A5D98); a rider seated
-    /// (state 0) is put out by 0x822A1280 and, the player's character,
-    /// takes 100.0 (0x820D9F18) as a damage message. From footage
-    /// (Xenia, a car that burnt out with Mattias in it, two runs): out
-    /// beside it, 1.5 and 1.7 m from its middle, no throw, 100.1 and 100.5
-    /// lost. Not established: a car wrecked at once by a crash threw her
-    /// 7.5 to 11 m clear with no such loss there (Xenia round 2), as if
-    /// she were no longer seated when it died (rider state other than 0:
-    /// 0x822A5D98 then only puts her out, 0x822A3758 for state 1); what
-    /// takes her out of the seat in that crash, and the throw, are not
-    /// traced (the seat's `TossSpeedChange`, default -1, and
-    /// `MinDitchSpeed`, 5, reflected at 0x823F1988, are leads).
+    /// (queue 0x831B21C0, 0x82299918 -> 0x822A5D98) and puts a seated
+    /// rider out (0x822A1280 -> 0x822A2648 -> 0x822A13D0, which places
+    /// her by the seat's exit and posts an empty action to her action
+    /// component 0x83656C20: no launch there). It then posts the
+    /// player's character a 100.0 damage message (0x820D9F18, queue
+    /// 0x8318C480, direction up); footage shows no loss (Xenia round 3),
+    /// so it is taken as blocked while she is still the vehicle's rider
+    /// (0x822889F8 passes nothing to a rider whose seat isn't
+    /// `bIsPlayerVulnerable`; inferred, the order not traced) and not
+    /// dealt. What throws her is not established: the car's wreck blast
+    /// (`fx_Explosion_Large`, started by its body's wreck state) lifts the
+    /// car about 5 m in the footage and may be what throws her too; the
+    /// throw is from footage.
     fn her_vehicle_wrecked(&mut self, f: &mut Field<'_>) {
         let Some(i) = f.player.driving else {
             return;
@@ -4186,17 +4187,17 @@ impl Combat {
         }
         self.seat = 0;
         let label = v.spec.label.clone();
-        let lost = self.hurt_player(f, WRECK_RIDER_DAMAGE, Some(middle));
-        self.tally.taken_blasts += lost;
-        let away = f
-            .player
-            .character
-            .position
+        let side = body.x_axis.truncate().with_y(0.0).normalize_or(Vec3::X);
+        let away = (f.player.character.position - middle)
             .with_y(0.0)
-            .distance(middle.with_y(0.0));
+            .normalize_or(side);
+        f.player
+            .throw(away * WRECK_THROW.0 + Vec3::Y * WRECK_THROW.1);
+        let (out, up) = WRECK_THROW;
         eprintln!(
-            "wreck: the {label} she is in is wrecked: she is put out {away:.1} m from its \
-             middle, {lost:.1} health lost"
+            "wreck: the {label} she is in is wrecked: she is put out and thrown, {out:.1} m/s \
+             away, {up:.1} m/s up, from {:.1}",
+            f.player.character.position
         );
     }
 
@@ -8149,7 +8150,7 @@ mod tests {
     }
 
     #[test]
-    fn her_wrecked_vehicle_puts_her_out_beside_it_100_down() {
+    fn her_wrecked_vehicle_throws_her_clear_unhurt() {
         use m2_engine::tuning::VehicleTuning;
         let mut physics = ground();
         let dt = 1.0 / 60.0;
@@ -8200,15 +8201,14 @@ mod tests {
         combat.step(&mut field, Trigger::default(), dt);
         assert_eq!(field.player.driving, Some(0));
         assert_eq!(combat.hp, full);
-        // Wrecked: out of it, beside it (not thrown), 100 down.
+        // Wrecked: out of it, thrown clear, not hurt by the wreck.
         field.vehicles[0].wrecked = true;
         combat.step(&mut field, Trigger::default(), dt);
         assert_eq!(field.player.driving, None);
-        assert!(
-            (full - combat.hp - WRECK_RIDER_DAMAGE).abs() < 0.01,
-            "{} of {full}",
-            combat.hp
-        );
+        assert_eq!(combat.hp, full, "no health lost at the wreck");
+        let v = field.player.character.velocity;
+        assert!((v.y - WRECK_THROW.1).abs() < 1e-3, "{v}");
+        assert!((v.with_y(0.0).length() - WRECK_THROW.0).abs() < 1e-3, "{v}");
         let middle = field
             .physics
             .vehicle_transform(id)

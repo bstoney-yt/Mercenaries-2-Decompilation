@@ -353,6 +353,10 @@ pub struct Player {
     /// Set as she lands after her floor went (taken by the log of what
     /// stands there).
     pub floor_landed: bool,
+    /// Thrown clear of a wrecked vehicle ([`crate::combat::WRECK_THROW`]):
+    /// she keeps the throw's speed, not steering, falling under the
+    /// world's gravity rather than her own, until she lands ([`Player::throw`]).
+    pub thrown: bool,
     pub model: Option<(GpuModel, Rig)>,
     /// On a ladder: where the climb holds her and what she plays
     /// ([`crate::ladders`]).
@@ -644,6 +648,7 @@ impl Player {
             waited: 0,
             floor_gone: false,
             floor_landed: false,
+            thrown: false,
             models_coming: false,
             model,
             ladder: None,
@@ -711,6 +716,19 @@ impl Player {
             swim: None,
             holstered: false,
         }
+    }
+
+    /// Throws her at `velocity` (m/s): off the ground, not steering, and
+    /// falling under the world's gravity ([`m2_engine::physics::GRAVITY`])
+    /// rather than her template's, as a body thrown limp does, until she
+    /// lands. Inferred: the footage's arc (Xenia, a wrecked car's rider:
+    /// 1.6 to 2.9 m up, down 1.3 to 1.7 s later) fits the world's 9.81,
+    /// not her 16.5.
+    pub fn throw(&mut self, velocity: Vec3) {
+        self.character.velocity = velocity;
+        self.character.grounded = false;
+        self.character.gravity = m2_engine::physics::GRAVITY;
+        self.thrown = true;
     }
 
     /// Takes her template's `_HumanPhysics` tuning: her jump, the gravity
@@ -1217,7 +1235,9 @@ impl Player {
             self.unsupported + dt
         };
         let have = Vec2::new(self.character.velocity.x, self.character.velocity.z);
-        let ground = if self.character.grounded {
+        let ground = if self.thrown {
+            have
+        } else if self.character.grounded {
             on_foot::ground_step(have, ground, on_foot::GROUND_MAX_ACCEL * dt)
         } else if self.unsupported < on_foot::LEDGE_GRACE && !matches!(self.leap, Leap::Air(_)) {
             on_foot::ground_step(have, ground, on_foot::LEDGE_MAX_CHANGE)
@@ -1239,6 +1259,10 @@ impl Player {
             self.jump_step(intent.jump, bashing, walking.length_squared(), dt);
         let jump = launch.then(|| self.motion.jump_speed());
         physics.move_character(&mut self.character, wanted, jump, dt);
+        if self.thrown && self.character.grounded {
+            self.thrown = false;
+            self.character.gravity = self.motion.gravity;
+        }
         // A fall that hurts: the 360 measures it from where she left the
         // ground, and by her template's limits it costs her health and
         // posts `FallImpactLight` or `FallImpactHeavy`.
@@ -2255,6 +2279,38 @@ mod tests {
         );
         p.step(1.0 / 60.0);
         p
+    }
+
+    #[test]
+    fn thrown_clear_she_keeps_the_throw_until_she_lands() {
+        let physics = ground();
+        let mut p = Player::new(0.0, 0.0, 0.0, None);
+        let dt = 1.0 / 60.0;
+        for _ in 0..usize::from(SETTLED) {
+            p.update(&physics, Intent::default(), dt);
+        }
+        assert!(p.landed);
+        let from = p.character.position;
+        // A wrecked car's throw, as Combat::her_vehicle_wrecked gives it.
+        let (out, up) = crate::combat::WRECK_THROW;
+        p.throw(Vec3::X * out + Vec3::Y * up);
+        let mut top = 0.0f32;
+        let mut t = 0.0;
+        loop {
+            p.update(&physics, Intent::default(), dt);
+            t += dt;
+            top = top.max(p.character.position.y - from.y);
+            if p.character.grounded || t > 3.0 {
+                break;
+            }
+        }
+        let across = p.character.position.x - from.x;
+        // Footage: 7.5 to 11 m out, 1.6 to 2.9 m up, 1.3 to 1.7 s.
+        assert!((7.5..=11.0).contains(&across), "{across} m out");
+        assert!((1.6..=2.9).contains(&top), "{top} m up");
+        assert!((1.3..=1.7).contains(&t), "{t} s");
+        assert!(!p.thrown);
+        assert_eq!(p.character.gravity, JENNIFER.gravity);
     }
 
     #[test]
