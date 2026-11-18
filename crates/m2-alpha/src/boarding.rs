@@ -34,7 +34,7 @@ pub struct Boarding {
     /// Getting out.
     pub exiting: bool,
     /// Over to this seat (`SeatLink` name) once in ([`Step::Transfer`]):
-    /// hero.lua slid her over from the seat she got in by, or the seat key.
+    /// hero.lua slid her over from the seat she got in by.
     pub transfer_to: Option<u32>,
     /// The clip playing: its step, once begun.
     pub step: Option<Step>,
@@ -70,15 +70,6 @@ impl Boarding {
         Self {
             exiting: true,
             ..Self::enter(vehicle, seat, entrance)
-        }
-    }
-
-    /// Over from seat `from` to `to` (seated already).
-    pub fn transfer(vehicle: usize, from: Option<u32>, to: u32) -> Self {
-        Self {
-            transfer_to: Some(to),
-            step: Some(Step::Transfer),
-            ..Self::enter(vehicle, from, None)
         }
     }
 

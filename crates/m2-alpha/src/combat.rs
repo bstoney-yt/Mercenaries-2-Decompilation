@@ -1608,7 +1608,8 @@ pub struct Trigger {
     pub next_explosive: bool,
     /// Set off her C4.
     pub detonate: bool,
-    /// Move to the vehicle's next seat with a weapon.
+    /// The d-pad's up or down in a vehicle: the HUD's counters shown
+    /// (the 360's `ShowAllCounters`); it moves her to no other seat.
     pub seat: bool,
     /// The support keys, up and down: the support menu opens, or its
     /// line moves ([`crate::support`]).
@@ -3280,16 +3281,10 @@ impl Combat {
                 }
             }
         }
-        match f.player.driving {
-            // Of a vehicle without seat data (the game moves her over its
-            // seats' links otherwise, `crate::ride::transfer`): the next
-            // armed seat (Invented).
-            Some(i) if trigger.seat && self.seat != NO_GUN => {
-                let seats = f.vehicles.get(i).map_or(1, |v| armed_seats(v).len());
-                self.seat = (self.seat + 1) % seats.max(1);
-            }
-            Some(_) => {}
-            None => self.seat = 0,
+        // Her seat is the one she got in by (or slid over to); no key
+        // moves her to another (the 360 has none).
+        if f.player.driving.is_none() {
+            self.seat = 0;
         }
         if f.player.driving.is_none() {
             self.vehicle_gun = 0;

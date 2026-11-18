@@ -385,7 +385,7 @@ hold F (or the middle button) to sound the horn.
 Fighting (mouse captured): left button fires, Tab or the wheel switches
 weapon, R reloads, right button or G throws a grenade, V picks the next
 explosive, F or the middle button bashes (a supply crate breaks open),
-X sets off C4, Y moves to the next seat. 4 or Right (the view switch) does
+X sets off C4, Y in a vehicle shows the HUD's counters. 4 or Right (the view switch) does
 nothing yet.
 Support: 1 or Up (and 2 or Down) opens the support menu and moves its
 line, and E takes up the item's designator and looks through the
