@@ -1074,6 +1074,8 @@ pub struct MissionLink {
     /// Interface sounds the scripts cued (`ui_HUD_Objective_New`), and
     /// whether each is to stop instead.
     sounds: Vec<(String, bool)>,
+    /// `--mine-check` ([`crate::mines::MineCheck`]).
+    mine_check: Option<crate::mines::MineCheck>,
     /// Sound category fades and pitches the scripts asked for.
     fades: Vec<crate::sound::CategoryChange>,
     /// The music cue the scripts last switched to (`Some(None)`: none).
@@ -1258,6 +1260,7 @@ impl MissionLink {
             hushed: Vec::new(),
             voice_banks: Vec::new(),
             sounds: Vec::new(),
+            mine_check: None,
             fades: Vec::new(),
             music: None,
             music_at: None,
@@ -1539,6 +1542,13 @@ impl MissionLink {
     /// The job she was skipped to, and where it stands.
     pub fn job(&self) -> Option<&crate::jobs::JobRun> {
         self.job.as_ref()
+    }
+
+    /// `--mine-check`: the nearest placed mine is blasted and run into
+    /// ([`crate::mines::MineCheck`]).
+    pub fn with_mine_check(mut self, on: bool) -> Self {
+        self.mine_check = on.then(crate::mines::MineCheck::default);
+        self
     }
 
     /// With a job to follow: she is put this far from its nearest target
@@ -3522,7 +3532,10 @@ impl MissionLink {
                 }
             }
             // Placed mines run into or blasted, her mines armed.
-            crate::mines::report(game, mission, &self.blasts, BLAST_REACH);
+            crate::mines::report(game, mission);
+            if let Some(check) = &mut self.mine_check {
+                check.tick(game, mission, STEP);
+            }
             self.blasts.clear();
             self.bombs.clear();
             // The scripts heal her and watch her health.

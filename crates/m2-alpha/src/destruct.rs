@@ -1273,6 +1273,30 @@ mod tests {
     }
 
     #[test]
+    fn a_placed_mine_goes_under_any_vehicle_that_meets_it() {
+        // `Mine (Vehicle)`'s record: flattened, taking 0 kg.
+        let mine = Some(Crash {
+            how: CrashHow::Flattened,
+            takes: 0.0,
+        });
+        let key = StaticKey::Entity(0x40);
+        let bike = Crasher {
+            mass: 150.0,
+            ..jeep(Vec3::ZERO)
+        };
+        assert_eq!(bike.does(key, mine, true), Some(Crashed::Down(key)));
+        assert_eq!(bike.does(key, mine, false), Some(Crashed::Down(key)));
+        // A 40 cm mine, 10 cm high: under the nose it is met; 1.5 m to
+        // the jeep's side, or under a helicopter 10 m up, it is not.
+        let disc = (Vec3::new(-0.2, 0.0, -0.2), Vec3::new(0.2, 0.1, 0.2));
+        let under = Mat4::from_translation(Vec3::new(0.0, 0.0, 2.0));
+        assert!(jeep(Vec3::ZERO).meets(under, disc));
+        let aside = Mat4::from_translation(Vec3::new(1.5, 0.0, 0.0));
+        assert!(!jeep(Vec3::ZERO).meets(aside, disc));
+        assert!(!jeep(Vec3::Y * 10.0).meets(under, disc));
+    }
+
+    #[test]
     fn a_ram_into_something_fixed_is_the_360s_crash() {
         use m2_engine::durability::{crash_base, crash_size};
         // A jeep at 10 m/s, a tank at 8, against a fixed body (15 t).
