@@ -249,6 +249,10 @@ struct Options {
     /// With `--drive` and `--wreck` or `--shoot-up`: get out of the wreck,
     /// walk to the fuel can it left and take it (testing).
     fuel_check: bool,
+    /// `--wreck-blast-check`: the car she drives is wrecked with her
+    /// 5.9 m off, and its flight and her health are logged against the
+    /// 360's (`wreck-blast-check:` lines, [`wreck_blast_check`]).
+    wreck_blast_check: bool,
     /// With `--drive`: stop and put this many rifle rounds into its parts.
     shoot_up: Option<u32>,
     /// With `--drive`: fire from the next seat with a weapon.
@@ -783,6 +787,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--plough" => o.plough = Some(value()?.to_ascii_lowercase()),
             "--wreck" => o.wreck = true,
             "--fuel-check" => o.fuel_check = true,
+            "--wreck-blast-check" => {
+                o.wreck_blast_check = true;
+                o.drive = true;
+            }
             "--shoot-up" => {
                 o.shoot_up = Some(
                     value()?
@@ -7679,6 +7687,10 @@ fn drive_for_screenshot(
             .collect::<Vec<_>>()
             .join(", ")
     );
+    if options.wreck_blast_check {
+        wreck_blast_check(game, tick);
+        return Ok(());
+    }
     if options.wreck {
         wreck_at_speed(game, tick);
     }
@@ -8562,6 +8574,99 @@ fn fuel_check(game: &mut Game, tick: f32) {
             p.at
         );
     }
+}
+
+/// The 360's car wreck in Xenia (a Phoenix shot dead, GodMode off, the
+/// hero 5.9 m from its middle): the car rose 5.3 m at 1.1 s, landed
+/// 16.4-16.6 m off, its top speed 17-18 m/s in the first 0.5 s; she lost
+/// 74.6 and slid 1.7 m.
+const XENIA_WRECK: (f32, f32, f32, f32) = (5.3, 16.5, 17.5, 74.6);
+
+/// `--wreck-blast-check` (it turns on `--drive`): she gets out of the
+/// car she drives and stands 5.9 m from its middle; it is wrecked
+/// ([`combat::Combat::wreck_now`]: its blast goes off at the next step)
+/// and watched 6 s. Logs its blast, its highest rise and when, how far
+/// off it came down, its top speed in the first 0.5 s, and her health
+/// lost and how far she moved, each beside Xenia's
+/// ([`XENIA_WRECK`]). One `wreck-blast-check: done` line; no pass or
+/// fail (the numbers are for comparing).
+fn wreck_blast_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::Vec3;
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("wreck-blast-check: FAIL she drives nothing");
+        return;
+    };
+    let Some(id) = game.scene.vehicles[i].id else {
+        eprintln!("wreck-blast-check: FAIL her vehicle has no body");
+        return;
+    };
+    // Stopped, a while, then her out and 5.9 m off its middle.
+    for _ in 0..(1.0 / tick) as u32 {
+        game.step(Intent::default(), tick);
+    }
+    let place = |game: &Game| {
+        let physics = &game.scene.world.as_ref()?.physics;
+        let (lo, hi) = game.scene.vehicles[i].spec.bounds;
+        let m = physics.vehicle_transform(id)?;
+        Some((
+            m.transform_point3((lo + hi) * 0.5),
+            physics.vehicle_velocity(id),
+        ))
+    };
+    let Some((start, _)) = place(game) else {
+        return;
+    };
+    if let (Some(world), Some(p)) = (game.scene.world.as_ref(), game.scene.player.as_mut()) {
+        game::get_out(&world.physics, &game.scene.vehicles[i], None, p);
+        let side = game.scene.vehicles[i]
+            .id
+            .and_then(|id| world.physics.vehicle_transform(id))
+            .map_or(Vec3::X, |m| m.x_axis.truncate().normalize_or(Vec3::X));
+        p.drop_at(start + side * 5.9);
+    }
+    game.ride = None;
+    for _ in 0..(1.0 / tick) as u32 {
+        game.step(Intent::default(), tick);
+    }
+    let her = |game: &Game| game.scene.player.as_ref().map(|p| p.character.position);
+    let (hp, her_from) = (game.combat.hp, her(game));
+    eprintln!(
+        "wreck-blast-check: the {} at {start:.1}, she {:.1} m off with {hp:.1} health",
+        game.scene.vehicles[i].spec.label,
+        her_from.map_or(0.0, |h| h.with_y(0.0).distance(start.with_y(0.0)))
+    );
+    if let Some(world) = game.scene.world.as_mut() {
+        let v = &mut game.scene.vehicles[i];
+        game.combat.wreck_now(&mut world.physics, v, i);
+    }
+    let (mut top, mut top_at, mut fastest, mut landed) = (0.0f32, 0.0, 0.0f32, None);
+    for k in 0..(6.0 / tick) as u32 {
+        game.step(Intent::default(), tick);
+        let t = (k + 1) as f32 * tick;
+        let Some((at, v)) = place(game) else {
+            break;
+        };
+        let rise = at.y - start.y;
+        if rise > top {
+            (top, top_at) = (rise, t);
+        }
+        if t <= 0.5 {
+            fastest = fastest.max(v.length());
+        }
+        if landed.is_none() && top > 0.5 && t > top_at && rise < 0.3 {
+            landed = Some(at.with_y(0.0).distance(start.with_y(0.0)));
+        }
+    }
+    let (rise, off, speed, lost) = XENIA_WRECK;
+    eprintln!(
+        "wreck-blast-check: rose {top:.1} m at {top_at:.2} s (360 {rise}), landed {} m off          (360 {off}), top speed {fastest:.1} m/s (360 {speed}); she lost {:.1} (360 {lost}) and          moved {:.1} m",
+        landed.map_or("never".to_owned(), |d| format!("{d:.1}")),
+        hp - game.combat.hp,
+        her(game)
+            .zip(her_from)
+            .map_or(0.0, |(a, b)| a.with_y(0.0).distance(b.with_y(0.0)))
+    );
+    eprintln!("wreck-blast-check: done");
 }
 
 /// Wrecks the vehicle she drives, as it goes, and logs how it comes to

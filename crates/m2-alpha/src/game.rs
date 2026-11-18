@@ -463,6 +463,24 @@ impl Game {
         if let Some(arms) = scene.arms() {
             combat.arm(arms, scene.damage_table());
         }
+        if let Some(w) = &scene.world {
+            let db = &w.index.template_db;
+            combat.wreck_blasts = db
+                .explosions
+                .iter()
+                .filter_map(|(&t, e)| {
+                    let blast = m2_engine::weapons::Blast {
+                        template: t,
+                        radius: e.radius,
+                        damage: e.damage,
+                        min_damage: e.least,
+                        max_force: e.force,
+                        key: (e.kind != 0).then_some(e.kind),
+                    };
+                    Some((m2_assets::name_hash(db.names.get(&t)?), blast))
+                })
+                .collect();
+        }
         own_explosives(&mut combat, scene.hero_explosives());
         eprintln!(
             "hero: carries {} grenades, {} C4, {} mines; launcher {} ({:?})",

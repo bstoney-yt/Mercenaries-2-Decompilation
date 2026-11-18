@@ -690,6 +690,39 @@ fn blast_cell(table: Option<&DamageTable>, v: &ParkedVehicle, key: Option<u32>) 
     }
 }
 
+/// Pushes vehicle `v` (`id`, placed at `body`) by blast `push` as the
+/// 360 pushes a moving rigid body ([`BlastPush::rigid_pushes`],
+/// 0x8215CBC8): five impulses up its world box, each per kg times its
+/// mass, its `ExplosionFudge` scaling them.
+///
+/// [`BlastPush::rigid_pushes`]: m2_engine::durability::BlastPush::rigid_pushes
+fn blast_push_vehicle(
+    physics: &mut Physics,
+    v: &ParkedVehicle,
+    id: m2_engine::VehicleId,
+    body: Mat4,
+    push: m2_engine::durability::BlastPush,
+) {
+    let (lo, hi) = world_box(body, v.spec.bounds);
+    for (per_kg, point) in push.rigid_pushes(lo, hi, fudge(v)) {
+        physics.push_vehicle(id, per_kg * v.spec.mass, point);
+    }
+}
+
+/// The world box round a model box `(lo, hi)` placed at `at`.
+fn world_box(at: Mat4, (lo, hi): (Vec3, Vec3)) -> (Vec3, Vec3) {
+    let mut out = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for x in [lo.x, hi.x] {
+        for y in [lo.y, hi.y] {
+            for z in [lo.z, hi.z] {
+                let p = at.transform_point3(Vec3::new(x, y, z));
+                out = (out.0.min(p), out.1.max(p));
+            }
+        }
+    }
+    out
+}
+
 /// How hard a blast throws vehicle `v`, of its usual: its
 /// `ExplosionFudge`. From the 360 code (0x8215CA38: the blast's impulse
 /// is its strength times the fudge times its falloff), where the fudge
@@ -1777,6 +1810,11 @@ pub struct Combat {
     /// the stream at `0x82B5E588`, from its start-up seed.
     knock_rng: m2_game::script_math::EngineRng,
     pub blasts: u32,
+    /// The effects that are explosions, by name hash, as blasts: a
+    /// vehicle's wreck sets one off ([`Combat::wreck`]).
+    pub wreck_blasts: std::collections::HashMap<u32, Blast>,
+    /// Wreck blasts to go off at the next step, where.
+    wreck_due: Vec<(Vec3, Blast)>,
     /// Where the last one went off, and what it pushes what it breaks
     /// with, where known.
     pub last_blast: Option<Vec3>,
@@ -2180,6 +2218,8 @@ impl Default for Combat {
             hits: 0,
             knock_rng: m2_game::script_math::EngineRng::default(),
             blasts: 0,
+            wreck_blasts: std::collections::HashMap::new(),
+            wreck_due: Vec::new(),
             last_blast: None,
             last_push: None,
             went_off: Vec::new(),
@@ -3145,6 +3185,12 @@ impl Combat {
         }
         self.went_off.clear();
         self.struck.clear();
+        // The blasts of the vehicles wrecked since: each goes off as any
+        // other (its damage, its wear, its push on every vehicle it
+        // reaches, the wreck's own too).
+        for (at, blast) in std::mem::take(&mut self.wreck_due) {
+            self.explode_keyed(f, at, Some(blast), blast.key);
+        }
         // Up again (revived, respawned, or put on her feet by a script):
         // her limp body goes. The state table's `Resurrect` leads from
         // `Die` and `Dead` straight to `Upright` `Idle`.
@@ -5331,6 +5377,52 @@ impl Combat {
         }
         self.wrecks.push((i, 0.0));
         self.remarks.push(Remark::Wreck);
+        if let Some((at, blast)) = self.wreck_blast(physics, v) {
+            eprintln!(
+                "wreck: the {} sets off its blast at {at:.1} ({:.0} m, {:.0} damage, push {:.0})",
+                v.spec.label, blast.radius, blast.damage, blast.max_force
+            );
+            self.wreck_due.push((at, blast));
+        }
+    }
+
+    /// Wrecks vehicle `i`, `v`, as damage would (its blast to go off at
+    /// the next step): for `--wreck-blast-check`.
+    pub fn wreck_now(&mut self, physics: &mut Physics, v: &mut ParkedVehicle, i: usize) {
+        self.wreck(physics, v, i);
+    }
+
+    /// Vehicle `v`'s wreck's blast and where it goes off: the first effect
+    /// its model's part states start that is an explosion's
+    /// (`fx_Explosion_Large` on the cars: 7 m, 160 to 150, push 300), at
+    /// its node, else at the vehicle's middle.
+    ///
+    /// From the 360 code: vehicle templates leave no `Explosive` on dying
+    /// (no `SpawnOnDeath` blast); the blast is the explosion object the
+    /// wreck state's `CreateObject` effect makes, whose `Explosive` then
+    /// does area damage (0x82291440 -> 0x82291B88 -> 0x82291640) and
+    /// pushes (0x8215C560 -> 0x8215CBC8). From footage (Xenia, a Phoenix
+    /// shot dead): she took 74.6 at 5.9 m. That matches
+    /// `fx_Explosion_Large`'s 150 floor times her `Hero` row's
+    /// `Explosion` cell (0.5), which the area damage gives.
+    ///
+    /// Inferred: which state's effect. The first explosion any state
+    /// starts is taken, as #673 does.
+    fn wreck_blast(&self, physics: &Physics, v: &ParkedVehicle) -> Option<(Vec3, Blast)> {
+        let body = v.id.and_then(|id| physics.vehicle_transform(id))?;
+        let (lo, hi) = v.spec.bounds;
+        let middle = body.transform_point3((lo + hi) * 0.5);
+        let dm = v.spec.damage.as_deref()?;
+        dm.states
+            .machines
+            .iter()
+            .flat_map(|m| &m.acts)
+            .flat_map(|a| &a.emitters)
+            .find_map(|&(fx, node)| {
+                let b = *self.wreck_blasts.get(&fx)?;
+                let at = node.map_or(middle, |n| body.transform_point3(dm.node_at(n)));
+                Some((at, b))
+            })
     }
 
     /// Vehicles running into each other, body to body: as a pair meets,
@@ -6574,12 +6666,17 @@ impl Combat {
                 let cell = blast_cell(self.damage_table.as_ref(), v, b.key) * weak;
                 v.blast_parts(body, at, reach, |p| b.damage_at(p) * cell);
                 self.hurt_vehicle(f.physics, v, i, damage);
-                if v.wrecked {
-                    let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
-                    let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass * fudge(v);
-                    f.physics
-                        .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
-                }
+            }
+            // Every vehicle in its reach is pushed, whole or wrecked (the
+            // wreck whose blast it is too), as the 360 pushes each moving
+            // body it reaches (0x8215C560 -> 0x8215CBC8).
+            if d < reach {
+                let push = m2_engine::durability::BlastPush {
+                    at,
+                    radius: reach,
+                    force: b.max_force,
+                };
+                blast_push_vehicle(f.physics, v, id, body, push);
             }
         }
         if killed {
@@ -7195,6 +7292,19 @@ mod tests {
     }
 
     use super::*;
+
+    // A vehicle's world box, for the blast's rigid push: turned a
+    // quarter, its length lies along x.
+    #[test]
+    fn a_vehicles_world_box_is_its_box_as_placed() {
+        let at = Mat4::from_rotation_translation(
+            Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+            Vec3::new(10.0, 1.0, 0.0),
+        );
+        let (lo, hi) = world_box(at, (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.5, 2.0)));
+        assert!((lo - Vec3::new(8.0, 1.0, -1.0)).length() < 1e-4);
+        assert!((hi - Vec3::new(12.0, 2.5, 1.0)).length() < 1e-4);
+    }
 
     // The emplaced MG's turret (its record's limits and speeds, bones
     // straight up a stick): she looks off to her right and up; it gets
