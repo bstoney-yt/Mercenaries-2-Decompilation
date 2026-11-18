@@ -447,6 +447,16 @@ struct Options {
     /// `ObjectState.SendDamage`; `nodedamage` lines log its health before
     /// and after and the message the node took.
     check_node_damage: Option<f32>,
+    /// `--check-building-damage <s>` with `--screenshot`: that many
+    /// seconds into play, the scripts' object nearest her (not a vehicle)
+    /// whose template gives node health has every node sent a share of 1,
+    /// one at a time, until it is destroyed; `buildingdamage` lines log
+    /// its node and object health and whether it was.
+    check_building_damage: Option<f32>,
+    /// `--part-destroy-check`: the island fortress's nodes destroyed by
+    /// the scripts, each part's `DestroyMsg` through its state machine
+    /// ([`mission::PartDestroyCheck`]).
+    part_destroy_check: bool,
     /// `--check-shots <s>,<s>...` with `--screenshot` on foot: the scene
     /// is pictured at those seconds in too (`<out>-at<s>.ppm`).
     check_shots: Vec<f32>,
@@ -1119,6 +1129,17 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--gates" => o.gates = true,
             "--marker-test" => o.marker_test = true,
             "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
+            "--part-destroy-check" => {
+                o.part_destroy_check = true;
+                o.mission = true;
+            }
+            "--check-building-damage" => {
+                o.check_building_damage = Some(
+                    value()?
+                        .parse()
+                        .context("--check-building-damage expects seconds")?,
+                )
+            }
             "--check-node-damage" => {
                 o.check_node_damage = Some(
                     value()?
@@ -4633,6 +4654,10 @@ fn mission_for_screenshot(
         .with_mine_check(options.mine_check)
         .with_object_sound_check(options.object_sound_check);
     link.check_node_damage = options.check_node_damage;
+    link.check_building_damage = options.check_building_damage;
+    if options.part_destroy_check {
+        link.part_destroy_check = Some(mission::PartDestroyCheck::default());
+    }
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
@@ -5217,6 +5242,23 @@ fn mission_for_screenshot(
         lap.mark("loop: before the step");
         spans::time("game", || game.step(intent, tick));
         spans::time("scripts", || link.tick(game, tick));
+        // `--part-destroy-check`'s pictures of the fortress, from above
+        // and off its side.
+        let shots = (link.part_destroy_check.as_mut()).map_or_else(Vec::new, |c| c.take_shots());
+        for (name, at) in shots {
+            let eye = at + m2_math::glam::Vec3::new(70.0, 45.0, 30.0);
+            delivery_picture(
+                backend,
+                game,
+                fov,
+                aspect,
+                at,
+                at,
+                Some(eye),
+                &picture(format!("fortress-{name}")),
+            )?;
+            eprintln!("part-destroy-check: pictured the fortress {name}");
+        }
         if let Some(audio) = &mut audio {
             spans::time("sound", || {
                 mission_sounds(audio, &mut link);
@@ -6261,6 +6303,11 @@ fn mission_for_screenshot(
             sounds.len(),
             rows.join(", ")
         );
+    }
+    // A `--part-destroy-check` that never passed or failed fails here,
+    // naming the step it was waiting on.
+    if let Some(c) = link.part_destroy_check.as_mut() {
+        c.finish();
     }
     if auto.is_some() {
         link.log_recruits("at the end");
