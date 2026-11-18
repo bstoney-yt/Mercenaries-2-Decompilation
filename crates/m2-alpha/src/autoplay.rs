@@ -6247,26 +6247,19 @@ fn gun_point(game: &Game, m: &crate::combat::Manned, target: u32, at: Vec3) -> O
 }
 
 /// The way the emplaced gun `m`'s round leaves its muzzle for `at`: a
-/// lobbed one on the lower of its arcs (as `Combat::manned_fire` fires it;
-/// 45 degrees up when out of its reach), else straight at it.
+/// lobbed one on the lower of its arcs as the ordnance step flies it (as
+/// `Combat::manned_fire` fires it; 45 degrees up when out of its reach),
+/// else straight at it.
 fn launch_dir(m: &crate::combat::Manned, at: Vec3) -> Vec3 {
     let d = at - m.pivot;
     if m.weapon.flight() != m2_engine::weapons::Flight::Lobbed {
         return d.normalize_or_zero();
     }
-    let (g, v2) = (
-        m2_engine::physics::GRAVITY,
-        m.weapon.ammo.velocity.max(1.0).powi(2),
-    );
-    let flat = d.with_y(0.0);
-    let x = flat.length().max(0.1);
-    let room = v2 * v2 - g * (g * x * x + 2.0 * d.y * v2);
-    let up = if room < 0.0 {
-        std::f32::consts::FRAC_PI_4
-    } else {
-        ((v2 - room.sqrt()) / (g * x)).atan()
-    };
-    (flat / x * up.cos() + Vec3::Y * up.sin()).normalize_or_zero()
+    let speed = m.weapon.ammo.velocity.max(1.0);
+    crate::combat::lob_round(m.pivot, at, speed, m.weapon.ammo.gravity).map_or_else(
+        || (d.with_y(0.0).normalize_or(Vec3::Z) + Vec3::Y).normalize(),
+        |v| v / speed,
+    )
 }
 
 /// An angle wrapped to -π..π.

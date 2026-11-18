@@ -226,6 +226,11 @@ m2-alpha [options]
                          against the 360's 9.0 m/s^2: a block dropped 20 m,
                          the vehicle she gets in driven off a 10 m ledge,
                          a parked boat settling on still water; PASS/FAIL
+  --arc-check            check: (no vehicle needed) her hand grenade, the RPG,
+                         the tank gun, the grenade launcher, the MLRS rocket
+                         and the FA missile flown at 30 deg over level
+                         ground: range and flight time against the closed
+                         form for 9.0 x GravityScale; PASS/FAIL
   --homing-check         debug: the vehicle she drives counts as ground and
                          air target (signatures 1, 1) for enemy homing
                          weapons, so any army SAM/AA/AT gun or homing

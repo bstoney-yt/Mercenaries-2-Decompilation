@@ -305,6 +305,8 @@ struct Options {
     homing_check: bool,
     /// `--gravity-check`: measure the physics world's gravity ([`gravity_check`]).
     gravity_check: bool,
+    /// `--arc-check`: fly a grenade and rounds at a fixed elevation ([`arc_check`]).
+    arc_check: bool,
     /// With `--screenshot` on foot: hits she takes just before the
     /// picture, from these directions (degrees clockwise from where the
     /// camera looks), to see the HUD's hit arcs.
@@ -1041,6 +1043,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--take" => o.take = true,
             "--fire" => o.fire = true,
             "--homing-check" => o.homing_check = true,
+            "--arc-check" => o.arc_check = true,
             "--gravity-check" => {
                 o.gravity_check = true;
                 o.drive = true;
@@ -2377,6 +2380,8 @@ fn screenshot(
             stage,
             options.fight_wait,
         )?;
+    } else if options.arc_check {
+        arc_check(&game);
     } else if options.shuffle_test && game.on_foot && game.scene.player.is_some() {
         shuffle_test(&mut game);
     } else if options.fight && game.on_foot && game.scene.player.is_some() {
@@ -11712,6 +11717,151 @@ mod tests {
     }
 }
 
+/// Where and when something flown from the origin at `v0` by `next`
+/// (where it is and its velocity, to theirs a tick of 1/60 s on) comes
+/// back down through level ([`arc_check`]), if within 60 s.
+fn arc_flight(
+    v0: m2_math::glam::Vec3,
+    mut next: impl FnMut(
+        m2_math::glam::Vec3,
+        m2_math::glam::Vec3,
+    ) -> (m2_math::glam::Vec3, m2_math::glam::Vec3),
+) -> Option<(f32, f32)> {
+    const DT: f32 = 1.0 / 60.0;
+    let (mut at, mut v) = (m2_math::glam::Vec3::ZERO, v0);
+    for k in 1..=3600 {
+        let (a, w) = next(at, v);
+        if a.y < 0.0 {
+            let s = at.y / (at.y - a.y);
+            return Some((at.z + (a.z - at.z) * s, (k as f32 - 1.0 + s) * DT));
+        }
+        (at, v) = (a, w);
+    }
+    None
+}
+
+/// The elevation `--arc-check` throws and fires at, degrees (invented).
+const ARC_CHECK_ELEVATION: f32 = 30.0;
+
+/// `--arc-check`: how far and how long what she throws and fires flies at
+/// [`ARC_CHECK_ELEVATION`] over level ground, from her own templates, as
+/// the Beta flies it ([`combat::grenade_move`] for a thrown grenade, the
+/// 360's ordnance step [`m2_engine::ordnance::step`] for rounds), against
+/// the closed form for 9.0 m/s^2 times its scale: a thrown grenade is a
+/// physics prop (`Grenade Projectile`, `_PropPhysics` 8 kg, no gravity
+/// scaler), so a parabola; a round keeps its speed and bends
+/// ([`m2_engine::ordnance::landing`]), and one of `GravityScale` 0 flies
+/// straight. Needs no vehicle. Prints a line each and PASS or FAIL.
+fn arc_check(game: &Game) {
+    use m2_engine::physics::WORLD_GRAVITY;
+    use m2_math::glam::Vec3;
+    const DT: f32 = 1.0 / 60.0;
+    let Some(world) = game.scene.world.as_ref() else {
+        eprintln!("arc-check: FAIL no world");
+        return;
+    };
+    let t = &world.index.template_db;
+    let up = ARC_CHECK_ELEVATION.to_radians();
+    let verdict = |ok: bool| if ok { "PASS" } else { "FAIL" };
+    let mut all = true;
+    let aim = |speed: f32| Vec3::new(0.0, up.sin(), up.cos()) * speed;
+    // The hand grenade.
+    match t.arms.thrown("Grenade") {
+        Some(g) => {
+            let speed = g.speed_at(up);
+            let got = arc_flight(aim(speed), |at, mut v| {
+                let step = combat::grenade_move(&mut v, DT);
+                (at + step, v)
+            });
+            let range = speed * speed * (2.0 * up).sin() / WORLD_GRAVITY;
+            let time = 2.0 * speed * up.sin() / WORLD_GRAVITY;
+            let ok = got.is_some_and(|(r, s)| {
+                (r - range).abs() < 0.02 * range + 0.3 && (s - time).abs() < 0.05
+            });
+            all &= ok;
+            eprintln!(
+                "arc-check: hand grenade ({}) {speed:.1} m/s at {ARC_CHECK_ELEVATION} deg, a physics prop under 9.0 x 1: {:.1} m in {:.2} s, want {range:.1} m in {time:.2} s: {}",
+                g.name,
+                got.map_or(f32::NAN, |g| g.0),
+                got.map_or(f32::NAN, |g| g.1),
+                verdict(ok)
+            );
+        }
+        None => {
+            all = false;
+            eprintln!("arc-check: FAIL no Grenade in the templates");
+        }
+    }
+    // Rounds: the RPG's, the tank gun's, the grenade launcher's, and two
+    // that bend part way (the MLRS rocket, the FA missile).
+    let tank = t.arms.named("Mounted Tank Gun (Default)").or_else(|| {
+        t.arms
+            .weapons
+            .values()
+            .filter(|w| w.name.contains("Tank Gun"))
+            .min_by_key(|w| w.template)
+    });
+    let mut rounds: Vec<(String, f32, f32)> = [
+        ("RPG", t.arms.named("RPG")),
+        ("tank shell", tank),
+        ("grenade launcher", t.arms.named("Grenade Launcher")),
+    ]
+    .into_iter()
+    .map(|(what, w)| match w {
+        Some(w) => (
+            format!("{what} ({})", w.name),
+            w.ammo.velocity,
+            w.ammo.gravity,
+        ),
+        None => (format!("{what} (none)"), f32::NAN, f32::NAN),
+    })
+    .collect();
+    for name in ["MLRS Rocket", "FA Missile"] {
+        if let Some(p) = t.id(name).and_then(|id| t.ordnance.projectiles.get(&id)) {
+            rounds.push((name.to_owned(), p.speed, p.gravity));
+        }
+    }
+    for (what, speed, scale) in rounds {
+        if !speed.is_finite() || speed <= 0.0 {
+            all = false;
+            eprintln!("arc-check: {what}: FAIL no round in the templates");
+            continue;
+        }
+        let got = arc_flight(aim(speed), move |at, v| {
+            m2_engine::ordnance::step(at, v, scale, WORLD_GRAVITY, DT)
+        });
+        let ok = match m2_engine::ordnance::landing(speed, up, WORLD_GRAVITY * scale) {
+            Some((range, time)) => {
+                let ok = got.is_some_and(|(r, s)| {
+                    (r - range).abs() < 0.02 * range + 0.3 && (s - time).abs() < 0.05
+                });
+                eprintln!(
+                    "arc-check: {what} {speed:.1} m/s at {ARC_CHECK_ELEVATION} deg, GravityScale {scale:.2} (9.0 x {scale:.2}): {:.1} m in {:.2} s, want {range:.1} m in {time:.2} s (a parabola would give {:.1} m): {}",
+                    got.map_or(f32::NAN, |g| g.0),
+                    got.map_or(f32::NAN, |g| g.1),
+                    speed * speed * (2.0 * up).sin() / (WORLD_GRAVITY * scale),
+                    verdict(ok)
+                );
+                ok
+            }
+            None => {
+                let ok = got.is_none();
+                eprintln!(
+                    "arc-check: {what} {speed:.1} m/s at {ARC_CHECK_ELEVATION} deg, GravityScale {scale:.2}: {}, want straight: {}",
+                    got.map_or("flies straight, never down".to_owned(), |g| format!(
+                        "down at {:.1} m in {:.2} s",
+                        g.0, g.1
+                    )),
+                    verdict(ok)
+                );
+                ok
+            }
+        };
+        all &= ok;
+    }
+    eprintln!("arc-check: {}", verdict(all));
+}
+
 /// `--gravity-check`: the world's gravity, measured in fresh physics
 /// worlds of the Beta's own (`m2_engine::Physics`), against the 360's
 /// 9.0 m/s^2 ([`m2_engine::physics::WORLD_GRAVITY`]): a block dropped
@@ -11874,6 +12024,54 @@ fn free_fall_seconds(h: f32) -> Option<f32> {
 
 #[cfg(test)]
 mod gravity_check_tests {
+    use super::*;
+
+    /// The arc check's flights land where their closed forms say: a round
+    /// of the grenade launcher's (20 m/s, scale 1) at 30 degrees 46.5 m
+    /// out after 2.44 s, not the parabola's 38.5 m; a thrown grenade on
+    /// its parabola; a round of no scale never down.
+    #[test]
+    fn the_arc_checks_flights_land_as_their_closed_forms_say() {
+        use m2_engine::physics::WORLD_GRAVITY;
+        use m2_math::glam::Vec3;
+        let up = ARC_CHECK_ELEVATION.to_radians();
+        let v0 = Vec3::new(0.0, up.sin(), up.cos()) * 20.0;
+        let (r, t) = arc_flight(v0, |at, v| {
+            m2_engine::ordnance::step(at, v, 1.0, WORLD_GRAVITY, 1.0 / 60.0)
+        })
+        .unwrap();
+        let (range, time) = m2_engine::ordnance::landing(20.0, up, WORLD_GRAVITY).unwrap();
+        assert!(
+            (range - 46.5).abs() < 0.1 && (time - 2.44).abs() < 0.01,
+            "{range} {time}"
+        );
+        // A tick's step falls a little short (46.2 m in 2.42 s).
+        assert!(
+            (r - range).abs() < 0.01 * range && (t - time).abs() < 0.03,
+            "{r} {t}"
+        );
+        let (r, t) = arc_flight(v0, |at, mut v| {
+            let step = combat::grenade_move(&mut v, 1.0 / 60.0);
+            (at + step, v)
+        })
+        .unwrap();
+        assert!(
+            (r - 400.0 * (2.0 * up).sin() / WORLD_GRAVITY).abs() < 0.3,
+            "{r}"
+        );
+        assert!((t - 20.0 / WORLD_GRAVITY).abs() < 0.03, "{t}");
+        assert!(
+            arc_flight(v0, |at, v| m2_engine::ordnance::step(
+                at,
+                v,
+                0.0,
+                WORLD_GRAVITY,
+                1.0 / 60.0
+            ))
+            .is_none()
+        );
+    }
+
     /// The world falls at the 360's 9.0 m/s^2: 20 m in 2.11 s.
     #[test]
     fn a_block_falls_as_the_worlds_gravity_has_it() {

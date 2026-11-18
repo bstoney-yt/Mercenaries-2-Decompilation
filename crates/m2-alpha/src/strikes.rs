@@ -8,7 +8,7 @@
 //! ([`m2_engine::ordnance`]): a "Cluster Bomb Projectile" at 80 m/s,
 //! leaving "Explosion (Cluster Bomb)".
 
-use m2_engine::physics::GRAVITY;
+use m2_engine::physics::WORLD_GRAVITY;
 use m2_engine::{Physics, Templates};
 use m2_game::airstrike::{Fuse, Launch};
 use m2_game::api::Command;
@@ -167,6 +167,12 @@ impl Strikes {
                 self.wanted.extend(model);
                 let speed = info.map_or(0.0, |i| i.speed);
                 let velocity = match launch {
+                    // At its template's speed if it has one, along the
+                    // script's velocity; else at that velocity's own speed
+                    // (0x82391B88, from the 360 code).
+                    Launch::Velocity(v) if speed > 0.0 => {
+                        Vec3::from(*v).normalize_or(Vec3::NEG_Y) * speed
+                    }
                     Launch::Velocity(v) => Vec3::from(*v),
                     Launch::Along(d) => {
                         Vec3::from(*d).normalize_or(Vec3::NEG_Y)
@@ -239,8 +245,14 @@ impl Strikes {
             if let (Some((cone, turn)), Some(target)) = (s.homing, s.target) {
                 home(&mut s.velocity, s.at, target, cone, turn, dt);
             }
-            s.velocity.y -= GRAVITY * s.gravity * dt;
-            let step = s.velocity * dt;
+            // Flown by the 360's ordnance step, as every round is: the
+            // air strikes' spawners (`Airstrike.SpawnOrdnance`,
+            // `SpawnCarpetBombLine` 0x82391B88, `ConeSpawn` 0x823923B8)
+            // make their ordnance through 0x82297C00, which the ordnance
+            // update (0x82298E50) flies with 0x822973D0 (from the 360 code).
+            let (next, bent) =
+                m2_engine::ordnance::step(s.at, s.velocity, s.gravity, WORLD_GRAVITY, dt);
+            let step = next - s.at;
             let length = step.length();
             let dir = step.normalize_or(Vec3::NEG_Y);
             let hit = physics
@@ -267,6 +279,7 @@ impl Strikes {
             }
             .or_else(|| s.timer.filter(|&t| s.age >= t).map(|_| s.at));
             s.at += step;
+            s.velocity = bent;
             s.travelled += length;
             if let Some(at) = off {
                 burst.push((s.guid, s.template, at));

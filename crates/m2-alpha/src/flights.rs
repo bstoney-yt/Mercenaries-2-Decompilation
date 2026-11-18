@@ -80,8 +80,13 @@ const GROUND_SLACK: f32 = 15.0;
 /// that let it go hovering over it (a look from high above met that
 /// first, and the crate stood on it, 10 m up).
 const FLOOR_REACH: f32 = 1.0;
-/// Downward acceleration of a crate let go, m/s².
-const GRAVITY: f32 = 9.81;
+/// Downward acceleration of a crate let go, m/s²: the world's. The
+/// `Supply Drop (...)` crates are physics props in the data (`_PropPhysics`
+/// 150 kg, no `PhysicsPropertyGravityScaler`; from samples), so on the 360
+/// they fall as rigid bodies under the world's gravity, 9 m/s² (0x82164A58;
+/// inferred from the data: the prop's body code is not traced). Here the
+/// fall is kept straight down until it lands (invented: no tumble).
+const GRAVITY: f32 = m2_engine::physics::WORLD_GRAVITY;
 /// A delivered crate's health (the first contract's supply drop's
 /// template gives it 100): blows and rounds that take it to nothing break
 /// it open, as does a blast this near, metres.

@@ -47,16 +47,19 @@ pub const STEP_HEIGHT: f32 = 0.5;
 /// Steepest slope a character walks up, radians (50 degrees).
 pub const MAX_SLOPE: f32 = 50.0 * std::f32::consts::PI / 180.0;
 /// Downward acceleration, m/s², of what the Beta moves by its own sums
-/// rather than the physics world (characters without a template, the
-/// fight's rounds and lobs, falling crates): see [`WORLD_GRAVITY`] for the
-/// world's.
+/// rather than the physics world and the 360's gravity for it is not
+/// traced (characters without a template, falling crates and pickups,
+/// dropped items): see [`WORLD_GRAVITY`] for the world's.
 pub const GRAVITY: f32 = 9.81;
 /// The physics world's gravity, m/s² downward: every rigid body's pull
 /// (vehicles, debris, props, ragdolls). From the 360 code: the world's
 /// set-up (0x82164A58, from the physics manager's init 0x821523B8) builds
 /// its `hkpWorldCinfo` (0x82630380) and loads its gravity from 0x820F9710,
 /// (0, -9, 0); its broadphase from the two vectors after it (+-4096 across,
-/// +-1000 up).
+/// +-1000 up). Ordnance in flight falls by it too, times its
+/// `GravityScale`: the 360's ordnance step (0x82295DF0) adds the world's
+/// gravity times the round's scale (+0x80) to its velocity each sub-step
+/// of at most 0.08 s, and flies straight where the scale is 0.
 pub const WORLD_GRAVITY: f32 = 9.0;
 /// The gravity the 360 car code pulls with where it works its own, m/s²
 /// (the constant at 0x82DE8C30, -10, that the gravity factor's pull at
