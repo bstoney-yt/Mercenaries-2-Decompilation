@@ -492,6 +492,9 @@ struct Options {
     /// swim her forward walking, at her pace and sprinting, logging how
     /// fast she goes (`swim-check:` lines).
     swim_check: bool,
+    /// `--cargo-check`: Xenia's El Grande drive with its crates aboard
+    /// ([`cargo_check`]): each crate's shift, phase by phase.
+    cargo_check: bool,
     /// With `--board`: the entrance she stands at, by name or hash
     /// (`entrance_driver`, `8efe45f3`); else the front right one.
     entrance: Option<u32>,
@@ -862,6 +865,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--seated" => o.seated = true,
             "--board" => o.board = true,
             "--swim-check" => o.swim_check = true,
+            "--cargo-check" => o.cargo_check = true,
             "--ladder-check" => {
                 o.ladder_check = Some(
                     value()?
@@ -7257,6 +7261,10 @@ fn drive_for_screenshot(
         swim_check(game, tick);
         return Ok(());
     }
+    if options.cargo_check {
+        cargo_check(game, tick);
+        return Ok(());
+    }
     if let Some(hold) = options.ladder_check {
         ladder_check(game, hold, tick);
         return Ok(());
@@ -8200,6 +8208,154 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 /// `--swim-check`: she is put in the nearest water over 4 m deep (looked
 /// for in rings out to 600 m) and swims forward for 4 s walking, at her
 /// pace and sprinting, through the game's tick; logs her speed each time.
+/// `--cargo-check`: Xenia's El Grande profile (`elgrande-crates.md`) on
+/// the first vehicle with cargo aboard (OilCon020's El Grande and its
+/// crates), her at the wheel: standing 3 s, full throttle straight 6 s
+/// (held to 11 m/s), a hard left turn at speed 2 s, hard braking (reverse
+/// throttle) until it stops or 4 s, then standing 3 s. Each crate's shift
+/// in the truck's frame from where it started is logged 4 times a
+/// second, and at each phase's end the median and most shift of those
+/// still aboard and how many have come off, as `cargo-check: <phase>:
+/// median <m> m, max <m> m, <n> of <k> off`.
+fn cargo_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::{Vec2, Vec3};
+    let vehicles = &game.scene.vehicles;
+    let Some(i) = (0..vehicles.len()).find(|&i| {
+        vehicles[i].id.is_some() && !vehicles[i].wrecked && game.scene.props.carrying(i)
+    }) else {
+        eprintln!("cargo-check: FAIL no vehicle with cargo aboard");
+        return;
+    };
+    let Some(id) = game.scene.vehicles[i].id else {
+        return;
+    };
+    let label = game.scene.vehicles[i].spec.label.clone();
+    if let Some(p) = game.scene.player.as_mut() {
+        p.driving = Some(i);
+        p.landed = true;
+    }
+    let local = |game: &Game| -> Vec<(u32, Vec3, bool)> {
+        let Some(world) = game.scene.world.as_ref() else {
+            return Vec::new();
+        };
+        let Some(at) = world.physics.vehicle_transform(id) else {
+            return Vec::new();
+        };
+        let inv = at.inverse();
+        game.scene
+            .props
+            .cargo_riding()
+            .into_iter()
+            .filter(|c| c.1 == i)
+            .map(|(e, _, centre, aboard)| (e, inv.transform_point3(centre), aboard))
+            .collect()
+    };
+    let start = local(game);
+    eprintln!("cargo-check: the {label}, {} crates aboard", start.len());
+    let yaw = |game: &Game| {
+        game.scene
+            .world
+            .as_ref()
+            .and_then(|w| w.physics.vehicle_transform(id))
+            .map_or(0.0, |m| {
+                let f = m.transform_vector3(Vec3::Z);
+                f.x.atan2(f.z).to_degrees()
+            })
+    };
+    let speed = |game: &Game| {
+        game.scene
+            .world
+            .as_ref()
+            .map_or(0.0, |w| w.physics.vehicle_speed(id))
+    };
+    let mut table = Vec::new();
+    let every = ((0.25 / tick) as u32).max(1);
+    for (phase, seconds) in [
+        ("standing", 3.0f32),
+        ("straight", 6.0),
+        ("hard turn", 2.0),
+        ("braking", 4.0),
+        ("standing after", 3.0),
+    ] {
+        let ticks = (seconds / tick) as u32;
+        let yaw0 = yaw(game);
+        for t in 0..ticks {
+            let v = speed(game);
+            let movement = match phase {
+                "straight" => Vec2::new(0.0, if v < 11.0 { 1.0 } else { 0.0 }),
+                "hard turn" => Vec2::new(-1.0, if v < 11.0 { 1.0 } else { 0.0 }),
+                "braking" => Vec2::new(0.0, if v > 0.5 { -1.0 } else { 0.0 }),
+                _ => Vec2::ZERO,
+            };
+            game.step(
+                crate::player::Intent {
+                    movement,
+                    ..Default::default()
+                },
+                tick,
+            );
+            if t % every == 0 {
+                let now = local(game);
+                let shifts: Vec<String> = now
+                    .iter()
+                    .filter_map(|(e, p, aboard)| {
+                        let s = start.iter().find(|s| s.0 == *e)?;
+                        let d = *p - s.1;
+                        Some(format!(
+                            "{e:#x} {:+.2},{:+.2},{:+.2}{}",
+                            d.x,
+                            d.y,
+                            d.z,
+                            if *aboard { "" } else { " off" }
+                        ))
+                    })
+                    .collect();
+                eprintln!(
+                    "cargo-check: {phase} {:.2} s, {:.1} m/s, yaw {:.0}: {}",
+                    t as f32 * tick,
+                    speed(game),
+                    yaw(game),
+                    shifts.join("; ")
+                );
+            }
+            if phase == "braking" && speed(game) < 0.5 && t as f32 * tick > 0.5 {
+                break;
+            }
+        }
+        let now = local(game);
+        let mut aboard: Vec<f32> = now
+            .iter()
+            .filter(|c| c.2)
+            .filter_map(|(e, p, _)| Some((*p - start.iter().find(|s| s.0 == *e)?.1).length()))
+            .collect();
+        let off = now.iter().filter(|c| !c.2).count();
+        let (median, most) = median_and_most(&mut aboard);
+        let line = format!(
+            "{phase}: median {median:.2} m, max {most:.2} m, {off} of {} off (yaw {:.0} -> {:.0}, {:.1} m/s)",
+            now.len(),
+            yaw0,
+            yaw(game),
+            speed(game)
+        );
+        eprintln!("cargo-check: {line}");
+        table.push(line);
+    }
+    eprintln!("cargo-check: TABLE (shift from start in the truck's frame, of those still aboard)");
+    for l in table {
+        eprintln!("cargo-check:   {l}");
+    }
+}
+
+/// The median and the most of `shifts` (0 for none), as the Xenia
+/// table gives them: the upper middle of an even count.
+fn median_and_most(shifts: &mut [f32]) -> (f32, f32) {
+    shifts.sort_by(f32::total_cmp);
+    (
+        shifts.get(shifts.len() / 2).copied().unwrap_or(0.0),
+        shifts.last().copied().unwrap_or(0.0),
+    )
+}
+
 fn swim_check(game: &mut Game, tick: f32) {
     use m2_math::glam::{Vec2, Vec3};
     let here = game.focus();
@@ -11436,6 +11592,13 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cargo_check_tables_the_median_and_most_shift() {
+        assert_eq!(median_and_most(&mut [0.5, 0.1, 2.0]), (0.5, 2.0));
+        assert_eq!(median_and_most(&mut [0.3, 0.1]), (0.3, 0.3));
+        assert_eq!(median_and_most(&mut []), (0.0, 0.0));
+    }
 
     #[test]
     fn autoplay_retries_a_failed_contract_only_with_a_retry_save_and_not_forever() {

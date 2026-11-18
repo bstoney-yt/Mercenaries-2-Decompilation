@@ -734,6 +734,20 @@ impl Props {
         self.cargo.values().any(|r| r.vehicle == index && r.aboard)
     }
 
+    /// What is loaded on vehicles: each prop, its vehicle's index, the
+    /// middle of its collision box (world) and whether it is still aboard.
+    pub fn cargo_riding(&self) -> Vec<(u32, usize, Vec3, bool)> {
+        self.cargo
+            .iter()
+            .filter_map(|(&e, r)| {
+                let p = self.shown.get(&e)?;
+                let at = Mat4::from_rotation_translation(p.rotation, p.position);
+                let (lo, hi) = r.bounds;
+                Some((e, r.vehicle, at.transform_point3((lo + hi) * 0.5), r.aboard))
+            })
+            .collect()
+    }
+
     /// Whether `entity` was loaded on a vehicle ([`load`](Self::load)),
     /// aboard still or fallen off.
     pub fn is_cargo(&self, entity: u32) -> bool {
