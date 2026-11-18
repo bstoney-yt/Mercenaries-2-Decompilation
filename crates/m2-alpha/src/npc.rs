@@ -452,6 +452,11 @@ pub struct FightClips {
     /// ([`FightClips::KNOCKED`]).
     pub knocked: Option<usize>,
     pub getup: Option<usize>,
+    /// Landing hard from a fall: the on-foot tables' `Upright`
+    /// `FallImpactLight` (handle aaa7ed8d) and `FallImpactHeavy`
+    /// (9504ae5e), the same clip for every class held (from samples).
+    pub fall_light: Option<usize>,
+    pub fall_heavy: Option<usize>,
     pub subdued: Option<usize>,
 }
 
@@ -739,6 +744,9 @@ impl FightClips {
     /// (ade601a9) and `Subdued` `Idle` (dbd4f17d), from samples.
     pub const KNOCKED: u32 = 0xbe25_dc0c;
     pub const GETUP: u32 = 0xaeb6_c9bd;
+    /// `FallImpactLight`'s and `FallImpactHeavy`'s clips (from samples).
+    pub const FALL_LIGHT: u32 = 0x580a_a328;
+    pub const FALL_HEAVY: u32 = 0x1897_ecf1;
     pub const SUBDUED: u32 = 0xf550_757d;
     /// Jennifer's running take-offs (0.93 s, 3.6 m/s), then the
     /// resident's; standing (0.37 s).
@@ -823,6 +831,8 @@ impl FightClips {
             aim_shuffles: Self::AIM_SHUFFLES.map(find),
             knocked: find(Self::KNOCKED),
             getup: find(Self::GETUP),
+            fall_light: find(Self::FALL_LIGHT),
+            fall_heavy: find(Self::FALL_HEAVY),
             subdued: find(Self::SUBDUED),
         }
     }
@@ -2451,9 +2461,13 @@ impl Npc {
         // A fall that hurts, as the 360 has every person's (0x82205F20,
         // [`m2_engine::on_foot::fall_impact`]): by their template's fall
         // limits, its damage; a deadly one (1,000,000) kills, and the
-        // dead go limp (`Die` is `FULL`). The light and heavy falls'
-        // messages lead to clips (`FallImpactLight`/`Heavy`, mode
-        // `NONE`), not played here.
+        // dead go limp (`Die` is `FULL`). A light or heavy one, for
+        // someone not limp (their action's mode not `FULL`), posts
+        // `FallImpactLight` or `FallImpactHeavy`, whose clip they play
+        // whole, doing nothing else (mode `NONE`). The 360 also skips a
+        // fall altogether for a person whose disguise record's state is 1
+        // or 2 (0x82467B70's record +0x40): the people here are never
+        // disguised.
         if let Some((d, fell)) = self
             .fall
             .step(!self.character.grounded, now.y)
@@ -2465,6 +2479,22 @@ impl Npc {
                 fell.damage
             );
             self.hurt(fell.damage, Vec3::ZERO);
+            let clip = match fell.impact {
+                Some(m2_engine::on_foot::FallImpact::Light) => self.clips.fall_light,
+                Some(m2_engine::on_foot::FallImpact::Heavy) => self.clips.fall_heavy,
+                None => None,
+            };
+            if let (Some(c), Some(impact)) = (clip, fell.impact)
+                && self.alive
+                && self.down.is_none()
+                && self.ragdoll.is_none()
+            {
+                self.rig.animator.set_upper(None);
+                self.rig
+                    .animator
+                    .play_action(c, true, m2_assets::name_hash(impact.name()));
+                self.stagger = Some(c);
+            }
         }
         // In it deeper than a wade, or over ground that is (stepping off a
         // dock or a bank): back where they were, unless they were in it
@@ -9142,6 +9172,17 @@ pub(crate) mod tests {
             &mut rng,
         );
         assert!(!deadly.alive);
+        // Between the heavy and deadly limits: alive, the heavy fall's
+        // damage taken.
+        let limits = m2_engine::on_foot::FallLimits::default();
+        let heavy = drop((limits.heavy + limits.death) * 0.5 + 0.1, &mut rng);
+        assert!(heavy.alive);
+        assert!(
+            (short.hp - heavy.hp - limits.damage_heavy).abs() < 1e-3,
+            "{} {}",
+            short.hp,
+            heavy.hp
+        );
     }
 
     // Soldiers walked the sea bed instead of swimming. Out of their depth
