@@ -509,6 +509,10 @@ struct Options {
     /// With `--board`: the entrance she stands at, by name or hash
     /// (`entrance_driver`, `8efe45f3`); else the front right one.
     entrance: Option<u32>,
+    /// `--seat-check`: as `--board`, by the first gunner's seat's own
+    /// entrance of the nearest vehicle that has one; logs the seat she
+    /// sits in and its turret camera record.
+    seat_check: bool,
     /// With `--board`: how far out from the entrance she is put, metres
     /// (0.6 when not given; further, off a boat, she swims).
     board_off: Option<f32>,
@@ -883,6 +887,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--seated" => o.seated = true,
             "--board" => o.board = true,
+            "--seat-check" => {
+                o.board = true;
+                o.seat_check = true;
+            }
             "--swim-check" => o.swim_check = true,
             "--ladder-check" => {
                 o.ladder_check = Some(
@@ -7906,6 +7914,14 @@ fn board_stand(
         .enumerate()
         .filter(|(_, v)| v.spec.label.to_ascii_lowercase().contains(want))
         .filter(|(_, v)| !v.spec.entrances.is_empty())
+        .filter(|(_, v)| {
+            !options.seat_check
+                || v.spec
+                    .seating
+                    .as_deref()
+                    .and_then(m2_engine::seats::gunner_entrance)
+                    .is_some()
+        })
         .filter_map(|(i, v)| {
             let at = world?.physics.vehicle_transform(v.id?)?;
             Some((i, at, at.transform_point3(Vec3::ZERO).distance(here)))
@@ -7916,8 +7932,24 @@ fn board_stand(
         return None;
     };
     let spec = &game.scene.vehicles[i].spec;
+    // `--seat-check`: the gunner's seat's own entrance.
+    let gunner = options
+        .seat_check
+        .then(|| {
+            spec.seating
+                .as_deref()
+                .and_then(m2_engine::seats::gunner_entrance)
+        })
+        .flatten();
+    if let (Some((seat, e)), Some(s)) = (gunner, spec.seating.as_deref()) {
+        eprintln!(
+            "seat-check: the {}: gunner's seat {:08x} by its entrance {e:08x}",
+            spec.label, s.seats[seat].name
+        );
+    }
     let right = options
         .entrance
+        .or(gunner.map(|g| g.1))
         .unwrap_or_else(|| m2_assets::name_hash("entrance_front_right"));
     let &(e, local) = spec
         .entrances
@@ -8039,6 +8071,23 @@ fn board_pressed(
         game.combat.seat,
         game.hud_info(None).driving.map(|d| d.0)
     );
+    if options.seat_check {
+        let v = &game.scene.vehicles[i];
+        let seat = game.ride.filter(|r| r.0 == i).and_then(|r| {
+            let s = v.spec.seating.as_deref()?;
+            s.seats.get(s.seat(r.1)?)
+        });
+        match seat {
+            Some(s) => eprintln!(
+                "seat-check: she sits in {:08x} ({:?}), aiming turret {:08x?}, its camera {:?}",
+                s.name,
+                s.role(),
+                s.turret,
+                s.camera
+            ),
+            None => eprintln!("seat-check: she sits in no seat of the {}", v.spec.label),
+        }
+    }
     // `--look`: the camera swung, and the turret her seat aims following
     // (to the end of its arc, at its pace).
     if options.look != 0.0 {
