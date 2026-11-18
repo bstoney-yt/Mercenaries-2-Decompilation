@@ -3844,6 +3844,8 @@ impl Game {
             satellite_look(&mut view.lighting);
         }
         self.picture.apply(&mut view.lighting);
+        // The game's motion blur, beating in her survival mode.
+        view.lighting.motion_blur = self.combat.motion_blur;
         // The effects' lights (a blast's flash, a fire), the nearest first.
         if let Some(p) = &self.scene.particles {
             let eye = view.view.inverse().w_axis.truncate();

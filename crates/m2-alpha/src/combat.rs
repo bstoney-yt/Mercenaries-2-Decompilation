@@ -578,6 +578,25 @@ const CLAMP_FLOOR_COOP: f32 = 1.0;
 /// of its damage. From the 360 code (0x822889F8, 0x820BB468), applied
 /// only when the clamp is not holding her.
 const SURVIVAL_DAMAGE: f32 = 0.1;
+/// The motion blur's velocity multiplier as the game keeps it (its post
+/// object's +0x34, 0.25 from its constructor 0x821BA6B0; no script sets
+/// it, `Graphics.MotionBlur.SetVelocityMultiplier` going unused).
+pub const MOTION_BLUR: f32 = 0.25;
+
+/// The survival mode's beat at `t` seconds into it (0x82439B18): a rise
+/// to 0.5 over 0.3 s and back to 0 by 0.6 s, `1 - k / (s^2 + k)` with
+/// `k` 0.09 and `s` the time from the nearer end; `None` past 0.6 s,
+/// where the 360 starts the beat again.
+fn survival_beat(t: f32) -> Option<f32> {
+    const K: f32 = 0.09;
+    if t < 0.3 {
+        Some(1.0 - K / (t * t + K))
+    } else if t < 0.6 {
+        Some(1.0 - K / ((0.6 - t) * (0.6 - t) + K))
+    } else {
+        None
+    }
+}
 /// Seconds she stays down at no health.
 const DOWN_TIME: f32 = 2.5;
 /// RPG: rocket speed (m/s), reload (s) and how far it flies.
@@ -1729,8 +1748,20 @@ pub struct Combat {
     /// would have taken her under its floor, or when the scripts turn it
     /// on; while on, hits from someone do [`SURVIVAL_DAMAGE`].
     pub survival: bool,
+    /// Whether her survival mode beats the screen (the player's +0x188,
+    /// 0x8243AED8): set with each change of the mode, true from the clamp
+    /// and unless the scripts' `Player.SetSurvivalMode` gives false.
+    pub survival_beat: bool,
     /// A second player has joined (the clamp's floor is lower).
     pub coop: bool,
+    /// Seconds into the survival beat (the player's +0x184), and the
+    /// value it last left (+0x638 of her camera slot, -0.1 times the beat;
+    /// what reads it is not known).
+    beat: f32,
+    beat_left: f32,
+    /// The motion blur's velocity multiplier this frame ([`MOTION_BLUR`],
+    /// beating up to 2.5 in survival mode).
+    pub motion_blur: f32,
     /// The scripts heal her (the hero script's timers), not the fight.
     pub scripted_health: bool,
     /// She just got back up after going down (taken by the mission).
@@ -2180,7 +2211,11 @@ impl Default for Combat {
             run_overs: (0, 0.0),
             health_clamp: false,
             survival: false,
+            survival_beat: true,
             coop: false,
+            beat: 0.0,
+            beat_left: 0.0,
+            motion_blur: MOTION_BLUR,
             scripted_health: false,
             revived: false,
             unkillable_her: false,
@@ -3266,6 +3301,7 @@ impl Combat {
         let feel = self.rifle.feel;
         self.bloom.settle(&feel, dt);
         self.quiet += dt;
+        self.motion_blur = self.survival_blur(dt);
 
         if self.down > 0.0 {
             self.down -= dt;
@@ -4261,6 +4297,43 @@ impl Combat {
         );
     }
 
+    /// The motion blur's velocity multiplier after `dt` more seconds, as
+    /// the 360's per-player update has it (0x82439B98): in survival mode
+    /// the beat ([`survival_beat`]) takes it to five times the beat (at
+    /// most 5) when that is above [`MOTION_BLUR`]; out of it the blur is
+    /// [`MOTION_BLUR`], and a beat under way runs on until a tenth of it
+    /// is under 0.01, then starts from nothing next time.
+    fn survival_blur(&mut self, dt: f32) -> f32 {
+        let mut beat = || {
+            self.beat += dt;
+            survival_beat(self.beat).unwrap_or_else(|| {
+                self.beat = 0.0;
+                0.0
+            })
+        };
+        if self.survival && self.survival_beat {
+            let b = beat();
+            self.beat_left = (-0.1 * b).clamp(-0.1, 0.01);
+            (5.0 * b).clamp(MOTION_BLUR, 5.0)
+        } else if self.survival {
+            // In survival mode without the beat (+0x188 clear), 0x82439B98
+            // leaves the blur as it is.
+            MOTION_BLUR
+        } else {
+            if self.beat_left != 0.0 {
+                let b = beat();
+                let left = (-0.1 * b).clamp(-0.1, 0.01);
+                if left.abs() < 0.01 {
+                    self.beat = 0.0;
+                    self.beat_left = 0.0;
+                } else {
+                    self.beat_left = left;
+                }
+            }
+            MOTION_BLUR
+        }
+    }
+
     /// Where the health clamp stops her health ([`CLAMP_FLOOR`]).
     fn clamp_floor(&self) -> f32 {
         if self.coop {
@@ -4283,6 +4356,7 @@ impl Combat {
             if self.hp - damage < self.clamp_floor() && !self.survival {
                 eprintln!("combat: survival mode on (the clamp caught a hit)");
                 self.survival = true;
+                self.survival_beat = true;
             }
             damage
         } else if self.survival && attacked {
@@ -7415,6 +7489,32 @@ pub fn survival_check() -> bool {
         cut.hp,
         verdict(ok)
     );
+    // The beat (0x82439B98): with the beat flag, the blur beats up to 2.5
+    // within its 0.6 s; without it (the scripts' third argument false),
+    // it stays at the game's 0.25.
+    let peak = |beat: bool| {
+        let mut c = Combat {
+            survival: true,
+            survival_beat: beat,
+            ..Combat::default()
+        };
+        (0..12)
+            .map(|_| c.survival_blur(0.05))
+            .fold(0.0f32, f32::max)
+    };
+    let (with, without) = (peak(true), peak(false));
+    let ok = (with - 2.5).abs() < 1e-3;
+    all &= ok;
+    println!(
+        "survival-check: survival on with the beat: blur peaks at {with:.2} in 0.6 s: {}",
+        verdict(ok)
+    );
+    let ok = (without - MOTION_BLUR).abs() < 1e-6;
+    all &= ok;
+    println!(
+        "survival-check: survival on without the beat: blur stays at {without:.2}: {}",
+        verdict(ok)
+    );
     println!("survival-check: {}", verdict(all));
     all
 }
@@ -8596,6 +8696,30 @@ mod tests {
             ..Combat::default()
         };
         assert_eq!(health_after(&mut two, &[(50.0, true)]), [1.0]);
+    }
+
+    /// From the 360 code (0x82439B18, 0x82439B98): out of survival the
+    /// blur is 0.25; in it, it beats to 2.5 and back every 0.6 s.
+    #[test]
+    fn survival_mode_beats_the_motion_blur() {
+        assert_eq!(survival_beat(0.0), Some(0.0));
+        assert!((survival_beat(0.3).unwrap() - 0.5).abs() < 1e-6);
+        assert!((survival_beat(0.45).unwrap() - survival_beat(0.15).unwrap()).abs() < 1e-6);
+        assert_eq!(survival_beat(0.6), None);
+        let mut c = Combat::default();
+        assert_eq!(c.survival_blur(0.1), MOTION_BLUR);
+        c.survival = true;
+        let blur: Vec<f32> = (0..12).map(|_| c.survival_blur(0.05)).collect();
+        let peak = blur.iter().cloned().fold(0.0, f32::max);
+        assert!((peak - 2.5).abs() < 1e-5, "{blur:?}");
+        assert_eq!(
+            blur[0], MOTION_BLUR,
+            "at 0.05 s five times the beat is under 0.25"
+        );
+        // The next beat starts again 0.6 s on.
+        assert!((c.survival_blur(0.3) - 2.5).abs() < 0.05);
+        c.survival = false;
+        assert_eq!(c.survival_blur(0.05), MOTION_BLUR);
     }
 
     /// From the 360 code (0x822889F8): with the clamp off, survival mode
