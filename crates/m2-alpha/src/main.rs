@@ -6175,6 +6175,11 @@ fn mission_for_screenshot(
             rows.join(", ")
         );
     }
+    // A `--part-destroy-check` that never passed or failed fails here,
+    // naming the step it was waiting on.
+    if let Some(c) = link.part_destroy_check.as_mut() {
+        c.finish();
+    }
     if auto.is_some() {
         link.log_recruits("at the end");
     }

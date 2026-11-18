@@ -3595,18 +3595,21 @@ impl MissionLink {
                     .filter_map(|n| Some((n.spawn?, n.character.velocity)));
                 report_speeds(mission, vehicles.chain(people));
             }
+            // These count play time: a step is `STEP` of it (the frame's
+            // `dt` is a sixth of that; counting it ran them at a sixth of
+            // the speed).
             if let Some(left) = &mut self.check_node_damage {
-                *left -= dt;
+                *left -= STEP;
                 if *left <= 0.0 {
                     self.check_node_damage = None;
                     check_node_damage(mission, game);
                 }
             }
             if let Some(c) = &mut self.part_destroy_check {
-                c.tick(game, mission, dt);
+                c.tick(game, mission, STEP);
             }
             if let Some(left) = &mut self.check_building_damage {
-                *left -= dt;
+                *left -= STEP;
                 if *left <= 0.0 {
                     self.check_building_damage = None;
                     check_building_damage(mission, game);
@@ -6775,9 +6778,42 @@ pub struct PartDestroyCheck {
     shots: Vec<(&'static str, Vec3)>,
     pictured: HashSet<&'static str>,
     done: bool,
+    /// The step it is waiting on, logged once each ([`waiting`]).
+    ///
+    /// [`waiting`]: Self::waiting
+    step: &'static str,
 }
 
 impl PartDestroyCheck {
+    /// It waits on `step` until `until` seconds of play: logged once, as
+    /// it starts waiting.
+    fn waiting(&mut self, step: &'static str, until: f32) {
+        if self.step != step {
+            self.step = step;
+            eprintln!(
+                "part-destroy-check: at {:.1} s of play, waiting until {until:.0} s to {step}",
+                self.t
+            );
+        }
+    }
+
+    /// The run ended: if it hadn't passed or failed, it fails, naming
+    /// the step it was on.
+    pub fn finish(&mut self) {
+        if !self.done {
+            self.done = true;
+            let step = if self.step.is_empty() {
+                "start"
+            } else {
+                self.step
+            };
+            eprintln!(
+                "part-destroy-check: FAIL the run ended at {:.1} s of play, still waiting to {step}",
+                self.t
+            );
+        }
+    }
+
     /// Pictures due since last asked: (name, where to look).
     pub fn take_shots(&mut self) -> Vec<(&'static str, Vec3)> {
         std::mem::take(&mut self.shots)
@@ -6837,6 +6873,9 @@ impl PartDestroyCheck {
             return;
         }
         self.t += dt;
+        if self.target.is_none() {
+            self.waiting("find the fortress and put her by it", 10.0);
+        }
         if self.target.is_none() && self.t >= 10.0 {
             let pick = {
                 let mut w = mission.world().borrow_mut();
@@ -6867,6 +6906,9 @@ impl PartDestroyCheck {
             }
             return;
         }
+        if self.target.is_some() && self.sent.is_none() {
+            self.waiting("destroy its nodes", 25.0);
+        }
         if self.target.is_some() && self.t >= 24.0 {
             self.shoot("before");
         }
@@ -6878,6 +6920,9 @@ impl PartDestroyCheck {
             eprintln!("part-destroy-check: its model's parts in: {shown}");
             self.sent = Some(check_building_damage_on(mission, game, Some(g)));
             return;
+        }
+        if self.sent.is_some() {
+            self.waiting("judge the parts' states", 40.0);
         }
         if let Some(destroyed) = self.sent
             && self.t >= 40.0
@@ -9700,6 +9745,7 @@ mod tests {
     #[test]
     fn a_label_only_destroy_hunts_the_nearest_living_carriers() {
         use m2_math::glam::Vec3;
+
         let vz = [m2_assets::name_hash("VZ")];
         let pmc = [m2_assets::name_hash("PMC")];
         let objs: Vec<(u32, Vec3, bool, &[u32])> = vec![
@@ -11101,5 +11147,21 @@ mod tests {
             let_go_hud_calls(&lua, last);
             assert!(hud_calls(&lua).is_empty());
         }
+    }
+
+    // A part-destroy check the run ends on without a verdict fails,
+    // naming its step; its steps are logged once each.
+    #[test]
+    fn a_part_destroy_check_without_a_verdict_fails_at_the_end() {
+        let mut c = super::PartDestroyCheck::default();
+        c.waiting("destroy its nodes", 25.0);
+        assert_eq!(c.step, "destroy its nodes");
+        c.waiting("destroy its nodes", 25.0);
+        assert!(!c.done);
+        c.finish();
+        assert!(c.done);
+        // Once done, nothing more.
+        c.finish();
+        assert!(c.done);
     }
 }
