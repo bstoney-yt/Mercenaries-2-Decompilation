@@ -3913,6 +3913,12 @@ impl MissionLink {
                     }
                     Command::SurvivalMode(on) => {
                         eprintln!("mission: survival mode {on}");
+                        if *on != game.combat.survival {
+                            eprintln!(
+                                "combat: survival mode {} (the scripts)",
+                                if *on { "on" } else { "off" }
+                            );
+                        }
                         game.combat.survival = *on;
                     }
                     Command::SetHealth { guid, health } if *guid == PLAYER => {
