@@ -1494,6 +1494,8 @@ pub enum Struck {
     Person(usize),
     /// A vehicle (its index).
     Vehicle(usize),
+    /// Her, the hero.
+    Her,
     /// The world: a static of the scene's if it was one, and the word of
     /// the triangle struck (0 none).
     Static(Option<StaticKey>, u32),
@@ -4185,6 +4187,14 @@ impl Combat {
             if at_her && f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
                 let damage = self.npc_round(gun);
                 self.firing = gun.map_or(0, |g| g.template);
+                let key = gun.and_then(|g| g.damage_key);
+                self.hit_events.push(Hit {
+                    at: closest,
+                    round: self.firing,
+                    kind: key.unwrap_or(0),
+                    struck: Struck::Her,
+                    cell: Some(self.hero_scale(key)),
+                });
                 let lost = self.hurt_player(f, damage, Some(from));
                 self.tally.taken_rounds += lost;
                 self.tally.rounds_on_her += u32::from(lost > 0.0);
@@ -4702,7 +4712,15 @@ impl Combat {
                         let along = (her - from).dot(aim).max(0.0);
                         let blocked = hit.is_some_and(|h| h.0 < along - 1.0);
                         if !blocked && (from + aim * along).distance(her) < 0.45 {
-                            let taken = damage * self.hero_scale(ammo.key);
+                            let cell = self.hero_scale(ammo.key);
+                            let taken = damage * cell;
+                            self.hit_events.push(Hit {
+                                at: her,
+                                round: self.firing,
+                                kind: ammo.key.unwrap_or(0),
+                                struck: Struck::Her,
+                                cell: Some(cell),
+                            });
                             let lost = self.hurt_player(f, taken, Some(from));
                             self.tally.taken_rounds += lost;
                             self.tally.rounds_on_her += u32::from(lost > 0.0);
