@@ -89,6 +89,7 @@ mod keytable;
 mod ladders;
 mod loading;
 mod marker_models;
+mod mines;
 mod mission;
 mod movie;
 mod moving;
@@ -252,6 +253,9 @@ struct Options {
     /// `--binocular-check`: the binoculars driven by a scripted look and
     /// zoom, offscreen, PASS/FAIL against the 360 ([`binoculars::check`]).
     binocular_check: bool,
+    /// `--survival-check`: her health clamp and survival mode on the
+    /// game's own code, offscreen ([`combat::survival_check`]); then exit.
+    survival_check: bool,
     /// With `--drive`: stop and put this many rifle rounds into its parts.
     shoot_up: Option<u32>,
     /// With `--drive`: fire from the next seat with a weapon.
@@ -306,6 +310,10 @@ struct Options {
     fire: bool,
     /// `--homing-check`: her vehicle is seen by every homing weapon.
     homing_check: bool,
+    /// `--gravity-check`: measure the physics world's gravity ([`gravity_check`]).
+    gravity_check: bool,
+    /// `--stagger-check`: her stagger's exemptions ([`stagger_check`]).
+    stagger_check: bool,
     /// With `--screenshot` on foot: hits she takes just before the
     /// picture, from these directions (degrees clockwise from where the
     /// camera looks), to see the HUD's hit arcs.
@@ -509,6 +517,13 @@ struct Options {
     /// swim her forward walking, at her pace and sprinting, logging how
     /// fast she goes (`swim-check:` lines).
     swim_check: bool,
+    /// `--mine-check`: in the mission, the nearest placed mine is blasted
+    /// by an RPG and, should it stand, run into by a jeep; logs
+    /// `mine-check:` lines ([`mines::MineCheck`]).
+    mine_check: bool,
+    /// `--impact-check`: rounds struck into the ground round her, by
+    /// surface ([`impact_check`]).
+    impact_check: bool,
     /// With `--board`: the entrance she stands at, by name or hash
     /// (`entrance_driver`, `8efe45f3`); else the front right one.
     entrance: Option<u32>,
@@ -787,6 +802,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--wreck" => o.wreck = true,
             "--fuel-check" => o.fuel_check = true,
             "--binocular-check" => o.binocular_check = true,
+            "--survival-check" => o.survival_check = true,
             "--shoot-up" => {
                 o.shoot_up = Some(
                     value()?
@@ -888,6 +904,14 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--seated" => o.seated = true,
             "--board" => o.board = true,
             "--swim-check" => o.swim_check = true,
+            "--mine-check" => {
+                o.mine_check = true;
+                o.mission = true;
+            }
+            "--impact-check" => {
+                o.impact_check = true;
+                o.drive = true;
+            }
             "--ladder-check" => {
                 o.ladder_check = Some(
                     value()?
@@ -1043,6 +1067,11 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--take" => o.take = true,
             "--fire" => o.fire = true,
             "--homing-check" => o.homing_check = true,
+            "--gravity-check" => {
+                o.gravity_check = true;
+                o.drive = true;
+            }
+            "--stagger-check" => o.stagger_check = true,
             "--look-pickup" => {
                 o.look_pickup = Some(value()?.parse().context("--look-pickup expects metres")?)
             }
@@ -1291,6 +1320,10 @@ fn run(
 ) -> anyhow::Result<()> {
     spans::start_profiler();
     let mut options = parse_args(args)?;
+    if options.survival_check {
+        combat::survival_check();
+        return Ok(());
+    }
     let ignored = screenshot_only_ignored(args);
     if !ignored.is_empty() {
         eprintln!(
@@ -2378,6 +2411,8 @@ fn screenshot(
             stage,
             options.fight_wait,
         )?;
+    } else if options.stagger_check && game.on_foot && game.scene.player.is_some() {
+        stagger_check(&mut game);
     } else if options.shuffle_test && game.on_foot && game.scene.player.is_some() {
         shuffle_test(&mut game);
     } else if options.fight && game.on_foot && game.scene.player.is_some() {
@@ -4484,7 +4519,8 @@ fn mission_for_screenshot(
         .with_skip_mode_off(options.skip_mode_off)
         .with_script_join(options.script_join)
         .with_skip_to(options.skip_to.clone())
-        .with_job_near(options.job_near);
+        .with_job_near(options.job_near)
+        .with_mine_check(options.mine_check);
     link.check_node_damage = options.check_node_damage;
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
@@ -7059,6 +7095,55 @@ const HOMING_CHECK_SECONDS: f32 = 60.0;
 /// launcher up, and the run waits up to [`HOMING_CHECK_SECONDS`] for his
 /// lock, his shot and its hit. Logs `homing-check: PASS ...` or
 /// `homing-check: FAIL <why>`.
+/// `--stagger-check`: her stagger as the 360's picker (0x824220B0) has it
+/// for a player, run on her own clips: a grenade's blast behind her
+/// staggers her standing (control); not aimed in (`Crouched`); not while
+/// invincible (`Object.GetInvincible`, 0x8228CB80); a bash aimed in
+/// still does. Prints a line each and PASS or FAIL.
+fn stagger_check(game: &mut Game) {
+    use m2_engine::stagger::Event;
+    use m2_math::glam::Vec3;
+    let Some(p) = game.scene.player.as_mut() else {
+        eprintln!("stagger-check: FAIL no player");
+        return;
+    };
+    let blast = Event {
+        direction: Vec3::new(p.facing.sin(), 0.0, p.facing.cos()),
+        direct: false,
+        melee: false,
+        key: Some(m2_assets::name_hash("Explosion")),
+    };
+    let bash = Event {
+        direction: -Vec3::new(p.facing.sin(), 0.0, p.facing.cos()),
+        direct: true,
+        melee: true,
+        key: None,
+    };
+    let cases: [(&str, &Event, bool, bool, bool); 4] = [
+        ("standing, a blast behind her", &blast, false, false, true),
+        ("aimed in, a blast behind her", &blast, true, false, false),
+        ("invincible, a blast behind her", &blast, false, true, false),
+        ("aimed in, a bash from ahead", &bash, true, false, true),
+    ];
+    let mut all = true;
+    for (what, event, aimed, invincible, want) in cases {
+        p.forget_stagger();
+        p.aiming = aimed;
+        let got = p.stagger(event, invincible);
+        let ok = got == want;
+        all &= ok;
+        eprintln!(
+            "stagger-check: {what}: {}, want {}: {}",
+            if got { "staggers" } else { "no stagger" },
+            if want { "staggers" } else { "no stagger" },
+            if ok { "PASS" } else { "FAIL" }
+        );
+    }
+    p.aiming = false;
+    p.forget_stagger();
+    eprintln!("stagger-check: {}", if all { "PASS" } else { "FAIL" });
+}
+
 fn homing_check(game: &mut Game, tick: f32) {
     use m2_math::glam::Vec3;
     let Some(world) = game.scene.world.as_ref() else {
@@ -7339,6 +7424,10 @@ fn drive_for_screenshot(
         swim_check(game, tick);
         return Ok(());
     }
+    if options.impact_check {
+        impact_check(game);
+        return Ok(());
+    }
     if let Some(hold) = options.ladder_check {
         ladder_check(game, hold, tick);
         return Ok(());
@@ -7376,6 +7465,10 @@ fn drive_for_screenshot(
     }
     if options.homing_check {
         homing_check(game, tick);
+        return Ok(());
+    }
+    if options.gravity_check {
+        gravity_check(game);
         return Ok(());
     }
     let label = game
@@ -8282,6 +8375,72 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 /// `--swim-check`: she is put in the nearest water over 4 m deep (looked
 /// for in rings out to 600 m) and swims forward for 4 s walking, at her
 /// pace and sprinting, through the game's tick; logs her speed each time.
+/// `--impact-check`: rounds fired straight down at the ground every 4 m
+/// over 200 m round her (and at the water where there is any), each
+/// struck as one of hers strikes the world ([`Combat::impact_probe`]):
+/// one line per surface word met, how many rounds struck it, and whether
+/// the particle table gave its effect (`by the table`) or the surface's
+/// own pick did (`by its own pick`); then the vehicles' crash cues the
+/// sound table gives for every pair of the scene's vehicles. For the
+/// impact tables (#684): grass, dirt and water are seldom struck in play.
+fn impact_check(game: &mut Game) {
+    use m2_math::glam::Vec3;
+    use std::collections::BTreeMap;
+    let here = game.focus();
+    let Some(world) = game.scene.world.as_ref() else {
+        eprintln!("impact-check: FAIL no island");
+        return;
+    };
+    let physics = &world.physics;
+    let mut by: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+    for i in -50..=50 {
+        for k in -50..=50 {
+            let from = Vec3::new(
+                here.x + i as f32 * 4.0,
+                here.y + 300.0,
+                here.z + k as f32 * 4.0,
+            );
+            let Some((t, _)) = physics.cast_ray(from, Vec3::NEG_Y, 1200.0) else {
+                continue;
+            };
+            let (surface, by_table) = game.combat.impact_probe(physics, from, Vec3::NEG_Y, t);
+            let word = m2_engine::surface::word(surface)
+                .map_or_else(|| format!("{surface:08x}"), str::to_owned);
+            let e = by.entry(word).or_default();
+            e.0 += 1;
+            e.1 += u32::from(by_table);
+        }
+    }
+    for (word, (n, table)) in &by {
+        eprintln!(
+            "impact-check: {word}: {n} rounds, {table} by the table, {} by its own pick",
+            n - table
+        );
+    }
+    let db = &world.index.template_db;
+    let key = |v: &crate::scene::ParkedVehicle| {
+        crate::game::vehicle_sound_key(db, &v.spec.label, v.spec.model)
+    };
+    let (mut pairs, mut cued) = (0, 0);
+    let vehicles = &game.scene.vehicles;
+    for (a, va) in vehicles.iter().enumerate() {
+        for vb in &vehicles[a + 1..] {
+            pairs += 1;
+            if let (Some(ka), Some(kb), Some(t)) = (key(va), key(vb), db.sound_table.as_ref())
+                && t.either(ka, kb).is_some()
+            {
+                cued += 1;
+            }
+        }
+    }
+    eprintln!("impact-check: vehicle pairs {pairs}, {cued} with a crash cue");
+    eprintln!(
+        "impact-check: {} surface words met, {} decided by the table",
+        by.len(),
+        by.values().filter(|v| v.1 > 0).count()
+    );
+}
+
 fn swim_check(game: &mut Game, tick: f32) {
     use m2_math::glam::{Vec2, Vec3};
     let here = game.focus();
@@ -10370,6 +10529,25 @@ impl Running {
             .as_ref()
             .is_some_and(gamehud::GameHud::store_up);
         self.pad.pda = (self.game.support.pda || store) && !self.hud.menu;
+        // Aiming in, the camera turns by its aimed presets.
+        self.pad.aiming = self.game.scene.player.as_ref().is_some_and(|p| p.aiming);
+        // Her pitch, and the held item's camera row (its template's
+        // `HumanCameraModifier`; none known: row 0).
+        if let Some(p) = self.game.scene.player.as_ref() {
+            self.pad.pitch = p.pitch;
+        }
+        let held = match self.game.combat.weapon {
+            combat::Weapon::Rifle => self.game.combat.rifle.name.clone(),
+            combat::Weapon::Rpg => "RPG".to_owned(),
+            combat::Weapon::GrenadeLauncher => "Grenade Launcher".to_owned(),
+        };
+        self.pad.camera_row = self
+            .game
+            .scene
+            .world
+            .as_ref()
+            .and_then(|w| w.index.template_db.camera_row(&held))
+            .unwrap_or(0);
         let mut held = Input::default();
         let target = if dialog { &mut held } else { &mut self.input };
         let keys = self.pad.poll(target, mode, dt);
@@ -10511,6 +10689,9 @@ impl Running {
         let o = &config.options;
         self.set_volumes([o.sfx_volume, o.music_volume, o.dialog_volume]);
         self.pad.look = Some(pause::pad_scale(o.pad_sensitivity));
+        // The on-foot camera's sensitivity: the menu's 0 to 100 over 100
+        // (inferred; 50 is the 360's start value, 0.5).
+        self.pad.sensitivity = Some((o.pad_sensitivity / 100.0).clamp(0.0, 1.0) as f32);
         self.pad.invert = o.invert_pad;
         self.pad.rumble_on = o.rumble;
         self.pad.table = Some(padtable::PadTable::from_names(&o.pad_buttons));
@@ -11684,5 +11865,176 @@ mod tests {
         t += Duration::from_millis(16);
         assert!(pace.frame(t, (1280, 720)).is_none());
         assert_eq!((pace.frames, pace.slow), (1, 0));
+    }
+}
+
+/// `--gravity-check`: the world's gravity, measured in fresh physics
+/// worlds of the Beta's own (`m2_engine::Physics`), against the 360's
+/// 9.0 m/s^2 ([`m2_engine::physics::WORLD_GRAVITY`]): a block dropped
+/// 20 m, the vehicle she is in driven off a 10 m ledge, and a parked boat
+/// (if one is near) left to settle on still water. Prints a line each and
+/// PASS or FAIL.
+fn gravity_check(game: &Game) {
+    use m2_engine::physics::{WORLD_GRAVITY, float_depth};
+    use m2_engine::{CollisionShape, Physics, StaticKey, VehicleControls};
+    use m2_math::glam::{Quat, Vec3};
+    const DT: f32 = 1.0 / 60.0;
+    let quad = |lo: Vec3, hi: Vec3| {
+        CollisionShape::mesh(
+            &[
+                Vec3::new(lo.x, lo.y, lo.z),
+                Vec3::new(hi.x, lo.y, lo.z),
+                Vec3::new(hi.x, lo.y, hi.z),
+                Vec3::new(lo.x, lo.y, hi.z),
+            ],
+            &[[0, 2, 1], [0, 3, 2]],
+        )
+    };
+    let verdict = |ok: bool| if ok { "PASS" } else { "FAIL" };
+    let mut all = true;
+    let h = 20.0;
+    let fell = free_fall_seconds(h);
+    let want = (2.0 * h / WORLD_GRAVITY).sqrt();
+    let ok = fell.is_some_and(|t| (t - want).abs() < 0.05);
+    all &= ok;
+    eprintln!(
+        "gravity-check: free fall {h} m: {:.3} s, want {want:.3} s (9.81 would give {:.3} s): {}",
+        fell.unwrap_or(f32::NAN),
+        (2.0 * h / 9.81f32).sqrt(),
+        verdict(ok)
+    );
+    // Her vehicle, driven at full throttle off a 10 m ledge onto flat
+    // ground.
+    let driving = game.scene.player.as_ref().and_then(|pl| pl.driving);
+    match driving.map(|i| &game.scene.vehicles[i].spec) {
+        Some(spec) if !spec.is_boat() => {
+            let mut p = Physics::new();
+            let ledge = 10.0;
+            if let (Some(top), Some(ground)) = (
+                quad(Vec3::new(-50.0, ledge, -300.0), Vec3::new(50.0, ledge, 0.0)),
+                quad(Vec3::new(-50.0, 0.0, 0.0), Vec3::new(50.0, 0.0, 400.0)),
+            ) {
+                p.add_static(StaticKey::Cell(1), &top, Vec3::ZERO, Quat::IDENTITY);
+                p.add_static(StaticKey::Cell(2), &ground, Vec3::ZERO, Quat::IDENTITY);
+            }
+            p.step(DT);
+            let id = p.add_vehicle(
+                spec,
+                Vec3::new(0.0, ledge + spec.ride_height() + 0.5, -200.0),
+                0.0,
+            );
+            let full = VehicleControls {
+                throttle: 1.0,
+                ..VehicleControls::default()
+            };
+            let mut off: Option<(f32, f32, f32)> = None;
+            let mut landed: Option<(f32, f32)> = None;
+            for k in 0..3600 {
+                p.drive(id, full);
+                p.step(DT);
+                let Some(m) = p.vehicle_transform(id) else {
+                    break;
+                };
+                let at = m.w_axis.truncate();
+                let t = k as f32 * DT;
+                match off {
+                    None if at.z > 0.0 => off = Some((t, at.z, p.vehicle_velocity(id).z)),
+                    Some((t0, z0, _)) if landed.is_none() && at.y < spec.ride_height() + 0.6 => {
+                        landed = Some((t - t0, at.z - z0));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            match (off, landed) {
+                (Some((_, _, speed)), Some((air, dist))) => {
+                    let want = (2.0 * ledge / WORLD_GRAVITY).sqrt();
+                    let ok = (air - want).abs() < 0.1 * want;
+                    all &= ok;
+                    eprintln!(
+                        "gravity-check: {} off a {ledge} m ledge at {speed:.1} m/s: {air:.2} s in the air, {dist:.1} m out, want about {want:.2} s and {:.1} m: {}",
+                        spec.label,
+                        speed * want,
+                        verdict(ok)
+                    );
+                }
+                _ => {
+                    all = false;
+                    eprintln!(
+                        "gravity-check: {} never left the ledge or never landed: FAIL",
+                        spec.label
+                    );
+                }
+            }
+        }
+        _ => eprintln!("gravity-check: not driving a ground vehicle: ledge SKIP"),
+    }
+    // A boat parked nearby, left on still water.
+    match game.scene.vehicles.iter().find(|v| v.spec.is_boat()) {
+        Some(v) => {
+            let mut p = Physics::new();
+            p.set_water(0.0);
+            let id = p.add_vehicle(&v.spec, Vec3::new(0.0, 1.5, 0.0), 0.0);
+            for _ in 0..900 {
+                p.drive(id, VehicleControls::default());
+                p.step(DT);
+            }
+            let y = p.vehicle_transform(id).map_or(f32::NAN, |m| m.w_axis.y);
+            let want = -float_depth(&v.spec);
+            let ok = (y - want).abs() < 0.05;
+            all &= ok;
+            eprintln!(
+                "gravity-check: boat {} settles with its origin at {y:.3} m, want {want:.3} m: {}",
+                v.spec.label,
+                verdict(ok)
+            );
+        }
+        None => eprintln!("gravity-check: no boat parked near: boat SKIP"),
+    }
+    eprintln!("gravity-check: {}", verdict(all));
+}
+
+/// How long a 100 kg block takes to fall `h` metres onto flat ground in a
+/// fresh physics world, seconds, at 60 steps a second.
+fn free_fall_seconds(h: f32) -> Option<f32> {
+    use m2_engine::physics::LoosePiece;
+    use m2_engine::{CollisionShape, Physics, StaticKey};
+    use m2_math::glam::{Mat4, Quat, Vec3};
+    const DT: f32 = 1.0 / 60.0;
+    let mut p = Physics::new();
+    let ground = CollisionShape::mesh(
+        &[
+            Vec3::new(-50.0, 0.0, -50.0),
+            Vec3::new(50.0, 0.0, -50.0),
+            Vec3::new(50.0, 0.0, 50.0),
+            Vec3::new(-50.0, 0.0, 50.0),
+        ],
+        &[[0, 2, 1], [0, 3, 2]],
+    )?;
+    p.add_static(StaticKey::Cell(1), &ground, Vec3::ZERO, Quat::IDENTITY);
+    let block = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.5), 100.0);
+    let id = p.add_debris(
+        &block,
+        Mat4::from_translation(Vec3::new(0.0, h + 0.5, 0.0)),
+        Vec3::ZERO,
+        Vec3::ZERO,
+    );
+    for k in 1..600 {
+        p.step(DT);
+        if p.debris_place(id)?.w_axis.y <= 0.52 {
+            return Some(k as f32 * DT);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod gravity_check_tests {
+    /// The world falls at the 360's 9.0 m/s^2: 20 m in 2.11 s.
+    #[test]
+    fn a_block_falls_as_the_worlds_gravity_has_it() {
+        let t = super::free_fall_seconds(20.0).unwrap();
+        let want = (2.0 * 20.0 / m2_engine::physics::WORLD_GRAVITY).sqrt();
+        assert!((t - want).abs() < 0.05, "{t} vs {want}");
     }
 }

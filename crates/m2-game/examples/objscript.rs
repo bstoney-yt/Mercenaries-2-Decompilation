@@ -14,7 +14,9 @@
 //! what they ask of the first one. For `AntiAir` it spawns a crewed
 //! `M113 AA (VZ) (Driver)` where the first stands, comes near it, has it
 //! lock on her and fire, and counts the radar calls the scripts make
-//! (`antiair:` lines). For `C4` and `beacon` it throws one (`C4
+//! (`antiair:` lines). For `autogunship` it flies the gunship over her
+//! with a hostile vehicle near her and prints the shells it fires
+//! (`gunship:` lines). For `C4` and `beacon` it throws one (`C4
 //! Projectile`, `ammo_designator_beacon`), leaves it 3 s and takes it
 //! away, printing what the scripts ask of it (`thrown:` lines).
 //! For a `tree_` script it makes an island tree of a template that runs
@@ -49,6 +51,20 @@ fn main() -> Result<()> {
         for e in entities.iter().filter(|e| e.script == Some(*hash)) {
             on.push((layer.clone(), e.guid, e.at));
         }
+    }
+    // What they are: template and the data the engine hands the script.
+    let mut kinds: std::collections::BTreeMap<(String, Option<u32>), u32> = Default::default();
+    for e in data
+        .layers
+        .values()
+        .flatten()
+        .filter(|e| e.script == Some(*hash))
+    {
+        let t = e.template.clone().unwrap_or_else(|| e.name.clone());
+        *kinds.entry((t, e.script_data)).or_default() += 1;
+    }
+    for ((t, d), n) in &kinds {
+        println!("  {n} x {t} (data {d:?})");
     }
     let mut layers: Vec<&str> = on.iter().map(|(l, _, _)| l.as_str()).collect();
     layers.dedup();
@@ -243,10 +259,205 @@ fn main() -> Result<()> {
             println!("{s}");
         }
     }
+    if name.eq_ignore_ascii_case("autogunship") {
+        let level = args.get(3).is_some_and(|a| a == "level");
+        autogunship(&mut mission, args.get(2).map(String::as_str), level)?;
+    }
     if ["c4", "beacon"].contains(&name.to_ascii_lowercase().as_str()) {
         thrown(&mut mission, name);
     }
+    if name.eq_ignore_ascii_case("mine") {
+        mines(&mut mission, &on, &mut run);
+    }
+    if name.eq_ignore_ascii_case("proximitymine") {
+        planted(&mut mission);
+    }
     println!("{name} lines logged: {failures}");
+    Ok(())
+}
+
+/// `mine`: for each kind of placed mine (the first of each name), she
+/// stands on it (0.5 m off) for 3 s, then it is killed as a vehicle or a
+/// blast would (`Mission::kill`) and 2 s pass. Prints what the scripts
+/// spawn (`mine:` lines).
+fn mines(
+    mission: &mut Mission,
+    on: &[(String, u32, [f32; 3])],
+    run: &mut impl FnMut(&mut Mission, f64),
+) {
+    let mut seen: Vec<String> = Vec::new();
+    for (_, g, at) in on {
+        let Some(n) = mission
+            .world()
+            .borrow()
+            .objects
+            .get(g)
+            .map(|o| o.name.clone())
+        else {
+            continue;
+        };
+        if seen.contains(&n) {
+            continue;
+        }
+        seen.push(n.clone());
+        mission.take_commands();
+        mission.put_player([at[0] + 0.5, at[1], at[2]]);
+        let spawned = |m: &mut Mission| -> Vec<String> {
+            m.take_commands()
+                .into_iter()
+                .filter_map(|c| match c {
+                    Command::Spawn { what, .. } => Some(what),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut stepped = Vec::new();
+        for _ in 0..12 {
+            mission.tick(0.25);
+            stepped.extend(spawned(mission));
+        }
+        let alive = mission.world().borrow().objects.get(g).map(|o| o.alive);
+        println!("mine: {n} {g:#x}: stood on it: spawned {stepped:?}, alive {alive:?}");
+        if alive == Some(true) {
+            mission.put_player([at[0] + 50.0, at[1], at[2]]);
+            run(mission, 0.5);
+            mission.take_commands();
+            mission.kill(*g);
+            let mut killed = Vec::new();
+            for _ in 0..8 {
+                mission.tick(0.25);
+                killed.extend(spawned(mission));
+            }
+            println!("mine: {n} {g:#x}: killed: spawned {killed:?}");
+        }
+    }
+}
+
+/// `proximitymine`: one planted at (100, 0, 100); she waits 10 m off for
+/// 2 s, then comes 4 m off for 2 s. Prints what its script does
+/// (`planted:` lines).
+fn planted(mission: &mut Mission) {
+    mission.put_player([110.0, 0.0, 100.0]);
+    mission.take_commands();
+    let g = mission.ammo_spawned("Proximity Mine (Planted)", [100.0, 0.0, 100.0]);
+    for (phase, x) in [("10 m off", 110.0), ("4 m off", 104.0)] {
+        mission.put_player([x, 0.0, 100.0]);
+        for _ in 0..8 {
+            mission.tick(0.25);
+            for c in mission.take_commands() {
+                match c {
+                    Command::Remove(r) if r == g => println!("planted: {phase}: removed"),
+                    Command::Ordnance {
+                        what,
+                        at,
+                        launch,
+                        fuse,
+                        ..
+                    } => {
+                        println!("planted: {phase}: {what} at {at:?} {launch:?} {fuse:?}")
+                    }
+                    _ => {}
+                }
+            }
+        }
+        println!(
+            "planted: {phase}: still there {}",
+            mission.world().borrow().objects.contains_key(&g)
+        );
+    }
+}
+
+/// `autogunship`: she stands at (100, 0, 100) with a hostile vehicle
+/// (`target`, default `M113 AA (VZ) (Driver)`) 60 m off; the gunship is
+/// flown over her
+/// as AllCon003 flies it (`Airstrike.Flyby` from 300 m north of her to
+/// her, 100 m up, at 40 m/s, and on past her on the 360 flyby path, or
+/// level with `level` as the fourth argument), and 30 s pass. Prints each
+/// `Gunship Shell` it fires (`gunship:` lines: when, from, which way)
+/// and the scripts' errors.
+fn autogunship(mission: &mut Mission, target: Option<&str>, level: bool) -> Result<()> {
+    let target = target.unwrap_or("M113 AA (VZ) (Driver)");
+    mission.put_player([100.0, 0.0, 100.0]);
+    let tank = mission.spawn(target, [160.0, 0.0, 100.0]);
+    let labels: String = mission
+        .lua()
+        .load(
+            "local t = ... local s = ''              for _, l in ipairs({'Vehicle', 'VZ', 'China', 'Guerilla'}) do                if Object.HasLabel(t, l) then s = s .. l .. ' ' end end              return s .. #Pg.FastCollectGroundVehicles(100, 0, 100, 200) .. ' near her'",
+        )
+        .call(tank.map(m2_game::events::guid_value))
+        .unwrap_or_default();
+    println!("gunship: target {target} {tank:?}: {labels}");
+    mission.take_commands();
+    mission.take_log();
+    let start = mission.now();
+    // AllCon003's call: from 50 m west and 300 m north of her to her, 100
+    // m over her, at 40 m/s.
+    mission.run(
+        "local x, y, z = Object.GetPosition(Player.GetLocalCharacter())          __gunship = Airstrike.Flyby('Support Vehicle (Autogunship)',          x - 50, z + 300, x, z, y + 100, 40)",
+        "gunship-check",
+    )?;
+    let gunship: Option<u32> = mission
+        .lua()
+        .load("return __gunship")
+        .eval::<mlua::Value>()
+        .ok()
+        .and_then(|v| m2_game::events::as_guid(&v));
+    let (from, to) = ([50.0_f32, 100.0, 400.0], [100.0_f32, 100.0, 100.0]);
+    let len = ((to[0] - from[0]).powi(2) + (to[2] - from[2]).powi(2)).sqrt();
+    let mut shells = 0;
+    let mut gunship = gunship;
+    while mission.now() < start + 30.0 {
+        // Flown at 40 m/s: level to her, then on past her. `level`: level,
+        // gone 1500 m past (the port before); else the 360's path (climbing
+        // one in four, gone at twice its run-in past her).
+        if let Some(g) = gunship {
+            let s = 40.0 * (mission.now() - start) as f32;
+            let (flat, up) = if s <= len || level {
+                (s, 0.0)
+            } else {
+                let past = (s - len) / (1.0f32 + 0.0625).sqrt();
+                (len + past, 0.25 * past)
+            };
+            let k = flat / len;
+            let at = [
+                from[0] + (to[0] - from[0]) * k,
+                100.0 + up,
+                from[2] + (to[2] - from[2]) * k,
+            ];
+            let fly_on = if level { 1500.0 } else { 2.0 * len };
+            if flat - len >= fly_on {
+                println!("gunship: t={:.2} gone at {at:.0?}", mission.now() - start);
+                mission.flyby_gone(g);
+                gunship = None;
+            } else {
+                mission.place(g, at, 0.0);
+            }
+        }
+        mission.tick(0.25);
+        for c in mission.take_commands() {
+            if let Command::Ordnance {
+                what, at, launch, ..
+            } = &c
+            {
+                shells += 1;
+                if shells <= 12 {
+                    println!(
+                        "gunship: t={:.2} {what} at {at:?} {launch:?}",
+                        mission.now() - start
+                    );
+                }
+            }
+        }
+        for l in mission.take_log() {
+            if l.contains("rror") || l.contains("SALVO") || l.contains("target") {
+                println!("gunship: log {}", l.chars().take(160).collect::<String>());
+            }
+        }
+    }
+    println!(
+        "gunship: {shells} shells in 30 s ({})",
+        if level { "level" } else { "360 path" }
+    );
     Ok(())
 }
 
