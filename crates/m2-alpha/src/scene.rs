@@ -1637,7 +1637,7 @@ impl LoosePart {
         if self.velocity == Vec3::ZERO {
             return;
         }
-        self.velocity.y -= 9.81 * dt;
+        self.velocity.y -= m2_engine::physics::WORLD_GRAVITY * dt;
         self.offset += self.velocity * dt;
         self.angle += self.spin * dt;
         if self.centre.y + self.offset.y <= self.ground {
@@ -1685,7 +1685,7 @@ impl Chunk {
         if self.velocity == Vec3::ZERO {
             return;
         }
-        self.velocity.y -= 9.81 * dt;
+        self.velocity.y -= m2_engine::physics::WORLD_GRAVITY * dt;
         let step = self.velocity * dt;
         if step.y < 0.0
             && let Some(d) = ground(self.at, -step.y)
