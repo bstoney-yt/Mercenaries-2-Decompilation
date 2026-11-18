@@ -637,10 +637,11 @@ const BASH_HIGH: f32 = 1.2;
 const BASH_LOW: f32 = 0.45;
 /// Blasts kill within `KILL` metres and hurt to `REACH`.
 const KILL: f32 = 4.0;
-/// How hard a blast throws people: (out, up) m/s at its heart, on top of
-/// 3 out and 2 up at the edge of its reach. Invented, to look like the
-/// game's flung bodies.
-pub(crate) const BLAST_PUSH: (f32, f32) = (9.0, 6.0);
+/// The `MaxForce` the blasts without a template (the alpha's own and the
+/// scripted bombs) throw people with: that of most of the game's
+/// explosions (`fx_Explosion_Large`, `Explosion (Small)`, ...: 300).
+/// Invented: these blasts are not the game's.
+const UNTEMPLATED_FORCE: f32 = 300.0;
 /// How hard a rifle round shoves the one it kills, m/s.
 const SHOT_PUSH: f32 = 2.0;
 pub(crate) const REACH: f32 = 9.0;
@@ -1850,6 +1851,9 @@ pub struct Combat {
     /// The game's damage table: what each kind of round and blast does to
     /// people and vehicles.
     pub damage_table: Option<DamageTable>,
+    /// The particle table: what a hit throws up by what it struck and
+    /// how ([`m2_engine::tuning::KeyTable`]).
+    pub particle_table: Option<m2_engine::tuning::KeyTable>,
     /// Pairs of vehicles body to body last tick ([`Combat::vehicle_crashes`]):
     /// a crash is counted as they meet, not while they stay pressed together.
     pub bumping: std::collections::HashSet<(VehicleId, VehicleId)>,
@@ -1954,6 +1958,8 @@ pub struct Combat {
     /// their surface's word names, or the generic one standing in
     /// ([`m2_engine::surface::bullet_impact`]).
     pub impacts: (u32, u32),
+    /// Of those named, how many the particle table decided.
+    pub table_impacts: u32,
     /// Those impacts by template.
     pub impact_kinds: std::collections::BTreeMap<&'static str, u32>,
     /// What the fighting has come to (for checking).
@@ -2215,6 +2221,7 @@ impl Default for Combat {
             rpg: Rifle::launcher(Weapon::Rpg),
             gl: Rifle::launcher(Weapon::GrenadeLauncher),
             damage_table: None,
+            particle_table: None,
             bumping: Default::default(),
             bumping_statics: Default::default(),
             throwables: Vec::new(),
@@ -2259,6 +2266,7 @@ impl Default for Combat {
             flashes: (0, 0),
             cases: 0,
             impacts: (0, 0),
+            table_impacts: 0,
             impact_kinds: std::collections::BTreeMap::new(),
             tally: Tally::default(),
             hurts: Vec::new(),
@@ -3014,7 +3022,7 @@ impl Combat {
             .collect();
         format!(
             "shots by sound set: {} (others firing: {}); flashes: {} the game's, {} the \
-             alpha's own; cases {}; impacts {} by surface, {} generic ({})",
+             alpha's own; cases {}; impacts {} by surface ({} of them by the particle table),              {} generic ({})",
             if sets.is_empty() {
                 "none".to_owned()
             } else {
@@ -3029,6 +3037,7 @@ impl Combat {
             self.flashes.1,
             self.cases,
             self.impacts.0,
+            self.table_impacts,
             self.impacts.1,
             self.impact_kinds
                 .iter()
@@ -3036,6 +3045,26 @@ impl Combat {
                 .collect::<Vec<_>>()
                 .join(", ")
         )
+    }
+
+    /// What a round from `from` along `dir` striking the world `t` metres
+    /// on throws up ([`strike_world`](Self::strike_world)): the word of the
+    /// surface it struck, and whether the particle table decided its
+    /// effect (for `--impact-check`).
+    pub fn impact_probe(
+        &mut self,
+        physics: &Physics,
+        from: Vec3,
+        dir: Vec3,
+        t: f32,
+    ) -> (u32, bool) {
+        let before = self.table_impacts;
+        let surface = physics
+            .cast_ray_surface(from, dir, t + 0.05)
+            .map_or(0, |(.., surface)| surface);
+        self.strike_world(physics, from, dir, t);
+        self.game_fx.clear();
+        (surface, self.table_impacts > before)
     }
 
     /// A round from `from` along `dir` striking the world `t` metres on:
@@ -3052,6 +3081,32 @@ impl Combat {
         let (key, surface) = physics
             .cast_ray_surface(from, dir, t + 0.05)
             .map_or((None, 0), |(_, _, key, surface)| (key, surface));
+        let at = from + dir * (t - IMPACT_BACK).max(0.0);
+        // The particle table's effect for the surface struck by a bullet
+        // first: a surface's word is a `ParticleKey` (`TERRAIN_GRASS` is
+        // the table's `Terrain_grass` row; names hash without case), and
+        // the table decides the terrain's, water's and vegetation's. An
+        // empty cell gives nothing of the table's (0x8218B410 starts no
+        // effect when the cell is 0): the surface's own pick stands there
+        // ([`m2_engine::surface::bullet_impact`]), as walls and metal
+        // still throw up their sparks in the game by another way.
+        let bullet = m2_assets::name_hash("Bullet");
+        if let Some(effect) = self
+            .particle_table
+            .as_ref()
+            .filter(|_| surface != 0)
+            .and_then(|t| t.get_exact(surface, bullet))
+        {
+            self.impacts.0 += 1;
+            self.table_impacts += 1;
+            self.game_fx.push(GameFx {
+                template: FxTemplate::Hash(effect),
+                at,
+                hold: None,
+                turn: None,
+            });
+            return key;
+        }
         let (template, named) = m2_engine::surface::bullet_impact(surface);
         if named {
             self.impacts.0 += 1;
@@ -3059,7 +3114,7 @@ impl Combat {
             self.impacts.1 += 1;
         }
         *self.impact_kinds.entry(template).or_default() += 1;
-        self.show_fx(template, from + dir * (t - IMPACT_BACK).max(0.0));
+        self.show_fx(template, at);
         key
     }
 
@@ -4233,9 +4288,12 @@ impl Combat {
                     let world: Vec<Mat4> = nodes.iter().map(|m| body * *m).collect();
                     // Limp from rest: what shove the 360 gives the body
                     // was not traced.
-                    let id = f
-                        .physics
-                        .add_ragdoll(&rig.skeleton.parents, &world, Vec3::ZERO);
+                    let id = f.physics.add_ragdoll_named(
+                        &rig.skeleton.name_hashes,
+                        &rig.skeleton.parents,
+                        &world,
+                        Vec3::ZERO,
+                    );
                     f.player.ragdoll = Some(id);
                 }
             }
@@ -5374,7 +5432,7 @@ impl Combat {
     /// the hundredth from a car or a tank, a `Tank` none, and nothing
     /// under size 5 or past no more than 1. The part where they met takes the same. Returns the
     /// crashes, for the log: (struck vehicle, the other, closing speed,
-    /// damage it took). From the 360 code: the size, floor, hundredth and
+    /// damage it took, where they met: the deepest point of contact). From the 360 code: the size, floor, hundredth and
     /// cells (0x82162BB8, 0x82163758, 0x8228B5F0, 0x82287CF8). Inferred:
     /// one crash per meeting (the 360 sends one for each new contact),
     /// and the `DamageModifier` multiplier (a body landing on another
@@ -5383,7 +5441,7 @@ impl Combat {
         &mut self,
         physics: &mut Physics,
         vehicles: &mut [ParkedVehicle],
-    ) -> Vec<(usize, usize, f32, f32)> {
+    ) -> Vec<(usize, usize, f32, f32, Vec3)> {
         let mut now = std::collections::HashSet::new();
         let mut met = Vec::new();
         for (i, v) in vehicles.iter().enumerate() {
@@ -5428,7 +5486,7 @@ impl Combat {
                 };
                 let damage = m2_engine::durability::crash_damage(size, cell);
                 if damage <= 0.0 {
-                    out.push((struck, other, closing, 0.0));
+                    out.push((struck, other, closing, 0.0, at));
                     continue;
                 }
                 let v = &mut vehicles[struck];
@@ -5436,7 +5494,7 @@ impl Combat {
                     v.hit_parts(body, at, damage);
                 }
                 self.hurt_vehicle(physics, v, struck, damage);
-                out.push((struck, other, closing, damage));
+                out.push((struck, other, closing, damage, at));
             }
         }
         out
@@ -6254,24 +6312,51 @@ impl Combat {
 
     /// A blast at `at`: fire and smoke, people killed or hurt, vehicles
     /// near it wrecked and thrown.
+    /// A blast at `at` of `(radius, max_force)` on person `j`: the 360's
+    /// push (0x8215CA38, [`m2_engine::ragdoll_launch::blast_impulse`]),
+    /// given to them if their ragdoll runs within the blast's window
+    /// ([`m2_engine::ragdoll_launch::Launch`], 0x8215C560). Their
+    /// `ExplosionFudge` is 1: no human template has one.
+    fn launch_person(
+        &mut self,
+        npcs: &mut [crate::npc::Npc],
+        j: usize,
+        at: Vec3,
+        (radius, force): (f32, f32),
+    ) {
+        let impulse = m2_engine::ragdoll_launch::blast_impulse(
+            at,
+            npcs[j].character.position,
+            radius,
+            force,
+            m2_engine::durability::LEAST_PUSH,
+            1.0,
+            [self.random(), self.random(), self.random()],
+        );
+        npcs[j].launch = Some(m2_engine::ragdoll_launch::Launch::new(&impulse, Vec3::Y));
+    }
+
     pub fn explode(&mut self, f: &mut Field<'_>, at: Vec3) {
         self.burst(at, 1.0, None);
         self.show_fx(fx::GRENADE, at);
         let mut killed = false;
         let key = Some(m2_assets::name_hash("Explosion"));
-        for n in &mut f.people.npcs {
+        for j in 0..f.people.npcs.len() {
+            let n = &f.people.npcs[j];
             let d = n.chest().distance(at);
-            // Thrown out and up, harder the nearer.
             let near = (1.0 - d / REACH).max(0.0);
-            let away = (n.chest() - at).with_y(0.0).normalize_or(Vec3::X);
-            let push = away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
             // Each by their own row of the table (`Human` 1 of an
             // `Explosion`, `HumanArmor` 0.5).
             let own = self.on_person(n, key);
+            if d < REACH {
+                self.launch_person(&mut f.people.npcs, j, at, (REACH, UNTEMPLATED_FORCE));
+            }
+            let n = &mut f.people.npcs[j];
+            // No push of its own: the launch throws them once limp.
             if d < KILL {
-                killed |= n.hurt_by_blast(1000.0 * own, push, key, at) && n.soldier;
+                killed |= n.hurt_by_blast(1000.0 * own, Vec3::ZERO, key, at) && n.soldier;
             } else if d < REACH {
-                killed |= n.hurt_by_blast(100.0 * near * own, push, key, at) && n.soldier;
+                killed |= n.hurt_by_blast(100.0 * near * own, Vec3::ZERO, key, at) && n.soldier;
                 n.panic(at);
             } else if d < REACH * 3.0 {
                 n.panic(at);
@@ -6576,12 +6661,12 @@ impl Combat {
             let n = &mut f.people.npcs[j];
             let d = n.chest().distance(at);
             if d < reach {
-                let near = 1.0 - d / reach;
-                let away = (n.chest() - at).with_y(0.0).normalize_or(Vec3::X);
-                let push =
-                    away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
-                killed |= n.hurt_by_blast(b.damage_at(d) * scale, push, b.key, at) && n.soldier;
-                n.panic(at);
+                // No push of its own (0x8215C560 pushes only a ragdoll
+                // that runs): the launch throws them once limp.
+                killed |=
+                    n.hurt_by_blast(b.damage_at(d) * scale, Vec3::ZERO, b.key, at) && n.soldier;
+                self.launch_person(&mut f.people.npcs, j, at, (b.radius, b.max_force));
+                f.people.npcs[j].panic(at);
             } else if d < reach * 3.0 {
                 n.panic(at);
             }
@@ -6815,20 +6900,20 @@ impl Combat {
             cover && d > 1.0 && physics.cast_ray(at, way / d, d - 0.5).is_some()
         };
         let mut killed = false;
-        for n in f.people.npcs.iter_mut() {
-            let chest = n.chest();
+        for j in 0..f.people.npcs.len() {
+            let chest = f.people.npcs[j].chest();
             let d = chest.distance(at);
             if d < radius * 2.0 {
-                n.panic(at);
+                f.people.npcs[j].panic(at);
             }
             if d >= radius || shielded(chest) {
                 continue;
             }
             let near = 1.0 - d / radius;
-            let away = (chest - at).with_y(0.0).normalize_or(Vec3::X);
-            let push = away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
-            let own = self.on_person(n, key);
-            killed |= n.hurt_by_blast(damage * near * own, push, key, at) && n.soldier;
+            let own = self.on_person(&f.people.npcs[j], key);
+            self.launch_person(&mut f.people.npcs, j, at, (radius, UNTEMPLATED_FORCE));
+            let n = &mut f.people.npcs[j];
+            killed |= n.hurt_by_blast(damage * near * own, Vec3::ZERO, key, at) && n.soldier;
         }
         let her = (f.player.driving.is_none() && f.player.landed)
             .then(|| f.player.character.position + Vec3::Y)
