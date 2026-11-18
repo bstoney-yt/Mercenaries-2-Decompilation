@@ -1267,6 +1267,7 @@ struct DeathCheck {
     next_hit: f32,
     hits: u32,
     died_at: Option<f32>,
+    answered: bool,
     done: bool,
 }
 
@@ -1295,7 +1296,7 @@ impl DeathCheck {
             None if self.hits >= DEATH_HITS && self.t >= self.next_hit => {
                 self.done = true;
                 eprintln!(
-                    "death-check: FAIL {DEATH_HITS} lethal hits and she lives ({:.1} health,                      clamp {})",
+                    "death-check: FAIL {DEATH_HITS} lethal hits and she lives ({:.1} health, clamp {})",
                     c.hp, c.health_clamp
                 );
             }
@@ -1308,11 +1309,22 @@ impl DeathCheck {
                 );
                 game.combat.pending_hurt.push(1.0e6);
             }
+            Some(at)
+                if c.down <= 0.0
+                    && c.hp >= crate::death::DEATH_BELOW
+                    && c.revived_by_scripts == Some(false) =>
+            {
+                self.done = true;
+                eprintln!(
+                    "death-check: FAIL died at {at:.1} s, stood up at {:.1} s by the alpha's own fallback, not the scripts' revive",
+                    self.t
+                );
+            }
             Some(at) if c.down <= 0.0 && c.hp >= crate::death::DEATH_BELOW => {
                 self.done = true;
                 let her = game.focus();
                 eprintln!(
-                    "death-check: PASS died at {at:.1} s, revived at {:.1} s with {:.1} health at                      {her:.0}",
+                    "death-check: PASS died at {at:.1} s, revived at {:.1} s with {:.1} health at {her:.0}",
                     self.t, c.hp
                 );
             }
@@ -4860,6 +4872,21 @@ fn mission_for_screenshot(
         }
         if let Some(c) = &mut death_check {
             c.tick(game, tick);
+            // Her death cancels the contract under way (`PlayerDied`:
+            // `mission:Cancel()`), whose fanfare waits for her answer;
+            // Continue (not Retry) ends it (`MrxTaskContract`'s end,
+            // 2f0b1589 line 560: no retry, her character dead) in
+            // `MrxPlayer.MoveToSickbay`. 3 s on it is answered so.
+            if c.died_at.is_some_and(|at| c.t >= at + 3.0)
+                && !c.answered
+                && let Some(seq) = link.waiting_fanfare()
+            {
+                c.answered = true;
+                eprintln!(
+                    "death-check: she takes Continue on the failed contract's fanfare (HUD call {seq})"
+                );
+                link.answer_fanfare(seq, false);
+            }
         }
         // With --support she throws the marker the scripts hand her.
         let mut intent = intent;

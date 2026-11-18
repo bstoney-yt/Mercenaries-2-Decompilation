@@ -1726,6 +1726,9 @@ pub struct Combat {
     /// (`--hurt`, `--death-check`): her floor, the scripts' clamp and her
     /// death apply as to any hit's.
     pub pending_hurt: Vec<f32>,
+    /// Who stood her up after her last death: `Some(true)` the scripts'
+    /// revive, `Some(false)` the alpha's own fallback ([`crate::death`]).
+    pub revived_by_scripts: Option<bool>,
     /// The scripts keep her from dying (`Object.SetUnkillable`): her
     /// health stops at [`crate::npc::UNKILLABLE_FLOOR`].
     pub unkillable_her: bool,
@@ -2170,6 +2173,7 @@ impl Default for Combat {
             died: false,
             revive_hp: None,
             pending_hurt: Vec::new(),
+            revived_by_scripts: None,
             unkillable_her: false,
             unkillable: std::collections::HashSet::new(),
             fire_lock: false,
@@ -3208,7 +3212,7 @@ impl Combat {
             let before = self.hp;
             let lost = self.hurt_player(f, damage, None);
             eprintln!(
-                "hurt: {damage:.1} dealt her: health {before:.1} -> {:.1} (lost {lost:.1}, clamp                  {}, dead {})",
+                "hurt: {damage:.1} dealt her: health {before:.1} -> {:.1} (lost {lost:.1}, clamp {}, dead {})",
                 self.hp,
                 self.health_clamp,
                 self.hp < crate::death::DEATH_BELOW
@@ -3250,10 +3254,20 @@ impl Combat {
                 // Their revive needs no `Hero.OnDeath` from us: their own
                 // death handlers ran.
                 match self.revive_hp.take() {
-                    Some(hp) => self.hp = hp.clamp(1.0, self.max_hp),
+                    Some(hp) => {
+                        self.hp = hp.clamp(1.0, self.max_hp);
+                        self.revived_by_scripts = Some(true);
+                    }
                     None => {
                         self.hp = self.max_hp;
                         self.revived = true;
+                        self.revived_by_scripts = Some(false);
+                        if self.scripted_health {
+                            eprintln!(
+                                "death: no revive from the scripts in {} s: the alpha stands her up",
+                                crate::death::SCRIPTS_WAIT
+                            );
+                        }
                     }
                 }
                 f.player.down = false;
