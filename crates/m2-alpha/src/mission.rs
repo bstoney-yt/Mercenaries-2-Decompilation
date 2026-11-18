@@ -6745,11 +6745,10 @@ fn check_building_damage_on(mission: &mut Mission, game: &Game, only: Option<u32
     false
 }
 
-/// `--part-destroy-check`: the island fortress (the scripts' living object
-/// named for it with node health) is looked for each step until 70 s of
-/// play (at 20 s, if it isn't in yet, she is put by where its layer places
-/// it; at 40 s its layer is put in the world); found, she is put 40 m from
-/// it, so its model streams in; 15 s on, its nodes are destroyed one at a time by the scripts'
+/// `--part-destroy-check`: the island fortress (the `islandfortress`
+/// entity of `vz_state_gurcon001_fortress`, alive with node health in the
+/// scripts' world) is looked for each step until 70 s of play; found, she
+/// is put 40 m from it, so its model streams in; 15 s on, its nodes are destroyed one at a time by the scripts'
 /// `ObjectState.SendDamage` ([`check_building_damage`]), each node's
 /// `DestroyMsg` going through its part's state machine
 /// ([`part_state_changes`]). Each change logs what the state entered
@@ -6779,11 +6778,10 @@ pub struct PartDestroyCheck {
     shots: Vec<(&'static str, Vec3)>,
     pictured: HashSet<&'static str>,
     done: bool,
-    /// Seconds of play when the fortress was found; whether she was put
-    /// by its layer's place and its layer loaded while looking.
+    /// Seconds of play when the fortress was found, and the find step's
+    /// conditions last logged.
     found: Option<f32>,
-    went: bool,
-    loaded: bool,
+    seen: String,
     /// The step it is waiting on, logged once each ([`waiting`]).
     ///
     /// [`waiting`]: Self::waiting
@@ -6925,78 +6923,63 @@ impl PartDestroyCheck {
     const FIND_BY: f32 = 70.0;
     const DAMAGE_AFTER: f32 = 15.0;
     const JUDGE_AFTER: f32 = 30.0;
-    /// If it isn't in the scripts' world by then, she is put by where its
-    /// layer places it (so its area streams in); and later its layer is
-    /// put in the world.
-    const GO_BY: f32 = 20.0;
-    const LOAD_BY: f32 = 40.0;
-
     /// The find step, each step until it is found or [`FIND_BY`]: the
-    /// scripts' living fortress with node health. Found, she is put 40 m
+    /// fortress is the `islandfortress` entity of the first layer (by
+    /// name) that has one, `vz_state_gurcon001_fortress`'s 0x8a5b0 (not
+    /// the ruined one of `..._destroyed`), which the scripts load early;
+    /// found once it is in the scripts' world, alive, with node health.
+    /// Each change of those conditions is logged. Found, she is put 40 m
     /// off it.
     ///
     /// [`FIND_BY`]: Self::FIND_BY
     fn find(&mut self, game: &mut Game, mission: &mut Mission) {
         self.waiting("find the fortress and put her by it", Self::FIND_BY);
-        let pick = {
+        let entity = mission.entity_with_script(m2_game::mission::ISLAND_FORTRESS);
+        let seen = entity.as_ref().map(|(layer, g, _)| {
             let mut w = mission.world().borrow_mut();
-            let fortress = w
+            let o = w
                 .objects
-                .iter()
-                .find(|(_, o)| o.alive && o.name.to_ascii_lowercase().contains("fortress"))
-                .map(|(g, o)| (*g, o.position));
-            fortress.filter(|(g, _)| w.node_table(*g).is_some())
+                .get(g)
+                .map(|o| (o.alive, o.health, Vec3::from(o.position)));
+            let nodes = w.node_table(*g).map(|t| t.entries().len());
+            let model = game.scene.props.model_parts(*g).is_some();
+            (layer.clone(), *g, o, nodes, model)
+        });
+        let line = match &seen {
+            None => "no layer entity runs islandfortress".to_owned(),
+            Some((layer, g, o, nodes, model)) => format!(
+                "{g:#x} of layer {layer}: in the scripts' world {}, alive {:?}, health {:?}, nodes {nodes:?}, model parts in {model}",
+                o.is_some(),
+                o.map(|o| o.0),
+                o.map(|o| o.1)
+            ),
         };
-        let put = |game: &mut Game, at: Vec3| {
+        if self.seen != line {
+            eprintln!("part-destroy-check: at {:.1} s of play, {line}", self.t);
+            self.seen = line;
+        }
+        if let Some((_, g, Some((true, _, at)), Some(_), _)) = seen {
+            eprintln!(
+                "part-destroy-check: {g:#x} at {at:.0} found at {:.1} s of play, she is put 40 m off",
+                self.t
+            );
             if let Some(p) = game.scene.player.as_mut() {
                 p.driving = None;
                 p.drop_at(at + Vec3::new(40.0, 5.0, 0.0));
             }
             game.ride = None;
             game.on_foot = true;
-        };
-        if let Some((g, at)) = pick {
-            let at = Vec3::from(at);
-            eprintln!(
-                "part-destroy-check: {g:#x} at {at:.0} found at {:.1} s of play, she is put 40 m off",
-                self.t
-            );
-            put(game, at);
             self.target = Some(g);
             self.at = Some(at);
             self.found = Some(self.t);
             return;
         }
-        let entity = mission.entity_with_script(m2_game::mission::ISLAND_FORTRESS);
-        if self.t >= Self::GO_BY
-            && !self.went
-            && let Some((layer, g, at)) = &entity
-        {
-            self.went = true;
-            let at = Vec3::from(*at);
-            eprintln!(
-                "part-destroy-check: not in the scripts' world at {:.1} s; she is put 40 m off where layer {layer} places {g:#x} ({at:.0})",
-                self.t
-            );
-            put(game, at);
-        }
-        if self.t >= Self::LOAD_BY
-            && !self.loaded
-            && let Some((layer, g, _)) = &entity
-        {
-            self.loaded = true;
-            let names = mission.preload(layer);
-            eprintln!(
-                "part-destroy-check: still not in at {:.1} s; layer {layer} put in the world for {g:#x} ({names:?})",
-                self.t
-            );
-        }
         if self.t >= Self::FIND_BY {
             self.done = true;
             eprintln!(
-                "part-destroy-check: FAIL no fortress with node health by {:.0} s of play (its layer entity: {:?})",
+                "part-destroy-check: FAIL no fortress with node health by {:.0} s of play ({})",
                 Self::FIND_BY,
-                entity.map(|e| (e.0, e.1))
+                self.seen
             );
         }
     }
@@ -11233,6 +11216,5 @@ mod tests {
         use super::PartDestroyCheck as C;
         const { assert!(C::FIND_BY + C::JUDGE_AFTER < 120.0) };
         const { assert!(C::DAMAGE_AFTER < C::JUDGE_AFTER) };
-        const { assert!(C::GO_BY < C::LOAD_BY && C::LOAD_BY < C::FIND_BY) };
     }
 }

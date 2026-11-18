@@ -309,6 +309,45 @@ fn fortress(mission: &mut Mission, guid: u32, at: [f32; 3], install: Option<&str
             "object health {health:.1}/{most:.1}, alive {alive}, nodes with health {left}/{nodes}"
         )
     };
+    // Every object of the scripts' world named for a fortress, as
+    // `--part-destroy-check`'s find step sees them: alive, its node count
+    // (none: no table), its health.
+    {
+        let mut w = mission.world().borrow_mut();
+        let named: Vec<(u32, String, bool)> = w
+            .objects
+            .iter()
+            .filter(|(_, o)| o.name.to_ascii_lowercase().contains("fortress"))
+            .map(|(g, o)| (*g, o.name.clone(), o.alive))
+            .collect();
+        for (g, name, alive) in named {
+            let nodes = w.node_table(g).map(|t| t.entries().len());
+            let health = w.objects.get(&g).map_or(0.0, |o| o.health);
+            println!(
+                "named for a fortress: {g:#x} {name:?}, alive {alive}, nodes {nodes:?}, health {health}"
+            );
+        }
+    }
+    // The find step's choice: before cbb88d6e's successor, the first
+    // object (in the map's order, which each run draws anew) named for a
+    // fortress, kept only if it had node health; now the islandfortress
+    // entity of the first layer that has one.
+    {
+        let mut w = mission.world().borrow_mut();
+        let first = w
+            .objects
+            .iter()
+            .find(|(_, o)| o.alive && o.name.to_ascii_lowercase().contains("fortress"))
+            .map(|(g, _)| *g);
+        let old = first.filter(|g| w.node_table(*g).is_some());
+        println!("old find step: first named {first:x?}, picked {old:x?}");
+        let new = mission
+            .entity_with_script(m2_game::mission::ISLAND_FORTRESS)
+            .map(|(_, g, _)| g)
+            .filter(|g| w.objects.get(g).is_some_and(|o| o.alive))
+            .filter(|g| w.node_table(*g).is_some());
+        println!("new find step: picked {new:x?}");
+    }
     // What `--part-destroy-check` falls back on while the fortress isn't
     // in the scripts' world: its layer entity, found by its script.
     println!(
