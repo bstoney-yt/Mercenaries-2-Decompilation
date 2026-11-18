@@ -1805,6 +1805,10 @@ pub struct Combat {
     /// Thrown from a wreck: its blast's place, where she was put out, her
     /// health then, and seconds since (for the landing's log line).
     thrown_from: Option<(Vec3, Vec3, f32, f32)>,
+    /// Her last landing thrown from a wreck: seconds flown, metres from
+    /// the blast and from where she was put out, health before and after
+    /// (`--wreck-rider-check`).
+    pub wreck_landing: Option<(f32, f32, f32, f32, f32)>,
     /// Where the last one went off, and what it pushes what it breaks
     /// with, where known.
     pub last_blast: Option<Vec3>,
@@ -2210,6 +2214,7 @@ impl Default for Combat {
             blasts: 0,
             blast_effects: std::collections::HashMap::new(),
             thrown_from: None,
+            wreck_landing: None,
             last_blast: None,
             last_push: None,
             went_off: Vec::new(),
@@ -4279,7 +4284,21 @@ impl Combat {
             hp,
             self.hp
         );
+        self.wreck_landing = Some((
+            *t,
+            at.with_y(0.0).distance(blast.with_y(0.0)),
+            at.with_y(0.0).distance(out.with_y(0.0)),
+            *hp,
+            self.hp,
+        ));
         self.thrown_from = None;
+    }
+
+    /// Takes all of vehicle `i`'s health through the vehicles' own damage
+    /// ([`Combat::hurt_vehicle`]): for `--wreck-rider-check`.
+    pub fn kill_vehicle(&mut self, physics: &mut Physics, v: &mut ParkedVehicle, i: usize) {
+        let all = v.most_health() * 2.0 + 1.0;
+        self.hurt_vehicle(physics, v, i, all);
     }
 
     /// A blast at `at` of `DamageKey` `key` reached her: alive after it,

@@ -236,6 +236,10 @@ struct Options {
     plough: Option<String>,
     /// With `--drive`: wreck it at speed at the end and watch it stop.
     wreck: bool,
+    /// `--wreck-rider-check`: her car (a Ridgeline and a semi too, where
+    /// loaded) wrecked under her, her throw and landing checked against
+    /// the 360's (`wreck-rider-check:` lines, [`wreck_rider_check`]).
+    wreck_rider_check: bool,
     /// With `--drive` and `--wreck` or `--shoot-up`: get out of the wreck,
     /// walk to the fuel can it left and take it (testing).
     fuel_check: bool,
@@ -768,6 +772,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--plough" => o.plough = Some(value()?.to_ascii_lowercase()),
             "--wreck" => o.wreck = true,
+            "--wreck-rider-check" => {
+                o.wreck_rider_check = true;
+                o.drive = true;
+            }
             "--fuel-check" => o.fuel_check = true,
             "--shoot-up" => {
                 o.shoot_up = Some(
@@ -7586,6 +7594,10 @@ fn drive_for_screenshot(
             .collect::<Vec<_>>()
             .join(", ")
     );
+    if options.wreck_rider_check {
+        wreck_rider_check(game, tick);
+        return Ok(());
+    }
     if options.wreck {
         wreck_at_speed(game, tick);
     }
@@ -8467,6 +8479,111 @@ fn fuel_check(game: &mut Game, tick: f32) {
         eprintln!(
             "fuel-check: at {:.1}: taken {gone}, fuel earned {fuel}",
             p.at
+        );
+    }
+}
+
+/// Xenia's seated rider of a wrecked car: thrown 7.5 to 11 m from the
+/// blast, landing 1.3 to 1.7 s on, unhurt.
+const RIDER_LANDS: (std::ops::RangeInclusive<f32>, std::ops::RangeInclusive<f32>) =
+    (7.5..=11.0, 1.3..=1.7);
+
+/// `--wreck-rider-check` (it turns on `--drive`): she is seated in the
+/// car she drives, then in a Ridgeline and a semi if their models are
+/// loaded (each put where she is, whole). Each is wrecked through the
+/// vehicles' own damage ([`combat::Combat::kill_vehicle`]) at full
+/// health, and her landing waited for (6 s at most). Each passes if
+/// she lost no health, landed [`RIDER_LANDS`] m from the blast and in
+/// that many seconds. One `wreck-rider-check: PASS` or `FAIL ...` line.
+fn wreck_rider_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::Vec3;
+    let Some(first) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("wreck-rider-check: FAIL she drives nothing");
+        return;
+    };
+    let mut picks = vec![first];
+    for name in ["Ridgeline", "Semi"] {
+        if let Some(i) = game
+            .scene
+            .vehicles
+            .iter()
+            .position(|v| !v.wrecked && v.spec.label.contains(name))
+            .filter(|i| !picks.contains(i))
+        {
+            picks.push(i);
+        }
+    }
+    let (mut passed, mut fails) = (Vec::new(), Vec::new());
+    for i in picks {
+        let label = game.scene.vehicles[i].spec.label.clone();
+        // Put where she is (on the ground), whole, her at the wheel.
+        let here = game.focus();
+        if let Some(world) = game.scene.world.as_mut() {
+            let v = &mut game.scene.vehicles[i];
+            if v.wrecked {
+                fails.push(format!("the {label} is already a wreck"));
+                continue;
+            }
+            if i != first || v.id.is_none() {
+                if let Some(id) = v.id.take() {
+                    world.physics.remove_vehicle(id);
+                }
+                v.id = Some(
+                    world
+                        .physics
+                        .add_vehicle(&v.spec, here + Vec3::Y * 0.5, 0.0),
+                );
+            }
+        }
+        if let Some(p) = game.scene.player.as_mut() {
+            p.driving = Some(i);
+            p.landed = true;
+        }
+        game.ride = None;
+        for _ in 0..(1.5 / tick) as u32 {
+            game.step(Intent::default(), tick);
+        }
+        game.combat.wreck_landing = None;
+        let hp = game.combat.hp;
+        if let Some(world) = game.scene.world.as_mut() {
+            let v = &mut game.scene.vehicles[i];
+            game.combat.kill_vehicle(&mut world.physics, v, i);
+        }
+        eprintln!("wreck-rider-check: the {label} wrecked under her at {hp:.1} health");
+        let mut landed = None;
+        for _ in 0..(6.0 / tick) as u32 {
+            game.step(Intent::default(), tick);
+            if let Some(l) = game.combat.wreck_landing.take() {
+                landed = Some(l);
+                break;
+            }
+        }
+        let (far, time) = RIDER_LANDS;
+        match landed {
+            None => fails.push(format!("the {label}: she never landed thrown (6 s)")),
+            Some((t, a, _, before, after)) => {
+                let line = format!(
+                    "the {label}: {a:.1} m from the blast after {t:.2} s, health {before:.1} -> {after:.1}"
+                );
+                if (after - before).abs() < 0.01 && far.contains(&a) && time.contains(&t) {
+                    passed.push(line);
+                } else {
+                    fails.push(line);
+                }
+            }
+        }
+        // Back on her feet for the next.
+        for _ in 0..(1.0 / tick) as u32 {
+            game.step(Intent::default(), tick);
+        }
+    }
+    if fails.is_empty() {
+        eprintln!("wreck-rider-check: PASS {}", passed.join("; "));
+    } else {
+        eprintln!(
+            "wreck-rider-check: FAIL {} (passed: {})",
+            fails.join("; "),
+            passed.join("; ")
         );
     }
 }
