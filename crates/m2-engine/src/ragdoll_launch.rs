@@ -33,6 +33,27 @@
 //! - **The fall** (0x82428768, each update for the first
 //!   [`HEAVY_SECONDS`] of the ragdoll, while the update is under 0.1 s):
 //!   [`heavy_gravity`] more of gravity on every bone.
+//! - **The joint motors** (0x82191118): the ragdoll's start (0x82427828)
+//!   turns them on when started in mode 1, which 0x82421E98 asks for when
+//!   the person's health (table 0x83656548, +4, the one
+//!   `lua_Object_Revive` reads) is over 0.01: so the living go down
+//!   powered and the dead limp. On, 0x825D4150 activates the motor of
+//!   every limited-hinge (Havok type 2) and ragdoll (type 7) joint, aimed
+//!   at the joint's rest (angle 0, 0x82000A84; orientation identity,
+//!   0x82A5E430); off, 0x825D4248 deactivates them. While on, each joint
+//!   motor's force is [`motor_force`] of the seconds since (0x821914A0).
+//!   The limp body's update (0x82190470) turns them off on the second
+//!   update in a row that the body touches something ([`MOTOR_OFF_TOUCHES`]).
+//!   (Mode 2, motors on at a blast's launch 0x824281C8, has no caller
+//!   that asks for it among those traced.)
+//! - **The tumble** (0x821911B8, each update the limp body touches
+//!   nothing): moving at [`SPIN_MIN_SPEED`] or more and turning at
+//!   [`SPIN_MAX_TURN`] or less, about the axis `up x travel` (straight up
+//!   or down: the pelvis's first and third axes summed) through the
+//!   pelvis (hardpoint 0xFAEFB386), every bone is pushed round that axis
+//!   by [`SPIN_PUSH`] times its mass times the update's seconds
+//!   ([`spin_push`]): a forward somersault. The push goes through the
+//!   same body impulse (0x8216DCC8) as the heavier fall's.
 
 use m2_math::glam::Vec3;
 
@@ -166,9 +187,89 @@ impl Launch {
     }
 }
 
+/// The joint motors' most force while on (0x82DE8880).
+pub const MOTOR_FORCE: f32 = 100.0;
+
+/// Seconds the joint motors take to reach [`MOTOR_FORCE`] (0x82DE8884).
+pub const MOTOR_RAMP: f32 = 0.5;
+
+/// Updates in a row touching something that turn the motors off
+/// (0x82190470: off once its count is over 1).
+pub const MOTOR_OFF_TOUCHES: u32 = 2;
+
+/// The tumble: the least speed, m/s (0x82DE8888), the most turn, rad/s
+/// (0x82DE888C), and the push per kilogram per second (0x82DE8890).
+pub const SPIN_MIN_SPEED: f32 = 1.0;
+pub const SPIN_MAX_TURN: f32 = 3.0;
+pub const SPIN_PUSH: f32 = 10.0;
+
+/// Under this (squared), an axis or a lever is none (0x820B7A44).
+const TINY: f32 = 1e-4;
+
+/// The joint motors' force `t` seconds after they went on (0x821914A0):
+/// [`MOTOR_FORCE`] times `min(t / MOTOR_RAMP, 1)`.
+pub fn motor_force(t: f32) -> f32 {
+    MOTOR_FORCE * (t / MOTOR_RAMP).clamp(0.0, 1.0)
+}
+
+/// The tumble's axis for a body going at `velocity` (0x821911B8): `up x
+/// travel`, or, going straight up or down, `fallback` (the pelvis's first
+/// and third axes summed). `None` when too slow or turning too fast.
+pub fn spin_axis(velocity: Vec3, turn: Vec3, fallback: Vec3) -> Option<Vec3> {
+    if velocity.length() < SPIN_MIN_SPEED || turn.length() > SPIN_MAX_TURN {
+        return None;
+    }
+    let axis = Vec3::Y.cross(velocity.normalize());
+    let axis = if axis.length_squared() < TINY {
+        fallback.normalize_or_zero()
+    } else {
+        axis
+    };
+    (axis != Vec3::ZERO).then_some(axis)
+}
+
+/// The tumble's push on a bone of `mass` kg at `at`, about `axis` through
+/// `pivot`, over `dt` s (0x821911B8): round the axis, [`SPIN_PUSH`] x
+/// mass x dt; none on the axis itself.
+pub fn spin_push(axis: Vec3, pivot: Vec3, at: Vec3, mass: f32, dt: f32) -> Vec3 {
+    let round = axis.cross(at - pivot);
+    if round.length_squared() <= TINY {
+        return Vec3::ZERO;
+    }
+    round.normalize() * (SPIN_PUSH * mass * dt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_motors_build_to_their_force_over_half_a_second() {
+        assert_eq!(motor_force(0.0), 0.0);
+        assert_eq!(motor_force(0.25), 50.0);
+        assert_eq!(motor_force(0.5), 100.0);
+        assert_eq!(motor_force(3.0), 100.0);
+    }
+
+    #[test]
+    fn a_body_flying_forward_somersaults_forward() {
+        let pelvis = Vec3::new(0.0, 1.0, 0.0);
+        let axis = spin_axis(Vec3::new(0.0, 2.0, 5.0), Vec3::ZERO, Vec3::X).unwrap();
+        // Going +z: about +x, the head (above) pushed on, the feet back.
+        assert!(axis.normalize().x > 0.99, "{axis}");
+        let head = spin_push(axis, pelvis, pelvis + Vec3::Y * 0.6, 5.0, 0.1);
+        let feet = spin_push(axis, pelvis, pelvis - Vec3::Y * 0.9, 5.0, 0.1);
+        assert!((head - Vec3::Z * 5.0).length() < 1e-4, "{head}");
+        assert!((feet + Vec3::Z * 5.0).length() < 1e-4, "{feet}");
+        // Too slow, or already spinning fast: none.
+        assert_eq!(spin_axis(Vec3::Z * 0.9, Vec3::ZERO, Vec3::X), None);
+        assert_eq!(spin_axis(Vec3::Z * 5.0, Vec3::X * 3.5, Vec3::X), None);
+        // Straight down: the pelvis's axes.
+        assert_eq!(
+            spin_axis(-Vec3::Y * 9.0, Vec3::ZERO, Vec3::Z),
+            Some(Vec3::Z)
+        );
+    }
 
     #[test]
     fn a_blast_pushes_away_and_up_at_45_degrees_by_its_falloff() {

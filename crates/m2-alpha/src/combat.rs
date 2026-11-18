@@ -4311,6 +4311,8 @@ impl Combat {
             &world,
             f.player.character.velocity,
         );
+        // Alive, she goes down with her joint motors on (0x82421E98).
+        f.physics.power_ragdoll(id, true);
         f.player.ragdoll = Some(id);
         f.player.down = true;
         f.player.aiming = false;

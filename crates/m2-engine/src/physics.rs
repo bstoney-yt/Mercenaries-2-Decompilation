@@ -1552,6 +1552,13 @@ const PARKED_FAST: f32 = 3.0;
 /// How far a ragdoll's limb may drift off its joint before it is put
 /// back, metres.
 const RAGDOLL_SLACK: f32 = 0.02;
+
+/// The ragdoll's joint motors' stiffness (N m per radian) and damping
+/// (N m s per radian), the force they may use capped by the 360's
+/// ([`crate::ragdoll_launch::motor_force`]). Invented: the motor objects'
+/// own gains were not traced.
+const RAGDOLL_MOTOR_STIFFNESS: f32 = 1000.0;
+const RAGDOLL_MOTOR_DAMPING: f32 = 20.0;
 /// What the 360's body builder (0x8216A290) gives every body of a model's
 /// physics, the ragdoll's among them: angular damping at least 0.8
 /// (0x820B8034, over the record's +0x44), Havok's linear damping left at
@@ -3326,6 +3333,13 @@ struct Ragdoll {
     /// Seconds since it went limp, for its first heavier fall
     /// ([`crate::ragdoll_launch::heavy_gravity`], the game's ragdoll only).
     age: f32,
+    /// Seconds since its joint motors went on, while on
+    /// ([`Physics::power_ragdoll`]).
+    powered: Option<f32>,
+    /// Updates in a row it has touched something.
+    touches: u32,
+    /// Its pelvis node (0xFAEFB386), the tumble's pivot.
+    pelvis: Option<usize>,
 }
 
 /// The physics world.
@@ -3353,6 +3367,9 @@ pub struct Physics {
     controller: KinematicCharacterController,
     vehicles: Vec<Option<VehicleBody>>,
     ragdolls: Vec<Option<Ragdoll>>,
+    /// Whether [`hold_ragdolls_together`](Self::hold_ragdolls_together)
+    /// runs (on; off only to measure what it holds).
+    hold_ragdolls: bool,
     /// The game's human ragdoll ([`Physics::set_human_ragdoll`]): every
     /// person's bodies and joints, where loaded.
     human_ragdoll: Option<std::sync::Arc<m2_assets::ragdoll::HumanRagdoll>>,
@@ -3429,6 +3446,7 @@ impl Physics {
             controller,
             vehicles: Vec::new(),
             ragdolls: Vec::new(),
+            hold_ragdolls: true,
             human_ragdoll: None,
             debris: Vec::new(),
             water: None,
@@ -3681,9 +3699,12 @@ impl Physics {
         self.fly_helicopters(dt);
         self.cap_debris_speeds();
         self.weigh_down_ragdolls(dt);
+        self.drive_ragdolls(dt);
         self.world.step_with_events(&HavokFriction, &());
         self.cap_ragdoll_speeds();
-        self.hold_ragdolls_together();
+        if self.hold_ragdolls {
+            self.hold_ragdolls_together();
+        }
         self.settle_debris();
     }
 
@@ -4219,9 +4240,143 @@ impl Physics {
         }
     }
 
+    /// Turns ragdoll `id`'s joint motors on or off (from the 360 code,
+    /// 0x82191118; [`crate::ragdoll_launch`]): on, each joint is driven to
+    /// its rest by [`motor_force`](crate::ragdoll_launch::motor_force) of
+    /// the seconds since. Only the game's ragdoll has motors.
+    pub fn power_ragdoll(&mut self, id: RagdollId, on: bool) {
+        let Some(doll) = self.ragdolls.get_mut(id.0).and_then(Option::as_mut) else {
+            return;
+        };
+        if doll.joint_handles.is_empty() || on == doll.powered.is_some() {
+            return;
+        }
+        doll.powered = on.then_some(0.0);
+        if !on {
+            let handles = doll.joint_handles.clone();
+            self.set_ragdoll_motors(&handles, None);
+        }
+    }
+
+    /// Turns the invented joint hold ([`hold_ragdolls_together`](Self::hold_ragdolls_together))
+    /// on or off, to measure what it holds (on by default).
+    pub fn set_hold_ragdolls(&mut self, on: bool) {
+        self.hold_ragdolls = on;
+    }
+
+    /// Whether ragdoll `id`'s joint motors are on.
+    pub fn ragdoll_powered(&self, id: RagdollId) -> Option<bool> {
+        Some(self.ragdolls.get(id.0)?.as_ref()?.powered.is_some())
+    }
+
+    /// Aims every free angle of the joints `handles` at its rest with at
+    /// most `force` (none: motors off).
+    fn set_ragdoll_motors(&mut self, handles: &[r::ImpulseJointHandle], force: Option<f32>) {
+        for &h in handles {
+            let Some(j) = self.world.impulse_joints.get_mut(h, true) else {
+                continue;
+            };
+            for axis in [r::JointAxis::AngX, r::JointAxis::AngY, r::JointAxis::AngZ] {
+                if j.data.locked_axes.contains(axis.into()) {
+                    continue;
+                }
+                match force {
+                    Some(f) => {
+                        j.data
+                            .set_motor_model(axis, r::MotorModel::ForceBased)
+                            .set_motor_position(
+                                axis,
+                                0.0,
+                                RAGDOLL_MOTOR_STIFFNESS,
+                                RAGDOLL_MOTOR_DAMPING,
+                            )
+                            .set_motor_max_force(axis, f);
+                    }
+                    None => {
+                        j.data
+                            .set_motor_position(axis, 0.0, 0.0, 0.0)
+                            .set_motor_max_force(axis, 0.0);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Each update of the game's ragdolls, before the step (from the 360
+    /// code, the limp body's update 0x82190470; [`crate::ragdoll_launch`]):
+    /// touching something two updates in a row turns the motors off; while
+    /// on, their force builds; touching nothing, the body tumbles.
+    fn drive_ragdolls(&mut self, dt: f32) {
+        use crate::ragdoll_launch::{MOTOR_OFF_TOUCHES, motor_force, spin_axis, spin_push};
+        for i in 0..self.ragdolls.len() {
+            let id = RagdollId(i);
+            let Some(doll) = self.ragdolls[i].as_ref() else {
+                continue;
+            };
+            if doll.joint_handles.is_empty() {
+                continue;
+            }
+            let touching = self.ragdoll_touching(id).unwrap_or(false);
+            let doll = self.ragdolls[i].as_mut().expect("present");
+            doll.touches = if touching { doll.touches + 1 } else { 0 };
+            if doll.touches >= MOTOR_OFF_TOUCHES && doll.powered.is_some() {
+                self.power_ragdoll(id, false);
+            }
+            let doll = self.ragdolls[i].as_mut().expect("present");
+            if let Some(t) = &mut doll.powered {
+                *t += dt;
+                let force = motor_force(*t);
+                let handles = doll.joint_handles.clone();
+                self.set_ragdoll_motors(&handles, Some(force));
+            }
+            if touching {
+                continue;
+            }
+            let doll = self.ragdolls[i].as_ref().expect("present");
+            let Some(pelvis) = doll.pelvis else {
+                continue;
+            };
+            let Some(root) = doll.bodies.iter().flatten().next().copied() else {
+                continue;
+            };
+            let Some(b) = self.world.bodies.get(root) else {
+                continue;
+            };
+            let (v, w) = (vec3(b.linvel()), vec3(b.angvel()));
+            let Some(nodes) = self.ragdoll_nodes(id) else {
+                continue;
+            };
+            let p = nodes[pelvis];
+            let fallback = p.x_axis.truncate() + p.z_axis.truncate();
+            let Some(axis) = spin_axis(v, w, fallback) else {
+                continue;
+            };
+            let pivot = p.w_axis.truncate();
+            let handles: Vec<r::RigidBodyHandle> = self.ragdolls[i]
+                .as_ref()
+                .expect("present")
+                .bodies
+                .iter()
+                .flatten()
+                .copied()
+                .collect();
+            for h in handles {
+                if let Some(b) = self.world.bodies.get_mut(h) {
+                    let push = spin_push(axis, pivot, vec3(b.center_of_mass()), b.mass(), dt);
+                    b.apply_impulse(vector(push), true);
+                }
+            }
+        }
+    }
+
     /// Puts each limb back on its joint where the solver let it drift (a
     /// hard landing or a car can pull joints apart), and takes away the
     /// speed it was drifting off with.
+    ///
+    /// Invented, a workaround for rapier's solver: the 360 has no such
+    /// correction (its limp body's update, 0x82190470, moves no bone);
+    /// Havok's solver holds its joints alone. Without it rapier lets a
+    /// thrown body's joints drift apart by metres.
     fn hold_ragdolls_together(&mut self) {
         for doll in self.ragdolls.iter().flatten() {
             for &(limb, on, anchor) in &doll.joints {
@@ -6369,6 +6524,15 @@ impl Physics {
             joints,
             joint_handles,
             age: 0.0,
+            powered: None,
+            touches: 0,
+            // The character's pelvis node; a skeleton without one (the
+            // ragdoll asset's own) pivots on the ragdoll's root bone
+            // (inferred: the same bone).
+            pelvis: hashes[..n]
+                .iter()
+                .position(|&h| h == crate::death::PELVIS_NODE)
+                .or(Some(hips)),
         }));
         Some(RagdollId(self.ragdolls.len() - 1))
     }
@@ -6542,6 +6706,9 @@ impl Physics {
             joints,
             joint_handles: Vec::new(),
             age: 0.0,
+            powered: None,
+            touches: 0,
+            pelvis: None,
         }));
         RagdollId(self.ragdolls.len() - 1)
     }

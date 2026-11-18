@@ -205,6 +205,96 @@ fn blast_launch(d: &Doll) -> Result<bool, Box<dyn std::error::Error>> {
     Ok(thrown && dropped)
 }
 
+/// The joint motors and the tumble (0x82191118, 0x821914A0, 0x821911B8):
+/// a living body let go 3 m up has its motors on while it falls and off
+/// on its second update touching the ground; one thrown forward through
+/// the air somersaults forward (its hips turn about `up x travel`).
+fn motors(d: &Doll) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut p = ground()?;
+    let lift = Mat4::from_translation(Vec3::Y * 3.0);
+    let nodes: Vec<Mat4> = d.bind.iter().map(|m| lift * *m).collect();
+    let id = p
+        .add_asset_ragdoll(&d.doll, &d.hashes, &d.parents, &nodes, Vec3::ZERO)
+        .ok_or("ragdoll not built")?;
+    p.power_ragdoll(id, true);
+    let (mut touched_at, mut off_at) = (None, None);
+    for k in 1..=180 {
+        p.step(1.0 / 60.0);
+        if touched_at.is_none() && p.ragdoll_touching(id) == Some(true) {
+            touched_at = Some(k);
+        }
+        if off_at.is_none() && p.ragdoll_powered(id) == Some(false) {
+            off_at = Some(k);
+        }
+    }
+    let ok = matches!((touched_at, off_at), (Some(t), Some(o)) if o == t + 1 || o == t + 2);
+    println!(
+        "ragdoll-check motors: a living body let go 3 m up: first touch on update {}, motors off on update {}: {}",
+        touched_at.map_or("-".into(), |t| t.to_string()),
+        off_at.map_or("-".into(), |t| t.to_string()),
+        verdict(ok)
+    );
+    // The tumble: thrown along +z, 30 m up, for half a second.
+    let mut p = ground()?;
+    let lift = Mat4::from_translation(Vec3::Y * 30.0);
+    let nodes: Vec<Mat4> = d.bind.iter().map(|m| lift * *m).collect();
+    let id = p
+        .add_asset_ragdoll(&d.doll, &d.hashes, &d.parents, &nodes, Vec3::ZERO)
+        .ok_or("ragdoll not built")?;
+    p.push_ragdoll(id, Vec3::Z * 8.0);
+    let before = Quat::from_mat4(&p.ragdoll_nodes(id).ok_or("gone")?[d.hips]);
+    for _ in 0..30 {
+        p.step(1.0 / 60.0);
+    }
+    let after = Quat::from_mat4(&p.ragdoll_nodes(id).ok_or("gone")?[d.hips]);
+    let (axis, angle) = (after * before.inverse()).to_axis_angle();
+    let forward = axis.x * angle;
+    let tumbles = forward > 0.2;
+    println!(
+        "ragdoll-check motors: thrown forward at 8 m/s: hips turned {:.2} rad forward in 0.5 s: {}",
+        forward,
+        verdict(tumbles)
+    );
+    Ok(ok && tumbles)
+}
+
+/// Not a pass or fail: how far the joints drift without the invented
+/// joint hold (`hold_ragdolls_together`), on a blast's throw, against with it.
+fn drift(d: &Doll) -> Result<(), Box<dyn std::error::Error>> {
+    use m2_engine::ragdoll_launch::{Launch, blast_impulse};
+    let mut worst = [0.0f32; 2];
+    for (k, hold) in [true, false].into_iter().enumerate() {
+        let mut p = ground()?;
+        p.set_hold_ragdolls(hold);
+        let lift = Mat4::from_translation(Vec3::Y * 0.6);
+        let nodes: Vec<Mat4> = d.bind.iter().map(|m| lift * *m).collect();
+        let id = p
+            .add_asset_ragdoll(&d.doll, &d.hashes, &d.parents, &nodes, Vec3::ZERO)
+            .ok_or("ragdoll not built")?;
+        p.power_ragdoll(id, true);
+        let i = blast_impulse(
+            Vec3::new(-2.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.6, 0.0),
+            10.0,
+            300.0,
+            0.3,
+            1.0,
+            [0.5; 3],
+        );
+        let l = Launch::new(&i, Vec3::Y);
+        p.launch_ragdoll(id, l.velocity, l.point);
+        for _ in 0..300 {
+            p.step(1.0 / 60.0);
+            worst[k] = worst[k].max(worst_stretch(d, &p.ragdoll_nodes(id).ok_or("gone")?));
+        }
+    }
+    println!(
+        "ragdoll-check drift: a blast's throw, motors on: worst joint stretch {:.2} m with the joint hold, {:.2} m without",
+        worst[0], worst[1]
+    );
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
         .nth(1)
@@ -214,6 +304,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     all &= limp(&d)?;
     all &= speed_cap(&d)?;
     all &= blast_launch(&d)?;
+    all &= motors(&d)?;
+    drift(&d)?;
     println!("ragdoll-check: {}", verdict(all));
     Ok(())
 }
