@@ -597,8 +597,6 @@ fn survival_beat(t: f32) -> Option<f32> {
         None
     }
 }
-/// Seconds she stays down at no health.
-const DOWN_TIME: f32 = 2.5;
 /// RPG: rocket speed (m/s), reload (s) and how far it flies.
 const ROCKET_SPEED: f32 = 60.0;
 const RPG_RELOAD: f32 = 1.0;
@@ -1514,6 +1512,47 @@ pub struct Contact {
     pub damaging: bool,
 }
 
+/// What a round struck.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Struck {
+    /// A person (index into the people).
+    Person(usize),
+    /// A vehicle (its index).
+    Vehicle(usize),
+    /// Her, the hero.
+    Her,
+    /// The world: a static of the scene's if it was one, and the word of
+    /// the triangle struck (0 none).
+    Static(Option<StaticKey>, u32),
+}
+
+/// A round striking something, the hit event the 360 posts for it
+/// (0x82296940 -> 0x8228D270, queue 0x83175048), which its sound pump
+/// hears (0x8235EFA0 -> 0x8235E190).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hit {
+    pub at: Vec3,
+    /// The round's template (or its gun's; 0 none): its `SoundKey`.
+    pub round: u32,
+    /// Its `DamageKey` (0 none).
+    pub kind: u32,
+    pub struck: Struck,
+    /// The damage table's cell for what it struck against the round, if
+    /// known here (the world's is looked up where it is heard): over 0,
+    /// the hit damages (the sound table's first word).
+    pub cell: Option<f32>,
+}
+
+/// The [`m2_engine::tuning::CONTACTS_HEARD`] of `hits` that damage most,
+/// most first: the 360 keeps three hit slots a frame (its sound
+/// manager's +0x4C, 0x82361CE8), ranked by the damage cell
+/// (0x8235E190 passes it as the priority).
+pub fn heard_hits(mut hits: Vec<(Hit, f32)>) -> Vec<(Hit, f32)> {
+    hits.sort_by(|a, b| b.1.total_cmp(&a.1));
+    hits.truncate(m2_engine::tuning::CONTACTS_HEARD);
+    hits
+}
+
 /// The `CONTACTS_HEARD` of `contacts` of the most mass, most first (the
 /// 360's three slots a frame, 0x82361CE8).
 pub fn heard_contacts(mut contacts: Vec<Contact>) -> Vec<Contact> {
@@ -1812,6 +1851,19 @@ pub struct Combat {
     pub scripted_health: bool,
     /// She just got back up after going down (taken by the mission).
     pub revived: bool,
+    /// She just died with the scripts running (taken by the mission,
+    /// which tells them: [`crate::death`]).
+    pub died: bool,
+    /// The scripts' revive (`Object.Revive`) came: her health, for the
+    /// next tick to stand her up with.
+    pub revive_hp: Option<f32>,
+    /// Damage to deal her at the next step through the health change
+    /// (`--hurt`, `--death-check`): her floor, the scripts' clamp and her
+    /// death apply as to any hit's.
+    pub pending_hurt: Vec<f32>,
+    /// Who stood her up after her last death: `Some(true)` the scripts'
+    /// revive, `Some(false)` the alpha's own fallback ([`crate::death`]).
+    pub revived_by_scripts: Option<bool>,
     /// The scripts keep her from dying (`Object.SetUnkillable`): her
     /// health stops at [`crate::npc::UNKILLABLE_FLOOR`].
     pub unkillable_her: bool,
@@ -2054,6 +2106,13 @@ pub struct Combat {
     /// Every new meeting of a vehicle with another or with a static this
     /// tick, damaging or not, for its sound ([`Contact`]).
     pub contacts: Vec<Contact>,
+    /// Every round that struck something this tick, for its sound
+    /// ([`Hit`]).
+    pub hit_events: Vec<Hit>,
+    /// The template of the round being fired (its ammunition's, or the
+    /// gun's where only that is known; 0 none): what [`Hit::round`]
+    /// names.
+    firing: u32,
     /// Vehicle-against-vehicle contacts heard with a cue, all told (for
     /// `--impact-check`).
     pub vehicle_contacts_heard: u32,
@@ -2270,6 +2329,10 @@ impl Default for Combat {
             motion_blur: MOTION_BLUR,
             scripted_health: false,
             revived: false,
+            died: false,
+            revive_hp: None,
+            pending_hurt: Vec::new(),
+            revived_by_scripts: None,
             unkillable_her: false,
             unkillable: std::collections::HashSet::new(),
             fire_lock: false,
@@ -2371,6 +2434,8 @@ impl Default for Combat {
             impacts: (0, 0),
             table_impacts: 0,
             contacts: Vec::new(),
+            hit_events: Vec::new(),
+            firing: 0,
             vehicle_contacts_heard: 0,
             impact_kinds: std::collections::BTreeMap::new(),
             tally: Tally::default(),
@@ -3187,6 +3252,13 @@ impl Combat {
             .cast_ray_surface(from, dir, t + 0.05)
             .map_or((None, 0), |(_, _, key, surface)| (key, surface));
         let at = from + dir * (t - IMPACT_BACK).max(0.0);
+        self.hit_events.push(Hit {
+            at,
+            round: self.firing,
+            kind: 0,
+            struck: Struck::Static(key, surface),
+            cell: None,
+        });
         // The particle table's effect for the surface struck by a bullet
         // first: a surface's word is a `ParticleKey` (`TERRAIN_GRASS` is
         // the table's `Terrain_grass` row; names hash without case), and
@@ -3336,6 +3408,16 @@ impl Combat {
         } else {
             trigger
         };
+        for damage in std::mem::take(&mut self.pending_hurt) {
+            let before = self.hp;
+            let lost = self.hurt_player(f, damage, None);
+            eprintln!(
+                "hurt: {damage:.1} dealt her: health {before:.1} -> {:.1} (lost {lost:.1}, clamp {}, dead {})",
+                self.hp,
+                self.health_clamp,
+                self.hp < crate::death::DEATH_BELOW
+            );
+        }
         // A fall that hurt her ([`m2_engine::on_foot::fall_impact`]).
         if let Some(fell) = f.player.fell.take() {
             self.hurt_player(f, fell.damage, None);
@@ -3365,9 +3447,30 @@ impl Combat {
 
         if self.down > 0.0 {
             self.down -= dt;
+            // The scripts revived her: up at once, with their health.
+            if self.revive_hp.is_some() {
+                self.down = 0.0;
+            }
             if self.down <= 0.0 {
-                self.hp = self.max_hp;
-                self.revived = true;
+                // Their revive needs no `Hero.OnDeath` from us: their own
+                // death handlers ran.
+                match self.revive_hp.take() {
+                    Some(hp) => {
+                        self.hp = hp.clamp(1.0, self.max_hp);
+                        self.revived_by_scripts = Some(true);
+                    }
+                    None => {
+                        self.hp = self.max_hp;
+                        self.revived = true;
+                        self.revived_by_scripts = Some(false);
+                        if self.scripted_health {
+                            eprintln!(
+                                "death: no revive from the scripts in {} s: the alpha stands her up",
+                                crate::death::SCRIPTS_WAIT
+                            );
+                        }
+                    }
+                }
                 f.player.down = false;
                 f.player.aiming = false;
             }
@@ -3703,6 +3806,7 @@ impl Combat {
         let feel = w.feel;
         let case = case_behind(f.arsenal, w.model, from, aim);
         let ammo = w.ammo;
+        self.firing = ammo.template;
         let round = match ammo.key {
             Some(k) if k == m2_assets::name_hash("Bullet") => Round::Bullet,
             _ => Round::BulletLarge,
@@ -3812,6 +3916,7 @@ impl Combat {
         let (eye, aim) = Self::aim_ray(f.player);
         let (from, case) = Self::muzzle_and_case(f, f.arsenal.of_gun(&self.rifle));
         let ammo = self.rifle.ammo;
+        self.firing = ammo.map_or(0, |a| a.template);
         let round = match ammo.and_then(|a| a.key) {
             Some(k) if k == m2_assets::name_hash("Bullet") || k == 0 => Round::Bullet,
             Some(_) => Round::BulletLarge,
@@ -4235,6 +4340,15 @@ impl Combat {
             }
             if at_her && f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
                 let damage = self.npc_round(gun);
+                self.firing = gun.map_or(0, |g| g.template);
+                let key = gun.and_then(|g| g.damage_key);
+                self.hit_events.push(Hit {
+                    at: closest,
+                    round: self.firing,
+                    kind: key.unwrap_or(0),
+                    struck: Struck::Her,
+                    cell: Some(self.hero_scale(key)),
+                });
                 let lost = self.hurt_player(f, damage, Some(from));
                 self.tally.taken_rounds += lost;
                 self.tally.rounds_on_her += u32::from(lost > 0.0);
@@ -4466,10 +4580,13 @@ impl Combat {
         let before = self.hp;
         self.hp = (self.hp - damage).max(floor.min(self.hp));
         let lost = (before - self.hp).max(0.0);
-        if self.hp <= 0.0 {
+        if self.hp < crate::death::DEATH_BELOW {
             self.tally.downs += 1;
             self.remarks.push(Remark::Down);
-            self.down = DOWN_TIME;
+            // With the scripts running she stays down for their death
+            // flow ([`crate::death`]); without, the alpha's own stand-up.
+            self.down = crate::death::down_time(self.scripted_health);
+            self.died = self.scripted_health;
             f.player.down = true;
             f.player.aiming = false;
             // On foot the 360 posts her `Die` (0x82287F98, when no hit's
@@ -4817,6 +4934,7 @@ impl Combat {
             );
         }
         let ammo = w.ammo;
+        self.firing = ammo.template;
         match w.flight() {
             m2_engine::weapons::Flight::Round => {
                 for _ in 0..w.pellets.max(1) {
@@ -4846,7 +4964,15 @@ impl Combat {
                         let along = (her - from).dot(aim).max(0.0);
                         let blocked = hit.is_some_and(|h| h.0 < along - 1.0);
                         if !blocked && (from + aim * along).distance(her) < 0.45 {
-                            let taken = damage * self.hero_scale(ammo.key);
+                            let cell = self.hero_scale(ammo.key);
+                            let taken = damage * cell;
+                            self.hit_events.push(Hit {
+                                at: her,
+                                round: self.firing,
+                                kind: ammo.key.unwrap_or(0),
+                                struck: Struck::Her,
+                                cell: Some(cell),
+                            });
                             let lost = self.hurt_player(f, taken, Some(from));
                             self.tally.taken_rounds += lost;
                             self.tally.rounds_on_her += u32::from(lost > 0.0);
@@ -5539,6 +5665,8 @@ impl Combat {
                 self.reload = w.gap();
             }
             let ammo = w.ammo;
+            self.firing = ammo.template;
+            self.firing = ammo.template;
             let hit = cast_shot(f.physics, f.people, from, aim, MG_RANGE, None, Some(id));
             let to = hit.map_or(from + aim * MG_RANGE, |h| from + aim * h.0);
             self.effect(Effect::Tracer { from, to }, 0.07);
@@ -5871,6 +5999,13 @@ impl Combat {
             {
                 scale = own;
             }
+            self.hit_events.push(Hit {
+                at,
+                round: self.firing,
+                kind: key,
+                struck: Struck::Vehicle(i),
+                cell: Some(scale),
+            });
             if damage * scale > 0.0 {
                 // The part it struck takes it as the whole does: the
                 // 360 posts one damage message, the table's cell already
@@ -6715,7 +6850,15 @@ impl Combat {
         push: Vec3,
         at: Option<Vec3>,
     ) -> bool {
-        let taken = damage * hero * self.on_person(&people.npcs[j], key);
+        let cell = self.on_person(&people.npcs[j], key);
+        let taken = damage * hero * cell;
+        self.hit_events.push(Hit {
+            at: at.unwrap_or(people.npcs[j].character.position + Vec3::Y),
+            round: self.firing,
+            kind: key.unwrap_or(0),
+            struck: Struck::Person(j),
+            cell: Some(cell),
+        });
         people.npcs[j].last_hit = at.map(|p| (p, push));
         if self.crew_firing {
             let killed = people.npcs[j].shot_by_army(taken, push, 0);
@@ -7649,6 +7792,20 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn three_hits_a_frame_are_heard_those_that_damage_most() {
+        let h = |round: u32| Hit {
+            at: Vec3::ZERO,
+            round,
+            kind: 0,
+            struck: Struck::Person(0),
+            cell: None,
+        };
+        let heard = heard_hits(vec![(h(1), 0.25), (h(2), 1.0), (h(3), 0.0), (h(4), 0.5)]);
+        let order: Vec<u32> = heard.iter().map(|(h, _)| h.round).collect();
+        assert_eq!(order, [2, 4, 1]);
+    }
 
     #[test]
     fn three_contacts_a_frame_are_heard_those_of_most_mass() {
@@ -8725,6 +8882,53 @@ mod tests {
         combat.step(&mut field, Trigger::default(), 1.0 / 60.0);
         assert_eq!(field.player.ragdoll, None);
         assert!(field.physics.ragdoll_nodes(doll).is_none());
+    }
+
+    /// With the scripts running a death goes to them: she stays down past
+    /// the alpha's 2.5 s, and gets up at once with their health when their
+    /// revive comes, with no `Hero.OnDeath` of ours.
+    #[test]
+    fn a_scripted_death_waits_for_the_scripts_revive() {
+        let mut physics = ground();
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        let mut vehicles = Vec::new();
+        let mut explosives = [];
+        let mut combat = Combat {
+            scripted_health: true,
+            ..Combat::default()
+        };
+        let mut field = Field {
+            physics: &mut physics,
+            player: &mut player,
+            people: &mut people,
+            vehicles: &mut vehicles,
+            arsenal: &arsenal,
+            explosives: &mut explosives,
+        };
+        // Left under 0.01 health she is dead, as the 360's health change
+        // has it (0x822889F8), not only at nothing.
+        combat.hurt_player(&mut field, combat.hp - 0.005, None);
+        assert!(field.player.down && combat.died, "{} left", combat.hp);
+        let dt = 1.0 / 60.0;
+        for _ in 0..60 * 5 {
+            combat.step(&mut field, Trigger::default(), dt);
+        }
+        assert!(field.player.down, "still down 5 s on");
+        combat.revive_hp = Some(100.0);
+        combat.step(&mut field, Trigger::default(), dt);
+        assert!(!field.player.down);
+        assert_eq!(combat.hp, 100.0);
+        assert!(!combat.revived, "their revive: no Hero.OnDeath of ours");
+        // Without the scripts: up after 2.5 s at full health, as before.
+        let mut alone = Combat::default();
+        alone.hurt_player(&mut field, 1.0e6, None);
+        assert!(!alone.died);
+        for _ in 0..(60.0 * 2.6) as usize {
+            alone.step(&mut field, Trigger::default(), dt);
+        }
+        assert!(!field.player.down && alone.revived);
     }
 
     /// Killed on foot with no body loaded there is nothing to go limp;

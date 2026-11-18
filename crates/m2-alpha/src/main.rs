@@ -63,6 +63,7 @@ mod cheats;
 mod combat;
 mod config;
 mod coop;
+mod death;
 mod destruct;
 mod disguise;
 mod display;
@@ -525,6 +526,9 @@ struct Options {
     /// by an RPG and, should it stand, run into by a jeep; logs
     /// `mine-check:` lines ([`mines::MineCheck`]).
     mine_check: bool,
+    /// `--object-sound-check`: her C4 put down in the mission, its
+    /// object-attached beep logged ([`mission::ObjectSoundCheck`]).
+    object_sound_check: bool,
     /// `--impact-check`: rounds struck into the ground round her, by
     /// surface ([`impact_check`]).
     impact_check: bool,
@@ -588,6 +592,10 @@ struct Options {
     /// With `--mission --screenshot`: her health drops to this eight
     /// seconds in, to see the scripts' healing and survival rescue.
     hurt: Option<f32>,
+    /// `--death-check`: lethal damage dealt her until she dies, then her
+    /// death through the scripts to their revive logged (`death-check:`
+    /// lines, [`DeathCheck`]).
+    death_check: bool,
     /// With `--mission`: driving, the horn is held half a second every
     /// this many seconds (to hear it, and what the gates, the disguise
     /// and friendly soldiers make of it).
@@ -915,6 +923,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.mine_check = true;
                 o.mission = true;
             }
+            "--object-sound-check" => {
+                o.object_sound_check = true;
+                o.mission = true;
+            }
             "--impact-check" => {
                 o.impact_check = true;
                 o.drive = true;
@@ -1093,6 +1105,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--autoplay" => o.autoplay = true,
             "--smarter-ai" => o.smarter_ai = true,
             "--hurt" => o.hurt = Some(value()?.parse().context("--hurt expects health")?),
+            "--death-check" => {
+                o.death_check = true;
+                o.mission = true;
+            }
             "--honk-every" => {
                 o.honk_every = Some(value()?.parse().context("--honk-every expects seconds")?)
             }
@@ -1272,6 +1288,89 @@ fn keep_crash_reports() {
 /// When `--hurt` takes her health: after the start's fade, which keeps her
 /// from harm.
 const HURT_AT: f32 = 8.0;
+
+/// `--death-check`: from [`HURT_AT`] on, lethal damage is dealt her each
+/// [`DEATH_HIT_EVERY`] s until she dies (the scripts' health clamp turns
+/// the first into their survival rescue; with it off, the next kills).
+/// Then it waits up to [`DEATH_WAIT`] s for the scripts' revive (their
+/// `PlayerDied` -> `MoveToSickbay` -> `Object.Revive`). Logs
+/// `death-check: PASS died at T s, revived at T2 s with H health at P`,
+/// else `FAIL <why>`.
+#[derive(Debug, Default)]
+struct DeathCheck {
+    t: f32,
+    next_hit: f32,
+    hits: u32,
+    died_at: Option<f32>,
+    answered: bool,
+    done: bool,
+}
+
+const DEATH_HIT_EVERY: f32 = 3.0;
+const DEATH_HITS: u32 = 10;
+const DEATH_WAIT: f32 = 90.0;
+
+impl DeathCheck {
+    fn tick(&mut self, game: &mut Game, dt: f32) {
+        if self.done {
+            return;
+        }
+        self.t += dt;
+        if self.t < HURT_AT {
+            return;
+        }
+        let c = &game.combat;
+        match self.died_at {
+            None if c.down > 0.0 && c.hp < crate::death::DEATH_BELOW => {
+                self.died_at = Some(self.t);
+                eprintln!(
+                    "death-check: she died at {:.1} s after {} hits",
+                    self.t, self.hits
+                );
+            }
+            None if self.hits >= DEATH_HITS && self.t >= self.next_hit => {
+                self.done = true;
+                eprintln!(
+                    "death-check: FAIL {DEATH_HITS} lethal hits and she lives ({:.1} health, clamp {})",
+                    c.hp, c.health_clamp
+                );
+            }
+            None if self.t >= self.next_hit => {
+                self.hits += 1;
+                self.next_hit = self.t + DEATH_HIT_EVERY;
+                eprintln!(
+                    "death-check: lethal hit {} (health {:.1}, clamp {})",
+                    self.hits, c.hp, c.health_clamp
+                );
+                game.combat.pending_hurt.push(1.0e6);
+            }
+            Some(at)
+                if c.down <= 0.0
+                    && c.hp >= crate::death::DEATH_BELOW
+                    && c.revived_by_scripts == Some(false) =>
+            {
+                self.done = true;
+                eprintln!(
+                    "death-check: FAIL died at {at:.1} s, stood up at {:.1} s by the alpha's own fallback, not the scripts' revive",
+                    self.t
+                );
+            }
+            Some(at) if c.down <= 0.0 && c.hp >= crate::death::DEATH_BELOW => {
+                self.done = true;
+                let her = game.focus();
+                eprintln!(
+                    "death-check: PASS died at {at:.1} s, revived at {:.1} s with {:.1} health at {her:.0}",
+                    self.t, c.hp
+                );
+            }
+            Some(at) if self.t - at > DEATH_WAIT => {
+                self.done = true;
+                eprintln!("death-check: FAIL died at {at:.1} s, no revive in {DEATH_WAIT} s");
+            }
+            _ => {}
+        }
+    }
+}
 
 /// With `--mission --hijack`, how long an action marker's vehicle is left
 /// before she hijacks it, seconds: the villa tank comes through the hall
@@ -4527,7 +4626,8 @@ fn mission_for_screenshot(
         .with_script_join(options.script_join)
         .with_skip_to(options.skip_to.clone())
         .with_job_near(options.job_near)
-        .with_mine_check(options.mine_check);
+        .with_mine_check(options.mine_check)
+        .with_object_sound_check(options.object_sound_check);
     link.check_node_damage = options.check_node_damage;
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
@@ -4665,6 +4765,7 @@ fn mission_for_screenshot(
     let (mut hijack_running, mut hijack_shots) = (0.0f32, 0u32);
     let mut action_since: Option<u32> = None;
     let mut placed_tried = std::collections::HashSet::new();
+    let mut death_check = options.death_check.then(DeathCheck::default);
     // Seconds she has been where --props-check hits the props.
     let mut props_ready = 0.0;
     let mut shop_check = options.shop_check.clone().map(shopcheck::ShopCheck::new);
@@ -4805,8 +4906,32 @@ fn mission_for_screenshot(
         if let Some(hp) = options.hurt
             && i == (HURT_AT / tick).round() as u32
         {
-            eprintln!("hurt: her health {:.1} -> {hp:.1}", game.combat.hp);
-            game.combat.hp = hp;
+            // Through the health change, as a hit's damage (her floor, the
+            // scripts' clamp and her death apply), not set outright.
+            let damage = (game.combat.hp - hp).max(0.0);
+            eprintln!(
+                "hurt: {damage:.1} to deal her ({:.1} -> {hp:.1})",
+                game.combat.hp
+            );
+            game.combat.pending_hurt.push(damage);
+        }
+        if let Some(c) = &mut death_check {
+            c.tick(game, tick);
+            // Her death cancels the contract under way (`PlayerDied`:
+            // `mission:Cancel()`), whose fanfare waits for her answer;
+            // Continue (not Retry) ends it (`MrxTaskContract`'s end,
+            // 2f0b1589 line 560: no retry, her character dead) in
+            // `MrxPlayer.MoveToSickbay`. 3 s on it is answered so.
+            if c.died_at.is_some_and(|at| c.t >= at + 3.0)
+                && !c.answered
+                && let Some(seq) = link.waiting_fanfare()
+            {
+                c.answered = true;
+                eprintln!(
+                    "death-check: she takes Continue on the failed contract's fanfare (HUD call {seq})"
+                );
+                link.answer_fanfare(seq, false);
+            }
         }
         // With --support she throws the marker the scripts hand her.
         let mut intent = intent;
@@ -11464,6 +11589,10 @@ fn mission_sounds(audio: &mut sound::GameAudio, m: &mut mission::MissionLink) {
             audio.ui_sound(&cue);
         }
     }
+    for (guid, cue, stop, at) in m.take_object_sounds() {
+        audio.object_sound(guid, &cue, at, stop);
+    }
+    audio.follow_objects(|g| m.object_at(g));
     if let Some(cue) = m.take_music() {
         audio.music_cue_at(cue.as_deref(), m.music_at());
     }
