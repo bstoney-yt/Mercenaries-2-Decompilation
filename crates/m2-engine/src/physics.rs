@@ -46,8 +46,18 @@ pub use winch_cable::{CARGO_TILT, CableId, HALF_LINK, LINK_MASS, LINK_RADIUS, MI
 pub const STEP_HEIGHT: f32 = 0.5;
 /// Steepest slope a character walks up, radians (50 degrees).
 pub const MAX_SLOPE: f32 = 50.0 * std::f32::consts::PI / 180.0;
-/// Downward acceleration, m/s².
+/// Downward acceleration, m/s², of what the Beta moves by its own sums
+/// rather than the physics world (characters without a template, the
+/// fight's rounds and lobs, falling crates): see [`WORLD_GRAVITY`] for the
+/// world's.
 pub const GRAVITY: f32 = 9.81;
+/// The physics world's gravity, m/s² downward: every rigid body's pull
+/// (vehicles, debris, props, ragdolls). From the 360 code: the world's
+/// set-up (0x82164A58, from the physics manager's init 0x821523B8) builds
+/// its `hkpWorldCinfo` (0x82630380) and loads its gravity from 0x820F9710,
+/// (0, -9, 0); its broadphase from the two vectors after it (+-4096 across,
+/// +-1000 up).
+pub const WORLD_GRAVITY: f32 = 9.0;
 /// The gravity the 360 car code pulls with where it works its own, m/s²
 /// (the constant at 0x82DE8C30, -10, that the gravity factor's pull at
 /// 0x8219EE4C and 14 other physics routines read).
@@ -1484,7 +1494,7 @@ fn preloads(spec: &VehicleSpec, strength: impl Fn(bool) -> f32, mass_z: f32) -> 
                 (1.0 - front_share, nr)
             };
             let k = strength(w.steers).max(1.0);
-            (GRAVITY * share / (n.max(1) as f32 * k)).min(1.0)
+            (WORLD_GRAVITY * share / (n.max(1) as f32 * k)).min(1.0)
         })
         .collect()
 }
@@ -1574,7 +1584,11 @@ pub const FLOAT_DEPTH: f32 = 0.35;
 /// metres: where its float springs hold it ([`BoatFloat::rest_depth`];
 /// its template's, else the 360 record's defaults).
 pub fn float_depth(spec: &VehicleSpec) -> f32 {
-    spec.tuning.boat.unwrap_or(BOAT).float.rest_depth(GRAVITY)
+    spec.tuning
+        .boat
+        .unwrap_or(BOAT)
+        .float
+        .rest_depth(WORLD_GRAVITY)
 }
 const BOAT_ROCK: f32 = 2.5;
 const BOAT_TOP: f32 = 18.0;
@@ -3382,7 +3396,10 @@ impl Physics {
             ..KinematicCharacterController::default()
         };
         Self {
-            world: r::PhysicsWorld::default(),
+            world: r::PhysicsWorld {
+                gravity: r::Vector::new(0.0, -WORLD_GRAVITY, 0.0),
+                ..r::PhysicsWorld::default()
+            },
             statics: HashMap::new(),
             keys: HashMap::new(),
             surfaces: HashMap::new(),
@@ -3688,7 +3705,7 @@ impl Physics {
             let ahead = (turn * Vec3::Z).with_y(0.0).normalize_or_zero();
             let wet = if v.wrecked {
                 let n = hull.points.len().max(1) as f32;
-                let lift = GRAVITY * v.mass / n * dt;
+                let lift = WORLD_GRAVITY * v.mass / n * dt;
                 let mut wet = 0.0;
                 for &q in &hull.points {
                     let p = at + turn * q;
@@ -3794,7 +3811,7 @@ impl Physics {
                 vec3(b.angvel()),
                 p.translation.y,
                 b.mass(),
-                GRAVITY,
+                WORLD_GRAVITY,
                 dt,
             );
             if let Some((x, z)) = flown.spin_across {
@@ -5003,9 +5020,9 @@ impl Physics {
             // up while it is near level.
             if gripping && v.tank.is_none() {
                 let up = body.position().rotation * r::Vector::Y;
-                let down = r::Vector::new(0.0, -GRAVITY, 0.0);
+                let down = r::Vector::new(0.0, -WORLD_GRAVITY, 0.0);
                 let along = down - up * down.dot(up);
-                let steep = along.length() / GRAVITY;
+                let steep = along.length() / WORLD_GRAVITY;
                 let held = (CLIMB_TRACKED.sin() / steep.max(1e-3)).min(1.0);
                 body.apply_impulse(-along * held * mass * dt, true);
             }
@@ -9212,10 +9229,10 @@ mod tests {
             p.step(DT);
         }
         // Afloat, level, its origin as deep as its springs hold it: their
-        // bottoms at its origin, 9.81 / (4 x 5) m under the water.
+        // bottoms at its origin, 9.0 / (4 x 5) m under the water.
         let m = place(&p);
         let y = m.w_axis.y;
-        assert!((float_depth(&spec) - 0.49).abs() < 0.01);
+        assert!((float_depth(&spec) - 0.45).abs() < 0.01);
         assert!(
             (y - (water - float_depth(&spec))).abs() < 0.05,
             "floats at {y}"
@@ -10044,7 +10061,8 @@ mod tests {
         // villa.
         let (slid, touching, (dropped, _)) = parked_tank(Some(0.38), 0.0, Some(0.0));
         assert!(dropped < 0.05, "dropped {dropped} m");
-        assert!(slid < 0.1, "slid {slid} m");
+        // Under 0.1 m with 9.81 m/s^2; 0.106 m with the world's 9.0.
+        assert!(slid < 0.12, "slid {slid} m");
         assert_eq!(touching, 6);
     }
 
@@ -10439,7 +10457,7 @@ mod tests {
             for _ in 0..300 {
                 p.step(DT);
             }
-            let want = f * GRAVITY / (4.0 * k);
+            let want = f * WORLD_GRAVITY / (4.0 * k);
             let sag = p.vehicle_suspension(id);
             let mean = sag.iter().sum::<f32>() / 4.0;
             // Within 5%: Rapier's springs settle 2 to 4% short of what
@@ -10573,7 +10591,7 @@ mod tests {
         };
         // An M151's 25 and 1.7: 9.8 cm down, back up after 0.34 s.
         let (sag, t) = ride(25.0, 1.7);
-        assert!((sag - 9.81 / 100.0).abs() < 0.01, "{sag}");
+        assert!((sag - WORLD_GRAVITY / 100.0).abs() < 0.01, "{sag}");
         assert!((t - half(25.0, 1.7)).abs() < 0.04, "{t}");
         // A sports car's 60 and 3: 4.1 cm, 0.22 s.
         let (sag, t) = ride(60.0, 3.0);

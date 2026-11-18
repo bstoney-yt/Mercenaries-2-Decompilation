@@ -222,6 +222,10 @@ m2-alpha [options]
                          walk to the fuel can the wreck left and take it
   --fire                 with --aim or --drive: fire just before the
                          picture
+  --gravity-check        check: (turns on --drive) the physics world's gravity
+                         against the 360's 9.0 m/s^2: a block dropped 20 m,
+                         the vehicle she gets in driven off a 10 m ledge,
+                         a parked boat settling on still water; PASS/FAIL
   --homing-check         debug: the vehicle she drives counts as ground and
                          air target (signatures 1, 1) for enemy homing
                          weapons, so any army SAM/AA/AT gun or homing
