@@ -637,6 +637,21 @@ const BASH_HIGH: f32 = 1.2;
 const BASH_LOW: f32 = 0.45;
 /// Blasts kill within `KILL` metres and hurt to `REACH`.
 const KILL: f32 = 4.0;
+/// Whether a collapse of world box `b` catches what is at `p`: inside
+/// the box widened [`COLLAPSE_REACH`] across and above (0x823977C8).
+pub fn collapse_catches_at(b: (Vec3, Vec3), p: Vec3) -> bool {
+    let lo = b.0 - Vec3::new(COLLAPSE_REACH, 0.0, COLLAPSE_REACH);
+    let hi = b.1 + Vec3::splat(COLLAPSE_REACH);
+    p.cmpge(lo).all() && p.cmple(hi).all()
+}
+
+/// How far beyond a collapsing building's box across and above it
+/// catches people, metres (0x820BAEEC, 0x823977C8).
+pub const COLLAPSE_REACH: f32 = 10.0;
+/// What a collapse does, before the damage table's `ExplosionLarge` cell
+/// (0x820CC0D4, 0x823977C8).
+pub const COLLAPSE_DAMAGE: f32 = 300.0;
+
 /// The `MaxForce` the blasts without a template (the alpha's own and the
 /// scripted bombs) throw people with: that of most of the game's
 /// explosions (`fx_Explosion_Large`, `Explosion (Small)`, ...: 300).
@@ -1712,6 +1727,9 @@ pub struct Combat {
     pub rammed: f32,
     /// Knocked down: lying limp until she gets up ([`KnockedHer`]).
     pub knocked: Option<KnockedHer>,
+    /// Buildings come down since the last step, by their world boxes, for
+    /// whom they catch ([`Combat::collapse_catches`]).
+    collapses: Vec<(Vec3, Vec3)>,
     /// Her template's `TossGetupSeconds`
     /// ([`m2_engine::melee::TOSS_GETUP_SECONDS`] without one).
     pub toss_getup: f32,
@@ -2157,6 +2175,7 @@ impl Default for Combat {
             invincible: false,
             rammed: 0.0,
             knocked: None,
+            collapses: Vec::new(),
             toss_getup: m2_engine::melee::TOSS_GETUP_SECONDS,
             run_overs: (0, 0.0),
             health_clamp: false,
@@ -3108,6 +3127,67 @@ impl Combat {
         self.sounds.push(Sound::Collapse(at));
     }
 
+    /// A building whose world box is `b` comes down: those it catches
+    /// are hurt and knocked down at the next step
+    /// ([`Combat::collapse_step`]).
+    pub fn collapse_catches(&mut self, b: (Vec3, Vec3)) {
+        self.collapses.push(b);
+    }
+
+    /// Who the buildings come down since the last step catch.
+    ///
+    /// From the 360 code (0x823977C8, run from the physics events' handler
+    /// 0x82205620 for a kind-6 object's collapse message, 0xDE60C8E2 or
+    /// 0x020F0FBA): the bodies in the collapsing object's box widened
+    /// [`COLLAPSE_REACH`] metres across and above are looked for; each its
+    /// coming-down meets takes the damage table's `ExplosionLarge`
+    /// (0xDC0A895F) cell for it times [`COLLAPSE_DAMAGE`] (not limp bodies
+    /// or kind 0xE); a person (kind 1) is also knocked down, for
+    /// [`m2_engine::durability::KNOCKDOWN_SECONDS`] through 0x82423848.
+    /// Inferred: "meets" (the 360 sweeps the collapsing shape along a set
+    /// of ways through 0x8216E330) is taken as standing inside the widened
+    /// box.
+    fn collapse_step(&mut self, f: &mut Field<'_>) {
+        let key = Some(m2_assets::name_hash("ExplosionLarge"));
+        for (lo, hi) in std::mem::take(&mut self.collapses) {
+            let inside = |p: Vec3| collapse_catches_at((lo, hi), p);
+            for j in 0..f.people.npcs.len() {
+                let n = &f.people.npcs[j];
+                if !n.alive || !inside(n.chest()) {
+                    continue;
+                }
+                let own = self.on_person(n, key);
+                let r = self.knock_rng.unit();
+                let seconds = m2_engine::melee::knockdown_seconds(
+                    m2_engine::durability::KNOCKDOWN_SECONDS,
+                    false,
+                    r,
+                );
+                let n = &mut f.people.npcs[j];
+                eprintln!(
+                    "collapse: catches person {:08x}: {:.0} damage, down {seconds:.1} s",
+                    n.spawn.unwrap_or(0),
+                    COLLAPSE_DAMAGE * own
+                );
+                n.hurt(COLLAPSE_DAMAGE * own, Vec3::ZERO);
+                n.knock_down_for(seconds, Vec3::ZERO);
+            }
+            let her = f.player.character.position + Vec3::Y;
+            if f.player.driving.is_none() && f.player.landed && inside(her) {
+                let hers = self.hero_damage.explosion_large;
+                let lost = self.hurt_player(f, COLLAPSE_DAMAGE * hers, None);
+                eprintln!("collapse: catches her: {lost:.0} lost");
+                let r = self.knock_rng.unit();
+                let seconds = m2_engine::melee::knockdown_seconds(
+                    m2_engine::durability::KNOCKDOWN_SECONDS,
+                    false,
+                    r,
+                );
+                self.knock_her_down(f, seconds);
+            }
+        }
+    }
+
     /// The building of `template` that came apart at `at` is down, its
     /// model leaving its `CollapseState` and sending `messages` there:
     /// heard as its sound set answers them, with nothing standing in.
@@ -3153,6 +3233,7 @@ impl Combat {
         }
         self.went_off.clear();
         self.struck.clear();
+        self.collapse_step(f);
         self.knocked_step(f, dt);
         // Up again (revived, respawned, or put on her feet by a script):
         // her limp body goes. The state table's `Resurrect` leads from
@@ -7357,6 +7438,18 @@ fn lock_share(held: f32, time: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    /// A collapse catches what stands within 10 m of its box across and
+    /// above it, not below it.
+    #[test]
+    fn a_collapse_catches_within_ten_metres_across_and_above() {
+        use super::collapse_catches_at;
+        let b = (Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, 8.0, 10.0));
+        assert!(collapse_catches_at(b, Vec3::new(-9.5, 1.0, 5.0)));
+        assert!(collapse_catches_at(b, Vec3::new(5.0, 17.5, 5.0)));
+        assert!(!collapse_catches_at(b, Vec3::new(-10.5, 1.0, 5.0)));
+        assert!(!collapse_catches_at(b, Vec3::new(5.0, -0.5, 5.0)));
+    }
+
     /// Knocked down for 5 s, she stands once that is past and her body
     /// has lain still half a second; tumbling, not before 19 s limp.
     #[test]
