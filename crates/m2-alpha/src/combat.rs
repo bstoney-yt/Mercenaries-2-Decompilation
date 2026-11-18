@@ -1687,6 +1687,10 @@ pub struct Combat {
     /// The scripts' revive (`Object.Revive`) came: her health, for the
     /// next tick to stand her up with.
     pub revive_hp: Option<f32>,
+    /// Damage to deal her at the next step through the health change
+    /// (`--hurt`, `--death-check`): her floor, the scripts' clamp and her
+    /// death apply as to any hit's.
+    pub pending_hurt: Vec<f32>,
     /// The scripts keep her from dying (`Object.SetUnkillable`): her
     /// health stops at [`crate::npc::UNKILLABLE_FLOOR`].
     pub unkillable_her: bool,
@@ -2063,6 +2067,7 @@ impl Default for Combat {
             revived: false,
             died: false,
             revive_hp: None,
+            pending_hurt: Vec::new(),
             unkillable_her: false,
             unkillable: std::collections::HashSet::new(),
             fire_lock: false,
@@ -3025,6 +3030,16 @@ impl Combat {
         } else {
             trigger
         };
+        for damage in std::mem::take(&mut self.pending_hurt) {
+            let before = self.hp;
+            let lost = self.hurt_player(f, damage, None);
+            eprintln!(
+                "hurt: {damage:.1} dealt her: health {before:.1} -> {:.1} (lost {lost:.1}, clamp                  {}, dead {})",
+                self.hp,
+                self.health_clamp,
+                self.hp < crate::death::DEATH_BELOW
+            );
+        }
         // A fall that hurt her ([`m2_engine::on_foot::fall_impact`]).
         if let Some(fell) = f.player.fell.take() {
             self.hurt_player(f, fell.damage, None);

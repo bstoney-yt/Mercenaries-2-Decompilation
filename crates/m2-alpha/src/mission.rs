@@ -3749,7 +3749,10 @@ impl MissionLink {
                     // The scripts revived her (the sickbay's
                     // `RiseFromYourGrave`): she gets up where they put her.
                     Command::Revive { guid, health } if *guid == PLAYER => {
-                        eprintln!("death: the scripts revive her with {health:.1}");
+                        eprintln!(
+                            "death: the scripts revive her with {health:.1} at {:.0} (the                              sickbay's RiseFromYourGrave)",
+                            game.focus()
+                        );
                         game.combat.revive_hp = Some(*health);
                     }
                     Command::SetHealth { guid, health } if *guid == PLAYER => {

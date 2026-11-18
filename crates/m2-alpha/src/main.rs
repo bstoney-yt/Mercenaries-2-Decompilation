@@ -547,6 +547,10 @@ struct Options {
     /// With `--mission --screenshot`: her health drops to this eight
     /// seconds in, to see the scripts' healing and survival rescue.
     hurt: Option<f32>,
+    /// `--death-check`: lethal damage dealt her until she dies, then her
+    /// death through the scripts to their revive logged (`death-check:`
+    /// lines, [`DeathCheck`]).
+    death_check: bool,
     /// With `--mission`: driving, the horn is held half a second every
     /// this many seconds (to hear it, and what the gates, the disguise
     /// and friendly soldiers make of it).
@@ -1025,6 +1029,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--autoplay" => o.autoplay = true,
             "--smarter-ai" => o.smarter_ai = true,
             "--hurt" => o.hurt = Some(value()?.parse().context("--hurt expects health")?),
+            "--death-check" => {
+                o.death_check = true;
+                o.mission = true;
+            }
             "--honk-every" => {
                 o.honk_every = Some(value()?.parse().context("--honk-every expects seconds")?)
             }
@@ -1187,6 +1195,77 @@ fn keep_crash_reports() {
 /// When `--hurt` takes her health: after the start's fade, which keeps her
 /// from harm.
 const HURT_AT: f32 = 8.0;
+
+/// `--death-check`: from [`HURT_AT`] on, lethal damage is dealt her each
+/// [`DEATH_HIT_EVERY`] s until she dies (the scripts' health clamp turns
+/// the first into their survival rescue; with it off, the next kills).
+/// Then it waits up to [`DEATH_WAIT`] s for the scripts' revive (their
+/// `PlayerDied` -> `MoveToSickbay` -> `Object.Revive`). Logs
+/// `death-check: PASS died at T s, revived at T2 s with H health at P`,
+/// else `FAIL <why>`.
+#[derive(Debug, Default)]
+struct DeathCheck {
+    t: f32,
+    next_hit: f32,
+    hits: u32,
+    died_at: Option<f32>,
+    done: bool,
+}
+
+const DEATH_HIT_EVERY: f32 = 3.0;
+const DEATH_HITS: u32 = 10;
+const DEATH_WAIT: f32 = 90.0;
+
+impl DeathCheck {
+    fn tick(&mut self, game: &mut Game, dt: f32) {
+        if self.done {
+            return;
+        }
+        self.t += dt;
+        if self.t < HURT_AT {
+            return;
+        }
+        let c = &game.combat;
+        match self.died_at {
+            None if c.down > 0.0 && c.hp < crate::death::DEATH_BELOW => {
+                self.died_at = Some(self.t);
+                eprintln!(
+                    "death-check: she died at {:.1} s after {} hits",
+                    self.t, self.hits
+                );
+            }
+            None if self.hits >= DEATH_HITS && self.t >= self.next_hit => {
+                self.done = true;
+                eprintln!(
+                    "death-check: FAIL {DEATH_HITS} lethal hits and she lives ({:.1} health,                      clamp {})",
+                    c.hp, c.health_clamp
+                );
+            }
+            None if self.t >= self.next_hit => {
+                self.hits += 1;
+                self.next_hit = self.t + DEATH_HIT_EVERY;
+                eprintln!(
+                    "death-check: lethal hit {} (health {:.1}, clamp {})",
+                    self.hits, c.hp, c.health_clamp
+                );
+                game.combat.pending_hurt.push(1.0e6);
+            }
+            Some(at) if c.down <= 0.0 && c.hp >= crate::death::DEATH_BELOW => {
+                self.done = true;
+                let her = game.focus();
+                eprintln!(
+                    "death-check: PASS died at {at:.1} s, revived at {:.1} s with {:.1} health at                      {her:.0}",
+                    self.t, c.hp
+                );
+            }
+            Some(at) if self.t - at > DEATH_WAIT => {
+                self.done = true;
+                eprintln!("death-check: FAIL died at {at:.1} s, no revive in {DEATH_WAIT} s");
+            }
+            _ => {}
+        }
+    }
+}
 
 /// With `--mission --hijack`, how long an action marker's vehicle is left
 /// before she hijacks it, seconds: the villa tank comes through the hall
@@ -4530,6 +4609,7 @@ fn mission_for_screenshot(
     let (mut hijack_running, mut hijack_shots) = (0.0f32, 0u32);
     let mut action_since: Option<u32> = None;
     let mut placed_tried = std::collections::HashSet::new();
+    let mut death_check = options.death_check.then(DeathCheck::default);
     // Seconds she has been where --props-check hits the props.
     let mut props_ready = 0.0;
     let mut shop_check = options.shop_check.clone().map(shopcheck::ShopCheck::new);
@@ -4660,8 +4740,17 @@ fn mission_for_screenshot(
         if let Some(hp) = options.hurt
             && i == (HURT_AT / tick).round() as u32
         {
-            eprintln!("hurt: her health {:.1} -> {hp:.1}", game.combat.hp);
-            game.combat.hp = hp;
+            // Through the health change, as a hit's damage (her floor, the
+            // scripts' clamp and her death apply), not set outright.
+            let damage = (game.combat.hp - hp).max(0.0);
+            eprintln!(
+                "hurt: {damage:.1} to deal her ({:.1} -> {hp:.1})",
+                game.combat.hp
+            );
+            game.combat.pending_hurt.push(damage);
+        }
+        if let Some(c) = &mut death_check {
+            c.tick(game, tick);
         }
         // With --support she throws the marker the scripts hand her.
         let mut intent = intent;
