@@ -1,0 +1,179 @@
+//! `--camera-check <kind>`: the pad's vehicle and turret cameras driven by
+//! scripted stick input, offscreen, against the 360 numbers in their PRs'
+//! recipes. It reads the game's template database for the records the
+//! cameras use, feeds [`crate::pad::Pad`] a stick for a few seconds at a
+//! sixtieth a frame, and reads the turn it hands the game. No world is
+//! loaded and nothing is drawn.
+//!
+//! Prints `camera-check: PASS ...` or `camera-check: FAIL ...` per case
+//! and `camera-check: RESULT PASS` (or `FAIL`) at the end.
+//!
+//! Kinds: `tank` (the tank camera, [`m2_engine::pad_camera::TankLook`]).
+
+use std::collections::HashMap;
+
+use m2_assets::layer::{Layer, TEMPLATE_DB_TYPE};
+use m2_engine::Install;
+use m2_engine::tuning::VehicleTuning;
+use m2_sys::xinput::PadState;
+
+use crate::input::Input;
+use crate::pad::{Mode, Pad};
+
+/// A sixtieth of a second, the engine's tick.
+pub const DT: f64 = 1.0 / 60.0;
+
+/// The template database's vehicle tunings and names.
+pub struct Records {
+    pub tunings: HashMap<u32, VehicleTuning>,
+    pub names: HashMap<u32, String>,
+}
+
+impl Records {
+    pub fn read(install: &Install) -> anyhow::Result<Self> {
+        let mut source = install.open_world()?;
+        let hash = {
+            let index = source.archive().index();
+            index
+                .assets()
+                .iter()
+                .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+                .map(|a| a.name_hash)
+                .ok_or_else(|| anyhow::anyhow!("no template database"))?
+        };
+        let data = source.asset(hash, TEMPLATE_DB_TYPE)?;
+        let db = Layer::parse(&data)?;
+        Ok(Self {
+            tunings: m2_engine::tuning::read(&db, None),
+            names: db
+                .names()
+                .into_iter()
+                .map(|(k, v)| (k, v.to_owned()))
+                .collect(),
+        })
+    }
+
+    /// The first template (by id) whose name holds `part` (any case) and
+    /// whose tuning `pick` takes.
+    pub fn find<T>(
+        &self,
+        part: &str,
+        pick: impl Fn(&VehicleTuning) -> Option<T>,
+    ) -> Option<(String, T)> {
+        let part = part.to_ascii_lowercase();
+        let mut ids: Vec<_> = self.tunings.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter().find_map(|id| {
+            let name = self.names.get(&id)?;
+            if !name.to_ascii_lowercase().contains(&part) {
+                return None;
+            }
+            Some((name.clone(), pick(&self.tunings[&id])?))
+        })
+    }
+}
+
+/// The checks' tally.
+#[derive(Default)]
+pub struct Tally {
+    pub failed: usize,
+    pub passed: usize,
+}
+
+impl Tally {
+    /// `got` within `tolerance` (a share) of `want`, or both 0.
+    pub fn near(&mut self, what: &str, got: f64, want: f64, tolerance: f64) {
+        let pass = if want == 0.0 {
+            got.abs() < 1e-6
+        } else {
+            ((got - want) / want).abs() <= tolerance
+        };
+        self.line(
+            pass,
+            &format!("{what}: {got:.2} (360: {want} ±{:.0}%)", tolerance * 100.0),
+        );
+    }
+
+    pub fn line(&mut self, pass: bool, what: &str) {
+        if pass {
+            self.passed += 1;
+        } else {
+            self.failed += 1;
+        }
+        eprintln!(
+            "camera-check: {} {what}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+    }
+
+    pub fn missing(&mut self, what: &str) {
+        self.line(false, &format!("{what}: no such record in the data"));
+    }
+
+    /// Prints the result line; whether every case passed.
+    pub fn finish(self) -> bool {
+        let pass = self.failed == 0 && self.passed > 0;
+        eprintln!(
+            "camera-check: RESULT {} ({} passed, {} failed)",
+            if pass { "PASS" } else { "FAIL" },
+            self.passed,
+            self.failed
+        );
+        pass
+    }
+}
+
+/// The right stick held at `stick` (raw, -1..1) for `seconds` in `mode`:
+/// the pad's last frame's turn, degrees a second (yaw, pitch).
+pub fn hold(pad: &mut Pad, mode: Mode, stick: [f32; 2], seconds: f64) -> (f64, f64) {
+    let mut input = Input::default();
+    let s = PadState {
+        right_raw: stick,
+        ..PadState::default()
+    };
+    let frames = (seconds / DT).round() as usize;
+    let mut last = (0.0, 0.0);
+    for _ in 0..frames {
+        pad.feed(&mut input, s, mode, DT);
+        last = input.take_pad_turn();
+        input.take_pad_look();
+    }
+    (last.0.to_degrees() / DT, last.1.to_degrees() / DT)
+}
+
+/// Runs the checks of `kind`; whether all passed.
+pub fn run(install: &Install, kind: &str) -> anyhow::Result<bool> {
+    let records = Records::read(install)?;
+    let mut t = Tally::default();
+    match kind {
+        "tank" => tank(&records, &mut t),
+        other => anyhow::bail!("--camera-check: no kind {other:?} (tank)"),
+    }
+    Ok(t.finish())
+}
+
+/// #700's recipe: a LAV III at full stick 172 deg/s once eased, at 0.75
+/// 95, at 0.4 nothing; an AMX-30 at full 69.
+fn tank(records: &Records, t: &mut Tally) {
+    let look = |v: &VehicleTuning| v.camera.and_then(|c| c.look);
+    for (part, cases) in [
+        ("lav", &[(1.0, 172.0), (0.75, 95.0), (0.4, 0.0)][..]),
+        ("amx", &[(1.0, 69.0)][..]),
+    ] {
+        let Some((name, tuning)) = records.find(part, look) else {
+            t.missing(&format!("tank {part}"));
+            continue;
+        };
+        for &(x, want) in cases {
+            let mut pad = Pad::default();
+            pad.tank_tuning = Some(tuning);
+            let (yaw, _) = hold(&mut pad, Mode::Tank, [x, 0.0], 3.0);
+            t.near(
+                &format!("tank {name} stick x {x}: yaw rate deg/s"),
+                yaw.abs(),
+                want,
+                0.05,
+            );
+        }
+    }
+}
