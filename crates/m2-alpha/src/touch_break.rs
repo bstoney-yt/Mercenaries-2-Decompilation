@@ -94,7 +94,11 @@ pub fn check(
     u.sort();
     let ok = u == ["C4", "C4 Projectile"];
     all &= ok;
-    println!("touch-check: uncrushable: {}: {}", u.join(", "), verdict(ok));
+    println!(
+        "touch-check: uncrushable: {}: {}",
+        u.join(", "),
+        verdict(ok)
+    );
     // A pile at x 0 (1 m each way, 0.8 m high) on flat ground; she
     // starts 3 m off and walks into it at 2 m/s for 3 s.
     let pile = breakers.iter().min().copied().unwrap_or(1);
@@ -185,7 +189,13 @@ mod tests {
             placed,
             &breakers,
             &uncrushable,
-            &[on(0.0, true), on(5.0, true), on(10.0, true), on(15.0, true), on(20.0, false)],
+            &[
+                on(0.0, true),
+                on(5.0, true),
+                on(10.0, true),
+                on(15.0, true),
+                on(20.0, false),
+            ],
         );
         assert_eq!(got, [1]);
     }
