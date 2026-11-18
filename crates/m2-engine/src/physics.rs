@@ -3315,6 +3315,9 @@ struct Ragdoll {
     /// The joints' handles, where they carry limits (a ragdoll built from
     /// the game's, [`Physics::add_asset_ragdoll`]).
     joint_handles: Vec<r::ImpulseJointHandle>,
+    /// Seconds since it went limp, for its first heavier fall
+    /// ([`crate::ragdoll_launch::heavy_gravity`], the game's ragdoll only).
+    age: f32,
 }
 
 /// The physics world.
@@ -3669,6 +3672,7 @@ impl Physics {
         self.float_boats(dt);
         self.fly_helicopters(dt);
         self.cap_debris_speeds();
+        self.weigh_down_ragdolls(dt);
         self.world.step_with_events(&HavokFriction, &());
         self.hold_ragdolls_together();
         self.settle_debris();
@@ -4113,6 +4117,73 @@ impl Physics {
         }
         if let Some(h) = self.debris.get_mut(id.0).and_then(Option::take) {
             self.world.remove_body_with_colliders(h, true);
+        }
+    }
+
+    /// The game's ragdolls fall harder for their first moments: each of
+    /// their bodies is pulled by gravity times
+    /// [`heavy_gravity`](crate::ragdoll_launch::heavy_gravity) of its age
+    /// more, while the step is under 0.1 s (from the 360 code: the ragdoll
+    /// controller's update, 0x82428768).
+    fn weigh_down_ragdolls(&mut self, dt: f32) {
+        let gravity = vec3(self.world.gravity);
+        for doll in self.ragdolls.iter_mut().flatten() {
+            let age = doll.age;
+            doll.age += dt;
+            if doll.joint_handles.is_empty() || dt >= 0.1 {
+                continue;
+            }
+            let k = crate::ragdoll_launch::heavy_gravity(age);
+            if k <= 0.0 {
+                continue;
+            }
+            for h in doll.bodies.iter().flatten() {
+                if let Some(b) = self.world.bodies.get_mut(*h) {
+                    let pull = gravity * (k * b.mass() * dt);
+                    b.apply_impulse(vector(pull), true);
+                }
+            }
+        }
+    }
+
+    /// Throws ragdoll `id` as a blast's launch does (from the 360 code,
+    /// 0x82428910): the bone whose body's centre is nearest `point` is
+    /// struck and the point moves onto it; each bone takes `velocity`
+    /// times its [`bone_factor`](crate::ragdoll_launch::bone_factor) times
+    /// its mass times [`BONE_SHARE`](crate::ragdoll_launch::BONE_SHARE), at
+    /// most [`MASS_CAP`](crate::ragdoll_launch::MASS_CAP) times its mass,
+    /// at the midpoint of the point and its centre.
+    pub fn launch_ragdoll(&mut self, id: RagdollId, velocity: Vec3, point: Vec3) {
+        use crate::ragdoll_launch::{BONE_SHARE, MASS_CAP, bone_factor};
+        let Some(doll) = self.ragdolls.get(id.0).and_then(Option::as_ref) else {
+            return;
+        };
+        let handles: Vec<r::RigidBodyHandle> = doll.bodies.iter().flatten().copied().collect();
+        let centre = |w: &r::PhysicsWorld, h: r::RigidBodyHandle| {
+            w.bodies.get(h).map(|b| vec3(b.center_of_mass()))
+        };
+        let Some((struck, at)) = handles
+            .iter()
+            .filter_map(|&h| Some((h, centre(&self.world, h)?)))
+            .min_by(|a, b| {
+                a.1.distance_squared(point)
+                    .total_cmp(&b.1.distance_squared(point))
+            })
+        else {
+            return;
+        };
+        for h in handles {
+            let Some(b) = self.world.bodies.get_mut(h) else {
+                continue;
+            };
+            let c = vec3(b.center_of_mass());
+            let f = bone_factor(h == struck, c.distance(at));
+            let mut impulse = velocity * (f * b.mass() * BONE_SHARE);
+            let cap = b.mass() * MASS_CAP;
+            if impulse.length() > cap {
+                impulse = impulse * (cap / impulse.length());
+            }
+            b.apply_impulse_at_point(vector(impulse), vector((at + c) * 0.5), true);
         }
     }
 
@@ -6265,6 +6336,7 @@ impl Physics {
             roots,
             joints,
             joint_handles,
+            age: 0.0,
         }));
         Some(RagdollId(self.ragdolls.len() - 1))
     }
@@ -6437,6 +6509,7 @@ impl Physics {
             roots,
             joints,
             joint_handles: Vec::new(),
+            age: 0.0,
         }));
         RagdollId(self.ragdolls.len() - 1)
     }
@@ -8337,6 +8410,26 @@ mod tests {
         // A skeleton without the shin's node: its own build.
         let short = p.add_ragdoll_named(&hashes[..3], &parents[..3], &nodes[..3], Vec3::ZERO);
         assert_eq!(p.ragdoll_joint_limits(short), Some(Vec::new()));
+    }
+
+    /// From the 360 code (0x82428910): the bone nearest the point takes
+    /// three tenths of the launch, the rest a tenth by how near they are.
+    #[test]
+    fn a_launch_throws_the_struck_bone_hardest() {
+        let mut p = ready();
+        p.set_human_ragdoll(std::sync::Arc::new(leg_doll()));
+        let hashes = [0x100, 0x101, 0x102, 0x103];
+        let parents = [None, Some(0), Some(1), Some(2)];
+        let nodes: Vec<Mat4> = [2.2, 2.0, 1.9, 1.5]
+            .iter()
+            .map(|&y| Mat4::from_translation(Vec3::new(0.0, y, 0.0)))
+            .collect();
+        let id = p.add_ragdoll_named(&hashes, &parents, &nodes, Vec3::ZERO);
+        let v = Vec3::new(10.0, 10.0, 0.0);
+        // At the shin's middle: the shin is struck.
+        p.launch_ragdoll(id, v, Vec3::new(0.0, 1.3, 0.0));
+        let fastest = p.ragdoll_speed(id).unwrap();
+        assert!((fastest - 0.3 * v.length()).abs() < 1e-3, "{fastest}");
     }
 
     #[test]

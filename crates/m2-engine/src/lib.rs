@@ -73,6 +73,7 @@ pub mod physics;
 pub mod pickup;
 pub mod population;
 pub mod projection;
+pub mod ragdoll_launch;
 pub mod reverb;
 pub mod road_driver;
 pub mod road_graph;
