@@ -4206,6 +4206,16 @@ impl Combat {
         let Some(k) = &mut self.knocked else {
             return;
         };
+        // Getting up: her controls back as the clip ends.
+        if let Some(left) = &mut k.rising {
+            *left -= dt;
+            if *left <= 0.0 {
+                self.knocked = None;
+                f.player.down = false;
+                eprintln!("knockdown: she is up");
+            }
+            return;
+        }
         let Some(id) = f.player.ragdoll else {
             self.knocked = None;
             return;
@@ -4215,7 +4225,6 @@ impl Combat {
         if !k.stands() {
             return;
         }
-        self.knocked = None;
         let nodes = f.physics.ragdoll_nodes(id);
         if let Some(at) = nodes.as_deref().and_then(crate::npc::limp_middle) {
             let from = at + Vec3::Y;
@@ -4233,8 +4242,27 @@ impl Combat {
         }
         f.physics.remove_ragdoll(id);
         f.player.ragdoll = None;
-        f.player.down = false;
-        eprintln!("knockdown: she gets up");
+        // `Stand` leads to `KnockedDown` `Getup`, an action with a clip
+        // (mode `NONE`): her rig's get-up clip, snapped into, her controls
+        // held until it ends; without one she is up at once.
+        let clip = f.player.model.as_mut().and_then(|(_, rig)| {
+            let c = crate::npc::FightClips::find(rig).getup?;
+            rig.animator
+                .play_action(c, true, m2_engine::blend::action::GETUP);
+            Some(rig.clips[c].clip.header.duration)
+        });
+        eprintln!("knockdown: she gets up ({:.2} s clip)", clip.unwrap_or(0.0));
+        match clip {
+            Some(seconds) if seconds > 0.0 => {
+                if let Some(k) = &mut self.knocked {
+                    k.rising = Some(seconds);
+                }
+            }
+            _ => {
+                self.knocked = None;
+                f.player.down = false;
+            }
+        }
     }
 
     /// `damage` done to her from `from`: the health she lost.
@@ -7143,14 +7171,18 @@ fn arc_clear(physics: &Physics, from: Vec3, velocity: Vec3, to: Vec3, gravity: f
 /// been limp over 19 s, as for the people ([`crate::npc`]'s `LIMP_STILL`
 /// and `LIMP_LONGEST`). Inferred, as for the people: those floats are the
 /// seconds still and limp, still being under 0.2 m/s; her time counts
-/// from the knockdown (the fall's own moment is not separated); she
-/// rises where the body lay with no get-up clip (not ported).
+/// from the knockdown (the fall's own moment is not separated). She
+/// rises where the body lay, into her rig's `KnockedDown` `Getup` clip
+/// (the on-foot tables' handle ade601a9, clip 0xAEB6C9BD; from samples),
+/// as the people do.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct KnockedHer {
     pub seconds: f32,
     pub down_for: f32,
     pub still: f32,
     pub limp: f32,
+    /// Getting up: seconds of the get-up clip left.
+    pub rising: Option<f32>,
 }
 
 impl KnockedHer {
