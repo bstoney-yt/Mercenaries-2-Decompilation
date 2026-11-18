@@ -5608,6 +5608,9 @@ impl People {
                         &world,
                         push,
                     );
+                    // The living go down with their joint motors on, the
+                    // dead limp (0x82421E98: health over 0.01).
+                    physics.power_ragdoll(id, npc.alive && npc.hp > 0.01);
                     npc.ragdoll = Some(id);
                 }
             }
