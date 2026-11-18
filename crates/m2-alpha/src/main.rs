@@ -5463,7 +5463,15 @@ fn mission_for_screenshot(
                     modifiers: egui::Modifiers::NONE,
                 });
             }
-            let _ = hud.build(input, &info, settings);
+            // At the HUD movies' own rate, not each tick (its clock is the
+            // play time given, so nothing runs slow): a build each tick
+            // after the first contract was the largest cost of a long
+            // story run (qstory: "loop: dialog and done" 13-14 ms of a
+            // 40 ms tick). Each tick still while keys are pressed.
+            let keyed = i % every <= 1 || dialog_up > 0.0 || store_up > 0.0 || boxed_now;
+            if late_hud_due(i, keyed) {
+                let _ = hud.build(input, &info, settings);
+            }
             // `--late-shots`: the scene and the HUD at those seconds after
             // each contract was done (its fanfare, the screens after).
             if let Some((done, n)) = last_done {
@@ -5770,12 +5778,17 @@ fn mission_for_screenshot(
         if i > 0 && i % ticks_a_minute == 0 {
             let wall = pace_since.elapsed().as_secs_f32();
             eprintln!(
-                "pace: autoplay {:.0} s of play: {:.2} s of play a second, {:.1} ms a tick, {} people, {} vehicles; ms a tick: {}",
+                "pace: autoplay {:.0} s of play: {:.2} s of play a second, {:.1} ms a tick, {} people, {} vehicles ({} placed); ms a tick: {}",
                 i as f32 * tick,
                 60.0 / wall.max(1e-3),
                 wall * 1000.0 / ticks_a_minute as f32,
                 game.scene.people.npcs.len(),
                 game.scene.vehicles.len(),
+                game.scene
+                    .vehicles
+                    .iter()
+                    .filter(|v| v.id.is_some())
+                    .count(),
                 spans::describe(&spans::take(), ticks_a_minute as f32, 20)
             );
             pace_since = Instant::now();
@@ -6731,6 +6744,19 @@ fn grapple_keys(game: &mut Game, input: &mut Input, allowed: bool) {
 
 /// How long the message box shows a message (its call's `nDuration`,
 /// seconds; 5 when not given, as the objectives' messages ask).
+/// Ticks between builds of the game's HUD after a contract: 30 builds a
+/// second against the game's 60 ticks (invented; the HUD steps by the
+/// play time it is given, [`gamehud::GameHud::frame_time`], so a gap of
+/// two ticks only coarsens it).
+const LATE_HUD_EVERY: u32 = 2;
+
+/// Whether the HUD after a contract is built on tick `i`: at its movies'
+/// rate, and each tick a key goes to it (`keyed`: Enter's down and up,
+/// a dialog's or the store's keys), so no press is missed.
+fn late_hud_due(i: u32, keyed: bool) -> bool {
+    keyed || i.is_multiple_of(LATE_HUD_EVERY)
+}
+
 fn message_seconds(data: &gamehud::Plain) -> f32 {
     use gamehud::Plain;
     let Plain::Table(t) = data else {
@@ -11544,6 +11570,16 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The HUD after a contract: every other tick, and each tick a key
+    // goes to it (qstory spent 13-14 ms a tick building it every tick).
+    #[test]
+    fn the_late_hud_is_built_at_half_the_tick_rate_unless_keyed() {
+        let built = (0..60).filter(|&i| late_hud_due(i, false)).count();
+        assert_eq!(built, 30);
+        assert!(!late_hud_due(1, false));
+        assert!(late_hud_due(1, true));
+    }
 
     #[test]
     fn autoplay_retries_a_failed_contract_only_with_a_retry_save_and_not_forever() {
