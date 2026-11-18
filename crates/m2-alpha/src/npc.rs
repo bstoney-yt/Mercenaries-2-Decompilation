@@ -1445,6 +1445,9 @@ pub struct Npc {
     fall: m2_engine::on_foot::FallWatch,
     /// Where their limp body's fall started ([`m2_engine::on_foot::LimpFallWatch`]).
     limp_fall: m2_engine::on_foot::LimpFallWatch,
+    /// How high above the ground they were placed, and the seconds since
+    /// ([`SPAWN_WATCH`]); `None` until placed.
+    placed: Option<(f32, f32)>,
     ground: Vec2,
     /// The speed they last moved at (m/s): what a stall is judged by.
     pushed: f32,
@@ -1709,6 +1712,7 @@ impl Npc {
             motion: m2_engine::on_foot::HumanMotion::default(),
             fall: m2_engine::on_foot::FallWatch::default(),
             limp_fall: m2_engine::on_foot::LimpFallWatch::default(),
+            placed: None,
             ground: Vec2::ZERO,
             pushed: 0.0,
             dither: Default::default(),
@@ -2538,6 +2542,9 @@ impl Npc {
         self.pushed = ground.length();
         let wanted = Vec3::new(ground.x, 0.0, ground.y);
         let before = self.character.position;
+        if let Some((_, t)) = &mut self.placed {
+            *t += dt;
+        }
         physics.move_character(&mut self.character, wanted, None, dt);
         let now = self.character.position;
         // A fall that hurts, as the 360 has every person's (0x82205F20,
@@ -2565,6 +2572,7 @@ impl Npc {
                 self.spawn.unwrap_or(0),
                 fell.damage
             );
+            self.spawn_hurt(&format!("falls {d:.1} m for {} damage", fell.damage));
             // A fall's damage event has no attacker (-1, 0x82205F20):
             // nobody's kill, no alert.
             self.hurt_by_nobody(fell.damage);
@@ -3390,6 +3398,21 @@ impl Npc {
         matches!(self.brain, Brain::Patrol { .. })
     }
 
+    /// Logs (`spawn-fall:`) a fall's hurt or a death within
+    /// [`SPAWN_WATCH`] of being placed, with how high they were placed: a
+    /// check that drops from the spawn point hurt nobody they shouldn't.
+    fn spawn_hurt(&mut self, what: &str) {
+        if let Some((above, t)) = self.placed
+            && t < SPAWN_WATCH
+        {
+            SPAWNS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "spawn-fall: {:08x} placed {above:.2} m above the ground {what} {t:.1} s after",
+                self.spawn.unwrap_or(0)
+            );
+        }
+    }
+
     /// What they are doing, in a word or two (for checking).
     pub fn doing(&self) -> &'static str {
         if !self.alive {
@@ -3466,7 +3489,33 @@ impl Npc {
             // they do), and nobody stands under the water (playtest 8).
             let dry = |y: f32| physics.water_at(p.x, p.z).is_none_or(|w| y >= w - WET);
             if let Some(y) = hit.filter(|&y| dry(y)) {
-                self.character.position.y = y + 0.05;
+                // From the 360 code: a person is made where their spawn
+                // puts them (0x823FE2A0, 0x82176F38, placed by 0x821831B0
+                // with no look for the ground), and their character drops
+                // from there (0x8217C4A8), the fall from that height
+                // counting as any other ([`m2_engine::on_foot::FallWatch`]).
+                // Only one placed into the ground is lifted onto it
+                // (invented: the capsule would drop through).
+                let above = p.y - y;
+                if above < 0.0 {
+                    self.character.position.y = y + 0.05;
+                }
+                let above = above.max(0.0);
+                {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    SPAWNS[0].fetch_add(1, Relaxed);
+                    SPAWNS[2].fetch_max((above * 100.0) as u32, Relaxed);
+                    if above >= SPAWN_DROP_LOG {
+                        SPAWNS[1].fetch_add(1, Relaxed);
+                    }
+                }
+                if above >= SPAWN_DROP_LOG {
+                    eprintln!(
+                        "spawn-drop: {:08x} placed {above:.2} m above the ground",
+                        self.spawn.unwrap_or(0)
+                    );
+                }
+                self.placed = Some((above, 0.0));
                 self.landed = true;
             } else if self.put_out && hit.is_some() {
                 // Put out of a boat over deep water: into it, to swim
@@ -3479,6 +3528,9 @@ impl Npc {
             return;
         }
         if !self.alive {
+            if self.dead_for == 0.0 {
+                self.spawn_hurt("dies");
+            }
             self.dead_for += dt;
             self.rig.advance(dt);
             // The clip they die in over (the action's `ON_END`): limp.
@@ -4026,6 +4078,44 @@ const SPIN_FADE: f32 = 2.0;
 /// How deep in the sea someone's feet may be before they count as stood
 /// in it, metres (a wade at the water's edge is fine).
 const WET: f32 = 1.0;
+
+/// Seconds after being placed in which a fall's hurt or a death is logged
+/// (`spawn-fall:`). Invented, for checking only.
+pub const SPAWN_WATCH: f32 = 10.0;
+
+/// Placed this high above the ground or more, m, a person's drop is logged
+/// (`spawn-drop:`). Invented, for checking only.
+pub const SPAWN_DROP_LOG: f32 = 0.5;
+
+/// Over the run: everyone placed, those placed [`SPAWN_DROP_LOG`] or more
+/// up, the highest placed (cm), and those hurt by a fall or killed within
+/// [`SPAWN_WATCH`] of being placed. For `--spawn-check`.
+static SPAWNS: [std::sync::atomic::AtomicU32; 4] = [
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+];
+
+/// Most people hurt or killed soon after being placed for
+/// `--spawn-check` to pass. Invented: "a handful".
+pub const SPAWN_CHECK_MOST_HURT: u32 = 3;
+
+/// The `--spawn-check` line for the run so far: how many were placed, how
+/// many up in the air and how high, and how many were hurt or killed
+/// within [`SPAWN_WATCH`]; PASS while that is at most
+/// [`SPAWN_CHECK_MOST_HURT`] of at least one placed.
+pub fn spawn_check_line() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [placed, up, highest, hurt] = [0, 1, 2, 3].map(|i| SPAWNS[i].load(Relaxed));
+    let ok = placed > 0 && hurt <= SPAWN_CHECK_MOST_HURT;
+    format!(
+        "spawn-check: {placed} placed, {up} of them {SPAWN_DROP_LOG} m or more above the ground (highest {:.2} m), \
+         {hurt} hurt by a fall or killed within {SPAWN_WATCH} s: {}",
+        highest as f32 / 100.0,
+        if ok { "PASS" } else { "FAIL" }
+    )
+}
 /// How high above the sea someone looks down for deep water under them
 /// before a step, metres.
 const SEA_LOOK: f32 = 8.0;
@@ -9242,6 +9332,48 @@ pub(crate) mod tests {
         assert!(npc.landed);
         let p = npc.character.position;
         assert!(p.y >= -1.0 - WET && p.z < 6.0, "{p}");
+    }
+
+    #[test]
+    fn people_drop_from_where_they_are_placed() {
+        // As the 360 makes them (0x823FE2A0, 0x821831B0): where placed,
+        // then down; a fall from up there hurts as any other.
+        let physics = ground();
+        let mut rng = Rng::default();
+        let mut placed = |y: f32| {
+            let mut npc = Npc::new(
+                0,
+                &rig(),
+                Vec3::new(0.0, y, 0.0),
+                0.0,
+                Brain::Post { facing: 0.0 },
+                Some(1),
+            );
+            npc.update(&physics, &mut rng, None, 1.0 / 60.0);
+            assert!(npc.landed);
+            let first = npc.character.position.y;
+            for _ in 0..60 * 4 {
+                npc.update(&physics, &mut rng, None, 1.0 / 60.0);
+            }
+            (first, npc)
+        };
+        // A step up: placed there, not snapped, down unhurt.
+        let (first, npc) = placed(1.0);
+        assert!(first > 0.9, "{first}");
+        assert!(
+            npc.character.position.y < 0.1,
+            "{}",
+            npc.character.position.y
+        );
+        assert_eq!(npc.hp, 100.0);
+        // A storey and a half up (human limits 2, 3, 4 m): a heavy fall.
+        let (_, npc) = placed(3.5);
+        assert_eq!(npc.hp, 50.0);
+        assert_eq!(npc.placed.map(|(above, _)| above), Some(3.5));
+        // Into the ground: lifted onto it.
+        let (first, npc) = placed(-0.5);
+        assert!((0.0..0.1).contains(&first), "{first}");
+        assert_eq!(npc.hp, 100.0);
     }
 
     /// A civilian's casualty meter (0x822D9990): hits that take it under

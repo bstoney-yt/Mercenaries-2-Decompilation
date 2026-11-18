@@ -389,6 +389,10 @@ struct Options {
     /// With `--mission`: try every placed pickup, crate and emplaced gun
     /// as the layers put them out ([`placed::check`]), for testing.
     placed_check: bool,
+    /// Every minute of the run, and at its end, how many people were
+    /// placed in the air and how many a fall hurt or killed soon after
+    /// ([`npc::spawn_check_line`]), for testing.
+    spawn_check: bool,
     /// With `--mission`: once the scripts offer a context action whose
     /// prompt reads this (`exit`, `talk`), put her at its object and take
     /// it with the use key, logging where she is after
@@ -832,6 +836,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--grapple" => o.grapple = true,
             "--placed-check" => o.placed_check = true,
+            "--spawn-check" => o.spawn_check = true,
             "--context" => o.context = Some(value()?),
             "--dialog-keys" => o.dialog_keys = Some(value()?),
             "--store-keys" => {
@@ -5148,6 +5153,11 @@ fn mission_for_screenshot(
                 game.save_icon = game::SAVE_ICON_SECONDS;
             }
         }
+        // With --spawn-check, the drops from where people are placed so
+        // far, every minute.
+        if options.spawn_check && i > 0 && i % (60.0 / tick).round() as u32 == 0 {
+            eprintln!("{}", npc::spawn_check_line());
+        }
         // With --placed-check, what the layers have put out is tried
         // every few seconds ([`placed::check`]).
         // Not before she is ashore: the first contract's boat ride is
@@ -6064,6 +6074,9 @@ fn mission_for_screenshot(
         if play_done.is_some_and(|d| i >= d + (options.after_contract / tick).round() as u32) {
             break;
         }
+    }
+    if options.spawn_check {
+        eprintln!("{} (run's end)", npc::spawn_check_line());
     }
     if let Some(sc) = &shop_check {
         for line in sc.summary() {
