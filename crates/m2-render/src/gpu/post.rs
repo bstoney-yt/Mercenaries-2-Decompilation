@@ -44,15 +44,18 @@
 //! values; its composite 526 then clips what passes the display range,
 //! which turns the overlapping glows of a big blast white). From the
 //! shaders. Its blur levels are held to the largest value its codec
-//! stores, as the game's are.//!
-//! Not done: the composite's motion blur (four taps along each pixel's
-//! movement since the last frame, from the depth map and
-//! `MotionBlurConstantX`/`Y`/`W`, scaled by `MotionBlurVelocityScale`) and
-//! its depth of field (`blurMap2` mixed in by depth under `dofParams`).
-//! The program sets those constants; no atmosphere field names them (none
-//! of `AtmosphereBase`'s 185 fields hashes to a motion, focus or depth of
-//! field name, gap-list renderer round), so their strength is not in the
-//! data.
+//! stores, as the game's are.
+//!
+//! Motion blur, as the composite does it (`motion_blurred`): four taps
+//! along each pixel's movement since the last frame, from its depth and
+//! the two frames' view and projection ([`motion_blur_constants`], from
+//! the 360 code), scaled by `MotionBlurVelocityScale`
+//! ([`Lighting::motion_blur`]). Not done: the composite's depth map's
+//! second channel, which also scales the movement (taken as 1), and the
+//! rain shader's use of the same constants. No atmosphere field names
+//! the blur (none of `AtmosphereBase`'s 185 fields hashes to a motion
+//! name, gap-list renderer round): the program keeps it at 0.25 and
+//! raises it in the hero's survival mode.
 
 use std::cell::Cell;
 use std::time::Instant;
@@ -108,6 +111,12 @@ struct Post {
     rain_color: vec4<f32>,
     rain_view: vec4<f32>,
     rain_mode: vec4<f32>,
+    // The motion blur (see `motion_blurred`): the game's
+    // MotionBlurConstantX, Y and W, and MotionBlurVelocityScale
+    mb_x: vec4<f32>,
+    mb_y: vec4<f32>,
+    mb_w: vec4<f32>,
+    mb_scale: vec4<f32>,
 };
 
 fn game_tone_map() -> bool {
@@ -478,6 +487,31 @@ fn display_to_linear(c: vec3<f32>) -> vec3<f32> {
     return select(high, low, c <= vec3<f32>(0.04045));
 }
 
+// The game's motion blur (its composite, the install's shader 526, with
+// the constants the 360 code makes, 0x821BA898 and 0x821BD348): the
+// pixel's movement since the last frame from its depth and the two
+// frames' view and projection, times the velocity scale, and four taps
+// of the frame a quarter of that apart, from half of it back, started
+// on by a dither of the pixel's position; their display values averaged.
+fn motion_blurred(v: Screen) -> vec3<f32> {
+    let size = vec2<f32>(textureDimensions(depth_map));
+    let px = vec2<i32>(clamp(v.uv * size, vec2<f32>(0.0), size - 1.0));
+    let p = vec4<f32>(v.uv, textureLoad(depth_map, px, 0), 1.0);
+    let w = dot(post.mb_w.xyz, p.xyz);
+    // The game scales it by its depth map's second channel as well,
+    // which is not known; taken as 1.
+    let d = (vec2<f32>(dot(post.mb_x, p), dot(post.mb_y, p)) - v.uv * w) * post.mb_scale.x;
+    let at = floor(v.position.xy);
+    let dither = fract(at.y * at.y * 0.381966025 + at.x * 0.618034005);
+    var t = v.uv + d * (dither * 0.25 - 0.5);
+    var sum = vec3<f32>(0.0);
+    for (var i = 0; i < 4; i = i + 1) {
+        sum = sum + to_game(textureSampleLevel(source, linear, t, 0.0).rgb * exposure());
+        t = t + d * 0.25;
+    }
+    return sum * 0.25;
+}
+
 @fragment
 fn fs_composite(v: Screen) -> @location(0) vec4<f32> {
     var c = textureSampleLevel(source, linear, v.uv, 0.0).rgb * exposure();
@@ -495,6 +529,9 @@ fn fs_composite(v: Screen) -> @location(0) vec4<f32> {
         // frame takes as linear light, so they are decoded at the end).
         let a = textureLoad(adapted, vec2<i32>(0, 0), 0).r;
         c = to_game(c);
+        if post.mb_scale.x != 0.0 && post.blur.x > 0.5 {
+            c = motion_blurred(v);
+        }
         // The sun flare, added to the frame's display values before the
         // tone map (inferred: where the game draws it is not established).
         if post.flare.w > 0.5 {
@@ -568,6 +605,10 @@ struct Uniforms {
     rain_color: [f32; 4],
     rain_view: [f32; 4],
     rain_mode: [f32; 4],
+    mb_x: [f32; 4],
+    mb_y: [f32; 4],
+    mb_w: [f32; 4],
+    mb_scale: [f32; 4],
 }
 
 /// The passes, by index: bright, blur across, blur down, composite, then
@@ -661,6 +702,10 @@ pub struct Post {
     frame: Cell<u32>,
     /// The frame's projection: its z scale and offset ([`Post::set_projection`]).
     projection: Cell<[f32; 2]>,
+    /// The motion blur's MotionBlurConstantX, Y and W for this frame, and
+    /// the last frame's view and projection ([`Post::set_view_projection`]).
+    motion: Cell<[[f32; 4]; 3]>,
+    last_view_projection: Cell<Option<Mat4>>,
 }
 
 /// The post pass's images sized by the frame, and its bind groups.
@@ -915,6 +960,8 @@ impl Post {
             last: Cell::new(None),
             frame: Cell::new(0),
             projection: Cell::new([0.0, 1.0]),
+            motion: Cell::new([[0.0; 4]; 3]),
+            last_view_projection: Cell::new(None),
         }
     }
 
@@ -1089,6 +1136,18 @@ impl Post {
     /// the depth of field turns depth back into distance with.
     pub fn set_projection(&self, p: &m2_math::glam::Mat4) {
         self.projection.set([p.z_axis.z, p.w_axis.z]);
+    }
+
+    /// The frame's view and projection (`projection * view`): with the
+    /// last frame's it makes the motion blur's constants
+    /// ([`motion_blur_constants`]). The first frame has none to move
+    /// from, so nothing blurs.
+    pub fn set_view_projection(&self, view_projection: Mat4) {
+        let last = self.last_view_projection.replace(Some(view_projection));
+        self.motion.set(motion_blur_constants(
+            last.unwrap_or(view_projection),
+            view_projection,
+        ));
     }
 
     /// Runs the passes for a frame lit by `lighting`, into `target`.
@@ -1304,6 +1363,10 @@ impl Post {
                 rain_vel: overlay.map_or([0.0; 4], |o| o.velocity),
                 rain_color: overlay.map_or([0.0; 4], |o| o.colour),
                 rain_view: self.rain_view.get(),
+                mb_x: self.motion.get()[0],
+                mb_y: self.motion.get()[1],
+                mb_w: self.motion.get()[2],
+                mb_scale: [lighting.motion_blur, 0.0, 0.0, 0.0],
                 rain_mode: [
                     match overlay.map(|o| o.blend) {
                         None => 0.0,
@@ -1443,6 +1506,43 @@ fn flare_group(
     })
 }
 
+/// The motion blur's MotionBlurConstantX, Y and W for a frame drawn with
+/// `current` (projection times view) after one drawn with `last`.
+///
+/// From the 360 code (0x821BA898, called by the post pass 0x821BD348;
+/// the view's +0xBA0 holds the last frame's +0xB60, copied by the camera
+/// update 0x82569110): the matrix taking a pixel's texture coordinates
+/// and depth to the last frame's, as clip space between the two (from
+/// texture coordinates: x 2u - 1, y 1 - 2v), less the identity; with
+/// `a` that, X is its first row with `a[3][3]` taken off its first
+/// element, Y its second with it taken off its second, and W the first
+/// three of its last row. The composite moves a pixel at (u, v, depth)
+/// by (X.p - u W.p, Y.p - v W.p), p = (u, v, depth, 1) (W.p of the
+/// first three): its last position less its own, before dividing by w.
+pub fn motion_blur_constants(last: Mat4, current: Mat4) -> [[f32; 4]; 3] {
+    use m2_math::glam::Vec4;
+    let from_uv = Mat4::from_cols(
+        Vec4::new(2.0, 0.0, 0.0, 0.0),
+        Vec4::new(0.0, -2.0, 0.0, 0.0),
+        Vec4::new(0.0, 0.0, 1.0, 0.0),
+        Vec4::new(-1.0, 1.0, 0.0, 1.0),
+    );
+    let to_uv = Mat4::from_cols(
+        Vec4::new(0.5, 0.0, 0.0, 0.0),
+        Vec4::new(0.0, -0.5, 0.0, 0.0),
+        Vec4::new(0.0, 0.0, 1.0, 0.0),
+        Vec4::new(0.5, 0.5, 0.0, 1.0),
+    );
+    let m = to_uv * last * current.inverse() * from_uv - Mat4::IDENTITY;
+    let a = |r: usize, c: usize| m.col(c)[r];
+    let w = a(3, 3);
+    [
+        [a(0, 0) - w, a(0, 1), a(0, 2), a(0, 3)],
+        [a(1, 0), a(1, 1) - w, a(1, 2), a(1, 3)],
+        [a(3, 0), a(3, 1), a(3, 2), 0.0],
+    ]
+}
+
 /// The screen overlay's `rainCenter` (x, y) and `rainFov` (z, w) for a
 /// camera looking along `forward` through `projection` (from the 360
 /// code, 0x821BF628): the centre is the view's bearing and pitch, each
@@ -1525,6 +1625,59 @@ fn follow(retention: f32, speed: f32, dt: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use m2_math::glam::{Mat4, Vec3, Vec4};
+
+    /// A pixel's move as the composite works it out from the constants:
+    /// (X.p - u W.p, Y.p - v W.p), and divided by the last frame's w
+    /// (1 + W.p + X's w term, as the matrix less the identity has it).
+    fn moved(k: &[[f32; 4]; 3], u: f32, v: f32, depth: f32) -> (f32, f32) {
+        let p = Vec4::new(u, v, depth, 1.0);
+        let w = Vec3::from_slice(&k[2][..3]).dot(p.truncate());
+        (
+            Vec4::from(k[0]).dot(p) - u * w,
+            Vec4::from(k[1]).dot(p) - v * w,
+        )
+    }
+
+    fn uv_of(view_projection: Mat4, world: Vec3) -> (f32, f32, f32) {
+        let c = view_projection * world.extend(1.0);
+        let n = c.truncate() / c.w;
+        ((n.x + 1.0) * 0.5, (1.0 - n.y) * 0.5, n.z)
+    }
+
+    #[test]
+    fn a_still_camera_blurs_nothing() {
+        let vp = Mat4::perspective_rh(1.0, 16.0 / 9.0, 0.3, 2000.0)
+            * Mat4::look_at_rh(Vec3::new(3.0, 2.0, 5.0), Vec3::ZERO, Vec3::Y);
+        let k = super::motion_blur_constants(vp, vp);
+        for row in k {
+            for x in row {
+                assert!(x.abs() < 1e-5, "{k:?}");
+            }
+        }
+    }
+
+    /// A pan: each pixel is moved to where the point under it was on
+    /// the last frame's screen (to within the composite's missing divide
+    /// by w, which is 1 for a camera that only turns or slides).
+    #[test]
+    fn a_moving_camera_moves_each_pixel_to_its_last_place() {
+        let proj = Mat4::perspective_rh(1.0, 16.0 / 9.0, 0.3, 2000.0);
+        let last = proj * Mat4::look_at_rh(Vec3::ZERO, Vec3::new(0.0, 0.0, -1.0), Vec3::Y);
+        let now =
+            proj * Mat4::look_at_rh(Vec3::ZERO, Vec3::new(0.05, 0.0, -1.0).normalize(), Vec3::Y);
+        let k = super::motion_blur_constants(last, now);
+        for world in [Vec3::new(0.0, 0.0, -10.0), Vec3::new(2.0, 1.0, -30.0)] {
+            let (u, v, depth) = uv_of(now, world);
+            let (u0, v0, _) = uv_of(last, world);
+            let (du, dv) = moved(&k, u, v, depth);
+            assert!((du - (u0 - u)).abs() < 2e-3, "{du} vs {}", u0 - u);
+            assert!((dv - (v0 - v)).abs() < 2e-3, "{dv} vs {}", v0 - v);
+            // Turned right: things now stand left of where they were.
+            assert!(du > 0.01, "{du}");
+        }
+    }
+
     #[test]
     fn the_flare_turns_by_the_codes_noise() {
         // 1 - (k (k^2 15731 + 789221) - 0x2df722f3 & 0x7fffffff) / 2^30

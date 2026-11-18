@@ -2671,6 +2671,7 @@ impl WgpuBackend {
                 })
         };
         self.post.set_projection(&view.projection);
+        self.post.set_view_projection(view.projection * view.view);
         // The screen overlay: its texture, and the view it is laid out by.
         if let Some(o) = l.screen_overlay
             && let Ok(t) = self.textures.get(o.map.0)
