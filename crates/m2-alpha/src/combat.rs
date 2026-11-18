@@ -568,9 +568,35 @@ const LAUNCH_CLEAR: f32 = BODY_RADIUS + 0.2;
 /// Health comes back after this many quiet seconds, at this rate a second.
 const REGEN_AFTER: f32 = 4.0;
 const REGEN_RATE: f32 = 25.0;
-/// Where the health clamp stops her health: the hero script's healing
-/// keeps at least this much too (inferred; no script sets the floor).
-const CLAMP_FLOOR: f32 = 1.0;
+/// Where the health clamp (`Player.SetHealthClamp`) stops her health:
+/// 3 with one player, 1 with two. From the 360 code (the health change
+/// 0x822889F8: 0x820C7A20 when fewer than two players have joined,
+/// counted by 0x82467A38, else 1).
+const CLAMP_FLOOR: f32 = 3.0;
+const CLAMP_FLOOR_COOP: f32 = 1.0;
+/// While her survival mode is on, a hit someone dealt her does this much
+/// of its damage. From the 360 code (0x822889F8, 0x820BB468), applied
+/// only when the clamp is not holding her.
+const SURVIVAL_DAMAGE: f32 = 0.1;
+/// The motion blur's velocity multiplier as the game keeps it (its post
+/// object's +0x34, 0.25 from its constructor 0x821BA6B0; no script sets
+/// it, `Graphics.MotionBlur.SetVelocityMultiplier` going unused).
+pub const MOTION_BLUR: f32 = 0.25;
+
+/// The survival mode's beat at `t` seconds into it (0x82439B18): a rise
+/// to 0.5 over 0.3 s and back to 0 by 0.6 s, `1 - k / (s^2 + k)` with
+/// `k` 0.09 and `s` the time from the nearer end; `None` past 0.6 s,
+/// where the 360 starts the beat again.
+fn survival_beat(t: f32) -> Option<f32> {
+    const K: f32 = 0.09;
+    if t < 0.3 {
+        Some(1.0 - K / (t * t + K))
+    } else if t < 0.6 {
+        Some(1.0 - K / ((0.6 - t) * (0.6 - t) + K))
+    } else {
+        None
+    }
+}
 /// Seconds she stays down at no health.
 const DOWN_TIME: f32 = 2.5;
 /// RPG: rocket speed (m/s), reload (s) and how far it flies.
@@ -637,10 +663,11 @@ const BASH_HIGH: f32 = 1.2;
 const BASH_LOW: f32 = 0.45;
 /// Blasts kill within `KILL` metres and hurt to `REACH`.
 const KILL: f32 = 4.0;
-/// How hard a blast throws people: (out, up) m/s at its heart, on top of
-/// 3 out and 2 up at the edge of its reach. Invented, to look like the
-/// game's flung bodies.
-pub(crate) const BLAST_PUSH: (f32, f32) = (9.0, 6.0);
+/// The `MaxForce` the blasts without a template (the alpha's own and the
+/// scripted bombs) throw people with: that of most of the game's
+/// explosions (`fx_Explosion_Large`, `Explosion (Small)`, ...: 300).
+/// Invented: these blasts are not the game's.
+const UNTEMPLATED_FORCE: f32 = 300.0;
 /// How hard a rifle round shoves the one it kills, m/s.
 const SHOT_PUSH: f32 = 2.0;
 pub(crate) const REACH: f32 = 9.0;
@@ -1589,6 +1616,8 @@ struct Mine {
     reach: f32,
     life: f32,
     blast: Option<Blast>,
+    /// What it becomes once armed (`Proximity Mine (Planted)`).
+    planted: u32,
 }
 
 /// What she asks of her weapons this tick.
@@ -1714,6 +1743,25 @@ pub struct Combat {
     /// The scripts keep her from dying (`Player.SetHealthClamp`): her
     /// health stops at [`CLAMP_FLOOR`] for their survival system.
     pub health_clamp: bool,
+    /// Her survival mode (`Player.SetSurvivalMode`, the player's +0x170 in
+    /// the 360 code, 0x8243AED8): on when the clamp catches a hit that
+    /// would have taken her under its floor, or when the scripts turn it
+    /// on; while on, hits from someone do [`SURVIVAL_DAMAGE`].
+    pub survival: bool,
+    /// Whether her survival mode beats the screen (the player's +0x188,
+    /// 0x8243AED8): set with each change of the mode, true from the clamp
+    /// and unless the scripts' `Player.SetSurvivalMode` gives false.
+    pub survival_beat: bool,
+    /// A second player has joined (the clamp's floor is lower).
+    pub coop: bool,
+    /// Seconds into the survival beat (the player's +0x184), and the
+    /// value it last left (+0x638 of her camera slot, -0.1 times the beat;
+    /// what reads it is not known).
+    beat: f32,
+    beat_left: f32,
+    /// The motion blur's velocity multiplier this frame ([`MOTION_BLUR`],
+    /// beating up to 2.5 in survival mode).
+    pub motion_blur: f32,
     /// The scripts heal her (the hero script's timers), not the fight.
     pub scripted_health: bool,
     /// She just got back up after going down (taken by the mission).
@@ -1848,6 +1896,9 @@ pub struct Combat {
     /// The game's damage table: what each kind of round and blast does to
     /// people and vehicles.
     pub damage_table: Option<DamageTable>,
+    /// The particle table: what a hit throws up by what it struck and
+    /// how ([`m2_engine::tuning::KeyTable`]).
+    pub particle_table: Option<m2_engine::tuning::KeyTable>,
     /// Pairs of vehicles body to body last tick ([`Combat::vehicle_crashes`]):
     /// a crash is counted as they meet, not while they stay pressed together.
     pub bumping: std::collections::HashSet<(VehicleId, VehicleId)>,
@@ -1863,6 +1914,11 @@ pub struct Combat {
     pub mines: u32,
     /// The last charge's number ([`Combat::charges_lying`]).
     charges_thrown: u32,
+    /// Her armed mines are the scripts' (`proximitymine` sets them off):
+    /// they no longer go off here on reach ([`Combat::mines_planted`]).
+    pub scripted_mines: bool,
+    /// Her armed mines as objects of the scripts' world: guid by number.
+    pub mine_guids: std::collections::HashMap<u32, u32>,
     /// Fire was held last tick (a one-shot-a-pull gun fires again only
     /// once it is let go).
     fire_held: bool,
@@ -1947,6 +2003,8 @@ pub struct Combat {
     /// their surface's word names, or the generic one standing in
     /// ([`m2_engine::surface::bullet_impact`]).
     pub impacts: (u32, u32),
+    /// Of those named, how many the particle table decided.
+    pub table_impacts: u32,
     /// Those impacts by template.
     pub impact_kinds: std::collections::BTreeMap<&'static str, u32>,
     /// What the fighting has come to (for checking).
@@ -2152,6 +2210,12 @@ impl Default for Combat {
             rammed: 0.0,
             run_overs: (0, 0.0),
             health_clamp: false,
+            survival: false,
+            survival_beat: true,
+            coop: false,
+            beat: 0.0,
+            beat_left: 0.0,
+            motion_blur: MOTION_BLUR,
             scripted_health: false,
             revived: false,
             unkillable_her: false,
@@ -2208,6 +2272,7 @@ impl Default for Combat {
             rpg: Rifle::launcher(Weapon::Rpg),
             gl: Rifle::launcher(Weapon::GrenadeLauncher),
             damage_table: None,
+            particle_table: None,
             bumping: Default::default(),
             bumping_statics: Default::default(),
             throwables: Vec::new(),
@@ -2215,6 +2280,8 @@ impl Default for Combat {
             charges: 0,
             mines: 0,
             charges_thrown: 0,
+            scripted_mines: false,
+            mine_guids: std::collections::HashMap::new(),
             fire_held: false,
             lock: None,
             seat: 0,
@@ -2250,6 +2317,7 @@ impl Default for Combat {
             flashes: (0, 0),
             cases: 0,
             impacts: (0, 0),
+            table_impacts: 0,
             impact_kinds: std::collections::BTreeMap::new(),
             tally: Tally::default(),
             hurts: Vec::new(),
@@ -2472,6 +2540,28 @@ impl Combat {
             } => Some((id, ammo, at)),
             _ => None,
         })
+    }
+
+    /// Her mines lying armed: number, the template each has become
+    /// (`Proximity Mine (Planted)`) and where it lies.
+    pub fn mines_planted(&self) -> impl Iterator<Item = (u32, u32, Vec3)> + '_ {
+        self.projectiles.iter().filter_map(|p| match *p {
+            Projectile::Charge {
+                id,
+                at,
+                timer,
+                mine: Some(m),
+                ..
+            } if timer <= 0.0 => Some((id, m.planted, at)),
+            _ => None,
+        })
+    }
+
+    /// Takes charge or mine `id` away (its script removed it: a mine that
+    /// popped up).
+    pub fn remove_charge(&mut self, id: u32) {
+        self.projectiles
+            .retain(|p| !matches!(*p, Projectile::Charge { id: i, .. } if i == id));
     }
 
     /// Takes up `weapon` (a launcher: the RPG or a grenade launcher) in
@@ -2983,7 +3073,7 @@ impl Combat {
             .collect();
         format!(
             "shots by sound set: {} (others firing: {}); flashes: {} the game's, {} the \
-             alpha's own; cases {}; impacts {} by surface, {} generic ({})",
+             alpha's own; cases {}; impacts {} by surface ({} of them by the particle table),              {} generic ({})",
             if sets.is_empty() {
                 "none".to_owned()
             } else {
@@ -2998,6 +3088,7 @@ impl Combat {
             self.flashes.1,
             self.cases,
             self.impacts.0,
+            self.table_impacts,
             self.impacts.1,
             self.impact_kinds
                 .iter()
@@ -3005,6 +3096,26 @@ impl Combat {
                 .collect::<Vec<_>>()
                 .join(", ")
         )
+    }
+
+    /// What a round from `from` along `dir` striking the world `t` metres
+    /// on throws up ([`strike_world`](Self::strike_world)): the word of the
+    /// surface it struck, and whether the particle table decided its
+    /// effect (for `--impact-check`).
+    pub fn impact_probe(
+        &mut self,
+        physics: &Physics,
+        from: Vec3,
+        dir: Vec3,
+        t: f32,
+    ) -> (u32, bool) {
+        let before = self.table_impacts;
+        let surface = physics
+            .cast_ray_surface(from, dir, t + 0.05)
+            .map_or(0, |(.., surface)| surface);
+        self.strike_world(physics, from, dir, t);
+        self.game_fx.clear();
+        (surface, self.table_impacts > before)
     }
 
     /// A round from `from` along `dir` striking the world `t` metres on:
@@ -3021,6 +3132,32 @@ impl Combat {
         let (key, surface) = physics
             .cast_ray_surface(from, dir, t + 0.05)
             .map_or((None, 0), |(_, _, key, surface)| (key, surface));
+        let at = from + dir * (t - IMPACT_BACK).max(0.0);
+        // The particle table's effect for the surface struck by a bullet
+        // first: a surface's word is a `ParticleKey` (`TERRAIN_GRASS` is
+        // the table's `Terrain_grass` row; names hash without case), and
+        // the table decides the terrain's, water's and vegetation's. An
+        // empty cell gives nothing of the table's (0x8218B410 starts no
+        // effect when the cell is 0): the surface's own pick stands there
+        // ([`m2_engine::surface::bullet_impact`]), as walls and metal
+        // still throw up their sparks in the game by another way.
+        let bullet = m2_assets::name_hash("Bullet");
+        if let Some(effect) = self
+            .particle_table
+            .as_ref()
+            .filter(|_| surface != 0)
+            .and_then(|t| t.get_exact(surface, bullet))
+        {
+            self.impacts.0 += 1;
+            self.table_impacts += 1;
+            self.game_fx.push(GameFx {
+                template: FxTemplate::Hash(effect),
+                at,
+                hold: None,
+                turn: None,
+            });
+            return key;
+        }
         let (template, named) = m2_engine::surface::bullet_impact(surface);
         if named {
             self.impacts.0 += 1;
@@ -3028,7 +3165,7 @@ impl Combat {
             self.impacts.1 += 1;
         }
         *self.impact_kinds.entry(template).or_default() += 1;
-        self.show_fx(template, from + dir * (t - IMPACT_BACK).max(0.0));
+        self.show_fx(template, at);
         key
     }
 
@@ -3164,6 +3301,7 @@ impl Combat {
         let feel = self.rifle.feel;
         self.bloom.settle(&feel, dt);
         self.quiet += dt;
+        self.motion_blur = self.survival_blur(dt);
 
         if self.down > 0.0 {
             self.down -= dt;
@@ -4146,30 +4284,122 @@ impl Combat {
     /// ([`m2_engine::stagger`]: the long stagger, for the explosion keys
     /// only). The way it travelled is taken as from the blast to her
     /// (inferred).
-    fn blast_staggers_her(f: &mut Field<'_>, at: Vec3, key: Option<u32>) {
+    fn blast_staggers_her(&self, f: &mut Field<'_>, at: Vec3, key: Option<u32>) {
         let direction = (f.player.character.position - at).with_y(0.0);
-        f.player.stagger(&m2_engine::stagger::Event {
-            direction,
-            direct: false,
-            melee: false,
-            key,
-        });
+        f.player.stagger(
+            &m2_engine::stagger::Event {
+                direction,
+                direct: false,
+                melee: false,
+                key,
+            },
+            self.invincible,
+        );
+    }
+
+    /// The motion blur's velocity multiplier after `dt` more seconds, as
+    /// the 360's per-player update has it (0x82439B98): in survival mode
+    /// the beat ([`survival_beat`]) takes it to five times the beat (at
+    /// most 5) when that is above [`MOTION_BLUR`]; out of it the blur is
+    /// [`MOTION_BLUR`], and a beat under way runs on until a tenth of it
+    /// is under 0.01, then starts from nothing next time.
+    fn survival_blur(&mut self, dt: f32) -> f32 {
+        let mut beat = || {
+            self.beat += dt;
+            survival_beat(self.beat).unwrap_or_else(|| {
+                self.beat = 0.0;
+                0.0
+            })
+        };
+        if self.survival && self.survival_beat {
+            let b = beat();
+            self.beat_left = (-0.1 * b).clamp(-0.1, 0.01);
+            (5.0 * b).clamp(MOTION_BLUR, 5.0)
+        } else if self.survival {
+            // In survival mode without the beat (+0x188 clear), 0x82439B98
+            // leaves the blur as it is.
+            MOTION_BLUR
+        } else {
+            if self.beat_left != 0.0 {
+                let b = beat();
+                let left = (-0.1 * b).clamp(-0.1, 0.01);
+                if left.abs() < 0.01 {
+                    self.beat = 0.0;
+                    self.beat_left = 0.0;
+                } else {
+                    self.beat_left = left;
+                }
+            }
+            MOTION_BLUR
+        }
+    }
+
+    /// Where the health clamp stops her health ([`CLAMP_FLOOR`]).
+    fn clamp_floor(&self) -> f32 {
+        if self.coop {
+            CLAMP_FLOOR_COOP
+        } else {
+            CLAMP_FLOOR
+        }
+    }
+
+    /// The damage a hit does her, as the 360's health change has it
+    /// (0x822889F8): with the clamp on, a hit that would leave her under
+    /// the floor turns her survival mode on (0x8243AED8(player, 1, 1));
+    /// with it off, survival mode cuts a hit someone dealt
+    /// (`attacked`) to [`SURVIVAL_DAMAGE`]. The floor itself is applied
+    /// by the caller. A hit from a crusher (`crushed`: its template
+    /// carries `Crusher`, table 0x83655CC8, [`m2_game::crusher`]) is
+    /// neither held by the clamp nor starts survival mode.
+    fn survival_damage(&mut self, damage: f32, attacked: bool, crushed: bool) -> f32 {
+        if self.health_clamp && !crushed {
+            if self.hp - damage < self.clamp_floor() && !self.survival {
+                eprintln!("combat: survival mode on (the clamp caught a hit)");
+                self.survival = true;
+                self.survival_beat = true;
+            }
+            damage
+        } else if self.survival && attacked {
+            damage * SURVIVAL_DAMAGE
+        } else {
+            damage
+        }
     }
 
     fn hurt_player(&mut self, f: &mut Field<'_>, damage: f32, from: Option<Vec3>) -> f32 {
+        self.hurt_player_as(f, damage, from, false)
+    }
+
+    /// Hurts her by a crusher's hit (falling debris whose template carries
+    /// `Crusher`): from the 360 code (0x822889F8), past the health clamp
+    /// and without starting survival mode. Nothing in the port drops
+    /// debris on her yet; this is where such a hit goes.
+    pub fn hurt_player_crushed(&mut self, f: &mut Field<'_>, damage: f32, from: Vec3) -> f32 {
+        self.hurt_player_as(f, damage, Some(from), true)
+    }
+
+    fn hurt_player_as(
+        &mut self,
+        f: &mut Field<'_>,
+        damage: f32,
+        from: Option<Vec3>,
+        crushed: bool,
+    ) -> f32 {
         if self.down > 0.0 || self.invincible {
             return 0.0;
         }
+        let damage = self.survival_damage(damage, from.is_some(), crushed);
         // Kept for the HUD; only the latest if nothing reads them.
         if self.hurts.len() >= MAX_HURTS {
             self.hurts.remove(0);
         }
         self.hurts.push((damage, from));
         self.quiet = 0.0;
+        let clamp = self.health_clamp && !crushed;
         let floor = if self.unkillable_her {
-            crate::npc::UNKILLABLE_FLOOR.max(if self.health_clamp { CLAMP_FLOOR } else { 0.0 })
-        } else if self.health_clamp {
-            CLAMP_FLOOR
+            crate::npc::UNKILLABLE_FLOOR.max(if clamp { self.clamp_floor() } else { 0.0 })
+        } else if clamp {
+            self.clamp_floor()
         } else {
             0.0
         };
@@ -4202,9 +4432,12 @@ impl Combat {
                     let world: Vec<Mat4> = nodes.iter().map(|m| body * *m).collect();
                     // Limp from rest: what shove the 360 gives the body
                     // was not traced.
-                    let id = f
-                        .physics
-                        .add_ragdoll(&rig.skeleton.parents, &world, Vec3::ZERO);
+                    let id = f.physics.add_ragdoll_named(
+                        &rig.skeleton.name_hashes,
+                        &rig.skeleton.parents,
+                        &world,
+                        Vec3::ZERO,
+                    );
                     f.player.ragdoll = Some(id);
                 }
             }
@@ -5343,7 +5576,7 @@ impl Combat {
     /// the hundredth from a car or a tank, a `Tank` none, and nothing
     /// under size 5 or past no more than 1. The part where they met takes the same. Returns the
     /// crashes, for the log: (struck vehicle, the other, closing speed,
-    /// damage it took). From the 360 code: the size, floor, hundredth and
+    /// damage it took, where they met: the deepest point of contact). From the 360 code: the size, floor, hundredth and
     /// cells (0x82162BB8, 0x82163758, 0x8228B5F0, 0x82287CF8). Inferred:
     /// one crash per meeting (the 360 sends one for each new contact),
     /// and the `DamageModifier` multiplier (a body landing on another
@@ -5352,7 +5585,7 @@ impl Combat {
         &mut self,
         physics: &mut Physics,
         vehicles: &mut [ParkedVehicle],
-    ) -> Vec<(usize, usize, f32, f32)> {
+    ) -> Vec<(usize, usize, f32, f32, Vec3)> {
         let mut now = std::collections::HashSet::new();
         let mut met = Vec::new();
         for (i, v) in vehicles.iter().enumerate() {
@@ -5397,7 +5630,7 @@ impl Combat {
                 };
                 let damage = m2_engine::durability::crash_damage(size, cell);
                 if damage <= 0.0 {
-                    out.push((struck, other, closing, 0.0));
+                    out.push((struck, other, closing, 0.0, at));
                     continue;
                 }
                 let v = &mut vehicles[struck];
@@ -5405,7 +5638,7 @@ impl Combat {
                     v.hit_parts(body, at, damage);
                 }
                 self.hurt_vehicle(physics, v, struck, damage);
-                out.push((struck, other, closing, damage));
+                out.push((struck, other, closing, damage, at));
             }
         }
         out
@@ -5869,6 +6102,7 @@ impl Combat {
                     reach,
                     life: planted.timer.map_or(f32::INFINITY, |(s, _)| s),
                     blast: planted.burst(),
+                    planted: planted.template,
                 }),
             });
         } else {
@@ -6013,6 +6247,7 @@ impl Combat {
                     .map(|m| m.w_axis.truncate()),
             )
             .collect();
+        let scripted_mines = self.scripted_mines;
         let wires = self.wires.clone();
         self.projectiles.retain_mut(|p| match p {
             Projectile::Rocket {
@@ -6141,7 +6376,12 @@ impl Combat {
                     Some(m) => {
                         m.life -= dt;
                         let armed = *timer <= 0.0;
-                        if armed && near.iter().any(|p| p.distance(*at) < m.reach) {
+                        // Once armed it is the planted mine's script that
+                        // sets it off ([`Combat::mines_planted`]).
+                        if armed
+                            && !scripted_mines
+                            && near.iter().any(|p| p.distance(*at) < m.reach)
+                        {
                             blasts.push((*at, m.blast, None));
                             return false;
                         }
@@ -6216,24 +6456,51 @@ impl Combat {
 
     /// A blast at `at`: fire and smoke, people killed or hurt, vehicles
     /// near it wrecked and thrown.
+    /// A blast at `at` of `(radius, max_force)` on person `j`: the 360's
+    /// push (0x8215CA38, [`m2_engine::ragdoll_launch::blast_impulse`]),
+    /// given to them if their ragdoll runs within the blast's window
+    /// ([`m2_engine::ragdoll_launch::Launch`], 0x8215C560). Their
+    /// `ExplosionFudge` is 1: no human template has one.
+    fn launch_person(
+        &mut self,
+        npcs: &mut [crate::npc::Npc],
+        j: usize,
+        at: Vec3,
+        (radius, force): (f32, f32),
+    ) {
+        let impulse = m2_engine::ragdoll_launch::blast_impulse(
+            at,
+            npcs[j].character.position,
+            radius,
+            force,
+            m2_engine::durability::LEAST_PUSH,
+            1.0,
+            [self.random(), self.random(), self.random()],
+        );
+        npcs[j].launch = Some(m2_engine::ragdoll_launch::Launch::new(&impulse, Vec3::Y));
+    }
+
     pub fn explode(&mut self, f: &mut Field<'_>, at: Vec3) {
         self.burst(at, 1.0, None);
         self.show_fx(fx::GRENADE, at);
         let mut killed = false;
         let key = Some(m2_assets::name_hash("Explosion"));
-        for n in &mut f.people.npcs {
+        for j in 0..f.people.npcs.len() {
+            let n = &f.people.npcs[j];
             let d = n.chest().distance(at);
-            // Thrown out and up, harder the nearer.
             let near = (1.0 - d / REACH).max(0.0);
-            let away = (n.chest() - at).with_y(0.0).normalize_or(Vec3::X);
-            let push = away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
             // Each by their own row of the table (`Human` 1 of an
             // `Explosion`, `HumanArmor` 0.5).
             let own = self.on_person(n, key);
+            if d < REACH {
+                self.launch_person(&mut f.people.npcs, j, at, (REACH, UNTEMPLATED_FORCE));
+            }
+            let n = &mut f.people.npcs[j];
+            // No push of its own: the launch throws them once limp.
             if d < KILL {
-                killed |= n.hurt_by_blast(1000.0 * own, push, key, at) && n.soldier;
+                killed |= n.hurt_by_blast(1000.0 * own, Vec3::ZERO, key, at) && n.soldier;
             } else if d < REACH {
-                killed |= n.hurt_by_blast(100.0 * near * own, push, key, at) && n.soldier;
+                killed |= n.hurt_by_blast(100.0 * near * own, Vec3::ZERO, key, at) && n.soldier;
                 n.panic(at);
             } else if d < REACH * 3.0 {
                 n.panic(at);
@@ -6253,7 +6520,7 @@ impl Combat {
                 let damage = 100.0 * (1.0 - d / REACH).max(0.0);
                 self.tally.taken_blasts +=
                     self.hurt_player(f, damage * self.hero_damage.explosion, Some(at));
-                Self::blast_staggers_her(f, at, key);
+                self.blast_staggers_her(f, at, key);
             }
         }
         for (i, v) in f.vehicles.iter_mut().enumerate() {
@@ -6453,12 +6720,15 @@ impl Combat {
         // Bashed and alive, she staggers (the 360's picker: a player's
         // character by a melee bash).
         let direction = (f.player.character.position - from).with_y(0.0);
-        f.player.stagger(&m2_engine::stagger::Event {
-            direction,
-            direct: true,
-            melee: true,
-            key: None,
-        });
+        f.player.stagger(
+            &m2_engine::stagger::Event {
+                direction,
+                direct: true,
+                melee: true,
+                key: None,
+            },
+            self.invincible,
+        );
     }
 
     fn npc_round(&self, gun: Option<m2_engine::tuning::HandGun>) -> f32 {
@@ -6538,12 +6808,12 @@ impl Combat {
             let n = &mut f.people.npcs[j];
             let d = n.chest().distance(at);
             if d < reach {
-                let near = 1.0 - d / reach;
-                let away = (n.chest() - at).with_y(0.0).normalize_or(Vec3::X);
-                let push =
-                    away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
-                killed |= n.hurt_by_blast(b.damage_at(d) * scale, push, b.key, at) && n.soldier;
-                n.panic(at);
+                // No push of its own (0x8215C560 pushes only a ragdoll
+                // that runs): the launch throws them once limp.
+                killed |=
+                    n.hurt_by_blast(b.damage_at(d) * scale, Vec3::ZERO, b.key, at) && n.soldier;
+                self.launch_person(&mut f.people.npcs, j, at, (b.radius, b.max_force));
+                f.people.npcs[j].panic(at);
             } else if d < reach * 3.0 {
                 n.panic(at);
             }
@@ -6553,7 +6823,7 @@ impl Combat {
             let d = (f.player.character.position + Vec3::Y).distance(at);
             if d < reach {
                 self.tally.taken_blasts += self.hurt_player(f, b.damage_at(d) * hers, Some(at));
-                Self::blast_staggers_her(f, at, b.key);
+                self.blast_staggers_her(f, at, b.key);
             }
         }
         for (i, v) in f.vehicles.iter_mut().enumerate() {
@@ -6777,20 +7047,20 @@ impl Combat {
             cover && d > 1.0 && physics.cast_ray(at, way / d, d - 0.5).is_some()
         };
         let mut killed = false;
-        for n in f.people.npcs.iter_mut() {
-            let chest = n.chest();
+        for j in 0..f.people.npcs.len() {
+            let chest = f.people.npcs[j].chest();
             let d = chest.distance(at);
             if d < radius * 2.0 {
-                n.panic(at);
+                f.people.npcs[j].panic(at);
             }
             if d >= radius || shielded(chest) {
                 continue;
             }
             let near = 1.0 - d / radius;
-            let away = (chest - at).with_y(0.0).normalize_or(Vec3::X);
-            let push = away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
-            let own = self.on_person(n, key);
-            killed |= n.hurt_by_blast(damage * near * own, push, key, at) && n.soldier;
+            let own = self.on_person(&f.people.npcs[j], key);
+            self.launch_person(&mut f.people.npcs, j, at, (radius, UNTEMPLATED_FORCE));
+            let n = &mut f.people.npcs[j];
+            killed |= n.hurt_by_blast(damage * near * own, Vec3::ZERO, key, at) && n.soldier;
         }
         let her = (f.player.driving.is_none() && f.player.landed)
             .then(|| f.player.character.position + Vec3::Y)
@@ -6838,7 +7108,7 @@ impl Combat {
             // For checking what hurts her (autoplay logs).
             eprintln!("blast: at {at:.1}, she takes {d:.0}");
             self.tally.taken_blasts += self.hurt_player(f, d, Some(at));
-            Self::blast_staggers_her(f, at, key);
+            self.blast_staggers_her(f, at, key);
         }
         if killed {
             self.remarks.push(Remark::Kill);
@@ -7148,6 +7418,105 @@ fn lock_share(held: f32, time: f32) -> f32 {
     } else {
         1.0
     }
+}
+
+/// `--survival-check`: her health clamp and survival mode as the 360's
+/// health change has them (0x822889F8), run on the game's own code with
+/// one player: the clamp holds a hit at 3 and starts survival; a
+/// crusher's hit goes past the clamp and does not; with the clamp off,
+/// survival cuts a hit someone dealt to a tenth. Prints a line each and
+/// PASS or FAIL; returns whether all passed.
+pub fn survival_check() -> bool {
+    let mut physics = Physics::new();
+    let mut player = Player::new(0.0, 0.0, 0.0, None);
+    let mut people = People::default();
+    let arsenal = Arsenal::default();
+    let mut vehicles = Vec::new();
+    let mut explosives = [];
+    let mut field = Field {
+        physics: &mut physics,
+        player: &mut player,
+        people: &mut people,
+        vehicles: &mut vehicles,
+        arsenal: &arsenal,
+        explosives: &mut explosives,
+    };
+    let verdict = |ok: bool| if ok { "PASS" } else { "FAIL" };
+    let mut all = true;
+    let mut clamped = Combat {
+        hp: 20.0,
+        max_hp: 120.0,
+        health_clamp: true,
+        ..Combat::default()
+    };
+    clamped.hurt_player(&mut field, 50.0, Some(Vec3::ZERO));
+    let ok = clamped.hp == 3.0 && clamped.survival;
+    all &= ok;
+    println!(
+        "survival-check: clamp on, 20 hp, a 50 hit from someone: {} hp, survival {}: {}",
+        clamped.hp,
+        if clamped.survival { "on" } else { "off" },
+        verdict(ok)
+    );
+    field.player.down = false;
+    let mut crushed = Combat {
+        hp: 20.0,
+        max_hp: 120.0,
+        health_clamp: true,
+        ..Combat::default()
+    };
+    crushed.hurt_player_crushed(&mut field, 50.0, Vec3::ZERO);
+    let ok = crushed.hp <= 0.0 && !crushed.survival;
+    all &= ok;
+    println!(
+        "survival-check: clamp on, 20 hp, a 50 hit from a crusher: {} hp, survival {}: {}",
+        crushed.hp,
+        if crushed.survival { "on" } else { "off" },
+        verdict(ok)
+    );
+    field.player.down = false;
+    let mut cut = Combat {
+        hp: 8.0,
+        max_hp: 120.0,
+        survival: true,
+        ..Combat::default()
+    };
+    cut.hurt_player(&mut field, 30.0, Some(Vec3::ZERO));
+    let ok = (cut.hp - 5.0).abs() < 1e-4;
+    all &= ok;
+    println!(
+        "survival-check: survival on, clamp off, 8 hp, a 30 hit from someone: {} hp: {}",
+        cut.hp,
+        verdict(ok)
+    );
+    // The beat (0x82439B98): with the beat flag, the blur beats up to 2.5
+    // within its 0.6 s; without it (the scripts' third argument false),
+    // it stays at the game's 0.25.
+    let peak = |beat: bool| {
+        let mut c = Combat {
+            survival: true,
+            survival_beat: beat,
+            ..Combat::default()
+        };
+        (0..12)
+            .map(|_| c.survival_blur(0.05))
+            .fold(0.0f32, f32::max)
+    };
+    let (with, without) = (peak(true), peak(false));
+    let ok = (with - 2.5).abs() < 1e-3;
+    all &= ok;
+    println!(
+        "survival-check: survival on with the beat: blur peaks at {with:.2} in 0.6 s: {}",
+        verdict(ok)
+    );
+    let ok = (without - MOTION_BLUR).abs() < 1e-6;
+    all &= ok;
+    println!(
+        "survival-check: survival on without the beat: blur stays at {without:.2}: {}",
+        verdict(ok)
+    );
+    println!("survival-check: {}", verdict(all));
+    all
 }
 
 #[cfg(test)]
@@ -8281,6 +8650,106 @@ mod tests {
         assert_eq!(field.player.ragdoll, None);
     }
 
+    /// Hurts her by each of `hits` (damage, dealt by someone) with
+    /// `combat` as set, returning her health after each.
+    fn health_after(combat: &mut Combat, hits: &[(f32, bool)]) -> Vec<f32> {
+        let mut physics = ground();
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        let mut vehicles = Vec::new();
+        let mut explosives = [];
+        let mut field = Field {
+            physics: &mut physics,
+            player: &mut player,
+            people: &mut people,
+            vehicles: &mut vehicles,
+            arsenal: &arsenal,
+            explosives: &mut explosives,
+        };
+        hits.iter()
+            .map(|&(d, by)| {
+                combat.hurt_player(&mut field, d, by.then_some(Vec3::ZERO));
+                combat.hp
+            })
+            .collect()
+    }
+
+    /// From the 360 code (0x822889F8): the clamp holds her at 3 with one
+    /// player and 1 with two, and the hit it catches turns survival on.
+    #[test]
+    fn the_clamp_holds_her_at_its_floor_and_starts_survival() {
+        let mut c = Combat {
+            hp: 20.0,
+            max_hp: 120.0,
+            health_clamp: true,
+            ..Combat::default()
+        };
+        assert_eq!(health_after(&mut c, &[(5.0, true)]), [15.0]);
+        assert!(!c.survival);
+        assert_eq!(health_after(&mut c, &[(50.0, true)]), [3.0]);
+        assert!(c.survival);
+        let mut two = Combat {
+            hp: 20.0,
+            health_clamp: true,
+            coop: true,
+            ..Combat::default()
+        };
+        assert_eq!(health_after(&mut two, &[(50.0, true)]), [1.0]);
+    }
+
+    /// From the 360 code (0x82439B18, 0x82439B98): out of survival the
+    /// blur is 0.25; in it, it beats to 2.5 and back every 0.6 s.
+    #[test]
+    fn survival_mode_beats_the_motion_blur() {
+        assert_eq!(survival_beat(0.0), Some(0.0));
+        assert!((survival_beat(0.3).unwrap() - 0.5).abs() < 1e-6);
+        assert!((survival_beat(0.45).unwrap() - survival_beat(0.15).unwrap()).abs() < 1e-6);
+        assert_eq!(survival_beat(0.6), None);
+        let mut c = Combat::default();
+        assert_eq!(c.survival_blur(0.1), MOTION_BLUR);
+        c.survival = true;
+        let blur: Vec<f32> = (0..12).map(|_| c.survival_blur(0.05)).collect();
+        let peak = blur.iter().cloned().fold(0.0, f32::max);
+        assert!((peak - 2.5).abs() < 1e-5, "{blur:?}");
+        assert_eq!(
+            blur[0], MOTION_BLUR,
+            "at 0.05 s five times the beat is under 0.25"
+        );
+        // The next beat starts again 0.6 s on.
+        assert!((c.survival_blur(0.3) - 2.5).abs() < 0.05);
+        c.survival = false;
+        assert_eq!(c.survival_blur(0.05), MOTION_BLUR);
+    }
+
+    /// From the 360 code (0x822889F8): with the clamp off, survival mode
+    /// cuts hits someone dealt to a tenth; a fall still does it all.
+    #[test]
+    fn the_survival_check_passes() {
+        assert!(super::survival_check());
+    }
+
+    #[test]
+    fn survival_mode_cuts_hits_from_others() {
+        let mut c = Combat {
+            hp: 8.0,
+            max_hp: 120.0,
+            survival: true,
+            ..Combat::default()
+        };
+        let after = health_after(&mut c, &[(30.0, true), (2.0, false)]);
+        assert!((after[0] - 5.0).abs() < 1e-5, "{after:?}");
+        assert!((after[1] - 3.0).abs() < 1e-5, "{after:?}");
+        // With the clamp on the clamp decides, not the cut.
+        let mut held = Combat {
+            hp: 8.0,
+            health_clamp: true,
+            survival: true,
+            ..Combat::default()
+        };
+        assert_eq!(health_after(&mut held, &[(4.0, true)]), [4.0]);
+    }
+
     #[test]
     fn fuel_tanks_go_off_one_after_another() {
         let mut physics = ground();
@@ -9191,6 +9660,7 @@ mod tests {
             reach: 2.0,
             life: 10.0,
             blast: None,
+            planted: 0x8000_6b6c,
         };
         combat.projectiles.push(charge(1, None));
         combat.projectiles.push(charge(2, Some(mine)));
@@ -9203,6 +9673,37 @@ mod tests {
                 (3, 0x8000_5fd4, Vec3::new(3.0, 0.0, 0.0))
             ]
         );
+    }
+
+    // An armed mine is listed as the template it has become; one still
+    // arming is not; a mine its script removed is gone.
+    #[test]
+    fn armed_mines_are_listed_as_planted_and_can_be_removed() {
+        let mut combat = Combat::default();
+        let mine = |id, timer| Projectile::Charge {
+            id,
+            ammo: 0x8000_6ea1,
+            at: Vec3::new(id as f32, 0.0, 0.0),
+            velocity: Vec3::ZERO,
+            model: None,
+            stuck: true,
+            blast: None,
+            timer,
+            mine: Some(Mine {
+                arm: 6.0,
+                reach: 3.0,
+                life: f32::INFINITY,
+                blast: None,
+                planted: 0x8000_6b6c,
+            }),
+        };
+        combat.projectiles.push(mine(1, -0.5));
+        combat.projectiles.push(mine(2, 4.0));
+        let planted: Vec<_> = combat.mines_planted().collect();
+        assert_eq!(planted, [(1, 0x8000_6b6c, Vec3::new(1.0, 0.0, 0.0))]);
+        combat.remove_charge(1);
+        assert_eq!(combat.mines_planted().count(), 0);
+        assert_eq!(combat.projectiles.len(), 1);
     }
 
     #[test]

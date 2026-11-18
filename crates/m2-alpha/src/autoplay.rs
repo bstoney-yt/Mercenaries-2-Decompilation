@@ -932,6 +932,16 @@ pub struct Autoplay {
     /// The current contract's active deliveries (set each tick:
     /// [`crate::mission::MissionLink::deliveries`]).
     pub deliveries: Vec<Delivery>,
+    /// The scripts turned down her last support call (`MrxSupport.
+    /// DenialMessage`, script line 733, as `TestAALevel` of the designator's
+    /// `sAATestLevel` finds anti-air up: "medium" for AllCon003's Chinese
+    /// AA, which puts nothing in the message box); set by the game loop,
+    /// taken each tick.
+    pub support_denied: bool,
+    /// What she is not to call support on again: what a call was turned
+    /// down for (AllCon003's Chinese AA, "medium": 21 bunker busters
+    /// turned down in 2400 s on her first try at it).
+    no_strike: Vec<u32>,
     /// The delivery she last got out at, and when: getting back into a
     /// vehicle while it still stands is a failed delivery, logged.
     pub delivery_exit: Option<(u32, f32)>,
@@ -1610,8 +1620,21 @@ impl Autoplay {
                 self.clock, p.template
             );
         }
+        // A call the scripts turned down: not again on what it was for.
+        if std::mem::take(&mut self.support_denied)
+            && let Some(Goal::Blast { target, .. }) = &self.goal
+            && !self.no_strike.contains(target)
+        {
+            eprintln!(
+                "autoplay {:.1} s: support turned down for {target:#x} (anti-air up): her own weapons from now on",
+                self.clock
+            );
+            self.no_strike.push(*target);
+        }
         let striking = !rifle
-            && matches!(&self.goal, Some(Goal::Blast { target, at }) if (sturdy(target) && !cannon) || (spent && !gun(at) && !cannon))
+            && matches!(&self.goal, Some(Goal::Blast { target, at })
+                if may_strike(&self.no_strike, *target)
+                    && ((sturdy(target) && !cannon) || (spent && !gun(at) && !cannon)))
             || matches!(self.goal, Some(Goal::Deliver(_)));
         // A call she is no longer after is put away: the designator goes
         // with a weapon taken up (twice from the satellite's view).
@@ -3929,61 +3952,9 @@ impl Autoplay {
             return self.plant(game, at, dt);
         }
         // In the water she can't fire: out where she can climb, first.
-        if swimming_now {
-            let out = game
-                .scene
-                .world
-                .as_ref()
-                .and_then(|w| landing(&w.physics, here, at, &self.tried));
-            // One she swims at and can't climb out at: another.
-            if let Some(l) = self.landing
-                && self.since_moved() > SPOT_GIVE_UP
-            {
-                eprintln!(
-                    "autoplay {:.1} s: no way out at {l:.1} in {SPOT_GIVE_UP} s: another",
-                    self.clock
-                );
-                self.tried.push(l);
-                self.landing = None;
-                self.fresh_headway();
-                self.stranded += 1;
-                // Swimming she gets out at none of them (round 33's
-                // AllCon002: 11 banks in 2000 s): hopped out, as a hop
-                // anywhere she makes no headway, and logged with them.
-                if self.stranded >= STRANDED_HOP
-                    && let Some(p) = game.scene.player.as_mut()
-                {
-                    eprintln!(
-                        "autoplay {:.1} s: no headway for {:.0} s at {here:.1} ({}): hopped to {l:.1}",
-                        self.clock,
-                        SPOT_GIVE_UP * self.stranded as f32,
-                        self.what
-                    );
-                    p.character.position = l + Vec3::Y * 0.1;
-                    p.character.velocity = Vec3::ZERO;
-                    self.hops.push((here, l));
-                    self.stranded = 0;
-                    return Intent::default();
-                }
-            }
-            if let Some(out) = out {
-                if self.landing.is_none_or(|l| l.distance(out) > 4.0) {
-                    eprintln!(
-                        "autoplay {:.1} s: in the water at {here:.1}: out at {out:.1}",
-                        self.clock
-                    );
-                }
-                self.landing = Some(out);
-                self.blast_spot = None;
-                self.blocked = 0.0;
-                return self.walk(game, out, 1.0, dt);
-            }
-        } else if here.y > WATERLINE + LANDING_DRY {
-            // Only once out on dry ground: in the shallows she is in and out
-            // of swimming (round 34's AllCon002: 12 ways out, never hopped).
-            self.stranded = 0;
+        if let Some(intent) = self.out_of_water(game, here, at, swimming_now, dt) {
+            return intent;
         }
-        self.landing = None;
         let Some(p) = game.scene.player.as_ref() else {
             return Intent::default();
         };
@@ -4396,15 +4367,99 @@ impl Autoplay {
         }
     }
 
+    /// Swimming, she can neither fire nor call in support (OilCon002
+    /// round 3; AllCon003 on #631's check: 950 s treading water 58 m from
+    /// its third AA gun, calling its bunker buster again and again): the
+    /// way out where she can climb, as an intent, while she swims ([`landing`],
+    /// hopped out after [`STRANDED_HOP`] banks she can't climb). `None` once
+    /// she is out.
+    fn out_of_water(
+        &mut self,
+        game: &mut Game,
+        here: Vec3,
+        at: Vec3,
+        swimming: bool,
+        dt: f32,
+    ) -> Option<Intent> {
+        if swimming {
+            let out = game
+                .scene
+                .world
+                .as_ref()
+                .and_then(|w| landing(&w.physics, here, at, &self.tried));
+            // One she swims at and can't climb out at: another.
+            if let Some(l) = self.landing
+                && self.since_moved() > SPOT_GIVE_UP
+            {
+                eprintln!(
+                    "autoplay {:.1} s: no way out at {l:.1} in {SPOT_GIVE_UP} s: another",
+                    self.clock
+                );
+                self.tried.push(l);
+                self.landing = None;
+                self.fresh_headway();
+                self.stranded += 1;
+                // Swimming she gets out at none of them (round 33's
+                // AllCon002: 11 banks in 2000 s): hopped out, as a hop
+                // anywhere she makes no headway, and logged with them.
+                if self.stranded >= STRANDED_HOP
+                    && let Some(p) = game.scene.player.as_mut()
+                {
+                    eprintln!(
+                        "autoplay {:.1} s: no headway for {:.0} s at {here:.1} ({}): hopped to {l:.1}",
+                        self.clock,
+                        SPOT_GIVE_UP * self.stranded as f32,
+                        self.what
+                    );
+                    p.character.position = l + Vec3::Y * 0.1;
+                    p.character.velocity = Vec3::ZERO;
+                    self.hops.push((here, l));
+                    self.stranded = 0;
+                    return Some(Intent::default());
+                }
+            }
+            if let Some(out) = out {
+                if self.landing.is_none_or(|l| l.distance(out) > 4.0) {
+                    eprintln!(
+                        "autoplay {:.1} s: in the water at {here:.1}: out at {out:.1}",
+                        self.clock
+                    );
+                }
+                self.landing = Some(out);
+                self.blast_spot = None;
+                self.blocked = 0.0;
+                return Some(self.walk(game, out, 1.0, dt));
+            }
+        } else if here.y > WATERLINE + LANDING_DRY {
+            // Only once out on dry ground: in the shallows she is in and out
+            // of swimming (round 34's AllCon002: 12 ways out, never hopped).
+            self.stranded = 0;
+        }
+        self.landing = None;
+        None
+    }
+
     fn strike(&mut self, game: &mut Game, at: Vec3, dt: f32) -> Intent {
         let flat = |a: Vec3| a.with_y(0.0).distance(at.with_y(0.0));
         if let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) {
+            debug_assert_eq!(strike_step(true, false), StrikeStep::Drive);
             let speed = vehicle_state(game, i).map_or(0.0, |s| s.1);
             let d = vehicle_at(game, i).map_or(0.0, |m| flat(m.w_axis.truncate()));
             if d < CALL_FROM.1 {
                 return self.press(speed);
             }
             return self.drive(game, i, at, CALL_FROM.1 - 15.0, dt);
+        }
+        let Some(p) = game.scene.player.as_ref() else {
+            return Intent::default();
+        };
+        let here = p.character.position;
+        // Out of the water first: swimming, the support menu is no use.
+        let swimming = p.swimming();
+        if strike_step(false, swimming) == StrikeStep::OutOfWater
+            && let Some(intent) = self.out_of_water(game, here, at, swimming, dt)
+        {
+            return intent;
         }
         let Some(p) = game.scene.player.as_ref() else {
             return Intent::default();
@@ -5725,6 +5780,33 @@ fn perch(
         }
     }
     None
+}
+
+/// Whether she may call support on `target`: not on one a call was
+/// turned down for (the scripts' anti-air test, [`Autoplay::support_denied`]).
+fn may_strike(denied: &[u32], target: u32) -> bool {
+    !denied.contains(&target)
+}
+
+/// What she does first towards calling in a strike: driving, gets there
+/// in her vehicle; swimming, gets out of the water (she can't call support
+/// from it: AllCon003 on #631's check trod water 950 s by its third AA
+/// gun, the support menu up and down); else the call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StrikeStep {
+    Drive,
+    OutOfWater,
+    Call,
+}
+
+fn strike_step(driving: bool, swimming: bool) -> StrikeStep {
+    if driving {
+        StrikeStep::Drive
+    } else if swimming {
+        StrikeStep::OutOfWater
+    } else {
+        StrikeStep::Call
+    }
 }
 
 /// Where she can climb out of the water nearest `at`: ground on
@@ -7236,6 +7318,24 @@ mod tests {
             vantage(&p, target, target, &[], &BLAST_RINGS, BLAST_BODY),
             None
         );
+    }
+
+    // AllCon003: the Chinese AA turns down her bunker buster ("medium"),
+    // 21 times in 2400 s; once turned down, not called on it again.
+    #[test]
+    fn a_strike_turned_down_is_not_called_again() {
+        assert!(may_strike(&[], 0xf9a92));
+        assert!(!may_strike(&[0xf9a92], 0xf9a92));
+        assert!(may_strike(&[0xf9a92], 0xf9aa3));
+    }
+
+    // AllCon003 on #631's check: in the water by its third AA gun she
+    // called the bunker buster from it again and again for 950 s.
+    #[test]
+    fn a_strike_is_called_from_dry_ground() {
+        assert_eq!(strike_step(false, true), StrikeStep::OutOfWater);
+        assert_eq!(strike_step(false, false), StrikeStep::Call);
+        assert_eq!(strike_step(true, false), StrikeStep::Drive);
     }
 
     // In a river with a bank 18 m high close by and a beach further off

@@ -1111,6 +1111,8 @@ pub struct MissionLink {
     /// Interface sounds the scripts cued (`ui_HUD_Objective_New`), and
     /// whether each is to stop instead.
     sounds: Vec<(String, bool)>,
+    /// `--mine-check` ([`crate::mines::MineCheck`]).
+    mine_check: Option<crate::mines::MineCheck>,
     /// Sound category fades and pitches the scripts asked for.
     fades: Vec<crate::sound::CategoryChange>,
     /// The music cue the scripts last switched to (`Some(None)`: none).
@@ -1301,6 +1303,7 @@ impl MissionLink {
             hushed: Vec::new(),
             voice_banks: Vec::new(),
             sounds: Vec::new(),
+            mine_check: None,
             fades: Vec::new(),
             music: None,
             music_at: None,
@@ -1586,6 +1589,13 @@ impl MissionLink {
     /// The job she was skipped to, and where it stands.
     pub fn job(&self) -> Option<&crate::jobs::JobRun> {
         self.job.as_ref()
+    }
+
+    /// `--mine-check`: the nearest placed mine is blasted and run into
+    /// ([`crate::mines::MineCheck`]).
+    pub fn with_mine_check(mut self, on: bool) -> Self {
+        self.mine_check = on.then(crate::mines::MineCheck::default);
+        self
     }
 
     /// With a job to follow: she is put this far from its nearest target
@@ -3690,6 +3700,11 @@ impl MissionLink {
                     mission.kill(e);
                 }
             }
+            // Placed mines run into or blasted, her mines armed.
+            crate::mines::report(game, mission);
+            if let Some(check) = &mut self.mine_check {
+                check.tick(game, mission, STEP);
+            }
             self.blasts.clear();
             self.bombs.clear();
             // The scripts heal her and watch her health.
@@ -3911,6 +3926,19 @@ impl MissionLink {
                         eprintln!("mission: health clamp {on}");
                         game.combat.health_clamp = *on;
                     }
+                    Command::SurvivalMode { on, beat } => {
+                        eprintln!("mission: survival mode {on}");
+                        if *on != game.combat.survival {
+                            eprintln!(
+                                "combat: survival mode {} (the scripts)",
+                                if *on { "on" } else { "off" }
+                            );
+                            // The beat flag goes with a change only
+                            // (0x8243AED8).
+                            game.combat.survival_beat = *beat;
+                        }
+                        game.combat.survival = *on;
+                    }
                     Command::SetHealth { guid, health } if *guid == PLAYER => {
                         eprintln!(
                             "mission: scripts set her health {:.1} -> {health:.1}",
@@ -4085,6 +4113,17 @@ impl MissionLink {
                     && what.starts_with("Explosion (Bunker Buster")
                 {
                     self.bombs.push(Vec3::from(*position));
+                }
+                // An explosion the scripts spawn (a mine's) goes off there.
+                if let Command::Spawn { what, position, .. } = &c
+                    && let Some(blast) = game
+                        .scene
+                        .world
+                        .as_ref()
+                        .and_then(|w| crate::mines::explosion_blast(&w.index.template_db, what))
+                {
+                    eprintln!("mission: the scripts set off {what} at {position:.1?}");
+                    game.combat.set_off(Vec3::from(*position), Some(blast));
                 }
                 if c == Command::Notify("Pg.ContractCompleted".into()) {
                     self.completed = Some(0.0);
@@ -5099,6 +5138,23 @@ impl MissionLink {
             .collect()
     }
 
+    /// How many support calls the scripts have turned down so far
+    /// (`MrxSupport.DenialMessage`, called with the reason as each is: the
+    /// anti-air level `TestAALevel` found up, "jammer", "nodrop", ...). The
+    /// count is kept by a wrapper put round it the first time this is read,
+    /// for the autoplay; the scripts' own call goes on unchanged.
+    pub fn support_denials(&self) -> u32 {
+        let State::Running(mission) = &self.state else {
+            return 0;
+        };
+        mission
+            .lua()
+            .load(SUPPORT_DENIALS)
+            .set_name("=support denials")
+            .eval::<u32>()
+            .unwrap_or(0)
+    }
+
     /// The names of the events the scripts wait for the game to post
     /// (`"PDA Open"`).
     pub fn awaited(&self) -> Vec<String> {
@@ -6100,6 +6156,23 @@ fn player_target(g: u32, her: Option<u32>) -> Option<u32> {
         g => Some(g),
     }
 }
+
+/// Counts the scripts' support denials ([`MissionLink::support_denials`]):
+/// wraps `MrxSupport.DenialMessage` once (the module's functions find it in
+/// the module's table, their environment) and returns the count.
+const SUPPORT_DENIALS: &str = r#"
+local s = rawget(_G, "MrxSupport")
+if type(s) ~= "table" or type(s.DenialMessage) ~= "function" then return 0 end
+if not rawget(s, "__m2_denials") then
+    local f = s.DenialMessage
+    rawset(s, "__m2_denials", 0)
+    s.DenialMessage = function(...)
+        rawset(s, "__m2_denials", rawget(s, "__m2_denials") + 1)
+        return f(...)
+    end
+end
+return rawget(s, "__m2_denials")
+"#;
 
 const CONTRACT_DELIVERIES: &str = r#"
 local ps = rawget(_G, "MrxPlayState")
@@ -9358,6 +9431,36 @@ mod tests {
         let exit_only = box_of("Display", "[Briefing.RootMenuDialog]", &["[Generic.Exit]"]);
         assert_eq!(contract_pick(&exit_only, &offered), None);
         assert_eq!(contract_pick(&menu, &[]), None);
+    }
+
+    // AllCon003: `MrxSupport.DenialMessage("medium")` for each bunker
+    // buster the Chinese AA turns down; counted, and still the scripts' own.
+    #[test]
+    fn the_scripts_support_denials_are_counted() {
+        let lua = mlua::Lua::new();
+        let count = |lua: &mlua::Lua| lua.load(SUPPORT_DENIALS).eval::<u32>().unwrap();
+        assert_eq!(count(&lua), 0, "no MrxSupport yet");
+        lua.load(
+            r#"
+            said = {}
+            MrxSupport = {}
+            function MrxSupport.DenialMessage(why) said[table.getn(said) + 1] = why end
+            "#,
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(count(&lua), 0);
+        lua.load(r#"MrxSupport.DenialMessage("medium"); MrxSupport.DenialMessage("jammer")"#)
+            .exec()
+            .unwrap();
+        assert_eq!(count(&lua), 2);
+        // Wrapped once only: a second read doesn't wrap the wrapper.
+        lua.load(r#"MrxSupport.DenialMessage("medium")"#)
+            .exec()
+            .unwrap();
+        assert_eq!(count(&lua), 3);
+        let said: Vec<String> = lua.load("return said").eval::<Vec<String>>().unwrap();
+        assert_eq!(said, ["medium", "jammer", "medium"]);
     }
 
     // The fail fanfare's answer reaches a contract's callback as the
