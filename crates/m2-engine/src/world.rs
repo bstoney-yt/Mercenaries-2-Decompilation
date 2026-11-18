@@ -367,6 +367,9 @@ pub struct Templates {
     /// What each piece of a template's objects weighs once broken off,
     /// kg, by id ([`crate::durability::piece_masses`]).
     pub piece_masses: HashMap<u32, f32>,
+    /// Each template's `Crusher` `DamageModifier`, by id
+    /// ([`crate::crush::crusher_modifiers`]).
+    pub crushers: HashMap<u32, f32>,
     /// Each template's `OSMParameter`s naming templates, by id: (the
     /// parameter's name hash, the template's id). What a part its model
     /// sends off goes as ([`crate::node_debris::goes_as`]).
@@ -1139,6 +1142,7 @@ impl Templates {
                 .collect(),
             infos,
             piece_masses: crate::durability::piece_masses(&db, &names),
+            crushers: crate::crush::crusher_modifiers(&db),
             params: crate::node_debris::params(&db, &names),
             by_hash: crate::node_debris::by_hash(&names),
             explosion_fudges: crate::durability::explosion_fudges(&db),

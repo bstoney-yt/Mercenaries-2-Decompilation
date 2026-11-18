@@ -1259,10 +1259,17 @@ impl Destruction {
                     && let Some((_, Some(t))) = props.sent_off_as(body)
                 {
                     let name = world.index.template_db.names.get(&t);
+                    // A `Crusher` template: what it lands on takes its
+                    // `DamageModifier` (Combat::limp_crushes, 0x8228B5F0).
+                    let crusher = world.index.template_db.crushers.get(&t).copied();
+                    if let Some(m) = crusher {
+                        combat.debris_crushers.insert(body, m);
+                    }
                     eprintln!(
-                        "destruct: {k:#x}'s part {:08x} goes as {}",
+                        "destruct: {k:#x}'s part {:08x} goes as {}{}",
                         c.machine,
-                        name.map_or("?", String::as_str)
+                        name.map_or("?", String::as_str),
+                        crusher.map_or(String::new(), |m| format!(" (a crusher, {m})"))
                     );
                 }
                 continue;
