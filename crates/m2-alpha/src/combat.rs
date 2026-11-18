@@ -1802,6 +1802,9 @@ pub struct Combat {
     /// The effects that are explosions, by name hash: their `Radius` and
     /// `MaxForce` (a wreck's blast, [`Combat::her_vehicle_wrecked`]).
     pub blast_effects: std::collections::HashMap<u32, (f32, f32)>,
+    /// Thrown from a wreck: its blast's place, where she was put out, her
+    /// health then, and seconds since (for the landing's log line).
+    thrown_from: Option<(Vec3, Vec3, f32, f32)>,
     /// Where the last one went off, and what it pushes what it breaks
     /// with, where known.
     pub last_blast: Option<Vec3>,
@@ -2206,6 +2209,7 @@ impl Default for Combat {
             knock_rng: m2_game::script_math::EngineRng::default(),
             blasts: 0,
             blast_effects: std::collections::HashMap::new(),
+            thrown_from: None,
             last_blast: None,
             last_push: None,
             went_off: Vec::new(),
@@ -3166,6 +3170,7 @@ impl Combat {
             trigger
         };
         self.her_vehicle_wrecked(f);
+        self.her_landing(f, dt);
         // A fall that hurt her ([`m2_engine::on_foot::fall_impact`]).
         if let Some(fell) = f.player.fell.take() {
             self.hurt_player(f, fell.damage, None);
@@ -4241,15 +4246,40 @@ impl Combat {
         let c = &f.player.character;
         let velocity = wreck_throw(at, push, c.position, (c.radius, c.height));
         f.player.throw(velocity);
+        self.thrown_from = Some((at, f.player.character.position, self.hp, 0.0));
         eprintln!(
-            "wreck: the {label} she is in is wrecked: she is put out and thrown by its blast \
-             ({:.0} m, push {:.0}) {:.1} m off: {:.1} m/s out, {:.1} m/s up",
+            "wreck: the {label} she is in is wrecked: she is put out and thrown by its blast              ({:.0} m, push {:.0}) {:.1} m off: {:.1} m/s out, {:.1} m/s up; health {:.1}",
             push.0,
             push.1,
             f.player.character.position.distance(at),
             velocity.with_y(0.0).length(),
-            velocity.y
+            velocity.y,
+            self.hp
         );
+    }
+
+    /// Thrown from a wreck, she landed: logs where (how far from the
+    /// blast and from where she was put out, across the ground), how long
+    /// she flew, and her health against what it was when thrown (Xenia:
+    /// 7.5 to 11 m out, no damage).
+    fn her_landing(&mut self, f: &Field<'_>, dt: f32) {
+        let Some((blast, out, hp, t)) = &mut self.thrown_from else {
+            return;
+        };
+        *t += dt;
+        if f.player.thrown && *t < 10.0 {
+            return;
+        }
+        let at = f.player.character.position;
+        eprintln!(
+            "wreck: she lands {:.1} s on, {:.1} m from the blast and {:.1} m from where she was              put out; health {:.1} -> {:.1}",
+            t,
+            at.with_y(0.0).distance(blast.with_y(0.0)),
+            at.with_y(0.0).distance(out.with_y(0.0)),
+            hp,
+            self.hp
+        );
+        self.thrown_from = None;
     }
 
     /// A blast at `at` of `DamageKey` `key` reached her: alive after it,
