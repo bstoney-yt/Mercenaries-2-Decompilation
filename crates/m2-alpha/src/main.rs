@@ -59,6 +59,7 @@ mod boarding;
 mod breakables;
 mod cache;
 mod camera;
+mod camera_check;
 mod cheats;
 mod combat;
 mod config;
@@ -249,6 +250,9 @@ struct Options {
     /// With `--drive` and `--wreck` or `--shoot-up`: get out of the wreck,
     /// walk to the fuel can it left and take it (testing).
     fuel_check: bool,
+    /// `--camera-check <kind>`: the pad's cameras driven by a scripted
+    /// stick, offscreen, PASS/FAIL against the 360 ([`camera_check`]).
+    camera_check: Option<String>,
     /// With `--drive`: stop and put this many rifle rounds into its parts.
     shoot_up: Option<u32>,
     /// With `--drive`: fire from the next seat with a weapon.
@@ -885,6 +889,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                         .map_err(|_| anyhow::anyhow!("--props-area expects x0,z0,x1,z1"))?,
                 );
             }
+            "--camera-check" => o.camera_check = Some(value()?),
             "--seated" => o.seated = true,
             "--board" => o.board = true,
             "--seat-check" => {
@@ -1355,6 +1360,13 @@ fn run(
             }
         },
     };
+    if let Some(kind) = &options.camera_check {
+        let Some(install) = &install else {
+            anyhow::bail!("--camera-check needs the game (--install)");
+        };
+        let pass = camera_check::run(install, kind)?;
+        std::process::exit(if pass { 0 } else { 1 });
+    }
     // No models named: the island (or, without an install, Jennifer's
     // grid, which shows only the ground).
     let gait = options.gait.unwrap_or(Gait::Idle);
