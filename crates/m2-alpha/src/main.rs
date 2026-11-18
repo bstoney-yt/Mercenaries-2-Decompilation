@@ -508,6 +508,9 @@ struct Options {
     /// swim her forward walking, at her pace and sprinting, logging how
     /// fast she goes (`swim-check:` lines).
     swim_check: bool,
+    /// `--impact-check`: rounds struck into the ground round her, by
+    /// surface ([`impact_check`]).
+    impact_check: bool,
     /// With `--board`: the entrance she stands at, by name or hash
     /// (`entrance_driver`, `8efe45f3`); else the front right one.
     entrance: Option<u32>,
@@ -886,6 +889,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--seated" => o.seated = true,
             "--board" => o.board = true,
             "--swim-check" => o.swim_check = true,
+            "--impact-check" => {
+                o.impact_check = true;
+                o.drive = true;
+            }
             "--ladder-check" => {
                 o.ladder_check = Some(
                     value()?
@@ -7338,6 +7345,10 @@ fn drive_for_screenshot(
         swim_check(game, tick);
         return Ok(());
     }
+    if options.impact_check {
+        impact_check(game);
+        return Ok(());
+    }
     if let Some(hold) = options.ladder_check {
         ladder_check(game, hold, tick);
         return Ok(());
@@ -8285,6 +8296,72 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 /// `--swim-check`: she is put in the nearest water over 4 m deep (looked
 /// for in rings out to 600 m) and swims forward for 4 s walking, at her
 /// pace and sprinting, through the game's tick; logs her speed each time.
+/// `--impact-check`: rounds fired straight down at the ground every 4 m
+/// over 200 m round her (and at the water where there is any), each
+/// struck as one of hers strikes the world ([`Combat::impact_probe`]):
+/// one line per surface word met, how many rounds struck it, and whether
+/// the particle table gave its effect (`by the table`) or the surface's
+/// own pick did (`by its own pick`); then the vehicles' crash cues the
+/// sound table gives for every pair of the scene's vehicles. For the
+/// impact tables (#684): grass, dirt and water are seldom struck in play.
+fn impact_check(game: &mut Game) {
+    use m2_math::glam::Vec3;
+    use std::collections::BTreeMap;
+    let here = game.focus();
+    let Some(world) = game.scene.world.as_ref() else {
+        eprintln!("impact-check: FAIL no island");
+        return;
+    };
+    let physics = &world.physics;
+    let mut by: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+    for i in -50..=50 {
+        for k in -50..=50 {
+            let from = Vec3::new(
+                here.x + i as f32 * 4.0,
+                here.y + 300.0,
+                here.z + k as f32 * 4.0,
+            );
+            let Some((t, _)) = physics.cast_ray(from, Vec3::NEG_Y, 1200.0) else {
+                continue;
+            };
+            let (surface, by_table) = game.combat.impact_probe(physics, from, Vec3::NEG_Y, t);
+            let word = m2_engine::surface::word(surface)
+                .map_or_else(|| format!("{surface:08x}"), str::to_owned);
+            let e = by.entry(word).or_default();
+            e.0 += 1;
+            e.1 += u32::from(by_table);
+        }
+    }
+    for (word, (n, table)) in &by {
+        eprintln!(
+            "impact-check: {word}: {n} rounds, {table} by the table, {} by its own pick",
+            n - table
+        );
+    }
+    let db = &world.index.template_db;
+    let key = |v: &crate::scene::ParkedVehicle| {
+        crate::game::vehicle_sound_key(db, &v.spec.label, v.spec.model)
+    };
+    let (mut pairs, mut cued) = (0, 0);
+    let vehicles = &game.scene.vehicles;
+    for (a, va) in vehicles.iter().enumerate() {
+        for vb in &vehicles[a + 1..] {
+            pairs += 1;
+            if let (Some(ka), Some(kb), Some(t)) = (key(va), key(vb), db.sound_table.as_ref())
+                && t.either(ka, kb).is_some()
+            {
+                cued += 1;
+            }
+        }
+    }
+    eprintln!("impact-check: vehicle pairs {pairs}, {cued} with a crash cue");
+    eprintln!(
+        "impact-check: {} surface words met, {} decided by the table",
+        by.len(),
+        by.values().filter(|v| v.1 > 0).count()
+    );
+}
+
 fn swim_check(game: &mut Game, tick: f32) {
     use m2_math::glam::{Vec2, Vec3};
     let here = game.focus();

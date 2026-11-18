@@ -467,6 +467,7 @@ impl Game {
         if let Some(arms) = scene.arms() {
             combat.arm(arms, scene.damage_table());
         }
+        combat.particle_table = scene.particle_table();
         own_explosives(&mut combat, scene.hero_explosives());
         eprintln!(
             "hero: carries {} grenades, {} C4, {} mines; launcher {} ({:?})",
@@ -2139,10 +2140,30 @@ impl Game {
             }
             // Vehicles running into each other hurt each other and the
             // parts where they met.
-            for (struck, other, closing, damage) in self
+            let crashes = self
                 .combat
-                .vehicle_crashes(&mut world.physics, &mut self.scene.vehicles)
-            {
+                .vehicle_crashes(&mut world.physics, &mut self.scene.vehicles);
+            // Each pair is heard once, by the sound table's cue for the
+            // two vehicles' `SoundKey`s either way round (0x8235E850 ->
+            // 0x82398958); a pair with none is silent, as in the game.
+            let db = &world.index.template_db;
+            let key_of = |v: &ParkedVehicle| {
+                db.id(&v.spec.label)
+                    .and_then(|t| db.sound_keys.get(&t).copied())
+            };
+            // Heard where they met (the contact's point: the 360 plays a
+            // contact's cue at the collision event's place, 0x8235E3A8).
+            for &(struck, other, _, _, at) in crashes.iter().filter(|c| c.0 < c.1) {
+                let (a, b) = (&self.scene.vehicles[struck], &self.scene.vehicles[other]);
+                let cue = match (key_of(a), key_of(b), db.sound_table.as_ref()) {
+                    (Some(ka), Some(kb), Some(t)) => t.either(ka, kb),
+                    _ => None,
+                };
+                if let Some(cue) = cue {
+                    self.combat.broke(at, cue);
+                }
+            }
+            for (struck, other, closing, damage, _) in crashes {
                 let v = &self.scene.vehicles[struck];
                 eprintln!(
                     "crash: the {} hit by the {} at {closing:.1} m/s takes {damage:.1} ({:.0} of {:.0} left)",
