@@ -120,6 +120,9 @@ pub struct ChaseRig {
     /// How far above the camera's line the crosshair (and the gun's aim)
     /// sits, radians.
     pub aim_lift: f32,
+    /// A car's or a boat's 360 camera preset: its drift back behind it and
+    /// its pitch, as the 360's ([`m2_engine::pad_camera::CarFollow`]).
+    pub car: Option<m2_engine::pad_camera::CarPreset>,
 }
 
 /// How far above the middle of the screen a tank's crosshair sits,
@@ -148,6 +151,7 @@ impl ChaseRig {
                 pitch_range: (-1.2, 0.9),
                 follows_aim: false,
                 aim_lift: 0.0,
+                car: None,
             };
         }
         match spec.tuning.camera {
@@ -158,15 +162,28 @@ impl ChaseRig {
                 pitch_range: c.pitch_range,
                 follows_aim: true,
                 aim_lift: TANK_AIM_LIFT,
+                car: None,
             },
-            None => Self {
-                pivot: Vec3::Y * 2.0,
-                distance: (spec.bounds.1.z - spec.bounds.0.z) * 0.9 + 3.0,
-                pitch: None,
-                pitch_range: (-1.2, 0.9),
-                follows_aim: spec.tracked,
-                aim_lift: 0.0,
-            },
+            None => {
+                // A car or a boat with its 360 camera preset: its
+                // `DefaultPitch` and the camera's pitch limits
+                // ([`m2_engine::pad_camera::CAR_PITCH_LIMITS`]).
+                let car = spec.tuning.car_camera.filter(|_| !spec.tracked);
+                let [low, high] = m2_engine::pad_camera::CAR_PITCH_LIMITS;
+                Self {
+                    pivot: Vec3::Y * 2.0,
+                    distance: (spec.bounds.1.z - spec.bounds.0.z) * 0.9 + 3.0,
+                    pitch: car.map(|c| c.default_pitch),
+                    pitch_range: if car.is_some() {
+                        (low, high)
+                    } else {
+                        (-1.2, 0.9)
+                    },
+                    follows_aim: spec.tracked,
+                    aim_lift: 0.0,
+                    car,
+                }
+            }
         }
     }
 }
@@ -326,6 +343,8 @@ pub struct Player {
     camera_distance: f32,
     /// Seconds since the mouse last turned the camera.
     look_still: f32,
+    /// A car camera's drift back behind it ([`ChaseRig::car`]).
+    car_follow: m2_engine::pad_camera::CarFollow,
     /// While driving: the point the chase camera turns about, and how far
     /// behind it the camera sits ([`ChaseRig`]).
     pub chase_target: Option<(Vec3, f32)>,
@@ -639,6 +658,7 @@ impl Player {
             chase_target: None,
             aim_lift: 0.0,
             look_still: 0.0,
+            car_follow: Default::default(),
             landed: false,
             land_from: None,
             streaming: false,
@@ -2046,6 +2066,7 @@ impl Player {
         let f = transform.transform_vector3(Vec3::Z);
         let heading = f.x.atan2(f.z);
         if self.chase_target.is_none() {
+            self.car_follow = Default::default();
             if let Some(pitch) = rig.pitch {
                 self.pitch = pitch;
             }
@@ -2064,7 +2085,18 @@ impl Player {
         } else {
             0.0
         };
-        if !rig.follows_aim && self.look_still > CHASE_HOLD && speed.abs() > 2.0 {
+        if let Some(preset) = &rig.car {
+            // The 360's drift back behind it: a turn of the stick's yaw
+            // over its threshold holds the look (taken from the turn's
+            // rate: over the car camera's 2 rad/s at the threshold).
+            let held = look.x.abs()
+                > m2_engine::pad_camera::CAR_RATES[0]
+                    * m2_engine::pad_camera::CAR_YAW_THRESHOLD
+                    * dt;
+            self.yaw = self
+                .car_follow
+                .step(preset, self.yaw, heading, speed, held, dt);
+        } else if !rig.follows_aim && self.look_still > CHASE_HOLD && speed.abs() > 2.0 {
             let mut turn = (heading - self.yaw).rem_euclid(std::f32::consts::TAU);
             if turn > std::f32::consts::PI {
                 turn -= std::f32::consts::TAU;

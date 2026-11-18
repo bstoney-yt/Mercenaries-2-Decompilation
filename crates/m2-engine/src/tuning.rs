@@ -88,6 +88,9 @@ pub struct VehicleTuning {
     /// `ee30a43d`, name unknown: 20 for the light helicopters, 39 for the
     /// Mi-26; and `DefaultPitch`).
     pub chase: Option<(f32, f32)>,
+    /// A car's or a boat's driver camera's preset (its
+    /// `CameraCarPresetLink`'s `PresetTemplate`'s `CameraCarPreset`).
+    pub car_camera: Option<crate::pad_camera::CarPreset>,
 }
 
 /// How a tracked vehicle drives, from its `_TankPhysics` (names from the
@@ -1848,6 +1851,8 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
     let heli_ai = Table::new(db, "_HelicopterPhysicsAi");
     let pilot = Table::new(db, "AiHelicopter");
     let heli_camera = Table::new(db, "CameraHelicopter");
+    let car_link = Table::new(db, "CameraCarPresetLink");
+    let car_preset = Table::new(db, "CameraCarPreset");
     let guns = Guns {
         weapon: Table::new(db, "WeaponProjectileBase"),
         effects: Table::new(db, "WeaponEffects"),
@@ -2231,6 +2236,25 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         heli_camera.float(r, CHASE_DISTANCE)?,
                         heli_camera.float(r, name_hash("DefaultPitch"))?,
                     ))
+                })(),
+                car_camera: (|| {
+                    // The driver's seat's link, else its first; its
+                    // preset's template's record (0x8243EAC0).
+                    let links = car_link.of_template(id);
+                    let seat = name_hash("SeatName");
+                    let link = links
+                        .iter()
+                        .find(|r| car_link.word(r, seat) == Some(name_hash("seat_driver")))
+                        .or(links.first())?;
+                    let preset = car_link.word(link, name_hash("PresetTemplate"))?;
+                    let r = car_preset.of_template(preset).first()?;
+                    let f = |n: &str| car_preset.float(r, name_hash(n));
+                    Some(crate::pad_camera::CarPreset {
+                        yaw_reset_time: f("YawResetTime")?,
+                        default_pitch: f("DefaultPitch")?,
+                        spring_strength: f("SpringStrength")?,
+                        spring_dampening: f("SpringDampening")?,
+                    })
                 })(),
             };
             (id, t)
