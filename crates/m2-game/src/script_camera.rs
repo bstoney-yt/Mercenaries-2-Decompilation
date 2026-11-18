@@ -314,7 +314,7 @@ pub(crate) fn install(
     add(&camera, "Follow", follow)?;
     add(&camera, "Hold", hold)?;
     add(&camera, "Blend", blend)?;
-    add(&camera, "SetPitch", answered)?;
+    add(&camera, "SetPitch", set_pitch)?;
     add(&camera, "StopBlending", answered)?;
     Ok(())
 }
@@ -451,11 +451,24 @@ fn blend(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiValue> 
     direct(w, a, |c| c.blend(s))
 }
 
-/// `Camera.SetPitch(camera, degrees)` and `Camera.StopBlending(camera)`
-/// (0x82316d10, 0x82316da8 through 0x82316a00): true when the handle names
-/// a camera, whatever drives it; nil without one. What they do to the
-/// view (the pitch message's turn, the base camera's transition blend) is
-/// not ported.
+/// `Camera.SetPitch(camera, degrees)` (0x82316d10 through 0x82316a00):
+/// as [`answered`], and on her camera the pitch message
+/// ([`crate::api::Command::CameraPitch`]); nil without degrees.
+fn set_pitch(w: &mut ScriptWorld, lua: &Lua, a: &[Value]) -> mlua::Result<MultiValue> {
+    let Some(degrees) = number(a.get(1)) else {
+        return one(Value::Nil);
+    };
+    if handle(w, a) == Some(true) {
+        w.commands
+            .push(crate::api::Command::CameraPitch(degrees.to_radians()));
+    }
+    answered(w, lua, a)
+}
+
+/// `Camera.StopBlending(camera)` (0x82316da8 through 0x82316a00): true when
+/// the handle names a camera, whatever drives it; nil without one. Its
+/// effect on the view (the base camera's transition blend) is not
+/// ported.
 fn answered(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiValue> {
     match handle(w, a) {
         Some(named) => one(Value::Boolean(named)),

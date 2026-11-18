@@ -123,6 +123,9 @@ pub struct ChaseRig {
     /// A car's or a boat's 360 camera preset: its drift back behind it and
     /// its pitch, as the 360's ([`m2_engine::pad_camera::CarFollow`]).
     pub car: Option<m2_engine::pad_camera::CarPreset>,
+    /// A helicopter's 360 camera: its view follows it with lag and leans
+    /// with it ([`m2_engine::pad_camera::HeliFollow`]).
+    pub heli: Option<m2_engine::pad_camera::HeliLookTuning>,
 }
 
 /// How far above the middle of the screen a tank's crosshair sits,
@@ -156,6 +159,7 @@ impl ChaseRig {
                 follows_aim: false,
                 aim_lift: 0.0,
                 car: None,
+                heli: spec.tuning.heli_camera,
             };
         }
         match spec.tuning.camera {
@@ -167,6 +171,7 @@ impl ChaseRig {
                 follows_aim: true,
                 aim_lift: TANK_AIM_LIFT,
                 car: None,
+                heli: None,
             },
             None => {
                 // A car or a boat with its 360 camera preset: its
@@ -186,6 +191,7 @@ impl ChaseRig {
                     follows_aim: spec.tracked,
                     aim_lift: 0.0,
                     car,
+                    heli: None,
                 }
             }
         }
@@ -349,6 +355,11 @@ pub struct Player {
     look_still: f32,
     /// A car camera's drift back behind it ([`ChaseRig::car`]).
     car_follow: m2_engine::pad_camera::CarFollow,
+    /// A helicopter camera's following of it ([`ChaseRig::heli`]), and
+    /// the pitch it adds and the roll it gives the view now.
+    heli_follow: m2_engine::pad_camera::HeliFollow,
+    pub heli_lift: f32,
+    pub camera_roll: f32,
     /// While driving: the point the chase camera turns about, and how far
     /// behind it the camera sits ([`ChaseRig`]).
     pub chase_target: Option<(Vec3, f32)>,
@@ -666,6 +677,9 @@ impl Player {
             aim_lift: 0.0,
             look_still: 0.0,
             car_follow: Default::default(),
+            heli_follow: Default::default(),
+            heli_lift: 0.0,
+            camera_roll: 0.0,
             landed: false,
             land_from: None,
             streaming: false,
@@ -2077,6 +2091,9 @@ impl Player {
         let heading = f.x.atan2(f.z);
         if self.chase_target.is_none() {
             self.car_follow = Default::default();
+            self.heli_follow = Default::default();
+            self.heli_lift = 0.0;
+            self.camera_roll = 0.0;
             if let Some(pitch) = rig.pitch {
                 self.pitch = pitch;
             }
@@ -2095,7 +2112,22 @@ impl Player {
         } else {
             0.0
         };
-        if let Some(preset) = &rig.car {
+        if let Some(h) = &rig.heli {
+            // The 360's: the view's yaw is the helicopter's, lagged; its
+            // pitch its own plus the nose's; it rolls with it. Her own
+            // pitch is the stick's ([`m2_engine::pad_camera::HeliLook`]),
+            // the lift added on top.
+            let up = transform.transform_vector3(Vec3::X);
+            let nose = f.y.clamp(-1.0, 1.0).asin();
+            let roll = (-up.y).clamp(-1.0, 1.0).asin();
+            self.pitch -= self.heli_lift;
+            let (yaw, lift, rolled) = self.heli_follow.step(h, heading, nose, roll, dt);
+            self.yaw = yaw;
+            self.heli_lift = lift;
+            self.pitch =
+                (self.pitch + lift).clamp(rig.pitch_range.0 + lift, rig.pitch_range.1 + lift);
+            self.camera_roll = rolled;
+        } else if let Some(preset) = &rig.car {
             // The 360's drift back behind it: a turn of the stick's yaw
             // over its threshold holds the look (taken from the turn's
             // rate: over the car camera's 2 rad/s at the threshold).
@@ -2172,7 +2204,7 @@ impl Player {
                 FAR,
             );
         }
-        View::perspective(
+        let mut view = View::perspective(
             self.eye(),
             self.camera_forward(),
             fov_y(
@@ -2182,7 +2214,30 @@ impl Player {
             aspect,
             NEAR,
             FAR,
-        )
+        );
+        // A helicopter's lean ([`m2_engine::pad_camera::HeliFollow`]).
+        if self.camera_roll != 0.0 && self.chase_target.is_some() {
+            view.view = Mat4::from_rotation_z(self.camera_roll) * view.view;
+        }
+        view
+    }
+
+    /// `Camera.SetPitch`'s pitch message on her camera, `radians` (the
+    /// 360's `0xDD8FBBCF`): a helicopter's sets its pitch (positive down,
+    /// 0x824C2480), a car's its pitch offset (0x824C0DF0), and on foot it
+    /// is added to the camera's 0..1 (clamped, 0x824C5E18).
+    pub fn set_camera_pitch(&mut self, radians: f32) {
+        use m2_engine::pad_camera::{STANDING, pitch_at, t_at};
+        match (self.chase_target.is_some(), self.driving.is_some()) {
+            (true, _) if self.heli_follow != Default::default() => {
+                self.pitch = -radians + self.heli_lift;
+            }
+            (true, _) => self.pitch = radians,
+            _ => {
+                let t = (t_at(self.pitch, &STANDING) + radians).clamp(0.0, 1.0);
+                self.pitch = pitch_at(t, &STANDING);
+            }
+        }
     }
 
     /// Model to world for her model, turned so its forward is her facing;

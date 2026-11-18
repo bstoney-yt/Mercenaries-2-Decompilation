@@ -683,6 +683,11 @@ pub enum Command {
     /// A scene of the scripts' begins (true) or ends
     /// (`Player.SetCinematicMode`): on its end the camera is hers again.
     Cinematic(bool),
+    /// `Camera.SetPitch(camera, degrees)` on her camera, radians
+    /// (0x82316D10 posts `0xDD8FBBCF` with the degrees made radians): each
+    /// camera takes it its own way (the helicopter's sets its pitch, the
+    /// car's its pitch offset, on foot it is added to the 0..1).
+    CameraPitch(f32),
     /// The player's aiming is on or off (`Player.SetAimMode(player, on)`):
     /// the HQ turns it off as she goes in, with `Human.DisableWeapons`,
     /// and on again as she leaves; off, she has no reticle.
