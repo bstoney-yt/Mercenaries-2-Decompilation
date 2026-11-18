@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let model = Model::parse(data)?;
         println!("{} nodes", model.nodes.len());
         let phy2 = u.top_level(*b"PHY2").ok_or("no PHY2")?;
-        let r = HumanRagdoll::from_physics(&Physics::parse(phy2)?)?;
+        let r = HumanRagdoll::from_model(&model, &Physics::parse(phy2)?)?;
         println!(
             "{} bones, {:.1} kg, {} joints",
             r.bones.len(),
@@ -72,6 +72,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 b.parent,
                 b.mass,
                 b.shape
+            );
+        }
+        for b in &r.bones {
+            let m = m2_math::glam::Mat4::from_cols_array(&b.bind);
+            let (_, q, t) = m.to_scale_rotation_translation();
+            println!(
+                "bind {:<9} at {:.3?} x {:.2?} y {:.2?} shape at {:.3?}",
+                name(b.node_hash),
+                t.to_array(),
+                (q * m2_math::glam::Vec3::X).to_array(),
+                (q * m2_math::glam::Vec3::Y).to_array(),
+                b.shape_place
             );
         }
         for (i, j) in r.joints.iter().enumerate() {

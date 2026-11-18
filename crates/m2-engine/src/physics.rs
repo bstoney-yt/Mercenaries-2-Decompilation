@@ -3312,6 +3312,9 @@ struct Ragdoll {
     /// Each limb's joint: (limb, the limb it hangs from, where in that
     /// limb), parents first.
     joints: Vec<(usize, usize, Vec3)>,
+    /// The joints' handles, where they carry limits (a ragdoll built from
+    /// the game's, [`Physics::add_asset_ragdoll`]).
+    joint_handles: Vec<r::ImpulseJointHandle>,
 }
 
 /// The physics world.
@@ -3339,6 +3342,9 @@ pub struct Physics {
     controller: KinematicCharacterController,
     vehicles: Vec<Option<VehicleBody>>,
     ragdolls: Vec<Option<Ragdoll>>,
+    /// The game's human ragdoll ([`Physics::set_human_ragdoll`]): every
+    /// person's bodies and joints, where loaded.
+    human_ragdoll: Option<std::sync::Arc<m2_assets::ragdoll::HumanRagdoll>>,
     /// Loose props' pieces, oldest first.
     debris: Vec<Option<r::RigidBodyHandle>>,
     /// The water's surface boats float on, if there is any.
@@ -3412,6 +3418,7 @@ impl Physics {
             controller,
             vehicles: Vec::new(),
             ragdolls: Vec::new(),
+            human_ragdoll: None,
             debris: Vec::new(),
             water: None,
             inland: None,
@@ -6076,6 +6083,226 @@ impl Physics {
         Some(sum)
     }
 
+    /// Gives every person's ragdoll the game's bodies and joints
+    /// ([`m2_assets::ragdoll`]): [`add_ragdoll_named`](Self::add_ragdoll_named)
+    /// builds from them.
+    pub fn set_human_ragdoll(&mut self, doll: std::sync::Arc<m2_assets::ragdoll::HumanRagdoll>) {
+        self.human_ragdoll = Some(doll);
+    }
+
+    /// Lets a person go limp: as [`add_ragdoll`](Self::add_ragdoll), but
+    /// with the game's own ragdoll ([`add_asset_ragdoll`](Self::add_asset_ragdoll))
+    /// where it is loaded and the skeleton has every one of its bones by
+    /// name (`hashes`, the nodes' name hashes); else built from the
+    /// skeleton.
+    pub fn add_ragdoll_named(
+        &mut self,
+        hashes: &[u32],
+        parents: &[Option<usize>],
+        nodes: &[Mat4],
+        velocity: Vec3,
+    ) -> RagdollId {
+        if let Some(doll) = self.human_ragdoll.clone()
+            && let Some(id) = self.add_asset_ragdoll(&doll, hashes, parents, nodes, velocity)
+        {
+            return id;
+        }
+        self.add_ragdoll(parents, nodes, velocity)
+    }
+
+    /// Lets a person go limp on the game's ragdoll `doll`: a body on each
+    /// of its bones' nodes (found by name hash in `hashes`), posed as
+    /// `nodes` (world space) has them, with the bone's mass, capsule,
+    /// friction and angular damping; joined as its joints say, a limited
+    /// hinge or a ragdoll joint with its limits; every body moving at
+    /// `velocity`. `None` if the skeleton lacks one of its bones.
+    ///
+    /// From the 360 code and samples ([`m2_assets::ragdoll`]): the bodies
+    /// and joints are the asset's. The joints' pivots and axes are in the
+    /// space of the bone that holds them (the pivots sit at its node's
+    /// origin; the thighs' and the spine's first axes run along their
+    /// bones), and the other bone's side is placed by the two bones' bind
+    /// (inferred: Havok sets a joint in both bodies' spaces when it is
+    /// built). Inferred too: the limits put on the joint's axes as twist
+    /// about the first axis, plane about the second and cone about the
+    /// third (Havok's ragdoll joint limits a cone and a plane rather than
+    /// angles about axes); no linear damping (the record's +0x38 is not
+    /// read by the 360's body builder).
+    pub fn add_asset_ragdoll(
+        &mut self,
+        doll: &m2_assets::ragdoll::HumanRagdoll,
+        hashes: &[u32],
+        parents: &[Option<usize>],
+        nodes: &[Mat4],
+        velocity: Vec3,
+    ) -> Option<RagdollId> {
+        use m2_assets::ragdoll::{BoneShape, JointLimits};
+        let n = nodes.len().min(parents.len()).min(hashes.len());
+        let node_of: Vec<usize> = doll
+            .bones
+            .iter()
+            .map(|b| hashes[..n].iter().position(|&h| h == b.node_hash))
+            .collect::<Option<_>>()?;
+        let at: Vec<(Vec3, Quat)> = nodes[..n]
+            .iter()
+            .map(|m| {
+                let (_, q, t) = m.to_scale_rotation_translation();
+                (t, q.normalize())
+            })
+            .collect();
+        let groups = r::InteractionGroups::new(
+            RAGDOLL,
+            r::Group::ALL.difference(RAGDOLL),
+            r::InteractionTestMode::And,
+        );
+        let mut bodies: Vec<Option<r::RigidBodyHandle>> = vec![None; n];
+        let mut handles = Vec::with_capacity(doll.bones.len());
+        for (bone, &node) in doll.bones.iter().zip(&node_of) {
+            let (p, q) = at[node];
+            let body = self.world.insert_body(
+                r::RigidBodyBuilder::dynamic()
+                    .pose(pose(p, q))
+                    .linvel(vector(velocity))
+                    .angular_damping(bone.angular_damping)
+                    .ccd_enabled(true),
+            );
+            let (place, turn) = bone.shape_place;
+            let place = Vec3::from(place);
+            let turn = Quat::from_array(turn).normalize();
+            let shape = match bone.shape {
+                Some(BoneShape::Capsule { radius, a, b }) => {
+                    r::ColliderBuilder::capsule_from_endpoints(
+                        vector(place + turn * Vec3::from(a)),
+                        vector(place + turn * Vec3::from(b)),
+                        radius,
+                    )
+                }
+                Some(BoneShape::Box { half_extents: h }) => {
+                    r::ColliderBuilder::cuboid(h[0], h[1], h[2]).position(pose(place, turn))
+                }
+                None => r::ColliderBuilder::ball(0.05).translation(vector(place)),
+            };
+            insert_collider(
+                &mut self.world,
+                shape
+                    .mass(bone.mass)
+                    .friction(bone.friction)
+                    .collision_groups(groups),
+                Some(body),
+            );
+            bodies[node] = Some(body);
+            handles.push(body);
+        }
+        let bind = |b: usize| Mat4::from_cols_array(&doll.bones[b].bind);
+        let mut joints = Vec::new();
+        let mut joint_handles = Vec::new();
+        for j in &doll.joints {
+            // The holding bone (the joint's owner) and the one it holds to.
+            let (owner, other) = (j.bone, j.other);
+            let pivot = Vec3::from(j.pivot);
+            let (first, second) = match j.limits {
+                JointLimits::Hinge { axis, .. } => (Vec3::from(axis), Vec3::ZERO),
+                JointLimits::Ragdoll { axes, .. } => (Vec3::from(axes[0]), Vec3::from(axes[1])),
+            };
+            let x = first.normalize_or(Vec3::X);
+            let y = (second - x * second.dot(x)).normalize_or(x.any_orthonormal_vector());
+            let frame = Quat::from_mat3(&m2_math::glam::Mat3::from_cols(x, y, x.cross(y)));
+            // The owner's frame in the other bone's space, as bound.
+            let rel = bind(other).inverse() * bind(owner);
+            let (_, rel_q, _) = rel.to_scale_rotation_translation();
+            let anchor = rel.transform_point3(pivot);
+            let rad = |v: f32| v.to_radians();
+            let joint = match j.limits {
+                JointLimits::Hinge {
+                    min, max, limited, ..
+                } => {
+                    let b = r::GenericJointBuilder::new(r::JointAxesMask::LOCKED_REVOLUTE_AXES);
+                    if limited {
+                        b.limits(r::JointAxis::AngX, [rad(min), rad(max)])
+                    } else {
+                        b
+                    }
+                }
+                JointLimits::Ragdoll {
+                    twist, cone, plane, ..
+                } => r::GenericJointBuilder::new(r::JointAxesMask::LOCKED_SPHERICAL_AXES)
+                    .limits(r::JointAxis::AngX, [rad(twist.0), rad(twist.1)])
+                    .limits(r::JointAxis::AngY, [rad(plane.0), rad(plane.1)])
+                    .limits(r::JointAxis::AngZ, [rad(cone.0), rad(cone.1)]),
+            }
+            .local_frame1(pose(anchor, (rel_q * frame).normalize()))
+            .local_frame2(pose(pivot, frame))
+            .contacts_enabled(false);
+            joint_handles.push(self.world.insert_impulse_joint(
+                handles[other],
+                handles[owner],
+                joint,
+            ));
+            joints.push((node_of[owner], node_of[other], anchor));
+        }
+        let locals = (0..n)
+            .map(|i| match parents[i].filter(|&p| p < n) {
+                Some(p) => nodes[p].inverse() * nodes[i],
+                None => nodes[i],
+            })
+            .collect();
+        // Nodes with no body above any body (the root) go with the
+        // hips' body, as they stood.
+        let hips = node_of[doll
+            .bones
+            .iter()
+            .position(|b| b.parent.is_none())
+            .unwrap_or(0)];
+        let limb = Mat4::from_rotation_translation(at[hips].1, at[hips].0);
+        let roots = (0..n)
+            .filter(|&i| parents[i].is_none_or(|p| p >= n) && bodies[i].is_none())
+            .map(|i| (i, hips, limb.inverse() * nodes[i]))
+            .collect();
+        self.ragdolls.push(Some(Ragdoll {
+            parents: parents[..n].to_vec(),
+            locals,
+            bodies,
+            roots,
+            joints,
+            joint_handles,
+        }));
+        Some(RagdollId(self.ragdolls.len() - 1))
+    }
+
+    /// The limits of ragdoll `id`'s joints, radians, about each joint's
+    /// first, second and third axis (`None` where free), in the order of
+    /// the game's joints; empty for a ragdoll built from the skeleton.
+    pub fn ragdoll_joint_limits(&self, id: RagdollId) -> Option<Vec<[Option<[f32; 2]>; 3]>> {
+        let doll = self.ragdolls.get(id.0)?.as_ref()?;
+        Some(
+            doll.joint_handles
+                .iter()
+                .filter_map(|&h| {
+                    let j = &self.world.impulse_joints.get(h)?.data;
+                    let l = |a| j.limits(a).map(|l| [l.min, l.max]);
+                    Some([
+                        l(r::JointAxis::AngX),
+                        l(r::JointAxis::AngY),
+                        l(r::JointAxis::AngZ),
+                    ])
+                })
+                .collect(),
+        )
+    }
+
+    /// The masses of ragdoll `id`'s bodies, kg, by the nodes they sit on;
+    /// `None` once removed.
+    pub fn ragdoll_masses(&self, id: RagdollId) -> Option<Vec<(usize, f32)>> {
+        let doll = self.ragdolls.get(id.0)?.as_ref()?;
+        Some(
+            doll.bodies
+                .iter()
+                .enumerate()
+                .filter_map(|(i, h)| Some((i, self.world.bodies.get((*h)?)?.mass())))
+                .collect(),
+        )
+    }
+
     /// Lets a skeleton go limp: `parents` and `nodes` (world space, as
     /// posed when it went) give its bones, and every limb starts moving at
     /// `velocity`. Limbs are capsules along bones from
@@ -6209,6 +6436,7 @@ impl Physics {
             bodies,
             roots,
             joints,
+            joint_handles: Vec::new(),
         }));
         RagdollId(self.ragdolls.len() - 1)
     }
