@@ -747,8 +747,13 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
 
     let pg = lib("Pg")?;
     add(&pg, "Rumble", |w, _, a| {
+        // From the 360 code (`lua_Pg_Rumble`, 0x82338D70): the rumble
+        // queue's record (0x82206860) takes the second argument as its
+        // seconds (0.25 without one); the pad's reader (0x8226F070) takes
+        // that as the shake's length, and the third argument (1.0 without
+        // one) is not read.
         if let Some(guid) = id(a.first()) {
-            let seconds = num(a.get(1)).unwrap_or(0.0);
+            let seconds = num(a.get(1)).unwrap_or(0.25);
             w.commands
                 .push(Command::Hijack(HijackCommand::Rumble { guid, seconds }));
         }

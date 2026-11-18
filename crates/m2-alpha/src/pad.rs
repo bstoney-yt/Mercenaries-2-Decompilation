@@ -392,8 +392,9 @@ pub struct Pad {
     /// The pause menu's Vibration (`gameRumbleVar`): off, [`Pad::rumble`]
     /// shakes nothing.
     pub rumble_on: bool,
-    /// Seconds of shaking left ([`Pad::rumble`]).
-    shaking: f64,
+    /// The shakes going: seconds since each began and its length
+    /// ([`Pad::rumble`]).
+    shakes: Vec<(f64, f64)>,
     /// The left stick's pushes up and down step a menu as the d-pad
     /// does ([`Pad::stick_steps`]): set while a dialog box is up.
     pub stick_menu: bool,
@@ -412,33 +413,38 @@ pub struct Pad {
     captured: Option<Button>,
 }
 
-/// How hard the motors run while the scripts shake the pad, left (heavy)
-/// and right (light), 0 to 1 (invented: `Pg.Rumble` names only who and
-/// for how long).
-pub const RUMBLE: [f32; 2] = [0.6, 0.6];
-
 impl Pad {
-    /// The scripts shake the player's pad for `seconds` (`Pg.Rumble`, the
-    /// hijack scripts' failed press: 0.3 s and 1 s); a longer shake
-    /// already going keeps going.
+    /// Shakes the player's pad for `seconds` (the rumble queue:
+    /// `Pg.Rumble`, the hijack scripts' failed press; a fall's impact).
     pub fn rumble(&mut self, seconds: f64) {
         if self.rumble_on && seconds > 0.0 {
-            self.shaking = self.shaking.max(seconds);
+            self.shakes.push((0.0, seconds));
         }
     }
 
-    /// The motors' speeds for the next `dt` seconds, and the shake's
-    /// count down: [`RUMBLE`] while shaking, else stopped.
+    /// The motors' speeds, left and right, for the next `dt` seconds.
+    ///
+    /// From the 360 code (the pad's rumble update 0x8226EB18, each shake
+    /// made by 0x8226F070): every shake runs while its time is no more
+    /// than its length, each motor by a curve of `t`, its time over its
+    /// length, held to 0..1, the strongest of the shakes going taken:
+    /// the left `t - t^2` (0 at either end, 0.25 halfway), the right
+    /// `1 - t + t^2` (1 at either end, 0.75 halfway).
     fn shake(&mut self, dt: f64) -> [f32; 2] {
         if !self.rumble_on {
-            self.shaking = 0.0;
+            self.shakes.clear();
         }
-        if self.shaking > 0.0 {
-            self.shaking = (self.shaking - dt).max(0.0);
-            RUMBLE
-        } else {
-            [0.0; 2]
+        let mut out = [0.0f32; 2];
+        for (at, length) in &self.shakes {
+            let t = (*at / *length) as f32;
+            out[0] = out[0].max((t - t * t).clamp(0.0, 1.0));
+            out[1] = out[1].max((1.0 - t + t * t).clamp(0.0, 1.0));
         }
+        for s in &mut self.shakes {
+            s.0 += dt;
+        }
+        self.shakes.retain(|s| s.0 <= s.1);
+        out
     }
     /// Reads the pad and feeds `input` (a no-op without one). `mode`
     /// picks the layout; `dt` is the seconds since the last read. Answers
@@ -865,13 +871,19 @@ mod tests {
         p.rumble(1.0);
         assert_eq!(p.shake(0.1), [0.0; 2]);
         p.rumble_on = true;
-        p.rumble(0.3);
+        // A deadly fall's second: the left motor rises to a quarter
+        // halfway and falls off, the right runs full at the ends and
+        // three quarters halfway; then it is over.
         p.rumble(1.0);
-        p.rumble(0.3);
-        for _ in 0..4 {
-            assert_eq!(p.shake(0.25), RUMBLE);
-        }
-        assert_eq!(p.shake(0.25), [0.0; 2]);
+        assert_eq!(p.shake(0.5), [0.0, 1.0]);
+        assert_eq!(p.shake(0.5), [0.25, 0.75]);
+        assert_eq!(p.shake(0.5), [0.0, 1.0]);
+        assert_eq!(p.shake(0.5), [0.0; 2]);
+        // Two at once: the strongest of each.
+        p.rumble(1.0);
+        p.rumble(0.15);
+        assert_eq!(p.shake(0.5), [0.0, 1.0]);
+        assert_eq!(p.shake(0.1), [0.25, 0.75]);
         p.rumble(1.0);
         p.rumble_on = false;
         assert_eq!(p.shake(0.1), [0.0; 2]);

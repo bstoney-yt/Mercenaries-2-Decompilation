@@ -147,8 +147,8 @@ impl RideHijack {
             _ => None,
         });
         let (going, rumble) = self.step(mission, commands, alongside);
-        if let Some(s) = rumble {
-            game.rumble = game.rumble.max(s);
+        if let Some(r) = rumble {
+            game.rumble.push(r);
         }
         going
     }
