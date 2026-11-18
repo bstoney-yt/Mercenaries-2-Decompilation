@@ -470,6 +470,18 @@ fn cue_record<'t>(
     }
 }
 
+/// Whether an object's cue loops: as its cue data says (a cue list
+/// entry's negative seconds, [`KeySounds::looped`]); for a cue
+/// no cue list entry covers, as its name says ([`named_loop`], inferred).
+/// From the 360 code: the cue starts in the sound middleware
+/// (0x82366AC0 -> 0x82366D10 -> 0x828316F8, with its end callback
+/// 0x823667A0), which plays it as its data says; neither the request
+/// (0x82340F08) nor the pump (0x8235ED50, 0x8236C0D8, 0x8236C1F0) carries
+/// a loop flag of its own.
+fn object_cue_loops(found: &KeySounds, cue: &str) -> bool {
+    found.looped.unwrap_or_else(|| named_loop(cue))
+}
+
 /// Whether a cue's name says it loops (`ui_SatDes_BG_Loop`,
 /// `sfx_survival_lp`), for cues the cue list doesn't flag. Inferred from
 /// the names.
@@ -1668,8 +1680,8 @@ impl GameAudio {
     /// with it ([`follow_objects`](Self::follow_objects)): the scripts'
     /// `Sound.CueSound(object, cue)` (the 360's 0x82340F08 -> queue
     /// 0x83224D60 -> 0x8235ED50, which starts the cue on the object). A
-    /// cue is found as the world's sound keys are (by its name's hash);
-    /// one whose name says it loops loops ([`named_loop`]; inferred). A
+    /// cue is found as the world's sound keys are (by its name's hash),
+    /// and loops as its cue data says ([`object_cue_loops`]). A
     /// cue started again on the same object stops its last start first,
     /// as a cue plays once per emitter.
     pub fn object_sound(&mut self, guid: u32, cue: &str, at: Vec3, stop: bool) {
@@ -1706,7 +1718,7 @@ impl GameAudio {
         if let Some(f) = found.falloff {
             play = play.falloff(f);
         }
-        if named_loop(cue) {
+        if object_cue_loops(&found, cue) {
             play = play.looped();
         }
         let voice = self.out.with(|m| m.play(play));
@@ -1714,7 +1726,11 @@ impl GameAudio {
     }
 
     /// Moves each sound playing on an object to where `at` says it is;
-    /// a sound whose object is gone stops. Those whose cue was not read
+    /// a sound whose object is gone stops. From the 360 code: each
+    /// frame 0x823667B8 moves an emitter's voices to its object's place
+    /// in the frame's list of objects, and stops them all
+    /// (0x82366C28(emitter, 0, 0, 1)) when its object isn't in that list
+    /// (destroyed, or streamed out). Those whose cue was not read
     /// when cued start once it is.
     pub fn follow_objects(&mut self, at: impl Fn(u32) -> Option<Vec3>) {
         let waiting: Vec<(u32, u32)> = self
@@ -1735,6 +1751,9 @@ impl GameAudio {
                 };
                 if let Some(f) = found.falloff {
                     play = play.falloff(f);
+                }
+                if found.looped == Some(true) {
+                    play = play.looped();
                 }
                 let voice = self.out.with(|m| m.play(play));
                 self.on_objects.insert((guid, key), Some(voice));
@@ -3577,6 +3596,23 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn an_object_cue_loops_as_its_cue_says_else_as_its_name_does() {
+        let cue = |looped| KeySounds {
+            looped,
+            ..Default::default()
+        };
+        // Its cue list entry says, whatever the name.
+        assert!(object_cue_loops(
+            &cue(Some(true)),
+            "wpn_bomb_timer_01_armed"
+        ));
+        assert!(!object_cue_loops(&cue(Some(false)), "sfx_alarm_lp"));
+        // No entry: the name.
+        assert!(object_cue_loops(&cue(None), "sfx_alarm_lp"));
+        assert!(!object_cue_loops(&cue(None), "wpn_bomb_timer_01_armed"));
+    }
 
     /// The grenade's blast as the data has it: set `701d113d`, whose
     /// only `Sounds` row is the create event's, cue `19152b89`.
