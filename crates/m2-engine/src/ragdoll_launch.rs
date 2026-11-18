@@ -11,10 +11,20 @@
 //!   and up to [`JITTER_UP`] up at random (0x824281C8).
 //! - **The launch** (the controller's vfunc +0x3C, 0x824282F8, called with
 //!   the controller's ragdoll flag cleared, so a limp body is launched
-//!   too): [`launch_velocity`], kept for [`LAUNCH_FRAMES`] updates
-//!   ([`Launch`]). The controller's update (0x82427D30) counts it down
-//!   while there is no ragdoll; at none left it is dropped, so a person who
-//!   does not go limp in time is not thrown.
+//!   too): [`launch_velocity`] ([`Launch`]).
+//! - **Only a live ragdoll is pushed** (the explosion action's update,
+//!   0x8215C560): each update of the blast's first [`BLAST_WINDOW`]
+//!   seconds (its +0x238, set to 1.0 by its constructor 0x8215C110), a
+//!   person not yet pushed is pushed if their ragdoll body is in the
+//!   physics world (its byte +0x130: set by the body's add to the world
+//!   0x821818D8, which the ragdoll's start 0x82427828 calls through vfunc
+//!   +0x1C, and cleared by its removal 0x821819E8, vfunc +0x20, from the
+//!   stop 0x824279F8), and a settings flag is off (byte +0xCD of the
+//!   options read by 0x822193D8 from the game's settings text, key hash
+//!   0xAD831DC7; 0 unless set there). A person whose ragdoll does not run
+//!   within the window is not thrown; one standing is not pushed at all.
+//!   The controller then keeps the launch for [`LAUNCH_FRAMES`] updates
+//!   (0x82427D30); here it is taken the update the ragdoll runs.
 //! - **The throw** (0x82428910, once the ragdoll runs): the bone whose
 //!   body is nearest the point is the struck one and the point moves onto
 //!   it; each bone takes `v * f * mass * `[`BONE_SHARE`], at most
@@ -35,8 +45,11 @@ pub const LAUNCH_SCALE: f32 = 1.5;
 pub const LAUNCH_MAX: f32 = 120.0;
 /// The least share of the launch along her up (50 x 0.01, 0x82DE4B10).
 pub const UP_SHARE: f32 = 0.5;
-/// Updates the launch waits for the ragdoll (+0x1D8 = 4).
+/// Updates the controller keeps a launch for its ragdoll (+0x1D8 = 4).
 pub const LAUNCH_FRAMES: u32 = 4;
+/// How long a blast pushes the people whose ragdolls run, seconds (its
+/// +0x238, 0x8215C110).
+pub const BLAST_WINDOW: f32 = 1.0;
 /// Each bone's share of the launch (0x820BB468).
 pub const BONE_SHARE: f32 = 0.1;
 /// The struck bone's factor (0x82DE4B18).
@@ -124,13 +137,15 @@ pub fn heavy_gravity(elapsed: f32) -> f32 {
     (1.0 - s2) * HEAVY_START + HEAVY_END * s2
 }
 
-/// A launch waiting for the person's ragdoll (the controller's +0x1BC
-/// velocity, +0x1C8 point, +0x1D8 updates left).
+/// A blast's launch waiting for the person's ragdoll to run: given it
+/// within the blast's [`BLAST_WINDOW`] (0x8215C560), as the controller's
+/// +0x1BC velocity and +0x1C8 point.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Launch {
     pub velocity: Vec3,
     pub point: Vec3,
-    pub frames: u32,
+    /// Seconds of the blast's window left.
+    pub left: f32,
 }
 
 impl Launch {
@@ -139,14 +154,15 @@ impl Launch {
         Self {
             velocity: launch_velocity(impulse, up),
             point: impulse.point,
-            frames: LAUNCH_FRAMES,
+            left: BLAST_WINDOW,
         }
     }
 
-    /// One update without a ragdoll: false once none is left (dropped).
-    pub fn wait(&mut self) -> bool {
-        self.frames = self.frames.saturating_sub(1);
-        self.frames > 0
+    /// An update of `dt` seconds without a ragdoll: false once the
+    /// blast's window has passed (dropped).
+    pub fn wait(&mut self, dt: f32) -> bool {
+        self.left -= dt;
+        self.left > 0.0
     }
 }
 
@@ -221,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn a_launch_waits_four_updates() {
+    fn a_launch_waits_out_the_blasts_second() {
         let mut l = Launch::new(
             &Impulse {
                 magnitude: 10.0,
@@ -230,7 +246,9 @@ mod tests {
             },
             Vec3::Y,
         );
-        assert!(l.wait() && l.wait() && l.wait());
-        assert!(!l.wait());
+        // The blast's second: three quarter-second updates wait, the
+        // fourth drops it.
+        assert!(l.wait(0.25) && l.wait(0.25) && l.wait(0.25));
+        assert!(!l.wait(0.25));
     }
 }
