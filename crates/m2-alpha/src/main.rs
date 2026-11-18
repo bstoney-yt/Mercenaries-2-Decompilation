@@ -63,6 +63,7 @@ mod cheats;
 mod combat;
 mod config;
 mod coop;
+mod death;
 mod destruct;
 mod disguise;
 mod display;
@@ -314,6 +315,9 @@ struct Options {
     gravity_check: bool,
     /// `--stagger-check`: her stagger's exemptions ([`stagger_check`]).
     stagger_check: bool,
+    /// `--disguise-check`: her vehicle disguise and a run-over
+    /// ([`disguise_check`]).
+    disguise_check: bool,
     /// With `--screenshot` on foot: hits she takes just before the
     /// picture, from these directions (degrees clockwise from where the
     /// camera looks), to see the HUD's hit arcs.
@@ -446,6 +450,16 @@ struct Options {
     /// `ObjectState.SendDamage`; `nodedamage` lines log its health before
     /// and after and the message the node took.
     check_node_damage: Option<f32>,
+    /// `--check-building-damage <s>` with `--screenshot`: that many
+    /// seconds into play, the scripts' object nearest her (not a vehicle)
+    /// whose template gives node health has every node sent a share of 1,
+    /// one at a time, until it is destroyed; `buildingdamage` lines log
+    /// its node and object health and whether it was.
+    check_building_damage: Option<f32>,
+    /// `--part-destroy-check`: the island fortress's nodes destroyed by
+    /// the scripts, each part's `DestroyMsg` through its state machine
+    /// ([`mission::PartDestroyCheck`]).
+    part_destroy_check: bool,
     /// `--check-shots <s>,<s>...` with `--screenshot` on foot: the scene
     /// is pictured at those seconds in too (`<out>-at<s>.ppm`).
     check_shots: Vec<f32>,
@@ -521,12 +535,19 @@ struct Options {
     /// by an RPG and, should it stand, run into by a jeep; logs
     /// `mine-check:` lines ([`mines::MineCheck`]).
     mine_check: bool,
+    /// `--object-sound-check`: her C4 put down in the mission, its
+    /// object-attached beep logged ([`mission::ObjectSoundCheck`]).
+    object_sound_check: bool,
     /// `--impact-check`: rounds struck into the ground round her, by
     /// surface ([`impact_check`]).
     impact_check: bool,
     /// With `--board`: the entrance she stands at, by name or hash
     /// (`entrance_driver`, `8efe45f3`); else the front right one.
     entrance: Option<u32>,
+    /// `--seat-check`: as `--board`, by the first gunner's seat's own
+    /// entrance of the nearest vehicle that has one; logs the seat she
+    /// sits in and its turret camera record.
+    seat_check: bool,
     /// With `--board`: how far out from the entrance she is put, metres
     /// (0.6 when not given; further, off a boat, she swims).
     board_off: Option<f32>,
@@ -584,6 +605,10 @@ struct Options {
     /// With `--mission --screenshot`: her health drops to this eight
     /// seconds in, to see the scripts' healing and survival rescue.
     hurt: Option<f32>,
+    /// `--death-check`: lethal damage dealt her until she dies, then her
+    /// death through the scripts to their revive logged (`death-check:`
+    /// lines, [`DeathCheck`]).
+    death_check: bool,
     /// With `--mission`: driving, the horn is held half a second every
     /// this many seconds (to hear it, and what the gates, the disguise
     /// and friendly soldiers make of it).
@@ -903,9 +928,21 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--seated" => o.seated = true,
             "--board" => o.board = true,
+            // Needs no `--drive`: it runs where `--board` does.
+            "--seat-check" => {
+                o.drive = true;
+                o.board = true;
+                o.seat_check = true;
+                // The M151 unless `--vehicle` names another (either order).
+                o.vehicle.get_or_insert_with(|| "m151".to_owned());
+            }
             "--swim-check" => o.swim_check = true,
             "--mine-check" => {
                 o.mine_check = true;
+                o.mission = true;
+            }
+            "--object-sound-check" => {
+                o.object_sound_check = true;
                 o.mission = true;
             }
             "--impact-check" => {
@@ -1072,6 +1109,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.drive = true;
             }
             "--stagger-check" => o.stagger_check = true,
+            "--disguise-check" => o.disguise_check = true,
             "--look-pickup" => {
                 o.look_pickup = Some(value()?.parse().context("--look-pickup expects metres")?)
             }
@@ -1085,12 +1123,27 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--autoplay" => o.autoplay = true,
             "--smarter-ai" => o.smarter_ai = true,
             "--hurt" => o.hurt = Some(value()?.parse().context("--hurt expects health")?),
+            "--death-check" => {
+                o.death_check = true;
+                o.mission = true;
+            }
             "--honk-every" => {
                 o.honk_every = Some(value()?.parse().context("--honk-every expects seconds")?)
             }
             "--gates" => o.gates = true,
             "--marker-test" => o.marker_test = true,
             "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
+            "--part-destroy-check" => {
+                o.part_destroy_check = true;
+                o.mission = true;
+            }
+            "--check-building-damage" => {
+                o.check_building_damage = Some(
+                    value()?
+                        .parse()
+                        .context("--check-building-damage expects seconds")?,
+                )
+            }
             "--check-node-damage" => {
                 o.check_node_damage = Some(
                     value()?
@@ -1264,6 +1317,89 @@ fn keep_crash_reports() {
 /// When `--hurt` takes her health: after the start's fade, which keeps her
 /// from harm.
 const HURT_AT: f32 = 8.0;
+
+/// `--death-check`: from [`HURT_AT`] on, lethal damage is dealt her each
+/// [`DEATH_HIT_EVERY`] s until she dies (the scripts' health clamp turns
+/// the first into their survival rescue; with it off, the next kills).
+/// Then it waits up to [`DEATH_WAIT`] s for the scripts' revive (their
+/// `PlayerDied` -> `MoveToSickbay` -> `Object.Revive`). Logs
+/// `death-check: PASS died at T s, revived at T2 s with H health at P`,
+/// else `FAIL <why>`.
+#[derive(Debug, Default)]
+struct DeathCheck {
+    t: f32,
+    next_hit: f32,
+    hits: u32,
+    died_at: Option<f32>,
+    answered: bool,
+    done: bool,
+}
+
+const DEATH_HIT_EVERY: f32 = 3.0;
+const DEATH_HITS: u32 = 10;
+const DEATH_WAIT: f32 = 90.0;
+
+impl DeathCheck {
+    fn tick(&mut self, game: &mut Game, dt: f32) {
+        if self.done {
+            return;
+        }
+        self.t += dt;
+        if self.t < HURT_AT {
+            return;
+        }
+        let c = &game.combat;
+        match self.died_at {
+            None if c.down > 0.0 && c.hp < crate::death::DEATH_BELOW => {
+                self.died_at = Some(self.t);
+                eprintln!(
+                    "death-check: she died at {:.1} s after {} hits",
+                    self.t, self.hits
+                );
+            }
+            None if self.hits >= DEATH_HITS && self.t >= self.next_hit => {
+                self.done = true;
+                eprintln!(
+                    "death-check: FAIL {DEATH_HITS} lethal hits and she lives ({:.1} health, clamp {})",
+                    c.hp, c.health_clamp
+                );
+            }
+            None if self.t >= self.next_hit => {
+                self.hits += 1;
+                self.next_hit = self.t + DEATH_HIT_EVERY;
+                eprintln!(
+                    "death-check: lethal hit {} (health {:.1}, clamp {})",
+                    self.hits, c.hp, c.health_clamp
+                );
+                game.combat.pending_hurt.push(1.0e6);
+            }
+            Some(at)
+                if c.down <= 0.0
+                    && c.hp >= crate::death::DEATH_BELOW
+                    && c.revived_by_scripts == Some(false) =>
+            {
+                self.done = true;
+                eprintln!(
+                    "death-check: FAIL died at {at:.1} s, stood up at {:.1} s by the alpha's own fallback, not the scripts' revive",
+                    self.t
+                );
+            }
+            Some(at) if c.down <= 0.0 && c.hp >= crate::death::DEATH_BELOW => {
+                self.done = true;
+                let her = game.focus();
+                eprintln!(
+                    "death-check: PASS died at {at:.1} s, revived at {:.1} s with {:.1} health at {her:.0}",
+                    self.t, c.hp
+                );
+            }
+            Some(at) if self.t - at > DEATH_WAIT => {
+                self.done = true;
+                eprintln!("death-check: FAIL died at {at:.1} s, no revive in {DEATH_WAIT} s");
+            }
+            _ => {}
+        }
+    }
+}
 
 /// With `--mission --hijack`, how long an action marker's vehicle is left
 /// before she hijacks it, seconds: the villa tank comes through the hall
@@ -2413,6 +2549,8 @@ fn screenshot(
         )?;
     } else if options.stagger_check && game.on_foot && game.scene.player.is_some() {
         stagger_check(&mut game);
+    } else if options.disguise_check {
+        disguise_check();
     } else if options.shuffle_test && game.on_foot && game.scene.player.is_some() {
         shuffle_test(&mut game);
     } else if options.fight && game.on_foot && game.scene.player.is_some() {
@@ -4520,8 +4658,13 @@ fn mission_for_screenshot(
         .with_script_join(options.script_join)
         .with_skip_to(options.skip_to.clone())
         .with_job_near(options.job_near)
-        .with_mine_check(options.mine_check);
+        .with_mine_check(options.mine_check)
+        .with_object_sound_check(options.object_sound_check);
     link.check_node_damage = options.check_node_damage;
+    link.check_building_damage = options.check_building_damage;
+    if options.part_destroy_check {
+        link.part_destroy_check = Some(mission::PartDestroyCheck::default());
+    }
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
@@ -4658,6 +4801,7 @@ fn mission_for_screenshot(
     let (mut hijack_running, mut hijack_shots) = (0.0f32, 0u32);
     let mut action_since: Option<u32> = None;
     let mut placed_tried = std::collections::HashSet::new();
+    let mut death_check = options.death_check.then(DeathCheck::default);
     // Seconds she has been where --props-check hits the props.
     let mut props_ready = 0.0;
     let mut shop_check = options.shop_check.clone().map(shopcheck::ShopCheck::new);
@@ -4798,8 +4942,32 @@ fn mission_for_screenshot(
         if let Some(hp) = options.hurt
             && i == (HURT_AT / tick).round() as u32
         {
-            eprintln!("hurt: her health {:.1} -> {hp:.1}", game.combat.hp);
-            game.combat.hp = hp;
+            // Through the health change, as a hit's damage (her floor, the
+            // scripts' clamp and her death apply), not set outright.
+            let damage = (game.combat.hp - hp).max(0.0);
+            eprintln!(
+                "hurt: {damage:.1} to deal her ({:.1} -> {hp:.1})",
+                game.combat.hp
+            );
+            game.combat.pending_hurt.push(damage);
+        }
+        if let Some(c) = &mut death_check {
+            c.tick(game, tick);
+            // Her death cancels the contract under way (`PlayerDied`:
+            // `mission:Cancel()`), whose fanfare waits for her answer;
+            // Continue (not Retry) ends it (`MrxTaskContract`'s end,
+            // 2f0b1589 line 560: no retry, her character dead) in
+            // `MrxPlayer.MoveToSickbay`. 3 s on it is answered so.
+            if c.died_at.is_some_and(|at| c.t >= at + 3.0)
+                && !c.answered
+                && let Some(seq) = link.waiting_fanfare()
+            {
+                c.answered = true;
+                eprintln!(
+                    "death-check: she takes Continue on the failed contract's fanfare (HUD call {seq})"
+                );
+                link.answer_fanfare(seq, false);
+            }
         }
         // With --support she throws the marker the scripts hand her.
         let mut intent = intent;
@@ -5081,6 +5249,23 @@ fn mission_for_screenshot(
         lap.mark("loop: before the step");
         spans::time("game", || game.step(intent, tick));
         spans::time("scripts", || link.tick(game, tick));
+        // `--part-destroy-check`'s pictures of the fortress, from above
+        // and off its side.
+        let shots = (link.part_destroy_check.as_mut()).map_or_else(Vec::new, |c| c.take_shots());
+        for (name, at) in shots {
+            let eye = at + m2_math::glam::Vec3::new(70.0, 45.0, 30.0);
+            delivery_picture(
+                backend,
+                game,
+                fov,
+                aspect,
+                at,
+                at,
+                Some(eye),
+                &picture(format!("fortress-{name}")),
+            )?;
+            eprintln!("part-destroy-check: pictured the fortress {name}");
+        }
         if let Some(audio) = &mut audio {
             spans::time("sound", || {
                 mission_sounds(audio, &mut link);
@@ -6126,6 +6311,11 @@ fn mission_for_screenshot(
             rows.join(", ")
         );
     }
+    // A `--part-destroy-check` that never passed or failed fails here,
+    // naming the step it was waiting on.
+    if let Some(c) = link.part_destroy_check.as_mut() {
+        c.finish();
+    }
     if auto.is_some() {
         link.log_recruits("at the end");
     }
@@ -7144,6 +7334,80 @@ fn stagger_check(game: &mut Game) {
     eprintln!("stagger-check: {}", if all { "PASS" } else { "FAIL" });
 }
 
+/// `--disguise-check`: her vehicle disguise against a run-over, on the
+/// game's own people and disguise code, offscreen: disguised as the VZ in
+/// their vehicle (scene vehicle 0), the car hits a passer-by of no
+/// faction at 10 m/s ([`crate::npc::People::traffic`]); the hit is
+/// counted for the vehicle she rides and gives the disguise away
+/// ([`crate::npc::VEHICLE_HIT_GIVES_AWAY`], 0x82445938). Control: a
+/// parked car hits nobody and the disguise holds. Prints a line each and
+/// PASS or FAIL.
+fn disguise_check() -> bool {
+    use crate::disguise::{Disguise, Tick};
+    use crate::npc::{Brain, Npc, People};
+    use m2_math::glam::{Mat4, Vec3};
+    let bounds = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.5, 2.0));
+    let run = |speed: f32| -> (bool, bool) {
+        let mut people = People::default();
+        let mut n = Npc::new(
+            0,
+            &crate::npc::empty_rig(),
+            Vec3::new(0.3, 0.0, 1.5),
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(9),
+        );
+        n.landed = true;
+        n.soldier = false;
+        n.faction = None;
+        people.npcs.push(n);
+        people.traffic(
+            &[(Mat4::IDENTITY, Vec3::new(0.0, 0.0, speed), bounds, 1500.0)],
+            None,
+        );
+        let ran_over = people.vehicle_hits.contains(&0);
+        let mut d = Disguise::default();
+        let tick = |hurt| Tick {
+            enabled: true,
+            vehicle: Some(0),
+            faction: Some("Vza"),
+            honks: 0,
+            near: 0,
+            hurt_someone: hurt,
+        };
+        d.update(tick(false), 1.0 / 60.0);
+        let holds = d.update(tick(ran_over), 1.0 / 60.0).is_some_and(|(_, h)| h);
+        (ran_over, holds)
+    };
+    let mut all = true;
+    for (what, speed, want_hit, want_holds) in [
+        (
+            "disguised in a VZ jeep at 10 m/s into a passer-by",
+            10.0,
+            true,
+            false,
+        ),
+        (
+            "disguised in a VZ jeep, parked by a passer-by",
+            0.0,
+            false,
+            true,
+        ),
+    ] {
+        let (hit, holds) = run(speed);
+        let ok = hit == want_hit && holds == want_holds;
+        all &= ok;
+        eprintln!(
+            "disguise-check: {what}: {}, disguise {}: {}",
+            if hit { "hit" } else { "no hit" },
+            if holds { "holds" } else { "given away" },
+            if ok { "PASS" } else { "FAIL" }
+        );
+    }
+    eprintln!("disguise-check: {}", if all { "PASS" } else { "FAIL" });
+    all
+}
+
 fn homing_check(game: &mut Game, tick: f32) {
     use m2_math::glam::Vec3;
     let Some(world) = game.scene.world.as_ref() else {
@@ -7365,13 +7629,21 @@ fn drive_for_screenshot(
     for _ in 0..90 {
         game.step(Intent::default(), tick);
     }
-    // A vehicle asked for that isn't parked here: one is parked.
+    // A vehicle asked for that isn't parked here: one is parked. With
+    // `--seat-check` it must have a gunner's own entrance (the island's
+    // own M151 Softtop has none), so the start position doesn't matter.
     if let Some(want) = &options.vehicle {
-        let have = |game: &Game| {
-            game.scene.vehicles.iter().any(|v| {
-                v.id.is_some() && v.spec.label.to_ascii_lowercase().contains(want.as_str())
-            })
+        let fits = |v: &crate::scene::ParkedVehicle| {
+            v.id.is_some()
+                && v.spec.label.to_ascii_lowercase().contains(want.as_str())
+                && (!options.seat_check
+                    || v.spec
+                        .seating
+                        .as_deref()
+                        .and_then(m2_engine::seats::gunner_entrance)
+                        .is_some())
         };
+        let have = |game: &Game| game.scene.vehicles.iter().any(fits);
         if !have(game) {
             let models: Vec<m2_engine::CatalogueEntry> = game
                 .scene
@@ -7393,7 +7665,45 @@ fn drive_for_screenshot(
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            if !models.is_empty() {
+            if options.seat_check {
+                // One model at a time: the first parked has a gunner's
+                // entrance, or the next is tried (its seats come from the
+                // first of its model's templates that has any).
+                for m in models {
+                    let placed = |game: &Game| {
+                        game.scene
+                            .vehicles
+                            .iter()
+                            .filter(|v| v.id.is_some())
+                            .count()
+                    };
+                    let before = placed(game);
+                    let label = m.label.clone();
+                    game.park_more(vec![m]);
+                    let waited = Instant::now();
+                    while placed(game) == before && waited.elapsed() < Duration::from_secs(30) {
+                        game.step(Intent::default(), tick);
+                        render(backend, game, fov, aspect, None)?;
+                    }
+                    for _ in 0..90 {
+                        game.step(Intent::default(), tick);
+                    }
+                    let ok = have(game);
+                    eprintln!(
+                        "seat-check: parked {label}: {}",
+                        if placed(game) == before {
+                            "not placed in 30 s"
+                        } else if ok {
+                            "has a gunner's own entrance"
+                        } else {
+                            "no gunner's own entrance, trying the next"
+                        }
+                    );
+                    if ok {
+                        break;
+                    }
+                }
+            } else if !models.is_empty() {
                 game.park_more(models);
                 let waited = Instant::now();
                 while !have(game) && waited.elapsed() < Duration::from_secs(90) {
@@ -7425,7 +7735,7 @@ fn drive_for_screenshot(
         return Ok(());
     }
     if options.impact_check {
-        impact_check(game);
+        impact_check(game, tick);
         return Ok(());
     }
     if let Some(hold) = options.ladder_check {
@@ -7881,9 +8191,133 @@ fn drive_for_screenshot(
 /// exit the rules chose.
 fn board_for_check(game: &mut Game, options: &Options, tick: f32) -> anyhow::Result<()> {
     let Some((i, at)) = board_stand(game, options, tick) else {
+        if options.seat_check {
+            eprintln!("seat-check: FAIL no parked vehicle with a gunner's own entrance");
+            eprintln!("seat-check: RESULT FAIL");
+        }
         return Ok(());
     };
+    if options.seat_check {
+        seat_check(game, tick, i);
+        return Ok(());
+    }
     board_pressed(game, options, tick, i, at)
+}
+
+/// The M151's gunner's seat and its `CameraTurret` record, as the data
+/// and the 360 give them (#717's recipe): seat `1b217b8a`, 2.0 and 1.8
+/// rad/s, yaw -1.25..1.25, pitch -0.19..0.85, keeps 0.95/0.91 and
+/// 0.97/0.9.
+const M151_GUNNER: (u32, m2_engine::seats::SeatCamera) = (
+    0x1b21_7b8a,
+    m2_engine::seats::SeatCamera {
+        yaw_speed: 2.0,
+        pitch_speed: 1.8,
+        yaw: (-1.25, 1.25),
+        pitch: (-0.19, 0.85),
+        yaw_keep: [0.95, 0.91],
+        pitch_keep: [0.97, 0.9],
+    },
+);
+
+/// `--seat-check`, standing at vehicle `i`'s gunner's own entrance
+/// ([`board_stand`]): the use key with getting in locked, then unlocked;
+/// her seat, its turret and camera record; the use key with getting out
+/// locked, then unlocked. Prints `seat-check: PASS ...` or `FAIL ...` for
+/// each and `seat-check: RESULT PASS` when all pass.
+fn seat_check(game: &mut Game, tick: f32, i: usize) {
+    let mut ok = true;
+    let mut check = |pass: bool, what: String| {
+        ok &= pass;
+        eprintln!("seat-check: {} {what}", if pass { "PASS" } else { "FAIL" });
+    };
+    let use_key = Intent {
+        use_pressed: true,
+        ..Intent::default()
+    };
+    let label = game.scene.vehicles[i].spec.label.clone();
+    let seating = game.scene.vehicles[i].spec.seating.clone();
+    let Some((want, entrance)) = seating
+        .as_deref()
+        .and_then(m2_engine::seats::gunner_entrance)
+    else {
+        check(false, format!("the {label} has no gunner's own entrance"));
+        eprintln!("seat-check: RESULT FAIL");
+        return;
+    };
+    let seats = seating.as_deref().map_or(&[][..], |s| &s.seats[..]);
+    let want_seat = seats[want].clone();
+    let driving = |game: &Game| game.scene.player.as_ref().and_then(|p| p.driving);
+    // Waits up to `limit` seconds for `done`.
+    let wait = |game: &mut Game, limit: f32, done: &dyn Fn(&Game) -> bool| {
+        let mut t = 0.0;
+        while t < limit && !done(game) {
+            game.step(Intent::default(), tick);
+            t += tick;
+        }
+        done(game)
+    };
+    // Getting in locked (+0x44D clear): the use key seats her nowhere.
+    game.seat_locks = [false, true, true];
+    game.step(use_key, tick);
+    let held_out = !wait(game, 2.0, &|g| driving(g).is_some());
+    check(
+        held_out,
+        format!("enter lock: use at entrance {entrance:08x} with +0x44D clear leaves her out"),
+    );
+    // Unlocked: she gets in by the gunner's entrance, into the gunner's seat.
+    game.seat_locks = [true; 3];
+    game.step(use_key, tick);
+    let boarded = wait(game, 6.0, &|g| {
+        driving(g) == Some(i) && g.boarding.is_none()
+    });
+    let seat = game.ride.filter(|r| r.0 == i).map(|r| r.1);
+    check(
+        boarded && seat == Some(want_seat.name),
+        format!(
+            "boarded the {label} by entrance {entrance:08x}: seat {seat:08x?}, expected {:08x} ({:?})",
+            want_seat.name,
+            want_seat.role()
+        ),
+    );
+    check(
+        want_seat.role() == m2_engine::seats::Role::Gunner,
+        format!("seat {:08x} is a gunner's seat", want_seat.name),
+    );
+    eprintln!(
+        "seat-check: seat {:08x} turret {:08x?} camera {:?}",
+        want_seat.name, want_seat.turret, want_seat.camera
+    );
+    check(
+        want_seat.camera.is_some(),
+        format!("seat {:08x} has its CameraTurret record", want_seat.name),
+    );
+    if label.to_ascii_lowercase().contains("m151") {
+        check(
+            want_seat.name == M151_GUNNER.0 && want_seat.camera == Some(M151_GUNNER.1),
+            format!(
+                "M151 gunner seat {:08x} and camera match 1b217b8a, 2.0/1.8 rad/s, yaw -1.25..1.25, pitch -0.19..0.85",
+                want_seat.name
+            ),
+        );
+    }
+    // Getting out locked (+0x44E clear): the use key keeps her in.
+    game.seat_locks = [true, false, true];
+    game.step(use_key, tick);
+    let kept_in = !wait(game, 2.0, &|g| driving(g).is_none());
+    check(
+        kept_in,
+        "exit lock: use with +0x44E clear keeps her in".to_owned(),
+    );
+    // Unlocked: out.
+    game.seat_locks = [true; 3];
+    game.step(use_key, tick);
+    let out = wait(game, 6.0, &|g| driving(g).is_none() && g.boarding.is_none());
+    check(
+        out,
+        "exit: use with the locks clear gets her out".to_owned(),
+    );
+    eprintln!("seat-check: RESULT {}", if ok { "PASS" } else { "FAIL" });
 }
 
 /// `--board --seated`: as `--board`, with the clips of her getting in and
@@ -8006,6 +8440,14 @@ fn board_stand(
         .enumerate()
         .filter(|(_, v)| v.spec.label.to_ascii_lowercase().contains(want))
         .filter(|(_, v)| !v.spec.entrances.is_empty())
+        .filter(|(_, v)| {
+            !options.seat_check
+                || v.spec
+                    .seating
+                    .as_deref()
+                    .and_then(m2_engine::seats::gunner_entrance)
+                    .is_some()
+        })
         .filter_map(|(i, v)| {
             let at = world?.physics.vehicle_transform(v.id?)?;
             Some((i, at, at.transform_point3(Vec3::ZERO).distance(here)))
@@ -8016,8 +8458,24 @@ fn board_stand(
         return None;
     };
     let spec = &game.scene.vehicles[i].spec;
+    // `--seat-check`: the gunner's seat's own entrance.
+    let gunner = options
+        .seat_check
+        .then(|| {
+            spec.seating
+                .as_deref()
+                .and_then(m2_engine::seats::gunner_entrance)
+        })
+        .flatten();
+    if let (Some((seat, e)), Some(s)) = (gunner, spec.seating.as_deref()) {
+        eprintln!(
+            "seat-check: the {}: gunner's seat {:08x} by its entrance {e:08x}",
+            spec.label, s.seats[seat].name
+        );
+    }
     let right = options
         .entrance
+        .or(gunner.map(|g| g.1))
         .unwrap_or_else(|| m2_assets::name_hash("entrance_front_right"));
     let &(e, local) = spec
         .entrances
@@ -8139,6 +8597,23 @@ fn board_pressed(
         game.combat.seat,
         game.hud_info(None).driving.map(|d| d.0)
     );
+    if options.seat_check {
+        let v = &game.scene.vehicles[i];
+        let seat = game.ride.filter(|r| r.0 == i).and_then(|r| {
+            let s = v.spec.seating.as_deref()?;
+            s.seats.get(s.seat(r.1)?)
+        });
+        match seat {
+            Some(s) => eprintln!(
+                "seat-check: she sits in {:08x} ({:?}), aiming turret {:08x?}, its camera {:?}",
+                s.name,
+                s.role(),
+                s.turret,
+                s.camera
+            ),
+            None => eprintln!("seat-check: she sits in no seat of the {}", v.spec.label),
+        }
+    }
     // `--look`: the camera swung, and the turret her seat aims following
     // (to the end of its arc, at its pace).
     if options.look != 0.0 {
@@ -8383,7 +8858,7 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 /// own pick did (`by its own pick`); then the vehicles' crash cues the
 /// sound table gives for every pair of the scene's vehicles. For the
 /// impact tables (#684): grass, dirt and water are seldom struck in play.
-fn impact_check(game: &mut Game) {
+fn impact_check(game: &mut Game, tick: f32) {
     use m2_math::glam::Vec3;
     use std::collections::BTreeMap;
     let here = game.focus();
@@ -8438,6 +8913,99 @@ fn impact_check(game: &mut Game) {
         "impact-check: {} surface words met, {} decided by the table",
         by.len(),
         by.values().filter(|v| v.1 > 0).count()
+    );
+    car_into_car(game, tick);
+}
+
+/// `--impact-check`'s car-into-car hit: she takes the nearest land
+/// vehicle if she is at no wheel (waiting up to 30 s for the parked ones),
+/// then the car she drives is driven at
+/// 8 m/s into another vehicle (the first other one loaded, put 10 m ahead
+/// of it, still), 3 s. Logs `impact-check: car into car: the <a> into
+/// the <b>: N vehicle contacts heard` (the heard ones log their own
+/// `contact: the … met Vehicle(…)` lines).
+fn car_into_car(game: &mut Game, tick: f32) {
+    use m2_math::glam::{Vec2, Vec3};
+    // Not at a wheel (the recipe's default spawn, no `--spawn`): she takes
+    // the nearest land vehicle that stands, once the parked ones are in.
+    if game
+        .scene
+        .player
+        .as_ref()
+        .is_some_and(|p| p.driving.is_none())
+    {
+        for _ in 0..(30.0 / tick) as u32 {
+            if !game.scene.vehicles_loading() && game.parking_done() {
+                break;
+            }
+            game.step(crate::player::Intent::default(), tick);
+        }
+        let here = game.focus();
+        let pick = game.scene.world.as_ref().and_then(|world| {
+            (game.scene.vehicles.iter().enumerate())
+                .filter(|(_, v)| !v.wrecked && !v.spec.is_boat())
+                .filter_map(|(i, v)| {
+                    let at = world.physics.vehicle_transform(v.id?)?.w_axis.truncate();
+                    Some((i, at.distance(here)))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        });
+        if let (Some(i), Some(p)) = (pick, game.scene.player.as_mut()) {
+            p.driving = Some(i);
+            p.landed = true;
+            game.take_from_driver(i);
+            eprintln!(
+                "impact-check: car into car: she takes the {} (not at a wheel)",
+                game.scene.vehicles[i].spec.label
+            );
+        }
+    }
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("impact-check: car into car: FAIL she drives nothing (no land vehicle loaded)");
+        return;
+    };
+    let Some(j) = (0..game.scene.vehicles.len()).find(|&j| {
+        j != i && !game.scene.vehicles[j].wrecked && !game.scene.vehicles[j].spec.is_boat()
+    }) else {
+        eprintln!("impact-check: car into car: FAIL no other vehicle loaded");
+        return;
+    };
+    let (Some(world), Some(a)) = (game.scene.world.as_mut(), game.scene.vehicles[i].id) else {
+        return;
+    };
+    let Some(at) = world.physics.vehicle_transform(a) else {
+        return;
+    };
+    let ahead = at
+        .transform_vector3(Vec3::Z)
+        .with_y(0.0)
+        .normalize_or(Vec3::Z);
+    let yaw = ahead.x.atan2(ahead.z);
+    let spot = at.w_axis.truncate() + ahead * 10.0 + Vec3::Y * 0.5;
+    let v = &mut game.scene.vehicles[j];
+    if let Some(id) = v.id.take() {
+        world.physics.remove_vehicle(id);
+    }
+    v.id = Some(world.physics.add_vehicle(&v.spec, spot, yaw));
+    let before = game.combat.vehicle_contacts_heard;
+    for _ in 0..(3.0 / tick) as u32 {
+        let speed = game
+            .scene
+            .world
+            .as_ref()
+            .map_or(0.0, |w| w.physics.vehicle_speed(a));
+        let intent = crate::player::Intent {
+            movement: Vec2::new(0.0, if speed < 8.0 { 1.0 } else { 0.0 }),
+            ..crate::player::Intent::default()
+        };
+        game.step(intent, tick);
+    }
+    eprintln!(
+        "impact-check: car into car: the {} into the {}: {} vehicle contacts heard",
+        game.scene.vehicles[i].spec.label,
+        game.scene.vehicles[j].spec.label,
+        game.combat.vehicle_contacts_heard - before
     );
 }
 
@@ -11280,6 +11848,10 @@ fn mission_sounds(audio: &mut sound::GameAudio, m: &mut mission::MissionLink) {
             audio.ui_sound(&cue);
         }
     }
+    for (guid, cue, stop, at) in m.take_object_sounds() {
+        audio.object_sound(guid, &cue, at, stop);
+    }
+    audio.follow_objects(|g| m.object_at(g));
     if let Some(cue) = m.take_music() {
         audio.music_cue_at(cue.as_deref(), m.music_at());
     }
@@ -12036,5 +12608,14 @@ mod gravity_check_tests {
         let t = super::free_fall_seconds(20.0).unwrap();
         let want = (2.0 * 20.0 / m2_engine::physics::WORLD_GRAVITY).sqrt();
         assert!((t - want).abs() < 0.05, "{t} vs {want}");
+    }
+}
+
+#[cfg(test)]
+mod disguise_check_tests {
+    /// The `--disguise-check` cases pass on the game's own code.
+    #[test]
+    fn the_disguise_check_passes() {
+        assert!(super::disguise_check());
     }
 }

@@ -31,7 +31,9 @@
 //!   ([`Change::sent_off`]).
 //!
 //! **Inferred:** a machine starts in its `InitState`'s state (the part
-//! whole), told of no change; the random fraction is this module's own
+//! whole), told of no change, or in `InitState` itself when that sets no
+//! other state (from samples: the island fortress's `cf37044a`, which
+//! takes `DestroyMsg` there); the random fraction is this module's own
 //! (a fixed sequence per object, [`Runner::new`]'s `seed`), as the engine's
 //! generator (0x8215E260) isn't followed.
 
@@ -85,7 +87,15 @@ impl Runner {
                 name: m.node.map_or(0, &node_name),
                 states: m.states.iter().map(|s| s.0).collect(),
                 acts: m.acts.clone(),
-                current: m.starts[0],
+                // A part whose `InitState` sets no other state stays in
+                // it (the island fortress's whole, `cf37044a`, whose
+                // `DestroyMsg` handler is there).
+                current: m.starts[0].or_else(|| {
+                    m.states
+                        .iter()
+                        .any(|s| s.0 == m2_assets::model::STATE_INIT)
+                        .then_some(m2_assets::model::STATE_INIT)
+                }),
                 sent_off: false,
             })
             .collect();
@@ -114,6 +124,18 @@ impl Runner {
         for m in 0..self.machines.len() {
             self.deliver_to(m, message, 0);
         }
+    }
+
+    /// The part whose machine is named `name` (its node's name hash)
+    /// takes `message` (a node's `DestroyMsg`, as `ObjectState.SendDamage`
+    /// destroys that node: 0x82289020), from the state it is in now.
+    /// False if no machine has that name.
+    pub fn deliver_named(&mut self, name: u32, message: u32) -> bool {
+        let Some(m) = self.machines.iter().position(|m| m.name == name) else {
+            return false;
+        };
+        self.deliver_to(m, message, 0);
+        true
     }
 
     fn deliver_to(&mut self, m: usize, message: u32, depth: usize) {
@@ -192,6 +214,17 @@ impl Runner {
     /// The changes since the last call, in order.
     pub fn take_changes(&mut self) -> Vec<Change> {
         std::mem::take(&mut self.changes)
+    }
+
+    /// The state the part whose machine is named `name` is in.
+    pub fn state_of(&self, name: u32) -> Option<u32> {
+        self.machines.iter().find(|m| m.name == name)?.current
+    }
+
+    /// The state each part is in, in the order of its object's machines
+    /// ([`PartStates::machines`]): `None` for one never put in any.
+    pub fn states(&self) -> Vec<Option<u32>> {
+        self.machines.iter().map(|m| m.current).collect()
     }
 
     /// Whether nothing more is due.
@@ -323,6 +356,13 @@ mod tests {
             assert!((3.0..=12.1).contains(&down), "{down}");
             assert!((2.9..=4.2).contains(&(out - down)), "{out} {down}");
             assert!(r.settled());
+            // Each part's state, in its machines' order, as the last
+            // change left it.
+            let states = r.states();
+            assert_eq!(states.len(), canopy().machines.len());
+            assert!(r.state_of(TRUNK).is_some());
+            assert!(states.contains(&r.state_of(TRUNK)));
+            assert!(states.contains(&r.state_of(SLICE00)));
         }
     }
 
@@ -380,10 +420,59 @@ mod tests {
         );
     }
 
+    // One part told a message by name (a building's node destroyed by the
+    // scripts): only that part moves, from the state it is in, and a
+    // second `DestroyMsg` finds it moved on (no change); a name no machine
+    // has is refused.
+    #[test]
+    fn a_part_told_by_name_moves_alone_and_keeps_its_state() {
+        let mut r = Runner::new(&canopy(), name, 1);
+        assert!(r.deliver_named(TRUNK, DESTROY_MSG));
+        let changes = r.take_changes();
+        assert_eq!(changes[0].machine, TRUNK);
+        assert_eq!(changes[0].state, COLLAPSE_FIRE);
+        assert_eq!(r.state_of(TRUNK), Some(COLLAPSE_FIRE));
+        // The crown was told by the trunk's state, not by the message.
+        assert_eq!(r.state_of(SLICE00), Some(WAITING));
+        assert!(r.deliver_named(TRUNK, DESTROY_MSG));
+        assert!(r.take_changes().is_empty());
+        assert!(!r.deliver_named(0x1234_5678, DESTROY_MSG));
+    }
+
     #[test]
     fn a_message_a_state_drops_or_does_not_know_changes_nothing() {
         let mut r = Runner::new(&canopy(), name, 1);
         r.deliver(0x1234_5678);
         assert!(r.take_changes().is_empty());
+    }
+
+    // The island fortress's whole: its InitState sets no state, so it
+    // stays there and takes DestroyMsg there.
+    #[test]
+    fn a_part_that_stays_in_its_init_state_takes_messages_there() {
+        use m2_assets::model::{STATE_INIT, StateActs};
+        const COLLAPSE: u32 = 0x6946_83eb;
+        let states = PartStates {
+            machines: vec![PartMachine {
+                node: Some(0),
+                states: vec![(STATE_INIT, vec![]), (COLLAPSE, vec![])],
+                starts: [None, None],
+                acts: vec![
+                    StateActs {
+                        on: vec![(DESTROY_MSG, COLLAPSE)],
+                        ..Default::default()
+                    },
+                    StateActs::default(),
+                ],
+            }],
+            ..Default::default()
+        };
+        let mut r = Runner::new(&states, |_| 0xcf37_044a, 1);
+        assert_eq!(r.states(), [Some(STATE_INIT)]);
+        assert!(r.deliver_named(0xcf37_044a, DESTROY_MSG));
+        assert_eq!(
+            r.take_changes().iter().map(|c| c.state).collect::<Vec<_>>(),
+            [COLLAPSE]
+        );
     }
 }

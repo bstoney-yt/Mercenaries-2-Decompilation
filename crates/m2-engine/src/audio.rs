@@ -1181,6 +1181,10 @@ pub struct KeySounds {
     /// farthest of its tracks' records'), where the record gives them.
     pub falloff: Option<Falloff>,
     pub how: String,
+    /// Whether it loops, as its cue says (a cue list entry's seconds,
+    /// negative for a loop, [`m2_assets::voice::PlainCue::seconds`]);
+    /// `None` where no cue list entry says (a bank's or a block's sounds).
+    pub looped: Option<bool>,
 }
 
 impl KeySounds {
@@ -1244,12 +1248,14 @@ impl KeySounds {
             } else {
                 1.0
             };
+            let looped = t.plain_cue(key).map(|c| c.seconds < 0.0);
             return Some(Self {
                 sounds,
                 volume,
                 start: Some(record.start),
                 falloff,
                 how,
+                looped,
             });
         }
         if let Some(found) = tables
@@ -1279,6 +1285,7 @@ impl KeySounds {
                 sounds,
                 volume: 1.0,
                 falloff: None,
+                looped: None,
             })
         };
         let library = SoundLibrary::load_banks(source, &[key]);
@@ -1361,6 +1368,7 @@ impl KeySounds {
             .collect();
         (!sounds.is_empty()).then(|| Self {
             start: None,
+            looped: None,
             how: format!(
                 "mixed cue: {} of its {} tracks ({}), {} takes of {:.2} s, peak {peak:.2} of full scale",
                 layers.len(),
@@ -2144,6 +2152,7 @@ mod tests {
             start: None,
             falloff: None,
             how: String::new(),
+            looped: None,
         };
         assert_eq!(key.pick(0.0).map(|s| s.hash), Some(1));
         assert_eq!(key.pick(0.2).map(|s| s.hash), Some(1));

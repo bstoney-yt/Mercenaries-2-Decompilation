@@ -259,6 +259,11 @@ fn main() -> Result<()> {
             println!("{s}");
         }
     }
+    if name.eq_ignore_ascii_case("islandfortress")
+        && let Some(&(_, first, at)) = on.first()
+    {
+        fortress(&mut mission, first, at, args.get(2).map(String::as_str))?;
+    }
     if name.eq_ignore_ascii_case("autogunship") {
         let level = args.get(3).is_some_and(|a| a == "level");
         autogunship(&mut mission, args.get(2).map(String::as_str), level)?;
@@ -273,6 +278,198 @@ fn main() -> Result<()> {
         planted(&mut mission);
     }
     println!("{name} lines logged: {failures}");
+    Ok(())
+}
+
+/// The island fortress's part whose `DestroyMsg` its script waits for.
+const FORTRESS_PART: u32 = 0xcf37_044a;
+
+/// For `islandfortress`: the first fortress's node and object health; its
+/// part `cf37044a` destroyed by `ObjectState.SendDamage` of 1; where its
+/// model's state machine sends that part on `DestroyMsg` (with `<install
+/// dir>` given: the model is read from it), told to the script's
+/// `OnStateChange`; then the script's slices coming down over time, and
+/// whether the whole fortress was destroyed.
+fn fortress(mission: &mut Mission, guid: u32, at: [f32; 3], install: Option<&str>) -> Result<()> {
+    mission.put_player([at[0] + 40.0, at[1], at[2]]);
+    let status = |m: &Mission| {
+        let mut w = m.world().borrow_mut();
+        w.node_table(guid);
+        let (health, most, alive) = w
+            .objects
+            .get(&guid)
+            .map_or((0.0, 0.0, false), |o| (o.health, o.max_health, o.alive));
+        let (left, nodes) = w.node_table(guid).map_or((0, 0), |t| {
+            (
+                t.entries().iter().filter(|e| e.health > 0).count(),
+                t.entries().len(),
+            )
+        });
+        format!(
+            "object health {health:.1}/{most:.1}, alive {alive}, nodes with health {left}/{nodes}"
+        )
+    };
+    // Every object of the scripts' world named for a fortress, as
+    // `--part-destroy-check`'s find step sees them: alive, its node count
+    // (none: no table), its health.
+    {
+        let mut w = mission.world().borrow_mut();
+        let named: Vec<(u32, String, bool)> = w
+            .objects
+            .iter()
+            .filter(|(_, o)| o.name.to_ascii_lowercase().contains("fortress"))
+            .map(|(g, o)| (*g, o.name.clone(), o.alive))
+            .collect();
+        for (g, name, alive) in named {
+            let nodes = w.node_table(g).map(|t| t.entries().len());
+            let health = w.objects.get(&g).map_or(0.0, |o| o.health);
+            println!(
+                "named for a fortress: {g:#x} {name:?}, alive {alive}, nodes {nodes:?}, health {health}"
+            );
+        }
+    }
+    // The find step's choice: before cbb88d6e's successor, the first
+    // object (in the map's order, which each run draws anew) named for a
+    // fortress, kept only if it had node health; now the islandfortress
+    // entity of the first layer that has one.
+    {
+        let mut w = mission.world().borrow_mut();
+        let first = w
+            .objects
+            .iter()
+            .find(|(_, o)| o.alive && o.name.to_ascii_lowercase().contains("fortress"))
+            .map(|(g, _)| *g);
+        let old = first.filter(|g| w.node_table(*g).is_some());
+        println!("old find step: first named {first:x?}, picked {old:x?}");
+        let new = mission
+            .entity_with_script(m2_game::mission::ISLAND_FORTRESS)
+            .map(|(_, g, _)| g)
+            .filter(|g| w.objects.get(g).is_some_and(|o| o.alive))
+            .filter(|g| w.node_table(*g).is_some());
+        println!("new find step: picked {new:x?}");
+    }
+    // What `--part-destroy-check` falls back on while the fortress isn't
+    // in the scripts' world: its layer entity, found by its script.
+    println!(
+        "fortress layer entity: {:?}",
+        mission.entity_with_script(m2_game::mission::ISLAND_FORTRESS)
+    );
+    println!("fortress {guid:#x}: {}", status(mission));
+    let template = mission
+        .world()
+        .borrow()
+        .placed_as
+        .get(&guid)
+        .cloned()
+        .unwrap_or_default();
+    let state = match install {
+        Some(root) => part_state(root, &template)?,
+        None => None,
+    };
+    // `--part-destroy-check`'s state path on the CPU: every node's
+    // DestroyMsg, in table order, through the part runner, applied a step
+    // later as the game applies it.
+    if let Some(root) = install {
+        let nodes: Vec<u32> = mission
+            .world()
+            .borrow_mut()
+            .node_table(guid)
+            .map(|t| t.entries().iter().map(|e| e.node).collect())
+            .unwrap_or_default();
+        apply_on_cpu(root, &template, guid, &nodes)?;
+    }
+    mission
+        .run(
+            &format!(
+                "ObjectState.SendDamage(Sys.StringToGuid('{guid:#x}'), \
+                 Sys.StringToGuid('{FORTRESS_PART:#x}'), 1)"
+            ),
+            "fortress part",
+        )
+        .map_err(|e| e.to_string())?;
+    let messages: Vec<String> = mission
+        .take_commands()
+        .into_iter()
+        .filter_map(|c| match c {
+            Command::NodeDamage { node, message, .. } => Some(format!("{node:#x}:{message:x?}")),
+            _ => None,
+        })
+        .collect();
+    println!(
+        "part {FORTRESS_PART:#x} sent 1: messages {messages:?}; {}",
+        status(mission)
+    );
+    match state {
+        Some(s) => {
+            println!("model: DestroyMsg sends part {FORTRESS_PART:#x} to state {s:#x}");
+            mission.object_state_changed(guid, FORTRESS_PART, s);
+        }
+        None => println!("model: no DestroyMsg state found for part {FORTRESS_PART:#x}"),
+    }
+    let (mut kills, mut destroyed_at) = (0, None);
+    let end = mission.now() + 120.0;
+    while mission.now() < end {
+        mission.tick(0.25);
+        for c in mission.take_commands() {
+            match c {
+                Command::NodeDamage {
+                    message: Some(_), ..
+                } => kills += 1,
+                Command::Kill(g) if g == guid && destroyed_at.is_none() => {
+                    destroyed_at = Some(mission.now());
+                }
+                _ => {}
+            }
+        }
+        mission.take_log();
+    }
+    println!(
+        "after 120 s: {kills} node messages, {}; {}",
+        status(mission),
+        destroyed_at.map_or("not destroyed".into(), |t| format!(
+            "destroyed (Kill at t={t:.1})"
+        ))
+    );
+    // What the cascade left (nodes no part's breaking hides here, with no
+    // game to hide them): each sent 1 until the fortress dies.
+    let left: Vec<u32> = mission
+        .world()
+        .borrow_mut()
+        .node_table(guid)
+        .map(|t| {
+            t.entries()
+                .iter()
+                .filter(|e| e.health > 0)
+                .map(|e| e.node)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut sent = 0;
+    for n in left {
+        if !mission.world().borrow().objects[&guid].alive {
+            break;
+        }
+        mission
+            .run(
+                &format!(
+                    "ObjectState.SendDamage(Sys.StringToGuid('{guid:#x}'),                      Sys.StringToGuid('{n:#x}'), 1)"
+                ),
+                "fortress node",
+            )
+            .map_err(|e| e.to_string())?;
+        sent += 1;
+    }
+    let killed = mission.take_commands().contains(&Command::Kill(guid));
+    mission.tick(0.25);
+    let deaths: Vec<String> = mission
+        .take_log()
+        .into_iter()
+        .filter(|l| l.contains("OnDeath"))
+        .collect();
+    println!(
+        "the rest sent 1, {sent} nodes: {}; Kill sent {killed}; OnDeath errors {deaths:?}",
+        status(mission)
+    );
     Ok(())
 }
 
@@ -461,6 +658,60 @@ fn autogunship(mission: &mut Mission, target: Option<&str>, level: bool) -> Resu
     Ok(())
 }
 
+/// Where template `template`'s model sends part `FORTRESS_PART` on
+/// `DestroyMsg` from its intact state.
+fn part_state(root: &str, template: &str) -> Result<Option<u32>> {
+    use m2_assets::layer::{Layer, TEMPLATE_DB_TYPE};
+    use m2_assets::model::{DESTROY_MSG, PartStates};
+    let install = m2_engine::Install::find(std::path::Path::new(root))?;
+    let mut source = install.open_world()?;
+    let index = source.archive().index();
+    let db_hash = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+        .ok_or("no template database")?;
+    let data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&data)?;
+    let names = db.names();
+    let Some(id) = names
+        .iter()
+        .find(|(_, n)| n.eq_ignore_ascii_case(template))
+        .map(|(id, _)| *id)
+    else {
+        return Ok(None);
+    };
+    let Some(&model) = db.hashes("ModelName").get(&id) else {
+        return Ok(None);
+    };
+    let data = source.model(model)?;
+    let model = data.parse()?;
+    let Some(states) = model.states.as_ref() else {
+        return Ok(None);
+    };
+    let Some(m) = states.machines.iter().find(|m| {
+        m.node
+            .and_then(|n| model.nodes.get(usize::from(n)))
+            .is_some_and(|n| n.name_hash == FORTRESS_PART)
+    }) else {
+        return Ok(None);
+    };
+    // A part whose InitState puts it nowhere stays there.
+    let Some(s) = PartStates::intact_state(m).or_else(|| {
+        m.states
+            .iter()
+            .position(|x| x.0 == m2_assets::model::STATE_INIT)
+    }) else {
+        return Ok(None);
+    };
+    Ok(m.acts.get(s).and_then(|a| {
+        a.on.iter()
+            .find(|(msg, _)| *msg == DESTROY_MSG)
+            .map(|&(_, to)| to)
+    }))
+}
+
 /// `C4` and `beacon`: thrown as she throws them (`C4 Projectile`; the
 /// Beacon Designator's `ammo_designator_beacon`, whose light runs
 /// `beacon`), left lying 3 s, then gone. Prints, per object the scripts
@@ -624,5 +875,86 @@ fn antiair(
     mission.round_gone(round);
     run(mission, 0.5);
     println!("antiair: once it burst: {:?}", calls(mission, round));
+    Ok(())
+}
+
+/// Template `template`'s model built on the CPU ([`m2_engine::model::CpuModel`]),
+/// its part runner given each of `nodes` a `DestroyMsg` at step 0, and
+/// its states applied as `--part-destroy-check`'s game applies them
+/// ([`m2_engine::ModelParts::apply_states`], one step after a change),
+/// over 15 s of 0.1 s steps. Prints the changes, the applications (and
+/// how many steps after their change), and the nodes shown and hidden.
+fn apply_on_cpu(root: &str, template: &str, guid: u32, nodes: &[u32]) -> Result<()> {
+    use m2_assets::layer::{Layer, TEMPLATE_DB_TYPE};
+    use m2_assets::model::DESTROY_MSG;
+    let install = m2_engine::Install::find(std::path::Path::new(root))?;
+    let mut source = install.open_world()?;
+    let index = source.archive().index();
+    let db_hash = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+        .ok_or("no template database")?;
+    let data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&data)?;
+    let Some(id) = db
+        .names()
+        .iter()
+        .find(|(_, n)| n.eq_ignore_ascii_case(template))
+        .map(|(id, _)| *id)
+    else {
+        return Err("no such template".into());
+    };
+    let model = *db.hashes("ModelName").get(&id).ok_or("no model")?;
+    let data = source.model(model)?;
+    let parsed = data.parse()?;
+    let cpu = m2_engine::model::CpuModel::build(model, &parsed, 0);
+    let (Some(parts), Some(states)) = (cpu.parts.clone(), cpu.part_states.clone()) else {
+        println!("cpu apply: model {model:08x} has no parts or no part states");
+        return Ok(());
+    };
+    let (machines, names) = &*states;
+    let name = |n: u16| names.get(usize::from(n)).copied().unwrap_or(0);
+    let mut runner = m2_engine::part_runner::Runner::new(machines, name, guid);
+    let mut delivered = 0;
+    for &n in nodes {
+        delivered += usize::from(runner.deliver_named(n, DESTROY_MSG));
+    }
+    let mut changes = runner.take_changes();
+    let whole = changes
+        .iter()
+        .find(|c| c.machine == FORTRESS_PART)
+        .map(|c| c.state);
+    let mut due = (!changes.is_empty()).then_some(0u32);
+    let (mut applied, mut on_time, mut late, mut shown, mut hidden) = (0, 0, 0, 0, 0);
+    let mut before: Option<Vec<bool>> = None;
+    let mut all = changes.len();
+    for step in 1..=150u32 {
+        if let Some(sent) = due.take() {
+            let st = runner.states();
+            let a = parts.apply_states(|k| st.get(k).copied().flatten(), before.as_deref());
+            applied += 1;
+            if step - sent == 1 {
+                on_time += 1;
+            } else {
+                late += 1;
+            }
+            shown += a.shown.len();
+            hidden += a.gone.len();
+            before = Some(a.hidden);
+        }
+        runner.advance(0.1);
+        changes = runner.take_changes();
+        if !changes.is_empty() {
+            all += changes.len();
+            due = Some(step);
+        }
+    }
+    println!(
+        "cpu apply: {} of {} nodes are part machines; {all} changes; {FORTRESS_PART:08x} -> {whole:08x?}; applied {applied} times ({on_time} one step after, {late} otherwise); {shown} nodes shown, {hidden} hidden",
+        delivered,
+        nodes.len()
+    );
     Ok(())
 }
