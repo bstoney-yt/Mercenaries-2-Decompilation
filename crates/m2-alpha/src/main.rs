@@ -521,6 +521,9 @@ struct Options {
     /// by an RPG and, should it stand, run into by a jeep; logs
     /// `mine-check:` lines ([`mines::MineCheck`]).
     mine_check: bool,
+    /// `--object-sound-check`: her C4 put down in the mission, its
+    /// object-attached beep logged ([`mission::ObjectSoundCheck`]).
+    object_sound_check: bool,
     /// `--impact-check`: rounds struck into the ground round her, by
     /// surface ([`impact_check`]).
     impact_check: bool,
@@ -905,6 +908,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--swim-check" => o.swim_check = true,
             "--mine-check" => {
                 o.mine_check = true;
+                o.mission = true;
+            }
+            "--object-sound-check" => {
+                o.object_sound_check = true;
                 o.mission = true;
             }
             "--impact-check" => {
@@ -4519,7 +4526,8 @@ fn mission_for_screenshot(
         .with_script_join(options.script_join)
         .with_skip_to(options.skip_to.clone())
         .with_job_near(options.job_near)
-        .with_mine_check(options.mine_check);
+        .with_mine_check(options.mine_check)
+        .with_object_sound_check(options.object_sound_check);
     link.check_node_damage = options.check_node_damage;
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
@@ -11446,6 +11454,10 @@ fn mission_sounds(audio: &mut sound::GameAudio, m: &mut mission::MissionLink) {
             audio.ui_sound(&cue);
         }
     }
+    for (guid, cue, stop, at) in m.take_object_sounds() {
+        audio.object_sound(guid, &cue, at, stop);
+    }
+    audio.follow_objects(|g| m.object_at(g));
     if let Some(cue) = m.take_music() {
         audio.music_cue_at(cue.as_deref(), m.music_at());
     }
