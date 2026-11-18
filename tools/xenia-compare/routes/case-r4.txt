@@ -1,0 +1,24 @@
+# Round 4 after vzacon001-boat.txt: boat brake and coast measured from speed,
+# beach, sprint by clicking LS, then the marker approached from the WSW so the
+# camera faces where the crate's helicopter comes from (-1336, 2740).
+mark boat start
+track -1727 -36 2069
+goto -1530 2262 25 60 a
+measure x 6                              # brake/reverse held at speed
+goto -1490 2320 15 40 a
+goto -1500 2450 20 60 a
+measure - 6                              # coasting from speed, nothing held
+goto -1490 2660 15 45 a
+mark beached
+press y 0.3
+wait 3
+trackfoot here
+measure - 3 1                            # run: stick forward
+set 0 1 0 0 -
+press ls 0.2                             # click the left stick: sprint
+measure - 4 1
+walk -1491 2668 3 60 - 1 sprint          # frames on the way (sprinting if the click took)
+walk -1478 2677 4 30                     # onto loc_vza_beach heading ENE
+mark at the beach marker
+burst drop 50 1
+mark crate window over

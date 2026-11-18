@@ -371,6 +371,19 @@ pub struct Pad {
     /// swapped.
     pub look: Option<f64>,
     pub invert: bool,
+    /// The camera sensitivity, 0..1 (the pause menu's 0 to 100 over 100;
+    /// unset, 0.5, the 360's start value), and the on-foot camera's turn
+    /// from the stick ([`m2_engine::pad_camera`]).
+    pub sensitivity: Option<f32>,
+    pub camera: m2_engine::pad_camera::LookCamera,
+    /// A car's or a boat's chase camera's look ([`Mode::Car`]).
+    pub car_camera: m2_engine::pad_camera::CarLook,
+    /// She is aiming in: the camera's aimed presets.
+    pub aiming: bool,
+    /// The held item's camera row ([`m2_engine::pad_camera::camera_row`]),
+    /// and her pitch now, radians (the camera's 0..1 is found from it).
+    pub camera_row: usize,
+    pub pitch: f32,
     /// The controller the window's events report (Android's).
     pub events: Events,
     /// The on-screen pad (a phone without a controller), read with the
@@ -582,13 +595,61 @@ impl Pad {
         ] {
             input.set_stick_push(action, push > PUSH);
         }
-        // Look: squared, so small pushes aim finely.
-        let [rx, ry] = s.right;
-        let ry = if self.invert { -ry } else { ry };
-        let curve = |v: f32| f64::from(v * v.abs());
-        let rate = LOOK_RATE * self.look.unwrap_or(1.0);
-        input.pad_look(curve(rx) * rate * dt, -curve(ry) * rate * dt);
+        // Look. On foot as the 360's camera turns ([`look_on_foot`]);
+        // elsewhere squared, so small pushes aim finely.
+        if mode == Mode::OnFoot {
+            let (yaw, pitch) = self.look_on_foot(&s, dt as f32);
+            input.pad_turn(yaw, pitch);
+        } else if mode == Mode::Car {
+            // As the 360's car camera turns: the camera's own dead zone,
+            // eased, linear ([`m2_engine::pad_camera::CarLook`]).
+            let [x, y] = s.right_raw;
+            let y = if self.invert { -y } else { y };
+            let stick = m2_engine::pad_camera::stick(x, y);
+            let (yaw, pitch) = self.car_camera.step(stick, dt as f32);
+            input.pad_turn(f64::from(yaw), f64::from(pitch));
+        } else {
+            let [rx, ry] = s.right;
+            let ry = if self.invert { -ry } else { ry };
+            let curve = |v: f32| f64::from(v * v.abs());
+            let rate = LOOK_RATE * self.look.unwrap_or(1.0);
+            input.pad_look(curve(rx) * rate * dt, -curve(ry) * rate * dt);
+        }
         self.last = s;
+    }
+
+    /// The on-foot camera's turn for a step of `dt` seconds with the pad
+    /// at `s`: yaw radians (towards the stick's right) and pitch radians
+    /// (up), as the 360's camera turns ([`m2_engine::pad_camera`]): its
+    /// own dead zone from the raw stick, its curves, inertia and rates,
+    /// at the camera sensitivity times the held item's row (row 0:
+    /// most items; the rows by item are not ported).
+    fn look_on_foot(&mut self, s: &PadState, dt: f32) -> (f64, f64) {
+        use m2_engine::pad_camera as cam;
+        let [x, y] = s.right_raw;
+        let y = if self.invert { -y } else { y };
+        let sens = self.sensitivity.unwrap_or(0.5);
+        let (yaw, step) = self.camera.step(
+            cam::stick(x, y),
+            sens,
+            self.camera_row,
+            self.aiming,
+            false,
+            dt,
+        );
+        // The camera's 0..1 moved, through its offsets' angles.
+        if step == 0.0 {
+            return (f64::from(yaw), 0.0);
+        }
+        let offsets = if self.aiming {
+            &cam::AIMING
+        } else {
+            &cam::STANDING
+        };
+        let t = (cam::t_at(self.pitch, offsets) + step).clamp(0.0, 1.0);
+        let pitch = cam::pitch_at(t, offsets) - self.pitch;
+        self.pitch += pitch;
+        (f64::from(yaw), f64::from(pitch))
     }
 
     /// Up and down as the left stick is pushed past half way that way
@@ -760,6 +821,10 @@ impl Events {
             buttons,
             left: stick(axis::X, axis::Y, LEFT_DEAD_ZONE),
             right: stick(axis::Z, axis::RZ, RIGHT_DEAD_ZONE),
+            right_raw: [
+                f32::from(raw(a(axis::Z))) / 32767.0,
+                f32::from(raw(-a(axis::RZ))) / 32767.0,
+            ],
             left_trigger: trigger(
                 a(axis::LTRIGGER).max(a(axis::BRAKE)),
                 self.digital_triggers[0],
@@ -1006,20 +1071,52 @@ mod tests {
             input.take_pressed(Action::MoveForward),
             "the hijack's press"
         );
-        let (dx, dy) = input.take_pad_look();
-        assert!((dx - 0.25 * LOOK_RATE * 0.5).abs() < 1e-9 && dy == 0.0);
-        // The pause menu's options: twice as fast, up and down swapped.
-        pad.look = Some(2.0);
-        pad.invert = true;
-        let up = PadState {
-            right: [0.0, 0.5],
+        // On foot the right stick is the 360's camera's: the raw stick,
+        // inside its dead zone nothing, past it a turn right.
+        assert_eq!(input.take_pad_look(), (0.0, 0.0));
+        assert_eq!(input.take_pad_turn(), (0.0, 0.0));
+        let right = PadState {
+            right_raw: [1.0, 0.0],
             ..PadState::default()
         };
-        pad.feed(&mut input, up, Mode::OnFoot, 0.5);
-        let (_, dy) = input.take_pad_look();
-        assert!((dy - 0.25 * LOOK_RATE).abs() < 1e-9, "{dy}");
-        pad.look = None;
+        pad.feed(&mut input, right, Mode::OnFoot, 1.0 / 60.0);
+        let (yaw, pitch) = input.take_pad_turn();
+        assert!(yaw > 0.0 && pitch == 0.0, "{yaw} {pitch}");
+        // Inverted, the stick's up turns the view down.
+        pad.invert = true;
+        let up = PadState {
+            right_raw: [0.0, 1.0],
+            ..PadState::default()
+        };
+        pad.camera = Default::default();
+        pad.feed(&mut input, up, Mode::OnFoot, 1.0 / 60.0);
+        let (_, pitch) = input.take_pad_turn();
+        assert!(pitch < 0.0, "{pitch}");
         pad.invert = false;
+        // At a car's wheel the stick is the 360's car camera's: eased,
+        // linear, past its dead zone, a turn right.
+        let right = PadState {
+            right_raw: [1.0, 0.0],
+            ..PadState::default()
+        };
+        pad.feed(&mut input, right, Mode::Car, 1.0 / 60.0);
+        let (yaw, pitch) = input.take_pad_turn();
+        assert!(yaw > 0.0 && pitch == 0.0, "{yaw} {pitch}");
+        assert_eq!(input.take_pad_look(), (0.0, 0.0));
+        // In a tank (and a helicopter) the stick turns as before:
+        // squared, times the pause menu's look speed.
+        let s = PadState {
+            right: [0.5, 0.0],
+            ..PadState::default()
+        };
+        pad.feed(&mut input, s, Mode::Tank, 0.5);
+        let (dx, dy) = input.take_pad_look();
+        assert!((dx - 0.25 * LOOK_RATE * 0.5).abs() < 1e-9 && dy == 0.0);
+        pad.look = Some(2.0);
+        pad.feed(&mut input, s, Mode::Tank, 0.5);
+        let (dx, _) = input.take_pad_look();
+        assert!((dx - 0.25 * LOOK_RATE).abs() < 1e-9, "{dx}");
+        pad.look = None;
         // Half way or less walks.
         let s = PadState {
             left: [0.3, 0.0],

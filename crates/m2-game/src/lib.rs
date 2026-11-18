@@ -7,6 +7,7 @@ pub mod atmosphere_script;
 pub mod cash;
 pub mod character_binding;
 pub mod cheat;
+pub mod crusher;
 pub mod events;
 pub mod gui;
 pub mod gui_anim;
