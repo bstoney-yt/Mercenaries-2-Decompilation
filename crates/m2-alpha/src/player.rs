@@ -148,7 +148,11 @@ impl ChaseRig {
                 pivot: Vec3::Y * (spec.bounds.1.y * 0.6),
                 distance,
                 pitch: Some(-pitch),
-                pitch_range: (-1.2, 0.9),
+                // Its camera's limits ([`m2_engine::pad_camera::HeliLook`]).
+                pitch_range: spec
+                    .tuning
+                    .heli_camera
+                    .map_or((-1.2, 0.9), |h| h.pitch_up()),
                 follows_aim: false,
                 aim_lift: 0.0,
                 car: None,

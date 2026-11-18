@@ -386,6 +386,10 @@ pub struct Pad {
     /// with a `CameraTurret`, and its state.
     pub turret_tuning: Option<m2_engine::pad_camera::TurretLookTuning>,
     pub turret_camera: m2_engine::pad_camera::TurretLook,
+    /// A helicopter's: its pilot camera's tuning while she flies one with
+    /// a `CameraHelicopter`, and its state.
+    pub heli_tuning: Option<m2_engine::pad_camera::HeliLookTuning>,
+    pub heli_camera: m2_engine::pad_camera::HeliLook,
     /// She is aiming in: the camera's aimed presets.
     pub aiming: bool,
     /// The held item's camera row ([`m2_engine::pad_camera::camera_row`]),
@@ -616,6 +620,15 @@ impl Pad {
         } else if mode == Mode::OnFoot {
             let (yaw, pitch) = self.look_on_foot(&s, dt as f32);
             input.pad_turn(yaw, pitch);
+        } else if let (Mode::Helicopter, Some(t)) = (mode, self.heli_tuning) {
+            // As the 360's helicopter camera: pitch only, slowed into its
+            // limits ([`m2_engine::pad_camera::HeliLook`]).
+            let [x, y] = s.right_raw;
+            let y = if self.invert { -y } else { y };
+            let stick = m2_engine::pad_camera::stick(x, y);
+            let pitch = self.heli_camera.step(stick, self.pitch, &t, dt as f32);
+            self.pitch += pitch;
+            input.pad_turn(0.0, f64::from(pitch));
         } else if let (Mode::Tank, Some(t)) = (mode, self.tank_tuning) {
             // As the 360's tank camera turns: its seat's speeds and
             // inertia, linear ([`m2_engine::pad_camera::TankLook`]).
