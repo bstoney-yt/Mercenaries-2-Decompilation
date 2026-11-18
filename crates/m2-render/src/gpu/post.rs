@@ -1646,7 +1646,7 @@ mod tests {
     }
 
     #[test]
-    fn a_still_camera_blurs_nothing() {
+    fn motion_blur_of_a_still_camera_is_nothing() {
         let vp = Mat4::perspective_rh(1.0, 16.0 / 9.0, 0.3, 2000.0)
             * Mat4::look_at_rh(Vec3::new(3.0, 2.0, 5.0), Vec3::ZERO, Vec3::Y);
         let k = super::motion_blur_constants(vp, vp);
@@ -1661,7 +1661,7 @@ mod tests {
     /// the last frame's screen (to within the composite's missing divide
     /// by w, which is 1 for a camera that only turns or slides).
     #[test]
-    fn a_moving_camera_moves_each_pixel_to_its_last_place() {
+    fn motion_blur_moves_each_pixel_to_its_last_place() {
         let proj = Mat4::perspective_rh(1.0, 16.0 / 9.0, 0.3, 2000.0);
         let last = proj * Mat4::look_at_rh(Vec3::ZERO, Vec3::new(0.0, 0.0, -1.0), Vec3::Y);
         let now =
