@@ -24,7 +24,7 @@ pub struct Config {
     pub enhanced: EnhancedConfig,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EnhancedConfig {
     /// Smarter enemy soldiers (`enabled = true` to switch on).
@@ -32,6 +32,26 @@ pub struct EnhancedConfig {
     /// The shop from anywhere, every item unlocked (a cheat; the game
     /// unlocks them as contract rewards).
     pub shop: ShopCheat,
+    /// How much louder a semi truck's engine is than its cue says, hers
+    /// and others' (`semi_engine_gain`; 1 is the game's). Not the game's:
+    /// the owner asked for semis at least twice as loud (playtest
+    /// 2026-11-14), though the 360's cue is authored that quiet on
+    /// throttle, so the default is [`SEMI_ENGINE_GAIN`].
+    pub semi_engine_gain: f32,
+}
+
+/// [`EnhancedConfig::semi_engine_gain`]'s default: the owner's twice as
+/// loud (invented, by request).
+pub const SEMI_ENGINE_GAIN: f32 = 2.0;
+
+impl Default for EnhancedConfig {
+    fn default() -> Self {
+        Self {
+            smarter_ai: Default::default(),
+            shop: ShopCheat::default(),
+            semi_engine_gain: SEMI_ENGINE_GAIN,
+        }
+    }
 }
 
 /// `[enhanced.shop]`: the shop opens anywhere with its key, on the game's
@@ -80,25 +100,35 @@ pub struct GameOptions {
     /// used by the alpha's drawing.
     pub video_detail: f64,
     pub advanced_video: [f64; 8],
+    /// The loading screens' hint counter, kept in the profile as the 360
+    /// keeps it (a byte of its profile, `+0x7C`): the next hint shown is
+    /// this one ([`crate::loading`]).
+    pub loading_hint: u8,
 }
 
 impl Default for GameOptions {
     fn default() -> Self {
+        let profile = m2_game::profile::ProfileOptions::default();
         Self {
-            subtitles: true,
-            tutorials: true,
-            autosave: true,
-            pad_sensitivity: 50.0,
+            // A new profile's, from the 360 code (0x8239B028): subtitles
+            // on only in the Russian game; this one is English.
+            subtitles: m2_game::profile::default_subtitles(m2_game::profile::Language::English),
+            tutorials: profile.tutorials != 0,
+            autosave: profile.autosave != 0,
+            pad_sensitivity: f64::from(profile.sensitivity),
             invert_pad: false,
             rumble: true,
             pad_buttons: Vec::new(),
-            brightness: 50.0,
+            brightness: f64::from(profile.brightness),
             view_distance: 100.0,
-            sfx_volume: 100.0,
-            music_volume: 100.0,
-            dialog_volume: 100.0,
+            // The profile's default for all three (from the 360 code,
+            // 0x8239B028; m2_game::profile).
+            sfx_volume: f64::from(m2_game::profile::DEFAULT_VOLUME),
+            music_volume: f64::from(m2_game::profile::DEFAULT_VOLUME),
+            dialog_volume: f64::from(m2_game::profile::DEFAULT_VOLUME),
             video_detail: crate::pause::DETAIL,
             advanced_video: crate::pause::ADVANCED,
+            loading_hint: 0,
         }
     }
 }
@@ -384,6 +414,24 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// The loading hints' counter is kept in the settings file, and a
+    /// file from before it starts at the first hint.
+    #[test]
+    fn the_loading_hint_counter_is_kept() {
+        let mut config = Config::default();
+        assert_eq!(config.options.loading_hint, 0);
+        config.options.loading_hint = 17;
+        let back: Config = toml::from_str(&config.to_toml()).unwrap();
+        assert_eq!(back.options.loading_hint, 17);
+        let old: Config = toml::from_str(
+            "[options]
+subtitles = false
+",
+        )
+        .unwrap();
+        assert_eq!(old.options.loading_hint, 0);
+    }
+
     #[test]
     fn defaults_round_trip() {
         let config = Config::default();
@@ -459,6 +507,18 @@ mod tests {
     #[test]
     fn the_smarter_soldiers_are_off_unless_switched_on() {
         assert!(!Config::default().enhanced.smarter_ai.enabled);
+        // The owner's louder semis, by default and as set.
+        assert_eq!(
+            Config::default().enhanced.semi_engine_gain,
+            SEMI_ENGINE_GAIN
+        );
+        let quiet: Config = toml::from_str(
+            "[enhanced]
+semi_engine_gain = 1.0
+",
+        )
+        .unwrap();
+        assert_eq!(quiet.enhanced.semi_engine_gain, 1.0);
         let config: Config = toml::from_str(
             r#"
             [enhanced.smarter_ai]

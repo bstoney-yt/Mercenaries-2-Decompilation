@@ -77,6 +77,10 @@ const PART_LEN: usize = 0x44;
 const BODY_LEN: usize = 0x6C;
 const SHAPE_LEN: usize = 0x6C;
 const NONE: u32 = 0xFFFF_FFFF;
+/// A constraint record's length, and its first and last words.
+const CONSTRAINT_LEN: usize = 0x118;
+const CONSTRAINT_START: u32 = 0xAAAA_BBBB;
+const CONSTRAINT_END: u32 = 0xAAAA_CCCC;
 /// Mesh shapes keep at most this many vertices.
 const MAX_VERTICES: u32 = 1 << 20;
 
@@ -268,7 +272,50 @@ pub struct Physics {
     pub parts: Vec<Part>,
     pub bodies: Vec<Body>,
     pub shapes: Vec<Shape>,
+    /// The joints between its bodies (a gate's leaves on their hinges),
+    /// as [`Constraint`] reads them; empty where none, or where they
+    /// don't read as the gates' do.
+    pub constraints: Vec<Constraint>,
 }
+
+/// A joint between two of a model's bodies: a gate's leaf on its hinge.
+///
+/// From samples (`_pmcoutpost_gate`'s model 6307d65b, two leaves) and the
+/// 360 code: the header's word at 0x14 counts them, and their records
+/// follow the shapes, 0x118 bytes each, from `0xAAAABBBB` to
+/// `0xAAAACCCC`. A body's part points at the first of its list
+/// ([`Part::unk_link`]) and each at the next at +0x10C, as the 360's
+/// gate builder (0x82160FF8) walks them. That builder (0x82160EA8) reads
+/// the other part at +4 and the kind at +8: 4 a hinge, opened to the
+/// angle at +0x64 from 0; 7 a slide, shut at +0x98 and open at minus
+/// +0x9C. The pivot (+0x0C) and the hinge's axis (+0x68) are read from
+/// samples alone: on the gate, pivots on each leaf's hinge post, axes
+/// straight up and down (one leaf's mirrored), so both leaves open the
+/// same way.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Constraint {
+    /// The part whose body it hangs from (whose list holds it), and the
+    /// part of the body it holds (+4).
+    pub owner: usize,
+    pub part: usize,
+    /// 4 a hinge, 7 a slide (+8).
+    pub kind: u32,
+    /// Where it holds, model space (+0x0C).
+    pub pivot: [f32; 3],
+    /// A hinge's open angle, degrees (+0x64), and the limit before it
+    /// (+0x60, 180 on the gate).
+    pub open: f32,
+    pub limit: f32,
+    /// A hinge's axis (+0x68).
+    pub axis: [f32; 3],
+    /// A slide's shut and open places (+0x98, minus +0x9C).
+    pub slide: (f32, f32),
+}
+
+/// The hinge kind of [`Constraint::kind`].
+pub const HINGE: u32 = 4;
+/// The slide kind.
+pub const SLIDE: u32 = 7;
 
 fn f32s<const N: usize>(r: &mut Reader) -> Result<[f32; N], OutOfBounds> {
     let mut out = [0.0; N];
@@ -311,6 +358,58 @@ fn array(
         .ok_or(PhysicsError::Object("array too long"))?;
     Reader::at(p.section(s)?.data, at as usize).take(len)?;
     Ok((s, at as usize, n))
+}
+
+/// The `count` constraint records from `at` (see [`Constraint`]), each
+/// with the part whose list holds it; `None` if any doesn't read so.
+fn constraints(
+    phy2: &[u8],
+    parts: &[Part],
+    parts_at: usize,
+    at: usize,
+    count: usize,
+) -> Option<Vec<Constraint>> {
+    // As many as the bytes left hold, no more (a count read from a
+    // damaged header).
+    if count > phy2.len().saturating_sub(at) / CONSTRAINT_LEN {
+        return None;
+    }
+    let word = |o: usize| Reader::at(phy2, o).u32().ok();
+    let float = |o: usize| word(o).map(f32::from_bits);
+    let part_at = |v: u32| {
+        let v = (v as usize).checked_sub(parts_at)?;
+        (v.is_multiple_of(PART_LEN) && v / PART_LEN < parts.len()).then_some(v / PART_LEN)
+    };
+    // Each record's owner: the part whose list reaches it.
+    let mut owner = std::collections::HashMap::new();
+    for (i, p) in parts.iter().enumerate() {
+        let mut next = p.unk_link;
+        let mut steps = 0;
+        while next != NONE && steps <= count {
+            owner.insert(next as usize, i);
+            next = word(next as usize + 0x10C)?;
+            steps += 1;
+        }
+    }
+    let mut out = Vec::with_capacity(count);
+    for k in 0..count {
+        let o = at + k * CONSTRAINT_LEN;
+        if word(o)? != CONSTRAINT_START || word(o + CONSTRAINT_LEN - 4)? != CONSTRAINT_END {
+            return None;
+        }
+        let v3 = |o: usize| Some([float(o)?, float(o + 4)?, float(o + 8)?]);
+        out.push(Constraint {
+            owner: *owner.get(&o)?,
+            part: part_at(word(o + 4)?)?,
+            kind: word(o + 8)?,
+            pivot: v3(o + 0x0C)?,
+            limit: float(o + 0x60)?,
+            open: float(o + 0x64)?,
+            axis: v3(o + 0x68)?,
+            slide: (float(o + 0x98)?, -float(o + 0x9C)?),
+        });
+    }
+    Some(out)
 }
 
 impl Physics {
@@ -561,6 +660,14 @@ impl Physics {
                 record,
             });
         }
+        let constraints = constraints(
+            phy2,
+            &parts,
+            parts_at,
+            shapes_at + nshapes * SHAPE_LEN,
+            hdr[5] as usize,
+        )
+        .unwrap_or_default();
         Ok(Self {
             version: hdr[0],
             model: hdr[1],
@@ -568,6 +675,7 @@ impl Physics {
             parts,
             bodies,
             shapes,
+            constraints,
         })
     }
 
@@ -862,6 +970,60 @@ fn capsule(a: [f32; 3], b: [f32; 3], r: f32) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A gate's hinge record (as `_pmcoutpost_gate`'s): found from the
+    /// list of the part whose body it hangs from, its leaf's part by the
+    /// offset at +4, its kind, pivot, angles and axis; one whose end
+    /// marker is wrong reads as none.
+    #[test]
+    fn constraints_read_as_the_gates_hinges() {
+        let part = |unk_link: u32| Part {
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            node_hash: 0,
+            node: 0,
+            body: None,
+            shape: None,
+            unk_link,
+            parent: None,
+            first_child: None,
+            next_sibling: None,
+        };
+        let (parts_at, at) = (0x10, 0x200);
+        let mut b = vec![0u8; at + CONSTRAINT_LEN];
+        let put = |b: &mut Vec<u8>, o: usize, w: u32| b[o..o + 4].copy_from_slice(&w.to_le_bytes());
+        put(&mut b, at, CONSTRAINT_START);
+        put(&mut b, at + 4, (parts_at + 2 * PART_LEN) as u32);
+        put(&mut b, at + 8, HINGE);
+        for (k, v) in [-6.57f32, 0.89, 0.0].into_iter().enumerate() {
+            put(&mut b, at + 0x0C + 4 * k, v.to_bits());
+        }
+        put(&mut b, at + 0x60, 180f32.to_bits());
+        put(&mut b, at + 0x64, 90f32.to_bits());
+        put(&mut b, at + 0x6C, (-1f32).to_bits());
+        put(&mut b, at + 0x10C, NONE);
+        put(&mut b, at + CONSTRAINT_LEN - 4, CONSTRAINT_END);
+        let parts = [part(at as u32), part(NONE), part(NONE)];
+        let c = constraints(&b, &parts, parts_at, at, 1).expect("read");
+        assert_eq!(
+            c,
+            [Constraint {
+                owner: 0,
+                part: 2,
+                kind: HINGE,
+                pivot: [-6.57, 0.89, 0.0],
+                open: 90.0,
+                limit: 180.0,
+                axis: [0.0, -1.0, 0.0],
+                slide: (0.0, -0.0),
+            }]
+        );
+        put(&mut b, at + CONSTRAINT_LEN - 4, 0);
+        assert!(constraints(&b, &parts, parts_at, at, 1).is_none());
+        assert_eq!(constraints(&b, &parts, parts_at, at, 0), Some(Vec::new()));
+        // A count past the bytes there reads as none.
+        assert!(constraints(&b, &parts, parts_at, at, usize::MAX / 2).is_none());
+    }
     use super::*;
     use crate::havok::tests::PackBuilder;
 
