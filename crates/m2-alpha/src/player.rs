@@ -975,6 +975,8 @@ impl Player {
         self.character.position = at;
         self.character.velocity = velocity;
         self.character.grounded = false;
+        // Set outright: held one step as it is (0x82179ED0's +0x250).
+        self.character.hold = true;
         self.ground = Vec2::ZERO;
         self.run_stop = RunStop::default();
         self.leap = Leap::Air(0.0);
