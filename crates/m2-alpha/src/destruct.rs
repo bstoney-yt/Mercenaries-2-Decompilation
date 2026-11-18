@@ -1253,7 +1253,18 @@ impl Destruction {
                     "destruct: {k:#x}'s part {:08x} goes off in {:08x}",
                     c.machine, c.state
                 );
-                props.send_off(&mut world.physics, k, c.machine);
+                // What it goes as (its `DebrisTemplate`): whether it
+                // crushes what it lands on (`m2_engine::crush`).
+                if let Some(body) = props.send_off(&mut world.physics, k, c.machine)
+                    && let Some((_, Some(t))) = props.sent_off_as(body)
+                {
+                    let name = world.index.template_db.names.get(&t);
+                    eprintln!(
+                        "destruct: {k:#x}'s part {:08x} goes as {}",
+                        c.machine,
+                        name.map_or("?", String::as_str)
+                    );
+                }
                 continue;
             }
             let entity = if adopted(k) {

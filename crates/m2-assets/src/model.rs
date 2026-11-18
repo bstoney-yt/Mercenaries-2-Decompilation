@@ -843,6 +843,28 @@ pub struct PartMachine {
     pub acts: Vec<StateActs>,
 }
 
+/// A part sent off as an object of its own: one `CreateObject`.
+///
+/// From the 360 code (0x82230030, the verb's handler): it pops five
+/// operands, last pushed first: the part's node, the state its machine
+/// starts in there (applied to the new object, 0x82429658), the template
+/// field naming what it goes as (the object's `OSMParameter` of that
+/// name, 0x823DA3C8 on 0x83655494, its value resolved by 0x82408B88), a
+/// second node placing it in place of the first when not 0 (0x82426F40),
+/// and a flag word (non-zero sets bit 7 of the spawn record's flags).
+/// A node not found whose hash is 0x15C02DA4 spawns nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Create {
+    pub state: u32,
+    /// The part's node: what goes off, and its machine.
+    pub node: u16,
+    /// The node it is placed at, when the second node names one.
+    pub at: Option<u16>,
+    /// The template field it goes as ([`DEBRIS_TEMPLATE`]).
+    pub param: u32,
+    pub flags: u32,
+}
+
 /// What entering a state does besides showing and hiding (a vehicle's
 /// parts: a door that dents at half its health and comes off at none,
 /// the hood that catches fire, the body that smokes as a wreck).
@@ -891,8 +913,8 @@ pub struct StateActs {
     /// The parts it sends off as objects of their own (`CreateObject`
     /// naming [`DEBRIS_TEMPLATE`]: a burning palm's leaves), each with the
     /// state its machine starts in there (`FireDebrisState`, embers; or
-    /// `DebrisState`): (state, the part's node).
-    pub creates: Vec<(u32, u16)>,
+    /// `DebrisState`).
+    pub creates: Vec<Create>,
     /// The states it puts parts in later (verb `0xBD3403A0`): (state,
     /// part's node, and the seconds between which the delay falls). From
     /// the 360 code (0x82231C58): the delay is `a + r (b - a)`, `r` a
@@ -1063,14 +1085,21 @@ impl PartStates {
                                         if operands.iter().any(|&at| w[at] == DETACH_STATE) {
                                             acts.detaches.extend(op(1).and_then(first));
                                         }
-                                        // (1, 0, `DebrisTemplate`, state, part): the
-                                        // part goes off as an object of the
-                                        // template's debris template, its machine
-                                        // starting in that state.
-                                        if let (Some(DEBRIS_TEMPLATE), Some(to), Some(n)) =
+                                        // (flags, at, `DebrisTemplate`, state,
+                                        // part): the part goes off as an object
+                                        // of the template's debris template, its
+                                        // machine starting in that state
+                                        // ([`Create`]).
+                                        if let (Some(param @ DEBRIS_TEMPLATE), Some(to), Some(n)) =
                                             (op(2), op(3), op(4).and_then(first))
                                         {
-                                            acts.creates.push((to, n));
+                                            acts.creates.push(Create {
+                                                state: to,
+                                                node: n,
+                                                at: op(1).filter(|&h| h != 0).and_then(first),
+                                                param,
+                                                flags: op(0).unwrap_or(0),
+                                            });
                                         }
                                     }
                                     SEND_DAMAGE => {
@@ -2276,7 +2305,16 @@ mod tests {
         assert_eq!(acts.delayed, vec![(0x3cc4_e770, 0, 2.5, 3.0)]);
         assert_eq!(acts.told, vec![(0x1b07_1983, 1)]);
         // And, as a burning palm's trunk, sends the part off burning.
-        assert_eq!(acts.creates, vec![(0x4c88_281b, 1)]);
+        assert_eq!(
+            acts.creates,
+            vec![Create {
+                state: 0x4c88_281b,
+                node: 1,
+                at: None,
+                param: DEBRIS_TEMPLATE,
+                flags: 1,
+            }]
+        );
     }
 
     #[test]
