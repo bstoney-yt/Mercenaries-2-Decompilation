@@ -1862,6 +1862,20 @@ impl Npc {
 
     /// Takes `damage`; at no health left, falls: true if it killed.
     /// `push` (m/s) shoves the body if it kills or is dead already.
+    /// Damage that nobody dealt (a fall's: its event's attacker is -1,
+    /// 0x82205F20): as [`hurt`](Self::hurt), but neither to her account
+    /// nor alerting them.
+    pub fn hurt_by_nobody(&mut self, damage: f32) -> bool {
+        let (by_her, killed_by_her, alert, hit) =
+            (self.hurt_by_her, self.killed_by_her, self.alert, self.hit);
+        let killed = self.hurt(damage, Vec3::ZERO);
+        self.hurt_by_her = by_her;
+        self.killed_by_her = killed_by_her;
+        self.alert = alert;
+        self.hit = hit;
+        killed
+    }
+
     pub fn hurt(&mut self, damage: f32, push: Vec3) -> bool {
         let clips = self.clips;
         let last_hit = self.last_hit.take();
@@ -2468,7 +2482,12 @@ impl Npc {
         // fall altogether for a person whose player record (0x82467B70,
         // table 0x83657FA8) has state +0x40 at 1 or 2: the people here
         // have no player record.
-        if let Some((d, fell)) = self
+        // Held or carried, the 360's human physics' skip flag (+0x224,
+        // set while grabbed, 0x8225BE88, or riding) sends no fall
+        // (0x8217C410): the watch starts afresh.
+        if self.held || matches!(self.down, Some(Down::Carried)) {
+            self.fall = m2_engine::on_foot::FallWatch::default();
+        } else if let Some((d, fell)) = self
             .fall
             .step(!self.character.grounded, now.y)
             .and_then(|d| m2_engine::on_foot::fall_impact(&self.motion.falls, d).map(|f| (d, f)))
@@ -2478,16 +2497,24 @@ impl Npc {
                 self.spawn.unwrap_or(0),
                 fell.damage
             );
-            self.hurt(fell.damage, Vec3::ZERO);
+            // A fall's damage event has no attacker (-1, 0x82205F20):
+            // nobody's kill, no alert.
+            self.hurt_by_nobody(fell.damage);
+            // The impact is posted unless their action's mode is `FULL`
+            // (falling or lying knocked down, or dead); the stance table
+            // gives the clip only to the armed (pistol, rifle, launcher:
+            // handles aaa7ed8d, 9504ae5e), none to the unarmed.
+            let limp = matches!(self.down, Some(Down::Falling(_) | Down::Knocked(_)))
+                || self.ragdoll.is_some()
+                || !self.alive;
             let clip = match fell.impact {
                 Some(m2_engine::on_foot::FallImpact::Light) => self.clips.fall_light,
                 Some(m2_engine::on_foot::FallImpact::Heavy) => self.clips.fall_heavy,
                 None => None,
-            };
+            }
+            .filter(|_| self.gun.is_some());
             if let (Some(c), Some(impact)) = (clip, fell.impact)
-                && self.alive
-                && self.down.is_none()
-                && self.ragdoll.is_none()
+                && !limp
             {
                 self.rig.animator.set_upper(None);
                 self.rig
@@ -9177,6 +9204,8 @@ pub(crate) mod tests {
         let limits = m2_engine::on_foot::FallLimits::default();
         let heavy = drop((limits.heavy + limits.death) * 0.5 + 0.1, &mut rng);
         assert!(heavy.alive);
+        // Nobody's damage: not to her account, no alert.
+        assert!(!heavy.hurt_by_her && !heavy.alert);
         assert!(
             (short.hp - heavy.hp - limits.damage_heavy).abs() < 1e-3,
             "{} {}",
