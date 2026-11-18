@@ -1924,6 +1924,13 @@ impl Player {
     /// her none while `Object.GetInvincible` holds (0x8228CB80, from
     /// 0x824220B0). Aimed in she is `Crouched` (0xC8886020), when it gives
     /// her none but for a melee bash.
+    /// Forgets her last stagger, so the next is not held back by the
+    /// cooldown (`--stagger-check` runs its cases back to back).
+    pub fn forget_stagger(&mut self) {
+        self.since_stagger = None;
+        self.stagger_pending = None;
+    }
+
     pub fn stagger(&mut self, event: &m2_engine::stagger::Event, immune: bool) -> bool {
         use m2_engine::stagger::{self, Person};
         if self.down || self.driving.is_some() || self.seated || !self.character.grounded {

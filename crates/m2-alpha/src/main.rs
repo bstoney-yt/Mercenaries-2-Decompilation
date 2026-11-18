@@ -305,6 +305,8 @@ struct Options {
     homing_check: bool,
     /// `--gravity-check`: measure the physics world's gravity ([`gravity_check`]).
     gravity_check: bool,
+    /// `--stagger-check`: her stagger's exemptions ([`stagger_check`]).
+    stagger_check: bool,
     /// With `--screenshot` on foot: hits she takes just before the
     /// picture, from these directions (degrees clockwise from where the
     /// camera looks), to see the HUD's hit arcs.
@@ -1052,6 +1054,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.gravity_check = true;
                 o.drive = true;
             }
+            "--stagger-check" => o.stagger_check = true,
             "--look-pickup" => {
                 o.look_pickup = Some(value()?.parse().context("--look-pickup expects metres")?)
             }
@@ -2384,6 +2387,8 @@ fn screenshot(
             stage,
             options.fight_wait,
         )?;
+    } else if options.stagger_check && game.on_foot && game.scene.player.is_some() {
+        stagger_check(&mut game);
     } else if options.shuffle_test && game.on_foot && game.scene.player.is_some() {
         shuffle_test(&mut game);
     } else if options.fight && game.on_foot && game.scene.player.is_some() {
@@ -7065,6 +7070,55 @@ const HOMING_CHECK_SECONDS: f32 = 60.0;
 /// launcher up, and the run waits up to [`HOMING_CHECK_SECONDS`] for his
 /// lock, his shot and its hit. Logs `homing-check: PASS ...` or
 /// `homing-check: FAIL <why>`.
+/// `--stagger-check`: her stagger as the 360's picker (0x824220B0) has it
+/// for a player, run on her own clips: a grenade's blast behind her
+/// staggers her standing (control); not aimed in (`Crouched`); not while
+/// invincible (`Object.GetInvincible`, 0x8228CB80); a bash aimed in
+/// still does. Prints a line each and PASS or FAIL.
+fn stagger_check(game: &mut Game) {
+    use m2_engine::stagger::Event;
+    use m2_math::glam::Vec3;
+    let Some(p) = game.scene.player.as_mut() else {
+        eprintln!("stagger-check: FAIL no player");
+        return;
+    };
+    let blast = Event {
+        direction: Vec3::new(p.facing.sin(), 0.0, p.facing.cos()),
+        direct: false,
+        melee: false,
+        key: Some(m2_assets::name_hash("Explosion")),
+    };
+    let bash = Event {
+        direction: -Vec3::new(p.facing.sin(), 0.0, p.facing.cos()),
+        direct: true,
+        melee: true,
+        key: None,
+    };
+    let cases: [(&str, &Event, bool, bool, bool); 4] = [
+        ("standing, a blast behind her", &blast, false, false, true),
+        ("aimed in, a blast behind her", &blast, true, false, false),
+        ("invincible, a blast behind her", &blast, false, true, false),
+        ("aimed in, a bash from ahead", &bash, true, false, true),
+    ];
+    let mut all = true;
+    for (what, event, aimed, invincible, want) in cases {
+        p.forget_stagger();
+        p.aiming = aimed;
+        let got = p.stagger(event, invincible);
+        let ok = got == want;
+        all &= ok;
+        eprintln!(
+            "stagger-check: {what}: {}, want {}: {}",
+            if got { "staggers" } else { "no stagger" },
+            if want { "staggers" } else { "no stagger" },
+            if ok { "PASS" } else { "FAIL" }
+        );
+    }
+    p.aiming = false;
+    p.forget_stagger();
+    eprintln!("stagger-check: {}", if all { "PASS" } else { "FAIL" });
+}
+
 fn homing_check(game: &mut Game, tick: f32) {
     use m2_math::glam::Vec3;
     let Some(world) = game.scene.world.as_ref() else {
