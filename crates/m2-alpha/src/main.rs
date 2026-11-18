@@ -8260,15 +8260,52 @@ fn impact_check(game: &mut Game, tick: f32) {
     car_into_car(game, tick);
 }
 
-/// `--impact-check`'s car-into-car hit: the car she drives is driven at
+/// `--impact-check`'s car-into-car hit: she takes the nearest land
+/// vehicle if she is at no wheel (waiting up to 30 s for the parked ones),
+/// then the car she drives is driven at
 /// 8 m/s into another vehicle (the first other one loaded, put 10 m ahead
 /// of it, still), 3 s. Logs `impact-check: car into car: the <a> into
 /// the <b>: N vehicle contacts heard` (the heard ones log their own
 /// `contact: the … met Vehicle(…)` lines).
 fn car_into_car(game: &mut Game, tick: f32) {
     use m2_math::glam::{Vec2, Vec3};
+    // Not at a wheel (the recipe's default spawn, no `--spawn`): she takes
+    // the nearest land vehicle that stands, once the parked ones are in.
+    if game
+        .scene
+        .player
+        .as_ref()
+        .is_some_and(|p| p.driving.is_none())
+    {
+        for _ in 0..(30.0 / tick) as u32 {
+            if !game.scene.vehicles_loading() && game.parking_done() {
+                break;
+            }
+            game.step(crate::player::Intent::default(), tick);
+        }
+        let here = game.focus();
+        let pick = game.scene.world.as_ref().and_then(|world| {
+            (game.scene.vehicles.iter().enumerate())
+                .filter(|(_, v)| !v.wrecked && !v.spec.is_boat())
+                .filter_map(|(i, v)| {
+                    let at = world.physics.vehicle_transform(v.id?)?.w_axis.truncate();
+                    Some((i, at.distance(here)))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        });
+        if let (Some(i), Some(p)) = (pick, game.scene.player.as_mut()) {
+            p.driving = Some(i);
+            p.landed = true;
+            game.take_from_driver(i);
+            eprintln!(
+                "impact-check: car into car: she takes the {} (not at a wheel)",
+                game.scene.vehicles[i].spec.label
+            );
+        }
+    }
     let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
-        eprintln!("impact-check: car into car: FAIL she drives nothing");
+        eprintln!("impact-check: car into car: FAIL she drives nothing (no land vehicle loaded)");
         return;
     };
     let Some(j) = (0..game.scene.vehicles.len()).find(|&j| {
