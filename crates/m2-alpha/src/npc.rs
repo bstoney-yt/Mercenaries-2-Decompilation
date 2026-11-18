@@ -1511,6 +1511,38 @@ pub enum Down {
 /// 1.0 at 0x820BAEE8).
 pub const VEHICLE_HIT_GIVES_AWAY: f32 = 1.0;
 
+/// A rig with no skeleton and no clips: a stand-in for checks that run
+/// people without their models (`--disguise-check`).
+pub fn empty_rig() -> Rig {
+    Rig {
+        skeleton: std::sync::Arc::new(m2_engine::Skeleton::from_nodes(&[])),
+        clips: std::sync::Arc::new(Vec::new()),
+        locomotion: None,
+        animator: m2_engine::Animator::default(),
+        gait: Gait::Idle,
+        upper: None,
+        two_handed: false,
+        aim: None,
+        hands: Default::default(),
+        sweeps: Default::default(),
+        sweep_upper: false,
+        kick: Default::default(),
+        aim_legs: false,
+        aim_walk: Default::default(),
+        lip: None,
+        shuffling: false,
+        aim_clock: 0.0,
+        cues: Vec::new(),
+        own: Default::default(),
+        foreign: Default::default(),
+        theirs: Default::default(),
+        aim_clip: None,
+        barrel: true,
+        scripted: None,
+        time_scales: Default::default(),
+    }
+}
+
 /// When someone knocked down stands up again. From the 360 code
 /// (0x8225CAE0, for a person in `KnockedDown` `Idle`): `Stand` is posted
 /// once they have been in that state longer than their time down (the
@@ -6623,7 +6655,7 @@ pub(crate) mod tests {
         // Standing well above the roof.
         assert!(!in_ram(Vec3::new(0.0, 2.5, 0.0), hull));
     }
-    use m2_engine::{Animator, CollisionShape, Skeleton, StaticKey};
+    use m2_engine::{CollisionShape, StaticKey};
     use m2_math::glam::Quat;
 
     #[test]
@@ -6752,33 +6784,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn rig() -> Rig {
-        Rig {
-            skeleton: Arc::new(Skeleton::from_nodes(&[])),
-            clips: Arc::new(Vec::new()),
-            locomotion: None,
-            animator: Animator::default(),
-            gait: Gait::Idle,
-            upper: None,
-            two_handed: false,
-            aim: None,
-            hands: Default::default(),
-            sweeps: Default::default(),
-            sweep_upper: false,
-            kick: Default::default(),
-            aim_legs: false,
-            aim_walk: Default::default(),
-            lip: None,
-            shuffling: false,
-            aim_clock: 0.0,
-            cues: Vec::new(),
-            own: Default::default(),
-            foreign: Default::default(),
-            theirs: Default::default(),
-            aim_clip: None,
-            barrel: true,
-            scripted: None,
-            time_scales: Default::default(),
-        }
+        super::empty_rig()
     }
 
     #[test]
