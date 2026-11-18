@@ -1506,6 +1506,11 @@ pub enum Down {
     Carried,
 }
 
+/// A vehicle's hit on a person of at least this much gives away the
+/// disguise of every player riding it, whoever the person (0x82445938:
+/// 1.0 at 0x820BAEE8).
+pub const VEHICLE_HIT_GIVES_AWAY: f32 = 1.0;
+
 /// When someone knocked down stands up again. From the 360 code
 /// (0x8225CAE0, for a person in `KnockedDown` `Idle`): `Stand` is posted
 /// once they have been in that state longer than their time down (the
@@ -3673,6 +3678,9 @@ pub struct People {
     /// when not known. Someone getting out of a vehicle's way looks
     /// scared for as long.
     pub threat_seconds: Option<f32>,
+    /// The cars (indices into what [`People::traffic`] was given) that hit
+    /// someone for at least [`VEHICLE_HIT_GIVES_AWAY`] since last taken.
+    pub vehicle_hits: Vec<usize>,
     /// Those the scripts keep from dying (`Object.SetUnkillable`), by
     /// spawn entity, here or still to come.
     unkillable: HashSet<u32>,
@@ -5498,7 +5506,7 @@ impl People {
         let human = m2_assets::name_hash("Human");
         let kind = m2_assets::name_hash(m2_engine::durability::RAM_KIND);
         let mut killed = 0;
-        for &(at, velocity, (lo, hi), mass) in cars {
+        for (car, &(at, velocity, (lo, hi), mass)) in cars.iter().enumerate() {
             let speed = velocity.length();
             if speed < RUN_OVER {
                 continue;
@@ -5519,6 +5527,9 @@ impl People {
                         let row = n.ai.modifier.unwrap_or(human);
                         m2_engine::durability::run_over(t, row, kind, mass, speed)
                     });
+                    if damage >= VEHICLE_HIT_GIVES_AWAY && !self.vehicle_hits.contains(&car) {
+                        self.vehicle_hits.push(car);
+                    }
                     if n.hurt(damage, push) {
                         killed += usize::from(n.soldier);
                     } else {
@@ -8662,6 +8673,9 @@ pub(crate) mod tests {
         };
         assert!(!hit.alive && hit.fling.is_some_and(|v| v.z > 10.0 && v.y > 2.0));
         assert!(ahead.alive && ahead.flee.is_some(), "dives aside");
+        // The car hit a passer-by (no faction): it counts for the
+        // disguise of whoever rides it (0x82445938).
+        assert_eq!(people.vehicle_hits, [0]);
         assert!(behind.alive && behind.flee.is_none());
         // Getting out of its way, the one ahead looks scared; the one
         // behind does not.
