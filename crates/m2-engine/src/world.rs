@@ -395,6 +395,9 @@ pub struct Templates {
     /// Each person template's face rig (a `facefxactor` asset's name
     /// hash), by id ([`crate::tuning::face_actors`]).
     pub face_actors: HashMap<u32, u32>,
+    /// Each item template's camera row's inputs, by id
+    /// ([`crate::tuning::camera_modifiers`]).
+    pub camera_modifiers: HashMap<u32, (u32, f32)>,
     /// Hand-held guns that fire rounds, by id ([`crate::tuning::hand_guns`]).
     pub guns: HashMap<u32, HandGun>,
     /// What each template's `EquipmentLink`s hand it, by id.
@@ -691,6 +694,15 @@ impl Templates {
 
     /// Template `name`'s face rig (a `facefxactor` asset's name hash),
     /// whatever its case.
+    /// Item template `name`'s camera row
+    /// ([`crate::pad_camera::camera_row`]), whatever its case.
+    pub fn camera_row(&self, name: &str) -> Option<usize> {
+        self.ids(name).iter().find_map(|id| {
+            let &(category, yaw) = self.camera_modifiers.get(id)?;
+            Some(crate::pad_camera::camera_row(category, yaw))
+        })
+    }
+
     pub fn face_actor(&self, name: &str) -> Option<u32> {
         self.ids(name)
             .iter()
@@ -1187,6 +1199,7 @@ impl Templates {
             cover_hints: crate::tuning::cover_hints(&db),
             human_sets: crate::tuning::human_animation_sets(&db),
             face_actors: crate::tuning::face_actors(&db),
+            camera_modifiers: crate::tuning::camera_modifiers(&db),
             guns: crate::tuning::hand_guns(&db),
             equipment: crate::tuning::equipment(&db),
             arms: crate::weapons::read(&db),

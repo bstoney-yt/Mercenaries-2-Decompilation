@@ -1687,6 +1687,23 @@ pub fn human_animation_sets(db: &Layer<'_>) -> HashMap<u32, (u32, u32)> {
 /// the person's record (store 0x83652B9C) +8 as that asset's name and
 /// looks it up with type 0x1CF649BB; that the record's word is this field
 /// is from samples (the field holds hashes of the rigs' asset names).
+/// Each item template's camera modifier, by id: its
+/// `HumanCameraModifier` `RotationSpeed` category and `YawSpeed`, which
+/// pick its camera row ([`crate::pad_camera::camera_row`]). From samples:
+/// every weapon's category is 3, its yaw speed 0.35 (the RPG) to 1.5 (the
+/// pistols).
+pub fn camera_modifiers(db: &Layer<'_>) -> HashMap<u32, (u32, f32)> {
+    let table = Table::new(db, "HumanCameraModifier");
+    let (category, yaw) = (name_hash("RotationSpeed"), name_hash("YawSpeed"));
+    table
+        .templates()
+        .filter_map(|t| {
+            let r = table.of_template(t).first()?;
+            Some((t, (table.word(r, category)?, table.float(r, yaw)?)))
+        })
+        .collect()
+}
+
 pub fn face_actors(db: &Layer<'_>) -> HashMap<u32, u32> {
     let systems = Table::new(db, "HumanAnimationSystem");
     let field = name_hash("facefxactor");
