@@ -171,6 +171,9 @@ pub struct Game {
     props_up: bool,
     /// The driver's throttle last tick, -1 (reverse) to 1.
     pub throttle: f32,
+    /// Her steering last tick, -1 to 1, positive to the left (the
+    /// seated driver's pose follows it: [`crate::hijack`]).
+    pub steer: f32,
     /// What stops her vehicle dead, for the log ([`crate::halt`]).
     halts: crate::halt::Halts,
     /// Seconds to the next puffs of spray off boats going fast.
@@ -320,6 +323,9 @@ pub struct Game {
     /// The horn held this tick (driving), and its presses not yet taken
     /// ([`Game::take_honks`]).
     pub honking: bool,
+    /// A semi's engine gain over its cue's
+    /// ([`crate::config::EnhancedConfig::semi_engine_gain`]).
+    pub semi_gain: f32,
     honks: u32,
     /// Her vehicle disguise ([`crate::disguise`]).
     pub disguise: crate::disguise::Disguise,
@@ -509,6 +515,7 @@ impl Game {
             arrival: None,
             props_up: false,
             throttle: 0.0,
+            steer: 0.0,
             halts: crate::halt::Halts::default(),
             spray_wait: 0.0,
             sky: AtmosphereMix::default(),
@@ -563,6 +570,7 @@ impl Game {
             pursued: false,
             honking: false,
             honks: 0,
+            semi_gain: crate::config::SEMI_ENGINE_GAIN,
             disguise: crate::disguise::Disguise::default(),
             rumble: 0.0,
             actions: Vec::new(),
@@ -1285,8 +1293,10 @@ impl Game {
                             if let Some(t) = p.turret {
                                 m.yaw = t.yaw;
                                 m.pitch = t.pitch;
+                                m.turret = crate::placed::turret(scene.source.as_mut(), &m, t);
                             }
                             m.seat = Some(p.seat);
+                            m.seat_link = Some(p.seat_link);
                             m
                         }),
                         (m, _) => m,
@@ -1395,6 +1405,7 @@ impl Game {
                                     "placed: she leaves the emplaced gun {:#x} with {} rounds",
                                     m.entity, m.rounds
                                 );
+                                scene.props.set_turned(m.entity, None);
                             }
                         }
                         // What lies within reach before any vehicle.
@@ -1629,6 +1640,7 @@ impl Game {
                     if self.honking && !was_honking {
                         self.honks += 1;
                     }
+                    self.steer = steer;
                     physics.drive(
                         id,
                         VehicleControls {
@@ -1681,7 +1693,20 @@ impl Game {
                             None => intent,
                         };
                         let waiting = !player.landed;
-                        player.update(physics, intent, dt);
+                        // Seated on it by its seat's clip, she only looks;
+                        // its turret turns after the view, at its own pace
+                        // ([`crate::combat::MannedTurret`]).
+                        if self.combat.manned.is_some() && player.seated {
+                            player.look(physics, intent, dt);
+                        } else {
+                            player.update(physics, intent, dt);
+                        }
+                        if let Some(m) = &mut self.combat.manned
+                            && let Some(t) = &mut m.turret
+                        {
+                            let nodes = t.step(player.camera_forward(), m.facing, dt);
+                            scene.props.set_turned(m.entity, Some(nodes));
+                        }
                         if waiting && player.landed && std::mem::take(&mut player.floor_landed) {
                             log_floor(&scene.props, physics, player.character.position);
                         }
@@ -2103,6 +2128,35 @@ impl Game {
                     v.most_health()
                 );
             }
+            // Vehicles running into the world (the ground, rocks, walls,
+            // buildings) are hurt as by another vehicle, by the damage
+            // table's cell for what they met.
+            let terrain = m2_assets::name_hash(m2_engine::durability::TERRAIN_KEY);
+            let crashes = {
+                let index = &world.index;
+                let props = &self.scene.props;
+                let key_of = |k: StaticKey| match k {
+                    StaticKey::Cell(_) => Some(terrain),
+                    StaticKey::Object(i) | StaticKey::Member(i, _) => index
+                        .objects
+                        .get(i)
+                        .and_then(|o| index.template_db.modifiers.get(&o.template).copied()),
+                    StaticKey::Entity(e) => props
+                        .get(e)
+                        .and_then(|(p, _)| index.template_db.modifiers.get(&p.template).copied()),
+                };
+                self.combat
+                    .world_crashes(&mut world.physics, &mut self.scene.vehicles, key_of)
+            };
+            for (i, key, closing, damage) in crashes {
+                let v = &self.scene.vehicles[i];
+                eprintln!(
+                    "crash: the {} hit {key:?} at {closing:.1} m/s, takes {damage:.1} ({:.0} of {:.0} left)",
+                    v.spec.label,
+                    (v.most_health() - v.damage).max(0.0),
+                    v.most_health()
+                );
+            }
             // What came down (to a vehicle, the traffic's too, or a blast
             // last tick) comes down whether she is on foot or the free
             // camera flies: its island copy has lost its collision already.
@@ -2495,6 +2549,7 @@ impl Game {
                     || player.driving.is_some()
                     || scene.props.get(m.entity).is_none_or(|(p, _)| p.wrecked))
             {
+                scene.props.set_turned(m.entity, None);
                 self.combat.manned = None;
             }
         }
@@ -3100,16 +3155,12 @@ impl Game {
     /// strings, once the scripts have read them).
     pub fn hud_info(&self, strings: Option<&m2_assets::StringTable>) -> HudInfo {
         let player = self.scene.player.as_ref();
+        // The island-wide tiles (nearby detail streams in quietly), its
+        // vehicles and people, or her arrival: the loading screen's.
         let loading = match &self.scene.world {
-            // The island-wide tiles; nearby detail streams in quietly.
-            Some(w) if w.stats().tiles + w.stats().failed < w.index.tiles.len() => {
-                Some("Loading the island...".to_owned())
-            }
-            Some(_) if self.scene.vehicles_loading() => {
-                Some("Finding vehicles and people...".to_owned())
-            }
-            _ if self.arrival.is_some() => Some("Arriving...".to_owned()),
-            _ => None,
+            Some(w) if w.stats().tiles + w.stats().failed < w.index.tiles.len() => true,
+            Some(_) if self.scene.vehicles_loading() => true,
+            _ => self.arrival.is_some(),
         };
         let driving = player.and_then(|p| p.driving).and_then(|i| {
             let v = self.scene.vehicles.get(i)?;
@@ -3432,19 +3483,28 @@ impl Game {
             .filter_map(|(i, v)| {
                 let set = *self.scene.engine_sets.get(&v.spec.model)?;
                 let id = v.id?;
-                let at = world.physics.vehicle_transform(id)?.w_axis.truncate();
+                let p = &world.physics;
+                let place = p.vehicle_transform(id)?;
+                let at = place.w_axis.truncate();
                 (set != 0).then_some((
                     at.distance(ear),
                     crate::sound::HeardEngine {
                         id: i,
                         at,
                         set,
-                        speed: world.physics.vehicle_speed(id),
+                        speed: p.vehicle_speed(id),
                         top: v.spec.tuning.max_speed.unwrap_or(if v.spec.tracked {
                             14.0
                         } else {
                             32.0
                         }),
+                        // As for her own engine ([`Game::engine`]).
+                        revs: p.vehicle_gear(id).map(|(_, rpm)| (rpm / 8000.0).min(1.0)),
+                        slide: p.vehicle_velocity(id).dot(place.x_axis.truncate()),
+                        surface: m2_engine::surface::tyre_class(p.vehicle_ground(id, 5.0)),
+                        braking: p.vehicle_braking(id),
+                        reversing: p.vehicle_rolling(id) < 0.0,
+                        gain: self.engine_gain(v, &world.index.template_db),
                     },
                 ))
             })
@@ -3504,7 +3564,23 @@ impl Game {
             slide,
             surface,
             braking,
+            gain: self
+                .scene
+                .world
+                .as_ref()
+                .map_or(1.0, |w| self.engine_gain(v, &w.index.template_db)),
         })
+    }
+
+    /// Vehicle `v`'s engine gain over its cue's: [`Game::semi_gain`] for
+    /// a semi (its engine bank `veh_semi`, its template's or its kind's),
+    /// else 1.
+    fn engine_gain(&self, v: &ParkedVehicle, db: &Templates) -> f32 {
+        let semi = m2_assets::name_hash("veh_semi");
+        let bank = db.engine_for_model(v.spec.model).unwrap_or_else(|| {
+            m2_assets::name_hash(crate::sound::engine_bank(&v.spec.kind, &v.spec.label))
+        });
+        if bank == semi { self.semi_gain } else { 1.0 }
     }
 
     /// The horn presses since the last call (the faction gates, the
@@ -4340,6 +4416,26 @@ fn within_bed(place: Mat4, (lo, hi): (Vec3, Vec3), bed: Vec3, c: Vec3) -> bool {
 /// run into that their weight breaks ([`Destruction::crash`]: plants,
 /// bushes, fences, lampposts, the island's and the state layers'), going
 /// on through it.
+/// A vehicle's template's `SoundKey`: the template its label names that
+/// has one, else the lowest vehicle template of its `model` that has one
+/// (a traffic or mission vehicle whose label is no template's name).
+pub(crate) fn vehicle_sound_key(db: &m2_engine::Templates, label: &str, model: u32) -> Option<u32> {
+    db.ids(label)
+        .into_iter()
+        .find_map(|t| db.sound_keys.get(&t).copied())
+        .or_else(|| {
+            let mut by_model: Vec<u32> = db
+                .infos
+                .iter()
+                .filter(|(_, i)| i.model == Some(model) && i.vehicle.is_some())
+                .map(|(&t, _)| t)
+                .filter(|t| db.sound_keys.contains_key(t))
+                .collect();
+            by_model.sort_unstable();
+            by_model.first().and_then(|t| db.sound_keys.get(t).copied())
+        })
+}
+
 fn knock_loose(
     world: &mut World,
     props: &mut Props,
@@ -4366,6 +4462,7 @@ fn knock_loose(
                 bounds: v.model.bounds,
                 velocity: Vec3::ZERO,
                 mass: v.spec.mass,
+                sound: 0,
             };
             // What stands in its box with collision, and what has none
             // (PirCon004's organ boxes: none rode, and the truck left
@@ -4424,11 +4521,14 @@ fn knock_loose(
         let Some(place) = world.physics.vehicle_transform(id) else {
             continue;
         };
+        let db = &world.index.template_db;
+        let sound = vehicle_sound_key(db, &v.spec.label, v.spec.model).unwrap_or(0);
         let crasher = Crasher {
             place,
             bounds: v.model.bounds,
             velocity: before,
             mass,
+            sound,
         };
         let keys = world.physics.vehicle_statics(id);
         let (shifted, ploughed) = run_into(
@@ -5999,6 +6099,27 @@ mod tests {
     use m2_engine::TemplateInfo;
 
     use super::*;
+
+    #[test]
+    fn a_vehicles_sound_key_is_found_by_label_else_by_model() {
+        let mut db = m2_engine::Templates::default();
+        db.names.insert(5, "veh_jeep".into());
+        db.sound_keys.insert(5, 0xa1);
+        db.infos.insert(
+            9,
+            m2_engine::TemplateInfo {
+                model: Some(0x77),
+                vehicle: Some(m2_engine::VehicleKind::Car),
+                engine: None,
+                person: false,
+                human: false,
+            },
+        );
+        db.sound_keys.insert(9, 0xb2);
+        assert_eq!(vehicle_sound_key(&db, "veh_jeep", 0x77), Some(0xa1));
+        assert_eq!(vehicle_sound_key(&db, "RTR (crappy)", 0x77), Some(0xb2));
+        assert_eq!(vehicle_sound_key(&db, "RTR (crappy)", 0x78), None);
+    }
 
     #[test]
     fn an_arrival_loads_until_its_place_is_in_or_its_time_is_up() {
