@@ -366,6 +366,9 @@ pub struct GameData {
     /// Templates' `CashValue` (`Object.GetCashValue`) by the template's
     /// name in lower case.
     pub template_cash: HashMap<String, i32>,
+    /// Templates carrying `Crusher` ([`crate::crusher`]), by name in
+    /// lower case.
+    pub template_crushers: HashMap<String, f32>,
     /// Templates' `NodeHealth` records by name in lower case
     /// ([`crate::node_damage::template_nodes`]).
     pub template_nodes: HashMap<String, crate::node_damage::TemplateNodes>,
@@ -485,6 +488,7 @@ impl GameData {
                 {
                     template_labels = labels_of(db.component("Label"));
                     data.template_cash = crate::cash::template_cash(&db);
+                    data.template_crushers = crate::crusher::template_crushers(&db);
                     data.template_children = crate::links::template_children(&db);
                     data.template_nodes = crate::node_damage::template_nodes(&db);
                     template_scripts = db.hashes("ObjectScript");
@@ -757,6 +761,7 @@ impl Mission {
             physical_links,
             template_children,
             template_cash,
+            template_crushers,
             template_nodes,
             template_names,
             template_drivers,
@@ -789,6 +794,7 @@ impl Mission {
             w.physical_links = physical_links;
             w.template_children = template_children;
             w.template_cash = template_cash;
+            w.template_crushers = template_crushers;
             w.template_nodes = template_nodes;
             w.template_names = template_names;
             w.template_drivers = template_drivers;

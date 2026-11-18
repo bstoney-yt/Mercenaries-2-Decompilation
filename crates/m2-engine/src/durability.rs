@@ -341,7 +341,7 @@ pub fn particle_keys(db: &Layer<'_>) -> HashMap<u32, u32> {
 
 /// `OSMParameter`'s value field (name unknown): with `Name` `PropTemplate`
 /// or `DebrisTemplate`, the name hash of a template.
-const OSM_VALUE: u32 = 0x255f_12c0;
+pub(crate) const OSM_VALUE: u32 = 0x255f_12c0;
 
 /// Each template's `ExplosionFudge` (field 6bcc541e, name unknown), by
 /// id: how hard blasts push its objects, of their push (322 templates,
