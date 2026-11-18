@@ -601,6 +601,31 @@ const USE_GIVE_UP: f32 = 30.0;
 
 /// Where a limp body lies: the middle of its nodes over the ground
 /// plane, at their lowest. `None` for no nodes.
+/// The way someone faces as they get up from a limp body whose nodes
+/// (world space) are `nodes`, named by `hashes`: along the ground from
+/// `Bone_Hips` to `Bone_Chest`, turned round unless they lie face down.
+///
+/// From the 360 code (the ragdoll's end, 0x824279F8): she is turned along
+/// the hips-to-chest line across the ground, the other way when a value
+/// of the ragdoll's is over -0.6 (0x820F97A4). **Inferred**: that value is
+/// how far the hips' forward (+z) points up, so lying face down (forward
+/// down) keeps the line and anything else turns it round.
+pub fn getup_yaw(nodes: &[Mat4], hashes: &[u32]) -> Option<f32> {
+    use m2_assets::ragdoll::{CHEST, HIPS};
+    let at = |h: u32| {
+        hashes
+            .iter()
+            .position(|&x| x == h)
+            .and_then(|i| nodes.get(i))
+    };
+    let (hips, chest) = (at(HIPS)?, at(CHEST)?);
+    let mut line = (chest.w_axis - hips.w_axis).truncate().with_y(0.0);
+    if hips.z_axis.y > -0.6 {
+        line = -line;
+    }
+    (line.length_squared() > 1e-8).then(|| line.x.atan2(line.z))
+}
+
 fn limp_middle(nodes: &[Mat4]) -> Option<Vec3> {
     if nodes.is_empty() {
         return None;
@@ -5364,13 +5389,20 @@ impl People {
                 && npc.alive
                 && let Some(id) = npc.ragdoll.take()
             {
-                if let Some(at) = physics.ragdoll_nodes(id).and_then(|n| limp_middle(&n)) {
+                let nodes = physics.ragdoll_nodes(id);
+                if let Some(at) = nodes.as_deref().and_then(limp_middle) {
                     let from = at + Vec3::Y;
                     let y = physics
                         .cast_ray(from, -Vec3::Y, 6.0)
                         .map_or(npc.character.position.y, |(d, _)| from.y - d + 0.05);
                     npc.character.position = Vec3::new(at.x, y, at.z);
                     npc.character.velocity = Vec3::ZERO;
+                }
+                if let Some(yaw) = nodes
+                    .as_deref()
+                    .and_then(|n| getup_yaw(n, &npc.rig.skeleton.name_hashes))
+                {
+                    npc.facing = yaw;
                 }
                 physics.remove_ragdoll(id);
             }
@@ -6475,6 +6507,31 @@ pub fn locking_launcher<'a>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Up from lying: face down (the hips' forward pointing down) they
+    /// face along the line from hips to chest; on their back, the other
+    /// way (0x820F97A4).
+    #[test]
+    fn they_get_up_facing_along_where_the_body_lay() {
+        use m2_assets::ragdoll::{CHEST, HIPS};
+        let hashes = [HIPS, CHEST];
+        let lying = |forward_y: f32| {
+            let hips = Mat4::from_cols(
+                Vec3::X.extend(0.0),
+                Vec3::Z.extend(0.0),
+                Vec3::new(0.0, forward_y, 0.0).extend(0.0),
+                Vec3::new(0.0, 0.2, 0.0).extend(1.0),
+            );
+            let chest = Mat4::from_translation(Vec3::new(0.0, 0.2, 0.5));
+            [hips, chest]
+        };
+        // Face down: along +z, hips to chest.
+        let down = getup_yaw(&lying(-1.0), &hashes).unwrap();
+        assert!(down.abs() < 1e-5, "{down}");
+        // On the back: the other way.
+        let up = getup_yaw(&lying(1.0), &hashes).unwrap();
+        assert!((up.abs() - std::f32::consts::PI).abs() < 1e-5, "{up}");
+    }
 
     #[test]
     fn the_nearest_fighting_soldier_of_its_faction_runs_to_raise_the_alarm() {
