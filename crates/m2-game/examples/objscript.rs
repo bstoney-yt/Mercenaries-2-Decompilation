@@ -309,6 +309,12 @@ fn fortress(mission: &mut Mission, guid: u32, at: [f32; 3], install: Option<&str
             "object health {health:.1}/{most:.1}, alive {alive}, nodes with health {left}/{nodes}"
         )
     };
+    // What `--part-destroy-check` falls back on while the fortress isn't
+    // in the scripts' world: its layer entity, found by its script.
+    println!(
+        "fortress layer entity: {:?}",
+        mission.entity_with_script(m2_game::mission::ISLAND_FORTRESS)
+    );
     println!("fortress {guid:#x}: {}", status(mission));
     let template = mission
         .world()

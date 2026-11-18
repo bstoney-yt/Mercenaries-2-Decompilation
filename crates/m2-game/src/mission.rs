@@ -944,6 +944,17 @@ impl Mission {
         Ok(mission)
     }
 
+    /// The first entity of any layer (loaded or not) whose object script
+    /// is `script`: its layer's name, its guid and where it stands.
+    pub fn entity_with_script(&self, script: u32) -> Option<(String, u32, [f32; 3])> {
+        self.layers.iter().find_map(|(layer, entities)| {
+            entities
+                .iter()
+                .find(|e| e.script == Some(script))
+                .map(|e| (layer.clone(), e.guid, e.at))
+        })
+    }
+
     /// Puts the layers whose names contain `part` (any case) in the world
     /// now, as if the scripts had loaded them; returns their names.
     pub fn preload(&mut self, part: &str) -> Vec<String> {
@@ -3561,6 +3572,21 @@ mod tests {
                 if guid == tree && name == "global_env_treepalm_anim")
         });
         assert!(played);
+    }
+
+    #[test]
+    fn an_entity_is_found_by_its_script_in_any_layer() {
+        let mut data = GameData::default();
+        let mut e = villa_tank();
+        e.script = Some(ISLAND_FORTRESS);
+        let (guid, at) = (e.guid, e.at);
+        data.layers.insert("vz_q3".into(), vec![e]);
+        let m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
+        assert_eq!(
+            m.entity_with_script(ISLAND_FORTRESS),
+            Some(("vz_q3".into(), guid, at))
+        );
+        assert_eq!(m.entity_with_script(0x1234), None);
     }
 
     #[test]
