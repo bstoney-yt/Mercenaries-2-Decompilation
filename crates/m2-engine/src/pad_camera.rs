@@ -479,6 +479,113 @@ pub struct CarLook {
 /// (+0x668) and pitch (+0x66C).
 pub const CAR_RATES: [f32; 2] = [2.0, 1.0];
 
+/// The car camera's pitch limits, radians below and above level: its
+/// pitch offset's (+0x610, 0x824C07F8: -1.2 and 0.25, 0x820F9364 and
+/// 0x820DABDC), which is the view's pitch (the camera turns by its
+/// negative, -(+0x62C + +0x610), the opposite way to the helicopter's):
+/// -68.8 to +14.3 degrees.
+pub const CAR_PITCH_LIMITS: [f32; 2] = [-1.2, 0.25];
+
+/// The stick's yaw input under which the car camera takes none: its
+/// square at most 0.1 (0x820BB468; 0x824C0AA0 drops it each update).
+pub const CAR_YAW_THRESHOLD: f32 = 0.316_227_77;
+
+/// The car camera's settings from its `CameraCarPreset` (placed by
+/// 0x824BFA10: `YawResetTime` at +0x658, `DefaultPitch` +0x654,
+/// `SpringStrength` +0x64C, `SpringDampening` +0x650).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CarPreset {
+    pub yaw_reset_time: f32,
+    pub default_pitch: f32,
+    pub spring_strength: f32,
+    pub spring_dampening: f32,
+}
+
+/// The look's fading back to the follow heading, seconds (+0x65C, 0.5,
+/// 0x820D9EDC by 0x824BFA10).
+pub const CAR_LOOK_FADE: f32 = 0.5;
+
+/// The car camera's drift back behind the car (0x824C0AA0, 0x824C02A8,
+/// 0x824B9B00, 0x824C07F8).
+///
+/// From the 360 code: a yaw input over [`CAR_YAW_THRESHOLD`] sets the look
+/// timer (+0x63C) to the preset's `YawResetTime` plus [`CAR_LOOK_FADE`];
+/// with none it runs down while the car goes faster than 2 m/s
+/// (0x820C77A4), or while it is over the fade (parked, it stops there:
+/// the look stays). While it runs the follow heading (+0x624) is the way
+/// the car goes; once it is out, a spring pulls the follow heading there
+/// (velocity += strength * the turn left - dampening * velocity, heading +=
+/// velocity * dt, angles wrapped). The view's yaw is the follow heading
+/// plus its own turn from it times the timer over the fade, clamped to 1,
+/// applied to the view each update: free until the fade's half second,
+/// then, compounding, back onto the follow heading within a fraction of
+/// it (a boat's `YawResetTime` 6: swung back about 6.7 s after the stick).
+///
+/// **Inferred**: the spring stepped 30 times a second (the 360 steps it
+/// once an update, its velocity's change not scaled by the time), the
+/// fade's compounding taken a step of ours at a time (the 360's an update),
+/// the parked countdown stopping at the fade itself (the 360's last step
+/// can land under it, which compounding would turn into a drift; the 360
+/// shows none parked in 5 s), and the
+/// way the car goes its heading (the 360's target turns to face back
+/// while reversing, +0x644, not ported); the air time that softens the
+/// spring (+0x640) taken as none.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CarFollow {
+    pub timer: f32,
+    pub follow: f32,
+    velocity: f32,
+    primed: bool,
+    carry: f32,
+}
+
+impl CarFollow {
+    /// The view's yaw after a step of `dt` seconds: `yaw` the view's yaw
+    /// with this step's turn, `heading` the car's, `speed` its speed (m/s,
+    /// either way), `held` whether the stick's yaw input is over
+    /// [`CAR_YAW_THRESHOLD`].
+    pub fn step(
+        &mut self,
+        p: &CarPreset,
+        yaw: f32,
+        heading: f32,
+        speed: f32,
+        held: bool,
+        dt: f32,
+    ) -> f32 {
+        use std::f32::consts::{PI, TAU};
+        let wrap = |a: f32| (a + PI).rem_euclid(TAU) - PI;
+        if !self.primed {
+            self.follow = heading;
+            self.primed = true;
+        }
+        if held {
+            self.timer = p.yaw_reset_time + CAR_LOOK_FADE;
+        } else if speed.abs() > 2.0 {
+            self.timer = (self.timer - dt).max(0.0);
+        } else if self.timer > CAR_LOOK_FADE {
+            // Parked it runs down to the fade and stops there (the 360's
+            // step can land a little under it; see the inferences).
+            self.timer = (self.timer - dt).max(CAR_LOOK_FADE);
+        }
+        if self.timer > 1e-4 {
+            self.velocity = 0.0;
+            self.follow = heading;
+        } else {
+            const STEP: f32 = 1.0 / 30.0;
+            self.carry += dt;
+            while self.carry >= STEP {
+                self.carry -= STEP;
+                let off = wrap(heading - self.follow);
+                self.velocity += p.spring_strength * off - p.spring_dampening * self.velocity;
+                self.follow = wrap(self.follow + self.velocity * STEP);
+            }
+        }
+        let k = (self.timer / CAR_LOOK_FADE).clamp(0.0, 1.0);
+        self.follow + wrap(yaw - self.follow) * k
+    }
+}
+
 impl CarLook {
     /// A step of `dt` seconds with the stick at `stick` (after
     /// [`stick`]): the yaw turned (radians, towards the stick's +x) and
@@ -486,6 +593,8 @@ impl CarLook {
     pub fn step(&mut self, stick: [f32; 2], dt: f32) -> (f32, f32) {
         let keep = |v: f32, moving: f32| if v.abs() >= 0.1 { moving } else { 0.75 };
         let [x, y] = stick;
+        // A yaw input under the threshold is none (0x824C0AA0).
+        let x = if x * x > 0.1 { x } else { 0.0 };
         self.eased[0] = approach(self.eased[0], x, keep(x, 0.825), dt);
         self.eased[1] = approach(self.eased[1], y, keep(y, 0.85), dt);
         (
@@ -520,12 +629,16 @@ mod tests {
 
     #[test]
     fn the_car_camera_turns_linearly_after_the_dead_zone() {
-        // Inside the stick's dead zone nothing; past it straight in
-        // proportion: 0.5 tilt 12.2 deg/s, 0.75 63.4, full 114.6 yaw;
-        // the pitch half that.
+        // The yaw takes nothing under 0.316 of input (0.62 of tilt);
+        // past it straight in proportion: 0.75 63.4 deg/s, full 114.6.
+        // The pitch has the stick's own dead zone only: 0.5 tilt 6.1.
         assert_eq!(car_rate([0.4, 0.0], 1.0), (0.0, 0.0));
-        let (yaw, _) = car_rate([0.5, 0.0], 1.0);
-        assert!((yaw - 12.2).abs() < 0.5, "{yaw}");
+        assert_eq!(car_rate([0.5, 0.0], 1.0), (0.0, 0.0));
+        assert_eq!(car_rate([0.6, 0.0], 1.0), (0.0, 0.0));
+        let (yaw, _) = car_rate([0.65, 0.0], 1.0);
+        assert!(yaw > 30.0, "{yaw}");
+        let (_, pitch) = car_rate([0.0, 0.5], 1.0);
+        assert!((pitch - 6.1).abs() < 0.3, "{pitch}");
         let (yaw, _) = car_rate([0.75, 0.0], 1.0);
         assert!((yaw - 63.4).abs() < 0.5, "{yaw}");
         let (yaw, _) = car_rate([1.0, 0.0], 1.0);
@@ -535,6 +648,54 @@ mod tests {
         // It eases in: the first sixth of a second well under full.
         let (yaw, _) = car_rate([1.0, 0.0], 0.1);
         assert!(yaw < 100.0, "{yaw}");
+    }
+
+    #[test]
+    fn the_car_camera_drifts_back_after_its_reset_time() {
+        // The ImpactSUT's preset: 2 s, spring 1.5 and 0.4.
+        let p = CarPreset {
+            yaw_reset_time: 2.0,
+            default_pitch: -0.2,
+            spring_strength: 1.5,
+            spring_dampening: 0.4,
+        };
+        let dt = 1.0 / 60.0;
+        let mut f = CarFollow::default();
+        // Looked a right angle off, the car driving on at 10 m/s.
+        let mut yaw = f.step(&p, 1.5, 0.0, 10.0, true, dt);
+        let at = |secs: f32, yaw: &mut f32, f: &mut CarFollow| {
+            for _ in 0..(secs / dt).round() as usize {
+                *yaw = f.step(&p, *yaw, 0.0, 10.0, false, dt);
+            }
+            *yaw
+        };
+        // Free for the 2 s, then the fade: applied to the view as it is
+        // each update, it compounds, so the view swings back within a
+        // tenth or two of a second (the 360's boat: +89 to +14 degrees in
+        // 0.25 s after its 6 s and the half second's wait).
+        assert!((at(2.0, &mut yaw, &mut f) - 1.5).abs() < 1e-3, "{yaw}");
+        let mid = at(0.1, &mut yaw, &mut f);
+        assert!(mid < 1.2 && mid > 0.3, "{mid}");
+        let end = at(0.4, &mut yaw, &mut f);
+        assert!(end.abs() < 1e-3, "{end}");
+        // Parked, the look stays.
+        let mut f = CarFollow::default();
+        let mut yaw = f.step(&p, 1.5, 0.0, 0.0, true, dt);
+        for _ in 0..600 {
+            yaw = f.step(&p, yaw, 0.0, 0.0, false, dt);
+        }
+        assert!((yaw - 1.5).abs() < 1e-4, "{yaw}");
+        // The car turns: the follow heading's spring catches up.
+        let mut f = CarFollow::default();
+        let mut yaw = f.step(&p, 0.0, 0.0, 10.0, false, dt);
+        for _ in 0..30 {
+            yaw = f.step(&p, yaw, 1.0, 10.0, false, dt);
+        }
+        assert!(yaw > 0.2 && yaw < 1.0, "{yaw}");
+        for _ in 0..600 {
+            yaw = f.step(&p, yaw, 1.0, 10.0, false, dt);
+        }
+        assert!((yaw - 1.0).abs() < 1e-2, "{yaw}");
     }
 
     /// Holding the stick at `tilt` along x (or y) for `secs` at 60 a
