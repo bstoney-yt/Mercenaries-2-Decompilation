@@ -89,6 +89,7 @@ mod keytable;
 mod ladders;
 mod loading;
 mod marker_models;
+mod mines;
 mod mission;
 mod movie;
 mod moving;
@@ -508,6 +509,10 @@ struct Options {
     /// swim her forward walking, at her pace and sprinting, logging how
     /// fast she goes (`swim-check:` lines).
     swim_check: bool,
+    /// `--mine-check`: in the mission, the nearest placed mine is blasted
+    /// by an RPG and, should it stand, run into by a jeep; logs
+    /// `mine-check:` lines ([`mines::MineCheck`]).
+    mine_check: bool,
     /// `--impact-check`: rounds struck into the ground round her, by
     /// surface ([`impact_check`]).
     impact_check: bool,
@@ -889,6 +894,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--seated" => o.seated = true,
             "--board" => o.board = true,
             "--swim-check" => o.swim_check = true,
+            "--mine-check" => {
+                o.mine_check = true;
+                o.mission = true;
+            }
             "--impact-check" => {
                 o.impact_check = true;
                 o.drive = true;
@@ -4490,7 +4499,8 @@ fn mission_for_screenshot(
         .with_skip_mode_off(options.skip_mode_off)
         .with_script_join(options.script_join)
         .with_skip_to(options.skip_to.clone())
-        .with_job_near(options.job_near);
+        .with_job_near(options.job_near)
+        .with_mine_check(options.mine_check);
     link.check_node_damage = options.check_node_damage;
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {

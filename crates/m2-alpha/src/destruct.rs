@@ -400,6 +400,10 @@ pub struct Destruction {
     /// ([`crate::combat::Combat::set_off`]): where, its template, and
     /// what its model's `CollapseState` starts (effect name hash, where).
     pub set_off: Vec<(Vec3, u32, Shows)>,
+    /// The state layers' props worn through that blew up as their
+    /// template's blast and were taken away (a placed water mine: its
+    /// script hears of its death, [`crate::mines::report`]).
+    pub blew_up: HashSet<u32>,
     /// Part states the props destroyed went to, for the scripts'
     /// `OnStateChange` ([`take_state_changes`](Self::take_state_changes)):
     /// (entity, machine, state), in order.
@@ -676,6 +680,7 @@ impl Destruction {
             eprintln!("destruct: {key:?} blows up at {centre:.1}");
             props.hide(&mut world.physics, [e]);
             self.set_off.push((centre, template, shows));
+            self.blew_up.insert(e);
             return true;
         }
         match key {
@@ -1570,6 +1575,30 @@ mod tests {
         // A crate (no such property) is shoved; a rock stands.
         assert_eq!(car.does(key, None, true), Some(Crashed::Loose(key)));
         assert_eq!(car.does(key, None, false), None);
+    }
+
+    #[test]
+    fn a_placed_mine_goes_under_any_vehicle_that_meets_it() {
+        // `Mine (Vehicle)`'s record: flattened, taking 0 kg.
+        let mine = Some(Crash {
+            how: CrashHow::Flattened,
+            takes: 0.0,
+        });
+        let key = StaticKey::Entity(0x40);
+        let bike = Crasher {
+            mass: 150.0,
+            ..jeep(Vec3::ZERO)
+        };
+        assert_eq!(bike.does(key, mine, true), Some(Crashed::Down(key)));
+        assert_eq!(bike.does(key, mine, false), Some(Crashed::Down(key)));
+        // A 40 cm mine, 10 cm high: under the nose it is met; 1.5 m to
+        // the jeep's side, or under a helicopter 10 m up, it is not.
+        let disc = (Vec3::new(-0.2, 0.0, -0.2), Vec3::new(0.2, 0.1, 0.2));
+        let under = Mat4::from_translation(Vec3::new(0.0, 0.0, 2.0));
+        assert!(jeep(Vec3::ZERO).meets(under, disc));
+        let aside = Mat4::from_translation(Vec3::new(1.5, 0.0, 0.0));
+        assert!(!jeep(Vec3::ZERO).meets(aside, disc));
+        assert!(!jeep(Vec3::Y * 10.0).meets(under, disc));
     }
 
     #[test]
