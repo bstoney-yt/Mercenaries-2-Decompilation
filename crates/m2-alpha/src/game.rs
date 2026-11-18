@@ -336,6 +336,10 @@ pub struct Game {
     /// Seconds the scripts asked her pad to shake (`Pg.Rumble`), for the
     /// pad to take.
     pub rumble: f64,
+    /// Scene vehicles that hit a person for at least
+    /// [`crate::npc::VEHICLE_HIT_GIVES_AWAY`] since the mission last took
+    /// them (her disguise).
+    pub vehicles_hit_someone: Vec<usize>,
     /// Keyed actions the scripts asked for (`Human.DoAction`: the player's
     /// verify photo `VerifyCamera`), each with its seconds left, ended for the
     /// scripts' `HumanActionComplete` ([`crate::mission`]).
@@ -579,6 +583,7 @@ impl Game {
             semi_gain: crate::config::SEMI_ENGINE_GAIN,
             disguise: crate::disguise::Disguise::default(),
             rumble: 0.0,
+            vehicles_hit_someone: Vec::new(),
             actions: Vec::new(),
             scripts_seated: false,
         }
@@ -2393,21 +2398,27 @@ impl Game {
                 focus,
                 dt,
             );
-            let cars: Vec<_> = self
+            let (cars, which): (Vec<_>, Vec<usize>) = self
                 .scene
                 .vehicles
                 .iter()
-                .filter_map(|v| {
+                .enumerate()
+                .filter_map(|(i, v)| {
                     let id = v.id?;
                     let at = world.physics.vehicle_transform(id)?;
                     let velocity = world.physics.vehicle_velocity(id);
-                    Some((at, velocity, v.spec.hull, v.spec.mass))
+                    Some(((at, velocity, v.spec.hull, v.spec.mass), i))
                 })
-                .collect();
+                .unzip();
             let run_over = self
                 .scene
                 .people
                 .traffic(&cars, self.combat.damage_table.as_ref());
+            // The cars that hit someone, as scene vehicles, for her
+            // disguise ([`crate::npc::VEHICLE_HIT_GIVES_AWAY`]).
+            let hits = std::mem::take(&mut self.scene.people.vehicle_hits);
+            self.vehicles_hit_someone
+                .extend(hits.into_iter().filter_map(|c| which.get(c).copied()));
             if run_over > 0 {
                 eprintln!("run over: {run_over} soldier(s) killed by a vehicle");
             }

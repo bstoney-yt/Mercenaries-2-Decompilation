@@ -229,6 +229,9 @@ m2-alpha [options]
                          against the 360's 9.0 m/s^2: a block dropped 20 m,
                          the vehicle she gets in driven off a 10 m ledge,
                          a parked boat settling on still water; PASS/FAIL
+  --disguise-check       check: (offscreen) her vehicle disguise: a VZ jeep
+                         she rides hits a passer-by at 10 m/s and gives it
+                         away; parked, it holds; PASS/FAIL
   --stagger-check        check: (on foot) her stagger's exemptions on her own
                          clips: a blast behind her staggers her standing,
                          not aimed in, not while invincible; a bash aimed

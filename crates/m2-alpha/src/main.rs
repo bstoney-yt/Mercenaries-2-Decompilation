@@ -311,6 +311,9 @@ struct Options {
     gravity_check: bool,
     /// `--stagger-check`: her stagger's exemptions ([`stagger_check`]).
     stagger_check: bool,
+    /// `--disguise-check`: her vehicle disguise and a run-over
+    /// ([`disguise_check`]).
+    disguise_check: bool,
     /// With `--screenshot` on foot: hits she takes just before the
     /// picture, from these directions (degrees clockwise from where the
     /// camera looks), to see the HUD's hit arcs.
@@ -1068,6 +1071,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.drive = true;
             }
             "--stagger-check" => o.stagger_check = true,
+            "--disguise-check" => o.disguise_check = true,
             "--look-pickup" => {
                 o.look_pickup = Some(value()?.parse().context("--look-pickup expects metres")?)
             }
@@ -2406,6 +2410,8 @@ fn screenshot(
         )?;
     } else if options.stagger_check && game.on_foot && game.scene.player.is_some() {
         stagger_check(&mut game);
+    } else if options.disguise_check {
+        disguise_check();
     } else if options.shuffle_test && game.on_foot && game.scene.player.is_some() {
         shuffle_test(&mut game);
     } else if options.fight && game.on_foot && game.scene.player.is_some() {
@@ -7135,6 +7141,80 @@ fn stagger_check(game: &mut Game) {
     p.aiming = false;
     p.forget_stagger();
     eprintln!("stagger-check: {}", if all { "PASS" } else { "FAIL" });
+}
+
+/// `--disguise-check`: her vehicle disguise against a run-over, on the
+/// game's own people and disguise code, offscreen: disguised as the VZ in
+/// their vehicle (scene vehicle 0), the car hits a passer-by of no
+/// faction at 10 m/s ([`crate::npc::People::traffic`]); the hit is
+/// counted for the vehicle she rides and gives the disguise away
+/// ([`crate::npc::VEHICLE_HIT_GIVES_AWAY`], 0x82445938). Control: a
+/// parked car hits nobody and the disguise holds. Prints a line each and
+/// PASS or FAIL.
+fn disguise_check() -> bool {
+    use crate::disguise::{Disguise, Tick};
+    use crate::npc::{Brain, Npc, People};
+    use m2_math::glam::{Mat4, Vec3};
+    let bounds = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.5, 2.0));
+    let run = |speed: f32| -> (bool, bool) {
+        let mut people = People::default();
+        let mut n = Npc::new(
+            0,
+            &crate::npc::empty_rig(),
+            Vec3::new(0.3, 0.0, 1.5),
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(9),
+        );
+        n.landed = true;
+        n.soldier = false;
+        n.faction = None;
+        people.npcs.push(n);
+        people.traffic(
+            &[(Mat4::IDENTITY, Vec3::new(0.0, 0.0, speed), bounds, 1500.0)],
+            None,
+        );
+        let ran_over = people.vehicle_hits.contains(&0);
+        let mut d = Disguise::default();
+        let tick = |hurt| Tick {
+            enabled: true,
+            vehicle: Some(0),
+            faction: Some("Vza"),
+            honks: 0,
+            near: 0,
+            hurt_someone: hurt,
+        };
+        d.update(tick(false), 1.0 / 60.0);
+        let holds = d.update(tick(ran_over), 1.0 / 60.0).is_some_and(|(_, h)| h);
+        (ran_over, holds)
+    };
+    let mut all = true;
+    for (what, speed, want_hit, want_holds) in [
+        (
+            "disguised in a VZ jeep at 10 m/s into a passer-by",
+            10.0,
+            true,
+            false,
+        ),
+        (
+            "disguised in a VZ jeep, parked by a passer-by",
+            0.0,
+            false,
+            true,
+        ),
+    ] {
+        let (hit, holds) = run(speed);
+        let ok = hit == want_hit && holds == want_holds;
+        all &= ok;
+        eprintln!(
+            "disguise-check: {what}: {}, disguise {}: {}",
+            if hit { "hit" } else { "no hit" },
+            if holds { "holds" } else { "given away" },
+            if ok { "PASS" } else { "FAIL" }
+        );
+    }
+    eprintln!("disguise-check: {}", if all { "PASS" } else { "FAIL" });
+    all
 }
 
 fn homing_check(game: &mut Game, tick: f32) {
@@ -12029,5 +12109,14 @@ mod gravity_check_tests {
         let t = super::free_fall_seconds(20.0).unwrap();
         let want = (2.0 * 20.0 / m2_engine::physics::WORLD_GRAVITY).sqrt();
         assert!((t - want).abs() < 0.05, "{t} vs {want}");
+    }
+}
+
+#[cfg(test)]
+mod disguise_check_tests {
+    /// The `--disguise-check` cases pass on the game's own code.
+    #[test]
+    fn the_disguise_check_passes() {
+        assert!(super::disguise_check());
     }
 }

@@ -2854,6 +2854,11 @@ impl MissionLink {
             _ => 0,
         };
         let enabled = mission.world().borrow().vehicle_disguise;
+        // The vehicle she rides hit someone, anyone, for at least 1: the
+        // 360 gives away the disguise of every player riding it
+        // (0x82445938 → 0x824457F8).
+        let ran_over = riding.is_some_and(|i| game.vehicles_hit_someone.contains(&i));
+        game.vehicles_hit_someone.clear();
         let state = game.disguise.update(
             crate::disguise::Tick {
                 enabled,
@@ -2861,7 +2866,7 @@ impl MissionLink {
                 faction,
                 honks,
                 near,
-                hurt_someone: hurt_someone && riding.is_some(),
+                hurt_someone: (hurt_someone && riding.is_some()) || ran_over,
             },
             dt,
         );
