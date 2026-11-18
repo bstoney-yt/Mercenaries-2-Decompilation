@@ -1113,6 +1113,9 @@ pub struct ScriptWorld {
     pub script_removals: Vec<(u32, u32)>,
     /// Templates' cash values by name in lower case ([`crate::cash`]).
     pub template_cash: HashMap<String, i32>,
+    /// Templates carrying `Crusher` ([`crate::crusher`]), by name in
+    /// lower case.
+    pub template_crushers: HashMap<String, f32>,
     /// Templates' `NodeHealth` records by name in lower case, and the
     /// node tables built from them, by object ([`crate::node_damage`]).
     pub template_nodes: HashMap<String, Vec<m2_engine::node_health::NodeRecord>>,

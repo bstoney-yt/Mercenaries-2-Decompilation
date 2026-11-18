@@ -4186,9 +4186,11 @@ impl Combat {
     /// the floor turns her survival mode on (0x8243AED8(player, 1, 1));
     /// with it off, survival mode cuts a hit someone dealt
     /// (`attacked`) to [`SURVIVAL_DAMAGE`]. The floor itself is applied
-    /// by the caller.
-    fn survival_damage(&mut self, damage: f32, attacked: bool) -> f32 {
-        if self.health_clamp {
+    /// by the caller. A hit from a crusher (`crushed`: its template
+    /// carries `Crusher`, table 0x83655CC8, [`m2_game::crusher`]) is
+    /// neither held by the clamp nor starts survival mode.
+    fn survival_damage(&mut self, damage: f32, attacked: bool, crushed: bool) -> f32 {
+        if self.health_clamp && !crushed {
             if self.hp - damage < self.clamp_floor() && !self.survival {
                 eprintln!("combat: survival mode on (the clamp caught a hit)");
                 self.survival = true;
@@ -4202,23 +4204,38 @@ impl Combat {
     }
 
     fn hurt_player(&mut self, f: &mut Field<'_>, damage: f32, from: Option<Vec3>) -> f32 {
+        self.hurt_player_as(f, damage, from, false)
+    }
+
+    /// Hurts her by a crusher's hit (falling debris whose template carries
+    /// `Crusher`): from the 360 code (0x822889F8), past the health clamp
+    /// and without starting survival mode. Nothing in the port drops
+    /// debris on her yet; this is where such a hit goes.
+    pub fn hurt_player_crushed(&mut self, f: &mut Field<'_>, damage: f32, from: Vec3) -> f32 {
+        self.hurt_player_as(f, damage, Some(from), true)
+    }
+
+    fn hurt_player_as(
+        &mut self,
+        f: &mut Field<'_>,
+        damage: f32,
+        from: Option<Vec3>,
+        crushed: bool,
+    ) -> f32 {
         if self.down > 0.0 || self.invincible {
             return 0.0;
         }
-        let damage = self.survival_damage(damage, from.is_some());
+        let damage = self.survival_damage(damage, from.is_some(), crushed);
         // Kept for the HUD; only the latest if nothing reads them.
         if self.hurts.len() >= MAX_HURTS {
             self.hurts.remove(0);
         }
         self.hurts.push((damage, from));
         self.quiet = 0.0;
+        let clamp = self.health_clamp && !crushed;
         let floor = if self.unkillable_her {
-            crate::npc::UNKILLABLE_FLOOR.max(if self.health_clamp {
-                self.clamp_floor()
-            } else {
-                0.0
-            })
-        } else if self.health_clamp {
+            crate::npc::UNKILLABLE_FLOOR.max(if clamp { self.clamp_floor() } else { 0.0 })
+        } else if clamp {
             self.clamp_floor()
         } else {
             0.0
@@ -7200,6 +7217,79 @@ fn lock_share(held: f32, time: f32) -> f32 {
     }
 }
 
+/// `--survival-check`: her health clamp and survival mode as the 360's
+/// health change has them (0x822889F8), run on the game's own code with
+/// one player: the clamp holds a hit at 3 and starts survival; a
+/// crusher's hit goes past the clamp and does not; with the clamp off,
+/// survival cuts a hit someone dealt to a tenth. Prints a line each and
+/// PASS or FAIL; returns whether all passed.
+pub fn survival_check() -> bool {
+    let mut physics = Physics::new();
+    let mut player = Player::new(0.0, 0.0, 0.0, None);
+    let mut people = People::default();
+    let arsenal = Arsenal::default();
+    let mut vehicles = Vec::new();
+    let mut explosives = [];
+    let mut field = Field {
+        physics: &mut physics,
+        player: &mut player,
+        people: &mut people,
+        vehicles: &mut vehicles,
+        arsenal: &arsenal,
+        explosives: &mut explosives,
+    };
+    let verdict = |ok: bool| if ok { "PASS" } else { "FAIL" };
+    let mut all = true;
+    let mut clamped = Combat {
+        hp: 20.0,
+        max_hp: 120.0,
+        health_clamp: true,
+        ..Combat::default()
+    };
+    clamped.hurt_player(&mut field, 50.0, Some(Vec3::ZERO));
+    let ok = clamped.hp == 3.0 && clamped.survival;
+    all &= ok;
+    println!(
+        "survival-check: clamp on, 20 hp, a 50 hit from someone: {} hp, survival {}: {}",
+        clamped.hp,
+        if clamped.survival { "on" } else { "off" },
+        verdict(ok)
+    );
+    field.player.down = false;
+    let mut crushed = Combat {
+        hp: 20.0,
+        max_hp: 120.0,
+        health_clamp: true,
+        ..Combat::default()
+    };
+    crushed.hurt_player_crushed(&mut field, 50.0, Vec3::ZERO);
+    let ok = crushed.hp <= 0.0 && !crushed.survival;
+    all &= ok;
+    println!(
+        "survival-check: clamp on, 20 hp, a 50 hit from a crusher: {} hp, survival {}: {}",
+        crushed.hp,
+        if crushed.survival { "on" } else { "off" },
+        verdict(ok)
+    );
+    field.player.down = false;
+    let mut cut = Combat {
+        hp: 8.0,
+        max_hp: 120.0,
+        survival: true,
+        ..Combat::default()
+    };
+    cut.hurt_player(&mut field, 30.0, Some(Vec3::ZERO));
+    let ok = (cut.hp - 5.0).abs() < 1e-4;
+    all &= ok;
+    println!(
+        "survival-check: survival on, clamp off, 8 hp, a 30 hit from someone: {} hp: {}",
+        cut.hp,
+        verdict(ok)
+    );
+    println!("survival-check: {}", verdict(all));
+    all
+}
+
 #[cfg(test)]
 mod tests {
     /// A knockdown's length is spread by the engine's own random draws
@@ -8381,6 +8471,11 @@ mod tests {
 
     /// From the 360 code (0x822889F8): with the clamp off, survival mode
     /// cuts hits someone dealt to a tenth; a fall still does it all.
+    #[test]
+    fn the_survival_check_passes() {
+        assert!(super::survival_check());
+    }
+
     #[test]
     fn survival_mode_cuts_hits_from_others() {
         let mut c = Combat {
