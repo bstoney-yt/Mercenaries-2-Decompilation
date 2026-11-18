@@ -76,5 +76,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+    // Rounds striking things (0x8235E190): the rounds' keys (each gun's
+    // ammunition's template's) against people's, vehicles', objects' and
+    // the ground's.
+    let rounds: BTreeSet<u32> = db
+        .leavings
+        .ammo
+        .values()
+        .filter_map(|a| db.sound_keys.get(a).copied())
+        .collect();
+    let people: BTreeSet<u32> = db
+        .infos
+        .iter()
+        .filter(|(_, i)| i.person)
+        .filter_map(|(t, _)| db.sound_keys.get(t).copied())
+        .collect();
+    println!(
+        "round SoundKeys: {} ({} the table's own); people's: {}",
+        rounds.len(),
+        rounds.iter().filter(|&&k| table.has(k)).count(),
+        people.len()
+    );
+    for (what, struck) in [
+        ("people", &people),
+        ("vehicles", &vehicles),
+        ("placed objects", &objects),
+        ("ground words", &ground),
+    ] {
+        for damaging in [false, true] {
+            let pairs: Vec<(u32, u32)> = struck
+                .iter()
+                .flat_map(|&s| rounds.iter().map(move |&r| (s, r)))
+                .collect();
+            let heard = pairs
+                .iter()
+                .filter(|&&(s, r)| table.contact_cue(s, r, damaging).is_some())
+                .count();
+            println!(
+                "rounds on {what}: {} pairs: {heard} with a cue, damaging {damaging}",
+                pairs.len()
+            );
+        }
+    }
     Ok(())
 }
