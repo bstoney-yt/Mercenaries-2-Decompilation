@@ -1248,6 +1248,7 @@ impl Destruction {
                     "destruct: {k:#x}'s part {:08x} goes off in {:08x}",
                     c.machine, c.state
                 );
+                props.send_off(&mut world.physics, k, c.machine);
                 continue;
             }
             let entity = if adopted(k) {
@@ -1267,6 +1268,7 @@ impl Destruction {
             );
             self.state_changes.push((entity, c.machine, c.state));
         }
+        props.part_changes_done();
         // The island's objects broken a part at a time whose props have
         // loaded: the island's copy and its collision go, the prop stands
         // with those parts broken (and its others in the way).

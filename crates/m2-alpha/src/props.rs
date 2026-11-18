@@ -79,6 +79,8 @@ struct PropModel {
     gpu: GpuModel,
     collision: Option<CollisionShape>,
     breakup: Option<Arc<Breakup>>,
+    /// The parts its states send off ([`m2_engine::node_debris`]).
+    node_pieces: Option<Arc<m2_engine::node_debris::NodePieces>>,
     /// For a merged batch (a `TINY` model), the entities it is made of: it
     /// isn't drawn while any of them is shown on its own.
     members: Vec<u32>,
@@ -195,6 +197,16 @@ pub struct Props {
     /// entity, where its template says ([`m2_engine::durability::piece_masses`]):
     /// its model's pieces otherwise weigh as stone of their size.
     piece_mass: HashMap<u32, f32>,
+    /// The parts each prop has sent off: the piece (of its model's
+    /// [`m2_engine::node_debris::NodePieces`]), its body and where the
+    /// body started.
+    sent_off: HashMap<u32, Vec<(usize, DebrisId, Mat4)>>,
+    /// What brought each state-driven prop down ([`state_driven`]): the
+    /// parts its states send off as they take the destroying message go
+    /// on with it ([`Props::part_changes_done`] forgets it).
+    wreck_push: HashMap<u32, Hit>,
+    /// The props whose part changes were last taken.
+    changes_taken: Vec<u32>,
     /// How hard blasts push each prop, of their push, by entity, where its
     /// template says (`ExplosionFudge`).
     fudge: HashMap<u32, f32>,
@@ -478,6 +490,7 @@ impl Props {
         if self.presets.is_none() {
             self.presets = Some(db.presets.clone());
         }
+
         if let Some(&kg) = db.piece_masses.get(&o.template) {
             self.piece_mass.insert(e, kg);
         }
@@ -959,7 +972,11 @@ impl Props {
                 _ => Sinking::under(),
             };
             self.sinking.insert(entity, sinking);
-            if let Some(breakup) = m.breakup.as_deref()
+            // Its parts go off as its part states send them
+            // ([`Props::send_off`]), not all at once.
+            if state_driven(m) {
+                self.wreck_push.insert(entity, hit);
+            } else if let Some(breakup) = m.breakup.as_deref()
                 && !self.knocked.contains_key(&entity)
             {
                 let breakup = &weighed(breakup, self.piece_mass.get(&entity).copied());
@@ -1040,9 +1057,18 @@ impl Props {
         true
     }
 
-    /// Whether `entity` broke apart (its pieces thrown).
+    /// Whether `entity` broke apart (its pieces thrown, or a state-driven
+    /// model wrecked, its parts sent off as its states send them).
     pub fn broke_apart(&self, entity: u32) -> bool {
         self.broken.contains_key(&entity)
+            || self.shown.get(&entity).is_some_and(|p| {
+                p.wrecked
+                    && self
+                        .models
+                        .get(&p.model)
+                        .and_then(Option::as_ref)
+                        .is_some_and(state_driven)
+            })
     }
 
     /// Moves `entity` (the scripts placed it elsewhere).
@@ -1765,6 +1791,7 @@ impl Props {
                 gpu,
                 collision: cpu.collision,
                 breakup: cpu.breakup,
+                node_pieces: cpu.node_pieces,
                 members,
                 gate,
             }),
@@ -1873,11 +1900,98 @@ impl Props {
         }
     }
 
+    /// Part `name` (its node's name hash) of `entity` goes off as an
+    /// object of its own, its state's `CreateObject`
+    /// ([`m2_engine::node_debris`]): its node's own `PHY2` dynamic body
+    /// (shape, mass, material: the model's loose piece on that node) leaves
+    /// the prop from where it stands, drawn with the node and those under
+    /// it, which the prop no longer shows. At rest, unless it goes on the
+    /// frame the prop was brought down, when the blast or the vehicle
+    /// that brought it down sends it on as the breakup's pieces are
+    /// ([`state_driven`]). True if it went.
+    pub fn send_off(&mut self, physics: &mut Physics, entity: u32, name: u32) -> bool {
+        let Some(p) = self.shown.get(&entity) else {
+            return false;
+        };
+        let Some(m) = self.models.get(&p.model).and_then(Option::as_ref) else {
+            return false;
+        };
+        let (Some(pieces), Some(loose)) = (
+            m.node_pieces.clone(),
+            m.collision.as_ref().and_then(|c| c.loose.clone()),
+        ) else {
+            return false;
+        };
+        let Some(k) = pieces.pieces.iter().position(|q| q.name == name) else {
+            return false;
+        };
+        if self
+            .sent_off
+            .get(&entity)
+            .is_some_and(|s| s.iter().any(|s| s.0 == k))
+        {
+            return false;
+        }
+        let Some(idx) = sent_piece(&loose, &pieces.pieces[k]) else {
+            return false;
+        };
+        let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+        let piece = &loose.pieces[idx];
+        let start = loose.starts(placed)[idx];
+        let corners = corners(start, piece);
+        let fudge = self.fudge.get(&entity).copied().unwrap_or(1.0);
+        let (velocity, spin) = match self.wreck_push.get(&entity) {
+            Some(Hit::Blast(Some(b), scale)) => launch(&corners, *b, scale * fudge),
+            Some(Hit::Crash(v, w)) => (*v, *w),
+            _ => (Vec3::ZERO, Vec3::ZERO),
+        };
+        let lift = Mat4::from_translation(Vec3::Y * buried(physics, &corners));
+        let body = physics.add_rubble(piece, lift * start, velocity, spin);
+        eprintln!(
+            "props: {entity:#x}'s part {name:08x} goes off as an object of its own ({:.0} kg, \
+             {} nodes) at {:.1} m/s",
+            piece.mass,
+            pieces.pieces[k].nodes.iter().filter(|&&n| n).count(),
+            velocity.length()
+        );
+        self.sent_off
+            .entry(entity)
+            .or_default()
+            .push((k, body, lift * start));
+        self.changed();
+        true
+    }
+
+    /// The nodes `entity` has sent off ([`send_off`](Self::send_off)), if
+    /// any: hidden on it.
+    fn sent_off_hidden(&self, entity: u32, m: &PropModel) -> Option<Vec<bool>> {
+        let sent = self.sent_off.get(&entity)?;
+        let pieces = m.node_pieces.as_ref()?;
+        let mut hidden = vec![false; pieces.rest.len()];
+        for &(k, _, _) in sent {
+            for (h, &n) in hidden.iter_mut().zip(&pieces.pieces[k].nodes) {
+                *h |= n;
+            }
+        }
+        Some(hidden)
+    }
+
     /// The part machines' changes since last asked ([`destroy_parts`]).
     ///
     /// [`destroy_parts`]: Self::destroy_parts
     pub fn take_part_changes(&mut self) -> Vec<(u32, m2_engine::part_runner::Change)> {
-        std::mem::take(&mut self.part_changes)
+        let changes = std::mem::take(&mut self.part_changes);
+        self.changes_taken = changes.iter().map(|c| c.0).collect();
+        changes
+    }
+
+    /// The part changes last taken are dealt with: what brought those
+    /// props down pushes nothing they send off later (a burning palm's
+    /// leaves falling once the fire has burnt them).
+    pub fn part_changes_done(&mut self) {
+        for e in std::mem::take(&mut self.changes_taken) {
+            self.wreck_push.remove(&e);
+        }
     }
 
     /// Plays material animation `anim` on `entity` (the scripts'
@@ -1939,6 +2053,19 @@ impl Props {
                     .unwrap_or_default();
                 m.gpu.set_surfaces(&surfaces);
             }
+            if let (Some(sent), Some(pieces)) = (self.sent_off.get(e), m.node_pieces.as_ref()) {
+                let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+                for &(k, body, start) in sent {
+                    if let Some(place) = physics.debris_place(body)
+                        && place.w_axis.truncate().distance(eye) <= limit
+                    {
+                        // Its nodes moved as its body has from where it started.
+                        let moved = place * start.inverse() * placed;
+                        m.gpu
+                            .draw_flying(queue, moved, &pieces.rest, &pieces.pieces[k].nodes);
+                    }
+                }
+            }
             let moved = match (self.broken.get(e), self.knocked.get(e)) {
                 (Some(pieces), _) => Some((m.breakup.as_deref().map(|b| &b.pieces), pieces)),
                 (None, Some(pieces)) => Some((self.loose(*e), pieces)),
@@ -1991,8 +2118,19 @@ impl Props {
             ) {
                 (Some(nodes), _) => m.gpu.draw_moved(queue, at, nodes, false, &[]),
                 // Some parts broken, the rest standing.
-                (None, Some(down)) if !p.wrecked => m.gpu.draw_hiding(queue, at, &down.hidden),
-                _ => m.gpu.draw_as(queue, at, p.wrecked),
+                (None, Some(down)) if !p.wrecked => {
+                    let mut hidden = down.hidden.clone();
+                    if let Some(sent) = self.sent_off_hidden(*e, m) {
+                        for (h, s) in hidden.iter_mut().zip(sent) {
+                            *h |= s;
+                        }
+                    }
+                    m.gpu.draw_hiding(queue, at, &hidden)
+                }
+                _ => match self.sent_off_hidden(*e, m).filter(|_| !p.wrecked) {
+                    Some(hidden) => m.gpu.draw_hiding(queue, at, &hidden),
+                    None => m.gpu.draw_as(queue, at, p.wrecked),
+                },
             }
             self.draw_sinking(queue, *e, m, at);
         }
@@ -2252,6 +2390,50 @@ fn launch(corners: &[Vec3; 8], push: BlastPush, scale: f32) -> (Vec3, Vec3) {
 
 /// A number from -0.5 to 0.5 for piece `i`, `k`th of its kind: the same
 /// every time, different for each.
+/// Whether model `m` breaks up as its part states send its parts off
+/// ([`Props::send_off`]) rather than all at once: every piece its
+/// breakup has lies in a part its states send off, and each of those
+/// parts has a `PHY2` body of its own to go as.
+fn state_driven(m: &PropModel) -> bool {
+    let (Some(pieces), Some(breakup), Some(loose)) = (
+        m.node_pieces.as_deref(),
+        m.breakup.as_deref(),
+        m.collision.as_ref().and_then(|c| c.loose.as_deref()),
+    ) else {
+        return false;
+    };
+    covers(pieces, breakup.pieces.pieces.iter().filter_map(|q| q.node))
+        && pieces.pieces.iter().all(|q| sent_piece(loose, q).is_some())
+}
+
+/// Whether every node of `chunks` lies in one of `pieces`' parts.
+fn covers(
+    pieces: &m2_engine::node_debris::NodePieces,
+    mut chunks: impl Iterator<Item = u16>,
+) -> bool {
+    chunks.all(|n| {
+        pieces
+            .pieces
+            .iter()
+            .any(|q| q.nodes.get(usize::from(n)).copied().unwrap_or(false))
+    })
+}
+
+/// The loose piece (a `PHY2` dynamic body) a part sent off goes as: the
+/// one on its node, else the first on a node under it.
+fn sent_piece(loose: &m2_engine::Loose, part: &m2_engine::node_debris::NodePiece) -> Option<usize> {
+    let on = |q: &m2_engine::LoosePiece| q.node;
+    loose
+        .pieces
+        .iter()
+        .position(|q| on(q) == Some(part.node))
+        .or_else(|| {
+            loose.pieces.iter().position(|q| {
+                on(q).is_some_and(|n| part.nodes.get(usize::from(n)).copied().unwrap_or(false))
+            })
+        })
+}
+
 fn scatter(i: u32, k: u32) -> f32 {
     let x = i.wrapping_mul(0x9e37_79b9) ^ k.wrapping_mul(0x85eb_ca6b);
     let x = (x ^ (x >> 15)).wrapping_mul(0x2c1b_3c6d);
@@ -2289,6 +2471,9 @@ impl Loaders {
                                     let mut cpu = CpuModel::from_data(&data, 0)?;
                                     let parsed = data.parse()?;
                                     cpu.breakup = Breakup::of(&parsed, 0).map(Arc::new);
+                                    cpu.node_pieces =
+                                        m2_engine::node_debris::NodePieces::of(&parsed)
+                                            .map(Arc::new);
                                     cpu.decode_textures(source, MODEL_TEXTURE_WIDTH);
                                     // A merged batch is in no one's way: its
                                     // members are, as their own props (the
@@ -2338,6 +2523,31 @@ impl Loaders {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_model_breaks_up_by_its_states_only_where_its_parts_hold_every_chunk() {
+        use m2_engine::node_debris::{NodePiece, NodePieces};
+        // Nodes 0..6: the parts sent off are node 2 (with 3 under it) and
+        // node 5.
+        let part = |node: u16, nodes: [bool; 6]| NodePiece {
+            name: u32::from(node),
+            node,
+            nodes: nodes.to_vec(),
+            bounds: None,
+        };
+        let pieces = NodePieces {
+            pieces: vec![
+                part(2, [false, false, true, true, false, false]),
+                part(5, [false, false, false, false, false, true]),
+            ],
+            rest: vec![Mat4::IDENTITY; 6],
+        };
+        // Chunks on 3 and 5: both in parts sent off (a palm, a wall).
+        assert!(covers(&pieces, [3u16, 5].into_iter()));
+        // A chunk on 4 no part takes (a warehouse's): it keeps breaking up
+        // all at once.
+        assert!(!covers(&pieces, [3u16, 4, 5].into_iter()));
+    }
 
     /// A gate the scripts open swings open over its time and stands in
     /// nobody's way meanwhile; shut, it swings back and stands in the way
