@@ -376,6 +376,8 @@ pub struct Pad {
     /// from the stick ([`m2_engine::pad_camera`]).
     pub sensitivity: Option<f32>,
     pub camera: m2_engine::pad_camera::LookCamera,
+    /// A car's or a boat's chase camera's look ([`Mode::Car`]).
+    pub car_camera: m2_engine::pad_camera::CarLook,
     /// She is aiming in: the camera's aimed presets.
     pub aiming: bool,
     /// The held item's camera row ([`m2_engine::pad_camera::camera_row`]),
@@ -598,6 +600,14 @@ impl Pad {
         if mode == Mode::OnFoot {
             let (yaw, pitch) = self.look_on_foot(&s, dt as f32);
             input.pad_turn(yaw, pitch);
+        } else if mode == Mode::Car {
+            // As the 360's car camera turns: the camera's own dead zone,
+            // eased, linear ([`m2_engine::pad_camera::CarLook`]).
+            let [x, y] = s.right_raw;
+            let y = if self.invert { -y } else { y };
+            let stick = m2_engine::pad_camera::stick(x, y);
+            let (yaw, pitch) = self.car_camera.step(stick, dt as f32);
+            input.pad_turn(f64::from(yaw), f64::from(pitch));
         } else {
             let [rx, ry] = s.right;
             let ry = if self.invert { -ry } else { ry };
@@ -1083,17 +1093,27 @@ mod tests {
         let (_, pitch) = input.take_pad_turn();
         assert!(pitch < 0.0, "{pitch}");
         pad.invert = false;
-        // In a vehicle the stick turns as before: squared, times the
-        // pause menu's look speed.
+        // At a car's wheel the stick is the 360's car camera's: eased,
+        // linear, past its dead zone, a turn right.
+        let right = PadState {
+            right_raw: [1.0, 0.0],
+            ..PadState::default()
+        };
+        pad.feed(&mut input, right, Mode::Car, 1.0 / 60.0);
+        let (yaw, pitch) = input.take_pad_turn();
+        assert!(yaw > 0.0 && pitch == 0.0, "{yaw} {pitch}");
+        assert_eq!(input.take_pad_look(), (0.0, 0.0));
+        // In a tank (and a helicopter) the stick turns as before:
+        // squared, times the pause menu's look speed.
         let s = PadState {
             right: [0.5, 0.0],
             ..PadState::default()
         };
-        pad.feed(&mut input, s, Mode::Car, 0.5);
+        pad.feed(&mut input, s, Mode::Tank, 0.5);
         let (dx, dy) = input.take_pad_look();
         assert!((dx - 0.25 * LOOK_RATE * 0.5).abs() < 1e-9 && dy == 0.0);
         pad.look = Some(2.0);
-        pad.feed(&mut input, s, Mode::Car, 0.5);
+        pad.feed(&mut input, s, Mode::Tank, 0.5);
         let (dx, _) = input.take_pad_look();
         assert!((dx - 0.25 * LOOK_RATE).abs() < 1e-9, "{dx}");
         pad.look = None;

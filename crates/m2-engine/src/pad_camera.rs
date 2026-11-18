@@ -451,9 +451,91 @@ impl LookCamera {
     }
 }
 
+/// A car's (and a boat's) chase camera's stick look, as the 360's
+/// (the `CameraCarPreset` camera, class 0x820F01F0, built by 0x824BFA10
+/// from the seat's `CameraCarPresetLink` preset, 0x8243EAC0).
+///
+/// From the 360 code: its handler (0x824C0DF0) keeps the look-yaw input
+/// (the stick's x, after [`stick`]) at +0x604 and the look-pitch (its y)
+/// at +0x600. Each update (0x824C0518) eases each toward its input,
+/// keeping 0.75 (0x820CAF1C) of the last, or past 0.1 (0x820BB468) of
+/// input 0.825 for yaw (0x820F8CB0) and 0.85 for pitch (0x820D2F64): no
+/// curve. The yaw turns at 2 radians a second times its eased input
+/// (+0x668, 2.0 from 0x820C77A4 by 0x824BFA10; 0x824C07F8) and the pitch
+/// offset at 1 (+0x66C), held to -1.2 (0x820F9364) to 0.25 (0x820DABDC).
+///
+/// **Inferred**: the easing taken a sixtieth of a second at a time (the
+/// 360 eases once an update), and the pitch's sign (the stick's up looks
+/// up, as on foot). **Not ported**: its own drift back behind the car
+/// (`YawResetTime`, 0x824C02A8; the alpha's chase camera keeps its own)
+/// and the first-person views.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CarLook {
+    /// The eased yaw and pitch inputs (+0x630, +0x634).
+    pub eased: [f32; 2],
+}
+
+/// The car camera's turn rates at full input, radians a second: yaw
+/// (+0x668) and pitch (+0x66C).
+pub const CAR_RATES: [f32; 2] = [2.0, 1.0];
+
+impl CarLook {
+    /// A step of `dt` seconds with the stick at `stick` (after
+    /// [`stick`]): the yaw turned (radians, towards the stick's +x) and
+    /// the pitch moved (radians, towards its +y).
+    pub fn step(&mut self, stick: [f32; 2], dt: f32) -> (f32, f32) {
+        let keep = |v: f32, moving: f32| if v.abs() >= 0.1 { moving } else { 0.75 };
+        let [x, y] = stick;
+        self.eased[0] = approach(self.eased[0], x, keep(x, 0.825), dt);
+        self.eased[1] = approach(self.eased[1], y, keep(y, 0.85), dt);
+        (
+            CAR_RATES[0] * self.eased[0] * dt,
+            CAR_RATES[1] * self.eased[1] * dt,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The car camera held at `tilt` along x (or y) for `secs`: degrees
+    /// a second over the last half second.
+    fn car_rate(tilt: [f32; 2], secs: f32) -> (f32, f32) {
+        let mut c = CarLook::default();
+        let dt = 1.0 / 60.0;
+        let n = (secs / dt).round() as usize;
+        let window = n.min(30);
+        let (mut yaw, mut pitch) = (0.0, 0.0);
+        for i in 0..n {
+            let (a, b) = c.step(stick(tilt[0], tilt[1]), dt);
+            if i >= n - window {
+                yaw += a;
+                pitch += b;
+            }
+        }
+        let span = window as f32 * dt;
+        (yaw.to_degrees() / span, pitch.to_degrees() / span)
+    }
+
+    #[test]
+    fn the_car_camera_turns_linearly_after_the_dead_zone() {
+        // Inside the stick's dead zone nothing; past it straight in
+        // proportion: 0.5 tilt 12.2 deg/s, 0.75 63.4, full 114.6 yaw;
+        // the pitch half that.
+        assert_eq!(car_rate([0.4, 0.0], 1.0), (0.0, 0.0));
+        let (yaw, _) = car_rate([0.5, 0.0], 1.0);
+        assert!((yaw - 12.2).abs() < 0.5, "{yaw}");
+        let (yaw, _) = car_rate([0.75, 0.0], 1.0);
+        assert!((yaw - 63.4).abs() < 0.5, "{yaw}");
+        let (yaw, _) = car_rate([1.0, 0.0], 1.0);
+        assert!((yaw - 114.6).abs() < 0.5, "{yaw}");
+        let (_, pitch) = car_rate([0.0, 1.0], 1.0);
+        assert!((pitch - 57.3).abs() < 0.5, "{pitch}");
+        // It eases in: the first sixth of a second well under full.
+        let (yaw, _) = car_rate([1.0, 0.0], 0.1);
+        assert!(yaw < 100.0, "{yaw}");
+    }
 
     /// Holding the stick at `tilt` along x (or y) for `secs` at 60 a
     /// second: the rate over the last half second, degrees a second (the
