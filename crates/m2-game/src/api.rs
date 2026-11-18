@@ -1747,11 +1747,19 @@ impl ScriptWorld {
         };
         let (at, riding) = (Vec3::from(her.position), her.vehicle);
         for (g, o) in &mut self.objects {
-            let wake = o.hibernation_distance();
             if o.vehicle.is_some() {
                 self.riders.push(*g);
             }
-            if Some(*g) == self.player
+            // Whether it would sleep or wake, first: few do in a tick, and
+            // only those need the checks of who keeps theirs (look-ups in
+            // the carried weapons and the fresh spawns, which cost a 1440p
+            // story tick more than all the rest of the pass).
+            let wake = o.hibernation_distance();
+            let d = Vec3::from(o.position).distance(at);
+            let sleeps = o.awake && d > wake + HIBERNATION_MARGIN;
+            let wakes = !o.awake && d <= wake;
+            if !(sleeps || wakes)
+                || Some(*g) == self.player
                 || Some(*g) == riding
                 || (FIRST_TEMPLATE..FIRST_SPAWNED).contains(g)
                 || self.inventory.carried.contains_key(g)
@@ -1759,12 +1767,7 @@ impl ScriptWorld {
             {
                 continue;
             }
-            let d = Vec3::from(o.position).distance(at);
-            if o.awake && d > wake + HIBERNATION_MARGIN {
-                o.awake = false;
-            } else if !o.awake && d <= wake {
-                o.awake = true;
-            }
+            o.awake = wakes;
         }
     }
 }
@@ -6095,6 +6098,89 @@ mod tests {
         w.objects.get_mut(&1).unwrap().position = [far - 10.0, 0.0, 0.0];
         w.update_hibernation();
         assert!(w.is_awake(50));
+    }
+
+    /// The hibernation pass as it was before it tested the distance
+    /// first, over a copy of the objects, kept to check the new one
+    /// against.
+    fn hibernation_as_before(
+        w: &ScriptWorld,
+        objects: &mut HashMap<u32, Object>,
+        fresh: &[u32],
+    ) -> Vec<u32> {
+        let mut riders = Vec::new();
+        let her = w.player.and_then(|p| objects.get(&p)).unwrap();
+        let (at, riding) = (Vec3::from(her.position), her.vehicle);
+        for (g, o) in objects.iter_mut() {
+            let wake = o.hibernation_distance();
+            if o.vehicle.is_some() {
+                riders.push(*g);
+            }
+            if Some(*g) == w.player
+                || Some(*g) == riding
+                || (FIRST_TEMPLATE..FIRST_SPAWNED).contains(g)
+                || w.inventory.carried.contains_key(g)
+                || fresh.contains(g)
+            {
+                continue;
+            }
+            let d = Vec3::from(o.position).distance(at);
+            if o.awake && d > wake + HIBERNATION_MARGIN {
+                o.awake = false;
+            } else if !o.awake && d <= wake {
+                o.awake = true;
+            }
+        }
+        riders
+    }
+
+    #[test]
+    fn hibernation_wakes_and_sleeps_the_same_objects_as_before() {
+        let (_host, world) = setup();
+        let mut w = world.borrow_mut();
+        // Objects at every distance, awake or not, some riding, some
+        // templates, some just spawned, and her in a vehicle.
+        let mut seed = 12345u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            seed >> 8
+        };
+        for i in 0..3000u32 {
+            let g = match i % 7 {
+                0 => FIRST_TEMPLATE + i,
+                _ => 1000 + i,
+            };
+            let r = next() as f32 / (1 << 24) as f32;
+            let mut o = Object::new(
+                "thing",
+                [r * 600.0 - 300.0, 0.0, (next() % 600) as f32 - 300.0],
+            );
+            o.awake = next() % 2 == 0;
+            if next() % 11 == 0 {
+                o.vehicle = Some(50);
+            }
+            if next() % 13 == 0 {
+                o.hibernation_distance = Some((next() % 400) as u16);
+            }
+            w.objects.insert(g, o);
+        }
+        w.objects.get_mut(&1).unwrap().vehicle = Some(50);
+        for step in 0..5 {
+            w.fresh = (0..40).map(|i| 1000 + i * 37 + step).collect();
+            let mut before = w.objects.clone();
+            let fresh = w.fresh.clone();
+            let riders = hibernation_as_before(&w, &mut before, &fresh);
+            w.update_hibernation();
+            assert_eq!(riders, w.riders, "step {step}");
+            let changed = w
+                .objects
+                .iter()
+                .filter(|(g, o)| o.awake != before[*g].awake)
+                .count();
+            assert_eq!(changed, 0, "step {step}");
+            // Move her for the next round.
+            w.objects.get_mut(&1).unwrap().position[0] += 90.0;
+        }
     }
 
     #[test]
