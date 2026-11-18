@@ -1111,6 +1111,8 @@ pub struct MissionLink {
     /// Interface sounds the scripts cued (`ui_HUD_Objective_New`), and
     /// whether each is to stop instead.
     sounds: Vec<(String, bool)>,
+    /// `--mine-check` ([`crate::mines::MineCheck`]).
+    mine_check: Option<crate::mines::MineCheck>,
     /// Sound category fades and pitches the scripts asked for.
     fades: Vec<crate::sound::CategoryChange>,
     /// The music cue the scripts last switched to (`Some(None)`: none).
@@ -1301,6 +1303,7 @@ impl MissionLink {
             hushed: Vec::new(),
             voice_banks: Vec::new(),
             sounds: Vec::new(),
+            mine_check: None,
             fades: Vec::new(),
             music: None,
             music_at: None,
@@ -1586,6 +1589,13 @@ impl MissionLink {
     /// The job she was skipped to, and where it stands.
     pub fn job(&self) -> Option<&crate::jobs::JobRun> {
         self.job.as_ref()
+    }
+
+    /// `--mine-check`: the nearest placed mine is blasted and run into
+    /// ([`crate::mines::MineCheck`]).
+    pub fn with_mine_check(mut self, on: bool) -> Self {
+        self.mine_check = on.then(crate::mines::MineCheck::default);
+        self
     }
 
     /// With a job to follow: she is put this far from its nearest target
@@ -2844,6 +2854,11 @@ impl MissionLink {
             _ => 0,
         };
         let enabled = mission.world().borrow().vehicle_disguise;
+        // The vehicle she rides hit someone, anyone, for at least 1: the
+        // 360 gives away the disguise of every player riding it
+        // (0x82445938 → 0x824457F8).
+        let ran_over = riding.is_some_and(|i| game.vehicles_hit_someone.contains(&i));
+        game.vehicles_hit_someone.clear();
         let state = game.disguise.update(
             crate::disguise::Tick {
                 enabled,
@@ -2851,7 +2866,7 @@ impl MissionLink {
                 faction,
                 honks,
                 near,
-                hurt_someone: hurt_someone && riding.is_some(),
+                hurt_someone: (hurt_someone && riding.is_some()) || ran_over,
             },
             dt,
         );
@@ -3690,6 +3705,11 @@ impl MissionLink {
                     mission.kill(e);
                 }
             }
+            // Placed mines run into or blasted, her mines armed.
+            crate::mines::report(game, mission);
+            if let Some(check) = &mut self.mine_check {
+                check.tick(game, mission, STEP);
+            }
             self.blasts.clear();
             self.bombs.clear();
             // The scripts heal her and watch her health.
@@ -3921,10 +3941,23 @@ impl MissionLink {
                     // `RiseFromYourGrave`): she gets up where they put her.
                     Command::Revive { guid, health } if *guid == PLAYER => {
                         eprintln!(
-                            "death: the scripts revive her with {health:.1} at {:.0} (the                              sickbay's RiseFromYourGrave)",
+                            "death: the scripts revive her with {health:.1} at {:.0} (the sickbay's RiseFromYourGrave)",
                             game.focus()
                         );
                         game.combat.revive_hp = Some(*health);
+                    }
+                    Command::SurvivalMode { on, beat } => {
+                        eprintln!("mission: survival mode {on}");
+                        if *on != game.combat.survival {
+                            eprintln!(
+                                "combat: survival mode {} (the scripts)",
+                                if *on { "on" } else { "off" }
+                            );
+                            // The beat flag goes with a change only
+                            // (0x8243AED8).
+                            game.combat.survival_beat = *beat;
+                        }
+                        game.combat.survival = *on;
                     }
                     Command::SetHealth { guid, health } if *guid == PLAYER => {
                         eprintln!(
@@ -4100,6 +4133,17 @@ impl MissionLink {
                     && what.starts_with("Explosion (Bunker Buster")
                 {
                     self.bombs.push(Vec3::from(*position));
+                }
+                // An explosion the scripts spawn (a mine's) goes off there.
+                if let Command::Spawn { what, position, .. } = &c
+                    && let Some(blast) = game
+                        .scene
+                        .world
+                        .as_ref()
+                        .and_then(|w| crate::mines::explosion_blast(&w.index.template_db, what))
+                {
+                    eprintln!("mission: the scripts set off {what} at {position:.1?}");
+                    game.combat.set_off(Vec3::from(*position), Some(blast));
                 }
                 if c == Command::Notify("Pg.ContractCompleted".into()) {
                     self.completed = Some(0.0);

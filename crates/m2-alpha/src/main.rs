@@ -90,6 +90,7 @@ mod keytable;
 mod ladders;
 mod loading;
 mod marker_models;
+mod mines;
 mod mission;
 mod movie;
 mod moving;
@@ -250,6 +251,9 @@ struct Options {
     /// With `--drive` and `--wreck` or `--shoot-up`: get out of the wreck,
     /// walk to the fuel can it left and take it (testing).
     fuel_check: bool,
+    /// `--survival-check`: her health clamp and survival mode on the
+    /// game's own code, offscreen ([`combat::survival_check`]); then exit.
+    survival_check: bool,
     /// With `--drive`: stop and put this many rifle rounds into its parts.
     shoot_up: Option<u32>,
     /// With `--drive`: fire from the next seat with a weapon.
@@ -306,6 +310,11 @@ struct Options {
     homing_check: bool,
     /// `--gravity-check`: measure the physics world's gravity ([`gravity_check`]).
     gravity_check: bool,
+    /// `--stagger-check`: her stagger's exemptions ([`stagger_check`]).
+    stagger_check: bool,
+    /// `--disguise-check`: her vehicle disguise and a run-over
+    /// ([`disguise_check`]).
+    disguise_check: bool,
     /// With `--screenshot` on foot: hits she takes just before the
     /// picture, from these directions (degrees clockwise from where the
     /// camera looks), to see the HUD's hit arcs.
@@ -509,6 +518,10 @@ struct Options {
     /// swim her forward walking, at her pace and sprinting, logging how
     /// fast she goes (`swim-check:` lines).
     swim_check: bool,
+    /// `--mine-check`: in the mission, the nearest placed mine is blasted
+    /// by an RPG and, should it stand, run into by a jeep; logs
+    /// `mine-check:` lines ([`mines::MineCheck`]).
+    mine_check: bool,
     /// `--impact-check`: rounds struck into the ground round her, by
     /// surface ([`impact_check`]).
     impact_check: bool,
@@ -793,6 +806,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--plough" => o.plough = Some(value()?.to_ascii_lowercase()),
             "--wreck" => o.wreck = true,
             "--fuel-check" => o.fuel_check = true,
+            "--survival-check" => o.survival_check = true,
             "--shoot-up" => {
                 o.shoot_up = Some(
                     value()?
@@ -894,6 +908,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--seated" => o.seated = true,
             "--board" => o.board = true,
             "--swim-check" => o.swim_check = true,
+            "--mine-check" => {
+                o.mine_check = true;
+                o.mission = true;
+            }
             "--impact-check" => {
                 o.impact_check = true;
                 o.drive = true;
@@ -1057,6 +1075,8 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.gravity_check = true;
                 o.drive = true;
             }
+            "--stagger-check" => o.stagger_check = true,
+            "--disguise-check" => o.disguise_check = true,
             "--look-pickup" => {
                 o.look_pickup = Some(value()?.parse().context("--look-pickup expects metres")?)
             }
@@ -1392,6 +1412,10 @@ fn run(
 ) -> anyhow::Result<()> {
     spans::start_profiler();
     let mut options = parse_args(args)?;
+    if options.survival_check {
+        combat::survival_check();
+        return Ok(());
+    }
     let ignored = screenshot_only_ignored(args);
     if !ignored.is_empty() {
         eprintln!(
@@ -2476,6 +2500,10 @@ fn screenshot(
             stage,
             options.fight_wait,
         )?;
+    } else if options.stagger_check && game.on_foot && game.scene.player.is_some() {
+        stagger_check(&mut game);
+    } else if options.disguise_check {
+        disguise_check();
     } else if options.shuffle_test && game.on_foot && game.scene.player.is_some() {
         shuffle_test(&mut game);
     } else if options.fight && game.on_foot && game.scene.player.is_some() {
@@ -4582,7 +4610,8 @@ fn mission_for_screenshot(
         .with_skip_mode_off(options.skip_mode_off)
         .with_script_join(options.script_join)
         .with_skip_to(options.skip_to.clone())
-        .with_job_near(options.job_near);
+        .with_job_near(options.job_near)
+        .with_mine_check(options.mine_check);
     link.check_node_damage = options.check_node_damage;
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
@@ -7182,6 +7211,129 @@ const HOMING_CHECK_SECONDS: f32 = 60.0;
 /// launcher up, and the run waits up to [`HOMING_CHECK_SECONDS`] for his
 /// lock, his shot and its hit. Logs `homing-check: PASS ...` or
 /// `homing-check: FAIL <why>`.
+/// `--stagger-check`: her stagger as the 360's picker (0x824220B0) has it
+/// for a player, run on her own clips: a grenade's blast behind her
+/// staggers her standing (control); not aimed in (`Crouched`); not while
+/// invincible (`Object.GetInvincible`, 0x8228CB80); a bash aimed in
+/// still does. Prints a line each and PASS or FAIL.
+fn stagger_check(game: &mut Game) {
+    use m2_engine::stagger::Event;
+    use m2_math::glam::Vec3;
+    let Some(p) = game.scene.player.as_mut() else {
+        eprintln!("stagger-check: FAIL no player");
+        return;
+    };
+    let blast = Event {
+        direction: Vec3::new(p.facing.sin(), 0.0, p.facing.cos()),
+        direct: false,
+        melee: false,
+        key: Some(m2_assets::name_hash("Explosion")),
+    };
+    let bash = Event {
+        direction: -Vec3::new(p.facing.sin(), 0.0, p.facing.cos()),
+        direct: true,
+        melee: true,
+        key: None,
+    };
+    let cases: [(&str, &Event, bool, bool, bool); 4] = [
+        ("standing, a blast behind her", &blast, false, false, true),
+        ("aimed in, a blast behind her", &blast, true, false, false),
+        ("invincible, a blast behind her", &blast, false, true, false),
+        ("aimed in, a bash from ahead", &bash, true, false, true),
+    ];
+    let mut all = true;
+    for (what, event, aimed, invincible, want) in cases {
+        p.forget_stagger();
+        p.aiming = aimed;
+        let got = p.stagger(event, invincible);
+        let ok = got == want;
+        all &= ok;
+        eprintln!(
+            "stagger-check: {what}: {}, want {}: {}",
+            if got { "staggers" } else { "no stagger" },
+            if want { "staggers" } else { "no stagger" },
+            if ok { "PASS" } else { "FAIL" }
+        );
+    }
+    p.aiming = false;
+    p.forget_stagger();
+    eprintln!("stagger-check: {}", if all { "PASS" } else { "FAIL" });
+}
+
+/// `--disguise-check`: her vehicle disguise against a run-over, on the
+/// game's own people and disguise code, offscreen: disguised as the VZ in
+/// their vehicle (scene vehicle 0), the car hits a passer-by of no
+/// faction at 10 m/s ([`crate::npc::People::traffic`]); the hit is
+/// counted for the vehicle she rides and gives the disguise away
+/// ([`crate::npc::VEHICLE_HIT_GIVES_AWAY`], 0x82445938). Control: a
+/// parked car hits nobody and the disguise holds. Prints a line each and
+/// PASS or FAIL.
+fn disguise_check() -> bool {
+    use crate::disguise::{Disguise, Tick};
+    use crate::npc::{Brain, Npc, People};
+    use m2_math::glam::{Mat4, Vec3};
+    let bounds = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.5, 2.0));
+    let run = |speed: f32| -> (bool, bool) {
+        let mut people = People::default();
+        let mut n = Npc::new(
+            0,
+            &crate::npc::empty_rig(),
+            Vec3::new(0.3, 0.0, 1.5),
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(9),
+        );
+        n.landed = true;
+        n.soldier = false;
+        n.faction = None;
+        people.npcs.push(n);
+        people.traffic(
+            &[(Mat4::IDENTITY, Vec3::new(0.0, 0.0, speed), bounds, 1500.0)],
+            None,
+        );
+        let ran_over = people.vehicle_hits.contains(&0);
+        let mut d = Disguise::default();
+        let tick = |hurt| Tick {
+            enabled: true,
+            vehicle: Some(0),
+            faction: Some("Vza"),
+            honks: 0,
+            near: 0,
+            hurt_someone: hurt,
+        };
+        d.update(tick(false), 1.0 / 60.0);
+        let holds = d.update(tick(ran_over), 1.0 / 60.0).is_some_and(|(_, h)| h);
+        (ran_over, holds)
+    };
+    let mut all = true;
+    for (what, speed, want_hit, want_holds) in [
+        (
+            "disguised in a VZ jeep at 10 m/s into a passer-by",
+            10.0,
+            true,
+            false,
+        ),
+        (
+            "disguised in a VZ jeep, parked by a passer-by",
+            0.0,
+            false,
+            true,
+        ),
+    ] {
+        let (hit, holds) = run(speed);
+        let ok = hit == want_hit && holds == want_holds;
+        all &= ok;
+        eprintln!(
+            "disguise-check: {what}: {}, disguise {}: {}",
+            if hit { "hit" } else { "no hit" },
+            if holds { "holds" } else { "given away" },
+            if ok { "PASS" } else { "FAIL" }
+        );
+    }
+    eprintln!("disguise-check: {}", if all { "PASS" } else { "FAIL" });
+    all
+}
+
 fn homing_check(game: &mut Game, tick: f32) {
     use m2_math::glam::Vec3;
     let Some(world) = game.scene.world.as_ref() else {
@@ -7463,7 +7615,7 @@ fn drive_for_screenshot(
         return Ok(());
     }
     if options.impact_check {
-        impact_check(game);
+        impact_check(game, tick);
         return Ok(());
     }
     if let Some(hold) = options.ladder_check {
@@ -8421,7 +8573,7 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 /// own pick did (`by its own pick`); then the vehicles' crash cues the
 /// sound table gives for every pair of the scene's vehicles. For the
 /// impact tables (#684): grass, dirt and water are seldom struck in play.
-fn impact_check(game: &mut Game) {
+fn impact_check(game: &mut Game, tick: f32) {
     use m2_math::glam::Vec3;
     use std::collections::BTreeMap;
     let here = game.focus();
@@ -8476,6 +8628,99 @@ fn impact_check(game: &mut Game) {
         "impact-check: {} surface words met, {} decided by the table",
         by.len(),
         by.values().filter(|v| v.1 > 0).count()
+    );
+    car_into_car(game, tick);
+}
+
+/// `--impact-check`'s car-into-car hit: she takes the nearest land
+/// vehicle if she is at no wheel (waiting up to 30 s for the parked ones),
+/// then the car she drives is driven at
+/// 8 m/s into another vehicle (the first other one loaded, put 10 m ahead
+/// of it, still), 3 s. Logs `impact-check: car into car: the <a> into
+/// the <b>: N vehicle contacts heard` (the heard ones log their own
+/// `contact: the … met Vehicle(…)` lines).
+fn car_into_car(game: &mut Game, tick: f32) {
+    use m2_math::glam::{Vec2, Vec3};
+    // Not at a wheel (the recipe's default spawn, no `--spawn`): she takes
+    // the nearest land vehicle that stands, once the parked ones are in.
+    if game
+        .scene
+        .player
+        .as_ref()
+        .is_some_and(|p| p.driving.is_none())
+    {
+        for _ in 0..(30.0 / tick) as u32 {
+            if !game.scene.vehicles_loading() && game.parking_done() {
+                break;
+            }
+            game.step(crate::player::Intent::default(), tick);
+        }
+        let here = game.focus();
+        let pick = game.scene.world.as_ref().and_then(|world| {
+            (game.scene.vehicles.iter().enumerate())
+                .filter(|(_, v)| !v.wrecked && !v.spec.is_boat())
+                .filter_map(|(i, v)| {
+                    let at = world.physics.vehicle_transform(v.id?)?.w_axis.truncate();
+                    Some((i, at.distance(here)))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        });
+        if let (Some(i), Some(p)) = (pick, game.scene.player.as_mut()) {
+            p.driving = Some(i);
+            p.landed = true;
+            game.take_from_driver(i);
+            eprintln!(
+                "impact-check: car into car: she takes the {} (not at a wheel)",
+                game.scene.vehicles[i].spec.label
+            );
+        }
+    }
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("impact-check: car into car: FAIL she drives nothing (no land vehicle loaded)");
+        return;
+    };
+    let Some(j) = (0..game.scene.vehicles.len()).find(|&j| {
+        j != i && !game.scene.vehicles[j].wrecked && !game.scene.vehicles[j].spec.is_boat()
+    }) else {
+        eprintln!("impact-check: car into car: FAIL no other vehicle loaded");
+        return;
+    };
+    let (Some(world), Some(a)) = (game.scene.world.as_mut(), game.scene.vehicles[i].id) else {
+        return;
+    };
+    let Some(at) = world.physics.vehicle_transform(a) else {
+        return;
+    };
+    let ahead = at
+        .transform_vector3(Vec3::Z)
+        .with_y(0.0)
+        .normalize_or(Vec3::Z);
+    let yaw = ahead.x.atan2(ahead.z);
+    let spot = at.w_axis.truncate() + ahead * 10.0 + Vec3::Y * 0.5;
+    let v = &mut game.scene.vehicles[j];
+    if let Some(id) = v.id.take() {
+        world.physics.remove_vehicle(id);
+    }
+    v.id = Some(world.physics.add_vehicle(&v.spec, spot, yaw));
+    let before = game.combat.vehicle_contacts_heard;
+    for _ in 0..(3.0 / tick) as u32 {
+        let speed = game
+            .scene
+            .world
+            .as_ref()
+            .map_or(0.0, |w| w.physics.vehicle_speed(a));
+        let intent = crate::player::Intent {
+            movement: Vec2::new(0.0, if speed < 8.0 { 1.0 } else { 0.0 }),
+            ..crate::player::Intent::default()
+        };
+        game.step(intent, tick);
+    }
+    eprintln!(
+        "impact-check: car into car: the {} into the {}: {} vehicle contacts heard",
+        game.scene.vehicles[i].spec.label,
+        game.scene.vehicles[j].spec.label,
+        game.combat.vehicle_contacts_heard - before
     );
 }
 
@@ -12074,5 +12319,14 @@ mod gravity_check_tests {
         let t = super::free_fall_seconds(20.0).unwrap();
         let want = (2.0 * 20.0 / m2_engine::physics::WORLD_GRAVITY).sqrt();
         assert!((t - want).abs() < 0.05, "{t} vs {want}");
+    }
+}
+
+#[cfg(test)]
+mod disguise_check_tests {
+    /// The `--disguise-check` cases pass on the game's own code.
+    #[test]
+    fn the_disguise_check_passes() {
+        assert!(super::disguise_check());
     }
 }

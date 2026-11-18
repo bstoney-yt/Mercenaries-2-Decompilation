@@ -36,6 +36,7 @@ use crate::script::{ScriptError, ScriptHost};
 
 mod ammo;
 mod homing;
+mod mines;
 pub use homing::{ANTI_AIR, HOMING_MISSILE, HomingKind, HomingPost};
 
 /// The script that starts the game (`Init`, then `LoadGame`).
@@ -365,6 +366,9 @@ pub struct GameData {
     /// Templates' `CashValue` (`Object.GetCashValue`) by the template's
     /// name in lower case.
     pub template_cash: HashMap<String, i32>,
+    /// Templates carrying `Crusher` ([`crate::crusher`]), by name in
+    /// lower case.
+    pub template_crushers: HashMap<String, f32>,
     /// Templates' `NodeHealth` records by name in lower case
     /// ([`crate::node_damage::template_nodes`]).
     pub template_nodes: HashMap<String, Vec<m2_engine::node_health::NodeRecord>>,
@@ -484,6 +488,7 @@ impl GameData {
                 {
                     template_labels = labels_of(db.component("Label"));
                     data.template_cash = crate::cash::template_cash(&db);
+                    data.template_crushers = crate::crusher::template_crushers(&db);
                     data.template_children = crate::links::template_children(&db);
                     data.template_nodes = crate::node_damage::template_nodes(&db);
                     template_scripts = db.hashes("ObjectScript");
@@ -756,6 +761,7 @@ impl Mission {
             physical_links,
             template_children,
             template_cash,
+            template_crushers,
             template_nodes,
             template_names,
             template_drivers,
@@ -788,6 +794,7 @@ impl Mission {
             w.physical_links = physical_links;
             w.template_children = template_children;
             w.template_cash = template_cash;
+            w.template_crushers = template_crushers;
             w.template_nodes = template_nodes;
             w.template_names = template_names;
             w.template_drivers = template_drivers;
@@ -3228,7 +3235,10 @@ fn seat_crew(
 /// `C4` and `beacon` are the scripts of her stuck C4 and of the Beacon
 /// Designator's beacon light: they blink and, a second on, beep until
 /// they go ([`Mission::ammo_spawned`]).
-pub const OBJECT_SCRIPTS: [(&str, u32); 24] = [
+///
+/// `mine` and `proximitymine` are the placed mines' and her planted
+/// mine's ([`Mission::placed_mines`]).
+pub const OBJECT_SCRIPTS: [(&str, u32); 26] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3247,6 +3257,8 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 24] = [
     ("HomingMissile", homing::HOMING_MISSILE),
     ("C4", ammo::C4),
     ("beacon", ammo::BEACON),
+    ("mine", mines::MINE),
+    ("proximitymine", mines::PROXIMITY_MINE),
     ("autogunship", AUTOGUNSHIP),
     ("tree_2dc6b6ed", TREE_SCRIPTS[0]),
     ("tree_e16dfae5", TREE_SCRIPTS[1]),
