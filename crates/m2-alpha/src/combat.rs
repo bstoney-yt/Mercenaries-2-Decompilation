@@ -4185,10 +4185,20 @@ impl Combat {
     /// (an `Explosive`: 7 m, `MaxForce` 300); a blast pushes what it
     /// reaches by the Havok explosion action the explosion record makes
     /// (0x82291B88 -> vtable 0x820C79B0 slot 5, 0x82154F60 ->
-    /// 0x8215C110; the push 0x8215CBC8). Inferred: that it pushes her, put
-    /// out, as a body of her capsule's box (it gives the footage's arc
-    /// under the world's gravity: [`crate::player::Player::throw`]); from
-    /// the wreck state's own effect, where its node is.
+    /// 0x8215C110, run by 0x8215C560). A person (body kind 1) is pushed
+    /// through her own physics object (component 0x8365726C): where she
+    /// has an impulse handler (component 0x8365849C) by 0x8215CA38, an
+    /// impulse of `MaxForce` x her `ExplosionFudge` x
+    /// `max(1 - d / Radius, MinForceFalloff)` x 150 (0x820EBF4C) along
+    /// her way from the blast across the ground plus as much up,
+    /// normalised, at a random point of her body (0.5 m either way across,
+    /// up to 1.75 m up: 0x824281C8), handed to that handler (vfunc 0x3C,
+    /// not traced); else by the rigid bodies' push (0x8215CBC8). Inferred:
+    /// the velocity it gives her, taken as the rigid bodies' push on her
+    /// capsule's box ([`wreck_throw`]: the same 45 degrees up), which
+    /// gives the footage's arc under the world's gravity
+    /// ([`crate::player::Player::throw`]); from the wreck state's own
+    /// effect, where its node is.
     fn her_vehicle_wrecked(&mut self, f: &mut Field<'_>) {
         let Some(i) = f.player.driving else {
             return;
