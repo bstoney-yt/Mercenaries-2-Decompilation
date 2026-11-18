@@ -69,6 +69,9 @@ pub struct Check {
     /// Where she was last put ashore, and how many times she has been.
     put_at: Option<m2_math::glam::Vec3>,
     puts: u32,
+    /// Where she was put ashore and wasn't on dry ground after: not
+    /// tried again ([`ParadropCheck::failed`]).
+    failed: Vec<m2_math::glam::Vec3>,
     done: bool,
 }
 
@@ -84,6 +87,11 @@ impl Check {
     /// Play put her ashore at `to` as [`Ask::Ashore`] asked (`None`: no
     /// dry ground within reach). She is given [`LAND_TIME`] to land there
     /// before the next ask, which then reports where she is.
+    /// The spots she was put ashore on and wasn't on dry ground after.
+    pub fn failed(&self) -> &[m2_math::glam::Vec3] {
+        &self.failed
+    }
+
     pub fn put_ashore(&mut self, to: Option<m2_math::glam::Vec3>) {
         match to {
             Some(at) => {
@@ -127,15 +135,18 @@ impl Check {
                 // Put ashore before and still not on dry ground: once she
                 // has had time to land there, that put failed.
                 if let Some(at) = self.put_at.take() {
+                    self.failed.push(at);
                     eprintln!(
-                        "paradrop-check: put ashore at {at:.0} but she is at {her:.0}                          (landed {}, in water {})",
+                        "paradrop-check: put ashore at {at:.0} but she is at {her:.0} \
+                         (landed {}, in water {})",
                         player.landed,
                         water(her)
                     );
                 }
                 if self.puts >= MOST_PUTS {
                     eprintln!(
-                        "paradrop-check: FAIL put ashore {MOST_PUTS} times, never on dry ground                          (at {her:.0})"
+                        "paradrop-check: FAIL put ashore {MOST_PUTS} times, never on dry ground \
+                         (at {her:.0})"
                     );
                     self.done = true;
                     return Ask::Nothing;

@@ -2464,7 +2464,7 @@ impl MissionLink {
         if self.ashore > 0 && game.scene.player.as_ref().is_some_and(|p| p.landed) {
             self.ashore -= 1;
             // Thousands of rays a look: twice a second is plenty.
-            if self.ashore.is_multiple_of(30) && go_ashore(game).is_some() {
+            if self.ashore.is_multiple_of(30) && go_ashore(game, &[]).is_some() {
                 self.ashore = 0;
             }
         }
@@ -3007,7 +3007,7 @@ impl MissionLink {
                 .as_ref()
                 .is_some_and(|p| p.landed || p.swimming())
         {
-            let to = go_ashore(game);
+            let to = go_ashore(game, check.failed());
             check.put_ashore(to);
         }
         // A pursuit run out: the scripts read level 0 again.
@@ -6131,19 +6131,28 @@ const BOARDING: u32 = 1800;
 /// Moves a player standing under the sea to the nearest dry ground within
 /// 1.5 km. True once she stands on dry ground (moved there, or there
 /// already); false while none around her has loaded.
-fn go_ashore(game: &mut Game) -> Option<Vec3> {
+fn go_ashore(game: &mut Game, avoid: &[Vec3]) -> Option<Vec3> {
     let (Some(world), Some(player)) = (&game.scene.world, &mut game.scene.player) else {
         return None;
     };
     // Boats and docks the layers place float at -36 m: dry ground is
     // above that, whatever height the sea is drawn at.
     let sea = world.settings.sea_level.max(WATERLINE);
+    // The island's own ground only (its terrain's cells), not a dock or
+    // a boat's deck over the water, and not where a put failed.
     let ground = |x: f32, z: f32| {
+        if avoid
+            .iter()
+            .any(|a| a.with_y(0.0).distance(Vec3::new(x, 0.0, z)) < AVOID)
+        {
+            return None;
+        }
         let top = 600.0;
-        let (t, normal) = world
-            .physics
-            .cast_ray(Vec3::new(x, top, z), Vec3::NEG_Y, 1200.0)?;
-        Some((top - t, normal.y))
+        let (t, normal, key, _) =
+            world
+                .physics
+                .cast_ray_surface(Vec3::new(x, top, z), Vec3::NEG_Y, 1200.0)?;
+        matches!(key, Some(m2_engine::StaticKey::Cell(_))).then_some((top - t, normal.y))
     };
     let to = dry_spot(
         player.character.position,
@@ -6160,6 +6169,10 @@ fn go_ashore(game: &mut Game) -> Option<Vec3> {
     player.drop_at(to);
     Some(to)
 }
+
+/// How far from a spot she was put ashore on and wasn't dry after the
+/// next try must be, metres.
+const AVOID: f32 = 25.0;
 
 /// The nearest dry ground to `from` (its own spot first, then rings out
 /// every 25 m to 1.5 km): where the ground (`ground`: its height and the
