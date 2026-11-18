@@ -50,6 +50,7 @@ Route files are one step per line (`#` comments):
     poslog start <name> <r> | stop   her + characters near her at ~25 Hz
     shootat <x> <z> <s> [weaken=<h>]  shoot the object there (optionally weakened first)
     camlog start <name> [<hex offs>] | stop  active camera, vtable and fields at ~50 Hz
+    ram <s> <r>                    drive her car at the nearest living character
     poke <hex addr> <byte>         set a guest data byte (runtime flag only)
     trackhero                      follow the player's character by the 360 code's tables (xmem.Hero)
     trackfoot <x> <y> <z>|here     as track, for the hero on foot (here: where track was)
@@ -1511,6 +1512,59 @@ def run(args) -> int:
                     th_c.start()
                     cl_state.update(stop=ev, thread=th_c)
                     say(f"camlog {name}: started")
+            elif op == "ram":
+                # ram <secs> <r>: in a car, drive (A) at the nearest living character
+                # (health pool key 0x4000xxxx, health > 0, within <r> m, not hers) by
+                # its live position; steer from her travel direction (stick right lowers
+                # the bearing, as for the boat). Stops when its health drops.
+                import math
+                import xmem
+
+                secs, rr = float(w[1]), float(w[2])
+                g = xmem.Guest(p.pid)
+                hh = xmem.Hero(g)
+                hero = hh.character()
+                here = hh.update()
+                best = None
+                for k_, a_ in xmem.map_entries(g, 0x83656558).items():
+                    if k_ >> 28 != 4 or hero - 1 <= k_ <= hero + 8:
+                        continue
+                    mx_, cur_ = struct.unpack(">2f", g.read(a_, 8))
+                    sa = hh.state_addr(k_)
+                    if mx_ != 100.0 or cur_ <= 0 or not sa:
+                        continue
+                    pos_ = struct.unpack(">3f", g.read(sa, 12))
+                    d_ = math.dist(pos_, here)
+                    if 3 < d_ <= rr and (best is None or d_ < best[0]):
+                        best = (d_, k_, a_, sa, cur_)
+                if best is None:
+                    say("ram: nobody in reach")
+                else:
+                    _, tk, ta, tsa, h0 = best
+                    say(f"ram: {tk:#x} at {best[0]:.0f} m, health {h0:.0f}")
+                    end, last_say, trail = time.time() + secs, 0.0, []
+                    while time.time() < end:
+                        hp_ = hh.update()
+                        tp = struct.unpack(">3f", g.read(tsa, 12))
+                        cur_ = struct.unpack(">f", g.read(ta + 4, 4))[0]
+                        if cur_ < h0 - 0.5:
+                            say(f"ram: hit {tk:#x}: health {h0:.0f} -> {cur_:.1f}")
+                            break
+                        now = time.time()
+                        trail = [(t_, q_) for t_, q_ in trail if now - t_ < 0.5] + [(now, hp_)]
+                        lx = 0.0
+                        if len(trail) >= 2 and math.dist(trail[0][1], trail[-1][1]) > 0.5:
+                            (_, a0), (_, a1) = trail[0], trail[-1]
+                            head = math.degrees(math.atan2(a1[0] - a0[0], a1[2] - a0[2]))
+                            want = math.degrees(math.atan2(tp[0] - hp_[0], tp[2] - hp_[2]))
+                            err = (want - head + 180) % 360 - 180
+                            lx = max(-1.0, min(1.0, -err / 30.0))
+                        apply(BTN["a"], 0, 0, lx, 0.0, 0.0, 0.0)
+                        if now - last_say > 1.0:
+                            last_say = now
+                            say(f"ram: {math.dist(tp, hp_):.0f} m, stick {lx:+.2f}")
+                        time.sleep(0.04)
+                    apply()
             elif op == "poke":
                 # poke <guest hex address> <byte>: set one guest data byte, a
                 # runtime flag (never code, the XEX or files). E.g. 0x83134382 =
