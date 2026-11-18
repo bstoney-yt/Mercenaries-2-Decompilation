@@ -6519,6 +6519,100 @@ fn vehicle_threat(spec: &m2_engine::vehicle::VehicleSpec) -> f32 {
 /// half turn a second is taken as full).
 const LIMP_LOOK_FULL: f32 = std::f32::consts::PI;
 
+/// Her look's turn this step (`dt` seconds) as the ragdoll camera's stick
+/// ([`LIMP_LOOK_FULL`] a second is full). The stick's +x turns the
+/// heading down; the look's +x turns it up.
+pub fn limp_stick(look: Vec2, dt: f32) -> [f32; 2] {
+    let full = (LIMP_LOOK_FULL * dt).max(1e-6);
+    [
+        (-look.x / full).clamp(-1.0, 1.0),
+        (look.y / full).clamp(-1.0, 1.0),
+    ]
+}
+
+/// `--ragdoll-check`: the ragdoll camera driven the way the game drives
+/// it ([`limp_stick`]) by a scripted look, offscreen and without a world,
+/// against #721's 360 numbers. Prints `ragdoll-check: PASS ...` or
+/// `FAIL ...` lines and `ragdoll-check: RESULT PASS` (or `FAIL`); whether
+/// all passed.
+pub fn ragdoll_check() -> bool {
+    use m2_engine::ragdoll_camera::{DISTANCE, RagdollCamera};
+    let dt = 1.0 / 60.0;
+    let mut ok = true;
+    let mut line = |pass: bool, what: String| {
+        ok &= pass;
+        eprintln!(
+            "ragdoll-check: {} {what}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+    };
+    let run = |c: &mut RagdollCamera, look: Vec2, seconds: f32| {
+        for _ in 0..(seconds / dt).round() as usize {
+            c.look(limp_stick(look, dt));
+            c.step(dt);
+        }
+    };
+    let deg = |r: f32| r.to_degrees();
+    let mut c = RagdollCamera::start(0.0);
+    c.step(dt);
+    let (eye, _) = c.view(Vec3::ZERO);
+    let (yaw, pitch) = c.angles();
+    line(
+        (deg(pitch) - 45.0).abs() < 0.01 && yaw == 0.0,
+        format!(
+            "start: heading {:.2} deg, pitch {:.2} deg down (360: the camera before's heading, 45 down)",
+            deg(yaw),
+            deg(pitch)
+        ),
+    );
+    line(
+        (eye.length() - DISTANCE).abs() < 1e-4,
+        format!("start: {:.3} m from her body (360: 4)", eye.length()),
+    );
+    // The look turning right as fast as counts as full stick, 10 s.
+    let full = std::f32::consts::PI * dt;
+    run(&mut c, Vec2::new(-full, 0.0), 10.0);
+    line(
+        (deg(c.angles().0) + 25.0).abs() < 0.05,
+        format!(
+            "full right 10 s: heading {:.2} deg (360: -25)",
+            deg(c.angles().0)
+        ),
+    );
+    run(&mut c, Vec2::new(0.0, full), 10.0);
+    line(
+        (deg(c.angles().1) - 20.0).abs() < 0.05,
+        format!(
+            "full up 10 s: pitch {:.2} deg down (360: 45 - 25 = 20)",
+            deg(c.angles().1)
+        ),
+    );
+    run(&mut c, Vec2::ZERO, 10.0);
+    let (yaw, pitch) = c.angles();
+    line(
+        deg(yaw).abs() < 0.05 && (deg(pitch) - 45.0).abs() < 0.05,
+        format!(
+            "let go 10 s: heading {:.2}, pitch {:.2} deg down (360: back to 0, 45)",
+            deg(yaw),
+            deg(pitch)
+        ),
+    );
+    let mut low = RagdollCamera {
+        pitch: 82f32.to_radians(),
+        ..RagdollCamera::start(0.0)
+    };
+    run(&mut low, Vec2::new(0.0, -full), 10.0);
+    line(
+        (deg(low.angles().1) - 85.0).abs() < 0.01,
+        format!(
+            "from 82 down, full down 10 s: pitch {:.2} deg down (360: held at 85)",
+            deg(low.angles().1)
+        ),
+    );
+    eprintln!("ragdoll-check: RESULT {}", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
 /// While her body lies limp, the 360's ragdoll camera
 /// ([`m2_engine::ragdoll_camera`]) takes over from her chase camera,
 /// starting from its heading, and looks at her body's first node; once
@@ -6538,12 +6632,7 @@ fn limp_camera(field: &mut Field<'_>, look: Vec2, dt: f32) {
     let c = p
         .limp_camera
         .get_or_insert_with(|| m2_engine::ragdoll_camera::RagdollCamera::start(heading));
-    let full = (LIMP_LOOK_FULL * dt).max(1e-6);
-    // The stick's +x turns the heading down; the look's +x turns it up.
-    c.look([
-        (-look.x / full).clamp(-1.0, 1.0),
-        (look.y / full).clamp(-1.0, 1.0),
-    ]);
+    c.look(limp_stick(look, dt));
     c.step(dt);
     p.limp_view = Some(c.view(at));
 }
