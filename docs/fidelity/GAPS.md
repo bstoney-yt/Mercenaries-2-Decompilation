@@ -42,6 +42,7 @@ available, (6) Correction, (7) Verification and (8) Risk.
 | [A8](#a8) | Decoder residuals: wavelet seam steps on 14 clips, unknown header fields | Visual | P3 | Data, Ghidra |
 | [P5](#p5) | Collision materials: friction and restitution per surface not read | Behavioral | P3 | Data, Ghidra |
 | [P6](#p6) | Projectile guidance law, drag and range not established from code | Behavioral | P3 | Ghidra |
+| [I1](#i1) | Layer `Anchor` component not ported: anchor distances and threat-release bits unread | Behavioral | P2 | Ghidra, data |
 | [U6](#u6) | Flash text: one color per field, no kerning, HTML reduced to `<font color>` | Visual | P3 | Data census |
 | [M4](#m4) | Swimming depths, float height, speed and stroke rate invented | Animation/movement | P3 | Footage, Ghidra |
 
@@ -865,6 +866,14 @@ P2
 8. **Risk:** Low to medium. Text metrics feed wrapping and line counts,
    so check every movie's screenshot at the five resolutions for changed
    line breaks.
+
+## AI
+
+### I1
+
+**Layer anchors** · Behavioral discrepancy · P2
+
+Layer `Anchor` component (table 0x83653630, read by 0x823ED9D8 and applied by 0x822D7310 from AI setup 0x822BB608/0x822D7778) is not ported: AnchorDist, AnchorResetDist and the threat-release bits (bCanScriptDisable, bPercieveThreat, bEnemyShouts, bExplosion, bThreatWithinRange, ThreatRange) are not read. Only the script `Ai.Anchor` and the spawner anchor exist (m2_engine::ai_anchor).
 
 ## Closed
 
