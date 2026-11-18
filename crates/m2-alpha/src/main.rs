@@ -8242,11 +8242,13 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 /// `--swim-check`: she is put in the nearest water over 4 m deep (looked
 /// for in rings out to 600 m) and swims forward for 4 s walking, at her
 /// pace and sprinting, through the game's tick; logs her speed each time.
-/// `--sink-check`: the first parked car (no boat, no helicopter) is put
-/// on water more than 6 m deep near her with her at the wheel, and held
+/// `--sink-check`: the first car loaded (no boat, no helicopter; parked
+/// or, with nowhere to park by her, not) is put on water more than 6 m
+/// deep near her with her at the wheel, and held
 /// its `Buoyancy` delay (5 s without one) and 10 s more, its time under
 /// the water logged each second; then the first helicopter likewise
-/// (its delay 0), held 3 s. Each passes when it has sunk and she is no
+/// (its delay 0), held 3 s, if one is loaded (else skipped, said so).
+/// Each passes when it has sunk and she is no
 /// longer in it while it stays whole (not wrecked), logging what she
 /// lost (Xenia: 100). One line `sink-check: PASS` or `FAIL ...` at the end.
 fn sink_check(game: &mut Game, tick: f32) {
@@ -8259,11 +8261,20 @@ fn sink_check(game: &mut Game, tick: f32) {
             break;
         };
         let here = game.focus();
-        let pick = game.scene.vehicles.iter().position(|v| {
-            v.id.is_some() && !v.wrecked && !v.spec.is_boat() && v.spec.is_helicopter() == heli
-        });
+        // Any loaded vehicle of the kind, parked or not (with nowhere to
+        // park by her, the loaded ones wait unplaced): the check places
+        // it itself.
+        let pick = game
+            .scene
+            .vehicles
+            .iter()
+            .position(|v| !v.wrecked && !v.spec.is_boat() && v.spec.is_helicopter() == heli);
         let Some(i) = pick else {
-            fails.push(format!("no parked {kind}"));
+            if heli {
+                eprintln!("sink-check: no helicopter model loaded here: its part is skipped");
+            } else {
+                fails.push(format!("no {kind} model loaded"));
+            }
             continue;
         };
         let physics = &world.physics;
