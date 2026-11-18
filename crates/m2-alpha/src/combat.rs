@@ -4147,13 +4147,13 @@ impl Combat {
             self.run_overs.1 += lost;
             eprintln!("run over: a vehicle ran into her for {damage:.1} ({lost:.1} health lost)");
             // A vehicle's hit of at least 2 on someone alive knocks them
-            // down for about 5 s (0x824203F0, 0x82422480; she is never
-            // disguised here).
+            // down (0x824203F0, 0x82422480): for her, a player's time down
+            // ([`HER_PLAYER_RECORD`]).
             if damage >= m2_engine::durability::KNOCKDOWN_DAMAGE && self.hp > 0.01 {
                 let r = self.knock_rng.unit();
                 let seconds = m2_engine::melee::knockdown_seconds(
                     m2_engine::durability::KNOCKDOWN_SECONDS,
-                    false,
+                    HER_PLAYER_RECORD,
                     r,
                 );
                 self.knock_her_down(f, seconds);
@@ -4200,7 +4200,8 @@ impl Combat {
         if f.player.tossed {
             f.player.tossed = false;
             let r = self.knock_rng.unit();
-            let seconds = m2_engine::melee::knockdown_seconds(self.toss_getup, false, r);
+            let seconds =
+                m2_engine::melee::knockdown_seconds(self.toss_getup, HER_PLAYER_RECORD, r);
             self.knock_her_down(f, seconds);
         }
         let Some(k) = &mut self.knocked else {
@@ -7161,6 +7162,15 @@ fn arc_clear(physics: &Physics, from: Vec3, velocity: Vec3, to: Vec3, gravity: f
     }
     false
 }
+
+/// Whether her knockdowns take a player's time down
+/// ([`m2_engine::melee::PLAYER_KNOCKDOWN_SECONDS`], 0.5 s spread a fifth
+/// either way) rather than the knockdown's own (5 s run over,
+/// `TossGetupSeconds` tossed): 0x82423848 halves it for a person with a
+/// player record (table 0x83657FA8; see
+/// [`m2_engine::melee::knockdown_seconds`]). The one place her time down
+/// is decided.
+pub const HER_PLAYER_RECORD: bool = true;
 
 /// Her knockdown: her time down (0x82423848, the human state record's
 /// +0x38) and how her limp body has lain.

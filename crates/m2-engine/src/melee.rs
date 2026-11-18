@@ -158,17 +158,36 @@ pub fn shove(low: bool, from: Vec3, to: Vec3, mass: f32) -> Vec3 {
 }
 
 /// How long a knockdown fells someone, seconds (0x82423848): `seconds`
-/// (half a second instead for someone in disguise), at least 1e-4, times
-/// `1 + 0.4 (r - 0.5)` for `r` a random number in [0, 1]. From the 360
-/// code: the flag is 0x82467B70's answer, the person's record in table
-/// 0x83657FA8, which `Object.IsDisguised` and
-/// `Player.GetVehicleDisguiseState` read; it is not "is the player".
+/// (half a second instead for a player's character), at least 1e-4,
+/// times `1 + 0.4 (r - 0.5)` for `r` a random number in [0, 1].
+///
+/// From the 360 code: the flag is whether 0x82467B70 finds the person a
+/// record in table 0x83657FA8 (keyed through 0x82175398, the entity's
+/// index in the table's +0x50 hash, to a key in its +0x44 array). That
+/// table's readers are player-holder code: `Pg.SpawnFromCamera`,
+/// `Pg.FindPointFromCamera`, `Airstrike.EquipDesignator`, the TOW wire's
+/// camera (0x82295400), the stagger picker's player test (0x824220B0).
+/// `Object.IsDisguised` and `Player.GetVehicleDisguiseState` read it too,
+/// but test a flag inside the record (+0x428 bit 0x40, with the global
+/// at 0x8313452B): a disguise is a state of a player's record, so having
+/// a record is not being disguised. Inferred: a record exists for, and
+/// only for, a player's character (who creates the records was not
+/// traced).
+/// A player's character's time down before the spread (0x820D9EDC, read
+/// by 0x82423848).
+pub const PLAYER_KNOCKDOWN_SECONDS: f32 = 0.5;
+
 /// `TossGetupSeconds`' registered default (0x823EAE98), and its value on
 /// every human template.
 pub const TOSS_GETUP_SECONDS: f32 = 3.0;
 
-pub fn knockdown_seconds(seconds: f32, disguised: bool, r: f32) -> f32 {
-    let base = if disguised { 0.5 } else { seconds }.max(1e-4);
+pub fn knockdown_seconds(seconds: f32, player: bool, r: f32) -> f32 {
+    let base = if player {
+        PLAYER_KNOCKDOWN_SECONDS
+    } else {
+        seconds
+    }
+    .max(1e-4);
     (((r - 0.5) * 0.4 + 1.0) * base).max(1e-4)
 }
 
