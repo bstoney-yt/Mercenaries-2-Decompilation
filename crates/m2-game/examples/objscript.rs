@@ -366,6 +366,18 @@ fn fortress(mission: &mut Mission, guid: u32, at: [f32; 3], install: Option<&str
         Some(root) => part_state(root, &template)?,
         None => None,
     };
+    // `--part-destroy-check`'s state path on the CPU: every node's
+    // DestroyMsg, in table order, through the part runner, applied a step
+    // later as the game applies it.
+    if let Some(root) = install {
+        let nodes: Vec<u32> = mission
+            .world()
+            .borrow_mut()
+            .node_table(guid)
+            .map(|t| t.entries().iter().map(|e| e.node).collect())
+            .unwrap_or_default();
+        apply_on_cpu(root, &template, guid, &nodes)?;
+    }
     mission
         .run(
             &format!(
@@ -863,5 +875,86 @@ fn antiair(
     mission.round_gone(round);
     run(mission, 0.5);
     println!("antiair: once it burst: {:?}", calls(mission, round));
+    Ok(())
+}
+
+/// Template `template`'s model built on the CPU ([`m2_engine::model::CpuModel`]),
+/// its part runner given each of `nodes` a `DestroyMsg` at step 0, and
+/// its states applied as `--part-destroy-check`'s game applies them
+/// ([`m2_engine::ModelParts::apply_states`], one step after a change),
+/// over 15 s of 0.1 s steps. Prints the changes, the applications (and
+/// how many steps after their change), and the nodes shown and hidden.
+fn apply_on_cpu(root: &str, template: &str, guid: u32, nodes: &[u32]) -> Result<()> {
+    use m2_assets::layer::{Layer, TEMPLATE_DB_TYPE};
+    use m2_assets::model::DESTROY_MSG;
+    let install = m2_engine::Install::find(std::path::Path::new(root))?;
+    let mut source = install.open_world()?;
+    let index = source.archive().index();
+    let db_hash = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+        .ok_or("no template database")?;
+    let data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&data)?;
+    let Some(id) = db
+        .names()
+        .iter()
+        .find(|(_, n)| n.eq_ignore_ascii_case(template))
+        .map(|(id, _)| *id)
+    else {
+        return Err("no such template".into());
+    };
+    let model = *db.hashes("ModelName").get(&id).ok_or("no model")?;
+    let data = source.model(model)?;
+    let parsed = data.parse()?;
+    let cpu = m2_engine::model::CpuModel::build(model, &parsed, 0);
+    let (Some(parts), Some(states)) = (cpu.parts.clone(), cpu.part_states.clone()) else {
+        println!("cpu apply: model {model:08x} has no parts or no part states");
+        return Ok(());
+    };
+    let (machines, names) = &*states;
+    let name = |n: u16| names.get(usize::from(n)).copied().unwrap_or(0);
+    let mut runner = m2_engine::part_runner::Runner::new(machines, name, guid);
+    let mut delivered = 0;
+    for &n in nodes {
+        delivered += usize::from(runner.deliver_named(n, DESTROY_MSG));
+    }
+    let mut changes = runner.take_changes();
+    let whole = changes
+        .iter()
+        .find(|c| c.machine == FORTRESS_PART)
+        .map(|c| c.state);
+    let mut due = (!changes.is_empty()).then_some(0u32);
+    let (mut applied, mut on_time, mut late, mut shown, mut hidden) = (0, 0, 0, 0, 0);
+    let mut before: Option<Vec<bool>> = None;
+    let mut all = changes.len();
+    for step in 1..=150u32 {
+        if let Some(sent) = due.take() {
+            let st = runner.states();
+            let a = parts.apply_states(|k| st.get(k).copied().flatten(), before.as_deref());
+            applied += 1;
+            if step - sent == 1 {
+                on_time += 1;
+            } else {
+                late += 1;
+            }
+            shown += a.shown.len();
+            hidden += a.gone.len();
+            before = Some(a.hidden);
+        }
+        runner.advance(0.1);
+        changes = runner.take_changes();
+        if !changes.is_empty() {
+            all += changes.len();
+            due = Some(step);
+        }
+    }
+    println!(
+        "cpu apply: {} of {} nodes are part machines; {all} changes; {FORTRESS_PART:08x} -> {whole:08x?}; applied {applied} times ({on_time} one step after, {late} otherwise); {shown} nodes shown, {hidden} hidden",
+        delivered,
+        nodes.len()
+    );
     Ok(())
 }

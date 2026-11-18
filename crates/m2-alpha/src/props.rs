@@ -366,6 +366,12 @@ impl Props {
         self.models.get(&p.model)?.as_ref()?.gpu.parts.as_ref()
     }
 
+    /// `entity`'s model parts, wrecked or not.
+    fn any_model_parts(&self, entity: u32) -> Option<&Arc<m2_engine::ModelParts>> {
+        let p = self.shown.get(&entity)?;
+        self.models.get(&p.model)?.as_ref()?.gpu.parts.as_ref()
+    }
+
     /// Whether any of `entity`'s parts is broken, the rest standing.
     pub fn parts_broken(&self, entity: u32) -> bool {
         self.parts_down
@@ -1989,27 +1995,24 @@ impl Props {
             if !done.insert(e) {
                 continue;
             }
-            let Some(parts) = self.model_parts(e).cloned() else {
+            // Applied even once the object is wrecked: its death sends
+            // its nodes' messages in the same step (0x82289F40), and the
+            // 360 applies the queued states all the same.
+            let Some(parts) = self.any_model_parts(e).cloned() else {
                 continue;
             };
             let Some(states) = self.part_runners.get(&e).map(|r| r.states()) else {
                 continue;
             };
-            let hidden = parts.hidden_in_states(|k| states.get(k).copied().flatten());
-            let wrecked = parts.down_in(&hidden);
-            let before = self
-                .parts_down
-                .get(&e)
-                .map_or_else(|| parts.hidden(&[]), |d| d.hidden.clone());
-            let names = |f: &dyn Fn(usize) -> bool| -> Vec<u32> {
-                (0..hidden.len())
-                    .filter(|&i| f(i))
-                    .filter_map(|i| parts.node_name(i))
-                    .collect()
-            };
-            let was = |i: usize| before.get(i).copied().unwrap_or(false);
-            let shown = names(&|i| was(i) && !hidden[i]);
-            let gone = names(&|i| !was(i) && hidden[i]);
+            let m2_engine::model::StatesApplied {
+                hidden,
+                wrecked,
+                shown,
+                gone,
+            } = parts.apply_states(
+                |k| states.get(k).copied().flatten(),
+                self.parts_down.get(&e).map(|d| d.hidden.as_slice()),
+            );
             let collision_changed = self
                 .parts_down
                 .get(&e)

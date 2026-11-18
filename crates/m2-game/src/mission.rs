@@ -3119,6 +3119,18 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             }
             if let Some(t) = &e.template {
                 w.placed_as.insert(e.guid, t.clone());
+                // Placed, an object with node health takes its template's
+                // `Health` (the 360's Health component, which placing
+                // fills: 0x8222D850), so the scripts and the checks read
+                // it from the start ([`crate::node_damage`]).
+                let most = w
+                    .template_nodes
+                    .get(&t.to_ascii_lowercase())
+                    .and_then(|n| n.health);
+                if let (Some(most), Some(o)) = (most, w.objects.get_mut(&e.guid)) {
+                    o.max_health = most;
+                    o.health = most;
+                }
             }
         } else {
             w.crews.remove(&e.guid);
@@ -3572,6 +3584,32 @@ mod tests {
                 if guid == tree && name == "global_env_treepalm_anim")
         });
         assert!(played);
+    }
+
+    // Placed, an object with node health has its template's Health before
+    // anything asks for its table.
+    #[test]
+    fn a_placed_object_with_node_health_takes_its_templates_health() {
+        let mut data = GameData::default();
+        let mut e = villa_tank();
+        e.template = Some("_island_bld_fortress01".into());
+        let guid = e.guid;
+        data.layers.insert("test_layer".into(), vec![e]);
+        data.template_nodes.insert(
+            "_island_bld_fortress01".into(),
+            crate::node_damage::TemplateNodes {
+                records: Vec::new(),
+                health: Some(4000.0),
+            },
+        );
+        let mut m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
+        m.preload("test_layer");
+        let w = m.world().borrow();
+        assert_eq!(
+            (w.objects[&guid].health, w.objects[&guid].max_health),
+            (4000.0, 4000.0)
+        );
+        assert!(w.node_tables.is_empty());
     }
 
     #[test]

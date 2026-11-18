@@ -31,7 +31,9 @@
 //!   ([`Change::sent_off`]).
 //!
 //! **Inferred:** a machine starts in its `InitState`'s state (the part
-//! whole), told of no change; the random fraction is this module's own
+//! whole), told of no change, or in `InitState` itself when that sets no
+//! other state (from samples: the island fortress's `cf37044a`, which
+//! takes `DestroyMsg` there); the random fraction is this module's own
 //! (a fixed sequence per object, [`Runner::new`]'s `seed`), as the engine's
 //! generator (0x8215E260) isn't followed.
 
@@ -85,7 +87,15 @@ impl Runner {
                 name: m.node.map_or(0, &node_name),
                 states: m.states.iter().map(|s| s.0).collect(),
                 acts: m.acts.clone(),
-                current: m.starts[0],
+                // A part whose `InitState` sets no other state stays in
+                // it (the island fortress's whole, `cf37044a`, whose
+                // `DestroyMsg` handler is there).
+                current: m.starts[0].or_else(|| {
+                    m.states
+                        .iter()
+                        .any(|s| s.0 == m2_assets::model::STATE_INIT)
+                        .then_some(m2_assets::model::STATE_INIT)
+                }),
                 sent_off: false,
             })
             .collect();
@@ -434,5 +444,35 @@ mod tests {
         let mut r = Runner::new(&canopy(), name, 1);
         r.deliver(0x1234_5678);
         assert!(r.take_changes().is_empty());
+    }
+
+    // The island fortress's whole: its InitState sets no state, so it
+    // stays there and takes DestroyMsg there.
+    #[test]
+    fn a_part_that_stays_in_its_init_state_takes_messages_there() {
+        use m2_assets::model::{STATE_INIT, StateActs};
+        const COLLAPSE: u32 = 0x6946_83eb;
+        let states = PartStates {
+            machines: vec![PartMachine {
+                node: Some(0),
+                states: vec![(STATE_INIT, vec![]), (COLLAPSE, vec![])],
+                starts: [None, None],
+                acts: vec![
+                    StateActs {
+                        on: vec![(DESTROY_MSG, COLLAPSE)],
+                        ..Default::default()
+                    },
+                    StateActs::default(),
+                ],
+            }],
+            ..Default::default()
+        };
+        let mut r = Runner::new(&states, |_| 0xcf37_044a, 1);
+        assert_eq!(r.states(), [Some(STATE_INIT)]);
+        assert!(r.deliver_named(0xcf37_044a, DESTROY_MSG));
+        assert_eq!(
+            r.take_changes().iter().map(|c| c.state).collect::<Vec<_>>(),
+            [COLLAPSE]
+        );
     }
 }

@@ -31,9 +31,10 @@
 //!
 //! Invented: an object's table is built the first time a native asks for
 //! it, from its template's records, rather than when it is placed; the
-//! two agree while nothing else damages its nodes. Its most health is
-//! then set to its template's `Health` amount (the scripts' objects
-//! otherwise stand at 100). A node the game hasn't hidden counts as a
+//! two agree while nothing else damages its nodes. Its health is its
+//! template's `Health` amount from placing (or, for an object spawned in
+//! play, from the table's first use); the scripts' other objects stand at
+//! 100. A node the game hasn't hidden counts as a
 //! shown piece even if its model lacks it (the 360 code would not count
 //! it; the model isn't known here).
 //! The death is carried out as `Object.Kill`'s ([`Command::Kill`]: the

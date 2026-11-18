@@ -1277,6 +1277,42 @@ impl ModelParts {
         })
     }
 
+    /// The parts' states applied (0x8222D2F0 -> 0x821C7648): with part
+    /// `k` in state `state(k)`, what of the model shows, which parts are
+    /// down, and against `before` (what was hidden; `None`: the model
+    /// intact) the nodes newly shown and newly hidden, by name hash.
+    pub fn apply_states(
+        &self,
+        state: impl Fn(usize) -> Option<u32>,
+        before: Option<&[bool]>,
+    ) -> StatesApplied {
+        let hidden = self.hidden_in_states(state);
+        let wrecked = self.down_in(&hidden);
+        let intact;
+        let before = match before {
+            Some(b) => b,
+            None => {
+                intact = self.hidden(&[]);
+                &intact
+            }
+        };
+        let was = |i: usize| before.get(i).copied().unwrap_or(false);
+        let names = |f: &dyn Fn(usize) -> bool| -> Vec<u32> {
+            (0..hidden.len())
+                .filter(|&i| f(i))
+                .filter_map(|i| self.node_name(i))
+                .collect()
+        };
+        let shown = names(&|i| was(i) && !hidden[i]);
+        let gone = names(&|i| !was(i) && hidden[i]);
+        StatesApplied {
+            hidden,
+            wrecked,
+            shown,
+            gone,
+        }
+    }
+
     /// Which parts are down with the nodes `hidden` marks hidden: those
     /// that show something of their own intact, none of it shown now.
     pub fn down_in(&self, hidden: &[bool]) -> Vec<bool> {
@@ -1344,6 +1380,18 @@ impl ModelParts {
         }
         Some(shape)
     }
+}
+
+/// What applying a model's parts' states did ([`ModelParts::apply_states`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct StatesApplied {
+    /// Per node, hidden now.
+    pub hidden: Vec<bool>,
+    /// Per part, down now.
+    pub wrecked: Vec<bool>,
+    /// Nodes newly shown and newly hidden, by name hash.
+    pub shown: Vec<u32>,
+    pub gone: Vec<u32>,
 }
 
 /// The collision of one building of a merged batch (a `TINY` model).
