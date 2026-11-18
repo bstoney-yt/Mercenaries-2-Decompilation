@@ -5407,14 +5407,14 @@ impl People {
                 physics.remove_ragdoll(id);
             }
             // A blast's launch: thrown once limp (a body limp already
-            // next update), dropped after its updates without (from the
-            // 360 code: the ragdoll controller, 0x82427D30, 0x82428910).
+            // next update), dropped when the blast's window passes without
+            // (from the 360 code: 0x8215C560, 0x82428910).
             if let Some(mut l) = npc.launch.take() {
                 match npc.ragdoll.filter(|_| npc.fling.is_none()) {
                     Some(id) => physics.launch_ragdoll(id, l.velocity, l.point),
                     None if npc.fling.is_some() => npc.launch = Some(l),
                     None => {
-                        if l.wait() {
+                        if l.wait(dt) {
                             npc.launch = Some(l);
                         }
                     }

@@ -637,10 +637,11 @@ const BASH_HIGH: f32 = 1.2;
 const BASH_LOW: f32 = 0.45;
 /// Blasts kill within `KILL` metres and hurt to `REACH`.
 const KILL: f32 = 4.0;
-/// How hard a blast throws people: (out, up) m/s at its heart, on top of
-/// 3 out and 2 up at the edge of its reach. Invented, to look like the
-/// game's flung bodies.
-pub(crate) const BLAST_PUSH: (f32, f32) = (9.0, 6.0);
+/// The `MaxForce` the blasts without a template (the alpha's own and the
+/// scripted bombs) throw people with: that of most of the game's
+/// explosions (`fx_Explosion_Large`, `Explosion (Small)`, ...: 300).
+/// Invented: these blasts are not the game's.
+const UNTEMPLATED_FORCE: f32 = 300.0;
 /// How hard a rifle round shoves the one it kills, m/s.
 const SHOT_PUSH: f32 = 2.0;
 pub(crate) const REACH: f32 = 9.0;
@@ -6219,24 +6220,51 @@ impl Combat {
 
     /// A blast at `at`: fire and smoke, people killed or hurt, vehicles
     /// near it wrecked and thrown.
+    /// A blast at `at` of `(radius, max_force)` on person `j`: the 360's
+    /// push (0x8215CA38, [`m2_engine::ragdoll_launch::blast_impulse`]),
+    /// given to them if their ragdoll runs within the blast's window
+    /// ([`m2_engine::ragdoll_launch::Launch`], 0x8215C560). Their
+    /// `ExplosionFudge` is 1: no human template has one.
+    fn launch_person(
+        &mut self,
+        npcs: &mut [crate::npc::Npc],
+        j: usize,
+        at: Vec3,
+        (radius, force): (f32, f32),
+    ) {
+        let impulse = m2_engine::ragdoll_launch::blast_impulse(
+            at,
+            npcs[j].character.position,
+            radius,
+            force,
+            m2_engine::durability::LEAST_PUSH,
+            1.0,
+            [self.random(), self.random(), self.random()],
+        );
+        npcs[j].launch = Some(m2_engine::ragdoll_launch::Launch::new(&impulse, Vec3::Y));
+    }
+
     pub fn explode(&mut self, f: &mut Field<'_>, at: Vec3) {
         self.burst(at, 1.0, None);
         self.show_fx(fx::GRENADE, at);
         let mut killed = false;
         let key = Some(m2_assets::name_hash("Explosion"));
-        for n in &mut f.people.npcs {
+        for j in 0..f.people.npcs.len() {
+            let n = &f.people.npcs[j];
             let d = n.chest().distance(at);
-            // Thrown out and up, harder the nearer.
             let near = (1.0 - d / REACH).max(0.0);
-            let away = (n.chest() - at).with_y(0.0).normalize_or(Vec3::X);
-            let push = away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
             // Each by their own row of the table (`Human` 1 of an
             // `Explosion`, `HumanArmor` 0.5).
             let own = self.on_person(n, key);
+            if d < REACH {
+                self.launch_person(&mut f.people.npcs, j, at, (REACH, UNTEMPLATED_FORCE));
+            }
+            let n = &mut f.people.npcs[j];
+            // No push of its own: the launch throws them once limp.
             if d < KILL {
-                killed |= n.hurt_by_blast(1000.0 * own, push, key, at) && n.soldier;
+                killed |= n.hurt_by_blast(1000.0 * own, Vec3::ZERO, key, at) && n.soldier;
             } else if d < REACH {
-                killed |= n.hurt_by_blast(100.0 * near * own, push, key, at) && n.soldier;
+                killed |= n.hurt_by_blast(100.0 * near * own, Vec3::ZERO, key, at) && n.soldier;
                 n.panic(at);
             } else if d < REACH * 3.0 {
                 n.panic(at);
@@ -6541,26 +6569,12 @@ impl Combat {
             let n = &mut f.people.npcs[j];
             let d = n.chest().distance(at);
             if d < reach {
-                let near = 1.0 - d / reach;
-                let away = (n.chest() - at).with_y(0.0).normalize_or(Vec3::X);
-                let push =
-                    away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
-                killed |= n.hurt_by_blast(b.damage_at(d) * scale, push, b.key, at) && n.soldier;
-                // The 360's push on a person, kept by their ragdoll
-                // controller (0x8215CA38, 0x824282F8): it throws them only
-                // if they go limp in time. `ExplosionFudge` is taken as 1.
-                let impulse = m2_engine::ragdoll_launch::blast_impulse(
-                    at,
-                    n.character.position,
-                    b.radius,
-                    b.max_force,
-                    m2_engine::durability::LEAST_PUSH,
-                    1.0,
-                    [self.random(), self.random(), self.random()],
-                );
-                let n = &mut f.people.npcs[j];
-                n.launch = Some(m2_engine::ragdoll_launch::Launch::new(&impulse, Vec3::Y));
-                n.panic(at);
+                // No push of its own (0x8215C560 pushes only a ragdoll
+                // that runs): the launch throws them once limp.
+                killed |=
+                    n.hurt_by_blast(b.damage_at(d) * scale, Vec3::ZERO, b.key, at) && n.soldier;
+                self.launch_person(&mut f.people.npcs, j, at, (b.radius, b.max_force));
+                f.people.npcs[j].panic(at);
             } else if d < reach * 3.0 {
                 n.panic(at);
             }
@@ -6794,20 +6808,20 @@ impl Combat {
             cover && d > 1.0 && physics.cast_ray(at, way / d, d - 0.5).is_some()
         };
         let mut killed = false;
-        for n in f.people.npcs.iter_mut() {
-            let chest = n.chest();
+        for j in 0..f.people.npcs.len() {
+            let chest = f.people.npcs[j].chest();
             let d = chest.distance(at);
             if d < radius * 2.0 {
-                n.panic(at);
+                f.people.npcs[j].panic(at);
             }
             if d >= radius || shielded(chest) {
                 continue;
             }
             let near = 1.0 - d / radius;
-            let away = (chest - at).with_y(0.0).normalize_or(Vec3::X);
-            let push = away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
-            let own = self.on_person(n, key);
-            killed |= n.hurt_by_blast(damage * near * own, push, key, at) && n.soldier;
+            let own = self.on_person(&f.people.npcs[j], key);
+            self.launch_person(&mut f.people.npcs, j, at, (radius, UNTEMPLATED_FORCE));
+            let n = &mut f.people.npcs[j];
+            killed |= n.hurt_by_blast(damage * near * own, Vec3::ZERO, key, at) && n.soldier;
         }
         let her = (f.player.driving.is_none() && f.player.landed)
             .then(|| f.player.character.position + Vec3::Y)
