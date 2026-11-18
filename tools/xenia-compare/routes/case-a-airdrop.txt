@@ -1,0 +1,23 @@
+# Case A: VzaCon001's beach landing and the first air drop (weapon crate),
+# with case B (the hero sprinting with the rifle) on the way up the beach.
+# Run after vzacon001-boat.txt (concatenate the two). The boat's throttle is A
+# (RT does nothing). Steering is closed-loop on positions read from guest
+# memory (track/goto/walk, xmem.py); waypoints follow m2-alpha's autoplay path
+# (it passes (-1538, 2262) at 15 s and lands at (-1508, 2677) at 30 s).
+mark boat start
+track -1727 -36 2069
+goto -1530 2262 25 60 a
+goto -1490 2320 15 40 a                  # east of a blockage the 360 boat stops at, (-1521, 2332)
+goto -1500 2450 20 60 a
+goto -1490 2660 15 45 a                  # the 360 boat beaches near (-1500, 2581)
+mark beached
+press y 0.3                              # out of the boat
+wait 3
+shot onfoot
+trackfoot here
+walk -1478 2677 4 60 ls 1 sprint         # sprint (left stick held in) to loc_vza_beach, a frame a second
+mark at the beach marker
+until delivery 20 2                      # "Wait for weapon delivery"
+mark objective: wait for weapon delivery
+burst drop 45 1                          # the helicopter brings the crate: 1 frame a second
+mark crate window over

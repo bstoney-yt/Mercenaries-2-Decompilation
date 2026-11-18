@@ -1,0 +1,58 @@
+# From boot to the wheel of VzaCon001's speedboat (Mattias, no profile).
+# Needs Xenia started with --headless=true (it answers its own sign-in
+# dialogs) and --apu=sdl (xenia-route.ps1 -Audio). About 3 to 4 minutes.
+wait 25
+tap_until start Continue_without 90      # title screen -> profile prompt
+wait 2
+press up 0.3                              # "Continue without saving"
+wait 1
+press a 0.3
+until NOTICE 30 2                         # "You need to be signed into Xbox LIVE..."
+press a 0.3
+until new_game 60 2                       # main menu, "Start a new game."
+press a 0.3
+until Mattias 30 2                        # character select
+press a 0.3
+until Tough_Merc 30 2                     # Mattias's card
+press a 0.3
+tap_until a Accelerate 400                # loading, villa movie (A skips), boat
+mark at the speedboat
+trackhero
+wait 2
+stickresp2 boatstill x1 x-1 hold=1 after=10 nolevel
+mark boat start
+trackhero
+airlog start -1472.6 2677 delivery          # the whole run: helicopters, crate, vehicles near the drop point
+goto -1550 2248 20 60 a
+goto -1497 2297 15 30 a max=20
+goto -1465 2330 12 30 a max=15
+goto -1465 2400 12 30 a max=15
+goto -1462 2440 12 30 a max=12
+goto -1478 2500 12 30 a max=12
+goto -1488 2545 6 30 a max=8             # slow final approach
+goto -1490 2565 4 25 a max=5             # the grounding point the two landings that reached the marker used
+mark beached
+hold x 2                                 # stop first: Y does not get her out while it moves
+press y 0.3
+wait 3
+ocr out1                                 # on foot the boat's hints ("Speed boost") are gone
+if_text boost press y 0.3                # still at the wheel: get out again
+wait 3
+ocr out2
+walkcam -1500 2650 6 150 - 2 swim       # swim/wade ashore, stick forward, steered by the camera
+walkcam -1490 2690 4 40                  # away from the beached boat, onto the sand (m2's autoplay is on foot here)
+walkcam -1478 2677 4 30                  # loc_vza_beach: "Wait for weapon delivery"
+mark at the beach marker
+wait 20
+ocr obj1
+killnear 4 -1467.9,-25.2,2779.6;-1470.9,-21.3,2802.5;-1460.4,-18.2,2818.7;-1456.6,-19.5,2810.5
+wait 5
+ocr obj2
+wait 10
+ocr obj3
+walkcam -1394 2898 6 120
+ocr obj4
+burst after 90 2
+ocr obj5
+airlog stop
+mark done
