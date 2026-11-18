@@ -6600,6 +6600,20 @@ impl Combat {
                 let push =
                     away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
                 killed |= n.hurt_by_blast(b.damage_at(d) * scale, push, b.key, at) && n.soldier;
+                // The 360's push on a person, kept by their ragdoll
+                // controller (0x8215CA38, 0x824282F8): it throws them only
+                // if they go limp in time. `ExplosionFudge` is taken as 1.
+                let impulse = m2_engine::ragdoll_launch::blast_impulse(
+                    at,
+                    n.character.position,
+                    b.radius,
+                    b.max_force,
+                    m2_engine::durability::LEAST_PUSH,
+                    1.0,
+                    [self.random(), self.random(), self.random()],
+                );
+                let n = &mut f.people.npcs[j];
+                n.launch = Some(m2_engine::ragdoll_launch::Launch::new(&impulse, Vec3::Y));
                 n.panic(at);
             } else if d < reach * 3.0 {
                 n.panic(at);

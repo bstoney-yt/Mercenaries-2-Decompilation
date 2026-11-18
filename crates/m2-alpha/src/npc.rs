@@ -1321,6 +1321,10 @@ pub struct Npc {
     /// A shove not yet given to their body (m/s): they went limp, or
     /// were hit again after.
     fling: Option<Vec3>,
+    /// A blast's launch waiting for the limp body
+    /// ([`m2_engine::ragdoll_launch::Launch`]): thrown bone by bone once it
+    /// goes limp within its updates, else dropped.
+    pub launch: Option<m2_engine::ragdoll_launch::Launch>,
     /// Knocked down and limp, they get up (or are subdued) this step:
     /// the limp body is given up and they are where it lay.
     rise: bool,
@@ -1537,6 +1541,7 @@ impl Npc {
             dead_for: 0.0,
             ragdoll: None,
             fling: None,
+            launch: None,
             rise: false,
             limp: (0.0, 0.0),
             last_hit: None,
@@ -5369,10 +5374,29 @@ impl People {
                 }
                 physics.remove_ragdoll(id);
             }
+            // A blast's launch: thrown once limp (a body limp already
+            // next update), dropped after its updates without (from the
+            // 360 code: the ragdoll controller, 0x82427D30, 0x82428910).
+            if let Some(mut l) = npc.launch.take() {
+                match npc.ragdoll.filter(|_| npc.fling.is_none()) {
+                    Some(id) => physics.launch_ragdoll(id, l.velocity, l.point),
+                    None if npc.fling.is_some() => npc.launch = Some(l),
+                    None => {
+                        if l.wait() {
+                            npc.launch = Some(l);
+                        }
+                    }
+                }
+            }
             // The dead, and the knocked down, go limp from where they
-            // stood, shoved as they were hit.
+            // stood, shoved as they were hit (by a blast: launched).
             let Some(push) = npc.fling.take() else {
                 continue;
+            };
+            let push = if npc.launch.is_some() {
+                Vec3::ZERO
+            } else {
+                push
             };
             match npc.ragdoll {
                 Some(id) => physics.push_ragdoll(id, push),
@@ -5388,6 +5412,9 @@ impl People {
                     );
                     npc.ragdoll = Some(id);
                 }
+            }
+            if let (Some(l), Some(id)) = (npc.launch.take(), npc.ragdoll) {
+                physics.launch_ragdoll(id, l.velocity, l.point);
             }
         }
         // Smarter: those near a soldier who spots her are told where she is.
