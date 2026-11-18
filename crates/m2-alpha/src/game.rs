@@ -1692,7 +1692,35 @@ impl Game {
                                 dt,
                             );
                         }
-                        player.chase(at, ChaseRig::of(&v.spec), intent.look, speed, dt);
+                        // In a seat with a turret camera (a gunner's, the
+                        // M113 AA driver's) the view turns as the gun's
+                        // camera does: no drift back behind the vehicle,
+                        // held to its limits about the vehicle's heading
+                        // (0x824C95F0; the base inferred).
+                        let seat = self
+                            .ride
+                            .filter(|r| Some(r.0) == player.driving)
+                            .map(|r| r.1);
+                        let camera = player.driving.and_then(|_| {
+                            crate::ride::seat_camera(crate::ride::Ride::of(v), seat)
+                                .map(|c| m2_engine::pad_camera::TurretLookTuning::from(&c))
+                        });
+                        let mut rig = ChaseRig::of(&v.spec);
+                        if let Some(t) = camera {
+                            rig.car = None;
+                            rig.heli = None;
+                            rig.pitch_range = t.pitch_up();
+                        }
+                        player.chase(at, rig, intent.look, speed, dt);
+                        if let Some(t) = camera {
+                            let f = at.transform_vector3(m2_math::glam::Vec3::Z);
+                            player.yaw = m2_engine::pad_camera::turret_clamp(
+                                player.yaw,
+                                f.x.atan2(f.z),
+                                t.yaw,
+                            )
+                            .0;
+                        }
                         player.keep_chase_clear(physics, Some(id));
                     }
                     None => {

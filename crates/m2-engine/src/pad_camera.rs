@@ -699,6 +699,21 @@ pub struct TurretLookTuning {
     pub pitch_keep: [f32; 3],
 }
 
+impl From<&crate::seats::SeatCamera> for TurretLookTuning {
+    /// A seat's own `CameraTurret` record (a gunner's, the M113 AA
+    /// driver's): the same fields as an emplaced gun's.
+    fn from(c: &crate::seats::SeatCamera) -> Self {
+        Self {
+            yaw_speed: c.yaw_speed,
+            pitch_speed: c.pitch_speed,
+            yaw: c.yaw,
+            pitch: c.pitch,
+            yaw_keep: [c.yaw_keep[0], c.yaw_keep[0], c.yaw_keep[1]],
+            pitch_keep: [c.pitch_keep[0], c.pitch_keep[0], c.pitch_keep[1]],
+        }
+    }
+}
+
 impl TurretLookTuning {
     /// The view's pitch limits from the base, radians up positive: the
     /// record's are the camera's, positive down (as the car's and the
@@ -1108,6 +1123,18 @@ mod tests {
         c.hold([-1.0, 0.0], Some(-1.0), None);
         assert_eq!(c.yaw.value, -0.7);
         assert_eq!(turret_at(0.0, 0.0, cutter), None);
+        // A seat's record reads the same way (the M151 gunner's).
+        let m151 = TurretLookTuning::from(&crate::seats::SeatCamera {
+            yaw_speed: 2.0,
+            pitch_speed: 1.8,
+            yaw: (-1.25, 1.25),
+            pitch: (-0.19, 0.85),
+            yaw_keep: [0.95, 0.91],
+            pitch_keep: [0.97, 0.9],
+        });
+        assert_eq!(m151.yaw_keep, [0.95, 0.95, 0.91]);
+        assert_eq!(m151.pitch_up(), (-0.85, 0.19));
+        assert_eq!(turret_at(1.25, 0.0, m151.yaw), Some(1.0));
     }
 
     #[test]

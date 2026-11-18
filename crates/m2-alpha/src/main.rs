@@ -10427,8 +10427,9 @@ impl Running {
         }
         self.pad.heli_tuning = heli;
         // An emplaced gun's turret camera while she mans one (its limits
-        // about its facing), else the turret camera of the seat she drives
-        // from, if it has one (no limits held here).
+        // about its facing), else the turret camera of the seat she rides
+        // in, if it has one (a gunner's, the M113 AA driver's; its limits
+        // about the vehicle's heading, inferred).
         let manned = self.game.combat.manned.as_ref().and_then(|m| {
             let w = self.game.scene.world.as_ref()?;
             Some((
@@ -10442,8 +10443,27 @@ impl Running {
             .player
             .as_ref()
             .and_then(|p| p.driving)
-            .and_then(|i| self.game.scene.vehicles.get(i)?.spec.tuning.driver_turret);
-        self.pad.turret_base = manned.map(|(_, facing)| facing);
+            .and_then(|i| {
+                let v = self.game.scene.vehicles.get(i)?;
+                let seat = self.game.ride.filter(|r| r.0 == i).map(|r| r.1);
+                let c = crate::ride::seat_camera(crate::ride::Ride::of(v), seat)?;
+                let at = self
+                    .game
+                    .scene
+                    .world
+                    .as_ref()?
+                    .physics
+                    .vehicle_transform(v.id?)?;
+                let f = at.transform_vector3(m2_math::glam::Vec3::Z);
+                Some((
+                    m2_engine::pad_camera::TurretLookTuning::from(&c),
+                    f.x.atan2(f.z),
+                ))
+            });
+        self.pad.turret_base = manned
+            .map(|(_, facing)| facing)
+            .or(driven.map(|(_, heading)| heading));
+        let driven = driven.map(|(t, _)| t);
         let turret = manned.map(|(t, _)| t).or(driven);
         if turret != self.pad.turret_tuning {
             self.pad.turret_camera = Default::default();
