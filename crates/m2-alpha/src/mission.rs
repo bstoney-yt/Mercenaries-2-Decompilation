@@ -6358,8 +6358,22 @@ fn go_ashore(game: &mut Game, avoid: &[Vec3]) -> Option<Vec3> {
     if player.landed && (to - from).with_y(0.0).length() < 1e-3 {
         return Some(to);
     }
+    // Out of any seat first: seated (VzaCon001 starts her at the wheel
+    // of its speed boat) she stays where the seat is, and the put came to
+    // nothing (the #618 game check: put ashore three times, each time
+    // back in the boat at the start).
+    let seated = player.driving.take().is_some();
+    if seated {
+        player.seated = false;
+        player.chase_target = None;
+        eprintln!("ashore: she leaves the vehicle she sits in to be put ashore");
+    }
     // As a teleport puts her down (her swim and landing state too).
     player.drop_at(to);
+    if seated {
+        game.ride = None;
+        game.on_foot = true;
+    }
     Some(to)
 }
 
