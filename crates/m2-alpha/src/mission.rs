@@ -1113,6 +1113,12 @@ pub struct MissionLink {
     sounds: Vec<(String, bool)>,
     /// `--mine-check` ([`crate::mines::MineCheck`]).
     mine_check: Option<crate::mines::MineCheck>,
+    /// Sounds the scripts cued on an object (`Sound.CueSound(object,
+    /// cue)`: her C4's `wpn_bomb_timer_01_armed`), whether each is to stop
+    /// instead, and where the object is ([`Self::take_object_sounds`]).
+    object_sounds: Vec<(u32, String, bool, Vec3)>,
+    /// `--object-sound-check` ([`ObjectSoundCheck`]).
+    object_sound_check: Option<ObjectSoundCheck>,
     /// Sound category fades and pitches the scripts asked for.
     fades: Vec<crate::sound::CategoryChange>,
     /// The music cue the scripts last switched to (`Some(None)`: none).
@@ -1304,6 +1310,8 @@ impl MissionLink {
             voice_banks: Vec::new(),
             sounds: Vec::new(),
             mine_check: None,
+            object_sounds: Vec::new(),
+            object_sound_check: None,
             fades: Vec::new(),
             music: None,
             music_at: None,
@@ -1600,6 +1608,14 @@ impl MissionLink {
 
     /// With a job to follow: she is put this far from its nearest target
     /// once it is tracked (`--job-near`).
+    /// `--object-sound-check`: a C4 charge of hers is put down beside her
+    /// once the scripts run, left 5 s and taken up again
+    /// ([`ObjectSoundCheck`]).
+    pub fn with_object_sound_check(mut self, on: bool) -> Self {
+        self.object_sound_check = on.then(ObjectSoundCheck::default);
+        self
+    }
+
     pub fn with_job_near(mut self, near: Option<f32>) -> Self {
         if let Some(job) = &mut self.job {
             job.near = near;
@@ -2854,6 +2870,11 @@ impl MissionLink {
             _ => 0,
         };
         let enabled = mission.world().borrow().vehicle_disguise;
+        // The vehicle she rides hit someone, anyone, for at least 1: the
+        // 360 gives away the disguise of every player riding it
+        // (0x82445938 → 0x824457F8).
+        let ran_over = riding.is_some_and(|i| game.vehicles_hit_someone.contains(&i));
+        game.vehicles_hit_someone.clear();
         let state = game.disguise.update(
             crate::disguise::Tick {
                 enabled,
@@ -2861,7 +2882,7 @@ impl MissionLink {
                 faction,
                 honks,
                 near,
-                hurt_someone: hurt_someone && riding.is_some(),
+                hurt_someone: (hurt_someone && riding.is_some()) || ran_over,
             },
             dt,
         );
@@ -3133,6 +3154,9 @@ impl MissionLink {
                     }
                 }
             }
+        }
+        if let Some(check) = &mut self.object_sound_check {
+            check.tick(game, mission, dt);
         }
         // A pursuit run out: the scripts read level 0 again.
         let pursued = !game.scene.people.pursuit.is_empty();
@@ -3894,6 +3918,28 @@ impl MissionLink {
                         self.sounds.push((cue.clone(), false));
                     }
                     Command::StopSound { at: None, cue } => self.sounds.push((cue.clone(), true)),
+                    // On an object: heard where it is, and moving with it
+                    // (the 360's `Sound.CueSound`, 0x82340F08, posts the
+                    // object and the cue to the sound queue 0x83224D60,
+                    // whose handler 0x8235ED50 starts the cue on the object
+                    // by 0x8236C0D8).
+                    Command::CueSound { at: Some(g), cue }
+                    | Command::StopSound { at: Some(g), cue } => {
+                        let stop = matches!(c, Command::StopSound { .. });
+                        let at = {
+                            let w = mission.world().borrow();
+                            w.objects.get(g).map(|o| Vec3::from_array(o.position))
+                        };
+                        let at = at.unwrap_or_else(|| game.focus());
+                        eprintln!(
+                            "object sound: {cue} on {g:#x} {} at {at:.1}",
+                            if stop { "stops" } else { "starts" }
+                        );
+                        if let Some(check) = &mut self.object_sound_check {
+                            check.heard(*g, stop);
+                        }
+                        self.object_sounds.push((*g, cue.clone(), stop, at));
+                    }
                     Command::FadeSound {
                         category,
                         level,
@@ -4351,6 +4397,21 @@ impl MissionLink {
     }
 
     /// Interface sounds the scripts cued since the last call.
+    /// The sounds the scripts cued on objects since last asked: the
+    /// object, the cue, whether it is to stop, and where the object is.
+    pub fn take_object_sounds(&mut self) -> Vec<(u32, String, bool, Vec3)> {
+        std::mem::take(&mut self.object_sounds)
+    }
+
+    /// Where object `guid` of the scripts' world is now.
+    pub fn object_at(&self, guid: u32) -> Option<Vec3> {
+        let State::Running(mission) = &self.state else {
+            return None;
+        };
+        let w = mission.world().borrow();
+        w.objects.get(&guid).map(|o| Vec3::from_array(o.position))
+    }
+
     pub fn take_sounds(&mut self) -> Vec<(String, bool)> {
         std::mem::take(&mut self.sounds)
     }
@@ -6369,6 +6430,66 @@ const BOARDING: u32 = 1800;
 /// Moves a player standing under the sea to the nearest dry ground within
 /// 1.5 km. True once she stands on dry ground (moved there, or there
 /// already); false while none around her has loaded.
+/// `--object-sound-check`: once the scripts run, her C4 charge is put
+/// down 2 m from her (`C4 Projectile`, whose `C4` object script arms and
+/// beeps it: `wpn_bomb_timer_01_armed` on the object), left 5 s and taken
+/// up (gone, which stops the beep). Logs each object sound started and
+/// stopped (`object sound:` lines) and, after, `object-sound-check: PASS`
+/// once the charge's cue started and stopped, else `FAIL`.
+#[derive(Debug, Default)]
+pub struct ObjectSoundCheck {
+    t: f32,
+    charge: Option<u32>,
+    started: u32,
+    stopped: u32,
+    done: bool,
+}
+
+impl ObjectSoundCheck {
+    /// A sound cued on object `guid` started (or stopped).
+    fn heard(&mut self, guid: u32, stop: bool) {
+        if self.charge == Some(guid) {
+            if stop {
+                self.stopped += 1;
+            } else {
+                self.started += 1;
+            }
+        }
+    }
+
+    fn tick(&mut self, game: &Game, mission: &mut m2_game::mission::Mission, dt: f32) {
+        if self.done {
+            return;
+        }
+        self.t += dt;
+        if self.charge.is_none() && self.t > 2.0 {
+            let at = game.focus() + Vec3::X * 2.0;
+            let g = mission.ammo_spawned("C4 Projectile", at.to_array());
+            eprintln!("object-sound-check: her C4 put down at {at:.1} ({g:#x})");
+            self.charge = Some(g);
+        }
+        if let Some(g) = self.charge
+            && self.t > 7.0
+        {
+            mission.ammo_gone(g);
+            if self.t > 8.0 {
+                self.done = true;
+                if self.started > 0 && self.stopped > 0 {
+                    eprintln!(
+                        "object-sound-check: PASS its cue started {} times, stopped {}",
+                        self.started, self.stopped
+                    );
+                } else {
+                    eprintln!(
+                        "object-sound-check: FAIL its cue started {} times, stopped {}",
+                        self.started, self.stopped
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn go_ashore(game: &mut Game) -> bool {
     let (Some(world), Some(player)) = (&game.scene.world, &mut game.scene.player) else {
         return true;
@@ -9732,6 +9853,19 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_object_sound_check_counts_its_charges_cue_only() {
+        let mut check = ObjectSoundCheck {
+            charge: Some(0x40),
+            ..ObjectSoundCheck::default()
+        };
+        check.heard(0x40, false);
+        check.heard(0x41, false);
+        check.heard(0x40, false);
+        check.heard(0x40, true);
+        assert_eq!((check.started, check.stopped), (2, 1));
+    }
 
     // VzaCon001's "Land on the beach": `vTgtInclude =
     // Player.GetAllCharacters()` read as no target ("quota 1 of 0

@@ -1474,6 +1474,93 @@ pub enum Sound {
         at: Vec3,
         key: u32,
     },
+    /// Two things meeting: the sound table's cue `key`
+    /// ([`m2_engine::tuning::KeyTable::contact_cue`]) at `level` of its
+    /// usual ([`m2_engine::tuning::contact_level`]).
+    Contact {
+        at: Vec3,
+        key: u32,
+        level: f32,
+    },
+}
+
+/// What a vehicle met: another vehicle (its index) or a static.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Met {
+    Vehicle(usize),
+    Static(m2_engine::StaticKey),
+}
+
+/// A vehicle meeting something, new this tick: the collision event the
+/// 360 posts for every new contact (0x82162BB8 to queue 0x8320C6F0),
+/// which its sound pump hears (0x8235EFA0 -> 0x8235E3A8) whether or not
+/// it is hard enough to damage anything.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Contact {
+    /// The vehicle's index.
+    pub vehicle: usize,
+    pub met: Met,
+    /// Where (world).
+    pub at: Vec3,
+    /// The contact normal, from the vehicle toward what it met.
+    pub normal: Vec3,
+    /// The closing speed along the normal (m/s).
+    pub closing: f32,
+    /// The two bodies' mass (kg, a fixed body 0): which three of a
+    /// frame's are heard ([`m2_engine::tuning::CONTACTS_HEARD`]).
+    pub mass: f32,
+    /// The damage table's cell for the vehicle's key against what it met
+    /// is over 0 (the sound table's first word, else its second).
+    pub damaging: bool,
+}
+
+/// What a round struck.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Struck {
+    /// A person (index into the people).
+    Person(usize),
+    /// A vehicle (its index).
+    Vehicle(usize),
+    /// Her, the hero.
+    Her,
+    /// The world: a static of the scene's if it was one, and the word of
+    /// the triangle struck (0 none).
+    Static(Option<StaticKey>, u32),
+}
+
+/// A round striking something, the hit event the 360 posts for it
+/// (0x82296940 -> 0x8228D270, queue 0x83175048), which its sound pump
+/// hears (0x8235EFA0 -> 0x8235E190).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hit {
+    pub at: Vec3,
+    /// The round's template (or its gun's; 0 none): its `SoundKey`.
+    pub round: u32,
+    /// Its `DamageKey` (0 none).
+    pub kind: u32,
+    pub struck: Struck,
+    /// The damage table's cell for what it struck against the round, if
+    /// known here (the world's is looked up where it is heard): over 0,
+    /// the hit damages (the sound table's first word).
+    pub cell: Option<f32>,
+}
+
+/// The [`m2_engine::tuning::CONTACTS_HEARD`] of `hits` that damage most,
+/// most first: the 360 keeps three hit slots a frame (its sound
+/// manager's +0x4C, 0x82361CE8), ranked by the damage cell
+/// (0x8235E190 passes it as the priority).
+pub fn heard_hits(mut hits: Vec<(Hit, f32)>) -> Vec<(Hit, f32)> {
+    hits.sort_by(|a, b| b.1.total_cmp(&a.1));
+    hits.truncate(m2_engine::tuning::CONTACTS_HEARD);
+    hits
+}
+
+/// The `CONTACTS_HEARD` of `contacts` of the most mass, most first (the
+/// 360's three slots a frame, 0x82361CE8).
+pub fn heard_contacts(mut contacts: Vec<Contact>) -> Vec<Contact> {
+    contacts.sort_by(|a, b| b.mass.total_cmp(&a.mass));
+    contacts.truncate(m2_engine::tuning::CONTACTS_HEARD);
+    contacts
 }
 
 /// A blow or a round that landed on something of the world's rather than
@@ -2005,6 +2092,19 @@ pub struct Combat {
     pub impacts: (u32, u32),
     /// Of those named, how many the particle table decided.
     pub table_impacts: u32,
+    /// Every new meeting of a vehicle with another or with a static this
+    /// tick, damaging or not, for its sound ([`Contact`]).
+    pub contacts: Vec<Contact>,
+    /// Every round that struck something this tick, for its sound
+    /// ([`Hit`]).
+    pub hit_events: Vec<Hit>,
+    /// The template of the round being fired (its ammunition's, or the
+    /// gun's where only that is known; 0 none): what [`Hit::round`]
+    /// names.
+    firing: u32,
+    /// Vehicle-against-vehicle contacts heard with a cue, all told (for
+    /// `--impact-check`).
+    pub vehicle_contacts_heard: u32,
     /// Those impacts by template.
     pub impact_kinds: std::collections::BTreeMap<&'static str, u32>,
     /// What the fighting has come to (for checking).
@@ -2318,6 +2418,10 @@ impl Default for Combat {
             cases: 0,
             impacts: (0, 0),
             table_impacts: 0,
+            contacts: Vec::new(),
+            hit_events: Vec::new(),
+            firing: 0,
+            vehicle_contacts_heard: 0,
             impact_kinds: std::collections::BTreeMap::new(),
             tally: Tally::default(),
             hurts: Vec::new(),
@@ -3133,6 +3237,13 @@ impl Combat {
             .cast_ray_surface(from, dir, t + 0.05)
             .map_or((None, 0), |(_, _, key, surface)| (key, surface));
         let at = from + dir * (t - IMPACT_BACK).max(0.0);
+        self.hit_events.push(Hit {
+            at,
+            round: self.firing,
+            kind: 0,
+            struck: Struck::Static(key, surface),
+            cell: None,
+        });
         // The particle table's effect for the surface struck by a bullet
         // first: a surface's word is a `ParticleKey` (`TERRAIN_GRASS` is
         // the table's `Terrain_grass` row; names hash without case), and
@@ -3255,6 +3366,12 @@ impl Combat {
     /// `at`: heard as its template's `SoundKey` `key` says.
     pub fn broke(&mut self, at: Vec3, key: u32) {
         self.sounds.push(Sound::Break { at, key });
+    }
+
+    /// Two things met at `at`, heard as the sound table's cue `key` at
+    /// `level` ([`Sound::Contact`]).
+    pub fn contact(&mut self, at: Vec3, key: u32, level: f32) {
+        self.sounds.push(Sound::Contact { at, key, level });
     }
 
     /// Where she is a target: her chest, or `None` while down, flying or
@@ -3643,6 +3760,7 @@ impl Combat {
         let feel = w.feel;
         let case = case_behind(f.arsenal, w.model, from, aim);
         let ammo = w.ammo;
+        self.firing = ammo.template;
         let round = match ammo.key {
             Some(k) if k == m2_assets::name_hash("Bullet") => Round::Bullet,
             _ => Round::BulletLarge,
@@ -3752,6 +3870,7 @@ impl Combat {
         let (eye, aim) = Self::aim_ray(f.player);
         let (from, case) = Self::muzzle_and_case(f, f.arsenal.of_gun(&self.rifle));
         let ammo = self.rifle.ammo;
+        self.firing = ammo.map_or(0, |a| a.template);
         let round = match ammo.and_then(|a| a.key) {
             Some(k) if k == m2_assets::name_hash("Bullet") || k == 0 => Round::Bullet,
             Some(_) => Round::BulletLarge,
@@ -4175,6 +4294,15 @@ impl Combat {
             }
             if at_her && f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
                 let damage = self.npc_round(gun);
+                self.firing = gun.map_or(0, |g| g.template);
+                let key = gun.and_then(|g| g.damage_key);
+                self.hit_events.push(Hit {
+                    at: closest,
+                    round: self.firing,
+                    kind: key.unwrap_or(0),
+                    struck: Struck::Her,
+                    cell: Some(self.hero_scale(key)),
+                });
                 let lost = self.hurt_player(f, damage, Some(from));
                 self.tally.taken_rounds += lost;
                 self.tally.rounds_on_her += u32::from(lost > 0.0);
@@ -4757,6 +4885,7 @@ impl Combat {
             );
         }
         let ammo = w.ammo;
+        self.firing = ammo.template;
         match w.flight() {
             m2_engine::weapons::Flight::Round => {
                 for _ in 0..w.pellets.max(1) {
@@ -4786,7 +4915,15 @@ impl Combat {
                         let along = (her - from).dot(aim).max(0.0);
                         let blocked = hit.is_some_and(|h| h.0 < along - 1.0);
                         if !blocked && (from + aim * along).distance(her) < 0.45 {
-                            let taken = damage * self.hero_scale(ammo.key);
+                            let cell = self.hero_scale(ammo.key);
+                            let taken = damage * cell;
+                            self.hit_events.push(Hit {
+                                at: her,
+                                round: self.firing,
+                                kind: ammo.key.unwrap_or(0),
+                                struck: Struck::Her,
+                                cell: Some(cell),
+                            });
                             let lost = self.hurt_player(f, taken, Some(from));
                             self.tally.taken_rounds += lost;
                             self.tally.rounds_on_her += u32::from(lost > 0.0);
@@ -5479,6 +5616,8 @@ impl Combat {
                 self.reload = w.gap();
             }
             let ammo = w.ammo;
+            self.firing = ammo.template;
+            self.firing = ammo.template;
             let hit = cast_shot(f.physics, f.people, from, aim, MG_RANGE, None, Some(id));
             let to = hit.map_or(from + aim * MG_RANGE, |h| from + aim * h.0);
             self.effect(Effect::Tracer { from, to }, 0.07);
@@ -5609,6 +5748,22 @@ impl Combat {
             };
             let relative = physics.vehicle_velocity_before(a) - physics.vehicle_velocity_before(b);
             let closing = relative.dot(normal).abs();
+            // Heard whether or not it damages: the first vehicle's key's
+            // row against the second's column.
+            let column = vehicles[j].spec.tuning.key.unwrap_or(kind);
+            let damaging = match (self.damage_table.as_ref(), vehicles[i].spec.tuning.key) {
+                (Some(t), Some(row)) => t.scale(row, column).unwrap_or(0.0) > 0.0,
+                _ => false,
+            };
+            self.contacts.push(Contact {
+                vehicle: i,
+                met: Met::Vehicle(j),
+                at,
+                normal,
+                closing,
+                mass: vehicles[i].spec.mass + vehicles[j].spec.mass,
+                damaging,
+            });
             let size = m2_engine::durability::crash_size(
                 vehicles[i].spec.mass,
                 vehicles[j].spec.mass,
@@ -5691,16 +5846,25 @@ impl Combat {
         for (i, key, at, normal, mass) in met {
             let Some(a) = vehicles[i].id else { continue };
             let closing = physics.vehicle_velocity_before(a).dot(normal).max(0.0);
-            let size = d::crash_size(vehicles[i].spec.mass, mass, closing);
-            if size < d::CRASH_FLOOR {
-                continue;
-            }
             let column = key_of(key).unwrap_or(any);
             let cell = match (self.damage_table.as_ref(), vehicles[i].spec.tuning.key) {
                 (Some(t), Some(row)) => t.scale(row, column).or_else(|| t.scale(row, any)),
                 _ => None,
             }
             .unwrap_or(0.0);
+            self.contacts.push(Contact {
+                vehicle: i,
+                met: Met::Static(key),
+                at,
+                normal,
+                closing,
+                mass: vehicles[i].spec.mass + mass,
+                damaging: cell > 0.0,
+            });
+            let size = d::crash_size(vehicles[i].spec.mass, mass, closing);
+            if size < d::CRASH_FLOOR {
+                continue;
+            }
             let damage = d::crash_damage(size, cell);
             if damage > 0.0 {
                 let v = &mut vehicles[i];
@@ -5786,6 +5950,13 @@ impl Combat {
             {
                 scale = own;
             }
+            self.hit_events.push(Hit {
+                at,
+                round: self.firing,
+                kind: key,
+                struck: Struck::Vehicle(i),
+                cell: Some(scale),
+            });
             if damage * scale > 0.0 {
                 // The part it struck takes it as the whole does: the
                 // 360 posts one damage message, the table's cell already
@@ -6630,7 +6801,15 @@ impl Combat {
         push: Vec3,
         at: Option<Vec3>,
     ) -> bool {
-        let taken = damage * hero * self.on_person(&people.npcs[j], key);
+        let cell = self.on_person(&people.npcs[j], key);
+        let taken = damage * hero * cell;
+        self.hit_events.push(Hit {
+            at: at.unwrap_or(people.npcs[j].character.position + Vec3::Y),
+            round: self.firing,
+            kind: key.unwrap_or(0),
+            struck: Struck::Person(j),
+            cell: Some(cell),
+        });
         people.npcs[j].last_hit = at.map(|p| (p, push));
         if self.crew_firing {
             let killed = people.npcs[j].shot_by_army(taken, push, 0);
@@ -7564,6 +7743,36 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn three_hits_a_frame_are_heard_those_that_damage_most() {
+        let h = |round: u32| Hit {
+            at: Vec3::ZERO,
+            round,
+            kind: 0,
+            struck: Struck::Person(0),
+            cell: None,
+        };
+        let heard = heard_hits(vec![(h(1), 0.25), (h(2), 1.0), (h(3), 0.0), (h(4), 0.5)]);
+        let order: Vec<u32> = heard.iter().map(|(h, _)| h.round).collect();
+        assert_eq!(order, [2, 4, 1]);
+    }
+
+    #[test]
+    fn three_contacts_a_frame_are_heard_those_of_most_mass() {
+        let c = |vehicle: usize, mass: f32| Contact {
+            vehicle,
+            met: Met::Vehicle(9),
+            at: Vec3::ZERO,
+            normal: Vec3::X,
+            closing: 1.0,
+            mass,
+            damaging: false,
+        };
+        let heard = heard_contacts(vec![c(0, 1000.0), c(1, 30000.0), c(2, 500.0), c(3, 2000.0)]);
+        let order: Vec<usize> = heard.iter().map(|c| c.vehicle).collect();
+        assert_eq!(order, [1, 3, 0]);
+    }
 
     // The emplaced MG's turret (its record's limits and speeds, bones
     // straight up a stick): she looks off to her right and up; it gets
