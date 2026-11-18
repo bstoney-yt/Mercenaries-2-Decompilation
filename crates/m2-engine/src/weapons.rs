@@ -333,18 +333,19 @@ pub struct Ammo {
     pub model: Option<u32>,
     /// It sticks where it lands (`Sticky`).
     pub sticky: bool,
+    /// Its round's `FlightNoise` ([`crate::ordnance::FlightNoise`]).
+    pub noise: Option<crate::ordnance::FlightNoise>,
 }
 
 impl Ammo {
-    /// Its speed fired by a person: `Velocity` times `HumanBoost`, no more
-    /// than `MaxVelocity`.
+    /// Its speed fired by a person: `Velocity` times `HumanBoost` (1 when
+    /// the template gives none). From the 360 code: the ordnance launch
+    /// (0x82298208) sets a round's speed to its record's +8 (`Velocity`)
+    /// times its +0x14 (taken as `HumanBoost`) when the spawn names a
+    /// firer, and reads no `MaxVelocity`: the carbine's round flies at 340
+    /// m/s, not its `MaxVelocity`'s 300.
     pub fn human_speed(&self) -> f32 {
-        let v = self.velocity * self.human_boost.max(1.0);
-        if self.max_velocity > 0.0 {
-            v.min(self.max_velocity)
-        } else {
-            v
-        }
+        self.velocity * self.human_boost.max(1.0)
     }
 
     /// The explosion it becomes: where it strikes, else when its timer
@@ -1280,6 +1281,7 @@ struct Parts<'a> {
     stimulus: Table<'a>,
     links: Table<'a>,
     models: HashMap<u32, u32>,
+    noise: Table<'a>,
 }
 
 impl Parts<'_> {
@@ -1370,6 +1372,7 @@ impl Parts<'_> {
             homing,
             model: self.models.get(&id).copied().filter(|&m| m != 0),
             sticky: !self.sticky.of_template(id).is_empty(),
+            noise: crate::ordnance::FlightNoise::of(&self.noise, id),
         }
     }
 }
@@ -1387,6 +1390,7 @@ pub fn read(db: &Layer<'_>) -> Arms {
         explosive: Table::new(db, "Explosive"),
         homing: Table::new(db, "HomingProjectile"),
         sticky: Table::new(db, "Sticky"),
+        noise: Table::new(db, "FlightNoise"),
         stimulus: Table::new(db, "Stimulus"),
         links: Table::new(db, "PhysicalLink"),
         models: db.hashes("ModelName"),
@@ -1936,6 +1940,7 @@ mod tests {
             homing: None,
             model: None,
             sticky: false,
+            noise: None,
         }
     }
 
@@ -1998,7 +2003,7 @@ mod tests {
     }
 
     // The carbine round: 6 out to 15 m, a tenth less by 50 m; 340 m/s
-    // from her hands, under its 300 m/s most. A round whose dropoff is
+    // from her hands, its 300 m/s `MaxVelocity` not applied. A round whose dropoff is
     // whole falls to its minimum; one of 0 keeps its damage.
     #[test]
     fn a_round_falls_off_with_range_and_flies_at_its_human_speed() {
@@ -2026,7 +2031,7 @@ mod tests {
             ..ammo(60.0, 15.0, (50.0, 100.0))
         };
         assert_eq!(sniper.damage_at(100.0), 60.0);
-        assert_eq!(a.human_speed(), 300.0);
+        assert_eq!(a.human_speed(), 340.0);
     }
 
     // The grenade's throw: 9 m/s at -45 degrees, 13 level, 16 at 45.

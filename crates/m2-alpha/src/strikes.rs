@@ -71,6 +71,9 @@ struct Shell {
     fuse: Fuse,
     travelled: f32,
     age: f32,
+    /// Its `FlightNoise` wobble ([`m2_engine::ordnance::step_wobbling`]),
+    /// with its own random numbers' state.
+    wobble: Option<(m2_engine::ordnance::Wobble, u64)>,
     /// Its template's timer: it goes off this long after it is made.
     timer: Option<f32>,
 }
@@ -179,7 +182,15 @@ impl Strikes {
                             * if speed > 0.0 { speed } else { FALL_SPEED }
                     }
                 };
+                let mut seed = u64::from(*guid) << 1 | 1;
+                let wobble = info.and_then(|i| i.noise).map(|n| {
+                    let w = m2_engine::ordnance::Wobble::launch(n, velocity, false, &mut || {
+                        next_random(&mut seed)
+                    });
+                    (w, seed)
+                });
                 self.shells.push(Shell {
+                    wobble,
                     guid: *guid,
                     template,
                     model,
@@ -250,8 +261,18 @@ impl Strikes {
             // `SpawnCarpetBombLine` 0x82391B88, `ConeSpawn` 0x823923B8)
             // make their ordnance through 0x82297C00, which the ordnance
             // update (0x82298E50) flies with 0x822973D0 (from the 360 code).
-            let (next, bent) =
-                m2_engine::ordnance::step(s.at, s.velocity, s.gravity, WORLD_GRAVITY, dt);
+            let (next, bent) = match &mut s.wobble {
+                Some((w, seed)) => m2_engine::ordnance::step_wobbling(
+                    s.at,
+                    s.velocity,
+                    s.gravity,
+                    WORLD_GRAVITY,
+                    dt,
+                    w,
+                    &mut || next_random(seed),
+                ),
+                None => m2_engine::ordnance::step(s.at, s.velocity, s.gravity, WORLD_GRAVITY, dt),
+            };
             let step = next - s.at;
             let length = step.length();
             let dir = step.normalize_or(Vec3::NEG_Y);
@@ -332,6 +353,14 @@ fn home(velocity: &mut Vec3, at: Vec3, target: Vec3, cone: f32, turn: f32, dt: f
     let most = (turn * dt).to_radians();
     let t = if angle <= most { 1.0 } else { most / angle };
     *velocity = now.slerp(want, t).normalize_or(now) * speed;
+}
+
+/// The next random number from `seed`, in [0, 1) (xorshift).
+fn next_random(seed: &mut u64) -> f32 {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 7;
+    *seed ^= *seed << 17;
+    (*seed >> 40) as f32 / (1u64 << 24) as f32
 }
 
 #[cfg(test)]
