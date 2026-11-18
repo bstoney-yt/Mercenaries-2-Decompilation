@@ -8247,7 +8247,8 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 /// its `Buoyancy` delay (5 s without one) and 10 s more, its time under
 /// the water logged each second; then the first helicopter likewise
 /// (its delay 0), held 3 s. Each passes when it has sunk and she is no
-/// longer in it. One line `sink-check: PASS` or `FAIL ...` at the end.
+/// longer in it while it stays whole (not wrecked), logging what she
+/// lost (Xenia: 100). One line `sink-check: PASS` or `FAIL ...` at the end.
 fn sink_check(game: &mut Game, tick: f32) {
     use m2_math::glam::Vec3;
     let mut fails: Vec<String> = Vec::new();
@@ -8294,6 +8295,8 @@ fn sink_check(game: &mut Game, tick: f32) {
         let ticks = ((after + extra) / tick) as u32;
         let every = ((1.0 / tick) as u32).max(1);
         let mut sunk_at = None;
+        game.combat.hp = 120.0;
+        let mut lost = 0.0;
         for t in 0..ticks {
             game.step(Intent::default(), tick);
             if t % every == 0 {
@@ -8306,6 +8309,7 @@ fn sink_check(game: &mut Game, tick: f32) {
             }
             if game.sunk(i) && sunk_at.is_none() {
                 sunk_at = Some(t as f32 * tick);
+                lost = 120.0 - game.combat.hp;
             }
         }
         let out = game
@@ -8314,7 +8318,12 @@ fn sink_check(game: &mut Game, tick: f32) {
             .as_ref()
             .is_none_or(|p| p.driving != Some(i));
         match sunk_at {
-            Some(s) if out => passed.push(format!("{kind} sank at {s:.1} s, she is out")),
+            Some(s) if out && game.scene.vehicles[i].wrecked => fails.push(format!(
+                "{kind} sank at {s:.1} s but was wrecked (the 360's stays whole)"
+            )),
+            Some(s) if out => passed.push(format!(
+                "{kind} sank at {s:.1} s whole, she is out, {lost:.0} of her health lost"
+            )),
             Some(s) => fails.push(format!("{kind} sank at {s:.1} s but she is still in it")),
             None => fails.push(format!("{kind} did not sink in {:.0} s", after + extra)),
         }

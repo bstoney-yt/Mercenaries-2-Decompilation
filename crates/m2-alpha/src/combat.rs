@@ -7208,6 +7208,22 @@ mod tests {
 
     use super::*;
 
+    // Put out of a car sunk under her (Xenia: 120 -> 19.6): 100 of her
+    // health, never below 1, heard as a hurt with no direction.
+    #[test]
+    fn sinking_puts_her_out_100_down() {
+        let mut c = Combat {
+            hp: 120.0,
+            ..Combat::default()
+        };
+        c.sank_out();
+        assert_eq!(c.hp, 20.0);
+        assert_eq!(c.take_hurts(), vec![(SANK_OUT, None)]);
+        c.hp = 30.0;
+        c.sank_out();
+        assert_eq!(c.hp, 1.0);
+    }
+
     // The emplaced MG's turret (its record's limits and speeds, bones
     // straight up a stick): she looks off to her right and up; it gets
     // there at 120 degrees a second and stops at its 90 and 30 degrees,
