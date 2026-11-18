@@ -5476,7 +5476,7 @@ impl People {
                             npc.spawn.unwrap_or(0),
                             fell.damage
                         );
-                        npc.hurt(fell.damage, Vec3::ZERO);
+                        npc.hurt_by_nobody(fell.damage);
                     }
                 }
                 None => {
