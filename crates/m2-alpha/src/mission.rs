@@ -1004,6 +1004,8 @@ enum State {
 /// The mission scripts and what they want shown.
 pub struct MissionLink {
     state: State,
+    /// The kept HUD calls read so far ([`HudCallCache`]).
+    hud_cache: std::cell::RefCell<HudCallCache>,
     /// `--check-node-damage <s>`: seconds of play left before the nearest
     /// vehicle with node health has a node sent damage by the scripts'
     /// `ObjectState.SendDamage` ([`check_node_damage`]).
@@ -1257,6 +1259,7 @@ impl MissionLink {
         };
         Self {
             state: State::Loading(rx),
+            hud_cache: Default::default(),
             check_node_damage: None,
             prop_nodes: HashMap::new(),
             faces: Default::default(),
@@ -5362,7 +5365,7 @@ impl MissionLink {
             stock: self.stock_counts.clone(),
             fanfare_waiting: self.completed.is_some() && waiting_fanfare(mission.lua()).is_some(),
             radar_regions: radar_regions(mission.lua()),
-            hud_calls: hud_calls(mission.lua()),
+            hud_calls: self.hud_cache.borrow_mut().calls(mission.lua()),
             pda_objectives: hud.mission.clone(),
             trespass: trespass(mission.lua()),
             vehicle_disguise: w.vehicle_disguise,
@@ -5596,6 +5599,52 @@ fn hud_calls_after(lua: &mlua::Lua, seq: u64) -> Vec<HudCall> {
             callback: t.get("callback").unwrap_or(false),
         })
         .collect()
+}
+
+/// The calls [`HUD_CALLS`] keeps, as [`hud_calls`] reads them, kept from
+/// tick to tick: each tick reads the calls made since (by number) and
+/// drops those the scripts let go of, rather than reading all of them
+/// again with a copy of each one's data (6% of a story run's main thread
+/// in its second contract). A kept call is a table made once and never
+/// changed (its data copied as the call was made), so what was read of
+/// it stands while it is kept.
+#[derive(Debug, Default)]
+struct HudCallCache {
+    /// The kept calls read, oldest first.
+    calls: Vec<HudCall>,
+    /// The number of the last call read.
+    read_to: u64,
+    /// The scripts' table of kept calls they were read from (a new one,
+    /// a new mission, reads all again).
+    table: Option<usize>,
+}
+
+impl HudCallCache {
+    /// The calls kept now, oldest first: what [`hud_calls`] returns.
+    fn calls(&mut self, lua: &mlua::Lua) -> Vec<HudCall> {
+        let g = lua.globals();
+        let (Ok(Some(table)), Ok(Some(latest))) = (
+            g.get::<Option<mlua::Table>>("__m2_hud_calls"),
+            g.get::<Option<u64>>("__m2_hud_call_count"),
+        ) else {
+            *self = Self::default();
+            return hud_calls(lua);
+        };
+        let id = table.to_pointer() as usize;
+        if self.table != Some(id) || latest < self.read_to {
+            *self = Self {
+                table: Some(id),
+                ..Self::default()
+            };
+        }
+        if latest > self.read_to {
+            self.calls.extend(hud_calls_after(lua, self.read_to));
+            self.read_to = latest;
+        }
+        self.calls
+            .retain(|c| table.contains_key(c.seq).unwrap_or(false));
+        self.calls.clone()
+    }
 }
 
 /// The calls [`HUD_CALLS`] keeps, oldest first.
@@ -9737,6 +9786,45 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_hud_call_cache_reads_what_reading_them_all_reads() {
+        let lua = mlua::Lua::new();
+        lua.load(HUD_CALLS).exec().unwrap();
+        // Calls made, past the 512 kept, some let go of, a new table of
+        // them (a new mission), each step read both ways.
+        let call = |lua: &mlua::Lua, n: u32| {
+            lua.load(format!(
+                "for i = 1, {n} do
+                    __m2_hud_call_count = __m2_hud_call_count + 1
+                    __m2_keep_hud_call({{ seq = __m2_hud_call_count, group = 'G' .. (i % 5),
+                        method = 'M', data = {{ i, {{ x = i * 2 }} }}, callback = i % 3 == 0 }})
+                end"
+            ))
+            .exec()
+            .unwrap();
+        };
+        let mut cache = HudCallCache::default();
+        assert_eq!(cache.calls(&lua), hud_calls(&lua));
+        for step in 0..12u64 {
+            call(
+                &lua,
+                [3, 0, 40, 700, 1, 5, 0, 300, 2, 9, 600, 4][step as usize],
+            );
+            if step == 4 {
+                let_go_hud_calls(&lua, 700);
+            }
+            if step == 8 {
+                lua.load("__m2_hud_calls = {} __m2_hud_call_count = 0")
+                    .exec()
+                    .unwrap();
+                call(&lua, 7);
+            }
+            let all = hud_calls(&lua);
+            assert_eq!(cache.calls(&lua), all, "step {step}");
+            assert!(all.len() <= 512);
+        }
+    }
 
     // VzaCon001's "Land on the beach": `vTgtInclude =
     // Player.GetAllCharacters()` read as no target ("quota 1 of 0
