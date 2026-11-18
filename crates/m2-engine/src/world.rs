@@ -367,6 +367,12 @@ pub struct Templates {
     /// What each piece of a template's objects weighs once broken off,
     /// kg, by id ([`crate::durability::piece_masses`]).
     pub piece_masses: HashMap<u32, f32>,
+    /// Each template's `OSMParameter`s naming templates, by id: (the
+    /// parameter's name hash, the template's id). What a part its model
+    /// sends off goes as ([`crate::node_debris::goes_as`]).
+    pub params: HashMap<u32, Vec<(u32, u32)>>,
+    /// Template ids by their name's hash.
+    pub by_hash: HashMap<u32, u32>,
     /// How hard blasts push each template's objects, of their push
     /// (`ExplosionFudge`), by id, where it says
     /// ([`crate::durability::explosion_fudges`]).
@@ -1133,6 +1139,8 @@ impl Templates {
                 .collect(),
             infos,
             piece_masses: crate::durability::piece_masses(&db, &names),
+            params: crate::node_debris::params(&db, &names),
+            by_hash: crate::node_debris::by_hash(&names),
             explosion_fudges: crate::durability::explosion_fudges(&db),
             names: names
                 .into_iter()

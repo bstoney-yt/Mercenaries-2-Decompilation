@@ -15,6 +15,15 @@
 //! cargo run --release -p m2-engine --example sentoff -- "<install dir>" [model hash]...
 //! ```
 //!
+//! Then what each part sent off goes as (its `CreateObject`'s template
+//! field, the object's `OSMParameter` of that name:
+//! [`m2_engine::node_debris::goes_as`]): how many resolve, how many to a
+//! `Crusher` template, whether that agrees with
+//! [`m2_engine::crush::piece_crushers`], how many name a second node and
+//! which flag words they carry. `sentoff identity: PASS` when every part
+//! of a placed model resolves to a template and every one
+//! `piece_crushers` lists agrees.
+//!
 //! Prints counts, names, hashes and times only.
 
 use std::collections::BTreeMap;
@@ -49,6 +58,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut source = install.open_world()?;
     let world = WorldIndex::build(&mut source)?;
     let db = &world.template_db;
+    let layer = {
+        let index = source.archive().index();
+        let hash = index
+            .assets()
+            .iter()
+            .find(|a| index.type_hash(a) == m2_assets::layer::TEMPLATE_DB_TYPE)
+            .map(|a| a.name_hash)
+            .ok_or("no template database")?;
+        source.asset(hash, m2_assets::layer::TEMPLATE_DB_TYPE)?
+    };
+    let layer = m2_assets::layer::Layer::parse(&layer)?;
+    let crushers = m2_engine::crush::crusher_modifiers(&layer);
+    let listed = m2_engine::crush::piece_crushers(&layer, &layer.names());
+    let (mut parts, mut resolved, mut crushing, mut agree, mut disagree, mut second) =
+        (0, 0, 0, 0, 0, 0);
+    let mut flags: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut unresolved: BTreeMap<u32, usize> = BTreeMap::new();
     let mut by_model: BTreeMap<u32, (u32, usize)> = BTreeMap::new();
     for o in &world.objects {
         by_model.entry(o.model).or_insert((o.template, 0)).1 += 1;
@@ -63,6 +89,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         };
         models += 1;
+        for p in &pieces.pieces {
+            parts += 1;
+            second += usize::from(p.at.is_some());
+            let goes = m2_engine::node_debris::goes_as(&db.params, &db.by_hash, template, p.param);
+            match goes {
+                Some(t) => {
+                    resolved += 1;
+                    crushing += usize::from(crushers.contains_key(&t));
+                }
+                None => *unresolved.entry(template).or_default() += 1,
+            }
+            if let Some(&(_, t, _)) = listed
+                .get(&template)
+                .and_then(|v| v.iter().find(|x| x.0 == p.param))
+            {
+                if goes == Some(t) {
+                    agree += 1;
+                } else {
+                    disagree += 1;
+                }
+            }
+        }
+        if let Some(states) = parsed.states.as_ref() {
+            for c in states
+                .machines
+                .iter()
+                .flat_map(|m| &m.acts)
+                .flat_map(|a| &a.creates)
+            {
+                *flags.entry(c.flags).or_default() += 1;
+            }
+        }
         let Some(states) = parsed.states.as_ref() else {
             continue;
         };
@@ -152,5 +210,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "models sending parts off: {models}; breaking up as their states send them (every chunk \
          in a part, every part with a PHY2 body): {driven} ({placed_driven} placed)"
     );
+    let unnamed: Vec<String> = unresolved
+        .iter()
+        .take(8)
+        .map(|(t, n)| format!("{} x{n}", db.names.get(t).map_or("?", String::as_str)))
+        .collect();
+    println!(
+        "sentoff identity: {parts} parts sent off; {resolved} go as a template ({crushing} a Crusher); piece_crushers agrees on {agree}, differs on {disagree}; {second} placed at a second node; flag words {flags:x?}; unresolved: {}",
+        unnamed.join(", ")
+    );
+    if resolved == parts && disagree == 0 {
+        println!("sentoff identity: PASS");
+    } else {
+        println!("sentoff identity: FAIL");
+    }
     Ok(())
 }

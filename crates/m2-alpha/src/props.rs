@@ -200,7 +200,11 @@ pub struct Props {
     /// The parts each prop has sent off: the piece (of its model's
     /// [`m2_engine::node_debris::NodePieces`]), its body and where the
     /// body started.
-    sent_off: HashMap<u32, Vec<(usize, DebrisId, Mat4)>>,
+    sent_off: HashMap<u32, Vec<SentOff>>,
+    /// The template database's `OSMParameter`s naming templates and the
+    /// template ids by name hash: what a part sent off goes as
+    /// ([`m2_engine::node_debris::goes_as`]).
+    goes_as: Option<Arc<GoesAs>>,
 
     /// How hard blasts push each prop, of their push, by entity, where its
     /// template says (`ExplosionFudge`).
@@ -208,6 +212,23 @@ pub struct Props {
     /// Wrecked since [`take_fallen`](Self::take_fallen): what falls with
     /// them is brought down too (`DestructionLink`).
     fallen: Vec<u32>,
+}
+
+/// `OSMParameter`s naming templates, by template id, and template ids by
+/// name hash ([`m2_engine::world::Templates::params`], `by_hash`).
+type GoesAs = (HashMap<u32, Vec<(u32, u32)>>, HashMap<u32, u32>);
+
+/// A part a prop sent off as an object of its own ([`Props::send_off`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SentOff {
+    /// Its piece, of the model's [`m2_engine::node_debris::NodePieces`].
+    piece: usize,
+    body: DebrisId,
+    /// Where its body started.
+    start: Mat4,
+    /// The template it goes as (its `CreateObject`'s field, the prop's
+    /// `DebrisTemplate`), where the database names one.
+    template: Option<u32>,
 }
 
 /// Which parts of a prop are broken ([`m2_engine::ModelParts`]), and the
@@ -484,6 +505,9 @@ impl Props {
         );
         if self.presets.is_none() {
             self.presets = Some(db.presets.clone());
+        }
+        if self.goes_as.is_none() {
+            self.goes_as = Some(Arc::new((db.params.clone(), db.by_hash.clone())));
         }
 
         if let Some(&kg) = db.piece_masses.get(&o.template) {
@@ -1903,51 +1927,62 @@ impl Props {
     /// (0x82409B38 gives it no velocity; the blast that brought the prop
     /// down made its explosion action from the bodies there before the
     /// piece was, 0x82291B88 -> 0x8215C110, so it doesn't push it; a
-    /// vehicle moves it only by running into it). True if it went.
-    pub fn send_off(&mut self, physics: &mut Physics, entity: u32, name: u32) -> bool {
-        let Some(p) = self.shown.get(&entity) else {
-            return false;
-        };
-        let Some(m) = self.models.get(&p.model).and_then(Option::as_ref) else {
-            return false;
-        };
+    /// vehicle moves it only by running into it). Its body, if it went.
+    pub fn send_off(&mut self, physics: &mut Physics, entity: u32, name: u32) -> Option<DebrisId> {
+        let p = self.shown.get(&entity)?;
+        let m = self.models.get(&p.model).and_then(Option::as_ref)?;
         let (Some(pieces), Some(loose)) = (
             m.node_pieces.clone(),
             m.collision.as_ref().and_then(|c| c.loose.clone()),
         ) else {
-            return false;
+            return None;
         };
-        let Some(k) = pieces.pieces.iter().position(|q| q.name == name) else {
-            return false;
-        };
+        let k = pieces.pieces.iter().position(|q| q.name == name)?;
         if self
             .sent_off
             .get(&entity)
-            .is_some_and(|s| s.iter().any(|s| s.0 == k))
+            .is_some_and(|s| s.iter().any(|s| s.piece == k))
         {
-            return false;
+            return None;
         }
-        let Some(idx) = sent_piece(&loose, &pieces.pieces[k]) else {
-            return false;
-        };
+        let idx = sent_piece(&loose, &pieces.pieces[k])?;
         let placed = Mat4::from_rotation_translation(p.rotation, p.position);
         let piece = &loose.pieces[idx];
         let start = loose.starts(placed)[idx];
         let corners = corners(start, piece);
         let lift = Mat4::from_translation(Vec3::Y * buried(physics, &corners));
-        let body = physics.add_rubble(piece, lift * start, Vec3::ZERO, Vec3::ZERO);
+        // At its second node, when its `CreateObject` names one.
+        let at = lift * pieces.placed(k, placed, start);
+        let body = physics.add_rubble(piece, at, Vec3::ZERO, Vec3::ZERO);
+        let template = self.goes_as.as_deref().and_then(|(params, by_hash)| {
+            m2_engine::node_debris::goes_as(params, by_hash, p.template, pieces.pieces[k].param)
+        });
         eprintln!(
             "props: {entity:#x}'s part {name:08x} goes off as an object of its own ({:.0} kg, \
-             {} nodes), at rest",
+             {} nodes), at rest, as template {}",
             piece.mass,
-            pieces.pieces[k].nodes.iter().filter(|&&n| n).count()
+            pieces.pieces[k].nodes.iter().filter(|&&n| n).count(),
+            template.map_or("unknown".to_owned(), |t| format!("{t:#x}"))
         );
-        self.sent_off
-            .entry(entity)
-            .or_default()
-            .push((k, body, lift * start));
+        self.sent_off.entry(entity).or_default().push(SentOff {
+            piece: k,
+            body,
+            start: lift * start,
+            template,
+        });
         self.changed();
-        true
+        Some(body)
+    }
+
+    /// What the body `body` is, if a prop sent it off as a part of its own
+    /// ([`send_off`](Self::send_off)): the prop's entity and the template
+    /// the part goes as (its `DebrisTemplate`; `None` where the database
+    /// names none). With [`m2_engine::crush::crusher_modifiers`] this says
+    /// whether it crushes what it lands on.
+    pub fn sent_off_as(&self, body: DebrisId) -> Option<(u32, Option<u32>)> {
+        self.sent_off
+            .iter()
+            .find_map(|(&e, v)| v.iter().find(|s| s.body == body).map(|s| (e, s.template)))
     }
 
     /// The nodes `entity` has sent off ([`send_off`](Self::send_off)), if
@@ -1956,8 +1991,8 @@ impl Props {
         let sent = self.sent_off.get(&entity)?;
         let pieces = m.node_pieces.as_ref()?;
         let mut hidden = vec![false; pieces.rest.len()];
-        for &(k, _, _) in sent {
-            for (h, &n) in hidden.iter_mut().zip(&pieces.pieces[k].nodes) {
+        for s in sent {
+            for (h, &n) in hidden.iter_mut().zip(&pieces.pieces[s.piece].nodes) {
                 *h |= n;
             }
         }
@@ -2032,7 +2067,13 @@ impl Props {
             }
             if let (Some(sent), Some(pieces)) = (self.sent_off.get(e), m.node_pieces.as_ref()) {
                 let placed = Mat4::from_rotation_translation(p.rotation, p.position);
-                for &(k, body, start) in sent {
+                for &SentOff {
+                    piece: k,
+                    body,
+                    start,
+                    ..
+                } in sent
+                {
                     if let Some(place) = physics.debris_place(body)
                         && place.w_axis.truncate().distance(eye) <= limit
                     {
@@ -2365,8 +2406,6 @@ fn launch(corners: &[Vec3; 8], push: BlastPush, scale: f32) -> (Vec3, Vec3) {
     (velocity * scale, spin * scale)
 }
 
-/// A number from -0.5 to 0.5 for piece `i`, `k`th of its kind: the same
-/// every time, different for each.
 /// Whether model `m` breaks up as its part states send its parts off
 /// ([`Props::send_off`]) rather than all at once: every piece its
 /// breakup has lies in a part its states send off, and each of those
@@ -2411,6 +2450,8 @@ fn sent_piece(loose: &m2_engine::Loose, part: &m2_engine::node_debris::NodePiece
         })
 }
 
+/// A number from -0.5 to 0.5 for piece `i`, `k`th of its kind: the same
+/// every time, different for each.
 fn scatter(i: u32, k: u32) -> f32 {
     let x = i.wrapping_mul(0x9e37_79b9) ^ k.wrapping_mul(0x85eb_ca6b);
     let x = (x ^ (x >> 15)).wrapping_mul(0x2c1b_3c6d);
@@ -2509,6 +2550,8 @@ mod tests {
         let part = |node: u16, nodes: [bool; 6]| NodePiece {
             name: u32::from(node),
             node,
+            param: 0,
+            at: None,
             nodes: nodes.to_vec(),
             bounds: None,
         };
