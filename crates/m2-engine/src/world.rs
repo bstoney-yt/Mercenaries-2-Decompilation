@@ -367,6 +367,10 @@ pub struct Templates {
     /// What each piece of a template's objects weighs once broken off,
     /// kg, by id ([`crate::durability::piece_masses`]).
     pub piece_masses: HashMap<u32, f32>,
+    /// Templates a character's touch breaks, and those it never does
+    /// ([`crate::touch_break`]), by id.
+    pub touch_breakers: HashSet<u32>,
+    pub uncrushable: HashSet<u32>,
     /// How hard blasts push each template's objects, of their push
     /// (`ExplosionFudge`), by id, where it says
     /// ([`crate::durability::explosion_fudges`]).
@@ -1133,6 +1137,8 @@ impl Templates {
                 .collect(),
             infos,
             piece_masses: crate::durability::piece_masses(&db, &names),
+            touch_breakers: crate::touch_break::touch_breakers(&db),
+            uncrushable: crate::touch_break::uncrushable(&db),
             explosion_fudges: crate::durability::explosion_fudges(&db),
             names: names
                 .into_iter()
