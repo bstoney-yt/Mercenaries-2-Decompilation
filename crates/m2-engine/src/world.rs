@@ -429,6 +429,11 @@ pub struct Templates {
     pub fake_masses: HashMap<u32, crate::durability::FakeMass>,
     /// The game's damage table, if found.
     pub damage: Option<DamageTable>,
+    /// The particle and sound tables ([`crate::tuning::KeyTable`]).
+    pub particle_table: Option<crate::tuning::KeyTable>,
+    pub sound_table: Option<crate::tuning::KeyTable>,
+    /// Each template's `ParticleKey`, by id.
+    pub particle_keys: HashMap<u32, u32>,
     /// Every gun, thrown weapon and vehicle armament ([`crate::weapons`]).
     pub arms: crate::weapons::Arms,
     /// Each template's parts' health and the part that burns, by id
@@ -1043,6 +1048,14 @@ impl Templates {
             .asset(name_hash(DAMAGE_TABLE), DAMAGE_TABLE_TYPE)
             .ok()
             .and_then(|d| DamageTable::parse(&d));
+        let key_table = |source: &mut AssetSource<R>, name: &str| {
+            source
+                .asset(name_hash(name), DAMAGE_TABLE_TYPE)
+                .ok()
+                .and_then(|d| crate::tuning::KeyTable::parse(&d))
+        };
+        let particle_table = key_table(source, crate::tuning::PARTICLE_TABLE);
+        let sound_table = key_table(source, crate::tuning::SOUND_TABLE);
         let model_of = db.hashes("ModelName");
         let engines = engine_banks(&db);
         let mut kinds: HashMap<u32, VehicleKind> = HashMap::new();
@@ -1184,6 +1197,9 @@ impl Templates {
             localized: localized_names(&db),
             faction_markers: faction_markers(&db),
             damage,
+            particle_table,
+            sound_table,
+            particle_keys: crate::durability::particle_keys(&db),
             blast_scripts: HashMap::new(),
         };
         for (id, script) in db.hashes("ObjectScript") {

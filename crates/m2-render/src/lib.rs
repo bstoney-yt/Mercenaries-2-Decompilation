@@ -24,6 +24,7 @@
 
 pub mod backend;
 pub mod buffer;
+pub mod fasthash;
 #[cfg(feature = "wgpu")]
 pub mod gpu;
 pub mod key;
@@ -33,8 +34,8 @@ pub mod texture;
 
 pub use backend::{
     Adaptation, BackendError, Clouds, DrawCall, Geometry, Haze, Lighting, LiveBuffers,
-    OverlayBlend, POINT_LIGHTS, PointLight, RenderBackend, ScreenOverlay, ToneMap, Topology, View,
-    WATER_RAMP_DEPTH,
+    OverlayBlend, POINT_LIGHTS, PointLight, RenderBackend, ScreenOverlay, SurfaceOverride, ToneMap,
+    Topology, View, WATER_RAMP_DEPTH,
 };
 pub use buffer::{
     BufferUsage, IndexBufferDesc, IndexBufferHandle, IndexFormat, SkinHandle, TextureHandle,

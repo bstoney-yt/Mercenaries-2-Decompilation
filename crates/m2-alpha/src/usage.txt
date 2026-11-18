@@ -274,6 +274,10 @@ m2-alpha [options]
                          scripts' HUD widgets start (the shop's store) is
                          pictured 1.5 s after it starts
                          (<out>-flash-<movie>-<widget>.ppm; flash-shot lines)
+  --mission-shots <s,...>
+                         with --mission --screenshot: the scene pictured
+                         at those seconds of play (<out>-t<s>.ppm), for
+                         side-by-side comparisons
   --late-shots <s,...>   with --mission --after-contract --screenshot: the
                          scene and the game's HUD pictured at these seconds
                          after each contract is done (<out>-c<n>-late<s>.ppm;
@@ -288,6 +292,9 @@ m2-alpha [options]
                          who fights her (faction-check lines); <f>:watch
                          hurts nobody; a picture with the HUD 40 s on
                          (-faction40)
+  --check-node-damage <s> with --mission: <s> seconds into play, the scripts'
+                         vehicle nearest her with node health has a node sent
+                         ObjectState.SendDamage(o, node, 1) (nodedamage lines)
   --honk-every <s>       with --mission: driving, hold the horn half a second
                          every <s> seconds (horn, gate and disguise lines)
   --bash-target <s>      with --mission --after-contract: this long after the
