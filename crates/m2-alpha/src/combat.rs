@@ -4256,9 +4256,12 @@ impl Combat {
                     let world: Vec<Mat4> = nodes.iter().map(|m| body * *m).collect();
                     // Limp from rest: what shove the 360 gives the body
                     // was not traced.
-                    let id = f
-                        .physics
-                        .add_ragdoll(&rig.skeleton.parents, &world, Vec3::ZERO);
+                    let id = f.physics.add_ragdoll_named(
+                        &rig.skeleton.name_hashes,
+                        &rig.skeleton.parents,
+                        &world,
+                        Vec3::ZERO,
+                    );
                     f.player.ragdoll = Some(id);
                 }
             }

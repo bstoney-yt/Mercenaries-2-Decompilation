@@ -92,9 +92,15 @@ pub struct RagdollBone {
     pub centre_of_mass: [f32; 3],
     pub friction: f32,
     pub angular_damping: f32,
-    /// Its collision shape: a capsule of this radius from `a` to `b` in
-    /// the node's space (a box's half extents for the spine's stand-in).
+    /// Its collision shape, in the node's space at `shape_place`
+    /// (position, rotation x y z w: its shape part's place, see
+    /// [`Physics::shape_place`]).
     pub shape: Option<BoneShape>,
+    pub shape_place: ([f32; 3], [f32; 4]),
+    /// The node's place in the asset's model space as it is bound (its
+    /// `HIER` transforms composed, column-major): the space the joints'
+    /// axes are given in. Identity where read without the model.
+    pub bind: [f32; 16],
 }
 
 /// A bone's collision shape.
@@ -181,20 +187,22 @@ impl HumanRagdoll {
             .enumerate()
             .map(|(i, b)| {
                 let part = part_of(i);
-                let shape = (0..p.shapes.len())
-                    .find(|&s| p.body_of(s) == Some(i))
-                    .and_then(|s| {
-                        let s = &p.shapes[s];
-                        match s.geometry {
-                            Geometry::Capsule { a, b } => Some(BoneShape::Capsule {
-                                radius: s.radius,
-                                a,
-                                b,
-                            }),
-                            Geometry::Box { half_extents } => Some(BoneShape::Box { half_extents }),
-                            _ => None,
-                        }
-                    });
+                let shape_index = (0..p.shapes.len()).find(|&s| p.body_of(s) == Some(i));
+                let shape_place = shape_index
+                    .and_then(|s| p.shape_place(s))
+                    .unwrap_or(([0.0; 3], [0.0, 0.0, 0.0, 1.0]));
+                let shape = shape_index.and_then(|s| {
+                    let s = &p.shapes[s];
+                    match s.geometry {
+                        Geometry::Capsule { a, b } => Some(BoneShape::Capsule {
+                            radius: s.radius,
+                            a,
+                            b,
+                        }),
+                        Geometry::Box { half_extents } => Some(BoneShape::Box { half_extents }),
+                        _ => None,
+                    }
+                });
                 RagdollBone {
                     node: part.map_or(0, |q| p.parts[q].node),
                     node_hash: part.map_or(0, |q| p.parts[q].node_hash),
@@ -204,6 +212,8 @@ impl HumanRagdoll {
                     friction: b.friction(),
                     angular_damping: b.angular_damping(),
                     shape,
+                    shape_place,
+                    bind: m2_math::glam::Mat4::IDENTITY.to_cols_array(),
                 }
             })
             .collect();
@@ -214,6 +224,28 @@ impl HumanRagdoll {
             .map(|(k, c)| joint(p, k, c))
             .collect::<Result<_, _>>()?;
         Ok(Self { bones, joints })
+    }
+
+    /// As [`from_physics`](Self::from_physics), with each bone's
+    /// [`bind`](RagdollBone::bind) from the asset's own `HIER`.
+    pub fn from_model(model: &crate::Model, p: &Physics) -> Result<Self, RagdollError> {
+        use m2_math::glam::Mat4;
+        let mut r = Self::from_physics(p)?;
+        let mut world: Vec<Mat4> = Vec::with_capacity(model.nodes.len());
+        for n in &model.nodes {
+            let local = Mat4::from(n.local);
+            let m = match n.parent.map(usize::from).and_then(|q| world.get(q)) {
+                Some(parent) => *parent * local,
+                None => local,
+            };
+            world.push(m);
+        }
+        for b in &mut r.bones {
+            if let Some(m) = world.get(b.node as usize) {
+                b.bind = m.to_cols_array();
+            }
+        }
+        Ok(r)
     }
 
     /// The whole body's mass, kilograms.

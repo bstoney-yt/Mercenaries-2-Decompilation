@@ -5380,7 +5380,12 @@ impl People {
                     let (nodes, _) = npc.rig.posed();
                     let body = npc.model_matrix();
                     let world: Vec<Mat4> = nodes.iter().map(|m| body * *m).collect();
-                    let id = physics.add_ragdoll(&npc.rig.skeleton.parents, &world, push);
+                    let id = physics.add_ragdoll_named(
+                        &npc.rig.skeleton.name_hashes,
+                        &npc.rig.skeleton.parents,
+                        &world,
+                        push,
+                    );
                     npc.ragdoll = Some(id);
                 }
             }
