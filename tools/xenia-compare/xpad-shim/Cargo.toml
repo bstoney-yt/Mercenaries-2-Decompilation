@@ -1,0 +1,17 @@
+[package]
+name = "xpad-shim"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Scriptable virtual pad: an xinput1_4.dll stand-in that reads its state from shared memory"
+
+# Standalone: not a member of the game workspace, never built by it.
+[workspace]
+
+[lib]
+name = "xinput1_4"
+crate-type = ["cdylib"]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
