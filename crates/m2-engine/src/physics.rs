@@ -3358,6 +3358,9 @@ pub struct Physics {
     human_ragdoll: Option<std::sync::Arc<m2_assets::ragdoll::HumanRagdoll>>,
     /// Loose props' pieces, oldest first.
     debris: Vec<Option<r::RigidBodyHandle>>,
+    /// Loose pieces tumbling at once at most ([`MAX_DEBRIS`]; a benchmark
+    /// raises it, [`set_debris_cap`](Physics::set_debris_cap)).
+    debris_cap: usize,
     /// The water's surface boats float on, if there is any.
     water: Option<f32>,
     /// The game's water heights: rivers, pools and lakes above the sea
@@ -3431,6 +3434,7 @@ impl Physics {
             ragdolls: Vec::new(),
             human_ragdoll: None,
             debris: Vec::new(),
+            debris_cap: MAX_DEBRIS,
             water: None,
             inland: None,
             time: 0.0,
@@ -3870,7 +3874,7 @@ impl Physics {
                 continue;
             }
             tumbling += 1;
-            if tumbling > MAX_DEBRIS || b.translation().y < DEBRIS_FLOOR {
+            if tumbling > self.debris_cap || b.translation().y < DEBRIS_FLOOR {
                 b.set_body_type(r::RigidBodyType::Fixed, false);
             }
         }
@@ -3960,6 +3964,24 @@ impl Physics {
                     .difference(DEBRIS)
                     .difference(VEHICLE)
                     .difference(RAGDOLL),
+                r::InteractionTestMode::And,
+            ),
+        )
+    }
+
+    /// A whole prop as a loose body of its own from the start, at rest,
+    /// meeting vehicles' hulls and other props as the 360's props do (gap
+    /// P7; the port's props are fixed until knocked loose). For the
+    /// props benchmark (`propbench`); nothing in play makes these yet.
+    pub fn add_prop_body(&mut self, piece: &LoosePiece, at: Mat4) -> DebrisId {
+        self.add_piece(
+            piece,
+            at,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            r::InteractionGroups::new(
+                DEBRIS,
+                r::Group::ALL.difference(RUBBLE),
                 r::InteractionTestMode::And,
             ),
         )
@@ -4118,6 +4140,38 @@ impl Physics {
             }
         }
         Some((*place, out?))
+    }
+
+    /// Adds `velocity` (m/s) to loose piece `id`'s, waking it (a blast's
+    /// push on a body that was at rest).
+    pub fn push_debris(&mut self, id: DebrisId, velocity: Vec3) {
+        let Some(h) = self.debris.get(id.0).copied().flatten() else {
+            return;
+        };
+        if let Some(b) = self.world.bodies.get_mut(h) {
+            let v = vec3(b.linvel()) + velocity;
+            b.set_linvel(vector(v), true);
+        }
+    }
+
+    /// How many loose pieces are awake (moving, not put to sleep).
+    pub fn debris_awake(&self) -> usize {
+        self.debris
+            .iter()
+            .flatten()
+            .filter(|h| {
+                self.world
+                    .bodies
+                    .get(**h)
+                    .is_some_and(|b| b.is_dynamic() && !b.is_sleeping())
+            })
+            .count()
+    }
+
+    /// How many loose pieces may tumble at once before the oldest are held
+    /// ([`MAX_DEBRIS`] by default).
+    pub fn set_debris_cap(&mut self, cap: usize) {
+        self.debris_cap = cap;
     }
 
     pub fn remove_debris(&mut self, id: DebrisId) {
