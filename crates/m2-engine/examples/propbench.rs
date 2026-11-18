@@ -37,7 +37,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .first()
         .ok_or("usage: propbench <install dir> [props]")?;
     if args.get(1).is_some_and(|a| a == "town") {
-        return town(root);
+        let dedup = args.iter().any(|a| a == "one-variant");
+        let slabs = args.iter().any(|a| a == "slabs");
+        return town(root, dedup, slabs);
     }
     let count: usize = args.get(1).map_or(Ok(3000), |s| s.parse())?;
     let spec = phoenix(root)?;
@@ -235,7 +237,7 @@ struct Placed {
 /// object's physics for the parts its state shows: 0x82182CE8 ->
 /// 0x82152780 -> 0x821831B0). Then it settles, stands still and takes a
 /// 20 m blast where the loose bodies are thickest.
-fn town(root: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn town(root: &str, dedup: bool, slabs: bool) -> Result<(), Box<dyn std::error::Error>> {
     use m2_assets::Ucfx;
     use m2_assets::model::Model;
     use m2_engine::world::WorldIndex;
@@ -273,7 +275,20 @@ fn town(root: &str) -> Result<(), Box<dyn std::error::Error>> {
     let inside = |p: Vec3| p.x >= lo.x && p.x < lo.x + 600.0 && p.z >= lo.z && p.z < lo.z + 600.0;
     let mut shapes: std::collections::HashMap<u32, Option<CollisionShape>> = Default::default();
     let mut placed = Vec::new();
+    // `one-variant`: of the objects of one model standing within 0.5 m of
+    // each other (a layer's pristine and staging variants of one prop),
+    // only the first.
+    let mut kept: Vec<(u32, Vec3)> = Vec::new();
     for o in all.iter().filter(|o| inside(o.position)) {
+        if dedup {
+            if kept
+                .iter()
+                .any(|(m, at)| *m == o.model && at.distance(o.position) < 0.5)
+            {
+                continue;
+            }
+            kept.push((o.model, o.position));
+        }
         let shape = shapes.entry(o.model).or_insert_with(|| {
             let d = source.model(o.model).ok()?;
             let m = Model::parse(&d.base).ok()?;
@@ -305,9 +320,9 @@ fn town(root: &str) -> Result<(), Box<dyn std::error::Error>> {
         placed.len(),
         shapes.len()
     );
-    town_run(&placed, lo, false, false);
-    town_run(&placed, lo, true, false);
-    town_run(&placed, lo, true, true);
+    town_run(&placed, lo, false, false, slabs);
+    town_run(&placed, lo, true, false, slabs);
+    town_run(&placed, lo, true, true, slabs);
     Ok(())
 }
 
@@ -331,7 +346,9 @@ fn timed(p: &mut Physics, seconds: f32, ms: &mut Vec<f64>) -> (usize, Option<f32
     (most, asleep)
 }
 
-fn town_run(placed: &[Placed], lo: Vec3, loose: bool, asleep: bool) {
+/// `slabs`: each loose body stands on a fixed slab at its own base (a
+/// stand-in for the terrain under it, which the flat floor isn't).
+fn town_run(placed: &[Placed], lo: Vec3, loose: bool, asleep: bool, slabs: bool) {
     let mut p = Physics::new();
     p.set_debris_cap(usize::MAX);
     let mut pieces = Vec::new();
@@ -341,6 +358,18 @@ fn town_run(placed: &[Placed], lo: Vec3, loose: bool, asleep: bool) {
             (Some(l), true) if !l.breaks => {
                 for (piece, at) in l.pieces.iter().zip(l.starts(o.at)) {
                     pieces.push((p.add_prop_body(piece, at, asleep), at.w_axis.truncate()));
+                    if slabs {
+                        let (c, e) = (at.transform_point3(piece.centre()), piece.extent());
+                        let base = c.y - e.y * 0.5;
+                        let slab =
+                            CollisionShape::cuboid(Vec3::new(e.x.max(e.z), 0.05, e.x.max(e.z)));
+                        p.add_static(
+                            StaticKey::Member(k, pieces.len()),
+                            &slab,
+                            Vec3::new(c.x, base - 0.05, c.z),
+                            Quat::IDENTITY,
+                        );
+                    }
                 }
             }
             _ => p.add_static(StaticKey::Object(k), &o.shape, translation, rotation),
@@ -362,6 +391,15 @@ fn town_run(placed: &[Placed], lo: Vec3, loose: bool, asleep: bool) {
     ];
     let ground = CollisionShape::mesh(&v, &[[0, 1, 2], [0, 2, 3]]).expect("plane");
     p.add_static(StaticKey::Cell(1), &ground, Vec3::ZERO, Quat::IDENTITY);
+    let moved = |p: &Physics, pieces: &[(m2_engine::DebrisId, Vec3)], by: f32| {
+        pieces
+            .iter()
+            .filter(|(id, at)| {
+                p.debris_place(*id)
+                    .is_some_and(|m| m.w_axis.truncate().distance(*at) > by)
+            })
+            .count()
+    };
     let mode = match (loose, asleep) {
         (false, _) => "fixed",
         (true, false) => "loose (placed awake)",
@@ -379,6 +417,14 @@ fn town_run(placed: &[Placed], lo: Vec3, loose: bool, asleep: bool) {
             "all asleep {t:.1} s in"
         ))
     );
+    if loose {
+        println!(
+            "town {mode}: after 8 s, {} moved over 2 cm, {} over 10 cm, {} over 1 m from where they were placed",
+            moved(&p, &pieces, 0.02),
+            moved(&p, &pieces, 0.1),
+            moved(&p, &pieces, 1.0)
+        );
+    }
     ms.clear();
     let (still, _) = timed(&mut p, 5.0, &mut ms);
     println!(
@@ -387,6 +433,14 @@ fn town_run(placed: &[Placed], lo: Vec3, loose: bool, asleep: bool) {
         ms[ms.len() - 1]
     );
     if !loose || pieces.is_empty() {
+        // Fixed: nothing for a blast to move.
+        ms.clear();
+        let (most, _) = timed(&mut p, 10.0, &mut ms);
+        println!(
+            "town {mode} after a 20 m blast (0 bodies in reach): step median {:.2} ms, worst {:.2} ms, most awake {most}",
+            ms[ms.len() / 2],
+            ms[ms.len() - 1]
+        );
         return;
     }
     // A 20 m blast where the loose bodies are thickest.
@@ -410,9 +464,9 @@ fn town_run(placed: &[Placed], lo: Vec3, loose: bool, asleep: bool) {
         }
     }
     ms.clear();
-    let (most, slept) = timed(&mut p, 10.0, &mut ms);
+    let (most, slept) = timed(&mut p, 30.0, &mut ms);
     println!(
-        "town {mode} after a 20 m blast ({reached} bodies in reach): step median {:.2} ms, worst \
+        "town {mode} after a 20 m blast (30 s) ({reached} bodies in reach): step median {:.2} ms, worst \
          {:.2} ms, most awake {most}, {}",
         ms[ms.len() / 2],
         ms[ms.len() - 1],
