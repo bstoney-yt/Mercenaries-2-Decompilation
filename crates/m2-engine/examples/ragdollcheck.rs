@@ -154,6 +154,57 @@ fn speed_cap(d: &Doll) -> Result<bool, Box<dyn std::error::Error>> {
     Ok(ok)
 }
 
+/// #722: a blast pushes people only through their ragdoll's launch
+/// (0x8215C560): a limp body given the launch of a blast 2 m off (the
+/// game's `MaxForce` 300, reach 10 m) is thrown, its hips more than 2 m
+/// up; a launch whose blast's second passes with no ragdoll to take it
+/// (the living, who only stagger) is dropped.
+fn blast_launch(d: &Doll) -> Result<bool, Box<dyn std::error::Error>> {
+    use m2_engine::ragdoll_launch::{Launch, blast_impulse};
+    let mut p = ground()?;
+    let lift = Mat4::from_translation(Vec3::Y * 0.6);
+    let nodes: Vec<Mat4> = d.bind.iter().map(|m| lift * *m).collect();
+    let start = nodes[d.hips].w_axis.y;
+    let id = p
+        .add_asset_ragdoll(&d.doll, &d.hashes, &d.parents, &nodes, Vec3::ZERO)
+        .ok_or("ragdoll not built")?;
+    let feet = Vec3::new(0.0, 0.6, 0.0);
+    let i = blast_impulse(
+        Vec3::new(-2.0, 0.0, 0.0),
+        feet,
+        10.0,
+        300.0,
+        0.3,
+        1.0,
+        [0.5; 3],
+    );
+    let l = Launch::new(&i, Vec3::Y);
+    p.launch_ragdoll(id, l.velocity, l.point);
+    let mut top = start;
+    for _ in 0..120 {
+        p.step(1.0 / 60.0);
+        top = top.max(p.ragdoll_nodes(id).ok_or("gone")?[d.hips].w_axis.y);
+    }
+    let thrown = top - start > 2.0;
+    println!(
+        "ragdoll-check 722: a limp body given a blast's launch: hips {:.2} m up from {start:.2}: {}",
+        top,
+        verdict(thrown)
+    );
+    // No ragdoll within the blast's second: dropped.
+    let mut kept = Launch::new(&i, Vec3::Y);
+    let mut updates = 0;
+    while kept.wait(1.0 / 60.0) {
+        updates += 1;
+    }
+    let dropped = (58..=60).contains(&updates);
+    println!(
+        "ragdoll-check 722: a launch with no ragdoll to take it: dropped after {updates} updates (the blast's 1 s): {}",
+        verdict(dropped)
+    );
+    Ok(thrown && dropped)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
         .nth(1)
@@ -162,6 +213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut all = true;
     all &= limp(&d)?;
     all &= speed_cap(&d)?;
+    all &= blast_launch(&d)?;
     println!("ragdoll-check: {}", verdict(all));
     Ok(())
 }
