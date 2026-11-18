@@ -27,6 +27,7 @@ use m2_engine::destroy_route as route;
 use std::collections::{HashMap, HashSet};
 
 use m2_engine::durability::{BlastPush, Crash, CrashHow};
+use m2_engine::tuning::DEFAULT_DAMAGE_KEY;
 use m2_engine::{Install, StaticKey, World};
 use m2_math::glam::{Mat4, Vec3};
 
@@ -416,6 +417,26 @@ pub struct Destruction {
     parting: Vec<(usize, Vec<usize>, Vec3, f32)>,
 }
 
+/// What a blast of `DamageKey` `kind` (0 for none) does to template
+/// `template`'s objects, of its damage: the damage table's cell for the
+/// template's `ModifierKey` row and the blast's column, as the 360's
+/// per-body blast damage finds it (0x82291640: the explosion's own
+/// `DamageKey`, 0x82398FC0, its default [`DEFAULT_DAMAGE_KEY`] where it
+/// has none; the row and column looked up by 0x823987D0, a key the
+/// table lacks finding its first). All of it without a table.
+pub fn blast_cell(db: &m2_engine::Templates, template: u32, kind: u32) -> f32 {
+    let Some(table) = db.damage.as_ref() else {
+        return 1.0;
+    };
+    let row = db
+        .modifiers
+        .get(&template)
+        .copied()
+        .unwrap_or(DEFAULT_DAMAGE_KEY);
+    let column = if kind == 0 { DEFAULT_DAMAGE_KEY } else { kind };
+    table.cell(row, column)
+}
+
 /// Whether template `t`'s objects blow up when destroyed: what it leaves
 /// on dying (`SpawnOnDeath`) is a blast (`Explosive`).
 pub fn explodes(db: &m2_engine::Templates, t: u32) -> bool {
@@ -781,8 +802,13 @@ impl Destruction {
             }
         }
         for (key, d) in reached {
-            let damage = blast.at_distance(d);
-            let hit = (damage, blast.kind, 1.0);
+            let Some((template, _)) = self.wearable(world, props, key) else {
+                continue;
+            };
+            // Its own column against the body's row, the 360's lookup
+            // (0x82291640 reads the blast's `DamageKey`, 0x823987D0).
+            let cell = blast_cell(&world.index.template_db, template, blast.kind);
+            let hit = (blast.at_distance(d) * cell, 0, 1.0);
             self.wear_by(world, props, install, key, hit, Cause::Blast(blast.push));
         }
     }
@@ -1549,6 +1575,40 @@ mod tests {
         assert!(jeep(end - Vec3::Z * 2.5).meets(turned, hedge));
         let past = turned.transform_point3(Vec3::X * 12.0);
         assert!(!jeep(past - Vec3::Z * 2.5).meets(turned, hedge));
+    }
+
+    // A blast's cell is its own column against the body's row, a key the
+    // table lacks finding the first (the default's), as the 360 looks it
+    // up; with no table it is taken in full.
+    #[test]
+    fn a_blasts_cell_is_its_own_column_against_the_row() {
+        let mut db = m2_engine::Templates::default();
+        assert_eq!(blast_cell(&db, 7, 0x16930afe), 1.0);
+        let mut d = vec![0u8; 0x48];
+        let (land, explosion, buster) = (0x1abb_43fd_u32, 0x1693_0afe_u32, 0x2231_4309_u32);
+        for w in [
+            2u32,
+            3,
+            DEFAULT_DAMAGE_KEY,
+            land,
+            DEFAULT_DAMAGE_KEY,
+            explosion,
+            buster,
+        ] {
+            d.extend(w.to_le_bytes());
+        }
+        for c in [1.0f32, 0.5, 0.25, 0.75, 0.0, 1.0] {
+            d.extend(c.to_le_bytes());
+        }
+        db.damage = m2_engine::tuning::DamageTable::parse(&d);
+        db.modifiers.insert(7, land);
+        assert_eq!(blast_cell(&db, 7, explosion), 0.0);
+        assert_eq!(blast_cell(&db, 7, buster), 1.0);
+        // No `DamageKey`, or one the table lacks: the first column.
+        assert_eq!(blast_cell(&db, 7, 0), 0.75);
+        assert_eq!(blast_cell(&db, 7, 0x99), 0.75);
+        // No row: the first row.
+        assert_eq!(blast_cell(&db, 8, explosion), 0.5);
     }
 
     #[test]

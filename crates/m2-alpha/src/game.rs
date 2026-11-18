@@ -2954,12 +2954,18 @@ impl Game {
             };
             // The first is the blast itself; the rest (its frag) reach
             // further with the same push.
+            // Each of its own column (its `DamageKey`, 0x82291640).
+            let db = &world.index.template_db;
+            let key = |id: u32| db.explosions.get(&id).map_or(0, |e| e.kind);
             if let Some(&(radius, damage)) = blasts.first() {
+                let first = ids.first().copied();
+                let k = first.map_or(0, key);
                 self.combat
-                    .blast(&mut field, at, radius, damage, ids.first().copied());
+                    .blast(&mut field, at, radius, damage, (first, k));
             }
             for (&(radius, damage), &id) in blasts.iter().zip(&ids).skip(1) {
-                self.combat.harm_at(&mut field, at, radius, damage, id);
+                self.combat
+                    .harm_at(&mut field, at, radius, damage, (id, key(id)));
             }
             if let (Some(reach), Some(push)) = (blasts.iter().map(|b| b.0).reduce(f32::max), push) {
                 blast_loose(world, &mut scene.props, &[push], reach >= combat::BOMB.0);
@@ -4220,8 +4226,10 @@ fn hit_world(
         }
     }
     let mut pushes = Vec::new();
-    for at in combat.went_off.clone() {
-        let blasts = rocket_blasts(&world.index.template_db, at);
+    for (at, of) in combat.went_off.clone() {
+        let Some(blasts) = went_off_blasts(&world.index.template_db, at, of) else {
+            continue;
+        };
         combat.last_push = blasts.first().map(|b| b.push);
         pushes.extend(combat.last_push);
         for blast in blasts {
@@ -4244,7 +4252,8 @@ fn hit_world(
             });
         }
     }
-    let mut broken = flights.strike(&mut world.physics, &combat.struck, &combat.went_off);
+    let went_off: Vec<Vec3> = combat.went_off.iter().map(|w| w.0).collect();
+    let mut broken = flights.strike(&mut world.physics, &combat.struck, &went_off);
     // The state layers' crates too ([`crate::placed`]).
     broken.extend(placed.strike(
         props,
@@ -4252,7 +4261,7 @@ fn hit_world(
         flights,
         &world.index.template_db,
         &combat.struck,
-        &combat.went_off,
+        &went_off,
     ));
     for (_, at) in broken {
         combat.show(
@@ -4271,7 +4280,11 @@ impl Game {
     /// rounds and blasts would ([`hit_world`]): the props check's hits
     /// ([`crate::breakables::check`]). The fight's own of the last step
     /// are dropped.
-    pub fn hit_world_with(&mut self, struck: Vec<combat::Strike>, went_off: Vec<Vec3>) {
+    pub fn hit_world_with(
+        &mut self,
+        struck: Vec<combat::Strike>,
+        went_off: Vec<(Vec3, Option<combat::Blasted>)>,
+    ) {
         let scene = &mut self.scene;
         let Some(world) = &mut scene.world else {
             return;
@@ -4747,6 +4760,36 @@ const ROCKET_HIT: f32 = 0.5;
 /// (`Rocket`, 100, within [`ROCKET_HIT`]), each at `at`. Those the data
 /// doesn't give are left out; with none, combat's own reach and 100 to
 /// nothing.
+/// What a blast gone off at `at` (explosion template `of`, where known)
+/// wears down of the world: its template's own `Explosive`, of its own
+/// `DamageKey` column (0x82291640 reads the explosion's, 0x82398FC0).
+/// The RPG's (by name), and one whose template isn't known or has no
+/// `Explosive`, are an RPG's with its frag and rocket ([`rocket_blasts`]).
+/// `None` for the satellite bomb's, whose blasts wear the world where it
+/// lands ([`bomb_blasts`]).
+pub(crate) fn went_off_blasts(
+    db: &Templates,
+    at: Vec3,
+    of: Option<combat::Blasted>,
+) -> Option<Vec<Blast>> {
+    let template = match of {
+        Some(combat::Blasted::Id(t)) => Some(t),
+        Some(combat::Blasted::Named(n)) if n == combat::fx::BOMB => return None,
+        Some(combat::Blasted::Named(n)) => db.id(n),
+        None => None,
+    };
+    let rocket = |t: u32| ROCKET_BLASTS.iter().any(|n| db.id(n) == Some(t));
+    Some(
+        match template
+            .filter(|&t| !rocket(t))
+            .and_then(|t| db.explosions.get(&t))
+        {
+            Some(&e) => vec![of_explosion(e, at)],
+            None => rocket_blasts(db, at),
+        },
+    )
+}
+
 pub(crate) fn rocket_blasts(db: &Templates, at: Vec3) -> Vec<Blast> {
     let mut out: Vec<Blast> = [explosion(db, &ROCKET_BLASTS), explosion(db, &[ROCKET_FRAG])]
         .into_iter()
@@ -5979,6 +6022,68 @@ fn switch_weapon(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    // Each blast wears the world of its own `DamageKey` column: a bunker
+    // buster's stage as itself; the RPG's (named), one not known and one
+    // with no `Explosive` as an RPG's; the satellite bomb's not here.
+    #[test]
+    fn a_blast_wears_the_world_of_its_own_column() {
+        use super::*;
+        use m2_engine::durability::Explosion;
+        let mut db = m2_engine::Templates::default();
+        let e = |radius, damage, kind| Explosion {
+            radius,
+            damage,
+            least: 0.0,
+            force: 500.0,
+            kind,
+        };
+        let buster = m2_assets::name_hash("BunkerBuster");
+        for (id, name, ex) in [
+            (
+                1,
+                "Explosion (Bunker Buster Stage 2)",
+                Some(e(8.0, 4095.0, buster)),
+            ),
+            (
+                2,
+                "Explosion (Handheld RPG)",
+                Some(e(5.0, 200.0, 0x1693_0afe)),
+            ),
+            (
+                3,
+                "Explosion (Handheld RPG Frag)",
+                Some(e(15.0, 300.0, 0x74fd_1ba9)),
+            ),
+            (4, "Explosion (Smart Bomb)", None),
+        ] {
+            db.names.insert(id, name.to_owned());
+            if let Some(ex) = ex {
+                db.explosions.insert(id, ex);
+            }
+        }
+        let at = Vec3::new(1.0, 2.0, 3.0);
+        let own = went_off_blasts(&db, at, Some(combat::Blasted::Id(1))).unwrap();
+        assert_eq!(own.len(), 1);
+        assert_eq!(
+            (own[0].kind, own[0].damage, own[0].radius),
+            (buster, 4095.0, 8.0)
+        );
+        assert_eq!(own[0].at, at);
+        let rpg = rocket_blasts(&db, at);
+        assert_eq!(rpg.len(), 2, "the RPG's blast and its frag");
+        let kinds = |b: &[Blast]| b.iter().map(|b| b.kind).collect::<Vec<_>>();
+        for of in [
+            Some(combat::Blasted::Id(2)),
+            Some(combat::Blasted::Named("Explosion (Handheld RPG)")),
+            Some(combat::Blasted::Named(combat::fx::FINAL)),
+            None,
+        ] {
+            let b = went_off_blasts(&db, at, of).unwrap();
+            assert_eq!(kinds(&b), kinds(&rpg), "{of:?}");
+        }
+        assert!(went_off_blasts(&db, at, Some(combat::Blasted::Named(combat::fx::BOMB))).is_none());
+    }
 
     #[test]
     fn a_pickup_taken_sets_off_its_pickup_effect() {
