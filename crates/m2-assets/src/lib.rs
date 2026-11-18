@@ -77,6 +77,7 @@ pub mod mixer;
 pub mod model;
 pub mod path;
 pub mod physics;
+pub mod ragdoll;
 pub mod region;
 pub mod scatter;
 pub mod sges;
