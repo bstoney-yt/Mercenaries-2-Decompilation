@@ -229,6 +229,9 @@ m2-alpha [options]
                          locked, then unlocked, then use with getting out
                          locked, then unlocked; prints seat-check: PASS or
                          FAIL lines and seat-check: RESULT PASS/FAIL
+  --log-check            testing: 5 numbered lines and log-check: RESULT PASS
+                         to standard error, then exit at once, as a check
+                         ends; all must reach a piped standard error
   --survival-check       check: her health clamp and survival mode on the
                          game's own code (clamp, a crusher's hit, the cut);
                          PASS/FAIL, then exit
