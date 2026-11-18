@@ -2161,6 +2161,16 @@ impl Game {
             // Every new meeting of the two kinds above is heard, damaging or
             // not (0x8235E3A8): the sound table's cue for the two sides'
             // `SoundKey`s, three a frame.
+            let hits = std::mem::take(&mut self.combat.hit_events);
+            for (at, cue) in hit_cues(
+                &world.index,
+                &self.scene.props,
+                &self.scene.vehicles,
+                &self.scene.people,
+                hits,
+            ) {
+                self.combat.contact(at, cue, 1.0);
+            }
             let contacts = std::mem::take(&mut self.combat.contacts);
             for (at, cue, level) in contact_cues(
                 &world.index,
@@ -4430,6 +4440,114 @@ fn within_bed(place: Mat4, (lo, hi): (Vec3, Vec3), bed: Vec3, c: Vec3) -> bool {
 /// run into that their weight breaks ([`Destruction::crash`]: plants,
 /// bushes, fences, lampposts, the island's and the state layers'), going
 /// on through it.
+/// A round's `SoundKey`: its template's, else (a gun's template) the
+/// ammunition the gun fires's.
+fn round_sound_key(db: &m2_engine::Templates, round: u32) -> u32 {
+    db.sound_keys
+        .get(&round)
+        .or_else(|| {
+            db.leavings
+                .ammo
+                .get(&round)
+                .and_then(|a| db.sound_keys.get(a))
+        })
+        .copied()
+        .unwrap_or(0)
+}
+
+/// What `hits`, a tick's rounds striking things ([`combat::Hit`]), are
+/// heard as: the three that damage most ([`combat::heard_hits`]), each
+/// the sound table's cue ([`m2_engine::tuning::KeyTable::contact_cue`])
+/// for what it struck's `SoundKey` and the round's
+/// ([`round_sound_key`]: `projectile_bullet_rifle` on the rifles'
+/// rounds), damaging when the damage table's cell for the two is over 0,
+/// at its full level, where it struck. What it struck: a person, their
+/// template's (`hum_soldier`, `hum_civ`); a vehicle, its template's; the
+/// ground, the word of the triangle (`TERRAIN_GRASS`); a placed object
+/// or prop, its template's. From the 360 code: 0x8235E190 takes the
+/// struck side's key and the round's by 0x8235E600, the damage cell by
+/// 0x823987D0, and plays 0x8235E798's cue at 1.0 in the hit slots; its
+/// fixed override table (0x82398A20, data 0x82DE4A40) is empty, so every
+/// hit goes by the sound table. Inferred: a person whose kind names no
+/// template looks up as 0 (the table's first row).
+pub(crate) fn hit_cues(
+    index: &m2_engine::WorldIndex,
+    props: &Props,
+    vehicles: &[ParkedVehicle],
+    people: &crate::npc::People,
+    hits: Vec<combat::Hit>,
+) -> Vec<(Vec3, u32)> {
+    let db = &index.template_db;
+    let Some(table) = db.sound_table.as_ref() else {
+        return Vec::new();
+    };
+    let template_key = |t: Option<u32>| t.and_then(|t| db.sound_keys.get(&t).copied()).unwrap_or(0);
+    let modifier = |t: Option<u32>| t.and_then(|t| db.modifiers.get(&t).copied());
+    let ranked: Vec<(combat::Hit, f32)> = hits
+        .into_iter()
+        .map(|h| {
+            let cell = h.cell.unwrap_or_else(|| {
+                let row = match h.struck {
+                    combat::Struck::Static(
+                        Some(StaticKey::Object(i) | StaticKey::Member(i, _)),
+                        _,
+                    ) => modifier(index.objects.get(i).map(|o| o.template)),
+                    combat::Struck::Static(Some(StaticKey::Entity(e)), _) => {
+                        modifier(props.get(e).map(|(p, _)| p.template))
+                    }
+                    _ => Some(m2_assets::name_hash(m2_engine::durability::TERRAIN_KEY)),
+                };
+                let column = if h.kind != 0 {
+                    h.kind
+                } else {
+                    m2_assets::name_hash("Bullet")
+                };
+                match (db.damage.as_ref(), row) {
+                    (Some(t), Some(r)) => t.scale(r, column).unwrap_or(0.0),
+                    _ => 0.0,
+                }
+            });
+            (h, cell)
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (h, cell) in combat::heard_hits(ranked) {
+        let struck = match h.struck {
+            combat::Struck::Person(j) => people
+                .npcs
+                .get(j)
+                .and_then(|n| people.kinds.get(n.kind))
+                .map_or(0, |k| template_key(db.id(&k.role))),
+            combat::Struck::Vehicle(i) => vehicles.get(i).map_or(0, |v| {
+                vehicle_sound_key(db, &v.spec.label, v.spec.model).unwrap_or(0)
+            }),
+            combat::Struck::Static(Some(StaticKey::Cell(_)) | None, surface) => surface,
+            combat::Struck::Static(Some(StaticKey::Object(i) | StaticKey::Member(i, _)), _) => {
+                template_key(index.objects.get(i).map(|o| o.template))
+            }
+            combat::Struck::Static(Some(StaticKey::Entity(e)), _) => {
+                template_key(props.get(e).map(|(p, _)| p.template))
+            }
+        };
+        let round = round_sound_key(db, h.round);
+        match table.contact_cue(struck, round, cell > 0.0) {
+            Some(cue) => {
+                eprintln!(
+                    "hit: {:?} struck by round {:08x}: keys {struck:08x} x {round:08x}, cell {cell:.2} \
+                     -> cue {cue:08x}",
+                    h.struck, h.round
+                );
+                out.push((h.at, cue));
+            }
+            None => eprintln!(
+                "hit: {:?} struck by round {:08x}: keys {struck:08x} x {round:08x}: no cue, silent",
+                h.struck, h.round
+            ),
+        }
+    }
+    out
+}
+
 /// What `contacts`, a tick's new meetings of vehicles with each other
 /// and the world ([`combat::Contact`]), are heard as: the three of the
 /// most mass ([`combat::heard_contacts`]), each the sound table's cue
@@ -6186,6 +6304,17 @@ mod tests {
     use m2_engine::TemplateInfo;
 
     use super::*;
+
+    #[test]
+    fn a_round_is_heard_by_its_own_sound_key_else_its_ammunitions() {
+        let mut db = m2_engine::Templates::default();
+        // A round with a key of its own; a gun whose ammunition has one.
+        db.sound_keys.insert(7, 0x69db_8e2c);
+        db.leavings.ammo.insert(9, 7);
+        assert_eq!(round_sound_key(&db, 7), 0x69db_8e2c);
+        assert_eq!(round_sound_key(&db, 9), 0x69db_8e2c);
+        assert_eq!(round_sound_key(&db, 5), 0);
+    }
 
     #[test]
     fn a_vehicles_sound_key_is_found_by_label_else_by_model() {
