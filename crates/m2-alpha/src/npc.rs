@@ -1849,6 +1849,20 @@ impl Npc {
 
     /// Takes `damage`; at no health left, falls: true if it killed.
     /// `push` (m/s) shoves the body if it kills or is dead already.
+    /// Hurt by something that is nobody's (a falling piece: its damage
+    /// event names the piece, not her): as [`Npc::hurt`], leaving who hurt
+    /// them, their alert and their hit as they were.
+    pub fn hurt_by_nobody(&mut self, damage: f32) -> bool {
+        let (by_her, killed_by_her, alert, hit) =
+            (self.hurt_by_her, self.killed_by_her, self.alert, self.hit);
+        let killed = self.hurt(damage, Vec3::ZERO);
+        self.hurt_by_her = by_her;
+        self.killed_by_her = killed_by_her;
+        self.alert = alert;
+        self.hit = hit;
+        killed
+    }
+
     pub fn hurt(&mut self, damage: f32, push: Vec3) -> bool {
         let clips = self.clips;
         let last_hit = self.last_hit.take();

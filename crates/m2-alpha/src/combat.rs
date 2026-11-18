@@ -1865,6 +1865,11 @@ pub struct Combat {
     /// The game's damage table: what each kind of round and blast does to
     /// people and vehicles.
     pub damage_table: Option<DamageTable>,
+    /// The loose pieces that crush, with their template's `Crusher`
+    /// `DamageModifier` ([`m2_engine::crush`]): filled as debris whose
+    /// template carries one is sent off (#701's pieces, by
+    /// [`m2_engine::crush::piece_crushers`]); pieces not here count as 1.
+    pub debris_crushers: std::collections::HashMap<m2_engine::DebrisId, f32>,
     /// The particle table: what a hit throws up by what it struck and
     /// how ([`m2_engine::tuning::KeyTable`]).
     pub particle_table: Option<m2_engine::tuning::KeyTable>,
@@ -2237,6 +2242,7 @@ impl Default for Combat {
             rpg: Rifle::launcher(Weapon::Rpg),
             gl: Rifle::launcher(Weapon::GrenadeLauncher),
             damage_table: None,
+            debris_crushers: std::collections::HashMap::new(),
             particle_table: None,
             bumping: Default::default(),
             bumping_statics: Default::default(),
@@ -4300,6 +4306,71 @@ impl Combat {
     /// `Crusher`): from the 360 code (0x822889F8), past the health clamp
     /// and without starting survival mode. Nothing in the port drops
     /// debris on her yet; this is where such a hit goes.
+    /// The damage table's cell for a person struck by a loose piece: the
+    /// `Human` row (a key the table lacks finds its first row, 0x82398890)
+    /// and the first column, as the pieces' own `DamageKey` is not read
+    /// yet (inferred: debris templates name none).
+    fn human_crush_cell(&self) -> f32 {
+        let Some(t) = self.damage_table.as_ref() else {
+            return 1.0;
+        };
+        let (rows, columns) = t.keys();
+        let human = m2_assets::name_hash("Human");
+        let row = rows.iter().position(|&k| k == human).unwrap_or(0);
+        let (Some(&r), Some(&c)) = (rows.get(row), columns.first()) else {
+            return 1.0;
+        };
+        t.scale(r, c).unwrap_or(1.0)
+    }
+
+    /// Loose pieces coming down on the limp, as the 360's collision damage
+    /// has it ([`m2_engine::crush`]; 0x8228B5F0, 0x82287CF8): each new
+    /// contact of a piece with a ragdoll's bone, its size from the bone's
+    /// and the piece's masses, the piece's `Crusher` modifier standing
+    /// when it comes down onto the body; damage by the `Human` row. A
+    /// crusher's hit on her goes past her health clamp
+    /// ([`Combat::hurt_player_crushed`]); people take theirs with no
+    /// attacker of hers. A living person's body is a shape phantom on the
+    /// 360 (0x82176F38, +0x2B4) and has no such contacts. Returns each
+    /// hit: (the person, `None` for her; the damage; whether a crusher).
+    pub fn limp_crushes(&mut self, f: &mut Field<'_>) -> Vec<(Option<usize>, f32, bool)> {
+        let cell = self.human_crush_cell();
+        let mut out = Vec::new();
+        let struck = |physics: &mut Physics, id: m2_engine::RagdollId| {
+            physics
+                .ragdoll_debris_hits(id)
+                .into_iter()
+                .filter_map(|h| {
+                    let m = self.debris_crushers.get(&h.debris).copied().unwrap_or(1.0);
+                    let c = m2_engine::crush::crush_hit(&h, m)?;
+                    let damage = m2_engine::crush::crush_damage(&c, cell);
+                    (damage > 0.0).then_some((damage, c.crusher.is_some(), h))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (i, n) in f.people.npcs.iter_mut().enumerate() {
+            let Some(id) = n.ragdoll else { continue };
+            for (damage, crushed, _) in struck(f.physics, id) {
+                if n.alive {
+                    n.hurt_by_nobody(damage);
+                }
+                out.push((Some(i), damage, crushed));
+            }
+        }
+        if let Some(id) = f.player.ragdoll {
+            for (damage, crushed, h) in struck(f.physics, id) {
+                let from = f.player.character.position + h.normal;
+                if crushed {
+                    self.hurt_player_crushed(f, damage, from);
+                } else {
+                    self.hurt_player(f, damage, Some(from));
+                }
+                out.push((None, damage, crushed));
+            }
+        }
+        out
+    }
+
     pub fn hurt_player_crushed(&mut self, f: &mut Field<'_>, damage: f32, from: Vec3) -> f32 {
         self.hurt_player_as(f, damage, Some(from), true)
     }
@@ -8552,6 +8623,93 @@ mod tests {
 
     /// Hurts her by each of `hits` (damage, dealt by someone) with
     /// `combat` as set, returning her health after each.
+    /// A limp body under a falling block: what [`Combat::limp_crushes`]
+    /// does to her (`her`) or a person, with the block as a crusher of
+    /// `modifier` (none: plain debris). Returns (hits, her or the person's
+    /// health after, her survival).
+    /// (hits as [`Combat::limp_crushes`] gives them, health, survival)
+    type Crushed = (Vec<(Option<usize>, f32, bool)>, f32, bool);
+
+    fn crushed_limp(her: bool, modifier: Option<f32>) -> Crushed {
+        let mut physics = ground();
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        let mut people = People::default();
+        let nodes = [
+            Mat4::from_translation(Vec3::new(0.0, 0.2, 0.0)),
+            Mat4::from_translation(Vec3::new(0.5, 0.2, 0.0)),
+            Mat4::from_translation(Vec3::new(1.0, 0.2, 0.0)),
+        ];
+        let doll = physics.add_ragdoll(&[None, Some(0), Some(1)], &nodes, Vec3::ZERO);
+        if her {
+            player.ragdoll = Some(doll);
+        } else {
+            let mut n = crate::npc::Npc::new(
+                0,
+                &crate::npc::tests::rig(),
+                Vec3::ZERO,
+                0.0,
+                crate::npc::Brain::Post { facing: 0.0 },
+                Some(1),
+            );
+            n.ragdoll = Some(doll);
+            people.npcs.push(n);
+        }
+        for _ in 0..60 {
+            physics.step(1.0 / 60.0);
+        }
+        physics.ragdoll_debris_hits(doll);
+        let block = m2_engine::LoosePiece::block(None, Vec3::ZERO, Vec3::new(0.4, 0.2, 0.4), 500.0);
+        let piece = physics.add_debris(
+            &block,
+            Mat4::from_translation(Vec3::new(0.5, 3.6, 0.0)),
+            Vec3::ZERO,
+            Vec3::ZERO,
+        );
+        let mut combat = Combat {
+            hp: 100.0,
+            max_hp: 120.0,
+            health_clamp: true,
+            ..Combat::default()
+        };
+        if let Some(m) = modifier {
+            combat.debris_crushers.insert(piece, m);
+        }
+        let arsenal = Arsenal::default();
+        let mut vehicles = Vec::new();
+        let mut explosives = [];
+        let mut hits = Vec::new();
+        for _ in 0..180 {
+            physics.step(1.0 / 60.0);
+            let mut field = Field {
+                physics: &mut physics,
+                player: &mut player,
+                people: &mut people,
+                vehicles: &mut vehicles,
+                arsenal: &arsenal,
+                explosives: &mut explosives,
+            };
+            hits.extend(combat.limp_crushes(&mut field));
+        }
+        let health = if her { combat.hp } else { people.npcs[0].hp };
+        (hits, health, combat.survival)
+    }
+
+    /// From the 360 code (0x8228B5F0, 0x822889F8): a crusher coming down
+    /// on the limp kills through her clamp; plain debris of the same fall
+    /// does no more than its hundredth.
+    #[test]
+    fn a_crusher_coming_down_on_the_limp_kills_through_the_clamp() {
+        let (hits, hp, survival) = crushed_limp(true, Some(1000.0));
+        assert!(matches!(hits.as_slice(), [(None, _, true)]), "{hits:?}");
+        assert!(hp <= 0.0 && !survival, "{hp} {survival}");
+        let (hits, hp, _) = crushed_limp(true, None);
+        assert!(hits.iter().all(|h| !h.2), "{hits:?}");
+        assert!(hp > 90.0, "{hp}");
+        let (hits, hp, _) = crushed_limp(false, Some(1000.0));
+        assert!(matches!(hits.as_slice(), [(Some(0), _, true)]), "{hits:?}");
+        assert!(hp <= 0.0, "{hp}");
+    }
+
     fn health_after(combat: &mut Combat, hits: &[(f32, bool)]) -> Vec<f32> {
         let mut physics = ground();
         let mut player = Player::new(0.0, 0.0, 0.0, None);

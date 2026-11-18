@@ -2425,6 +2425,14 @@ impl Game {
                 arsenal: &scene.arsenal,
                 explosives: &mut scene.explosives,
             };
+            // Loose pieces coming down on the limp (0x8228B5F0).
+            for (who, damage, crushed) in self.combat.limp_crushes(&mut field) {
+                eprintln!(
+                    "crush: {} takes {damage:.1} from a falling piece{}",
+                    who.map_or("she".to_string(), |i| format!("person {i}")),
+                    if crushed { " (a crusher)" } else { "" }
+                );
+            }
             crate::spans::time("on foot: combat", || {
                 // Her weapons away (swimming, or put away by the scripts):
                 // nothing to fire, aim or throw (the on-foot table's `Swim`

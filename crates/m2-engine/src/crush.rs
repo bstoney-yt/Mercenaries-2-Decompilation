@@ -105,6 +105,27 @@ pub fn crush(c: &Contact) -> Option<Crush> {
     })
 }
 
+/// The crush step of a loose piece coming onto a ragdoll's bone
+/// ([`crate::Physics::ragdoll_debris_hits`]): the piece side `a` with its
+/// template's `modifier` (1 without `Crusher`), the bone side `b`.
+pub fn crush_hit(hit: &crate::physics::DebrisHit, modifier: f32) -> Option<Crush> {
+    crush(&Contact {
+        size: hit.size,
+        modifier: [modifier, 1.0],
+        normal: hit.normal,
+        closing: hit.closing,
+        velocity: hit.velocity,
+    })
+}
+
+/// What a crush does to the struck side, by its cell of the damage table
+/// (its `ModifierKey` row, the crusher's `DamageKey` column): the base
+/// times the cell, nothing unless over 1 (0x82287CF8).
+pub fn crush_damage(c: &Crush, cell: f32) -> f32 {
+    let damage = c.base * cell;
+    if damage > 1.0 { damage } else { 0.0 }
+}
+
 /// Each template's `Crusher` `DamageModifier`, by id.
 pub fn crusher_modifiers(db: &Layer<'_>) -> HashMap<u32, f32> {
     let t = Table::new(db, "Crusher");

@@ -3326,6 +3326,26 @@ struct Ragdoll {
     /// Seconds since it went limp, for its first heavier fall
     /// ([`crate::ragdoll_launch::heavy_gravity`], the game's ragdoll only).
     age: f32,
+    /// The loose pieces ([`DebrisId`]) its bones touched at the last
+    /// [`Physics::ragdoll_debris_hits`], so a touch is told once.
+    debris_touching: Vec<usize>,
+}
+
+/// A loose piece ([`Physics::add_debris`]) coming onto a ragdoll's bone:
+/// what the 360's collision event records for it (0x82162BB8), for the
+/// crush step ([`crate::crush`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DebrisHit {
+    pub debris: DebrisId,
+    /// The crash's size ([`crate::durability::crash_size`]) by the two
+    /// bodies' masses and how fast they closed.
+    pub size: f32,
+    /// The contact normal, pointing from the bone to the piece.
+    pub normal: Vec3,
+    /// How fast they closed along the normal, m/s.
+    pub closing: f32,
+    /// The piece's and the bone's velocities, m/s.
+    pub velocity: [Vec3; 2],
 }
 
 /// The physics world.
@@ -3358,6 +3378,9 @@ pub struct Physics {
     human_ragdoll: Option<std::sync::Arc<m2_assets::ragdoll::HumanRagdoll>>,
     /// Loose props' pieces, oldest first.
     debris: Vec<Option<r::RigidBodyHandle>>,
+    /// The loose pieces' and ragdoll bones' velocities as the last step
+    /// began, for how fast a contact closed ([`Physics::ragdoll_debris_hits`]).
+    velocity_before: HashMap<r::RigidBodyHandle, Vec3>,
     /// Loose pieces tumbling at once at most ([`MAX_DEBRIS`]; a benchmark
     /// raises it, [`set_debris_cap`](Physics::set_debris_cap)).
     debris_cap: usize,
@@ -3434,6 +3457,7 @@ impl Physics {
             ragdolls: Vec::new(),
             human_ragdoll: None,
             debris: Vec::new(),
+            velocity_before: HashMap::new(),
             debris_cap: MAX_DEBRIS,
             water: None,
             inland: None,
@@ -3595,6 +3619,17 @@ impl Physics {
     pub fn step(&mut self, dt: f32) {
         self.world.integration_parameters.dt = dt;
         self.time += dt;
+        self.velocity_before.clear();
+        for h in self.debris.iter().flatten().chain(
+            self.ragdolls
+                .iter()
+                .flatten()
+                .flat_map(|d| d.bodies.iter().flatten()),
+        ) {
+            if let Some(b) = self.world.bodies.get(*h) {
+                self.velocity_before.insert(*h, vec3(b.linvel()));
+            }
+        }
         let w = &mut self.world;
         for v in self.vehicles.iter_mut().flatten() {
             v.before = w
@@ -3904,6 +3939,88 @@ impl Physics {
     /// Adds a loose piece where `at` (world space; scale ignored) puts it,
     /// flying at `velocity` (m/s) and turning at `spin` (radians a second
     /// about each axis).
+    /// The loose pieces that have come onto ragdoll `id`'s bones since the
+    /// last call: one hit per piece as it first touches (the 360 records
+    /// a contact as it is made, 0x82162BB8), the bone it met the one that
+    /// closed fastest.
+    pub fn ragdoll_debris_hits(&mut self, id: RagdollId) -> Vec<DebrisHit> {
+        let Some(doll) = self.ragdolls.get(id.0).and_then(Option::as_ref) else {
+            return Vec::new();
+        };
+        let debris: HashMap<r::RigidBodyHandle, usize> = self
+            .debris
+            .iter()
+            .enumerate()
+            .filter_map(|(k, h)| Some(((*h)?, k)))
+            .collect();
+        let mut best: HashMap<usize, DebrisHit> = HashMap::new();
+        for bone in doll.bodies.iter().flatten() {
+            let Some(b) = self.world.bodies.get(*bone) else {
+                continue;
+            };
+            for &c in b.colliders() {
+                for pair in self.world.narrow_phase.contact_pairs_with(c) {
+                    if !pair.has_any_active_contact() {
+                        continue;
+                    }
+                    let (mine_first, other) = if pair.collider1 == c {
+                        (true, pair.collider2)
+                    } else {
+                        (false, pair.collider1)
+                    };
+                    let Some(oh) = self.world.colliders.get(other).and_then(|o| o.parent()) else {
+                        continue;
+                    };
+                    let Some(&k) = debris.get(&oh) else {
+                        continue;
+                    };
+                    let Some(m) = pair.manifolds().iter().find(|m| !m.points.is_empty()) else {
+                        continue;
+                    };
+                    // Rapier's normal points from the first collider to
+                    // the second: from the bone to the piece when the bone
+                    // is first.
+                    let n = vec3(m.data.normal);
+                    let normal = if mine_first { n } else { -n };
+                    let Some(piece) = self.world.bodies.get(oh) else {
+                        continue;
+                    };
+                    // As the step that met began (the 360's event has the
+                    // speeds they met at).
+                    let before = |h: r::RigidBodyHandle, now: Vec3| {
+                        self.velocity_before.get(&h).copied().unwrap_or(now)
+                    };
+                    let (vp, vb) = (
+                        before(oh, vec3(piece.linvel())),
+                        before(*bone, vec3(b.linvel())),
+                    );
+                    let closing = (vb - vp).dot(normal).max(0.0);
+                    let size = crate::durability::crash_size(b.mass(), piece.mass(), closing);
+                    let hit = DebrisHit {
+                        debris: DebrisId(k),
+                        size,
+                        normal,
+                        closing,
+                        velocity: [vp, vb],
+                    };
+                    if best.get(&k).is_none_or(|h| h.closing < closing) {
+                        best.insert(k, hit);
+                    }
+                }
+            }
+        }
+        let doll = self.ragdolls[id.0].as_mut().expect("present");
+        let was = std::mem::take(&mut doll.debris_touching);
+        doll.debris_touching = best.keys().copied().collect();
+        let mut hits: Vec<DebrisHit> = best
+            .into_iter()
+            .filter(|(k, _)| !was.contains(k))
+            .map(|(_, h)| h)
+            .collect();
+        hits.sort_by_key(|h| h.debris.0);
+        hits
+    }
+
     pub fn add_debris(
         &mut self,
         piece: &LoosePiece,
@@ -6429,6 +6546,7 @@ impl Physics {
             joints,
             joint_handles,
             age: 0.0,
+            debris_touching: Vec::new(),
         }));
         Some(RagdollId(self.ragdolls.len() - 1))
     }
@@ -6602,6 +6720,7 @@ impl Physics {
             joints,
             joint_handles: Vec::new(),
             age: 0.0,
+            debris_touching: Vec::new(),
         }));
         RagdollId(self.ragdolls.len() - 1)
     }
