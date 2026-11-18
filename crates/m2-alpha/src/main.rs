@@ -4645,6 +4645,7 @@ fn mission_for_screenshot(
     let mut was_driving = false;
     // `--mission-shots` pictured so far (they are kept sorted).
     let mut mission_shots_taken = 0;
+    let mut support_denials = 0u32;
     for i in 0..(seconds / tick).round() as u32 {
         lap.mark("loop: pictures and checks");
         let intent = match auto.as_mut().filter(|_| play_done.is_none()) {
@@ -4723,6 +4724,13 @@ fn mission_for_screenshot(
                     delivery_key = key;
                 }
                 a.deliveries = deliveries;
+                // A support call the scripts turned down since the last
+                // tick: the autoplay keeps off that call for its target.
+                let denials = link.support_denials();
+                if denials > support_denials {
+                    a.support_denied = true;
+                }
+                support_denials = denials;
                 let keep = link.kept_within();
                 if keep.len() != a.keep.len() {
                     eprintln!(
