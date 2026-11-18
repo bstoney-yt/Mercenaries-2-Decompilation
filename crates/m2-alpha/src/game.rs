@@ -2418,35 +2418,6 @@ impl Game {
             }
         }
         split("game: people");
-        // Piles a character touches break once (0x82183ED0, 0x82176830,
-        // 0x821859E0): hers on foot and every living person's.
-        if let Some(world) = &mut self.scene.world {
-            let mut capsules: Vec<crate::touch_break::Capsule> = self
-                .scene
-                .people
-                .npcs
-                .iter()
-                .filter(|n| n.alive)
-                .map(|n| (n.character.position, n.character.radius, n.character.height))
-                .collect();
-            if self.on_foot
-                && let Some(p) = &self.scene.player
-                && p.driving.is_none()
-            {
-                let c = &p.character;
-                capsules.push((c.position, c.radius, c.height));
-            }
-            let db = &world.index.template_db;
-            for e in crate::touch_break::break_touched(
-                &mut self.scene.props,
-                &mut world.physics,
-                &db.touch_breakers,
-                &db.uncrushable,
-                &capsules,
-            ) {
-                eprintln!("touch: {e:#x} breaks under a character's touch");
-            }
-        }
         let scene = &mut self.scene;
         if self.on_foot
             && let (Some(world), Some(player)) = (&mut scene.world, &mut scene.player)

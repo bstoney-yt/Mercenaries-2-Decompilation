@@ -7,13 +7,16 @@
 //!   the object gets body property 0x200A.
 //! - A character proxy's contact callback (0x82176830) that touches a body
 //!   with 0x200A calls the touched object's vfunc +0xB4 (0x821859E0) and
-//!   posts the removal of 0x200A (queue 0x8322DC38), so it fires once.
+//!   posts the removal of 0x200A (queue 0x8322DC38), so it fires once;
+//!   but only when the toucher's human object has its byte +0x40 set
+//!   (vfunc +0x30, 0x8217DC30), "riding with a player", which walking
+//!   people never have (`m2_alpha`'s `touch_break` has the gate), and
+//!   never for a body pushed as a dynamic prop (property 0x2009).
 //! - 0x821859E0 posts a damage event of 1,000,000 (0x820F9604) on the
 //!   touched object itself through the ordinary damage queue
 //!   (0x8318C480), unless the object is in `PhysicsPropertyUncrushable`
 //!   (table 0x83651B30) or is dead or destroyed (its byte +0x15, set by
 //!   0x821831B0 when its health is under 0.01). The toucher takes nothing.
-//! - Any character proxy counts: the hero's and every person's.
 //!
 //! **From samples:** the key is a `Label` value. Ten templates carry it,
 //! `_global_trashpile01` to `03` and `_global_pile01` to `07`, placed
