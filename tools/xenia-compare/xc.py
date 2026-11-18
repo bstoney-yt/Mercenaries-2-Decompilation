@@ -1405,11 +1405,13 @@ def run(args) -> int:
                             hm_ = xmem.map_entries(gp, 0x83656558)
                             while not ev.is_set():
                                 tt = time.time() - t0
+                                try:  # bulk lookups once per pass (per-bucket probing stalled with many people)
+                                    sidx = hp_.table_index(hp_.STATES)
+                                    aidx = hp_.table_index(0x83657B94)
+                                except Exception:  # noqa: BLE001
+                                    sidx, aidx = {}, {}
                                 for k_ in picks:
-                                    try:
-                                        sa = hp_.state_addr(k_)
-                                    except Exception:  # noqa: BLE001
-                                        sa = None
+                                    sa = sidx.get(k_)
                                     if not sa:
                                         continue
                                     b = gp.read(sa, 12)
@@ -1417,7 +1419,7 @@ def run(args) -> int:
                                     hb_ = gp.read(a_ + 4, 4) if a_ else None
                                     hv = struct.unpack(">f", hb_)[0] if hb_ and len(hb_) == 4 else float("nan")
                                     try:
-                                        st_ = hp_.anim_state(k_) or (0, 0, 0)
+                                        st_ = hp_.anim_state(k_, aidx) or (0, 0, 0)
                                     except Exception:  # noqa: BLE001
                                         st_ = (0, 0, 0)
                                     if b:

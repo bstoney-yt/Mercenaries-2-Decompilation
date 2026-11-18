@@ -223,13 +223,44 @@ class Hero:
                 return self._u32(obj + 0x14)
         return None
 
-    def anim_state(self, handle: int):
+    def table_index(self, table: int) -> dict:
+        """{handle: entry address} for a state-table-shaped handle table (map at +0x34: size +8, keys +0x10,
+        buckets +0x14; paged pool +0x20/+0x24/+0x26/+0x70), read in a few bulk reads instead of probing
+        bucket by bucket (poslog stalled on per-bucket reads with many people)."""
+        m = table + 0x34
+        size, keys, buckets = self._u32(m + 8), self._u32(m + 0x10), self._u32(m + 0x14)
+        if not size or size > 1 << 18:
+            return {}
+        kb, bb = self.g.read(keys, 4 * size), self.g.read(buckets, 4 * size)
+        if not kb or not bb:
+            return {}
+        hdr = self.g.read(table, 0x80)
+        if not hdr:
+            return {}
+        mask = struct.unpack_from(">I", hdr, 0x20)[0]
+        esz, shift = struct.unpack_from(">hh", hdr, 0x24)
+        pages = struct.unpack_from(">I", hdr, 0x70)[0]
+        if not mask:
+            return {}
+        n_pages = (size + mask - 1) // mask + 1
+        pb = self.g.read(pages, 4 * n_pages) or b""
+        pg = struct.unpack(f">{len(pb) // 4}I", pb)
+        out = {}
+        for e in struct.unpack(f">{size}I", bb):
+            if e == 0xFFFFFFFF or e >= size:
+                continue
+            pi = e >> shift
+            if pi < len(pg) and pg[pi]:
+                out[struct.unpack_from(">I", kb, e * 4)[0]] = pg[pi] + (e & (mask - 1)) * esz
+        return out
+
+    def anim_state(self, handle: int, index: dict | None = None):
         """(stance hash, action hash, action mode hash) of the person's state
         machine: table 0x83657B94 (looked up like the state table, 0x823DA2A0)
         holds a pointer to it, S; S+4 stance (KnockedDown 0x35365D24), S+8 action
         (Idle 0xB4DA003B), *(S+0x1C)+0x24 mode (FULL 0x4294EBA2, ON_END 0x7AC501F8,
         NONE 0x4FF9F863). None when the person has no entry."""
-        a = self.state_addr(handle, 0x83657B94)
+        a = index.get(handle) if index is not None else self.state_addr(handle, 0x83657B94)
         sp = self._u32(a) if a else 0
         if not sp:
             return None
