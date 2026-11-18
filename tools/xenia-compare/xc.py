@@ -1295,6 +1295,9 @@ def run(args) -> int:
                 secs, cx, cz, rr = float(w[1]), float(w[2]), float(w[3]), float(w[4])
                 weak = "weak" in w
                 stand_off = next((float(t[9:]) for t in w if t.startswith("standoff=")), 25.0)
+                # grenade=<m>: within that, throw an explosive (LB) every 5 s when lined up
+                gren = next((float(t[8:]) for t in w if t.startswith("grenade=")), 0.0)
+                last_gren, n_gren = 0.0, 0
                 g = xmem.Guest(p.pid)
                 hh = xmem.Hero(g)
                 cam = xmem.Camera(g)
@@ -1354,7 +1357,13 @@ def run(args) -> int:
                         if now - last_say > 1.0:
                             last_say = now
                             say(f"fight3: {tk:#x} at {d:.0f} m, yaw err {err:+.0f}, pitch err {perr:+.0f}, {'advance' if ly else ('FIRE' if fire else 'aim')}; {len(tgts)} left, {len(killed)} down")
-                    apply(0, 0, fire, 0.0, ly, rx, ry)
+                    bb = 0
+                    if gren and yv is not None and d <= gren and abs(err) < 8 and now - last_gren > 5.0:
+                        last_gren, n_gren = now, n_gren + 1
+                        say(f"fight3: grenade {n_gren} at {tk:#x}, {d:.0f} m")
+                    if now - last_gren < 0.3:
+                        bb, fire = BTN["lb"], 0
+                    apply(bb, 0, fire, 0.0, ly, rx, ry)
                     time.sleep(0.04)
                 apply()
             elif op == "poslog":
