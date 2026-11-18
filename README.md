@@ -189,4 +189,4 @@ translation status (see [symbols/README.md](symbols/README.md)).
 
 *Mercenaries 2: World in Flames* is a trademark of Electronic Arts Inc. This project is not affiliated with or endorsed by Electronic Arts or Pandemic Studios.
 
-<sub>Licensed under MIT or Apache-2.0, at your option. The license covers this repository's own code only.</sub>
+<sub>Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. The license covers only this repository's original code. Game data and assets are not included and remain the property of their owners.</sub>

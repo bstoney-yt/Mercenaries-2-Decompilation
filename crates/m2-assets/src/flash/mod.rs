@@ -19,11 +19,12 @@
 //! each sprite showing its own first frame, as triangles in the movie's
 //! pixels: solid fills coloured, bitmap fills textured from the images
 //! the movie names (Scaleform's `DefineExternalImage`: textures in the
-//! archives by file name), every colour through the transforms above it.
+//! archives by file name), gradient fills textured as the game's Scaleform
+//! draws them ([`gradient`]), every colour through the transforms above it.
 //! A mask clips what it masks to its bounds (the masks of the game's
 //! screens are rectangles).
 //!
-//! Not drawn yet: gradients (drawn in their first colour),
+//! Not drawn yet: gradient strokes (drawn in their first colour),
 //! text, buttons, filters and blend modes; nothing runs the movies'
 //! ActionScript, so a sprite shows its first frame whatever its script
 //! would make of it.
@@ -38,9 +39,11 @@
 use std::collections::HashMap;
 
 pub mod avm1;
+pub mod gradient;
 pub mod player;
 pub mod text;
 
+pub use gradient::{Gradient, GradientImage, GradientKind};
 pub use player::{ClipId, Library, Player, Translator};
 pub use text::FontBook;
 
@@ -56,11 +59,17 @@ const HAIRLINE: f32 = 1.0;
 struct Bits<'a> {
     data: &'a [u8],
     bit: usize,
+    /// Gradient records read so far (fills and line fills).
+    gradients: u16,
 }
 
 impl<'a> Bits<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self { data, bit: 0 }
+        Self {
+            data,
+            bit: 0,
+            gradients: 0,
+        }
     }
 
     fn ub(&mut self, n: usize) -> u32 {
@@ -262,8 +271,8 @@ impl ColourTransform {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Fill {
     Solid([f32; 4]),
-    /// A gradient, drawn for now in its first colour.
-    Gradient([f32; 4]),
+    /// A gradient ([`gradient`]).
+    Gradient(Gradient),
     /// A bitmap (by character id) through `matrix` (image pixels to the
     /// shape's pixels); `repeat` tiles it, else it is clamped.
     Bitmap {
@@ -299,6 +308,9 @@ pub struct Shape {
     pub fills: Vec<Fill>,
     pub lines: Vec<Line>,
     pub edges: Vec<Edge>,
+    /// How many gradient records it read (fills and line fills): the
+    /// movie numbers its gradients in reading order.
+    pub gradients: u16,
 }
 
 /// A triangle of a shape's mesh in the shape's pixels, and what it is
@@ -320,22 +332,29 @@ fn fill_style(b: &mut Bits<'_>, version: u8) -> Fill {
     match b.u8() {
         0x00 => Fill::Solid(b.colour(alpha)),
         kind @ (0x10 | 0x12 | 0x13) => {
-            b.matrix();
+            let matrix = gradient_matrix(b.matrix());
             b.align();
+            // Bit 0x10: linear RGB; the spread bits (0xc0) go unread, as
+            // the game's player draws every gradient padded (0x8279A640).
             let head = b.u8();
-            let count = usize::from(head & 15);
-            let mut first = [0.0, 0.0, 0.0, 1.0];
-            for i in 0..count {
-                b.u8();
-                let c = b.colour(alpha);
-                if i == 0 {
-                    first = c;
-                }
-            }
-            if kind == 0x13 {
-                b.u16();
-            }
-            Fill::Gradient(first)
+            let stops = (0..head & 15)
+                .map(|_| (b.u8(), colour_bytes(b.colour(alpha))))
+                .collect();
+            let kind = match kind {
+                0x10 => GradientKind::Linear,
+                0x12 => GradientKind::Radial,
+                _ => GradientKind::Focal(f32::from(b.u16() as i16) / 256.0),
+            };
+            let index = b.gradients;
+            b.gradients += 1;
+            Fill::Gradient(Gradient {
+                kind,
+                matrix,
+                linear_rgb: head & 0x10 != 0,
+                stops,
+                index,
+                image: None,
+            })
         }
         kind @ 0x40..=0x43 => {
             let id = b.u16();
@@ -356,6 +375,24 @@ fn fill_style(b: &mut Bits<'_>, version: u8) -> Fill {
         }
         _ => Fill::Solid([0.0; 4]),
     }
+}
+
+/// A gradient's matrix as read (the 32768-twip square to the shape's twips,
+/// translation already in pixels) as the unit square to the shape's pixels.
+fn gradient_matrix(m: Matrix) -> Matrix {
+    let k = gradient::HALF_SQUARE / TWIPS;
+    Matrix {
+        a: m.a * k,
+        b: m.b * k,
+        c: m.c * k,
+        d: m.d * k,
+        ..m
+    }
+}
+
+/// A colour (0 to 1) as the bytes it was read from.
+fn colour_bytes(c: [f32; 4]) -> [u8; 4] {
+    c.map(|v| (v * 255.0).round() as u8)
 }
 
 fn style_arrays(b: &mut Bits<'_>, version: u8, fills: &mut Vec<Fill>, lines: &mut Vec<Line>) {
@@ -383,7 +420,8 @@ fn style_arrays(b: &mut Bits<'_>, version: u8, fills: &mut Vec<Fill>, lines: &mu
             }
             let colour = if has_fill {
                 match fill_style(b, version) {
-                    Fill::Solid(c) | Fill::Gradient(c) => c,
+                    Fill::Solid(c) => c,
+                    Fill::Gradient(g) => g.first_colour(),
                     Fill::Bitmap { .. } => [1.0; 4],
                 }
             } else {
@@ -408,29 +446,48 @@ pub struct MorphShape {
 }
 
 /// A morph fill style: the start's fill and the end's.
-fn morph_fill(b: &mut Bits<'_>) -> (Fill, Fill) {
+fn morph_fill(b: &mut Bits<'_>, two: bool) -> (Fill, Fill) {
     match b.u8() {
         0x00 => (Fill::Solid(b.colour(true)), Fill::Solid(b.colour(true))),
         kind @ (0x10 | 0x12 | 0x13) => {
-            b.matrix();
-            b.matrix();
+            let start = gradient_matrix(b.matrix());
+            let end = gradient_matrix(b.matrix());
             b.align();
-            let count = usize::from(b.u8() & 15);
-            let (mut first, mut last) = ([0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]);
-            for i in 0..count {
-                b.u8();
-                let s = b.colour(true);
-                b.u8();
-                let e = b.colour(true);
-                if i == 0 {
-                    (first, last) = (s, e);
+            // The byte holds the interpolation bit and the count only in
+            // `DefineMorphShape2` and for focal gradients; otherwise it is
+            // all count (0x827B94A0).
+            let head = b.u8();
+            let split = two || kind == 0x13;
+            let count = if split { head & 15 } else { head };
+            let linear = split && head & 0x10 != 0;
+            let mut stops = (Vec::new(), Vec::new());
+            for _ in 0..count {
+                stops.0.push((b.u8(), colour_bytes(b.colour(true))));
+                stops.1.push((b.u8(), colour_bytes(b.colour(true))));
+            }
+            let kinds = match kind {
+                0x10 => (GradientKind::Linear, GradientKind::Linear),
+                0x12 => (GradientKind::Radial, GradientKind::Radial),
+                _ => {
+                    let s = f32::from(b.u16() as i16) / 256.0;
+                    let e = f32::from(b.u16() as i16) / 256.0;
+                    (GradientKind::Focal(s), GradientKind::Focal(e))
                 }
-            }
-            if kind == 0x13 {
-                b.u16();
-                b.u16();
-            }
-            (Fill::Gradient(first), Fill::Gradient(last))
+            };
+            let gradient = |kind, matrix, stops| {
+                Fill::Gradient(Gradient {
+                    kind,
+                    matrix,
+                    linear_rgb: linear,
+                    stops,
+                    index: 0,
+                    image: None,
+                })
+            };
+            (
+                gradient(kinds.0, start, stops.0),
+                gradient(kinds.1, end, stops.1),
+            )
         }
         kind @ 0x40..=0x43 => {
             let id = b.u16();
@@ -483,7 +540,7 @@ impl MorphShape {
             n = usize::from(b.u16());
         }
         for _ in 0..n {
-            let (s, e) = morph_fill(&mut b);
+            let (s, e) = morph_fill(&mut b, two);
             fills.0.push(s);
             fills.1.push(e);
         }
@@ -500,9 +557,10 @@ impl MorphShape {
                     b.u16();
                 }
                 if (head >> 3) & 1 == 1 {
-                    let (s, e) = morph_fill(&mut b);
+                    let (s, e) = morph_fill(&mut b, two);
                     let colour = |f: Fill| match f {
-                        Fill::Solid(c) | Fill::Gradient(c) => c,
+                        Fill::Solid(c) => c,
+                        Fill::Gradient(g) => g.first_colour(),
                         Fill::Bitmap { .. } => [1.0; 4],
                     };
                     [colour(s), colour(e)]
@@ -526,6 +584,7 @@ impl MorphShape {
             fills: fills.0,
             lines: lines.0,
             edges: Vec::new(),
+            gradients: 0,
         };
         start.read_records(&mut b, 3);
         let mut end = Shape {
@@ -533,6 +592,7 @@ impl MorphShape {
             fills: fills.1,
             lines: lines.1,
             edges: Vec::new(),
+            gradients: 0,
         };
         end.read_records(&mut b, 3);
         (id, MorphShape { start, end })
@@ -574,7 +634,7 @@ impl MorphShape {
             .zip(&self.end.fills)
             .map(|(s, e)| match (s, e) {
                 (Fill::Solid(a), Fill::Solid(b)) => Fill::Solid(mix4(*a, *b)),
-                (Fill::Gradient(a), Fill::Gradient(b)) => Fill::Gradient(mix4(*a, *b)),
+                (Fill::Gradient(a), Fill::Gradient(b)) => Fill::Gradient(a.mix(b, t)),
                 _ => s.clone(),
             })
             .collect();
@@ -594,6 +654,7 @@ impl MorphShape {
             fills,
             lines,
             edges,
+            gradients: 0,
         }
     }
 }
@@ -621,12 +682,14 @@ impl Shape {
                 colour: [0.0; 4],
             }],
             edges: Vec::new(),
+            gradients: 0,
         };
         let (mut fills, mut lines) = (Vec::new(), Vec::new());
         style_arrays(&mut b, version, &mut fills, &mut lines);
         shape.fills.extend(fills);
         shape.lines.extend(lines);
         shape.read_records(&mut b, version);
+        shape.gradients = b.gradients;
         (id, shape)
     }
 
@@ -880,6 +943,8 @@ pub struct Triangle {
     /// Drawn with the multiply blend mode (its clip's `PlaceObject3`):
     /// what is under it multiplied by it.
     pub multiply: bool,
+    /// The texture is clamped at its edges (gradients), not repeated.
+    pub clamp: bool,
 }
 
 /// A shape's triangles drawn through `matrix` and `colour`, bitmap fills
@@ -893,13 +958,44 @@ pub fn draw_shape(
     clip: Option<[f32; 4]>,
     out: &mut Vec<Triangle>,
 ) {
+    // Each gradient fill's texture and inverse matrix, once.
+    let gradients: Vec<Option<(String, Matrix)>> = shape
+        .fills
+        .iter()
+        .map(|f| match f {
+            Fill::Gradient(g) => g.matrix.inverse().map(|inv| (g.texture_name(), inv)),
+            _ => None,
+        })
+        .collect();
     for t in mesh {
+        if let Style::Fill(i) = t.style
+            && let Fill::Gradient(g) = &shape.fills[i]
+        {
+            // A gradient's texture, through its matrix, tinted as an
+            // image is; one squashed flat draws nothing.
+            let Some(Some((name, inv))) = gradients.get(i) else {
+                continue;
+            };
+            let c = colour.apply([1.0; 4]);
+            if c[3] <= 0.0 {
+                continue;
+            }
+            let corners = t.corners.map(|p| matrix.apply(p));
+            let uv = t.corners.map(|p| g.uv(inv, p));
+            let start = out.len();
+            push_clipped(out, corners, uv, c, Some(name.clone()), clip);
+            for t in &mut out[start..] {
+                t.clamp = true;
+            }
+            continue;
+        }
         // The colour, and for an image its texture and the shape's
         // pixels to the image's.
         let (tint, image) = match t.style {
             Style::Line(i) => (shape.lines[i].colour, None),
             Style::Fill(i) => match &shape.fills[i] {
-                Fill::Solid(c) | Fill::Gradient(c) => (*c, None),
+                Fill::Solid(c) => (*c, None),
+                Fill::Gradient(_) => continue,
                 Fill::Bitmap { id, matrix: bm, .. } => match (images.get(id), bm.inverse()) {
                     (Some(img), Some(inv)) => ([1.0; 4], Some((img, inv))),
                     // An image the movie doesn't name: nothing.
@@ -944,6 +1040,7 @@ pub fn push_clipped(
             colour,
             texture,
             multiply: false,
+            clamp: false,
         }),
         Some(rect) => {
             for (corners, uv) in clip_triangle(corners, uv, rect) {
@@ -953,6 +1050,7 @@ pub fn push_clipped(
                     colour,
                     texture: texture.clone(),
                     multiply: false,
+                    clamp: false,
                 });
             }
         }
@@ -987,6 +1085,7 @@ pub fn cut_to_mask(tris: &[Triangle], mask: &[Corners]) -> Vec<Triangle> {
             colour: t.colour,
             texture: t.texture.clone(),
             multiply: t.multiply,
+            clamp: t.clamp,
         });
     };
     for t in tris {

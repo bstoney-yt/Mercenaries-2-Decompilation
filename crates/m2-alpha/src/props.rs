@@ -107,10 +107,10 @@ struct Swing {
 /// The state layers' models in play.
 #[derive(Debug, Default)]
 pub struct Props {
-    shown: HashMap<u32, Prop>,
+    shown: m2_render::fasthash::FastMap<u32, Prop>,
     /// By hash, once some shown prop wants it: `None` until it has loaded
     /// (and when it failed).
-    models: HashMap<u32, Option<PropModel>>,
+    models: m2_render::fasthash::FastMap<u32, Option<PropModel>>,
     /// Wanted, not yet asked of the loaders.
     waiting: HashSet<u32>,
     /// Asked of the loaders, not yet uploaded.
@@ -154,9 +154,20 @@ pub struct Props {
     heard: HashSet<u32>,
     /// Knocked loose since [`take_knocked`](Self::take_knocked).
     fresh_knocks: Vec<u32>,
+    /// The material animations playing on them
+    /// ([`play_material_animation`](Self::play_material_animation)).
+    material_anims: HashMap<u32, m2_engine::material_anim::Playing>,
+    /// The part machines of those destroyed, running on
+    /// ([`destroy_parts`](Self::destroy_parts)).
+    part_runners: HashMap<u32, m2_engine::part_runner::Runner>,
+    /// Their changes since last asked: (entity, change).
+    part_changes: Vec<(u32, m2_engine::part_runner::Change)>,
     /// Node matrices of those that move on their own, by entity
     /// ([`crate::moving`]).
     poses: HashMap<u32, Vec<Mat4>>,
+    /// Node matrices of the emplaced gun she mans, turned and tilted to
+    /// where its turret has got ([`set_turned`](Self::set_turned)).
+    turned: HashMap<u32, Vec<Mat4>>,
     /// The gates opened or shut, by entity, until shut again.
     swings: HashMap<u32, Swing>,
     /// Those only a support strike brings down (a mission's gates): no
@@ -395,6 +406,20 @@ impl Props {
     /// with, by entity (those left out stand in their rest pose).
     pub fn set_poses(&mut self, poses: HashMap<u32, Vec<Mat4>>) {
         self.poses = poses;
+    }
+
+    /// Draws `entity` with the node matrices `nodes` (an emplaced gun's
+    /// turret turned, [`m2_engine::vehicle::Aimer::pose`]), or in its rest
+    /// pose again with `None`.
+    pub fn set_turned(&mut self, entity: u32, nodes: Option<Vec<Mat4>>) {
+        match nodes {
+            Some(n) => {
+                self.turned.insert(entity, n);
+            }
+            None => {
+                self.turned.remove(&entity);
+            }
+        }
     }
 
     /// Puts up the models of those of `entities` the state layers place
@@ -1778,16 +1803,27 @@ impl Props {
 
     /// Moves on `dt` seconds: what breaks apart sinks.
     pub fn advance(&mut self, dt: f32) {
+        for a in self.material_anims.values_mut() {
+            a.advance(dt);
+        }
+        for (e, r) in self.part_runners.iter_mut() {
+            r.advance(dt);
+            self.part_changes
+                .extend(r.take_changes().into_iter().map(|c| (*e, c)));
+        }
+        self.part_runners.retain(|_, r| !r.settled());
         // Gates swing on; a shut one stands in the way again
         // ([`update`](Self::update) puts its collision back).
-        for s in self.swings.values_mut() {
+        // Each at its widest leaf's pace, a quarter turn where its model
+        // isn't in (invented).
+        for (e, s) in self.swings.iter_mut() {
             let to = if s.open { 1.0 } else { 0.0 };
-            let step = m2_engine::gate::SWING * dt;
-            s.at = if s.at < to {
-                (s.at + step).min(to)
-            } else {
-                (s.at - step).max(to)
-            };
+            let open = self
+                .shown
+                .get(e)
+                .and_then(|p| self.models.get(&p.model)?.as_ref()?.gate.as_ref())
+                .map_or(std::f32::consts::FRAC_PI_2, |g| g.gate.widest());
+            s.at = m2_engine::gate::swing(s.at, to, open, dt);
         }
         let shut: Vec<u32> = (self.swings.iter())
             .filter(|(_, s)| !s.open && s.at <= 0.0)
@@ -1811,6 +1847,49 @@ impl Props {
                 }
             }
         }
+    }
+
+    /// `entity` was destroyed: its model's part machines take `message`
+    /// (`DestroyMsg`, or the fire-destroy message from an explosion) and
+    /// run on from there ([`m2_engine::part_runner`]). Nothing for a model
+    /// with no part states.
+    pub fn destroy_parts(&mut self, entity: u32, message: u32) {
+        let Some(states) = self
+            .shown
+            .get(&entity)
+            .and_then(|p| self.models.get(&p.model)?.as_ref())
+            .and_then(|m| m.gpu.part_states.clone())
+        else {
+            return;
+        };
+        let (machines, names) = &*states;
+        let name = |n: u16| names.get(usize::from(n)).copied().unwrap_or(0);
+        let mut runner = m2_engine::part_runner::Runner::new(machines, name, entity);
+        runner.deliver(message);
+        self.part_changes
+            .extend(runner.take_changes().into_iter().map(|c| (entity, c)));
+        if !runner.settled() {
+            self.part_runners.insert(entity, runner);
+        }
+    }
+
+    /// The part machines' changes since last asked ([`destroy_parts`]).
+    ///
+    /// [`destroy_parts`]: Self::destroy_parts
+    pub fn take_part_changes(&mut self) -> Vec<(u32, m2_engine::part_runner::Change)> {
+        std::mem::take(&mut self.part_changes)
+    }
+
+    /// Plays material animation `anim` on `entity` (the scripts'
+    /// `Object.PlayMaterialAnimation`), in place of any it played.
+    pub fn play_material_animation(
+        &mut self,
+        entity: u32,
+        anim: m2_assets::material_animation::MaterialAnimation,
+        looped: bool,
+    ) {
+        self.material_anims
+            .insert(entity, m2_engine::material_anim::Playing::new(anim, looped));
     }
 
     /// `entity` was heard coming down as a building: its collapse's end
@@ -1849,6 +1928,16 @@ impl Props {
             // of their own would draw them whole a second time.
             if m.members.iter().any(|x| self.shown.contains_key(x)) {
                 continue;
+            }
+            // Its material animation's values, or its materials as they
+            // are (the model is shared by every prop of it).
+            if !self.material_anims.is_empty() {
+                let surfaces = self
+                    .material_anims
+                    .get(e)
+                    .map(m2_engine::material_anim::Playing::surfaces)
+                    .unwrap_or_default();
+                m.gpu.set_surfaces(&surfaces);
             }
             let moved = match (self.broken.get(e), self.knocked.get(e)) {
                 (Some(pieces), _) => Some((m.breakup.as_deref().map(|b| &b.pieces), pieces)),
@@ -1894,7 +1983,10 @@ impl Props {
                 .filter(|_| !p.wrecked)
                 .map(|(s, g)| g.gate.nodes(s.at));
             match (
-                swung.as_ref().or(self.poses.get(e).filter(|_| !p.wrecked)),
+                swung
+                    .as_ref()
+                    .or(self.turned.get(e).filter(|_| !p.wrecked))
+                    .or(self.poses.get(e).filter(|_| !p.wrecked)),
                 self.parts_down.get(e),
             ) {
                 (Some(nodes), _) => m.gpu.draw_moved(queue, at, nodes, false, &[]),
@@ -2278,7 +2370,8 @@ mod tests {
         assert!(!physics.has_static(StaticKey::Entity(1)));
         props.advance(1.0);
         let at = props.gate_open(1).unwrap();
-        assert!((at - m2_engine::gate::SWING).abs() < 1e-6, "{at}");
+        let quarter = std::f32::consts::FRAC_PI_2;
+        assert!((at - m2_engine::gate::swing(0.0, 1.0, quarter, 1.0)).abs() < 1e-6);
         props.advance(5.0);
         assert_eq!(props.gate_open(1), Some(1.0));
         // Shut: back, then gone from the swings (its collision goes back
