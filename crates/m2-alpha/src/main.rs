@@ -303,6 +303,8 @@ struct Options {
     fire: bool,
     /// `--homing-check`: her vehicle is seen by every homing weapon.
     homing_check: bool,
+    /// `--gravity-check`: measure the physics world's gravity ([`gravity_check`]).
+    gravity_check: bool,
     /// With `--screenshot` on foot: hits she takes just before the
     /// picture, from these directions (degrees clockwise from where the
     /// camera looks), to see the HUD's hit arcs.
@@ -1039,6 +1041,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--take" => o.take = true,
             "--fire" => o.fire = true,
             "--homing-check" => o.homing_check = true,
+            "--gravity-check" => {
+                o.gravity_check = true;
+                o.drive = true;
+            }
             "--look-pickup" => {
                 o.look_pickup = Some(value()?.parse().context("--look-pickup expects metres")?)
             }
@@ -7371,6 +7377,10 @@ fn drive_for_screenshot(
         homing_check(game, tick);
         return Ok(());
     }
+    if options.gravity_check {
+        gravity_check(game);
+        return Ok(());
+    }
     let label = game
         .scene
         .player
@@ -11677,5 +11687,176 @@ mod tests {
         t += Duration::from_millis(16);
         assert!(pace.frame(t, (1280, 720)).is_none());
         assert_eq!((pace.frames, pace.slow), (1, 0));
+    }
+}
+
+/// `--gravity-check`: the world's gravity, measured in fresh physics
+/// worlds of the Beta's own (`m2_engine::Physics`), against the 360's
+/// 9.0 m/s^2 ([`m2_engine::physics::WORLD_GRAVITY`]): a block dropped
+/// 20 m, the vehicle she is in driven off a 10 m ledge, and a parked boat
+/// (if one is near) left to settle on still water. Prints a line each and
+/// PASS or FAIL.
+fn gravity_check(game: &Game) {
+    use m2_engine::physics::{WORLD_GRAVITY, float_depth};
+    use m2_engine::{CollisionShape, Physics, StaticKey, VehicleControls};
+    use m2_math::glam::{Quat, Vec3};
+    const DT: f32 = 1.0 / 60.0;
+    let quad = |lo: Vec3, hi: Vec3| {
+        CollisionShape::mesh(
+            &[
+                Vec3::new(lo.x, lo.y, lo.z),
+                Vec3::new(hi.x, lo.y, lo.z),
+                Vec3::new(hi.x, lo.y, hi.z),
+                Vec3::new(lo.x, lo.y, hi.z),
+            ],
+            &[[0, 2, 1], [0, 3, 2]],
+        )
+    };
+    let verdict = |ok: bool| if ok { "PASS" } else { "FAIL" };
+    let mut all = true;
+    let h = 20.0;
+    let fell = free_fall_seconds(h);
+    let want = (2.0 * h / WORLD_GRAVITY).sqrt();
+    let ok = fell.is_some_and(|t| (t - want).abs() < 0.05);
+    all &= ok;
+    eprintln!(
+        "gravity-check: free fall {h} m: {:.3} s, want {want:.3} s (9.81 would give {:.3} s): {}",
+        fell.unwrap_or(f32::NAN),
+        (2.0 * h / 9.81f32).sqrt(),
+        verdict(ok)
+    );
+    // Her vehicle, driven at full throttle off a 10 m ledge onto flat
+    // ground.
+    let driving = game.scene.player.as_ref().and_then(|pl| pl.driving);
+    match driving.map(|i| &game.scene.vehicles[i].spec) {
+        Some(spec) if !spec.is_boat() => {
+            let mut p = Physics::new();
+            let ledge = 10.0;
+            if let (Some(top), Some(ground)) = (
+                quad(Vec3::new(-50.0, ledge, -300.0), Vec3::new(50.0, ledge, 0.0)),
+                quad(Vec3::new(-50.0, 0.0, 0.0), Vec3::new(50.0, 0.0, 400.0)),
+            ) {
+                p.add_static(StaticKey::Cell(1), &top, Vec3::ZERO, Quat::IDENTITY);
+                p.add_static(StaticKey::Cell(2), &ground, Vec3::ZERO, Quat::IDENTITY);
+            }
+            p.step(DT);
+            let id = p.add_vehicle(
+                spec,
+                Vec3::new(0.0, ledge + spec.ride_height() + 0.5, -200.0),
+                0.0,
+            );
+            let full = VehicleControls {
+                throttle: 1.0,
+                ..VehicleControls::default()
+            };
+            let mut off: Option<(f32, f32, f32)> = None;
+            let mut landed: Option<(f32, f32)> = None;
+            for k in 0..3600 {
+                p.drive(id, full);
+                p.step(DT);
+                let Some(m) = p.vehicle_transform(id) else {
+                    break;
+                };
+                let at = m.w_axis.truncate();
+                let t = k as f32 * DT;
+                match off {
+                    None if at.z > 0.0 => off = Some((t, at.z, p.vehicle_velocity(id).z)),
+                    Some((t0, z0, _)) if landed.is_none() && at.y < spec.ride_height() + 0.6 => {
+                        landed = Some((t - t0, at.z - z0));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            match (off, landed) {
+                (Some((_, _, speed)), Some((air, dist))) => {
+                    let want = (2.0 * ledge / WORLD_GRAVITY).sqrt();
+                    let ok = (air - want).abs() < 0.1 * want;
+                    all &= ok;
+                    eprintln!(
+                        "gravity-check: {} off a {ledge} m ledge at {speed:.1} m/s: {air:.2} s in the air, {dist:.1} m out, want about {want:.2} s and {:.1} m: {}",
+                        spec.label,
+                        speed * want,
+                        verdict(ok)
+                    );
+                }
+                _ => {
+                    all = false;
+                    eprintln!(
+                        "gravity-check: {} never left the ledge or never landed: FAIL",
+                        spec.label
+                    );
+                }
+            }
+        }
+        _ => eprintln!("gravity-check: not driving a ground vehicle: ledge SKIP"),
+    }
+    // A boat parked nearby, left on still water.
+    match game.scene.vehicles.iter().find(|v| v.spec.is_boat()) {
+        Some(v) => {
+            let mut p = Physics::new();
+            p.set_water(0.0);
+            let id = p.add_vehicle(&v.spec, Vec3::new(0.0, 1.5, 0.0), 0.0);
+            for _ in 0..900 {
+                p.drive(id, VehicleControls::default());
+                p.step(DT);
+            }
+            let y = p.vehicle_transform(id).map_or(f32::NAN, |m| m.w_axis.y);
+            let want = -float_depth(&v.spec);
+            let ok = (y - want).abs() < 0.05;
+            all &= ok;
+            eprintln!(
+                "gravity-check: boat {} settles with its origin at {y:.3} m, want {want:.3} m: {}",
+                v.spec.label,
+                verdict(ok)
+            );
+        }
+        None => eprintln!("gravity-check: no boat parked near: boat SKIP"),
+    }
+    eprintln!("gravity-check: {}", verdict(all));
+}
+
+/// How long a 100 kg block takes to fall `h` metres onto flat ground in a
+/// fresh physics world, seconds, at 60 steps a second.
+fn free_fall_seconds(h: f32) -> Option<f32> {
+    use m2_engine::physics::LoosePiece;
+    use m2_engine::{CollisionShape, Physics, StaticKey};
+    use m2_math::glam::{Mat4, Quat, Vec3};
+    const DT: f32 = 1.0 / 60.0;
+    let mut p = Physics::new();
+    let ground = CollisionShape::mesh(
+        &[
+            Vec3::new(-50.0, 0.0, -50.0),
+            Vec3::new(50.0, 0.0, -50.0),
+            Vec3::new(50.0, 0.0, 50.0),
+            Vec3::new(-50.0, 0.0, 50.0),
+        ],
+        &[[0, 2, 1], [0, 3, 2]],
+    )?;
+    p.add_static(StaticKey::Cell(1), &ground, Vec3::ZERO, Quat::IDENTITY);
+    let block = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.5), 100.0);
+    let id = p.add_debris(
+        &block,
+        Mat4::from_translation(Vec3::new(0.0, h + 0.5, 0.0)),
+        Vec3::ZERO,
+        Vec3::ZERO,
+    );
+    for k in 1..600 {
+        p.step(DT);
+        if p.debris_place(id)?.w_axis.y <= 0.52 {
+            return Some(k as f32 * DT);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod gravity_check_tests {
+    /// The world falls at the 360's 9.0 m/s^2: 20 m in 2.11 s.
+    #[test]
+    fn a_block_falls_as_the_worlds_gravity_has_it() {
+        let t = super::free_fall_seconds(20.0).unwrap();
+        let want = (2.0 * 20.0 / m2_engine::physics::WORLD_GRAVITY).sqrt();
+        assert!((t - want).abs() < 0.05, "{t} vs {want}");
     }
 }
