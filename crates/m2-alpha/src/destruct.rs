@@ -1268,7 +1268,6 @@ impl Destruction {
             );
             self.state_changes.push((entity, c.machine, c.state));
         }
-        props.part_changes_done();
         // The island's objects broken a part at a time whose props have
         // loaded: the island's copy and its collision go, the prop stands
         // with those parts broken (and its others in the way).

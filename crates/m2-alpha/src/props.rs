@@ -201,12 +201,7 @@ pub struct Props {
     /// [`m2_engine::node_debris::NodePieces`]), its body and where the
     /// body started.
     sent_off: HashMap<u32, Vec<(usize, DebrisId, Mat4)>>,
-    /// What brought each state-driven prop down ([`state_driven`]): the
-    /// parts its states send off as they take the destroying message go
-    /// on with it ([`Props::part_changes_done`] forgets it).
-    wreck_push: HashMap<u32, Hit>,
-    /// The props whose part changes were last taken.
-    changes_taken: Vec<u32>,
+
     /// How hard blasts push each prop, of their push, by entity, where its
     /// template says (`ExplosionFudge`).
     fudge: HashMap<u32, f32>,
@@ -974,10 +969,9 @@ impl Props {
             self.sinking.insert(entity, sinking);
             // Its parts go off as its part states send them
             // ([`Props::send_off`]), not all at once.
-            if state_driven(m) {
-                self.wreck_push.insert(entity, hit);
-            } else if let Some(breakup) = m.breakup.as_deref()
+            if let Some(breakup) = m.breakup.as_deref()
                 && !self.knocked.contains_key(&entity)
+                && !state_driven(m)
             {
                 let breakup = &weighed(breakup, self.piece_mass.get(&entity).copied());
                 let pieces = match hit {
@@ -1905,10 +1899,11 @@ impl Props {
     /// ([`m2_engine::node_debris`]): its node's own `PHY2` dynamic body
     /// (shape, mass, material: the model's loose piece on that node) leaves
     /// the prop from where it stands, drawn with the node and those under
-    /// it, which the prop no longer shows. At rest, unless it goes on the
-    /// frame the prop was brought down, when the blast or the vehicle
-    /// that brought it down sends it on as the breakup's pieces are
-    /// ([`state_driven`]). True if it went.
+    /// it, which the prop no longer shows. At rest, as the 360 spawns it
+    /// (0x82409B38 gives it no velocity; the blast that brought the prop
+    /// down made its explosion action from the bodies there before the
+    /// piece was, 0x82291B88 -> 0x8215C110, so it doesn't push it; a
+    /// vehicle moves it only by running into it). True if it went.
     pub fn send_off(&mut self, physics: &mut Physics, entity: u32, name: u32) -> bool {
         let Some(p) = self.shown.get(&entity) else {
             return false;
@@ -1939,20 +1934,13 @@ impl Props {
         let piece = &loose.pieces[idx];
         let start = loose.starts(placed)[idx];
         let corners = corners(start, piece);
-        let fudge = self.fudge.get(&entity).copied().unwrap_or(1.0);
-        let (velocity, spin) = match self.wreck_push.get(&entity) {
-            Some(Hit::Blast(Some(b), scale)) => launch(&corners, *b, scale * fudge),
-            Some(Hit::Crash(v, w)) => (*v, *w),
-            _ => (Vec3::ZERO, Vec3::ZERO),
-        };
         let lift = Mat4::from_translation(Vec3::Y * buried(physics, &corners));
-        let body = physics.add_rubble(piece, lift * start, velocity, spin);
+        let body = physics.add_rubble(piece, lift * start, Vec3::ZERO, Vec3::ZERO);
         eprintln!(
             "props: {entity:#x}'s part {name:08x} goes off as an object of its own ({:.0} kg, \
-             {} nodes) at {:.1} m/s",
+             {} nodes), at rest",
             piece.mass,
-            pieces.pieces[k].nodes.iter().filter(|&&n| n).count(),
-            velocity.length()
+            pieces.pieces[k].nodes.iter().filter(|&&n| n).count()
         );
         self.sent_off
             .entry(entity)
@@ -1980,18 +1968,7 @@ impl Props {
     ///
     /// [`destroy_parts`]: Self::destroy_parts
     pub fn take_part_changes(&mut self) -> Vec<(u32, m2_engine::part_runner::Change)> {
-        let changes = std::mem::take(&mut self.part_changes);
-        self.changes_taken = changes.iter().map(|c| c.0).collect();
-        changes
-    }
-
-    /// The part changes last taken are dealt with: what brought those
-    /// props down pushes nothing they send off later (a burning palm's
-    /// leaves falling once the fire has burnt them).
-    pub fn part_changes_done(&mut self) {
-        for e in std::mem::take(&mut self.changes_taken) {
-            self.wreck_push.remove(&e);
-        }
+        std::mem::take(&mut self.part_changes)
     }
 
     /// Plays material animation `anim` on `entity` (the scripts'

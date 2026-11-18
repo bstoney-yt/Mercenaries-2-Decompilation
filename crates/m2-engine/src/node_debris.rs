@@ -150,6 +150,61 @@ mod tests {
         assert_eq!(subtree(&parents, 0), [true; 5]);
     }
 
+    /// A part a delayed state sends off leaves when that state comes in,
+    /// another sent off at once leaves at once (a model whose states give
+    /// the leaves their own delays; the palms' data has none).
+    #[test]
+    fn a_part_a_delayed_state_sends_off_leaves_later() {
+        use m2_assets::model::{DESTROY_MSG, PartMachine, PartStates, STATE_INTACT, StateActs};
+        // The trunk (node 0) on DestroyMsg goes to 0xA, which sends leaf
+        // 1 off at once and sets 0xB 2 to 2 s later, which sends leaf 2 off.
+        let (gone, later, off) = (0xa, 0xb, 0xc);
+        let trunk = PartMachine {
+            node: Some(0),
+            states: vec![(STATE_INTACT, vec![]), (gone, vec![]), (later, vec![])],
+            starts: [Some(STATE_INTACT), None],
+            acts: vec![
+                StateActs {
+                    on: vec![(DESTROY_MSG, gone)],
+                    ..Default::default()
+                },
+                StateActs {
+                    creates: vec![(off, 1)],
+                    delayed: vec![(later, 0, 2.0, 2.0)],
+                    ..Default::default()
+                },
+                StateActs {
+                    creates: vec![(off, 2)],
+                    ..Default::default()
+                },
+            ],
+        };
+        let leaf = |n: u16| PartMachine {
+            node: Some(n),
+            states: vec![(STATE_INTACT, vec![]), (off, vec![])],
+            starts: [Some(STATE_INTACT), None],
+            acts: vec![StateActs::default(), StateActs::default()],
+        };
+        let states = PartStates {
+            machines: vec![trunk, leaf(1), leaf(2)],
+            ..Default::default()
+        };
+        let mut runner = crate::part_runner::Runner::new(&states, |n| 100 + u32::from(n), 1);
+        runner.deliver(DESTROY_MSG);
+        let sent = |r: &mut crate::part_runner::Runner| -> Vec<u32> {
+            r.take_changes()
+                .into_iter()
+                .filter(|c| c.sent_off)
+                .map(|c| c.machine)
+                .collect()
+        };
+        assert_eq!(sent(&mut runner), [101]);
+        runner.advance(1.9);
+        assert!(sent(&mut runner).is_empty());
+        runner.advance(0.2);
+        assert_eq!(sent(&mut runner), [102]);
+    }
+
     #[test]
     fn its_box_holds_its_nodes_boxes_where_they_sit() {
         let up = Mat4::from_translation(Vec3::Y * 5.0);
