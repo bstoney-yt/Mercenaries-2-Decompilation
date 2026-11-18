@@ -19,6 +19,13 @@ tap_until a Objective 150
 trackhero
 mark PmcCon001 start
 ocr start
+nearlog start 2765.4 -24.0 3 pile
+healthlog start pilehp
+walkcam 2765.4 -24.0 0.6 30
+walkcam 2765.4 -30.0 1.0 15
+wait 2
+nearlog stop
+healthlog stop
 walkcam 2765 -10 3 40
 enter 2765 -7 2.0 8
 ocr onbike
