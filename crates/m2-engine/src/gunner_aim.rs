@@ -19,9 +19,10 @@
 //!   byte (the rider's mind +0x128, which 0x822ECE70 hands the driver):
 //!   [`Report`], from which `CarAttack` moves and turns for its crew.
 //!
-//! Inferred: the gravity factor is the round's `GravityScale`, the world's
-//! gravity the alpha's own ([`crate::physics::GRAVITY`], as its rounds fall
-//! by it); the round's speed its `Velocity`. Not ported: how often it
+//! Inferred: the gravity factor is the round's `GravityScale`; the round's
+//! speed its `Velocity`. From the 360 code: rounds fall by the world's
+//! gravity times that factor (the ordnance step 0x82295DF0), so the drop
+//! is solved with the world's ([`crate::physics::WORLD_GRAVITY`]). Not ported: how often it
 //! takes a new aim point (+0x3C counting down from its +0x40), and what
 //! it does about what its line of sight meets (0x822C9530); its rays
 //! (mask 0x223F6FDA) are here all that is solid but its own bodies and hers.
@@ -217,7 +218,7 @@ pub fn aim(
     };
     if speed > 0.0
         && gravity != 0.0
-        && let Some(h) = drop(p - muzzle, speed, gravity * crate::physics::GRAVITY)
+        && let Some(h) = drop(p - muzzle, speed, gravity * crate::physics::WORLD_GRAVITY)
     {
         p.y += h;
     }

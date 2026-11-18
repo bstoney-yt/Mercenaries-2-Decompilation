@@ -3515,7 +3515,7 @@ impl Combat {
             m2_engine::weapons::Flight::Lobbed => {
                 let goal = Self::aim_point(f.physics, f.people, f.player, None);
                 let speed = ammo.velocity.max(1.0);
-                let velocity = lob_velocity(from, goal, speed, m2_engine::physics::GRAVITY)
+                let velocity = lob_velocity(from, goal, speed, m2_engine::physics::WORLD_GRAVITY)
                     .unwrap_or(aim * speed);
                 self.projectiles.push(Projectile::Round {
                     at: from,
@@ -3921,7 +3921,7 @@ impl Combat {
         let n = &f.people.npcs[i];
         let from = n.character.position + Vec3::Y * 1.8;
         eprintln!("grenade: a soldier throws from {from:.1} at {at:.1}");
-        let gravity = m2_engine::physics::GRAVITY;
+        let gravity = m2_engine::physics::WORLD_GRAVITY;
         // The low lob, else the high one where the low one would meet
         // something on the way (the cover he throws from: playtest
         // 2026-11-14's grenades went off at the throwers' feet, behind
@@ -4370,7 +4370,7 @@ impl Combat {
         );
         let goal = cast_shot(f.physics, f.people, eye, dir, ROCKET_RANGE, None, None)
             .map_or(eye + dir * ROCKET_RANGE, |h| eye + dir * h.0);
-        let gravity = m2_engine::physics::GRAVITY;
+        let gravity = m2_engine::physics::WORLD_GRAVITY;
         let speed = self.launcher.speed(LOB_SPEED);
         let velocity = lob_velocity(from, goal, speed, gravity)
             .unwrap_or_else(|| farthest(goal - from, speed));
@@ -4573,7 +4573,7 @@ impl Combat {
             }
             m2_engine::weapons::Flight::Lobbed => {
                 let speed = ammo.velocity.max(1.0);
-                let velocity = lob_velocity(from, goal, speed, m2_engine::physics::GRAVITY)
+                let velocity = lob_velocity(from, goal, speed, m2_engine::physics::WORLD_GRAVITY)
                     .unwrap_or(aim * speed);
                 self.projectiles.push(Projectile::Round {
                     at: from,
@@ -5970,7 +5970,7 @@ impl Combat {
             if t.age >= MARKER_SMOKE.0 && (t.age / MARKER_PUFF).floor() > puffed {
                 marks.push(t.at);
             }
-            t.velocity.y -= m2_engine::physics::GRAVITY * dt;
+            t.velocity.y -= m2_engine::physics::WORLD_GRAVITY * dt;
             let step = t.velocity * dt;
             if let Some((d, normal)) = f.physics.cast_ray(t.at, step, step.length()) {
                 t.at += step.normalize_or_zero() * (d - 0.05).max(0.0);
@@ -6097,7 +6097,7 @@ impl Combat {
                 flown,
                 blast,
             } => {
-                velocity.y -= m2_engine::physics::GRAVITY * dt;
+                velocity.y -= m2_engine::physics::WORLD_GRAVITY * dt;
                 let step = *velocity * dt;
                 let len = step.length();
                 if let Some((d, _)) = cast_shot(f.physics, f.people, *at, step, len, None, None) {
@@ -6125,7 +6125,7 @@ impl Combat {
                 mine,
             } => {
                 if !*stuck {
-                    velocity.y -= m2_engine::physics::GRAVITY * dt;
+                    velocity.y -= m2_engine::physics::WORLD_GRAVITY * dt;
                     let step = *velocity * dt;
                     if let Some((d, _)) = f.physics.cast_ray(*at, step, step.length()) {
                         // It sticks (C4) or settles (a mine) where it lands.
@@ -6162,7 +6162,7 @@ impl Combat {
                 blast,
                 army,
             } => {
-                velocity.y -= m2_engine::physics::GRAVITY * dt;
+                velocity.y -= m2_engine::physics::WORLD_GRAVITY * dt;
                 let step = *velocity * dt;
                 if let Some((d, normal)) = f.physics.cast_ray(*at, step, step.length()) {
                     *at += step.normalize_or_zero() * (d - 0.05).max(0.0);
@@ -8063,7 +8063,7 @@ mod tests {
 
     #[test]
     fn a_soldier_lobs_high_over_the_wall_in_front_of_him() {
-        let gravity = m2_engine::physics::GRAVITY;
+        let gravity = m2_engine::physics::WORLD_GRAVITY;
         let mut physics = ground();
         let (from, to) = (Vec3::new(0.0, 1.8, 0.0), Vec3::new(0.0, 0.0, 14.0));
         let (low, high) = lob_velocities(from, to, THROW, gravity).unwrap();
@@ -8628,7 +8628,7 @@ mod tests {
 
     #[test]
     fn a_lobbed_round_comes_down_where_it_is_aimed() {
-        let g = m2_engine::physics::GRAVITY;
+        let g = m2_engine::physics::WORLD_GRAVITY;
         let from = Vec3::new(0.0, 1.5, 0.0);
         for to in [
             Vec3::new(0.0, 0.0, 25.0),

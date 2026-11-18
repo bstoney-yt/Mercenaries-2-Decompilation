@@ -8,7 +8,7 @@
 //! ([`m2_engine::ordnance`]): a "Cluster Bomb Projectile" at 80 m/s,
 //! leaving "Explosion (Cluster Bomb)".
 
-use m2_engine::physics::GRAVITY;
+use m2_engine::physics::WORLD_GRAVITY;
 use m2_engine::{Physics, Templates};
 use m2_game::airstrike::{Fuse, Launch};
 use m2_game::api::Command;
@@ -239,7 +239,7 @@ impl Strikes {
             if let (Some((cone, turn)), Some(target)) = (s.homing, s.target) {
                 home(&mut s.velocity, s.at, target, cone, turn, dt);
             }
-            s.velocity.y -= GRAVITY * s.gravity * dt;
+            s.velocity.y -= WORLD_GRAVITY * s.gravity * dt;
             let step = s.velocity * dt;
             let length = step.length();
             let dir = step.normalize_or(Vec3::NEG_Y);

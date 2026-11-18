@@ -6255,7 +6255,7 @@ fn launch_dir(m: &crate::combat::Manned, at: Vec3) -> Vec3 {
         return d.normalize_or_zero();
     }
     let (g, v2) = (
-        m2_engine::physics::GRAVITY,
+        m2_engine::physics::WORLD_GRAVITY,
         m.weapon.ammo.velocity.max(1.0).powi(2),
     );
     let flat = d.with_y(0.0);
