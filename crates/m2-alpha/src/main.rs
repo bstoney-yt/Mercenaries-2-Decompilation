@@ -867,7 +867,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--swim-check" => o.swim_check = true,
             "--cargo-check" => {
                 o.cargo_check = true;
-                o.drive = true;
+                o.mission = true;
             }
             "--ladder-check" => {
                 o.ladder_check = Some(
@@ -4574,6 +4574,7 @@ fn mission_for_screenshot(
     let mut placed_tried = std::collections::HashSet::new();
     // Seconds she has been where --props-check hits the props.
     let mut props_ready = 0.0;
+    let mut cargo_wait = options.cargo_check.then(CargoWait::default);
     let mut shop_check = options.shop_check.clone().map(shopcheck::ShopCheck::new);
     let mut cheat_check = options.cheat_check.then(cheats::Check::default);
     let mut context = ContextCheck::default();
@@ -5103,6 +5104,16 @@ fn mission_for_screenshot(
             && game.scene.player.as_ref().is_some_and(|p| p.landed)
         {
             placed::check(game, &mut placed_tried, tick);
+        }
+        // With --cargo-check, once the contract has put out a vehicle with
+        // cargo aboard (she is put by it so it streams in), it is driven
+        // ([`cargo_check`]); then the run ends.
+        if let Some(w) = &mut cargo_wait
+            && i % (1.0 / tick).round() as u32 == 0
+            && w.tick(game, 1.0)
+        {
+            cargo_check(game, tick);
+            break;
         }
         // With --props-check, every placed prop is hit once she has been
         // ashore (and in --props-area, if given) a while, for the
@@ -7264,10 +7275,6 @@ fn drive_for_screenshot(
         swim_check(game, tick);
         return Ok(());
     }
-    if options.cargo_check {
-        cargo_check(game, tick);
-        return Ok(());
-    }
     if let Some(hold) = options.ladder_check {
         ladder_check(game, hold, tick);
         return Ok(());
@@ -8220,6 +8227,83 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 /// second, and at each phase's end the median and most shift of those
 /// still aboard and how many have come off, as `cargo-check: <phase>:
 /// median <m> m, max <m> m, <n> of <k> off`.
+/// How long `--cargo-check` waits for a vehicle with cargo aboard after
+/// she is put by one that might carry some, seconds.
+const CARGO_WAIT: f32 = 60.0;
+
+/// `--cargo-check`'s wait in the mission for a vehicle with cargo aboard
+/// (the contract's layers put out OilCon020's El Grande and its crates):
+/// each second, once a vehicle carries cargo it is time; before that,
+/// she is put 8 m from the first vehicle near which the layers placed
+/// props that might ride (or an El Grande, else the first vehicle), so
+/// both stream in; [`CARGO_WAIT`] s after, a `FAIL` with what was there.
+#[derive(Debug, Default)]
+struct CargoWait {
+    t: f32,
+    put_at: Option<f32>,
+    done: bool,
+}
+
+impl CargoWait {
+    fn tick(&mut self, game: &mut Game, dt: f32) -> bool {
+        use m2_math::glam::Vec3;
+        if self.done {
+            return false;
+        }
+        self.t += dt;
+        let vehicles = &game.scene.vehicles;
+        if (0..vehicles.len()).any(|i| {
+            vehicles[i].id.is_some() && !vehicles[i].wrecked && game.scene.props.carrying(i)
+        }) {
+            self.done = true;
+            eprintln!(
+                "cargo-check: a vehicle has cargo aboard after {:.0} s",
+                self.t
+            );
+            return true;
+        }
+        // Not before the contract's layers have had a moment.
+        if self.put_at.is_none() && self.t >= 10.0 {
+            let pick = vehicles
+                .iter()
+                .position(|v| v.id.is_some() && !v.wrecked && v.spec.label.contains("El Grande"))
+                .or_else(|| vehicles.iter().position(|v| v.id.is_some() && !v.wrecked));
+            let at = pick.and_then(|i| {
+                let id = vehicles[i].id?;
+                let m = game.scene.world.as_ref()?.physics.vehicle_transform(id)?;
+                Some((i, m.w_axis.truncate(), m.x_axis.truncate()))
+            });
+            match at {
+                Some((i, at, side)) => {
+                    eprintln!(
+                        "cargo-check: she is put 8 m from the {} at {at:.0}",
+                        vehicles[i].spec.label
+                    );
+                    if let Some(p) = game.scene.player.as_mut() {
+                        p.driving = None;
+                        p.drop_at(at + side.normalize_or(Vec3::X) * 8.0 + Vec3::Y);
+                    }
+                    game.ride = None;
+                    game.on_foot = true;
+                }
+                None => eprintln!("cargo-check: no vehicle out yet at {:.0} s", self.t),
+            }
+            self.put_at = Some(self.t);
+        }
+        if self.put_at.is_some_and(|t| self.t - t > CARGO_WAIT) {
+            self.done = true;
+            let props = &game.scene.props;
+            eprintln!(
+                "cargo-check: FAIL no vehicle with cargo aboard {CARGO_WAIT} s after she was put                  by one ({} vehicles, {} props loaded on any, {} shown)",
+                game.scene.vehicles.len(),
+                props.cargo_places().len(),
+                props.shown().count()
+            );
+        }
+        false
+    }
+}
+
 fn cargo_check(game: &mut Game, tick: f32) {
     use m2_math::glam::{Vec2, Vec3};
     let vehicles = &game.scene.vehicles;
