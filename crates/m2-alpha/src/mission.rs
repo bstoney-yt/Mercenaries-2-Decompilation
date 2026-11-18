@@ -2757,6 +2757,50 @@ impl MissionLink {
             p.carrying = carrying;
         }
         lap.mark("scripts: actions");
+        // Civilians worn down to a casualty (0x822D9990): the faction
+        // manager's `ResolveCivCasualty(target, cause, killer)`, as the
+        // engine calls it; the script charges the player's casualties
+        // (`ChargeCivCasualty`: the collateral penalty, its cash, the
+        // `CollateralDamage` event, the tutorial and the heroes' lines).
+        // Inferred: the cause is nil and the killer her when she hurt
+        // them, as for `ObjectDeath`.
+        {
+            let civ = m2_assets::name_hash("Civ");
+            let w = mission.world().borrow();
+            for n in &mut game.scene.people.npcs {
+                if n.civ_label.is_none()
+                    && let Some(o) = n.spawn.and_then(|g| w.objects.get(&g))
+                {
+                    n.civ_label = Some(o.all_labels().contains(&civ));
+                }
+            }
+        }
+        let casualties: Vec<(u32, bool)> = game
+            .scene
+            .people
+            .npcs
+            .iter_mut()
+            .filter_map(|n| std::mem::take(&mut n.casualty).then_some((n.spawn?, n.hurt_by_her)))
+            .collect();
+        for (g, hers) in casualties {
+            let killer = if hers {
+                PLAYER.to_string()
+            } else {
+                "nil".to_owned()
+            };
+            let call = format!(
+                "local m = rawget(_G, 'MrxFactionManager')                  if type(m) == 'table' and type(m.ResolveCivCasualty) == 'function' then                      m.ResolveCivCasualty({g}, nil, {killer}) return true end return false"
+            );
+            match mission.lua().load(call).eval::<bool>() {
+                Ok(ran) => eprintln!(
+                    "scripts: civilian casualty {g:#x}: ResolveCivCasualty {}",
+                    if ran { "ran" } else { "not loaded" }
+                ),
+                Err(e) => {
+                    eprintln!("scripts: civilian casualty {g:#x}: ResolveCivCasualty failed: {e}")
+                }
+            }
+        }
         // The placed people's human states, as they change, for the
         // scripts' `HumanStateTransition` events.
         for n in &game.scene.people.npcs {

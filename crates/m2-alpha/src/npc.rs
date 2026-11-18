@@ -1383,6 +1383,15 @@ pub struct Npc {
     pub uid: u64,
     /// The state of their face's own random numbers.
     face_seed: u64,
+    /// A civilian's casualty meter ([`CIV_METER`]): what hits take from
+    /// it, a knockdown once it runs low ([`Npc::hurt`]).
+    civ_meter: f32,
+    /// A civilian casualty for the scripts' faction manager, since last
+    /// taken ([`Npc::civilian_casualty`]).
+    pub casualty: bool,
+    /// Whether their object's labels hold `Civ` (0xDCC8B14D), once the
+    /// scripts' world has told (`None`: not known yet).
+    pub civ_label: Option<bool>,
     /// Scared while getting out of a vehicle's way: the seconds the
     /// `ThreatReaction` action has left ([`People::threat_seconds`]), or
     /// below 0 when its length isn't known (until they settle).
@@ -1520,6 +1529,9 @@ pub enum Down {
     Carried,
 }
 
+/// A civilian's casualty meter when whole (0x820D9F18, 0x822D7D50).
+pub const CIV_METER: f32 = 100.0;
+
 /// When someone knocked down stands up again. From the 360 code
 /// (0x8225CAE0, for a person in `KnockedDown` `Idle`): `Stand` is posted
 /// once they have been in that state longer than their time down (the
@@ -1600,6 +1612,9 @@ impl Npc {
             },
             uid,
             face_seed: uid.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1,
+            civ_meter: CIV_METER,
+            casualty: false,
+            civ_label: None,
             scared: None,
             stagger: None,
             since_stagger: None,
@@ -1863,8 +1878,6 @@ impl Npc {
         Some((direction, clip))
     }
 
-    /// Takes `damage`; at no health left, falls: true if it killed.
-    /// `push` (m/s) shoves the body if it kills or is dead already.
     /// Damage that nobody dealt (a fall's: its event's attacker is -1,
     /// 0x82205F20): as [`hurt`](Self::hurt), but neither to her account
     /// nor alerting them.
@@ -1879,6 +1892,57 @@ impl Npc {
         killed
     }
 
+    /// A civilian hit for `damage`: their casualty meter runs down, and
+    /// once it drops under 1 they count as a civilian casualty and are
+    /// knocked down for about 5 s (never halved).
+    ///
+    /// From the 360 code: an AI person whose labels hold `Civ` (0xDCC8B14D)
+    /// has its controller's +0x17DC bit 0 set (0x822D7D50) and +0x1754 set
+    /// to 100 (0x820D9F18). Each damage event (0x82289650 → 0x822D9990)
+    /// takes its amount from that meter while the person is not limp
+    /// (`FULL`), the meter is at least 1 and the controller's +0xFF4 is
+    /// clear. When it falls under 1 the engine calls the faction manager's
+    /// script (`MrxFactionManager`, hash 0xB2CEC5F5) `ResolveCivCasualty`
+    /// (0x823094F0, three arguments from the damage), and the
+    /// controller's update (0x822D9C10)
+    /// knocks them down (`KnockDown`, time down 0x82423848(5.0, not
+    /// disguised)) unless they are already limp.
+    /// The meter is theirs whose object's labels hold `Civ` as the 360
+    /// finds it (the object's labels, table 0x83653C4C; [`Npc::civ_label`]);
+    /// where the scripts' world has not told, the people of no faction
+    /// who are not soldiers (inferred). +0xFF4 is not modelled. The call
+    /// is made by the mission ([`Npc::casualty`]).
+    fn civilian_casualty(&mut self, damage: f32) {
+        let civ = self
+            .civ_label
+            .unwrap_or(!self.soldier && self.faction.is_none());
+        if !civ || self.down.is_some() || self.ragdoll.is_some() {
+            return;
+        }
+        if self.civ_meter < 1.0 {
+            return;
+        }
+        self.civ_meter -= damage;
+        if self.civ_meter >= 1.0 || self.hp <= 0.0 {
+            return;
+        }
+        let seed = &mut self.face_seed;
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        let r = (*seed >> 40) as f32 / (1u64 << 24) as f32;
+        let seconds =
+            m2_engine::melee::knockdown_seconds(m2_engine::durability::KNOCKDOWN_SECONDS, false, r);
+        eprintln!(
+            "people: {:08x} civilian casualty: down {seconds:.1} s",
+            self.spawn.unwrap_or(0)
+        );
+        self.knock_down_for(seconds, Vec3::ZERO);
+        self.casualty = true;
+    }
+
+    /// Takes `damage`; at no health left, falls: true if it killed.
+    /// `push` (m/s) shoves the body if it kills or is dead already.
     pub fn hurt(&mut self, damage: f32, push: Vec3) -> bool {
         let clips = self.clips;
         let last_hit = self.last_hit.take();
@@ -1895,6 +1959,7 @@ impl Npc {
         self.hurt_by_her = true;
         self.alert = self.soldier;
         self.hit = true;
+        self.civilian_casualty(damage);
         if self.hp <= 0.0 {
             self.alive = false;
             self.died = true;
@@ -9177,6 +9242,39 @@ pub(crate) mod tests {
         assert!(npc.landed);
         let p = npc.character.position;
         assert!(p.y >= -1.0 - WET && p.z < 6.0, "{p}");
+    }
+
+    /// A civilian's casualty meter (0x822D9990): hits that take it under
+    /// 1 of its 100 knock them down for about 5 s; a soldier has none.
+    #[test]
+    fn a_civilian_worn_down_is_knocked_down_and_a_soldier_is_not() {
+        let mut n = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(4),
+        );
+        n.hp = 1000.0;
+        n.soldier = false;
+        n.faction = None;
+        n.hurt(60.0, Vec3::ZERO);
+        assert!(n.down.is_none());
+        n.hurt(39.5, Vec3::ZERO);
+        assert!(n.down.is_some(), "{}", n.civ_meter);
+        let mut s = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(5),
+        );
+        s.hp = 1000.0;
+        s.soldier = true;
+        s.hurt(200.0, Vec3::ZERO);
+        assert!(s.down.is_none());
     }
 
     /// A person falls as the 360 has every person fall (0x82205F20): a

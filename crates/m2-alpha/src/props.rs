@@ -1215,6 +1215,40 @@ impl Props {
             .collect()
     }
 
+    /// `entity`'s model's box in the world, as the box round its eight
+    /// corners (least and most); `None` unless it is shown and its model
+    /// has loaded.
+    /// `entity`'s model's box: its model-to-world matrix and its least
+    /// and most corners in the model; `None` unless it is shown and its
+    /// model has loaded.
+    pub fn model_box(&self, entity: u32) -> Option<(Mat4, Vec3, Vec3)> {
+        let p = self.shown.get(&entity)?;
+        let m = self.models.get(&p.model)?.as_ref()?;
+        let (lo, hi) = m.gpu.bounds;
+        Some((
+            Mat4::from_rotation_translation(p.rotation, p.position),
+            lo,
+            hi,
+        ))
+    }
+
+    pub fn world_box(&self, entity: u32) -> Option<(Vec3, Vec3)> {
+        let p = self.shown.get(&entity)?;
+        let m = self.models.get(&p.model)?.as_ref()?;
+        let (lo, hi) = m.gpu.bounds;
+        let mut out = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+        for i in 0..8 {
+            let c = Vec3::new(
+                if i & 1 == 0 { lo.x } else { hi.x },
+                if i & 2 == 0 { lo.y } else { hi.y },
+                if i & 4 == 0 { lo.z } else { hi.z },
+            );
+            let w = p.position + p.rotation * c;
+            out = (out.0.min(w), out.1.max(w));
+        }
+        Some(out)
+    }
+
     /// The middle of `entity`'s model's box in the world; `None` unless it
     /// is shown and its model has loaded.
     pub fn centre(&self, entity: u32) -> Option<Vec3> {
