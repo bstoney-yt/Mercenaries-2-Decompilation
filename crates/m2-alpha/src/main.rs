@@ -126,6 +126,7 @@ mod strikes;
 mod subtitles;
 mod support;
 mod touch;
+mod touch_break;
 mod traffic;
 mod ui;
 mod winches;
@@ -518,6 +519,9 @@ struct Options {
     /// swim her forward walking, at her pace and sprinting, logging how
     /// fast she goes (`swim-check:` lines).
     swim_check: bool,
+    /// `--touch-check`: (turns on --drive) the break-on-touch piles'
+    /// templates and the touch rule ([`touch_break::check`]), offscreen; then exit.
+    touch_check: bool,
     /// `--mine-check`: in the mission, the nearest placed mine is blasted
     /// by an RPG and, should it stand, run into by a jeep; logs
     /// `mine-check:` lines ([`mines::MineCheck`]).
@@ -911,6 +915,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--seated" => o.seated = true,
             "--board" => o.board = true,
             "--swim-check" => o.swim_check = true,
+            "--touch-check" => {
+                o.touch_check = true;
+                o.drive = true;
+            }
             "--mine-check" => {
                 o.mine_check = true;
                 o.mission = true;
@@ -7620,6 +7628,16 @@ fn drive_for_screenshot(
     }
     if options.swim_check {
         swim_check(game, tick);
+        return Ok(());
+    }
+    if options.touch_check {
+        match game.scene.world.as_ref() {
+            Some(w) => {
+                let db = &w.index.template_db;
+                touch_break::check(&db.touch_breakers, &db.uncrushable, &db.names);
+            }
+            None => println!("touch-check: FAIL no world"),
+        }
         return Ok(());
     }
     if options.impact_check {
