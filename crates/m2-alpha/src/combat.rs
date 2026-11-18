@@ -3235,7 +3235,7 @@ impl Combat {
                 let r = self.knock_rng.unit();
                 let seconds = m2_engine::melee::knockdown_seconds(
                     m2_engine::durability::KNOCKDOWN_SECONDS,
-                    false,
+                    HER_PLAYER_RECORD,
                     r,
                 );
                 self.knock_her_down(f, seconds);
