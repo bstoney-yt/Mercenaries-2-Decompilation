@@ -46,8 +46,18 @@ pub use winch_cable::{CARGO_TILT, CableId, HALF_LINK, LINK_MASS, LINK_RADIUS, MI
 pub const STEP_HEIGHT: f32 = 0.5;
 /// Steepest slope a character walks up, radians (50 degrees).
 pub const MAX_SLOPE: f32 = 50.0 * std::f32::consts::PI / 180.0;
-/// Downward acceleration, m/s².
+/// Downward acceleration, m/s², of what the Beta moves by its own sums
+/// rather than the physics world (characters without a template, the
+/// fight's rounds and lobs, falling crates): see [`WORLD_GRAVITY`] for the
+/// world's.
 pub const GRAVITY: f32 = 9.81;
+/// The physics world's gravity, m/s² downward: every rigid body's pull
+/// (vehicles, debris, props, ragdolls). From the 360 code: the world's
+/// set-up (0x82164A58, from the physics manager's init 0x821523B8) builds
+/// its `hkpWorldCinfo` (0x82630380) and loads its gravity from 0x820F9710,
+/// (0, -9, 0); its broadphase from the two vectors after it (+-4096 across,
+/// +-1000 up).
+pub const WORLD_GRAVITY: f32 = 9.0;
 /// The gravity the 360 car code pulls with where it works its own, m/s²
 /// (the constant at 0x82DE8C30, -10, that the gravity factor's pull at
 /// 0x8219EE4C and 14 other physics routines read).
@@ -1099,7 +1109,20 @@ impl CollisionShape {
     /// given and parses, else its rigid visible geometry at `lod` (a stand
     /// in).
     pub fn for_model(model: &Model<'_>, phy2: Option<&[u8]>, lod: u32) -> Option<Self> {
-        Self::for_model_part(model, phy2, lod, None)
+        Self::for_model_part(model, phy2, lod, None, None)
+    }
+
+    /// [`for_model`](Self::for_model) with its nodes where `nodes` (model
+    /// space, one a node) puts them, not at rest: a gate's shapes with
+    /// its leaves swung open ([`crate::gate::Gate::nodes`]), as the 360's
+    /// leaves are bodies of their own on their hinges.
+    pub fn for_model_posed(
+        model: &Model<'_>,
+        phy2: Option<&[u8]>,
+        lod: u32,
+        nodes: &[Mat4],
+    ) -> Option<Self> {
+        Self::for_model_part(model, phy2, lod, None, Some(nodes))
     }
 
     /// The `PHY2` shapes [`for_model`](Self::for_model) stands in the
@@ -1141,7 +1164,7 @@ impl CollisionShape {
     /// vertices carry in their position's `w`: its visible geometry at
     /// `lod`, in model space.
     pub fn for_sub_object(model: &Model<'_>, index: u32, lod: u32) -> Option<Self> {
-        Self::for_model_part(model, None, lod, Some(index))
+        Self::for_model_part(model, None, lod, Some(index), None)
     }
 
     fn for_model_part(
@@ -1149,6 +1172,7 @@ impl CollisionShape {
         phy2: Option<&[u8]>,
         lod: u32,
         sub_object: Option<u32>,
+        posed: Option<&[Mat4]>,
     ) -> Option<Self> {
         let mut vertices = Vec::new();
         let mut triangles = Vec::new();
@@ -1200,7 +1224,10 @@ impl CollisionShape {
                 let node = p
                     .shape_node(k)
                     .and_then(|n| u16::try_from(n).ok())
-                    .and_then(|n| model.node_to_model(n))
+                    .and_then(|n| match posed {
+                        Some(nodes) => nodes.get(usize::from(n)).copied(),
+                        None => model.node_to_model(n),
+                    })
                     .unwrap_or(Mat4::IDENTITY);
                 let to_model = node * p.shape_place(k).map_or(Mat4::IDENTITY, place);
                 let (v, t) = s.geometry.triangles(s.radius);
@@ -1467,7 +1494,7 @@ fn preloads(spec: &VehicleSpec, strength: impl Fn(bool) -> f32, mass_z: f32) -> 
                 (1.0 - front_share, nr)
             };
             let k = strength(w.steers).max(1.0);
-            (GRAVITY * share / (n.max(1) as f32 * k)).min(1.0)
+            (WORLD_GRAVITY * share / (n.max(1) as f32 * k)).min(1.0)
         })
         .collect()
 }
@@ -1525,6 +1552,14 @@ const PARKED_FAST: f32 = 3.0;
 /// How far a ragdoll's limb may drift off its joint before it is put
 /// back, metres.
 const RAGDOLL_SLACK: f32 = 0.02;
+/// What the 360's body builder (0x8216A290) gives every body of a model's
+/// physics, the ragdoll's among them: angular damping at least 0.8
+/// (0x820B8034, over the record's +0x44), Havok's linear damping left at
+/// its default (none), no bounce, and speed limits of 132 m/s
+/// (0x820F9628) and 3 pi radians a second (0x820F8CC4).
+const RAGDOLL_ANGULAR_DAMPING: f32 = 0.8;
+const RAGDOLL_MAX_SPEED: f32 = 132.0;
+const RAGDOLL_MAX_SPIN: f32 = 9.424_778;
 /// How quickly a wreck stops sliding and spinning, how hard its hull
 /// drags on the ground, and how far down its wheels' rims reach (of the
 /// radius from the centre): invented.
@@ -1557,7 +1592,11 @@ pub const FLOAT_DEPTH: f32 = 0.35;
 /// metres: where its float springs hold it ([`BoatFloat::rest_depth`];
 /// its template's, else the 360 record's defaults).
 pub fn float_depth(spec: &VehicleSpec) -> f32 {
-    spec.tuning.boat.unwrap_or(BOAT).float.rest_depth(GRAVITY)
+    spec.tuning
+        .boat
+        .unwrap_or(BOAT)
+        .float
+        .rest_depth(WORLD_GRAVITY)
 }
 const BOAT_ROCK: f32 = 2.5;
 const BOAT_TOP: f32 = 18.0;
@@ -1708,6 +1747,8 @@ struct VehicleBody {
     held: bool,
     /// Its velocity before the last step, m/s: what it hit things with.
     before: Vec3,
+    /// Its spin before the last step, radians a second about each axis.
+    spin_before: Vec3,
     /// A boat's: it floats instead of rolling on wheels.
     hull: Option<Hull>,
     /// A helicopter's: it flies.
@@ -2199,6 +2240,10 @@ pub struct Character {
     /// Downward acceleration it falls at, m/s² ([`GRAVITY`] unless its
     /// template gives its own `_HumanPhysics` `Gravity`).
     pub gravity: f32,
+    /// The upright surface it last pushed against (its flat normal), kept
+    /// while it goes on pushing, as a proxy keeps its contacts from step
+    /// to step ([`Physics::move_character`]).
+    pub wall: Option<Vec3>,
 }
 
 impl Character {
@@ -2211,6 +2256,7 @@ impl Character {
             radius: 0.35,
             height: 1.8,
             gravity: GRAVITY,
+            wall: None,
         }
     }
 
@@ -3274,6 +3320,12 @@ struct Ragdoll {
     /// Each limb's joint: (limb, the limb it hangs from, where in that
     /// limb), parents first.
     joints: Vec<(usize, usize, Vec3)>,
+    /// The joints' handles, where they carry limits (a ragdoll built from
+    /// the game's, [`Physics::add_asset_ragdoll`]).
+    joint_handles: Vec<r::ImpulseJointHandle>,
+    /// Seconds since it went limp, for its first heavier fall
+    /// ([`crate::ragdoll_launch::heavy_gravity`], the game's ragdoll only).
+    age: f32,
 }
 
 /// The physics world.
@@ -3301,6 +3353,9 @@ pub struct Physics {
     controller: KinematicCharacterController,
     vehicles: Vec<Option<VehicleBody>>,
     ragdolls: Vec<Option<Ragdoll>>,
+    /// The game's human ragdoll ([`Physics::set_human_ragdoll`]): every
+    /// person's bodies and joints, where loaded.
+    human_ragdoll: Option<std::sync::Arc<m2_assets::ragdoll::HumanRagdoll>>,
     /// Loose props' pieces, oldest first.
     debris: Vec<Option<r::RigidBodyHandle>>,
     /// The water's surface boats float on, if there is any.
@@ -3358,7 +3413,10 @@ impl Physics {
             ..KinematicCharacterController::default()
         };
         Self {
-            world: r::PhysicsWorld::default(),
+            world: r::PhysicsWorld {
+                gravity: r::Vector::new(0.0, -WORLD_GRAVITY, 0.0),
+                ..r::PhysicsWorld::default()
+            },
             statics: HashMap::new(),
             keys: HashMap::new(),
             surfaces: HashMap::new(),
@@ -3371,6 +3429,7 @@ impl Physics {
             controller,
             vehicles: Vec::new(),
             ragdolls: Vec::new(),
+            human_ragdoll: None,
             debris: Vec::new(),
             water: None,
             inland: None,
@@ -3538,6 +3597,10 @@ impl Physics {
                 .bodies
                 .get(v.controller.chassis)
                 .map_or(Vec3::ZERO, |b| vec3(b.linvel()));
+            v.spin_before = w
+                .bodies
+                .get(v.controller.chassis)
+                .map_or(Vec3::ZERO, |b| vec3(b.angvel()));
             if v.held {
                 continue;
             }
@@ -3617,7 +3680,9 @@ impl Physics {
         self.float_boats(dt);
         self.fly_helicopters(dt);
         self.cap_debris_speeds();
+        self.weigh_down_ragdolls(dt);
         self.world.step_with_events(&HavokFriction, &());
+        self.cap_ragdoll_speeds();
         self.hold_ragdolls_together();
         self.settle_debris();
     }
@@ -3660,7 +3725,7 @@ impl Physics {
             let ahead = (turn * Vec3::Z).with_y(0.0).normalize_or_zero();
             let wet = if v.wrecked {
                 let n = hull.points.len().max(1) as f32;
-                let lift = GRAVITY * v.mass / n * dt;
+                let lift = WORLD_GRAVITY * v.mass / n * dt;
                 let mut wet = 0.0;
                 for &q in &hull.points {
                     let p = at + turn * q;
@@ -3766,7 +3831,7 @@ impl Physics {
                 vec3(b.angvel()),
                 p.translation.y,
                 b.mass(),
-                GRAVITY,
+                WORLD_GRAVITY,
                 dt,
             );
             if let Some((x, z)) = flown.spin_across {
@@ -4061,6 +4126,96 @@ impl Physics {
         }
         if let Some(h) = self.debris.get_mut(id.0).and_then(Option::take) {
             self.world.remove_body_with_colliders(h, true);
+        }
+    }
+
+    /// The game's ragdolls' bodies are held to Havok's speed limits the
+    /// 360's body builder gives them ([`RAGDOLL_MAX_SPEED`],
+    /// [`RAGDOLL_MAX_SPIN`]); rapier has none of its own.
+    fn cap_ragdoll_speeds(&mut self) {
+        for doll in self.ragdolls.iter().flatten() {
+            if doll.joint_handles.is_empty() {
+                continue;
+            }
+            for h in doll.bodies.iter().flatten() {
+                if let Some(b) = self.world.bodies.get_mut(*h) {
+                    let v = vec3(b.linvel());
+                    if v.length() > RAGDOLL_MAX_SPEED {
+                        b.set_linvel(vector(v * (RAGDOLL_MAX_SPEED / v.length())), true);
+                    }
+                    let w = vec3(b.angvel());
+                    if w.length() > RAGDOLL_MAX_SPIN {
+                        b.set_angvel(vector(w * (RAGDOLL_MAX_SPIN / w.length())), true);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The game's ragdolls fall harder for their first moments: each of
+    /// their bodies is pulled by gravity times
+    /// [`heavy_gravity`](crate::ragdoll_launch::heavy_gravity) of its age
+    /// more, while the step is under 0.1 s (from the 360 code: the ragdoll
+    /// controller's update, 0x82428768).
+    fn weigh_down_ragdolls(&mut self, dt: f32) {
+        let gravity = vec3(self.world.gravity);
+        for doll in self.ragdolls.iter_mut().flatten() {
+            let age = doll.age;
+            doll.age += dt;
+            if doll.joint_handles.is_empty() || dt >= 0.1 {
+                continue;
+            }
+            let k = crate::ragdoll_launch::heavy_gravity(age);
+            if k <= 0.0 {
+                continue;
+            }
+            for h in doll.bodies.iter().flatten() {
+                if let Some(b) = self.world.bodies.get_mut(*h) {
+                    let pull = gravity * (k * b.mass() * dt);
+                    b.apply_impulse(vector(pull), true);
+                }
+            }
+        }
+    }
+
+    /// Throws ragdoll `id` as a blast's launch does (from the 360 code,
+    /// 0x82428910): the bone whose body's centre is nearest `point` is
+    /// struck and the point moves onto it; each bone takes `velocity`
+    /// times its [`bone_factor`](crate::ragdoll_launch::bone_factor) times
+    /// its mass times [`BONE_SHARE`](crate::ragdoll_launch::BONE_SHARE), at
+    /// most [`MASS_CAP`](crate::ragdoll_launch::MASS_CAP) times its mass,
+    /// at the midpoint of the point and its centre.
+    pub fn launch_ragdoll(&mut self, id: RagdollId, velocity: Vec3, point: Vec3) {
+        use crate::ragdoll_launch::{BONE_SHARE, MASS_CAP, bone_factor};
+        let Some(doll) = self.ragdolls.get(id.0).and_then(Option::as_ref) else {
+            return;
+        };
+        let handles: Vec<r::RigidBodyHandle> = doll.bodies.iter().flatten().copied().collect();
+        let centre = |w: &r::PhysicsWorld, h: r::RigidBodyHandle| {
+            w.bodies.get(h).map(|b| vec3(b.center_of_mass()))
+        };
+        let Some((struck, at)) = handles
+            .iter()
+            .filter_map(|&h| Some((h, centre(&self.world, h)?)))
+            .min_by(|a, b| {
+                a.1.distance_squared(point)
+                    .total_cmp(&b.1.distance_squared(point))
+            })
+        else {
+            return;
+        };
+        for h in handles {
+            let Some(b) = self.world.bodies.get_mut(h) else {
+                continue;
+            };
+            let c = vec3(b.center_of_mass());
+            let f = bone_factor(h == struck, c.distance(at));
+            let mut impulse = velocity * (f * b.mass() * BONE_SHARE);
+            let cap = b.mass() * MASS_CAP;
+            if impulse.length() > cap {
+                impulse = impulse * (cap / impulse.length());
+            }
+            b.apply_impulse_at_point(vector(impulse), vector((at + c) * 0.5), true);
         }
     }
 
@@ -4650,6 +4805,7 @@ impl Physics {
             hinge,
             held: false,
             before: Vec3::ZERO,
+            spin_before: Vec3::ZERO,
             hull,
             rotor,
         }));
@@ -4974,9 +5130,9 @@ impl Physics {
             // up while it is near level.
             if gripping && v.tank.is_none() {
                 let up = body.position().rotation * r::Vector::Y;
-                let down = r::Vector::new(0.0, -GRAVITY, 0.0);
+                let down = r::Vector::new(0.0, -WORLD_GRAVITY, 0.0);
                 let along = down - up * down.dot(up);
-                let steep = along.length() / GRAVITY;
+                let steep = along.length() / WORLD_GRAVITY;
                 let held = (CLIMB_TRACKED.sin() / steep.max(1e-3)).min(1.0);
                 body.apply_impulse(-along * held * mass * dt, true);
             }
@@ -5474,6 +5630,74 @@ impl Physics {
         out
     }
 
+    /// The statics a vehicle's body is in contact with (its wheels'
+    /// contacts aside): the terrain's cells, placed objects, buildings and
+    /// a state layer's models, each once, with the deepest point of
+    /// contact, the contact normal from the vehicle toward it (world
+    /// space) and its mass (0 for a fixed one, as the 360's collision
+    /// event's size takes it: [`crate::durability::crash_size`]).
+    pub fn vehicle_static_hits(&self, id: VehicleId) -> Vec<(StaticKey, Vec3, Vec3, f32)> {
+        let Some(body) = self
+            .vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .and_then(|v| self.world.bodies.get(v.controller.chassis))
+        else {
+            return Vec::new();
+        };
+        let mut out: Vec<(StaticKey, Vec3, Vec3, f32)> = Vec::new();
+        for &c in body.colliders() {
+            let Some(mine) = self.world.colliders.get(c) else {
+                continue;
+            };
+            for pair in self.world.narrow_phase.contact_pairs_with(c) {
+                if !pair.has_any_active_contact() {
+                    continue;
+                }
+                let first = pair.collider1 == c;
+                let other = if first {
+                    pair.collider2
+                } else {
+                    pair.collider1
+                };
+                let Some(&key) = self.keys.get(&other) else {
+                    continue;
+                };
+                if out.iter().any(|(k, ..)| *k == key) {
+                    continue;
+                }
+                let Some((manifold, deepest)) = pair
+                    .manifolds()
+                    .iter()
+                    .flat_map(|m| m.points.iter().map(move |p| (m, p)))
+                    .min_by(|a, b| a.1.dist.total_cmp(&b.1.dist))
+                else {
+                    continue;
+                };
+                let (local, normal) = if first {
+                    (deepest.local_p1, vec3(manifold.data.normal))
+                } else {
+                    (deepest.local_p2, -vec3(manifold.data.normal))
+                };
+                let mass = self
+                    .world
+                    .colliders
+                    .get(other)
+                    .and_then(|o| o.parent())
+                    .and_then(|b| self.world.bodies.get(b))
+                    .filter(|b| b.is_dynamic())
+                    .map_or(0.0, |b| b.mass());
+                out.push((
+                    key,
+                    vec3(mine.position().transform_point(local)),
+                    normal.normalize_or_zero(),
+                    mass,
+                ));
+            }
+        }
+        out
+    }
+
     /// The other vehicles a vehicle's body is in contact with, body to
     /// body, each once, with the deepest point of contact and the contact
     /// normal from this one toward the other (world space).
@@ -5860,6 +6084,25 @@ impl Physics {
             .map_or(Vec3::ZERO, |v| v.before)
     }
 
+    /// A vehicle's spin before the last step, radians a second about each
+    /// axis.
+    pub fn vehicle_spin_before(&self, id: VehicleId) -> Vec3 {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map_or(Vec3::ZERO, |v| v.spin_before)
+    }
+
+    /// Sets a vehicle's spin, radians a second about each axis.
+    pub fn set_vehicle_spin(&mut self, id: VehicleId, spin: Vec3) {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
+            body.set_angvel(vector(spin), true);
+        }
+    }
+
     /// Sets a vehicle's velocity, m/s (as it was before something it hit
     /// gave way).
     pub fn set_vehicle_velocity(&mut self, id: VehicleId, velocity: Vec3) {
@@ -5941,6 +6184,227 @@ impl Physics {
             sum += body.mass();
         }
         Some(sum)
+    }
+
+    /// Gives every person's ragdoll the game's bodies and joints
+    /// ([`m2_assets::ragdoll`]): [`add_ragdoll_named`](Self::add_ragdoll_named)
+    /// builds from them.
+    pub fn set_human_ragdoll(&mut self, doll: std::sync::Arc<m2_assets::ragdoll::HumanRagdoll>) {
+        self.human_ragdoll = Some(doll);
+    }
+
+    /// Lets a person go limp: as [`add_ragdoll`](Self::add_ragdoll), but
+    /// with the game's own ragdoll ([`add_asset_ragdoll`](Self::add_asset_ragdoll))
+    /// where it is loaded and the skeleton has every one of its bones by
+    /// name (`hashes`, the nodes' name hashes); else built from the
+    /// skeleton.
+    pub fn add_ragdoll_named(
+        &mut self,
+        hashes: &[u32],
+        parents: &[Option<usize>],
+        nodes: &[Mat4],
+        velocity: Vec3,
+    ) -> RagdollId {
+        if let Some(doll) = self.human_ragdoll.clone()
+            && let Some(id) = self.add_asset_ragdoll(&doll, hashes, parents, nodes, velocity)
+        {
+            return id;
+        }
+        self.add_ragdoll(parents, nodes, velocity)
+    }
+
+    /// Lets a person go limp on the game's ragdoll `doll`: a body on each
+    /// of its bones' nodes (found by name hash in `hashes`), posed as
+    /// `nodes` (world space) has them, with the bone's mass, capsule,
+    /// friction and angular damping; joined as its joints say, a limited
+    /// hinge or a ragdoll joint with its limits; every body moving at
+    /// `velocity`. `None` if the skeleton lacks one of its bones.
+    ///
+    /// From the 360 code and samples ([`m2_assets::ragdoll`]): the bodies
+    /// and joints are the asset's. The joints' pivots and axes are in the
+    /// space of the bone that holds them (the pivots sit at its node's
+    /// origin; the thighs' and the spine's first axes run along their
+    /// bones), and the other bone's side is placed by the two bones' bind
+    /// (inferred: Havok sets a joint in both bodies' spaces when it is
+    /// built). Inferred too: the limits put on the joint's axes as twist
+    /// about the first axis, plane about the second and cone about the
+    /// third (Havok's ragdoll joint limits a cone and a plane rather than
+    /// angles about axes); no linear damping (the record's +0x38 is not
+    /// read by the 360's body builder).
+    pub fn add_asset_ragdoll(
+        &mut self,
+        doll: &m2_assets::ragdoll::HumanRagdoll,
+        hashes: &[u32],
+        parents: &[Option<usize>],
+        nodes: &[Mat4],
+        velocity: Vec3,
+    ) -> Option<RagdollId> {
+        use m2_assets::ragdoll::{BoneShape, JointLimits};
+        let n = nodes.len().min(parents.len()).min(hashes.len());
+        let node_of: Vec<usize> = doll
+            .bones
+            .iter()
+            .map(|b| hashes[..n].iter().position(|&h| h == b.node_hash))
+            .collect::<Option<_>>()?;
+        let at: Vec<(Vec3, Quat)> = nodes[..n]
+            .iter()
+            .map(|m| {
+                let (_, q, t) = m.to_scale_rotation_translation();
+                (t, q.normalize())
+            })
+            .collect();
+        let groups = r::InteractionGroups::new(
+            RAGDOLL,
+            r::Group::ALL.difference(RAGDOLL),
+            r::InteractionTestMode::And,
+        );
+        let mut bodies: Vec<Option<r::RigidBodyHandle>> = vec![None; n];
+        let mut handles = Vec::with_capacity(doll.bones.len());
+        for (bone, &node) in doll.bones.iter().zip(&node_of) {
+            let (p, q) = at[node];
+            let body = self.world.insert_body(
+                r::RigidBodyBuilder::dynamic()
+                    .pose(pose(p, q))
+                    .linvel(vector(velocity))
+                    .angular_damping(bone.angular_damping.max(RAGDOLL_ANGULAR_DAMPING))
+                    .ccd_enabled(true),
+            );
+            let (place, turn) = bone.shape_place;
+            let place = Vec3::from(place);
+            let turn = Quat::from_array(turn).normalize();
+            let shape = match bone.shape {
+                Some(BoneShape::Capsule { radius, a, b }) => {
+                    r::ColliderBuilder::capsule_from_endpoints(
+                        vector(place + turn * Vec3::from(a)),
+                        vector(place + turn * Vec3::from(b)),
+                        radius,
+                    )
+                }
+                Some(BoneShape::Box { half_extents: h }) => {
+                    r::ColliderBuilder::cuboid(h[0], h[1], h[2]).position(pose(place, turn))
+                }
+                None => r::ColliderBuilder::ball(0.05).translation(vector(place)),
+            };
+            insert_collider(
+                &mut self.world,
+                shape
+                    .mass(bone.mass)
+                    .friction(bone.friction)
+                    .collision_groups(groups),
+                Some(body),
+            );
+            bodies[node] = Some(body);
+            handles.push(body);
+        }
+        let bind = |b: usize| Mat4::from_cols_array(&doll.bones[b].bind);
+        let mut joints = Vec::new();
+        let mut joint_handles = Vec::new();
+        for j in &doll.joints {
+            // The holding bone (the joint's owner) and the one it holds to.
+            let (owner, other) = (j.bone, j.other);
+            let pivot = Vec3::from(j.pivot);
+            let (first, second) = match j.limits {
+                JointLimits::Hinge { axis, .. } => (Vec3::from(axis), Vec3::ZERO),
+                JointLimits::Ragdoll { axes, .. } => (Vec3::from(axes[0]), Vec3::from(axes[1])),
+            };
+            let x = first.normalize_or(Vec3::X);
+            let y = (second - x * second.dot(x)).normalize_or(x.any_orthonormal_vector());
+            let frame = Quat::from_mat3(&m2_math::glam::Mat3::from_cols(x, y, x.cross(y)));
+            // The owner's frame in the other bone's space, as bound.
+            let rel = bind(other).inverse() * bind(owner);
+            let (_, rel_q, _) = rel.to_scale_rotation_translation();
+            let anchor = rel.transform_point3(pivot);
+            let rad = |v: f32| v.to_radians();
+            let joint = match j.limits {
+                JointLimits::Hinge {
+                    min, max, limited, ..
+                } => {
+                    let b = r::GenericJointBuilder::new(r::JointAxesMask::LOCKED_REVOLUTE_AXES);
+                    if limited {
+                        b.limits(r::JointAxis::AngX, [rad(min), rad(max)])
+                    } else {
+                        b
+                    }
+                }
+                JointLimits::Ragdoll {
+                    twist, cone, plane, ..
+                } => r::GenericJointBuilder::new(r::JointAxesMask::LOCKED_SPHERICAL_AXES)
+                    .limits(r::JointAxis::AngX, [rad(twist.0), rad(twist.1)])
+                    .limits(r::JointAxis::AngY, [rad(plane.0), rad(plane.1)])
+                    .limits(r::JointAxis::AngZ, [rad(cone.0), rad(cone.1)]),
+            }
+            .local_frame1(pose(anchor, (rel_q * frame).normalize()))
+            .local_frame2(pose(pivot, frame))
+            .contacts_enabled(false);
+            joint_handles.push(self.world.insert_impulse_joint(
+                handles[other],
+                handles[owner],
+                joint,
+            ));
+            joints.push((node_of[owner], node_of[other], anchor));
+        }
+        let locals = (0..n)
+            .map(|i| match parents[i].filter(|&p| p < n) {
+                Some(p) => nodes[p].inverse() * nodes[i],
+                None => nodes[i],
+            })
+            .collect();
+        // Nodes with no body above any body (the root) go with the
+        // hips' body, as they stood.
+        let hips = node_of[doll
+            .bones
+            .iter()
+            .position(|b| b.parent.is_none())
+            .unwrap_or(0)];
+        let limb = Mat4::from_rotation_translation(at[hips].1, at[hips].0);
+        let roots = (0..n)
+            .filter(|&i| parents[i].is_none_or(|p| p >= n) && bodies[i].is_none())
+            .map(|i| (i, hips, limb.inverse() * nodes[i]))
+            .collect();
+        self.ragdolls.push(Some(Ragdoll {
+            parents: parents[..n].to_vec(),
+            locals,
+            bodies,
+            roots,
+            joints,
+            joint_handles,
+            age: 0.0,
+        }));
+        Some(RagdollId(self.ragdolls.len() - 1))
+    }
+
+    /// The limits of ragdoll `id`'s joints, radians, about each joint's
+    /// first, second and third axis (`None` where free), in the order of
+    /// the game's joints; empty for a ragdoll built from the skeleton.
+    pub fn ragdoll_joint_limits(&self, id: RagdollId) -> Option<Vec<[Option<[f32; 2]>; 3]>> {
+        let doll = self.ragdolls.get(id.0)?.as_ref()?;
+        Some(
+            doll.joint_handles
+                .iter()
+                .filter_map(|&h| {
+                    let j = &self.world.impulse_joints.get(h)?.data;
+                    let l = |a| j.limits(a).map(|l| [l.min, l.max]);
+                    Some([
+                        l(r::JointAxis::AngX),
+                        l(r::JointAxis::AngY),
+                        l(r::JointAxis::AngZ),
+                    ])
+                })
+                .collect(),
+        )
+    }
+
+    /// The masses of ragdoll `id`'s bodies, kg, by the nodes they sit on;
+    /// `None` once removed.
+    pub fn ragdoll_masses(&self, id: RagdollId) -> Option<Vec<(usize, f32)>> {
+        let doll = self.ragdolls.get(id.0)?.as_ref()?;
+        Some(
+            doll.bodies
+                .iter()
+                .enumerate()
+                .filter_map(|(i, h)| Some((i, self.world.bodies.get((*h)?)?.mass())))
+                .collect(),
+        )
     }
 
     /// Lets a skeleton go limp: `parents` and `nodes` (world space, as
@@ -6076,6 +6540,8 @@ impl Physics {
             bodies,
             roots,
             joints,
+            joint_handles: Vec::new(),
+            age: 0.0,
         }));
         RagdollId(self.ragdolls.len() - 1)
     }
@@ -6241,13 +6707,14 @@ impl Physics {
         radius: f32,
         skip: Option<VehicleId>,
     ) -> Option<f32> {
-        let mut filter = solid();
-        if let Some(v) = skip
-            .and_then(|v| self.vehicles.get(v.0))
-            .and_then(Option::as_ref)
-        {
-            filter = filter.exclude_rigid_body(v.controller.chassis);
-        }
+        // All of the vehicle: its turret's and gun's bodies too (a light
+        // tank's camera turns about a point inside its turret: the
+        // M551's is 0.4 m over the ring, playtest 2026-11-14's camera
+        // inside the cheat's tank).
+        let own = self.bodies_of(skip);
+        let keep =
+            |_: r::ColliderHandle, c: &r::Collider| c.parent().is_none_or(|p| !own.contains(&p));
+        let filter = solid().predicate(&keep);
         let ball = r::Ball::new(radius.max(1e-3));
         let options = rapier3d::parry::query::ShapeCastOptions {
             max_time_of_impact: max,
@@ -6803,6 +7270,14 @@ impl Physics {
     /// Moves `character` for `dt` seconds: horizontally at `walk` (m/s; its
     /// y is ignored), jumping at `jump` m/s if given while grounded, falling
     /// under gravity otherwise.
+    ///
+    /// Its velocity afterwards is the walk the walls it met leave it
+    /// ([`solved_walk`]), as a character proxy's is, and not the distance
+    /// the controller moved it: pushed against a wall the controller
+    /// nudges it in and out by up to 0.1 m/s a tick, which the 360's
+    /// locomotion node, standing at 0.01 m/s of its proxy's velocity
+    /// ([`crate::blend::STILL`]), would read as setting off. Over a step
+    /// it climbed, or meeting nothing upright, it is the distance moved.
     pub fn move_character(
         &self,
         character: &mut Character,
@@ -6817,27 +7292,94 @@ impl Physics {
         vertical -= character.gravity * dt;
         let desired = Vec3::new(walk.x, 0.0, walk.z) * dt + Vec3::Y * (vertical * dt);
         let shape = r::Capsule::new_y(character.half_height(), character.radius);
+        let mut hits: Vec<(r::ColliderHandle, Vec3, Vec3)> = Vec::new();
         let movement = self.controller.move_shape(
             dt,
             &self.world.query_pipeline_with_filter(solid()),
             &shape,
             &pose(character.centre(), Quat::IDENTITY),
             vector(desired),
-            |_| {},
+            |hit| {
+                let n = vec3(hit.hit.normal1);
+                if n.y.abs() < WALL_NORMAL_Y {
+                    hits.push((hit.handle, vec3(hit.hit.witness1), n));
+                }
+            },
         );
+        // Each upright face met, by its own normal (the contact's tilts
+        // where the capsule meets a triangle's edge, and a step's edge is no
+        // wall), turned to face the walk and laid flat.
+        let mut walls: Vec<Vec3> = hits
+            .iter()
+            .filter_map(|&(handle, at, n)| {
+                let only = |h: r::ColliderHandle, _: &r::Collider| h == handle;
+                let ray = r::Ray::new(vector(at + n * 0.05), vector(-n));
+                let (_, hit) = self
+                    .world
+                    .query_pipeline_with_filter(solid().predicate(&only))
+                    .cast_ray_and_get_normal(&ray, 0.1, true)?;
+                let face = vec3(hit.normal);
+                if face.y.abs() >= WALL_NORMAL_Y {
+                    return None;
+                }
+                let flat = Vec3::new(face.x, 0.0, face.z).normalize_or_zero();
+                Some(if flat.dot(walk) > 0.0 { -flat } else { flat })
+            })
+            .collect();
         let moved = vec3(movement.translation);
         character.position += moved;
         character.grounded = movement.grounded;
+        let flat = Vec3::new(walk.x, 0.0, walk.z);
+        // A move that met no wall yet fell short of the walk is still at
+        // the last one (the controller holds off it by its offset).
+        let short = Vec3::new(moved.x, 0.0, moved.z).length() < flat.length() * dt * SHORT;
+        match (walls.last(), character.wall) {
+            (Some(&n), _) => character.wall = Some(n),
+            (None, Some(n)) if short && flat.dot(n) < 0.0 => walls.push(n),
+            _ => character.wall = None,
+        }
+        let climbed = movement.grounded && moved.y > CLIMBED;
+        let along = if climbed || walls.is_empty() {
+            Vec3::new(moved.x / dt, 0.0, moved.z / dt)
+        } else {
+            solved_walk(flat, &walls)
+        };
         character.velocity = Vec3::new(
-            moved.x / dt,
+            along.x,
             if movement.grounded { 0.0 } else { vertical },
-            moved.z / dt,
+            along.z,
         );
         // Landing on something while rising (a ceiling) stops the climb.
         if !movement.grounded && vertical > 0.0 && moved.y < desired.y * 0.5 {
             character.velocity.y = 0.0;
         }
     }
+}
+
+/// Normals flatter than this (their up part, of 1) are walls a walk
+/// pushes against rather than ground under it.
+const WALL_NORMAL_Y: f32 = 0.7;
+/// Risen at least this far in a grounded move, metres: a step climbed.
+const CLIMBED: f32 = 1e-3;
+/// A move this share of the walk or less fell short of it.
+const SHORT: f32 = 0.9;
+
+/// What is left of the flat walk `walk` once each wall it pushes into
+/// (`walls`, their flat normals) takes away the part into it: a character
+/// proxy's solved velocity (Havok's proxy, whose velocity the 360's
+/// locomotion reads through 0x8268E030; that it holds the solved walk is
+/// inferred, the library's own behaviour, not read in the program).
+pub fn solved_walk(walk: Vec3, walls: &[Vec3]) -> Vec3 {
+    let mut v = walk;
+    for _ in 0..2 {
+        for &n in walls {
+            let into = v.dot(n);
+            if into < 0.0 {
+                v -= n * into;
+            }
+        }
+    }
+    v
 }
 
 #[cfg(test)]
@@ -7207,6 +7749,24 @@ mod tests {
         let alone = p.add_vehicle(&car(), Vec3::new(10.0, 0.5, 0.0), 0.0);
         assert!((p.vehicle_mass(alone).unwrap() - car().mass).abs() < 1.0);
         assert_eq!(p.vehicle_mass(VehicleId(99)), None);
+    }
+
+    /// Her camera's ball passes through all of the tank she drives: its
+    /// hull and its turret on a body of its own (playtest 2026-11-14: the
+    /// camera of the M551, which turns about a point inside its turret,
+    /// sat inside the tank). Another vehicle still stops it.
+    #[test]
+    fn the_camera_passes_through_her_own_tank_s_turret() {
+        let mut p = Physics::new();
+        let id = p.add_vehicle(&gun_tank(), Vec3::new(0.0, 0.5, 0.0), 0.0);
+        p.step(1.0 / 60.0);
+        let at = p.vehicle_transform(id).unwrap();
+        // From behind it at the turret's height, toward it.
+        let from = at.transform_point3(Vec3::new(0.0, 2.0, -6.0));
+        let ahead = at.transform_vector3(Vec3::Z);
+        assert_eq!(p.cast_sphere(from, ahead, 12.0, 0.2, Some(id)), None);
+        let d = p.cast_sphere(from, ahead, 12.0, 0.2, None).unwrap();
+        assert!(d > 4.0 && d < 5.2, "{d}");
     }
 
     /// A shot from a tank's own gun passes through all of it: its hull,
@@ -7778,6 +8338,153 @@ mod tests {
         }
     }
 
+    /// A hip, a thigh on a ragdoll joint and a shin on a knee, as the
+    /// game's ragdoll asset gives them, bound standing along -y.
+    fn leg_doll() -> m2_assets::ragdoll::HumanRagdoll {
+        use m2_assets::ragdoll::{BoneShape, HumanRagdoll, JointLimits, RagdollBone, RagdollJoint};
+        let bone = |hash: u32, parent: Option<usize>, mass: f32, y: f32| RagdollBone {
+            node: hash - 0x100,
+            node_hash: hash,
+            parent,
+            mass,
+            centre_of_mass: [0.0, -0.2, 0.0],
+            friction: 0.3,
+            angular_damping: 0.3,
+            shape: Some(BoneShape::Capsule {
+                radius: 0.1,
+                a: [0.0, -0.05, 0.0],
+                b: [0.0, -0.35, 0.0],
+            }),
+            shape_place: ([0.0; 3], [0.0, 0.0, 0.0, 1.0]),
+            bind: Mat4::from_translation(Vec3::new(0.0, y, 0.0)).to_cols_array(),
+        };
+        HumanRagdoll {
+            bones: vec![
+                bone(0x101, None, 19.2, 1.0),
+                bone(0x102, Some(0), 8.9, 0.9),
+                bone(0x103, Some(1), 17.4, 0.5),
+            ],
+            joints: vec![
+                RagdollJoint {
+                    bone: 1,
+                    other: 0,
+                    pivot: [0.0; 3],
+                    friction: 0.0,
+                    limits: JointLimits::Ragdoll {
+                        axes: [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0]],
+                        twist: (-15.0, 15.0),
+                        cone: (-60.0, 60.0),
+                        plane: (-30.0, 15.0),
+                    },
+                },
+                RagdollJoint {
+                    bone: 2,
+                    other: 1,
+                    pivot: [0.0; 3],
+                    friction: 0.0,
+                    limits: JointLimits::Hinge {
+                        axis: [1.0, 0.0, 0.0],
+                        min: -110.0,
+                        max: 0.0,
+                        limited: true,
+                    },
+                },
+            ],
+        }
+    }
+
+    /// The game's ragdoll is built with the asset's masses and limits on
+    /// the skeleton's nodes of the same names, and falls in one piece; a
+    /// skeleton without its bones, or a world without the asset, goes
+    /// limp on its own bones instead.
+    #[test]
+    fn the_games_ragdoll_keeps_its_masses_and_limits() {
+        let doll = leg_doll();
+        let mut p = ready();
+        // A root, then the leg's three nodes, 2 m up.
+        let hashes = [0x100, 0x101, 0x102, 0x103];
+        let parents = [None, Some(0), Some(1), Some(2)];
+        let nodes: Vec<Mat4> = [2.2, 2.0, 1.9, 1.5]
+            .iter()
+            .map(|&y| Mat4::from_translation(Vec3::new(0.0, y, 0.0)))
+            .collect();
+        // Without the asset: the skeleton's own build, no limits.
+        let own = p.add_ragdoll_named(&hashes, &parents, &nodes, Vec3::ZERO);
+        assert_eq!(p.ragdoll_joint_limits(own), Some(Vec::new()));
+        p.remove_ragdoll(own);
+        p.set_human_ragdoll(std::sync::Arc::new(doll.clone()));
+        // Pushed over: balanced on end, a stiff leg would stand.
+        let id = p.add_ragdoll_named(&hashes, &parents, &nodes, Vec3::new(1.5, 0.0, 0.0));
+        let masses = p.ragdoll_masses(id).unwrap();
+        assert_eq!(masses.iter().map(|m| m.0).collect::<Vec<_>>(), [1, 2, 3]);
+        let total: f32 = masses.iter().map(|m| m.1).sum();
+        assert!((total - doll.mass()).abs() < 1e-3, "{total}");
+        assert!((masses[2].1 - 17.4).abs() < 1e-3);
+        let r = |v: f32| v.to_radians();
+        let limits = p.ragdoll_joint_limits(id).unwrap();
+        let near = |a: Option<[f32; 2]>, b: [f32; 2]| {
+            a.is_some_and(|a| (a[0] - b[0]).abs() < 1e-5 && (a[1] - b[1]).abs() < 1e-5)
+        };
+        assert!(near(limits[0][0], [r(-15.0), r(15.0)]), "{limits:?}");
+        assert!(near(limits[0][1], [r(-30.0), r(15.0)]), "{limits:?}");
+        assert!(near(limits[0][2], [r(-60.0), r(60.0)]), "{limits:?}");
+        assert!(near(limits[1][0], [r(-110.0), 0.0]), "{limits:?}");
+        assert_eq!((limits[1][1], limits[1][2]), (None, None));
+        for _ in 0..240 {
+            p.step(DT);
+        }
+        let now = p.ragdoll_nodes(id).unwrap();
+        for m in &now[1..] {
+            assert!(m.w_axis.y > -0.1 && m.w_axis.y < 0.6, "{}", m.w_axis);
+        }
+        assert!(now[1].w_axis.distance(now[2].w_axis) < 0.3);
+        assert!(now[2].w_axis.distance(now[3].w_axis) < 0.6);
+        // A skeleton without the shin's node: its own build.
+        let short = p.add_ragdoll_named(&hashes[..3], &parents[..3], &nodes[..3], Vec3::ZERO);
+        assert_eq!(p.ragdoll_joint_limits(short), Some(Vec::new()));
+    }
+
+    /// From the 360 code (0x82428910): the bone nearest the point takes
+    /// three tenths of the launch, the rest a tenth by how near they are.
+    #[test]
+    fn a_launch_throws_the_struck_bone_hardest() {
+        let mut p = ready();
+        p.set_human_ragdoll(std::sync::Arc::new(leg_doll()));
+        let hashes = [0x100, 0x101, 0x102, 0x103];
+        let parents = [None, Some(0), Some(1), Some(2)];
+        let nodes: Vec<Mat4> = [2.2, 2.0, 1.9, 1.5]
+            .iter()
+            .map(|&y| Mat4::from_translation(Vec3::new(0.0, y, 0.0)))
+            .collect();
+        let id = p.add_ragdoll_named(&hashes, &parents, &nodes, Vec3::ZERO);
+        let v = Vec3::new(10.0, 10.0, 0.0);
+        // At the shin's middle: the shin is struck.
+        p.launch_ragdoll(id, v, Vec3::new(0.0, 1.3, 0.0));
+        let fastest = p.ragdoll_speed(id).unwrap();
+        assert!((fastest - 0.3 * v.length()).abs() < 1e-3, "{fastest}");
+    }
+
+    /// From the 360 code (0x8216A290): the game's ragdoll's bodies never
+    /// go faster than 132 m/s.
+    #[test]
+    fn the_games_ragdoll_keeps_to_havoks_speed_limit() {
+        let mut p = ready();
+        p.set_human_ragdoll(std::sync::Arc::new(leg_doll()));
+        let nodes: Vec<Mat4> = [2.2, 2.0, 1.9, 1.5]
+            .iter()
+            .map(|&y| Mat4::from_translation(Vec3::new(0.0, y, 0.0)))
+            .collect();
+        let id = p.add_ragdoll_named(
+            &[0x100, 0x101, 0x102, 0x103],
+            &[None, Some(0), Some(1), Some(2)],
+            &nodes,
+            Vec3::new(400.0, 0.0, 0.0),
+        );
+        p.step(DT);
+        let fastest = p.ragdoll_speed(id).unwrap();
+        assert!(fastest <= RAGDOLL_MAX_SPEED + 1e-3, "{fastest}");
+    }
+
     #[test]
     fn ragdolls_fall_to_the_ground_and_rays_pass_them() {
         let mut p = ready();
@@ -7884,6 +8591,65 @@ mod tests {
         assert!(c.position.y.abs() < 0.1, "{}", c.position.y);
     }
 
+    /// Pushed against a wall a character's velocity is the walk the wall
+    /// leaves it, every tick: none pushed square on (the 360's locomotion
+    /// stands it, at 0.01 m/s), the part along the wall pushed at a slant;
+    /// standing still, none. The controller alone moved it in and out by
+    /// up to 0.1 m/s a tick, flipping it between standing and walking 120
+    /// times in 6 s.
+    #[test]
+    fn a_character_pushing_into_a_wall_has_the_walk_it_leaves() {
+        let mut p = ready();
+        let wall = CollisionShape::mesh(
+            &[
+                Vec3::new(0.0, 0.0, -5.0),
+                Vec3::new(0.0, 0.0, 5.0),
+                Vec3::new(0.0, 1.5, 5.0),
+                Vec3::new(0.0, 1.5, -5.0),
+            ],
+            &[[0, 1, 2], [0, 2, 3]],
+        )
+        .unwrap();
+        p.add_static(
+            StaticKey::Object(0),
+            &wall,
+            Vec3::new(5.0, 0.0, -10.0),
+            Quat::IDENTITY,
+        );
+        p.step(DT);
+        for (start, walking, along) in [
+            (Vec3::ZERO, Vec3::ZERO, 0.0),
+            (Vec3::new(0.0, 0.0, -10.0), Vec3::new(4.0, 0.0, 0.0), 0.0),
+            (Vec3::new(0.0, 0.0, -10.0), Vec3::new(4.0, 0.0, 0.3), 0.3),
+        ] {
+            let mut c = Character::new(start);
+            walk(&p, &mut c, walking, 3.0);
+            for _ in 0..360 {
+                p.move_character(&mut c, walking, None, DT);
+                let speed = m2_math::glam::Vec2::new(c.velocity.x, c.velocity.z).length();
+                assert!((speed - along).abs() < 1e-3, "{walking}: {speed} m/s");
+            }
+        }
+    }
+
+    #[test]
+    fn a_wall_takes_the_part_of_a_walk_into_it() {
+        let wall = Vec3::NEG_X;
+        assert_eq!(solved_walk(Vec3::new(4.0, 0.0, 0.0), &[wall]), Vec3::ZERO);
+        assert_eq!(
+            solved_walk(Vec3::new(4.0, 0.0, 1.0), &[wall]),
+            Vec3::new(0.0, 0.0, 1.0)
+        );
+        // Walking away from it, nothing.
+        assert_eq!(
+            solved_walk(Vec3::new(-4.0, 0.0, 1.0), &[wall]),
+            Vec3::new(-4.0, 0.0, 1.0)
+        );
+        // Into a corner, nowhere.
+        let corner = solved_walk(Vec3::new(4.0, 0.0, 4.0), &[wall, Vec3::NEG_Z]);
+        assert!(corner.length() < 1e-6, "{corner}");
+    }
+
     #[test]
     fn climbs_a_step_but_not_a_wall() {
         let mut p = ready();
@@ -7908,7 +8674,15 @@ mod tests {
         p.step(DT);
 
         let mut c = Character::new(Vec3::new(0.0, 0.0, 0.0));
-        walk(&p, &mut c, Vec3::new(0.0, 0.0, 4.0), 3.0);
+        // Over the step it is moving all but the ten ticks the controller
+        // holds it at the step's lip before stepping up (it moves it no
+        // distance then: measured, the same as by the distance moved).
+        let mut stopped = 0;
+        for _ in 0..(3.0 / DT) as usize {
+            p.move_character(&mut c, Vec3::new(0.0, 0.0, 4.0), None, DT);
+            stopped += usize::from(c.velocity.z < 1.0);
+        }
+        assert!(stopped <= 10, "stood {stopped} ticks");
         assert!(c.position.z > 8.0, "stopped at {}", c.position);
         assert!(
             (c.position.y - 0.4).abs() < 0.1,
@@ -8935,10 +9709,10 @@ mod tests {
             p.step(DT);
         }
         // Afloat, level, its origin as deep as its springs hold it: their
-        // bottoms at its origin, 9.81 / (4 x 5) m under the water.
+        // bottoms at its origin, 9.0 / (4 x 5) m under the water.
         let m = place(&p);
         let y = m.w_axis.y;
-        assert!((float_depth(&spec) - 0.49).abs() < 0.01);
+        assert!((float_depth(&spec) - 0.45).abs() < 0.01);
         assert!(
             (y - (water - float_depth(&spec))).abs() < 0.05,
             "floats at {y}"
@@ -9767,7 +10541,8 @@ mod tests {
         // villa.
         let (slid, touching, (dropped, _)) = parked_tank(Some(0.38), 0.0, Some(0.0));
         assert!(dropped < 0.05, "dropped {dropped} m");
-        assert!(slid < 0.1, "slid {slid} m");
+        // Under 0.1 m with 9.81 m/s^2; 0.106 m with the world's 9.0.
+        assert!(slid < 0.12, "slid {slid} m");
         assert_eq!(touching, 6);
     }
 
@@ -9900,6 +10675,43 @@ mod tests {
         let back = p.vehicle_bumps(b);
         assert_eq!(back.first().map(|m| m.0), Some(a));
         assert!(back[0].2.z < -0.9, "and back the other way");
+    }
+
+    #[test]
+    fn a_car_driven_into_a_wall_hits_it_and_the_ground_is_known() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
+        let wall = StaticKey::Object(7);
+        p.add_static(
+            wall,
+            &CollisionShape::cuboid(Vec3::new(5.0, 2.0, 0.5)),
+            Vec3::new(0.0, 2.0, 10.0),
+            Quat::IDENTITY,
+        );
+        p.step(DT);
+        let a = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        for _ in 0..60 {
+            p.step(DT);
+        }
+        assert!(
+            p.vehicle_static_hits(a).iter().all(|h| h.0 != wall),
+            "apart, it doesn't touch the wall"
+        );
+        let up = p.vehicle_velocity(a).y;
+        p.set_vehicle_velocity(a, Vec3::new(0.0, up, 10.0));
+        let mut met = None;
+        for _ in 0..120 {
+            p.step(DT);
+            if let Some(&h) = p.vehicle_static_hits(a).iter().find(|h| h.0 == wall) {
+                met = Some(h);
+                break;
+            }
+        }
+        let (_, at, normal, mass) = met.expect("it never met the wall");
+        // Its front bumper on the wall's face, 9.5 m on; toward it; fixed.
+        assert!((at.z - 9.5).abs() < 0.5, "met at {at:?}");
+        assert!(normal.z > 0.9, "normal {normal:?}");
+        assert_eq!(mass, 0.0);
     }
 
     #[test]
@@ -10125,7 +10937,7 @@ mod tests {
             for _ in 0..300 {
                 p.step(DT);
             }
-            let want = f * GRAVITY / (4.0 * k);
+            let want = f * WORLD_GRAVITY / (4.0 * k);
             let sag = p.vehicle_suspension(id);
             let mean = sag.iter().sum::<f32>() / 4.0;
             // Within 5%: Rapier's springs settle 2 to 4% short of what
@@ -10259,7 +11071,7 @@ mod tests {
         };
         // An M151's 25 and 1.7: 9.8 cm down, back up after 0.34 s.
         let (sag, t) = ride(25.0, 1.7);
-        assert!((sag - 9.81 / 100.0).abs() < 0.01, "{sag}");
+        assert!((sag - WORLD_GRAVITY / 100.0).abs() < 0.01, "{sag}");
         assert!((t - half(25.0, 1.7)).abs() < 0.04, "{t}");
         // A sports car's 60 and 3: 4.1 cm, 0.22 s.
         let (sag, t) = ride(60.0, 3.0);
@@ -10405,6 +11217,7 @@ mod tests {
             version: 0x39,
             model: 0,
             unk_0x14: [0; 3],
+            constraints: Vec::new(),
             // A trunk and its leaves on node 1, a piece it breaks into on
             // node 2 (hidden intact).
             parts: vec![

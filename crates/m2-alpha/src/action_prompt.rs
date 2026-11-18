@@ -33,22 +33,70 @@
 //!   in `0x82405920`), whether any of its seats has a living rider
 //!   (`0x8229DB28`) and, if so, its standing with the players: the least
 //!   of their moods to it (`0x822F08D0`), hostile below -33.
-//! - In a vehicle, `0x8242FB68` sends `[ContextAction.ExitVehicle]` at
-//!   kind 15 and takes it back.
+//! - In a vehicle, `0x8242FB68` sends the plain `[ContextAction.ExitVehicle]`
+//!   (`0x820EBFF8`) at kind 15, or takes it back. It is a helicopter's
+//!   bail-out check ([`ExitConfirm`]): the in-vehicle update (`0x8242E7A0`)
+//!   asks `0x8242FA70` before letting her out on the exit button, which,
+//!   for a helicopter (physics kind 4) with no prompt up whose two heights
+//!   (its physics' `+0x158` and `+0x160`, the lesser) are 5 m or more
+//!   (`0x820BAF84`), sends the prompt, starts a 2 s clock (`0x820C77A4`)
+//!   and keeps her in; pressed again while the clock runs, she gets out.
+//!   The update runs the clock down and takes the prompt back when it
+//!   ends; leaving the state (`0x8242E730`) takes it back too.
+//! - Among several things in reach the one she faces is offered and
+//!   taken ([`faced`], `0x82432CF0`): one alone is taken; else each is
+//!   scored by the dot of her look (the state's `+0x12C`, normalized) with
+//!   the way from the camera (the player's camera `+0x38`) to it, and by
+//!   its squared distance from her; it beats the best so far when its dot
+//!   is no more than 0.1 lower (`0x820B7FC4`) and either 0.1 or more
+//!   higher (`0x820BB468`), or higher and nearer, or (lower) nearer by
+//!   more than 3 m² (`0x820F9584`); the first starts against -1e30 and
+//!   1e30 (`0x820F9770`, `0x820F9774`).
 //!
-//! Not done here: the facing choice among several things in reach (the
-//! alpha keeps its own order: the scripts' text, then a gun, then an
-//! emplacement or a vehicle); grapple, subdue, verify, stow and the exit
-//! prompt (when `0x8242FB68` is called was not read).
+//! Inferred: the state's `+0x12C` read as the camera's look; the
+//! helicopter's two heights read as one downward ray's height above what
+//! lies under it (what the physics stores at `+0x158`/`+0x160` was not
+//! traced). The alpha offers the scripts' text first and keeps its own
+//! choice between a gun lying there and an emplaced gun (a gun lying
+//! there first); the facing choice is between that and the vehicle
+//! entrance in reach. Not done: grapple, subdue, verify and stow.
 
 use m2_engine::seats::Role;
 use m2_engine::world::VehicleKind;
+use m2_math::glam::Vec3;
+
+/// Which of `things` in reach she faces (`0x82432CF0`), looking along
+/// `look` from the camera at `eye`, standing at `her`: one alone is
+/// taken, none is none.
+pub fn faced(eye: Vec3, look: Vec3, her: Vec3, things: &[Vec3]) -> Option<usize> {
+    match things.len() {
+        0 => return None,
+        1 => return Some(0),
+        _ => {}
+    }
+    let look = look.normalize_or_zero();
+    let (mut best, mut best_dot, mut best_d2) = (None, -1.0e30_f32, 1.0e30_f32);
+    for (i, &at) in things.iter().enumerate() {
+        let dot = look.dot((at - eye).normalize_or_zero());
+        let d2 = at.distance_squared(her);
+        let gain = dot - best_dot;
+        let nearer = d2 - best_d2;
+        let better = gain > -0.1
+            && (gain >= 0.1 || (gain >= 0.0 && nearer < 0.0) || (gain < 0.0 && nearer < -3.0));
+        if better {
+            best = Some(i);
+            best_dot = dot;
+            best_d2 = d2;
+        }
+    }
+    best
+}
 
 /// What the use button does, by the 360's kind number (its priority on
 /// the HUD).
 #[allow(
     dead_code,
-    reason = "the 360's whole table; the alpha does not send grapple, subdue, verify, exit or stow"
+    reason = "the 360's whole table; the alpha does not send grapple, subdue, verify or stow"
 )]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -125,6 +173,59 @@ impl Action {
             (Some(stem), Some(key)) => format!("[ContextAction.{stem}:[0x{key:08X}]]"),
             _ => self.plain().to_owned(),
         }
+    }
+}
+
+/// The least height (m) at which a helicopter asks before she bails out
+/// (`0x820BAF84`).
+pub const EXIT_CONFIRM_HEIGHT: f32 = 5.0;
+
+/// How long the bail-out prompt waits for the second press, seconds
+/// (`0x820C77A4`).
+pub const EXIT_CONFIRM_SECONDS: f32 = 2.0;
+
+/// A helicopter's bail-out check (`0x8242FA70`, its clock run down by
+/// `0x8242E7A0`): the first exit press up high shows
+/// [`Action::Exit`] and keeps her in; a second while it shows lets her go.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ExitConfirm {
+    /// Seconds left on the prompt; 0 when none is up.
+    left: f32,
+}
+
+impl ExitConfirm {
+    /// The prompt is up.
+    pub fn shown(&self) -> bool {
+        self.left > 0.0
+    }
+
+    /// Runs the clock down by `dt`; true when the prompt was just taken
+    /// back.
+    pub fn tick(&mut self, dt: f32) -> bool {
+        if self.left > 0.0 {
+            self.left -= dt;
+            if self.left <= 0.0 {
+                self.left = 0.0;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The exit button, in a helicopter (`heli`) whose height is `height`
+    /// (`None`: unknown, nothing under it in reach): whether she gets
+    /// out. With no prompt up, up high, it shows the prompt instead.
+    pub fn press(&mut self, heli: bool, height: Option<f32>) -> bool {
+        if heli && self.left <= 0.0 && height.is_none_or(|h| h >= EXIT_CONFIRM_HEIGHT) {
+            self.left = EXIT_CONFIRM_SECONDS;
+            return false;
+        }
+        true
+    }
+
+    /// Out of the vehicle: the prompt goes (`0x8242E730`).
+    pub fn clear(&mut self) {
+        self.left = 0.0;
     }
 }
 
@@ -273,6 +374,60 @@ mod tests {
             vehicle_action(&crewed(true, Role::Passenger)),
             Action::Hijack
         );
+    }
+
+    /// A helicopter up high asks first: the first press shows the prompt
+    /// and keeps her in, a second within 2 s lets her out; low down, or
+    /// in anything else, she gets out at once.
+    #[test]
+    fn a_helicopter_up_high_asks_before_she_bails_out() {
+        let mut c = ExitConfirm::default();
+        assert!(c.press(false, Some(100.0)), "not a helicopter");
+        assert!(c.press(true, Some(4.9)), "low down");
+        assert!(!c.shown());
+        assert!(!c.press(true, Some(5.0)), "the first press up high");
+        assert!(c.shown());
+        assert!(!c.tick(1.5));
+        assert!(c.press(true, Some(50.0)), "pressed again in time");
+        c.clear();
+        // Let go: the prompt goes after 2 s and the next press asks again.
+        assert!(!c.press(true, None));
+        assert!(!c.tick(1.99));
+        assert!(c.tick(0.02), "taken back when the clock ends");
+        assert!(!c.shown());
+        assert!(!c.press(true, Some(6.0)));
+        assert_eq!(Action::Exit.text(None), "[ContextAction.ExitVehicle]");
+        assert_eq!(Action::Exit.kind(), 15);
+    }
+
+    /// The one she looks at most squarely is offered; nearly as squarely,
+    /// the nearer (by more than 3 m² when it is the less square).
+    #[test]
+    fn the_thing_she_faces_is_offered() {
+        let (eye, her) = (Vec3::new(0.0, 2.0, -4.0), Vec3::ZERO);
+        let ahead = Vec3::Z;
+        assert_eq!(faced(eye, ahead, her, &[]), None);
+        assert_eq!(faced(eye, ahead, her, &[Vec3::new(9.0, 0.0, 0.0)]), Some(0));
+        // A gun ahead, a car well off to the side: the gun, either order.
+        let gun = Vec3::new(0.0, 0.0, 2.0);
+        let car = Vec3::new(4.0, 0.0, -1.0);
+        assert_eq!(faced(eye, ahead, her, &[car, gun]), Some(1));
+        assert_eq!(faced(eye, ahead, her, &[gun, car]), Some(0));
+        // Nearly in line (within 0.1): a nearer one wins only by more
+        // than 3 m² when it is the less square.
+        let far = Vec3::new(0.0, 0.0, 6.0);
+        let near_side = Vec3::new(0.6, 0.0, 1.0);
+        let (d_far, d_near) = (
+            ahead.dot((far - eye).normalize()),
+            ahead.dot((near_side - eye).normalize()),
+        );
+        assert!(d_near < d_far && d_far - d_near < 0.1, "{d_far} {d_near}");
+        assert_eq!(faced(eye, ahead, her, &[far, near_side]), Some(1));
+        // Less square and nearer by under 3 m²: the first stays.
+        let behind_it = Vec3::new(0.2, 0.0, 6.0);
+        let a = Vec3::new(0.0, 0.0, 6.2);
+        assert!(a.distance_squared(her) - behind_it.distance_squared(her) < 3.0);
+        assert_eq!(faced(eye, ahead, her, &[a, behind_it]), Some(0));
     }
 
     /// The texts: named with the thing's key where the kind takes one,

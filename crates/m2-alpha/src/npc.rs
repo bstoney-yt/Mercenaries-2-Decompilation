@@ -601,6 +601,31 @@ const USE_GIVE_UP: f32 = 30.0;
 
 /// Where a limp body lies: the middle of its nodes over the ground
 /// plane, at their lowest. `None` for no nodes.
+/// The way someone faces as they get up from a limp body whose nodes
+/// (world space) are `nodes`, named by `hashes`: along the ground from
+/// `Bone_Hips` to `Bone_Chest`, turned round unless they lie face down.
+///
+/// From the 360 code (the ragdoll's end, 0x824279F8): she is turned along
+/// the hips-to-chest line across the ground, the other way when a value
+/// of the ragdoll's is over -0.6 (0x820F97A4). **Inferred**: that value is
+/// how far the hips' forward (+z) points up, so lying face down (forward
+/// down) keeps the line and anything else turns it round.
+pub fn getup_yaw(nodes: &[Mat4], hashes: &[u32]) -> Option<f32> {
+    use m2_assets::ragdoll::{CHEST, HIPS};
+    let at = |h: u32| {
+        hashes
+            .iter()
+            .position(|&x| x == h)
+            .and_then(|i| nodes.get(i))
+    };
+    let (hips, chest) = (at(HIPS)?, at(CHEST)?);
+    let mut line = (chest.w_axis - hips.w_axis).truncate().with_y(0.0);
+    if hips.z_axis.y > -0.6 {
+        line = -line;
+    }
+    (line.length_squared() > 1e-8).then(|| line.x.atan2(line.z))
+}
+
 fn limp_middle(nodes: &[Mat4]) -> Option<Vec3> {
     if nodes.is_empty() {
         return None;
@@ -1321,6 +1346,10 @@ pub struct Npc {
     /// A shove not yet given to their body (m/s): they went limp, or
     /// were hit again after.
     fling: Option<Vec3>,
+    /// A blast's launch waiting for the limp body
+    /// ([`m2_engine::ragdoll_launch::Launch`]): thrown bone by bone once it
+    /// goes limp within its updates, else dropped.
+    pub launch: Option<m2_engine::ragdoll_launch::Launch>,
     /// Knocked down and limp, they get up (or are subdued) this step:
     /// the limp body is given up and they are where it lay.
     rise: bool,
@@ -1537,6 +1566,7 @@ impl Npc {
             dead_for: 0.0,
             ragdoll: None,
             fling: None,
+            launch: None,
             rise: false,
             limp: (0.0, 0.0),
             last_hit: None,
@@ -3089,6 +3119,17 @@ impl Npc {
         [gun, launcher]
     }
 
+    /// Debug (`--homing-check`): he holds launcher `l` up, goes for no
+    /// other army's soldier, and asks to fire it (his shot then waits for
+    /// its lock, [`crate::combat`]'s `npc_seek`).
+    pub fn hold_launcher(&mut self, l: m2_engine::weapons::NpcLauncher) {
+        self.launcher = Some(l);
+        self.weapon = Some(1);
+        self.weapon_wait = 1.0e6;
+        self.foe_at = None;
+        self.launches = true;
+    }
+
     /// He chooses the weapon he has up against his target `distance`
     /// metres off, at random by their worths
     /// ([`m2_engine::ai_target::pick_weapon`]): again each
@@ -3259,6 +3300,7 @@ impl Npc {
                 *seed ^= *seed << 17;
                 (*seed >> 40) as f32 / (1u64 << 24) as f32
             });
+            self.rig.step_lip(dt);
         }
         if !self.landed {
             // Onto the ground (or the roof or floor of their post) under
@@ -5347,7 +5389,8 @@ impl People {
                 && npc.alive
                 && let Some(id) = npc.ragdoll.take()
             {
-                if let Some(at) = physics.ragdoll_nodes(id).and_then(|n| limp_middle(&n)) {
+                let nodes = physics.ragdoll_nodes(id);
+                if let Some(at) = nodes.as_deref().and_then(limp_middle) {
                     let from = at + Vec3::Y;
                     let y = physics
                         .cast_ray(from, -Vec3::Y, 6.0)
@@ -5355,12 +5398,37 @@ impl People {
                     npc.character.position = Vec3::new(at.x, y, at.z);
                     npc.character.velocity = Vec3::ZERO;
                 }
+                if let Some(yaw) = nodes
+                    .as_deref()
+                    .and_then(|n| getup_yaw(n, &npc.rig.skeleton.name_hashes))
+                {
+                    npc.facing = yaw;
+                }
                 physics.remove_ragdoll(id);
             }
+            // A blast's launch: thrown once limp (a body limp already
+            // next update), dropped when the blast's window passes without
+            // (from the 360 code: 0x8215C560, 0x82428910).
+            if let Some(mut l) = npc.launch.take() {
+                match npc.ragdoll.filter(|_| npc.fling.is_none()) {
+                    Some(id) => physics.launch_ragdoll(id, l.velocity, l.point),
+                    None if npc.fling.is_some() => npc.launch = Some(l),
+                    None => {
+                        if l.wait(dt) {
+                            npc.launch = Some(l);
+                        }
+                    }
+                }
+            }
             // The dead, and the knocked down, go limp from where they
-            // stood, shoved as they were hit.
+            // stood, shoved as they were hit (by a blast: launched).
             let Some(push) = npc.fling.take() else {
                 continue;
+            };
+            let push = if npc.launch.is_some() {
+                Vec3::ZERO
+            } else {
+                push
             };
             match npc.ragdoll {
                 Some(id) => physics.push_ragdoll(id, push),
@@ -5368,9 +5436,17 @@ impl People {
                     let (nodes, _) = npc.rig.posed();
                     let body = npc.model_matrix();
                     let world: Vec<Mat4> = nodes.iter().map(|m| body * *m).collect();
-                    let id = physics.add_ragdoll(&npc.rig.skeleton.parents, &world, push);
+                    let id = physics.add_ragdoll_named(
+                        &npc.rig.skeleton.name_hashes,
+                        &npc.rig.skeleton.parents,
+                        &world,
+                        push,
+                    );
                     npc.ragdoll = Some(id);
                 }
+            }
+            if let (Some(l), Some(id)) = (npc.launch.take(), npc.ragdoll) {
+                physics.launch_ragdoll(id, l.velocity, l.point);
             }
         }
         // Smarter: those near a soldier who spots her are told where she is.
@@ -6411,9 +6487,51 @@ impl People {
     }
 }
 
+/// The locking launcher `--homing-check` hands its soldier: the first a
+/// person here carries, else the lowest template's of `weapons` that
+/// locks on ground signatures (kind 1), else on air.
+pub fn locking_launcher<'a>(
+    carried: impl IntoIterator<Item = NpcLauncher>,
+    weapons: impl IntoIterator<Item = (&'a u32, &'a m2_engine::weapons::WeaponSpec)>,
+) -> Option<NpcLauncher> {
+    let locks = |l: &NpcLauncher| l.seeker.is_some_and(|s| s.locks());
+    carried.into_iter().find(locks).or_else(|| {
+        weapons
+            .into_iter()
+            .filter_map(|(id, w)| NpcLauncher::of(w).filter(locks).map(|l| (*id, l)))
+            .min_by_key(|(id, l)| (l.seeker.map_or(9, |s| s.kind), *id))
+            .map(|(_, l)| l)
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Up from lying: face down (the hips' forward pointing down) they
+    /// face along the line from hips to chest; on their back, the other
+    /// way (0x820F97A4).
+    #[test]
+    fn they_get_up_facing_along_where_the_body_lay() {
+        use m2_assets::ragdoll::{CHEST, HIPS};
+        let hashes = [HIPS, CHEST];
+        let lying = |forward_y: f32| {
+            let hips = Mat4::from_cols(
+                Vec3::X.extend(0.0),
+                Vec3::Z.extend(0.0),
+                Vec3::new(0.0, forward_y, 0.0).extend(0.0),
+                Vec3::new(0.0, 0.2, 0.0).extend(1.0),
+            );
+            let chest = Mat4::from_translation(Vec3::new(0.0, 0.2, 0.5));
+            [hips, chest]
+        };
+        // Face down: along +z, hips to chest.
+        let down = getup_yaw(&lying(-1.0), &hashes).unwrap();
+        assert!(down.abs() < 1e-5, "{down}");
+        // On the back: the other way.
+        let up = getup_yaw(&lying(1.0), &hashes).unwrap();
+        assert!((up.abs() - std::f32::consts::PI).abs() < 1e-5, "{up}");
+    }
 
     #[test]
     fn the_nearest_fighting_soldier_of_its_faction_runs_to_raise_the_alarm() {
@@ -6612,6 +6730,7 @@ pub(crate) mod tests {
             breakup: None,
             parts: None,
             state_fx: Default::default(),
+            part_states: None,
             state_messages: Default::default(),
             looks: None,
             lamp_nodes: Default::default(),
@@ -6637,9 +6756,9 @@ pub(crate) mod tests {
             kick: Default::default(),
             aim_legs: false,
             aim_walk: Default::default(),
+            lip: None,
             shuffling: false,
             aim_clock: 0.0,
-            arm: Default::default(),
             cues: Vec::new(),
             own: Default::default(),
             foreign: Default::default(),
@@ -7527,7 +7646,36 @@ pub(crate) mod tests {
             Some(1),
         );
         n.gun = Some(rifle());
-        n.launcher = Some(NpcLauncher {
+        n.launcher = Some(soldier_launcher());
+        let mut rng = Rng::default();
+        let mut picks = |n: &mut Npc, to| {
+            n.target_hint = to;
+            let mut seen = [0; 2];
+            for _ in 0..200 {
+                n.weapon = None;
+                n.choose_weapon(50.0, &mut rng, 0.1);
+                seen[n.weapon.expect("one is worth something")] += 1;
+            }
+            seen
+        };
+        let tank = m2_engine::ai_target::Hint {
+            armour: 4,
+            ..VEHICLE_HINT
+        };
+        assert_eq!(picks(&mut n, tank), [0, 200]);
+        let [gun, launcher] = picks(&mut n, m2_engine::ai_target::HUMAN);
+        assert!(gun > 0 && launcher > 0, "{gun} and {launcher}");
+        // With the rifle alone, a tank leaves him nothing to fire.
+        n.launcher = None;
+        n.target_hint = tank;
+        n.weapon = None;
+        n.choose_weapon(50.0, &mut rng, 0.1);
+        assert_eq!(n.weapon, None);
+    }
+
+    /// An RPG as a soldier carries it: unguided.
+    fn soldier_launcher() -> NpcLauncher {
+        NpcLauncher {
             template: 7,
             seeker: None,
             hint: FireHint {
@@ -7556,31 +7704,34 @@ pub(crate) mod tests {
                 sticky: false,
             },
             feel: Default::default(),
-        });
-        let mut rng = Rng::default();
-        let mut picks = |n: &mut Npc, to| {
-            n.target_hint = to;
-            let mut seen = [0; 2];
-            for _ in 0..200 {
-                n.weapon = None;
-                n.choose_weapon(50.0, &mut rng, 0.1);
-                seen[n.weapon.expect("one is worth something")] += 1;
-            }
-            seen
+        }
+    }
+
+    // `--homing-check`'s launcher: one a person carries first, if it
+    // locks; a TOW (kind 3) or an unguided one does not.
+    #[test]
+    fn the_check_takes_a_carried_locking_launcher_first() {
+        let rocket = soldier_launcher();
+        let seeker = |kind| m2_engine::weapons::Seeker {
+            kind,
+            min_signature: 0.5,
+            cone: 12.0,
+            range: 400.0,
+            lock_time: 1.0,
         };
-        let tank = m2_engine::ai_target::Hint {
-            armour: 4,
-            ..VEHICLE_HINT
+        let tow = NpcLauncher {
+            template: 1,
+            seeker: Some(seeker(3)),
+            ..rocket
         };
-        assert_eq!(picks(&mut n, tank), [0, 200]);
-        let [gun, launcher] = picks(&mut n, m2_engine::ai_target::HUMAN);
-        assert!(gun > 0 && launcher > 0, "{gun} and {launcher}");
-        // With the rifle alone, a tank leaves him nothing to fire.
-        n.launcher = None;
-        n.target_hint = tank;
-        n.weapon = None;
-        n.choose_weapon(50.0, &mut rng, 0.1);
-        assert_eq!(n.weapon, None);
+        let at = NpcLauncher {
+            template: 2,
+            seeker: Some(seeker(1)),
+            ..rocket
+        };
+        let none = std::iter::empty::<(&u32, &m2_engine::weapons::WeaponSpec)>;
+        assert_eq!(locking_launcher([rocket, tow], none()), None);
+        assert_eq!(locking_launcher([rocket, tow, at], none()), Some(at));
     }
 
     fn rifle() -> HandGun {

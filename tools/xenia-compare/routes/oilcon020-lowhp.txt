@@ -1,0 +1,36 @@
+# OilCon020 by the game's Mission skip, then get into the Phoenix (Racing) 19 m away.
+wait 25
+pokestr 83133F98 OilCon020
+poke 82B7C953 0
+tap_until start Continue_without 90
+wait 2
+press up 0.3
+wait 1
+press a 0.3
+until NOTICE 30 2
+press a 0.3
+until new_game 60 2
+press a 0.3
+until Mattias 30 2
+press a 0.3
+until Tough_Merc 30 2
+press a 0.3
+tap_until a Steal 150
+trackhero
+mark OilCon020 start
+wait 4
+lowhp 120 6 full
+lowhp 10 8 h10
+lowhp 120 6 r1
+lowhp 8 8 h08
+lowhp 120 6 r2
+lowhp 6 8 h06
+lowhp 120 6 r3
+lowhp 5 8 h05
+lowhp 120 6 r4
+lowhp 4 16 h04long                        # held 16 s: how the tint fades
+lowhp 120 6 r5
+lowhp 4 8 h04b                            # crossing again: retriggered?
+lowhp 2 8 h02                             # a further drop while already low
+lowhp 120 6 r6
+mark done

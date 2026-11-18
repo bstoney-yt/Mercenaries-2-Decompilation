@@ -37,9 +37,11 @@ pub mod car_attack;
 pub mod car_driver;
 pub mod collision_layers;
 pub mod death;
+pub mod destroy_route;
 pub mod durability;
 pub mod face_expression;
 pub mod face_graph;
+pub mod gate;
 pub mod grapple;
 pub mod gun_sounds;
 pub mod gunner_aim;
@@ -51,6 +53,8 @@ pub mod hijack;
 pub mod human_state;
 pub mod ladder;
 pub mod lights;
+pub mod lip_sync;
+pub mod material_anim;
 pub mod melee;
 pub mod model;
 pub mod motion;
@@ -60,6 +64,8 @@ pub mod on_foot;
 pub mod ordnance;
 pub mod osprey;
 pub mod osprey_mesh;
+pub mod pad_camera;
+pub mod part_runner;
 pub mod particles;
 pub mod path_move;
 pub mod path_search;
@@ -67,6 +73,7 @@ pub mod physics;
 pub mod pickup;
 pub mod population;
 pub mod projection;
+pub mod ragdoll_launch;
 pub mod reverb;
 pub mod road_driver;
 pub mod road_graph;
@@ -100,7 +107,9 @@ pub use ai::{AiFlags, AiProfile};
 pub use anim::{Animator, BoundClip, Gait, Locomotion, Pose, Skeleton};
 pub use assets::{AssetError, AssetSource, DecodedTexture, Install, ModelData};
 pub use atmosphere::Atmosphere;
-pub use audio::{Category, Mixer, Play, SoundBuffer, SoundLibrary, Streams, VoiceId, Voices};
+pub use audio::{
+    Category, MOVIE_GAIN, Mixer, Play, SoundBuffer, SoundLibrary, Streams, VoiceId, Voices,
+};
 pub use model::{
     CpuModel, GpuModel, Looks, MaterialCache, ModelParts, MorphedFace, PieceMorph, StateFx,
     StateMessage,

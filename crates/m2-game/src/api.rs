@@ -994,6 +994,9 @@ pub struct ScriptWorld {
     /// The layers' data-authored links by parent entity: (link name hash,
     /// child entity), made into [`Self::links`] as the parent is placed.
     pub physical_links: HashMap<u32, Vec<(u32, u32)>>,
+    /// The child templates spawned with a template, by its name in lower
+    /// case ([`crate::mission::GameData::template_children`]).
+    pub template_children: HashMap<String, Vec<(u32, String)>>,
     /// The sound engine's state the scripts set (`crate::script_sound`).
     pub sound: crate::script_sound::SoundSettings,
     /// The level and shell names and the post-processing values the
@@ -3976,10 +3979,13 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
-    // 100 until the scripts set it: invented, the game's figure is not
-    // decoded.
+    // Until the scripts set it, the profile's default (from the 360 code:
+    // 300, `0x8239B028`; crate::profile).
     add(&player, "GetFuelCapacity", |w, _, _| {
-        values([Value::Number(f64::from(w.fuel_capacity.unwrap_or(100.0)))])
+        let default = crate::profile::ProfileOptions::default().fuel_capacity();
+        values([Value::Number(f64::from(
+            w.fuel_capacity.unwrap_or(default as f32),
+        ))])
     })?;
     add(&player, "SetFuelCapacity", |w, _, a| {
         if let Some(c) = num(a.first()) {

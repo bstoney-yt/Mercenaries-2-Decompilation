@@ -10,6 +10,9 @@ publish.workspace = true
 [features]
 ## The GPU backend (Direct3D 12, Vulkan or Metal through wgpu).
 wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+## wgpu's no-GPU backend, for timing the CPU side of a frame with
+## `WGPU_BACKEND=noop WGPU_NOOP_BACKEND=1` (see `docs/profiling.md`).
+noop = ["wgpu", "wgpu/noop"]
 
 [dependencies]
 m2-math.workspace = true
