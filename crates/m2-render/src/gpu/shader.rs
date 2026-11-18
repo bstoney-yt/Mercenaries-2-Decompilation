@@ -838,7 +838,12 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
         let n = sea_normal(v.world_pos.xz, frame.view_dir.w, footprint);
         let view = normalize(frame.eye.xyz - v.world_pos);
         let l = -normalize(frame.sun_dir.xyz);
-        let shade = sunlight(v.world_pos, vec3<f32>(0.0, 1.0, 0.0));
+        // The shadow maps are read only where the sun can light the
+        // surface: everything shade scales is zero where it can't.
+        var shade = 1.0;
+        if dot(n, l) > 0.0 {
+            shade = sunlight(v.world_pos, vec3<f32>(0.0, 1.0, 0.0));
+        }
         // What lies beneath: the seabed's point from the depth drawn
         // before the water. Its depth below the surface sets the body
         // colour (the game looks it up in a depth colour map); the length
@@ -954,7 +959,13 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
         if !front {
             surface_n = -surface_n;
         }
-        let shade = sunlight(v.world_pos, surface_n);
+        // The shadow maps (nine taps) are read only where the sun can
+        // light the surface: everything shade scales is zero where it
+        // can't (the sun term by N.L, the highlight only with N.L > 0).
+        var shade = 1.0;
+        if n_dot_l > 0.0 {
+            shade = sunlight(v.world_pos, surface_n);
+        }
         let points = point_lights(v.world_pos, n);
         var lit: vec3<f32>;
         if ground {
