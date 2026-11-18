@@ -14,7 +14,8 @@
 //! `heli-follow` (that camera following the helicopter's turn, nose and
 //! bank, [`m2_engine::pad_camera::HeliFollow`], with the helicopter's
 //! motion scripted), `turret-limits` (the turret camera's eased input
-//! dropped at a limit, and the M113 AA driver's turret camera).
+//! dropped at a limit, and the M113 AA driver's turret camera), `gunner`
+//! (a gunner's seat's own turret camera: the M151's).
 
 use std::collections::HashMap;
 
@@ -35,6 +36,8 @@ pub struct Records {
     pub names: HashMap<u32, String>,
     /// Each template's turret camera (an emplaced gun's).
     pub turrets: HashMap<u32, m2_engine::pad_camera::TurretLookTuning>,
+    /// Each vehicle template's seats ([`m2_engine::seats`]).
+    pub seats: HashMap<u32, m2_engine::seats::VehicleSeats>,
 }
 
 impl Records {
@@ -54,6 +57,7 @@ impl Records {
         Ok(Self {
             tunings: m2_engine::tuning::read(&db, None),
             turrets: m2_engine::tuning::turret_cameras(&db),
+            seats: m2_engine::seats::read_vehicles(&db),
             names: db
                 .names()
                 .into_iter()
@@ -176,8 +180,9 @@ pub fn run(install: &Install, kind: &str) -> anyhow::Result<bool> {
         "heli" => heli(&records, &mut t),
         "heli-follow" => heli_follow(&records, &mut t),
         "turret-limits" => turret_limits(&records, &mut t),
+        "gunner" => gunner(&records, &mut t),
         other => anyhow::bail!(
-            "--camera-check: no kind {other:?} (tank, turret, heli, heli-follow, turret-limits)"
+            "--camera-check: no kind {other:?} (tank, turret, heli, heli-follow, turret-limits, gunner)"
         ),
     }
     Ok(t.finish())
@@ -415,11 +420,68 @@ fn turret_limits(records: &Records, t: &mut Tally) {
             "turret-limits {name}: reversed, first frame eased input {back:.3} (360: non-zero)"
         ),
     );
-    match records.find("m113", |v| v.driver_turret.map(|_| ())) {
-        Some((m113, ())) => t.line(
+    // The M113 AA's driver's seat has its own turret camera (#718: seat
+    // records, in place of #713's `driver_turret`).
+    let mut ids: Vec<_> = records.seats.keys().copied().collect();
+    ids.sort_unstable();
+    let m113 = ids.into_iter().find_map(|id| {
+        let name = records.names.get(&id)?;
+        let s = &records.seats[&id];
+        (name.contains("M113 AA") && s.seats[s.driver()?].camera.is_some()).then(|| name.clone())
+    });
+    match m113 {
+        Some(m113) => t.line(
             true,
             &format!("turret-limits {m113}: driver's seat has its CameraTurret"),
         ),
         None => t.missing("turret-limits m113 driver's CameraTurret"),
     }
+}
+
+/// #718's recipe: the M151's gunner's seat (`1b217b8a`) turns its camera
+/// at its own record's 2.0 rad/s (114.6 deg/s) and 1.8 (103.1), and its
+/// yaw stops 1.25 rad either side of the vehicle's heading.
+fn gunner(records: &Records, t: &mut Tally) {
+    use m2_engine::pad_camera::{TurretLookTuning, turret_at, turret_clamp};
+    let mut ids: Vec<_> = records.seats.keys().copied().collect();
+    ids.sort_unstable();
+    let found = ids.into_iter().find_map(|id| {
+        let name = records.names.get(&id)?;
+        if !name.contains("M151") {
+            return None;
+        }
+        let seat = records.seats[&id]
+            .seats
+            .iter()
+            .find(|s| s.name == 0x1b21_7b8a)?;
+        Some((name.clone(), seat.camera?))
+    });
+    let Some((name, camera)) = found else {
+        t.missing("gunner M151 seat 1b217b8a camera");
+        return;
+    };
+    let tuning = TurretLookTuning::from(&camera);
+    for (stick, want, axis) in [([1.0, 0.0], 114.6, "yaw"), ([0.0, 1.0], 103.1, "pitch")] {
+        let mut pad = Pad::default();
+        pad.turret_tuning = Some(tuning);
+        let (yaw, pitch) = hold(&mut pad, Mode::OnFoot, stick, 3.0);
+        let got = if axis == "yaw" { yaw } else { pitch };
+        t.near(
+            &format!("gunner {name} seat 1b217b8a: full stick {axis} rate deg/s"),
+            got.abs(),
+            want,
+            0.02,
+        );
+    }
+    let (held, _) = turret_clamp(1.6, 0.0, tuning.yaw);
+    t.near(
+        &format!("gunner {name}: yaw held at rad from the heading"),
+        f64::from(held),
+        1.25,
+        0.001,
+    );
+    t.line(
+        turret_at(1.25, 0.0, tuning.yaw) == Some(1.0),
+        &format!("gunner {name}: at 1.25 rad the limit is flagged (0x824C9538)"),
+    );
 }
