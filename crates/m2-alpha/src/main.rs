@@ -518,8 +518,8 @@ struct Options {
     /// swim her forward walking, at her pace and sprinting, logging how
     /// fast she goes (`swim-check:` lines).
     swim_check: bool,
-    /// `--touch-check`: the break-on-touch piles' templates and the touch
-    /// rule ([`touch_break::check`]), offscreen; then exit.
+    /// `--touch-check`: (turns on --drive) the break-on-touch piles'
+    /// templates and the touch rule ([`touch_break::check`]), offscreen; then exit.
     touch_check: bool,
     /// `--mine-check`: in the mission, the nearest placed mine is blasted
     /// by an RPG and, should it stand, run into by a jeep; logs
@@ -907,7 +907,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--seated" => o.seated = true,
             "--board" => o.board = true,
             "--swim-check" => o.swim_check = true,
-            "--touch-check" => o.touch_check = true,
+            "--touch-check" => {
+                o.touch_check = true;
+                o.drive = true;
+            }
             "--mine-check" => {
                 o.mine_check = true;
                 o.mission = true;
