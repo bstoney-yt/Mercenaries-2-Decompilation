@@ -1974,15 +1974,43 @@ impl Props {
         Some(body)
     }
 
-    /// What the body `body` is, if a prop sent it off as a part of its own
-    /// ([`send_off`](Self::send_off)): the prop's entity and the template
-    /// the part goes as (its `DebrisTemplate`; `None` where the database
-    /// names none). With [`m2_engine::crush::crusher_modifiers`] this says
+    /// What the loose body `body` is, if a prop's: the prop's entity and
+    /// the template the body goes as, `None` where the database names
+    /// none. With [`m2_engine::crush::crusher_modifiers`] this says
     /// whether it crushes what it lands on.
+    ///
+    /// - A part the prop sent off ([`send_off`](Self::send_off)): its
+    ///   `CreateObject`'s field (the prop's `DebrisTemplate`).
+    /// - A piece of a prop broken apart all at once: the prop's
+    ///   `DebrisTemplate` too (inferred: what its state machine makes its
+    ///   debris as, [`m2_engine::node_debris::goes_as`]).
+    /// - A piece of a prop knocked loose whole: the prop's own template
+    ///   (it is the object itself, moving).
     pub fn sent_off_as(&self, body: DebrisId) -> Option<(u32, Option<u32>)> {
-        self.sent_off
+        if let Some(found) = self
+            .sent_off
             .iter()
             .find_map(|(&e, v)| v.iter().find(|s| s.body == body).map(|s| (e, s.template)))
+        {
+            return Some(found);
+        }
+        let template = |e: u32| self.shown.get(&e).map(|p| p.template);
+        if let Some((&e, _)) = self.broken.iter().find(|(_, v)| v.contains(&body)) {
+            let debris = template(e).and_then(|t| {
+                let (params, by_hash) = self.goes_as.as_deref()?;
+                m2_engine::node_debris::goes_as(
+                    params,
+                    by_hash,
+                    t,
+                    m2_assets::model::DEBRIS_TEMPLATE,
+                )
+            });
+            return Some((e, debris));
+        }
+        self.knocked
+            .iter()
+            .find(|(_, v)| v.contains(&body))
+            .map(|(&e, _)| (e, template(e)))
     }
 
     /// The nodes `entity` has sent off ([`send_off`](Self::send_off)), if
@@ -2615,6 +2643,40 @@ mod tests {
     }
     use super::*;
     use m2_engine::{CollisionShape, LoosePiece};
+
+    // What a loose body goes as: a piece of one broken apart its
+    // `DebrisTemplate`, a prop knocked loose whole its own template.
+    #[test]
+    fn a_loose_body_goes_as_its_debris_template_or_its_own() {
+        let mut physics = Physics::new();
+        let mut props = Props::default();
+        let prop = |template| Prop {
+            model: 7,
+            position: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            wrecked: false,
+            template,
+            named: false,
+            preset: Default::default(),
+        };
+        props.shown.insert(1, prop(10));
+        props.shown.insert(2, prop(20));
+        let debris = m2_assets::model::DEBRIS_TEMPLATE;
+        props.goes_as = Some(Arc::new((
+            HashMap::from([(10, vec![(debris, 77)])]),
+            HashMap::new(),
+        )));
+        let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.5), 10.0);
+        let at = Mat4::from_translation(Vec3::Y * 5.0);
+        let a = physics.add_rubble(&piece, at, Vec3::ZERO, Vec3::ZERO);
+        let b = physics.add_debris(&piece, at, Vec3::ZERO, Vec3::ZERO);
+        props.broken.insert(1, vec![a]);
+        props.knocked.insert(2, vec![b]);
+        assert_eq!(props.sent_off_as(a), Some((1, Some(77))));
+        assert_eq!(props.sent_off_as(b), Some((2, Some(20))));
+        let c = physics.add_debris(&piece, at, Vec3::ZERO, Vec3::ZERO);
+        assert_eq!(props.sent_off_as(c), None);
+    }
 
     #[test]
     fn on_top_of_a_box_is_not_beside_it() {
