@@ -452,6 +452,11 @@ pub struct FightClips {
     /// ([`FightClips::KNOCKED`]).
     pub knocked: Option<usize>,
     pub getup: Option<usize>,
+    /// Landing hard from a fall: the on-foot tables' `Upright`
+    /// `FallImpactLight` (handle aaa7ed8d) and `FallImpactHeavy`
+    /// (9504ae5e), the same clip for every class held (from samples).
+    pub fall_light: Option<usize>,
+    pub fall_heavy: Option<usize>,
     pub subdued: Option<usize>,
 }
 
@@ -739,6 +744,9 @@ impl FightClips {
     /// (ade601a9) and `Subdued` `Idle` (dbd4f17d), from samples.
     pub const KNOCKED: u32 = 0xbe25_dc0c;
     pub const GETUP: u32 = 0xaeb6_c9bd;
+    /// `FallImpactLight`'s and `FallImpactHeavy`'s clips (from samples).
+    pub const FALL_LIGHT: u32 = 0x580a_a328;
+    pub const FALL_HEAVY: u32 = 0x1897_ecf1;
     pub const SUBDUED: u32 = 0xf550_757d;
     /// Jennifer's running take-offs (0.93 s, 3.6 m/s), then the
     /// resident's; standing (0.37 s).
@@ -823,6 +831,8 @@ impl FightClips {
             aim_shuffles: Self::AIM_SHUFFLES.map(find),
             knocked: find(Self::KNOCKED),
             getup: find(Self::GETUP),
+            fall_light: find(Self::FALL_LIGHT),
+            fall_heavy: find(Self::FALL_HEAVY),
             subdued: find(Self::SUBDUED),
         }
     }
@@ -1422,6 +1432,8 @@ pub struct Npc {
     /// speed they go as it builds, their turn's speed and the slide to a
     /// stop after a run.
     pub motion: m2_engine::on_foot::HumanMotion,
+    /// Where a fall started, for its damage ([`m2_engine::on_foot::fall_impact`]).
+    fall: m2_engine::on_foot::FallWatch,
     ground: Vec2,
     /// The speed they last moved at (m/s): what a stall is judged by.
     pushed: f32,
@@ -1678,6 +1690,7 @@ impl Npc {
             cover_spot: None,
             cover_retry: 0.0,
             motion: m2_engine::on_foot::HumanMotion::default(),
+            fall: m2_engine::on_foot::FallWatch::default(),
             ground: Vec2::ZERO,
             pushed: 0.0,
             dither: Default::default(),
@@ -1849,6 +1862,20 @@ impl Npc {
 
     /// Takes `damage`; at no health left, falls: true if it killed.
     /// `push` (m/s) shoves the body if it kills or is dead already.
+    /// Damage that nobody dealt (a fall's: its event's attacker is -1,
+    /// 0x82205F20): as [`hurt`](Self::hurt), but neither to her account
+    /// nor alerting them.
+    pub fn hurt_by_nobody(&mut self, damage: f32) -> bool {
+        let (by_her, killed_by_her, alert, hit) =
+            (self.hurt_by_her, self.killed_by_her, self.alert, self.hit);
+        let killed = self.hurt(damage, Vec3::ZERO);
+        self.hurt_by_her = by_her;
+        self.killed_by_her = killed_by_her;
+        self.alert = alert;
+        self.hit = hit;
+        killed
+    }
+
     pub fn hurt(&mut self, damage: f32, push: Vec3) -> bool {
         let clips = self.clips;
         let last_hit = self.last_hit.take();
@@ -2445,6 +2472,57 @@ impl Npc {
         let before = self.character.position;
         physics.move_character(&mut self.character, wanted, None, dt);
         let now = self.character.position;
+        // A fall that hurts, as the 360 has every person's (0x82205F20,
+        // [`m2_engine::on_foot::fall_impact`]): by their template's fall
+        // limits, its damage; a deadly one (1,000,000) kills, and the
+        // dead go limp (`Die` is `FULL`). A light or heavy one, for
+        // someone not limp (their action's mode not `FULL`), posts
+        // `FallImpactLight` or `FallImpactHeavy`, whose clip they play
+        // whole, doing nothing else (mode `NONE`). The 360 also skips a
+        // fall altogether for a person whose player record (0x82467B70,
+        // table 0x83657FA8) has state +0x40 at 1 or 2: the people here
+        // have no player record.
+        // Held or carried, the 360's human physics' skip flag (+0x224,
+        // set while grabbed, 0x8225BE88, or riding) sends no fall
+        // (0x8217C410): the watch starts afresh.
+        if self.held || matches!(self.down, Some(Down::Carried)) {
+            self.fall = m2_engine::on_foot::FallWatch::default();
+        } else if let Some((d, fell)) = self
+            .fall
+            .step(!self.character.grounded, now.y)
+            .and_then(|d| m2_engine::on_foot::fall_impact(&self.motion.falls, d).map(|f| (d, f)))
+        {
+            eprintln!(
+                "people: {:08x} falls {d:.1} m for {} damage",
+                self.spawn.unwrap_or(0),
+                fell.damage
+            );
+            // A fall's damage event has no attacker (-1, 0x82205F20):
+            // nobody's kill, no alert.
+            self.hurt_by_nobody(fell.damage);
+            // The impact is posted unless their action's mode is `FULL`
+            // (falling or lying knocked down, or dead); the stance table
+            // gives the clip only to the armed (pistol, rifle, launcher:
+            // handles aaa7ed8d, 9504ae5e), none to the unarmed.
+            let limp = matches!(self.down, Some(Down::Falling(_) | Down::Knocked(_)))
+                || self.ragdoll.is_some()
+                || !self.alive;
+            let clip = match fell.impact {
+                Some(m2_engine::on_foot::FallImpact::Light) => self.clips.fall_light,
+                Some(m2_engine::on_foot::FallImpact::Heavy) => self.clips.fall_heavy,
+                None => None,
+            }
+            .filter(|_| self.gun.is_some());
+            if let (Some(c), Some(impact)) = (clip, fell.impact)
+                && !limp
+            {
+                self.rig.animator.set_upper(None);
+                self.rig
+                    .animator
+                    .play_action(c, true, m2_assets::name_hash(impact.name()));
+                self.stagger = Some(c);
+            }
+        }
         // In it deeper than a wade, or over ground that is (stepping off a
         // dock or a bank): back where they were, unless they were in it
         // already (then they may walk out). Well above the water (no ground
@@ -9076,6 +9154,64 @@ pub(crate) mod tests {
         assert!(npc.landed);
         let p = npc.character.position;
         assert!(p.y >= -1.0 - WET && p.z < 6.0, "{p}");
+    }
+
+    /// A person falls as the 360 has every person fall (0x82205F20): a
+    /// short drop costs nothing, past their deadly height they die (and
+    /// go limp).
+    #[test]
+    fn a_deadly_fall_kills_and_a_short_one_does_not() {
+        let mut rng = Rng::default();
+        let mut physics = Physics::new();
+        let v = [
+            Vec3::new(-50.0, 0.0, -50.0),
+            Vec3::new(50.0, 0.0, -50.0),
+            Vec3::new(50.0, 0.0, 50.0),
+            Vec3::new(-50.0, 0.0, 50.0),
+        ];
+        let shape = CollisionShape::mesh(&v, &[[0, 2, 1], [0, 3, 2]]).unwrap();
+        physics.add_static(StaticKey::Cell(1), &shape, Vec3::ZERO, Quat::IDENTITY);
+        physics.step(1.0 / 60.0);
+        let drop = |height: f32, rng: &mut Rng| {
+            // Stood on the ground, then off a height (a ledge's).
+            let mut npc = Npc::new(
+                0,
+                &rig(),
+                Vec3::ZERO,
+                0.0,
+                Brain::Post { facing: 0.0 },
+                Some(3),
+            );
+            for _ in 0..30 {
+                npc.update(&physics, rng, None, 1.0 / 60.0);
+            }
+            assert!(npc.landed);
+            npc.character.position.y = height;
+            for _ in 0..60 * 5 {
+                npc.update(&physics, rng, None, 1.0 / 60.0);
+            }
+            npc
+        };
+        let short = drop(0.5, &mut rng);
+        assert!(short.alive, "{}", short.hp);
+        let deadly = drop(
+            m2_engine::on_foot::FallLimits::default().death + 6.0,
+            &mut rng,
+        );
+        assert!(!deadly.alive);
+        // Between the heavy and deadly limits: alive, the heavy fall's
+        // damage taken.
+        let limits = m2_engine::on_foot::FallLimits::default();
+        let heavy = drop((limits.heavy + limits.death) * 0.5 + 0.1, &mut rng);
+        assert!(heavy.alive);
+        // Nobody's damage: not to her account, no alert.
+        assert!(!heavy.hurt_by_her && !heavy.alert);
+        assert!(
+            (short.hp - heavy.hp - limits.damage_heavy).abs() < 1e-3,
+            "{} {}",
+            short.hp,
+            heavy.hp
+        );
     }
 
     // Soldiers walked the sea bed instead of swimming. Out of their depth
