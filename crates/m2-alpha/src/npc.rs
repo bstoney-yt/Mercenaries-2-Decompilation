@@ -6508,6 +6508,31 @@ pub fn locking_launcher<'a>(
 pub(crate) mod tests {
     use super::*;
 
+    /// Up from lying: face down (the hips' forward pointing down) they
+    /// face along the line from hips to chest; on their back, the other
+    /// way (0x820F97A4).
+    #[test]
+    fn they_get_up_facing_along_where_the_body_lay() {
+        use m2_assets::ragdoll::{CHEST, HIPS};
+        let hashes = [HIPS, CHEST];
+        let lying = |forward_y: f32| {
+            let hips = Mat4::from_cols(
+                Vec3::X.extend(0.0),
+                Vec3::Z.extend(0.0),
+                Vec3::new(0.0, forward_y, 0.0).extend(0.0),
+                Vec3::new(0.0, 0.2, 0.0).extend(1.0),
+            );
+            let chest = Mat4::from_translation(Vec3::new(0.0, 0.2, 0.5));
+            [hips, chest]
+        };
+        // Face down: along +z, hips to chest.
+        let down = getup_yaw(&lying(-1.0), &hashes).unwrap();
+        assert!(down.abs() < 1e-5, "{down}");
+        // On the back: the other way.
+        let up = getup_yaw(&lying(1.0), &hashes).unwrap();
+        assert!((up.abs() - std::f32::consts::PI).abs() < 1e-5, "{up}");
+    }
+
     #[test]
     fn the_nearest_fighting_soldier_of_its_faction_runs_to_raise_the_alarm() {
         let post = || Brain::Post { facing: 0.0 };

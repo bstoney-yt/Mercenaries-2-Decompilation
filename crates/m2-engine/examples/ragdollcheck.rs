@@ -130,6 +130,30 @@ fn limp(d: &Doll) -> Result<bool, Box<dyn std::error::Error>> {
     Ok(ok)
 }
 
+/// #710: the game's ragdoll keeps to Havok's speed limit (132 m/s, the
+/// body settings 0x8216A290): every limb shoved to 200 m/s, none is ever
+/// faster than the limit after a step.
+fn speed_cap(d: &Doll) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut p = ground()?;
+    let lift = Mat4::from_translation(Vec3::Y * 0.6);
+    let nodes: Vec<Mat4> = d.bind.iter().map(|m| lift * *m).collect();
+    let id = p
+        .add_asset_ragdoll(&d.doll, &d.hashes, &d.parents, &nodes, Vec3::ZERO)
+        .ok_or("ragdoll not built")?;
+    p.push_ragdoll(id, Vec3::new(1.0, 1.0, 0.0).normalize() * 200.0);
+    let mut fastest = 0.0f32;
+    for _ in 0..240 {
+        p.step(1.0 / 60.0);
+        fastest = fastest.max(p.ragdoll_speed(id).unwrap_or(0.0));
+    }
+    let ok = fastest <= 132.0 + 1e-3;
+    println!(
+        "ragdoll-check 710: every limb shoved to 200 m/s: fastest limb {fastest:.1} m/s, at most 132: {}",
+        verdict(ok)
+    );
+    Ok(ok)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
         .nth(1)
@@ -137,6 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let d = load(&path)?;
     let mut all = true;
     all &= limp(&d)?;
+    all &= speed_cap(&d)?;
     println!("ragdoll-check: {}", verdict(all));
     Ok(())
 }
