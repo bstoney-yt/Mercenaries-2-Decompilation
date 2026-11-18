@@ -2001,6 +2001,9 @@ pub struct Combat {
     /// Every new meeting of a vehicle with another or with a static this
     /// tick, damaging or not, for its sound ([`Contact`]).
     pub contacts: Vec<Contact>,
+    /// Vehicle-against-vehicle contacts heard with a cue, all told (for
+    /// `--impact-check`).
+    pub vehicle_contacts_heard: u32,
     /// Those impacts by template.
     pub impact_kinds: std::collections::BTreeMap<&'static str, u32>,
     /// What the fighting has come to (for checking).
@@ -2307,6 +2310,7 @@ impl Default for Combat {
             impacts: (0, 0),
             table_impacts: 0,
             contacts: Vec::new(),
+            vehicle_contacts_heard: 0,
             impact_kinds: std::collections::BTreeMap::new(),
             tally: Tally::default(),
             hurts: Vec::new(),

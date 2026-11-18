@@ -2162,7 +2162,7 @@ impl Game {
             // not (0x8235E3A8): the sound table's cue for the two sides'
             // `SoundKey`s, three a frame.
             let contacts = std::mem::take(&mut self.combat.contacts);
-            for (at, cue, level) in contact_cues(
+            for (at, cue, level, vehicle) in contact_cues(
                 &world.index,
                 &world.physics,
                 &self.scene.props,
@@ -2170,6 +2170,7 @@ impl Game {
                 contacts,
             ) {
                 self.combat.contact(at, cue, level);
+                self.combat.vehicle_contacts_heard += u32::from(vehicle);
             }
             // What came down (to a vehicle, the traffic's too, or a blast
             // last tick) comes down whether she is on foot or the free
@@ -4449,7 +4450,7 @@ pub(crate) fn contact_cues(
     props: &Props,
     vehicles: &[ParkedVehicle],
     contacts: Vec<combat::Contact>,
-) -> Vec<(Vec3, u32, f32)> {
+) -> Vec<(Vec3, u32, f32, bool)> {
     let db = &index.template_db;
     let Some(table) = db.sound_table.as_ref() else {
         return Vec::new();
@@ -4492,7 +4493,7 @@ pub(crate) fn contact_cues(
                         "not damaging"
                     }
                 );
-                out.push((c.at, cue, level));
+                out.push((c.at, cue, level, matches!(c.met, combat::Met::Vehicle(_))));
             }
             None => eprintln!(
                 "contact: the {} met {:?}: keys {own:08x} x {other:08x}: no cue, silent",
