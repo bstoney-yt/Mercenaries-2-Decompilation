@@ -3015,6 +3015,26 @@ impl Combat {
         )
     }
 
+    /// What a round from `from` along `dir` striking the world `t` metres
+    /// on throws up ([`strike_world`](Self::strike_world)): the word of the
+    /// surface it struck, and whether the particle table decided its
+    /// effect (for `--impact-check`).
+    pub fn impact_probe(
+        &mut self,
+        physics: &Physics,
+        from: Vec3,
+        dir: Vec3,
+        t: f32,
+    ) -> (u32, bool) {
+        let before = self.table_impacts;
+        let surface = physics
+            .cast_ray_surface(from, dir, t + 0.05)
+            .map_or(0, |(.., surface)| surface);
+        self.strike_world(physics, from, dir, t);
+        self.game_fx.clear();
+        (surface, self.table_impacts > before)
+    }
+
     /// A round from `from` along `dir` striking the world `t` metres on:
     /// it throws up the impact for what the triangle it struck is made of
     /// ([`m2_engine::surface::bullet_impact`]), and this is what it
