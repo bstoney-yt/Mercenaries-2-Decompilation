@@ -568,9 +568,16 @@ const LAUNCH_CLEAR: f32 = BODY_RADIUS + 0.2;
 /// Health comes back after this many quiet seconds, at this rate a second.
 const REGEN_AFTER: f32 = 4.0;
 const REGEN_RATE: f32 = 25.0;
-/// Where the health clamp stops her health: the hero script's healing
-/// keeps at least this much too (inferred; no script sets the floor).
-const CLAMP_FLOOR: f32 = 1.0;
+/// Where the health clamp (`Player.SetHealthClamp`) stops her health:
+/// 3 with one player, 1 with two. From the 360 code (the health change
+/// 0x822889F8: 0x820C7A20 when fewer than two players have joined,
+/// counted by 0x82467A38, else 1).
+const CLAMP_FLOOR: f32 = 3.0;
+const CLAMP_FLOOR_COOP: f32 = 1.0;
+/// While her survival mode is on, a hit someone dealt her does this much
+/// of its damage. From the 360 code (0x822889F8, 0x820BB468), applied
+/// only when the clamp is not holding her.
+const SURVIVAL_DAMAGE: f32 = 0.1;
 /// Seconds she stays down at no health.
 const DOWN_TIME: f32 = 2.5;
 /// RPG: rocket speed (m/s), reload (s) and how far it flies.
@@ -1714,6 +1721,13 @@ pub struct Combat {
     /// The scripts keep her from dying (`Player.SetHealthClamp`): her
     /// health stops at [`CLAMP_FLOOR`] for their survival system.
     pub health_clamp: bool,
+    /// Her survival mode (`Player.SetSurvivalMode`, the player's +0x170 in
+    /// the 360 code, 0x8243AED8): on when the clamp catches a hit that
+    /// would have taken her under its floor, or when the scripts turn it
+    /// on; while on, hits from someone do [`SURVIVAL_DAMAGE`].
+    pub survival: bool,
+    /// A second player has joined (the clamp's floor is lower).
+    pub coop: bool,
     /// The scripts heal her (the hero script's timers), not the fight.
     pub scripted_health: bool,
     /// She just got back up after going down (taken by the mission).
@@ -2152,6 +2166,8 @@ impl Default for Combat {
             rammed: 0.0,
             run_overs: (0, 0.0),
             health_clamp: false,
+            survival: false,
+            coop: false,
             scripted_health: false,
             revived: false,
             unkillable_her: false,
@@ -4156,10 +4172,40 @@ impl Combat {
         });
     }
 
+    /// Where the health clamp stops her health ([`CLAMP_FLOOR`]).
+    fn clamp_floor(&self) -> f32 {
+        if self.coop {
+            CLAMP_FLOOR_COOP
+        } else {
+            CLAMP_FLOOR
+        }
+    }
+
+    /// The damage a hit does her, as the 360's health change has it
+    /// (0x822889F8): with the clamp on, a hit that would leave her under
+    /// the floor turns her survival mode on (0x8243AED8(player, 1, 1));
+    /// with it off, survival mode cuts a hit someone dealt
+    /// (`attacked`) to [`SURVIVAL_DAMAGE`]. The floor itself is applied
+    /// by the caller.
+    fn survival_damage(&mut self, damage: f32, attacked: bool) -> f32 {
+        if self.health_clamp {
+            if self.hp - damage < self.clamp_floor() && !self.survival {
+                eprintln!("combat: survival mode on (the clamp caught a hit)");
+                self.survival = true;
+            }
+            damage
+        } else if self.survival && attacked {
+            damage * SURVIVAL_DAMAGE
+        } else {
+            damage
+        }
+    }
+
     fn hurt_player(&mut self, f: &mut Field<'_>, damage: f32, from: Option<Vec3>) -> f32 {
         if self.down > 0.0 || self.invincible {
             return 0.0;
         }
+        let damage = self.survival_damage(damage, from.is_some());
         // Kept for the HUD; only the latest if nothing reads them.
         if self.hurts.len() >= MAX_HURTS {
             self.hurts.remove(0);
@@ -4167,9 +4213,13 @@ impl Combat {
         self.hurts.push((damage, from));
         self.quiet = 0.0;
         let floor = if self.unkillable_her {
-            crate::npc::UNKILLABLE_FLOOR.max(if self.health_clamp { CLAMP_FLOOR } else { 0.0 })
+            crate::npc::UNKILLABLE_FLOOR.max(if self.health_clamp {
+                self.clamp_floor()
+            } else {
+                0.0
+            })
         } else if self.health_clamp {
-            CLAMP_FLOOR
+            self.clamp_floor()
         } else {
             0.0
         };
@@ -8279,6 +8329,77 @@ mod tests {
         combat.hurt_player(&mut field, 1.0e6, None);
         assert!(field.player.down);
         assert_eq!(field.player.ragdoll, None);
+    }
+
+    /// Hurts her by each of `hits` (damage, dealt by someone) with
+    /// `combat` as set, returning her health after each.
+    fn health_after(combat: &mut Combat, hits: &[(f32, bool)]) -> Vec<f32> {
+        let mut physics = ground();
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        let mut vehicles = Vec::new();
+        let mut explosives = [];
+        let mut field = Field {
+            physics: &mut physics,
+            player: &mut player,
+            people: &mut people,
+            vehicles: &mut vehicles,
+            arsenal: &arsenal,
+            explosives: &mut explosives,
+        };
+        hits.iter()
+            .map(|&(d, by)| {
+                combat.hurt_player(&mut field, d, by.then_some(Vec3::ZERO));
+                combat.hp
+            })
+            .collect()
+    }
+
+    /// From the 360 code (0x822889F8): the clamp holds her at 3 with one
+    /// player and 1 with two, and the hit it catches turns survival on.
+    #[test]
+    fn the_clamp_holds_her_at_its_floor_and_starts_survival() {
+        let mut c = Combat {
+            hp: 20.0,
+            max_hp: 120.0,
+            health_clamp: true,
+            ..Combat::default()
+        };
+        assert_eq!(health_after(&mut c, &[(5.0, true)]), [15.0]);
+        assert!(!c.survival);
+        assert_eq!(health_after(&mut c, &[(50.0, true)]), [3.0]);
+        assert!(c.survival);
+        let mut two = Combat {
+            hp: 20.0,
+            health_clamp: true,
+            coop: true,
+            ..Combat::default()
+        };
+        assert_eq!(health_after(&mut two, &[(50.0, true)]), [1.0]);
+    }
+
+    /// From the 360 code (0x822889F8): with the clamp off, survival mode
+    /// cuts hits someone dealt to a tenth; a fall still does it all.
+    #[test]
+    fn survival_mode_cuts_hits_from_others() {
+        let mut c = Combat {
+            hp: 8.0,
+            max_hp: 120.0,
+            survival: true,
+            ..Combat::default()
+        };
+        let after = health_after(&mut c, &[(30.0, true), (2.0, false)]);
+        assert!((after[0] - 5.0).abs() < 1e-5, "{after:?}");
+        assert!((after[1] - 3.0).abs() < 1e-5, "{after:?}");
+        // With the clamp on the clamp decides, not the cut.
+        let mut held = Combat {
+            hp: 8.0,
+            health_clamp: true,
+            survival: true,
+            ..Combat::default()
+        };
+        assert_eq!(health_after(&mut held, &[(4.0, true)]), [4.0]);
     }
 
     #[test]
