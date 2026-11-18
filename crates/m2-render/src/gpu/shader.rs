@@ -11,6 +11,8 @@ use crate::buffer::{VertexFormat, VertexLayout, VertexSemantic};
 
 /// Bind group 0: per frame. Must match `FrameUniforms` in `mod.rs`.
 const COMMON: &str = r#"
+// The materials' maps are one array of textures (see `maps`).
+enable wgpu_binding_array;
 struct Frame {
     view_proj: mat4x4<f32>,
     eye: vec4<f32>,
@@ -175,6 +177,17 @@ struct Draw {
     uv: vec4<f32>,
     // Multiplies the surface's colour and alpha (a marker model's colour)
     tint: vec4<f32>,
+    // In place of the material's direct light colour, when w is 1
+    direct: vec4<f32>,
+    // In place of the material's highlight colour, when w is 1
+    specular: vec4<f32>,
+    // In place of the material's ambient and emitted colours, when w is 1
+    ambient: vec4<f32>,
+    emissive: vec4<f32>,
+    // The texture coordinates' transform, two rows over (u, v, 1), when
+    // the first's w is 1
+    uv_u: vec4<f32>,
+    uv_v: vec4<f32>,
 };
 
 struct Material {
@@ -206,6 +219,13 @@ struct Material {
     // x: open water, y: scale on the sky it mirrors, z: on its waves,
     // w: how soon its waves fade with the pixel's size
     water: vec4<f32>,
+    // Its maps' places in `maps`: base, detail, specular, normal (0: the
+    // white stand-in)
+    tex: vec4<u32>,
+    // Its ground layers' places in `maps`
+    layer_tex: vec4<u32>,
+    // x: its base map's sampler in `samplers` (0: repeating, 1: clamped)
+    samp: vec4<u32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -220,17 +240,14 @@ struct Material {
 // The draw the vertex belongs to (set by the entry points).
 var<private> draw: Draw;
 @group(1) @binding(1) var<storage, read> palette: array<mat4x4<f32>>;
-@group(2) @binding(0) var<uniform> material: Material;
-@group(2) @binding(1) var base_map: texture_2d<f32>;
-@group(2) @binding(2) var base_sampler: sampler;
-@group(2) @binding(3) var detail_map: texture_2d<f32>;
-@group(2) @binding(4) var detail_sampler: sampler;
-@group(2) @binding(5) var specular_map: texture_2d<f32>;
-@group(2) @binding(6) var normal_map: texture_2d<f32>;
-@group(2) @binding(7) var layer0: texture_2d<f32>;
-@group(2) @binding(8) var layer1: texture_2d<f32>;
-@group(2) @binding(9) var layer2: texture_2d<f32>;
-@group(2) @binding(10) var layer3: texture_2d<f32>;
+// Every texture a material uses, by the places its record names, and the
+// samplers (bound once a pass: switching material sets only the record).
+@group(2) @binding(0) var maps: binding_array<texture_2d<f32>>;
+@group(2) @binding(1) var samplers: binding_array<sampler>;
+// The draw's material: its record in one buffer of them all, at an offset
+// set as the draw changes material. The last group, since wgpu applies a
+// changed group again with every group after it.
+@group(4) @binding(0) var<uniform> material: Material;
 // Depth of what was drawn before the water (reversed: 0 is nothing).
 @group(3) @binding(0) var scene_depth: texture_depth_2d;
 @group(3) @binding(1) var scene_color: texture_2d<f32>;
@@ -250,10 +267,34 @@ struct Varyings {
     @location(6) tint: vec4<f32>,
     // Its beams shine whatever the hour (see `Draw`)
     @location(7) @interpolate(flat) beams_lit: f32,
+    // The draw's material values in place of its material's (see `Draw`)
+    @location(8) @interpolate(flat) over_direct: vec4<f32>,
+    @location(9) @interpolate(flat) over_specular: vec4<f32>,
+    // Negative: the material's own
+    @location(10) @interpolate(flat) over_opacity: f32,
+    @location(11) @interpolate(flat) over_ambient: vec4<f32>,
+    @location(12) @interpolate(flat) over_emissive: vec4<f32>,
 };
 "#;
 
 const FRAGMENT: &str = r#"
+// The material's direct light colour, highlight colour and opacity, or
+// the draw's in their place (a material animation's).
+fn surface_direct(v: Varyings) -> vec3<f32> {
+    return select(material.direct.rgb, v.over_direct.rgb, v.over_direct.w > 0.5);
+}
+fn surface_specular(v: Varyings) -> vec3<f32> {
+    return select(material.specular.rgb, v.over_specular.rgb, v.over_specular.w > 0.5);
+}
+fn surface_ambient(v: Varyings) -> vec3<f32> {
+    return select(material.ambient.rgb, v.over_ambient.rgb, v.over_ambient.w > 0.5);
+}
+fn surface_emissive(v: Varyings) -> vec3<f32> {
+    return select(material.emissive.rgb, v.over_emissive.rgb, v.over_emissive.w > 0.5);
+}
+fn surface_opacity(v: Varyings) -> f32 {
+    return select(material.color.a, v.over_opacity, v.over_opacity >= 0.0);
+}
 // The game's ambient cube: each axis's face, picked by the normal's sign,
 // weighted by that component squared.
 fn ambient_light(n: vec3<f32>) -> vec3<f32> {
@@ -714,8 +755,8 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
     // Water's map is its foam, drifting over world space.
     let drift = vec2<f32>(0.021, 0.013) * frame.view_dir.w;
     let base_uv = select(v.uv, v.world_pos.xz * 0.15 + drift, water);
-    let base_texel = textureSample(base_map, base_sampler, base_uv);
-    var base = select(base_texel, vec4<f32>(1.0), water) * material.color;
+    let base_texel = textureSample(maps[material.tex.x], samplers[material.samp.x], base_uv);
+    var base = select(base_texel, vec4<f32>(1.0), water) * vec4<f32>(material.color.rgb, surface_opacity(v));
     let ao = material.params.z > 0.5 && !ground;
     if ao {
         base.a = base.a * v.color.a;
@@ -729,12 +770,12 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
     var water_alpha = 1.0;
     // Sampled outside branches: derivatives need uniform control flow.
     let p = vec4<f32>(v.world_pos, 1.0);
-    let t0 = textureSample(layer0, detail_sampler, layer_uv(0u, p)).rgb;
-    let t1 = textureSample(layer1, detail_sampler, layer_uv(1u, p)).rgb;
-    let t2 = textureSample(layer2, detail_sampler, layer_uv(2u, p)).rgb;
-    let t3 = textureSample(layer3, detail_sampler, layer_uv(3u, p)).rgb;
+    let t0 = textureSample(maps[material.layer_tex.x], samplers[0], layer_uv(0u, p)).rgb;
+    let t1 = textureSample(maps[material.layer_tex.y], samplers[0], layer_uv(1u, p)).rgb;
+    let t2 = textureSample(maps[material.layer_tex.z], samplers[0], layer_uv(2u, p)).rgb;
+    let t3 = textureSample(maps[material.layer_tex.w], samplers[0], layer_uv(3u, p)).rgb;
     let detail_uv = v.world_pos.xz * material.detail.x;
-    let detail_texel = textureSample(detail_map, detail_sampler, detail_uv).rgb;
+    let detail_texel = textureSample(maps[material.tex.y], samplers[0], detail_uv).rgb;
     if ground {
         // As the game's terrain shaders: the vertex colour weights the
         // tiled layers (r the first), the colour map makes up any shortfall
@@ -762,12 +803,12 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
     } else if material.detail.x > 0.0 {
         // Each texel against the map's average (its smallest mip), so the
         // base colour keeps its brightness.
-        let mean = textureSampleLevel(detail_map, detail_sampler, detail_uv, 16.0).rgb;
+        let mean = textureSampleLevel(maps[material.tex.y], samplers[0], detail_uv, 16.0).rgb;
         let fade = clamp(1.0 - dist / material.detail.y, 0.0, 1.0);
         rgb = rgb * mix(vec3<f32>(1.0), detail_texel / max(mean, vec3<f32>(0.05)), fade);
     }
-    let spec_texel = textureSample(specular_map, base_sampler, v.uv).rgb;
-    let normal_texel = textureSample(normal_map, base_sampler, v.uv);
+    let spec_texel = textureSample(maps[material.tex.z], samplers[material.samp.x], v.uv).rgb;
+    let normal_texel = textureSample(maps[material.tex.w], samplers[material.samp.x], v.uv);
     // Highlight and reflection, added after any ambient occlusion.
     var shine = vec3<f32>(0.0);
     var spec_light = vec3<f32>(0.0);
@@ -799,8 +840,8 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
         // display values when surfaces are lit so), each scaled by the
         // material's diffuse and ambient colours.
         let light = light_from_display(
-            light_to_display(surface_sun()) * (max(dot(n, l), 0.0) * shade) * material.direct.rgb
-                + ambient_display(n) * material.ambient.rgb,
+            light_to_display(surface_sun()) * (max(dot(n, l), 0.0) * shade) * surface_direct(v)
+                + ambient_display(n) * surface_ambient(v),
         );
         let shallow = vec3<f32>(0.09, 0.30, 0.34);
         var body = mix(shallow, base.rgb, 1.0 - exp(-depth / 5.0)) * light;
@@ -826,7 +867,7 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
         let h = normalize(l + view);
         let sun = select(surface_sun(), frame.sun_color.rgb, frame.sky_fit.w > 0.5);
         let glint = select(0.0, 1.0, dot(n, l) > 0.0) * sun * shade
-            * pow(max(dot(n, h), 0.0), power) * material.specular.rgb * frame.glint_fit.x;
+            * pow(max(dot(n, h), 0.0), power) * surface_specular(v) * frame.glint_fit.x;
         body = body + glint;
         // Schlick's Fresnel from the material's reflectance facing the
         // eye, times its reflection strength, mixes in the sky mirrored.
@@ -910,7 +951,7 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
             // The point lights past the clamp: the game's shaders sum them
             // unclamped (an explosion's flash, 12 times white, blows out).
             let direct = clamp(sun, vec3<f32>(0.0), vec3<f32>(1.0)) + points;
-            lit = rgb * light_from_display(direct * material.direct.rgb + ambient_display(n) * material.ambient.rgb);
+            lit = rgb * light_from_display(direct * surface_direct(v) + ambient_display(n) * surface_ambient(v));
         }
         var tint = vec3<f32>(1.0);
         if material.maps.x > 0.5 {
@@ -921,7 +962,7 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
             let h = normalize(l + view);
             let n_dot_h = dot(n, h);
             if n_dot_h > 0.0 {
-                spec_light = surface_sun() * material.specular.rgb * tint * pow(n_dot_h, material.specular.a) * max(shade, 0.25);
+                spec_light = surface_sun() * surface_specular(v) * tint * pow(n_dot_h, material.specular.a) * max(shade, 0.25);
             }
         }
         shine = spec_light;
@@ -942,7 +983,7 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
     }
     rgb = rgb + shine;
     // Light the surface gives off, on top of what it reflects.
-    var glow = material.emissive.rgb;
+    var glow = surface_emissive(v);
     if material.emissive.w > 0.5 {
         glow = glow * spec_texel;
     }
@@ -990,7 +1031,7 @@ fn fs_glow(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
     let s = surface(v, front);
     var rgb = pow(max(s.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
     if material.params.y < 0.5 && material.params.z > 0.5 {
-        let t = textureSample(base_map, base_sampler, v.uv);
+        let t = textureSample(maps[material.tex.x], samplers[material.samp.x], v.uv);
         rgb = srgb_encode(t.rgb) * material.color.rgb * v.color.rgb * v.tint.rgb;
     }
     if material.params.w > 0.5 {
@@ -1021,7 +1062,7 @@ fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
 // out as they cut themselves.
 @fragment
 fn fs_shadow(v: Varyings) {
-    var a = textureSample(base_map, base_sampler, v.uv).a * material.color.a;
+    var a = textureSample(maps[material.tex.x], samplers[material.samp.x], v.uv).a * surface_opacity(v);
     if material.params.z > 0.5 && material.maps.w < 0.5 {
         a = a * v.color.a;
     }
@@ -1226,12 +1267,22 @@ fn place(v: VertexIn, instance: u32) -> Varyings {{
     out.clip = frame.view_proj * world;
     out.world_pos = world.xyz;
     out.normal = (model * vec4<f32>(normal, 0.0)).xyz;
-    out.uv = {uv} + draw.uv.xy;
+    let base_uv = {uv};
+    let moved_uv = vec2<f32>(
+        dot(draw.uv_u.xyz, vec3<f32>(base_uv, 1.0)),
+        dot(draw.uv_v.xyz, vec3<f32>(base_uv, 1.0)),
+    );
+    out.uv = select(base_uv, moved_uv, draw.uv_u.w > 0.5) + draw.uv.xy;
     out.color = {color};
     out.tangent = vec4<f32>((model * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w);
     out.haze = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     out.tint = draw.tint;
     out.beams_lit = draw.uv.z;
+    out.over_direct = draw.direct;
+    out.over_specular = draw.specular;
+    out.over_opacity = draw.uv.w;
+    out.over_ambient = draw.ambient;
+    out.over_emissive = draw.emissive;
     return out;
 }}
 
@@ -1268,7 +1319,8 @@ mod tests {
             .unwrap_or_else(|e| panic!("{}", e.emit_to_string(src)));
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::empty(),
+            // The materials' texture and sampler arrays.
+            naga::valid::Capabilities::TEXTURE_AND_SAMPLER_BINDING_ARRAY,
         )
         .validate(&module)
         .unwrap_or_else(|e| panic!("{e:?}\n{src}"));

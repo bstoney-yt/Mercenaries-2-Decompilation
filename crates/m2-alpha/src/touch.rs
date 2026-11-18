@@ -314,6 +314,7 @@ pub fn merge(s: PadState, t: PadState) -> PadState {
         buttons: s.buttons | t.buttons,
         left: bigger(s.left, t.left),
         right: bigger(s.right, t.right),
+        right_raw: bigger(s.right_raw, t.right_raw),
         left_trigger: s.left_trigger.max(t.left_trigger),
         right_trigger: s.right_trigger.max(t.right_trigger),
     }

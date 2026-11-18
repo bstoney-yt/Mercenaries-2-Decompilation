@@ -261,6 +261,20 @@ impl ShopCheck {
                 Aim::Laser => intent.trigger.fire = true,
             }
         }
+        // A satellite item's view and wheel ([`Support::equip`]):
+        // confirmed where it opens, then each wedge pressed as the needle
+        // comes into it.
+        match game.support.phase {
+            Phase::Viewing { .. } => {
+                self.tapped = !self.tapped;
+                intent.trigger.fire = self.tapped;
+            }
+            Phase::Timing { .. } => {
+                self.tapped = !self.tapped;
+                intent.trigger.fire = self.tapped && game.support.wheel_ready();
+            }
+            _ => {}
+        }
     }
 
     /// Gives her cash for the next item, or ends the check.

@@ -392,6 +392,12 @@ pub struct Templates {
     /// Each person template's `HumanAnimationSet` gender and character
     /// name, by id ([`crate::tuning::human_animation_sets`]).
     pub human_sets: HashMap<u32, (u32, u32)>,
+    /// Each person template's face rig (a `facefxactor` asset's name
+    /// hash), by id ([`crate::tuning::face_actors`]).
+    pub face_actors: HashMap<u32, u32>,
+    /// Each item template's camera row's inputs, by id
+    /// ([`crate::tuning::camera_modifiers`]).
+    pub camera_modifiers: HashMap<u32, (u32, f32)>,
     /// Hand-held guns that fire rounds, by id ([`crate::tuning::hand_guns`]).
     pub guns: HashMap<u32, HandGun>,
     /// What each template's `EquipmentLink`s hand it, by id.
@@ -421,8 +427,16 @@ pub struct Templates {
     /// says what each kind of damage does to its objects (`PropFragile`,
     /// `Prop`, `Fence`, `Car`, ...).
     pub modifiers: HashMap<u32, u32>,
+    /// Each `_PropPhysics` template's fake mass ratios, by id
+    /// ([`crate::durability::FakeMass`]).
+    pub fake_masses: HashMap<u32, crate::durability::FakeMass>,
     /// The game's damage table, if found.
     pub damage: Option<DamageTable>,
+    /// The particle and sound tables ([`crate::tuning::KeyTable`]).
+    pub particle_table: Option<crate::tuning::KeyTable>,
+    pub sound_table: Option<crate::tuning::KeyTable>,
+    /// Each template's `ParticleKey`, by id.
+    pub particle_keys: HashMap<u32, u32>,
     /// Every gun, thrown weapon and vehicle armament ([`crate::weapons`]).
     pub arms: crate::weapons::Arms,
     /// Each template's parts' health and the part that burns, by id
@@ -679,6 +693,23 @@ impl Templates {
         self.ids(name)
             .iter()
             .find_map(|id| self.human_sets.get(id).copied())
+    }
+
+    /// Template `name`'s face rig (a `facefxactor` asset's name hash),
+    /// whatever its case.
+    /// Item template `name`'s camera row
+    /// ([`crate::pad_camera::camera_row`]), whatever its case.
+    pub fn camera_row(&self, name: &str) -> Option<usize> {
+        self.ids(name).iter().find_map(|id| {
+            let &(category, yaw) = self.camera_modifiers.get(id)?;
+            Some(crate::pad_camera::camera_row(category, yaw))
+        })
+    }
+
+    pub fn face_actor(&self, name: &str) -> Option<u32> {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.face_actors.get(id).copied())
     }
 
     /// The rifle template `name` (a hero: `Jen`) is handed by its
@@ -1029,6 +1060,14 @@ impl Templates {
             .asset(name_hash(DAMAGE_TABLE), DAMAGE_TABLE_TYPE)
             .ok()
             .and_then(|d| DamageTable::parse(&d));
+        let key_table = |source: &mut AssetSource<R>, name: &str| {
+            source
+                .asset(name_hash(name), DAMAGE_TABLE_TYPE)
+                .ok()
+                .and_then(|d| crate::tuning::KeyTable::parse(&d))
+        };
+        let particle_table = key_table(source, crate::tuning::PARTICLE_TABLE);
+        let sound_table = key_table(source, crate::tuning::SOUND_TABLE);
         let model_of = db.hashes("ModelName");
         let engines = engine_banks(&db);
         let mut kinds: HashMap<u32, VehicleKind> = HashMap::new();
@@ -1156,18 +1195,24 @@ impl Templates {
             gravity_scales: crate::durability::gravity_scales(&db),
             projectiles: crate::durability::projectiles(&db),
             modifiers: crate::durability::modifier_keys(&db),
+            fake_masses: crate::durability::fake_masses(&db),
             health: crate::tuning::healths(&db),
             speeds: crate::tuning::human_speeds(&db),
             swim_speeds: crate::tuning::human_swim_speeds(&db),
             human_motion: crate::tuning::human_motion(&db),
             cover_hints: crate::tuning::cover_hints(&db),
             human_sets: crate::tuning::human_animation_sets(&db),
+            face_actors: crate::tuning::face_actors(&db),
+            camera_modifiers: crate::tuning::camera_modifiers(&db),
             guns: crate::tuning::hand_guns(&db),
             equipment: crate::tuning::equipment(&db),
             arms: crate::weapons::read(&db),
             localized: localized_names(&db),
             faction_markers: faction_markers(&db),
             damage,
+            particle_table,
+            sound_table,
+            particle_keys: crate::durability::particle_keys(&db),
             blast_scripts: HashMap::new(),
         };
         for (id, script) in db.hashes("ObjectScript") {
