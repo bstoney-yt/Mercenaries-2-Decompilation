@@ -1422,6 +1422,8 @@ pub struct Npc {
     /// speed they go as it builds, their turn's speed and the slide to a
     /// stop after a run.
     pub motion: m2_engine::on_foot::HumanMotion,
+    /// Where a fall started, for its damage ([`m2_engine::on_foot::fall_impact`]).
+    fall: m2_engine::on_foot::FallWatch,
     ground: Vec2,
     /// The speed they last moved at (m/s): what a stall is judged by.
     pushed: f32,
@@ -1678,6 +1680,7 @@ impl Npc {
             cover_spot: None,
             cover_retry: 0.0,
             motion: m2_engine::on_foot::HumanMotion::default(),
+            fall: m2_engine::on_foot::FallWatch::default(),
             ground: Vec2::ZERO,
             pushed: 0.0,
             dither: Default::default(),
@@ -2445,6 +2448,24 @@ impl Npc {
         let before = self.character.position;
         physics.move_character(&mut self.character, wanted, None, dt);
         let now = self.character.position;
+        // A fall that hurts, as the 360 has every person's (0x82205F20,
+        // [`m2_engine::on_foot::fall_impact`]): by their template's fall
+        // limits, its damage; a deadly one (1,000,000) kills, and the
+        // dead go limp (`Die` is `FULL`). The light and heavy falls'
+        // messages lead to clips (`FallImpactLight`/`Heavy`, mode
+        // `NONE`), not played here.
+        if let Some((d, fell)) = self
+            .fall
+            .step(!self.character.grounded, now.y)
+            .and_then(|d| m2_engine::on_foot::fall_impact(&self.motion.falls, d).map(|f| (d, f)))
+        {
+            eprintln!(
+                "people: {:08x} falls {d:.1} m for {} damage",
+                self.spawn.unwrap_or(0),
+                fell.damage
+            );
+            self.hurt(fell.damage, Vec3::ZERO);
+        }
         // In it deeper than a wade, or over ground that is (stepping off a
         // dock or a bank): back where they were, unless they were in it
         // already (then they may walk out). Well above the water (no ground
@@ -9076,6 +9097,51 @@ pub(crate) mod tests {
         assert!(npc.landed);
         let p = npc.character.position;
         assert!(p.y >= -1.0 - WET && p.z < 6.0, "{p}");
+    }
+
+    /// A person falls as the 360 has every person fall (0x82205F20): a
+    /// short drop costs nothing, past their deadly height they die (and
+    /// go limp).
+    #[test]
+    fn a_deadly_fall_kills_and_a_short_one_does_not() {
+        let mut rng = Rng::default();
+        let mut physics = Physics::new();
+        let v = [
+            Vec3::new(-50.0, 0.0, -50.0),
+            Vec3::new(50.0, 0.0, -50.0),
+            Vec3::new(50.0, 0.0, 50.0),
+            Vec3::new(-50.0, 0.0, 50.0),
+        ];
+        let shape = CollisionShape::mesh(&v, &[[0, 2, 1], [0, 3, 2]]).unwrap();
+        physics.add_static(StaticKey::Cell(1), &shape, Vec3::ZERO, Quat::IDENTITY);
+        physics.step(1.0 / 60.0);
+        let drop = |height: f32, rng: &mut Rng| {
+            // Stood on the ground, then off a height (a ledge's).
+            let mut npc = Npc::new(
+                0,
+                &rig(),
+                Vec3::ZERO,
+                0.0,
+                Brain::Post { facing: 0.0 },
+                Some(3),
+            );
+            for _ in 0..30 {
+                npc.update(&physics, rng, None, 1.0 / 60.0);
+            }
+            assert!(npc.landed);
+            npc.character.position.y = height;
+            for _ in 0..60 * 5 {
+                npc.update(&physics, rng, None, 1.0 / 60.0);
+            }
+            npc
+        };
+        let short = drop(0.5, &mut rng);
+        assert!(short.alive, "{}", short.hp);
+        let deadly = drop(
+            m2_engine::on_foot::FallLimits::default().death + 6.0,
+            &mut rng,
+        );
+        assert!(!deadly.alive);
     }
 
     // Soldiers walked the sea bed instead of swimming. Out of their depth
