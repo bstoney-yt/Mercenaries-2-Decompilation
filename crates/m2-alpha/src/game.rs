@@ -2412,6 +2412,7 @@ impl Game {
                     trigger.seat = false;
                 }
                 self.combat.step(&mut field, trigger, dt);
+                limp_camera(&mut field, intent.look, dt);
             });
             crate::spans::time("on foot: vehicles hit her", || {
                 self.combat.vehicles_hit_her(&mut field, dt);
@@ -6511,4 +6512,38 @@ fn vehicle_hint(t: &m2_engine::tuning::VehicleTuning) -> m2_engine::ai_target::H
 fn vehicle_threat(spec: &m2_engine::vehicle::VehicleSpec) -> f32 {
     let hints = spec.armed.iter().filter_map(|m| m.weapon.hint.as_ref());
     m2_engine::ai_target::threat(hints, m2_engine::ai_target::HUMAN, 0.0, true)
+}
+
+/// The look's turn a frame that counts as the stick pushed all the way, a
+/// second (Invented: the alpha's look is a turn, not the stick's push; a
+/// half turn a second is taken as full).
+const LIMP_LOOK_FULL: f32 = std::f32::consts::PI;
+
+/// While her body lies limp, the 360's ragdoll camera
+/// ([`m2_engine::ragdoll_camera`]) takes over from her chase camera,
+/// starting from its heading, and looks at her body's first node; once
+/// she is up, her chase camera is back.
+fn limp_camera(field: &mut Field<'_>, look: Vec2, dt: f32) {
+    let p = &mut *field.player;
+    let at = p
+        .ragdoll
+        .and_then(|id| field.physics.ragdoll_nodes(id))
+        .and_then(|n| n.first().map(|m| m.w_axis.truncate()));
+    let Some(at) = at else {
+        p.limp_camera = None;
+        p.limp_view = None;
+        return;
+    };
+    let heading = p.yaw;
+    let c = p
+        .limp_camera
+        .get_or_insert_with(|| m2_engine::ragdoll_camera::RagdollCamera::start(heading));
+    let full = (LIMP_LOOK_FULL * dt).max(1e-6);
+    // The stick's +x turns the heading down; the look's +x turns it up.
+    c.look([
+        (-look.x / full).clamp(-1.0, 1.0),
+        (look.y / full).clamp(-1.0, 1.0),
+    ]);
+    c.step(dt);
+    p.limp_view = Some(c.view(at));
 }

@@ -452,6 +452,10 @@ pub struct Player {
     /// plain `Die` has no clip and makes a person a ragdoll at once
     /// ([`crate::combat::Combat`] makes it and takes it away).
     pub ragdoll: Option<m2_engine::RagdollId>,
+    /// While she lies limp: the 360's camera for it
+    /// ([`m2_engine::ragdoll_camera`]) and where it looks from and along.
+    pub limp_camera: Option<m2_engine::ragdoll_camera::RagdollCamera>,
+    pub limp_view: Option<(Vec3, Vec3)>,
     /// The expressions on her face ([`m2_engine::face_expression`]): she
     /// blinks from the start, as everyone does (0x8241F360), her mouth
     /// flaps while a line of hers plays, and a stagger shows `Angry`.
@@ -686,6 +690,8 @@ impl Player {
             fell: None,
             seated: false,
             ragdoll: None,
+            limp_camera: None,
+            limp_view: None,
             face: {
                 let mut face = m2_engine::face_expression::Face::default();
                 face.play(
@@ -2099,6 +2105,17 @@ impl Player {
                 self.look_at(),
                 self.camera_forward(),
                 crate::binoculars::magnified(tall, z).to_radians(),
+                aspect,
+                NEAR,
+                FAR,
+            );
+        }
+        // Limp, the 360's ragdoll camera looks at her body.
+        if let Some((eye, forward)) = self.limp_view {
+            return View::perspective(
+                eye,
+                forward,
+                fov_y(fov_degrees.to_radians(), aspect),
                 aspect,
                 NEAR,
                 FAR,
