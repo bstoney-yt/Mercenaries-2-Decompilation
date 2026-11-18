@@ -44,7 +44,7 @@ Route files are one step per line (`#` comments):
     pokef <table> <handle|hero> <off> <f>  set a float in a handle table entry (runtime data)
     lowhp <health> <secs> <name>   hold her health there; shots, camera shake spread
     nearlog start <x> <z> <r> <name> | stop  log what was within r m of a point (vehicle + cargo)
-    wreckwith <health|-> <drive s>  wreck her vehicle with her in it (health pokes); log her health
+    wreckwith <health|-> <drive s> [<car health, 0 = leave>]  wreck her vehicle with her in it (health pokes); log her health
     poke <hex addr> <byte>         set a guest data byte (runtime flag only)
     trackhero                      follow the player's character by the 360 code's tables (xmem.Hero)
     trackfoot <x> <y> <z>|here     as track, for the hero on foot (here: where track was)
@@ -797,6 +797,55 @@ def run(args) -> int:
                             say(f"stickresp {'moving' if ly else 'standing'} r{axis}={v:+.2f}: yaw {dy / (tb - ta):+7.1f} deg/s, pitch {(pb - pa) / (tb - ta):+6.1f} deg/s (pitch now {pb:+.1f})")
                         time.sleep(1.0)
                 apply()
+            elif op == "stickresp2":
+                # stickresp2 <name> [<axis values...>]: from a level view (pitch
+                # brought within 2 deg of 0 first), hold the right stick 3 s at each
+                # value (e.g. x0.5 x1 y-1), sampling the camera's yaw/pitch as fast
+                # as it reads (~50 Hz); says the mean yaw and pitch rate over
+                # 0-0.5, 0.5-1 and 2.5-3 s and the pitch at the end; every sample to
+                # <out>/<name>.csv.
+                import csv
+                import xmem
+
+                cam = xmem.Camera(xmem.Guest(p.pid))
+                name = w[1]
+                vals = w[2:] or ["x0.5", "x0.75", "x1", "x-1", "y0.5", "y0.75", "y1", "y-0.5", "y-0.75", "y-1"]
+                with open(Path(args.out) / f"{name}.csv", "w", newline="") as fh:
+                    wr = csv.writer(fh)
+                    wr.writerow(["hold", "t", "yaw", "pitch"])
+                    for hv in vals:
+                        axis, v = hv[0], float(hv[1:])
+                        lv = time.time() + 6
+                        while time.time() < lv:
+                            pv = cam.pitch()
+                            if pv is None or abs(pv) < 2:
+                                break
+                            apply(0, 0, 0, 0.0, 0.0, 0.0, max(-1.0, min(1.0, -pv / 25)) if abs(pv) > 6 else (-0.6 if pv > 0 else 0.6))
+                            time.sleep(0.03)
+                        apply()
+                        time.sleep(1.0)
+                        t_s, smp, uy, last = time.time(), [], 0.0, None
+                        apply(0, 0, 0, 0.0, 0.0, v if axis == "x" else 0.0, v if axis == "y" else 0.0)
+                        while time.time() - t_s < 3.0:
+                            yv, pv = cam.yaw(), cam.pitch()
+                            if yv is not None and pv is not None:
+                                if last is not None:
+                                    uy += (yv - last + 180) % 360 - 180
+                                last = yv
+                                tt = time.time() - t_s
+                                smp.append((tt, uy, pv))
+                                wr.writerow([hv, f"{tt:.3f}", f"{uy:.3f}", f"{pv:.3f}"])
+                            time.sleep(0.01)
+                        apply()
+
+                        def rate(a, b, i):
+                            seg = [x for x in smp if a <= x[0] <= b]
+                            return (seg[-1][i] - seg[0][i]) / (seg[-1][0] - seg[0][0]) if len(seg) >= 2 and seg[-1][0] > seg[0][0] else float("nan")
+
+                        hz = len(smp) / 3.0
+                        say(f"stickresp2 {name} {hv}: {hz:.0f} Hz; yaw {rate(0, .5, 1):+6.1f} {rate(.5, 1, 1):+6.1f} {rate(2.5, 3, 1):+6.1f} deg/s; "
+                            f"pitch {rate(0, .5, 2):+6.1f} {rate(.5, 1, 2):+6.1f} {rate(2.5, 3, 2):+6.1f} deg/s; pitch at end {smp[-1][2] if smp else float('nan'):+.1f}")
+                        time.sleep(1.0)
             elif op == "airwatch":
                 # airwatch <dropx> <dropz> <secs> [<every_s> <name>]: every 0.25 s
                 # read the whole state table (xmem.state_entries) and log every
@@ -1121,18 +1170,21 @@ def run(args) -> int:
                     say("wreckwith: no vehicle record under her")
                 else:
                     ca = hm[car]
-                    g.write(ca + 4, struct.pack(">f", 1.0))
-                    say(f"wreckwith: hero {hero:#x} health {hcur:.2f}/{hmax:.2f}; vehicle {car:#x} health set 1 (max {struct.unpack('>f', g.read(ca, 4))[0]:.0f}); hold her at {hv}")
+                    cset = float(w[3]) if len(w) > 3 else 1.0
+                    if cset > 0:
+                        g.write(ca + 4, struct.pack(">f", cset))
+                    say(f"wreckwith: hero {hero:#x} health {hcur:.2f}/{hmax:.2f}; vehicle {car:#x} health set {cset} (0 = left) (max {struct.unpack('>f', g.read(ca, 4))[0]:.0f}); hold her at {hv}")
                     st = time.time()
                     apply(BTN["a"])
-                    while time.time() - st < 60:
+                    while time.time() - st < 120:
                         if time.time() - st > drive:
                             apply()
-                        if hv is not None:
-                            g.write(hm[hero] + 4, struct.pack(">f", hv))
+                        # the vehicle first: a hold written after its death would hide her damage
                         cv = struct.unpack(">f", g.read(ca + 4, 4))[0]
                         if cv <= 0:
                             break
+                        if hv is not None:
+                            g.write(hm[hero] + 4, struct.pack(">f", hv))
                         time.sleep(0.05)
                     apply()
                     before = struct.unpack(">f", g.read(hm[hero] + 4, 4))[0]
@@ -1143,7 +1195,9 @@ def run(args) -> int:
                         hc = hh.character()
                         cur = xmem.map_entries(g, 0x83656558).get(hc)
                         v = struct.unpack(">f", g.read(cur + 4, 4))[0] if cur else float("nan")
-                        say(f"wreckwith: +{time.time() - st:.1f} s her health {v:.2f} at ({hp_now[0]:.2f}, {hp_now[1]:.2f}, {hp_now[2]:.2f}) char {hc and hex(hc)}")
+                        csa = hh.state_addr(car)
+                        cp = struct.unpack(">3f", g.read(csa, 12)) if csa else (float("nan"),) * 3
+                        say(f"wreckwith: +{time.time() - st:.1f} s her health {v:.2f} at ({hp_now[0]:.2f}, {hp_now[1]:.2f}, {hp_now[2]:.2f}) vehicle at ({cp[0]:.2f}, {cp[1]:.2f}, {cp[2]:.2f})")
             elif op == "poke":
                 # poke <guest hex address> <byte>: set one guest data byte, a
                 # runtime flag (never code, the XEX or files). E.g. 0x83134382 =
