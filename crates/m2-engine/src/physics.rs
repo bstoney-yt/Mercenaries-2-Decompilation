@@ -2407,8 +2407,9 @@ impl Tracks {
 struct Rest {
     /// Where its centre of mass was at the last check (world).
     from: Option<Vec3>,
-    /// Seconds since the last check.
-    clock: f32,
+    /// The world's check its last check was ([`REST_PERIOD`]s of the
+    /// physics' time): every body is checked on the same step.
+    check: Option<i64>,
     /// Checks in a row it has kept within the distance.
     still: u8,
     /// Its body was put to sleep (or found asleep).
@@ -2421,14 +2422,36 @@ const REST_DISTANCE: f32 = 0.02;
 const REST_CHECKS: u8 = 6;
 
 impl Rest {
-    /// One step of `dt` s at `centre`: whether it now sleeps.
-    fn step(&mut self, centre: Vec3, dt: f32) -> bool {
-        let from = *self.from.get_or_insert(centre);
-        self.clock += dt;
-        if self.clock + 1e-6 < REST_PERIOD {
+    /// One step, the physics' time `now`, at `centre`: whether it may
+    /// sleep at this step.
+    ///
+    /// From the 360 code: the island check 0x824CE9C8 reads each body's
+    /// two 7-bit still counts (its motion's +0xDC and +0xDA, each tagged in
+    /// its top bits with the world's check index, +0x2C6 and +0x2C5) and
+    /// keeps the island awake while any body's larger count is under 6.
+    /// The check index is the world's: every body is checked on the same
+    /// step, and an island may sleep only then. Here the check index is
+    /// the physics' time in [`REST_PERIOD`]s, the same for every body.
+    /// Inferred, not traced: that a body's count goes up by one a check
+    /// it kept within [`REST_DISTANCE`] and back to 0 otherwise (the
+    /// integrator's update of +0xDC/+0xDA is not read).
+    ///
+    /// Before, each body had its own clock from when it was made: two
+    /// touching, their checks on different steps, were never both allowed
+    /// on one step and their island never slept (q753e: two pairs of
+    /// placed objects standing in each other, awake after 10 s).
+    fn step(&mut self, centre: Vec3, now: f32) -> bool {
+        let k = (now / REST_PERIOD).floor() as i64;
+        let Some(last) = self.check else {
+            self.check = Some(k);
+            self.from = Some(centre);
+            return false;
+        };
+        if k == last {
             return false;
         }
-        self.clock -= REST_PERIOD;
+        self.check = Some(k);
+        let from = self.from.unwrap_or(centre);
         self.still = if (centre - from).length() < REST_DISTANCE {
             self.still.saturating_add(1)
         } else {
@@ -3599,6 +3622,7 @@ impl Physics {
     pub fn step(&mut self, dt: f32) {
         self.world.integration_parameters.dt = dt;
         self.time += dt;
+        let now = self.time;
         let w = &mut self.world;
         for v in self.vehicles.iter_mut().flatten() {
             v.before = w
@@ -3635,7 +3659,7 @@ impl Physics {
                 // is never put to sleep alone: rapier would go on moving
                 // it (gravity) while its tracks no longer hold it up
                 // (PmcCon001: the villa tank fell through the HQ's floor).
-                let still = !v.wrecked && tank.rest.step(vec3(b.center_of_mass()), dt);
+                let still = !v.wrecked && tank.rest.step(vec3(b.center_of_mass()), now);
                 rest_hand_off(b, still);
             }
             // A car's body sleeps the same way: no set-up of a car calls
@@ -3657,7 +3681,7 @@ impl Physics {
                 if v.rest.asleep {
                     v.rest.wake();
                 }
-                let still = !v.wrecked && v.rest.step(vec3(b.center_of_mass()), dt);
+                let still = !v.wrecked && v.rest.step(vec3(b.center_of_mass()), now);
                 rest_hand_off(b, still);
             }
             let filter = ground().exclude_rigid_body(v.controller.chassis);
@@ -10494,7 +10518,7 @@ mod tests {
         let dt = 1.0 / 60.0;
         let mut still = Rest::default();
         let steps = |r: &mut Rest, speed: f32| {
-            (1..=120).find(|&i| r.step(Vec3::Z * speed * i as f32 * dt, dt))
+            (1..=120).find(|&i| r.step(Vec3::Z * speed * i as f32 * dt, i as f32 * dt))
         };
         // Still: the first check sets where it stands, then six in a row
         // within 0.02 m (each 0.2 s): asleep at 1.2 s.
@@ -10505,6 +10529,30 @@ mod tests {
         // At 0.05 m/s (0.01 m a check) it still sleeps.
         let mut slow = Rest::default();
         assert_eq!(steps(&mut slow, 0.05), Some(72));
+        // Two bodies made at different times are checked on the same
+        // steps (the world's check index), so both may sleep on one step;
+        // never between checks.
+        let mut a = Rest::default();
+        let mut b = Rest::default();
+        let mut both = None;
+        for i in 1..=200 {
+            let now = i as f32 * dt;
+            let x = a.step(Vec3::ZERO, now);
+            let y = if i > 7 {
+                b.step(Vec3::ZERO, now)
+            } else {
+                false
+            };
+            assert_eq!(
+                x || y,
+                (x || y) && i % 12 == 0,
+                "allowed off a check, step {i}"
+            );
+            if x && y {
+                both.get_or_insert(i);
+            }
+        }
+        assert!(both.is_some(), "never both on one step");
     }
 
     #[test]
@@ -10546,11 +10594,9 @@ mod tests {
     /// 10 s, and whether it ends asleep. `turret`: a
     /// turret on its own body on a hinge, turned at that many radians a
     /// second (0: kept still).
-    fn parked_tank(
-        shape_floor: Option<f32>,
-        degrees: f32,
-        turret: Option<f32>,
-    ) -> (f32, usize, (f32, bool)) {
+    /// An AMX-30-like tank for the rest tests ([`parked_tank`]): its hull
+    /// shape from `shape_floor` up, a turret if `turret`.
+    fn test_tank(shape_floor: Option<f32>, turret: bool) -> VehicleSpec {
         use crate::vehicle::WheelSpec;
         let mut spec = tank();
         spec.wheels = [-2.3f32, 0.0, 2.3]
@@ -10595,7 +10641,7 @@ mod tests {
             })
             .unwrap_or_default()
             .into();
-        if turret.is_some() {
+        if turret {
             spec.turret_shapes = vec![box_points(
                 Vec3::new(-1.0, 1.6, -1.0),
                 Vec3::new(1.0, 2.4, 1.0),
@@ -10617,6 +10663,71 @@ mod tests {
                 yaw: None,
             });
         }
+        spec
+    }
+
+    /// Two empty cars standing touching each other sleep together: each
+    /// one's still count stays set between its checks, as the 360's body
+    /// counters do (0x824CE9C8: an island stays awake while any body's is
+    /// under 6), though their checks fall on different steps.
+    #[test]
+    fn two_touching_empty_cars_sleep_together() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
+        p.step(DT);
+        let a = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        // Its checks a step and a bit behind the first's.
+        for _ in 0..7 {
+            p.drive(a, VehicleControls::default());
+            p.step(DT);
+        }
+        let b = p.add_vehicle(&car(), Vec3::new(1.98, 0.1, 0.0), 0.0);
+        let mut both = None;
+        for i in 0..(10.0 / DT) as usize {
+            p.drive(a, VehicleControls::default());
+            p.drive(b, VehicleControls::default());
+            p.step(DT);
+            if both.is_none() && p.vehicle_asleep(a) && p.vehicle_asleep(b) {
+                both = Some(i);
+            }
+        }
+        assert!(both.is_some(), "the two touching cars never slept");
+    }
+
+    /// An empty tank with an empty car standing against it sleeps with
+    /// it (their island, as the cars' above).
+    #[test]
+    fn an_empty_tank_and_a_car_against_it_sleep_together() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
+        p.step(DT);
+        let tank = p.add_vehicle(&test_tank(Some(0.38), false), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        for _ in 0..7 {
+            p.drive(tank, VehicleControls::default());
+            p.step(DT);
+        }
+        let car = p.add_vehicle(&car(), Vec3::new(2.58, 0.1, 0.0), 0.0);
+        let mut both = None;
+        for i in 0..(12.0 / DT) as usize {
+            p.drive(tank, VehicleControls::default());
+            p.drive(car, VehicleControls::default());
+            p.step(DT);
+            if both.is_none() && p.vehicle_asleep(tank) && p.vehicle_asleep(car) {
+                both = Some(i);
+            }
+        }
+        assert!(
+            both.is_some(),
+            "the tank and the car against it never slept"
+        );
+    }
+
+    fn parked_tank(
+        shape_floor: Option<f32>,
+        degrees: f32,
+        turret: Option<f32>,
+    ) -> (f32, usize, (f32, bool)) {
+        let spec = test_tank(shape_floor, turret.is_some());
         let mut p = Physics::new();
         let tilt = Quat::from_rotation_x(-degrees.to_radians());
         let half = 200.0;
