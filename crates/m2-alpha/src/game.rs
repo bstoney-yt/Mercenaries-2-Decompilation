@@ -5284,14 +5284,17 @@ fn blast_loose(world: &mut World, props: &mut Props, pushes: &[BlastPush], strik
                 props.blast_thrown(&mut world.physics, e);
             }
         }
-        // The island's placed objects that are bodies of their own: the
-        // same, by their model's box where their first body lies.
+        // The island's placed objects that are bodies of their own:
+        // pushed where they lie, as a blast pushes any moving body it
+        // reaches (0x8215C560 -> 0x8215CBC8), and handed to the disposer
+        // as every object a blast pushes is (0x82289F40 -> 0x82246A08).
         let island: Vec<(usize, Vec<m2_engine::DebrisId>)> = world
             .as_bodies()
             .map(|(i, ids)| (i, ids.to_vec()))
             .collect();
         for (i, ids) in island {
-            let Some(at) = ids.first().and_then(|d| world.physics.debris_place(*d)) else {
+            let Some(&first) = ids.first() else { continue };
+            let Some(at) = world.physics.debris_place(first) else {
                 continue;
             };
             let centre = at.w_axis.truncate();
@@ -5310,6 +5313,10 @@ fn blast_loose(world: &mut World, props: &mut Props, pushes: &[BlastPush], strik
             for d in ids {
                 world.physics.push_debris(d, velocity);
             }
+            props.island_thrown(&mut world.physics, i, first, half.length());
+        }
+        for i in props.take_disposed_island() {
+            world.dispose(i);
         }
         // Props that are bodies of their own: pushed where they now lie,
         // as a blast pushes any moving body it reaches (0x8215C560 ->

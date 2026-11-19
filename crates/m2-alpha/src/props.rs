@@ -241,6 +241,13 @@ pub struct Props {
     /// Vehicles (by index) and prop bodies in contact the step before
     /// ([`met_bodies`](Self::met_bodies)).
     bumping: HashSet<(usize, DebrisId)>,
+    /// The island's placed objects blasts threw, held by the disposer
+    /// too (keys with the top bit set: [`ISLAND`]): each one's first body
+    /// and half its box, for how big it looks.
+    island_thrown: HashMap<u32, (DebrisId, f32)>,
+    /// The island's placed objects the disposer took away, for the world
+    /// to remove ([`take_disposed_island`](Self::take_disposed_island)).
+    disposed_island: Vec<usize>,
 }
 
 /// A prop's parts' states applied ([`Props::apply_states`]): which nodes
@@ -262,6 +269,10 @@ pub struct Applied {
 /// A prop that is a body of its own near a blast ([`Props::bodies_near`]):
 /// its entity, its template, its bodies and its box as it now stands.
 pub type BodyNear = (u32, u32, Vec<DebrisId>, (Vec3, Vec3));
+
+/// The disposer's keys for the island's placed objects: the object's index
+/// with this bit set (a prop's entity never has it).
+pub const ISLAND: u32 = 0x8000_0000;
 
 /// Which parts of a prop are broken ([`m2_engine::ModelParts`]), and the
 /// nodes hidden for it.
@@ -1022,24 +1033,53 @@ impl Props {
     pub fn blast_thrown(&mut self, physics: &mut Physics, entity: u32) {
         self.thrown += 1;
         let seen = self.seen(physics, entity).unwrap_or(0.0);
-        match self.disposer.admit(entity, self.clock, seen) {
-            m2_engine::disposer::Admit::Disposing(old) => {
-                eprintln!(
-                    "props: the disposer takes {old:#x} away for {entity:#x} ({} held)",
-                    self.disposer.len()
-                );
+        self.dispose_for(physics, entity, seen);
+    }
+
+    /// A blast threw the island's placed object `i` (a body of its own):
+    /// the disposer holds it as it holds props (`first` its first body,
+    /// `half` half its box's diagonal).
+    pub fn island_thrown(&mut self, physics: &mut Physics, i: usize, first: DebrisId, half: f32) {
+        self.thrown += 1;
+        let key = i as u32 | ISLAND;
+        self.island_thrown.insert(key, (first, half));
+        let seen = self.seen(physics, key).unwrap_or(0.0);
+        self.dispose_for(physics, key, seen);
+    }
+
+    fn dispose_for(&mut self, physics: &mut Physics, key: u32, seen: f32) {
+        if let m2_engine::disposer::Admit::Disposing(old) =
+            self.disposer.admit(key, self.clock, seen)
+        {
+            eprintln!(
+                "props: the disposer takes {old:#x} away for {key:#x} ({} held)",
+                self.disposer.len()
+            );
+            if old & ISLAND != 0 {
+                self.island_thrown.remove(&old);
+                self.disposed_island.push((old & !ISLAND) as usize);
+            } else {
                 self.hide(physics, [old]);
-                self.disposed.push(old);
             }
-            m2_engine::disposer::Admit::Refused => {}
-            m2_engine::disposer::Admit::Taken => {}
+            self.disposed.push(old);
         }
+    }
+
+    /// The island's placed objects the disposer took away since last
+    /// asked: the world removes them.
+    pub fn take_disposed_island(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.disposed_island)
     }
 
     /// How big `entity` looks from the eye ([`m2_engine::disposer::seen_size`]):
     /// its first loose piece's place (where it was, if none) and half its
     /// model's box. `None` once it is gone.
     fn seen(&self, physics: &Physics, entity: u32) -> Option<f32> {
+        if entity & ISLAND != 0 {
+            let &(first, half) = self.island_thrown.get(&entity)?;
+            let at = physics.debris_place(first)?.w_axis.truncate();
+            return Some(m2_engine::disposer::seen_size(half, at.distance(self.eye)));
+        }
         let p = self.shown.get(&entity)?;
         let m = self.models.get(&p.model)?.as_ref()?;
         let (lo, hi) = m.gpu.bounds;

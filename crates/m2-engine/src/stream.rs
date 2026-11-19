@@ -956,6 +956,16 @@ impl World {
         made
     }
 
+    /// Takes placed object `i`, a body of its own, away: its bodies go and
+    /// it is no longer drawn (the disposer took it, [`crate::disposer`]).
+    pub fn dispose(&mut self, i: usize) {
+        for d in self.knocked.remove(&i).into_iter().flatten() {
+            self.physics.remove_debris(d);
+        }
+        self.as_body.remove(&i);
+        self.taken.insert(i);
+    }
+
     /// The placed objects that are bodies of their own from the start
     /// ([`bodies_on`](Self::bodies_on)): each object and its bodies.
     pub fn as_bodies(&self) -> impl Iterator<Item = (usize, &[DebrisId])> + '_ {
