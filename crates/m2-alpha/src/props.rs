@@ -214,6 +214,11 @@ pub struct Props {
     pub physics_props: HashMap<u32, m2_engine::durability::PropPhysics>,
     /// Shown since their model came in, their collision not yet up.
     unwalled: HashSet<u32>,
+    /// Put up by the scripts from a template with no physics component
+    /// ([`m2_engine::durability::physical`]): drawn, but with no
+    /// collision, as on the 360 (the paradrop plane, whose jumpers are
+    /// made inside it: q618g, 7 of 16 stood on it at 123 m).
+    bodiless: HashSet<u32>,
     /// Those a vehicle broke some parts of, a part at a time (a hedge's
     /// sections, a gate's leaf): which parts, and the nodes that hides.
     parts_down: HashMap<u32, PartsDown>,
@@ -528,12 +533,34 @@ impl Props {
 
     /// Puts up a prop the scripts make (`Pg.Spawn`), placed as `o` says,
     /// as a layer's would be ([`show`](Self::show)). False if it is up.
+    /// One whose template has no physics component gets no collision
+    /// ([`bodiless`](Self::bodiless)).
     pub fn show_spawned(&mut self, install: &Install, db: &Templates, o: &ObjectPlacement) -> bool {
+        self.note_bodiless(db, o);
         let up = self.put_up(db, o, false);
         if !self.waiting.is_empty() && self.loaders.is_none() {
             self.loaders = Some(Loaders::start(install));
         }
         up
+    }
+
+    /// Notes `o`, which the scripts made, as [`bodiless`](Self::bodiless)
+    /// if its template has no physics component.
+    fn note_bodiless(&mut self, db: &Templates, o: &ObjectPlacement) {
+        if !db.physical.contains(&o.template) {
+            self.bodiless.insert(o.entity);
+        }
+    }
+
+    /// Whether `e`, shown as `p`, has its collision up once its model is
+    /// in: not adopted by the destruction, wrecked, bodiless, knocked
+    /// loose or swinging open.
+    fn walled(&self, e: u32, p: &Prop) -> bool {
+        stands(e)
+            && !p.wrecked
+            && !self.bodiless.contains(&e)
+            && !self.knocked.contains_key(&e)
+            && !self.swings.contains_key(&e)
     }
 
     /// Puts up `o` (as its entity), its model asked for. False if it is up.
@@ -645,6 +672,7 @@ impl Props {
             self.parts_down.remove(&e);
             self.swings.remove(&e);
             self.sinking.remove(&e);
+            self.bodiless.remove(&e);
             let broken = self.broken.remove(&e).into_iter().flatten();
             let riding = self.cargo.remove(&e).map(|r| r.piece);
             for d in self
@@ -1423,6 +1451,7 @@ impl Props {
             && let Some(shape) = &m.collision
             && !p.wrecked
             && stands(entity)
+            && !self.bodiless.contains(&entity)
         {
             physics.add_static_as(
                 StaticKey::Entity(entity),
@@ -1946,10 +1975,7 @@ impl Props {
                 continue;
             }
             if let Some(shape) = shape
-                && stands(e)
-                && !p.wrecked
-                && !self.knocked.contains_key(&e)
-                && !self.swings.contains_key(&e)
+                && self.walled(e, p)
                 && !physics.has_static(StaticKey::Entity(e))
             {
                 physics.add_static_as(
@@ -2110,7 +2136,11 @@ impl Props {
                 if through_on_island(p, shape) {
                     through.push(format!("{e:#x} (template {:08x})", p.template));
                 }
-                if !p.wrecked && !self.knocked.contains_key(&e) && !self.swings.contains_key(&e) {
+                // As at every other place its collision goes up
+                // ([`walled`](Self::walled)): q618h, the paradrop plane's
+                // model coming in after it was shown put its collision up
+                // here, bodiless or not.
+                if self.walled(e, p) {
                     physics.add_static_as(
                         StaticKey::Entity(e),
                         shape,
@@ -2918,6 +2948,36 @@ mod tests {
     }
     use super::*;
     use m2_engine::{CollisionShape, LoosePiece};
+
+    // A prop the scripts make from a template with no physics component
+    // (the paradrop plane) is drawn but stands in nobody's way; one whose
+    // template has one (a `_PropPhysics` crate) is in the way as before.
+    #[test]
+    fn a_scripted_prop_without_physics_has_no_collision() {
+        let mut db = Templates::default();
+        db.physical.insert(2);
+        let mut props = Props::default();
+        let place = |entity, template| ObjectPlacement {
+            entity,
+            template,
+            model: 7,
+            position: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            named: false,
+            fade: None,
+        };
+        for (e, t) in [(10, 1), (20, 2)] {
+            let o = place(e, t);
+            props.note_bodiless(&db, &o);
+            props.put_up(&db, &o, false);
+        }
+        assert!(!props.walled(10, &props.shown[&10]), "the plane");
+        assert!(props.walled(20, &props.shown[&20]), "the crate");
+        assert!(props.shown.contains_key(&10), "still drawn");
+        let mut physics = Physics::new();
+        props.hide(&mut physics, [10]);
+        assert!(!props.bodiless.contains(&10));
+    }
 
     #[test]
     fn on_top_of_a_box_is_not_beside_it() {
