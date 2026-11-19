@@ -216,12 +216,25 @@ const LOOK_EVERY: f32 = 0.2;
 /// how close to where he last saw her he goes (inferred).
 const GIVE_UP: f32 = 20.0;
 const CLOSE_ENOUGH: f32 = 2.0;
-/// A chase stopped by a wall goes along it until the way on is open this
-/// far, metres, or for at most this long, seconds (invented).
-const DETOUR_OPEN: f32 = 2.5;
-const DETOUR_TIME: f32 = 4.0;
-/// The least he goes round before looking again, seconds (invented).
-const DETOUR_MIN: f32 = 1.0;
+/// A person's re-path (0x822BF7A8 -> 0x822BF5E0 -> 0x822BF400): a new way
+/// is searched for when the goal moved more than `REPATH_K` x his squared
+/// flat distance to it plus `REPATH_ADD` (squared, x/z) from the goal the
+/// way was found for (k at 0x820B8054); else the way's end is moved onto
+/// the goal once it moved more than `NUDGE` (squared, 0x820B7A44).
+const REPATH_K: f32 = 0.2;
+const REPATH_ADD: f32 = 0.4;
+const NUDGE: f32 = 0.01;
+/// The steer's easing near its target (0x822D19C8): within this, metres
+/// (0x82B7D82C), the speed is cut by `0.1 / (d + 0.1)`; a speed between
+/// 0.0001 and `SLOWEST` is lifted to it.
+const EASE_NEAR: f32 = 2.0;
+const SLOWEST: f32 = 0.1;
+/// A person's search height on foot, metres (0x822C1520: 0x820BB6AC).
+const SEARCH_HEIGHT: f32 = 1.5;
+/// Searches run a tick, at most (invented: the 360's search manager,
+/// 0x822E7CE0, steps its searches over several frames; how many was not
+/// read).
+const SEARCHES_A_TICK: usize = 4;
 /// Between steps about in a fight: seconds (at least, plus up to), how
 /// far a step goes, metres, and how close he pushes in to her (inferred).
 const STEP_GAP: (f32, f32) = (2.0, 3.0);
@@ -1308,10 +1321,8 @@ pub struct Npc {
     /// and the seconds since he was last hit.
     cover: Option<(Vec3, f32)>,
     hit: bool,
-    /// In a chase, a way round what stopped him: which way and for how
-    /// much longer; and the side (1 or -1, 0 for none yet) he went round.
-    detour: Option<(Vec3, f32)>,
-    detour_side: f32,
+    /// His way to where he is going ([`Route`]).
+    pub route: Route,
     /// Rounds left in the burst he is firing, and seconds since his last.
     burst: u32,
     since_shot: f32,
@@ -1695,8 +1706,7 @@ impl Npc {
             spotted: false,
             cover: None,
             hit: false,
-            detour: None,
-            detour_side: 0.0,
+            route: Route::default(),
             burst: 0,
             since_shot: f32::INFINITY,
             flee: None,
@@ -1791,7 +1801,7 @@ impl Npc {
                 self.flee = None;
                 self.step = None;
                 self.cover = None;
-                self.detour = None;
+                self.route = Route::default();
                 self.through = false;
             }
             Some(_) if depth < crate::player::SWIM_STOP => {
@@ -2713,6 +2723,60 @@ impl Npc {
         self.dither.mark_for(at, 10.0);
     }
 
+    /// The velocity his move toward `goal` at `speed` asks for this tick,
+    /// as the 360's steer gives it (0x822D19C8): at his way's point ahead
+    /// when he has a way ([`Route`]), else straight at the goal; flat;
+    /// eased within [`EASE_NEAR`] of it. Asks for a new way when the goal
+    /// has moved far enough ([`REPATH_K`]), else moves the way's end onto
+    /// it.
+    ///
+    /// Inferred: that people follow a way by the vehicles' lookahead
+    /// ([`m2_engine::path_search::lookahead`], 0x822E2770; the 360 reads
+    /// the route's current point, +0x2DC, whose stepping was not read);
+    /// that every on-foot move eases (the 360 eases when its caller asks).
+    /// Not ported: the "arrived" message within 3 m of the way's end
+    /// (nothing here waits on it).
+    fn steer_to(&mut self, goal: Vec3, speed: f32, dt: f32) -> Vec3 {
+        let at = self.character.position;
+        let flat = |v: Vec3| v.with_y(0.0);
+        let d2 = flat(goal - at).length_squared();
+        match self.route.goal {
+            Some(last) if flat(goal - last).length_squared() <= REPATH_K * d2 + REPATH_ADD => {
+                if flat(goal - last).length_squared() > NUDGE {
+                    if let Some(end) = self.route.way.as_mut().and_then(|w| w.points.last_mut()) {
+                        *end = goal;
+                    }
+                    self.route.goal = Some(goal);
+                }
+            }
+            _ => {
+                self.route = Route {
+                    goal: Some(goal),
+                    way: None,
+                    asked: true,
+                };
+            }
+        }
+        let point = match &self.route.way {
+            Some(w) if w.points.len() >= 2 => {
+                let ahead =
+                    m2_engine::path_search::lookahead(2.0 * self.character.radius, speed, dt);
+                w.ahead_of(at, ahead)
+            }
+            _ => goal,
+        };
+        let to = flat(point - at);
+        let d = to.length();
+        let mut s = speed;
+        if d < EASE_NEAR {
+            s *= 1.0 - 0.1 / (d + 0.1);
+        }
+        if s > 0.0001 && s < SLOWEST {
+            s = SLOWEST;
+        }
+        to * (s / (d + 0.01))
+    }
+
     /// The step's caller after a move given up with no path held
     /// (0x822B34A8): he stops dead, and his destination goes so that the
     /// behaviour picks again.
@@ -2721,7 +2785,7 @@ impl Npc {
         self.character.velocity.z = 0.0;
         self.ground = Vec2::ZERO;
         self.step = None;
-        self.detour = None;
+        self.route = Route::default();
         self.cover_spot = None;
     }
 
@@ -2855,7 +2919,7 @@ impl Npc {
             Some(spot) => {
                 let flat = (spot - at).with_y(0.0);
                 if flat.length() > 0.6 {
-                    wanted = flat.normalize() * to_cover;
+                    wanted = self.steer_to(spot, to_cover, dt);
                 }
                 true
             }
@@ -2865,33 +2929,19 @@ impl Npc {
             self.step = None;
         } else if !seen || distance > self.fire_hint().range {
             self.step = None;
-            let mut toward = (goal - at).with_y(0.0);
             // Where he last saw her, and she isn't there: on towards the
-            // fight, where she is (invented: he hears it).
-            if toward.length() <= CLOSE_ENOUGH {
-                toward = (threat - at).with_y(0.0);
-            }
-            // Going round what stopped him, until the way on is open.
-            if let Some((way, left)) = &mut self.detour {
-                *left -= dt;
-                let waist = at + Vec3::Y * 0.9;
-                let open = physics
-                    .cast_ray(waist, toward.normalize_or(Vec3::Z), DETOUR_OPEN)
-                    .is_none();
-                // Not given up the moment the way looks open: the thin
-                // look misses what is low, and he would turn back and forth
-                // between the wall and the way round (playtest 8).
-                if *left <= 0.0 || (open && *left < DETOUR_TIME - DETOUR_MIN) {
-                    self.detour = None;
-                } else {
-                    wanted = *way * self.push(self.ai.pursue_speed);
-                }
-            }
-            if self.detour.is_none() && toward.length() > CLOSE_ENOUGH {
-                wanted = toward.normalize() * self.push(self.ai.pursue_speed);
+            // fight, where she is (invented: he hears it). Along his way
+            // there ([`Npc::steer_to`]): the 360 has no way round of its
+            // own for a chase (the port's side-flipping detour is gone).
+            let dest = if (goal - at).with_y(0.0).length() <= CLOSE_ENOUGH {
+                threat
+            } else {
+                goal
+            };
+            if (dest - at).with_y(0.0).length() > CLOSE_ENOUGH {
+                wanted = self.steer_to(dest, self.push(self.ai.pursue_speed), dt);
             }
         } else {
-            self.detour = None;
             self.step_wait -= dt;
             if self.step.is_none() && self.step_wait <= 0.0 {
                 self.step_wait = STEP_GAP.0 + rng.range(0.0, STEP_GAP.1);
@@ -2918,11 +2968,12 @@ impl Npc {
             }
             if let Some((target, left)) = &mut self.step {
                 *left -= dt;
-                let flat = (*target - at).with_y(0.0);
+                let target = *target;
+                let flat = (target - at).with_y(0.0);
                 if *left <= 0.0 || flat.length() < 0.5 {
                     self.step = None;
                 } else {
-                    wanted = flat.normalize() * self.push(self.ai.combat_speed);
+                    wanted = self.steer_to(target, self.push(self.ai.combat_speed), dt);
                 }
             }
         }
@@ -2932,7 +2983,6 @@ impl Npc {
         let reach = 2.0 * self.character.radius + m2_engine::ai_close::REACH;
         if seen && !hiding && distance < reach && self.striking <= 0.0 {
             self.step = None;
-            self.detour = None;
             let toward = to.with_y(0.0).normalize_or_zero();
             match self.close.think(distance, self.ai.combat_speed, dt) {
                 m2_engine::ai_close::Close::Move(k) => {
@@ -2990,8 +3040,6 @@ impl Npc {
                 "to cover"
             } else if self.step.is_some() {
                 "stepping"
-            } else if self.detour.is_some() {
-                "going round"
             } else if seen && distance < reach {
                 "close in"
             } else {
@@ -3006,44 +3054,6 @@ impl Npc {
             );
             self.dither.mark(self.character.position);
             self.give_up_move();
-        }
-        if !gave_up && self.pushed > 0.3 && moved < 0.2 && self.stalled >= STALLED {
-            // Walked into something: stop stepping; a chase goes round it
-            // (along it the clearer way, or back if it is a corner) for a
-            // while, then on.
-            self.step = None;
-            let chasing = !hiding && (!seen || distance > self.fire_hint().range);
-            if chasing {
-                let waist = self.character.position + Vec3::Y * 0.9;
-                let clear = |d: Vec3| physics.cast_ray(waist, d, CLEAR).map_or(CLEAR, |(t, _)| t);
-                let way = match self.detour.take() {
-                    // The way round is blocked too: the other way.
-                    Some(_) => {
-                        self.detour_side = if self.detour_side > 0.0 { -1.0 } else { 1.0 };
-                        let ahead = (goal - at).with_y(0.0).normalize_or(Vec3::Z);
-                        Vec3::new(ahead.z, 0.0, -ahead.x) * self.detour_side
-                    }
-                    None => {
-                        let ahead = wanted.with_y(0.0).normalize_or(Vec3::Z);
-                        let side = Vec3::new(ahead.z, 0.0, -ahead.x);
-                        let (l, r) = (clear(side), clear(-side));
-                        // The side he went round last, while it is open;
-                        // else the clearer; back if it is a corner.
-                        if l.max(r) < 1.0 {
-                            -ahead
-                        } else {
-                            if self.detour_side == 0.0 || clear(side * self.detour_side) < 1.0 {
-                                self.detour_side = if l >= r { 1.0 } else { -1.0 };
-                            }
-                            side * self.detour_side
-                        }
-                    }
-                };
-                self.detour = Some((way, DETOUR_TIME));
-                // Turning to the way round takes them a moment
-                // ([`m2_engine::on_foot::steer`]): stalls count afresh.
-                self.stalled = 0;
-            }
         }
         let seen = seen && !hiding;
         let face = if seen || wanted == Vec3::ZERO {
@@ -3314,8 +3324,7 @@ impl Npc {
         self.last_seen = None;
         self.unseen = 0.0;
         self.step = None;
-        self.detour = None;
-        self.detour_side = 0.0;
+        self.route = Route::default();
         self.cover = None;
         self.hit = false;
     }
@@ -3753,6 +3762,45 @@ pub fn threat_reaction_seconds(
         length(c).is_some()
     })?;
     length(clip.clip)
+}
+
+/// A person's way to where he is going: the goal it was asked for, the
+/// way found (none yet, or none to be had: he goes straight at the goal,
+/// and a blocked straight line ends in the 8-swing give-up, as in the
+/// 360), and whether a search is wanted.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Route {
+    goal: Option<Vec3>,
+    way: Option<m2_engine::path_search::Way>,
+    asked: bool,
+}
+
+/// A path search's world for a person on foot: the physics, his hints.
+struct OnFoot<'a> {
+    physics: &'a Physics,
+    hints: crate::pursuers::Hints<'a>,
+}
+
+impl m2_engine::path_search::PathWorld for OnFoot<'_> {
+    fn sweep(
+        &mut self,
+        from: Vec3,
+        to: Vec3,
+        half: Vec3,
+    ) -> Option<m2_engine::path_search::Obstacle> {
+        self.physics.sweep_obstacle(from, to, half, None)
+    }
+    fn ground(&mut self, at: Vec3) -> Option<(Vec3, Option<u64>)> {
+        self.physics.path_ground(at, None)
+    }
+    fn hints(&mut self, id: u64) -> Vec<(u32, Vec3)> {
+        self.physics
+            .obstacle_key(id)
+            .map_or_else(Vec::new, self.hints)
+    }
+    fn body(&mut self, id: u64) -> Option<m2_engine::path_search::Obstacle> {
+        self.physics.obstacle(id)
+    }
 }
 
 /// Everyone on the island but the player.
@@ -4315,6 +4363,23 @@ pub fn in_ram(local: Vec3, (lo, hi): (Vec3, Vec3)) -> bool {
 }
 
 impl People {
+    /// A way for `npc` to the goal he asked for (0x822C1520: at his own
+    /// width, 1.5 m high on foot), through the path search vehicles use
+    /// ([`m2_engine::path_search`], manager 0x822E7CE0). None found, he
+    /// goes straight at the goal. Inferred: his width is his capsule's
+    /// (the 360 reads his own box's x extent, +0x2AC - +0x2A0).
+    fn find_way(physics: &Physics, hints: crate::pursuers::Hints<'_>, npc: &mut Npc) {
+        npc.route.asked = false;
+        let Some(goal) = npc.route.goal else { return };
+        let size = m2_engine::path_search::Size {
+            width: 2.0 * npc.character.radius,
+            height: SEARCH_HEIGHT,
+        };
+        let mut world = OnFoot { physics, hints };
+        npc.route.way =
+            m2_engine::path_search::find(&mut world, size, npc.character.position, goal);
+    }
+
     /// While he heads for a cover spot, his claim on it is made again each
     /// update from where he is, for its first
     /// [`m2_engine::ai_cover::CLAIM_AGE`] seconds (0x822C7CF0 ->
@@ -5346,6 +5411,7 @@ impl People {
     /// One fixed tick: people come and go around `focus`, then move;
     /// soldiers on alert fight the player at `threat` (her chest; `None`
     /// while she is down or not playing).
+    #[cfg(test)]
     pub fn update(
         &mut self,
         physics: &mut Physics,
@@ -5354,6 +5420,21 @@ impl People {
         threat: Option<Vec3>,
         dt: f32,
     ) {
+        self.update_with_hints(physics, spawns, focus, threat, &|_| Vec::new(), dt);
+    }
+
+    /// [`update`](Self::update), their path searches meeting the
+    /// `AiHintNode` points `hints` gives ([`crate::path_hints`]).
+    pub fn update_with_hints(
+        &mut self,
+        physics: &mut Physics,
+        spawns: &[SpawnPoint],
+        focus: Vec3,
+        threat: Option<Vec3>,
+        hints: crate::pursuers::Hints<'_>,
+        dt: f32,
+    ) {
+        let mut searches = 0;
         let mut lap = crate::spans::Lap::new();
         self.pursue(dt);
         lap.mark("people: pursuit");
@@ -5491,6 +5572,10 @@ impl People {
                 npc.update(physics, &mut self.rng, threat, dt)
             });
             Self::renew_cover_claim(&mut self.cover_claims, i as u32, npc, dt);
+            if npc.route.asked && searches < SEARCHES_A_TICK {
+                searches += 1;
+                Self::find_way(physics, hints, npc);
+            }
             let p = npc.character.position;
             crate::spans::time("people: checks", || {
                 self.checks
@@ -8922,21 +9007,19 @@ pub(crate) mod tests {
     }
 
     // Hit by her from behind a wall, a soldier chasing her goes round it
-    // and comes to see her, not stand against it.
+    // along the way the path search finds, and comes to see her, not
+    // stand against it.
     #[test]
     fn a_chase_goes_round_a_wall() {
         let mut physics = ground();
-        let shape = CollisionShape::mesh(
-            &[
-                Vec3::new(-5.0, -1.0, 6.0),
-                Vec3::new(5.0, -1.0, 6.0),
-                Vec3::new(5.0, 4.0, 6.0),
-                Vec3::new(-5.0, 4.0, 6.0),
-            ],
-            &[[0, 1, 2], [0, 2, 3], [0, 2, 1], [0, 3, 2]],
-        )
-        .unwrap();
-        physics.add_static(StaticKey::Cell(2), &shape, Vec3::ZERO, Quat::IDENTITY);
+        // A wall 10 m wide, 5 m high, across the way 6 m on.
+        let shape = CollisionShape::cuboid(Vec3::new(5.0, 2.5, 0.25));
+        physics.add_static(
+            StaticKey::Object(9),
+            &shape,
+            Vec3::new(0.0, 1.5, 6.0),
+            Quat::IDENTITY,
+        );
         let dt = 1.0 / 60.0;
         physics.step(dt);
         let mut rng = Rng::default();
@@ -8949,6 +9032,10 @@ pub(crate) mod tests {
         let mut saw = false;
         for _ in 0..60 * 12 {
             n.update(&physics, &mut rng, Some(her), dt);
+            // His way there, as `People` searches for it.
+            if n.route.asked {
+                People::find_way(&physics, &|_| Vec::new(), &mut n);
+            }
             saw |= n.sees(&physics, her, true);
         }
         assert!(n.alert, "still fighting");

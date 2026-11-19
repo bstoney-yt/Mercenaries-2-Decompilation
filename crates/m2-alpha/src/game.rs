@@ -2411,9 +2411,29 @@ impl Game {
         if let Some(world) = &mut self.scene.world
             && (!self.on_foot || self.scene.player.as_ref().is_none_or(|p| p.landed))
         {
-            self.scene
-                .people
-                .update(&mut world.physics, &world.index.spawns, focus, threat, dt);
+            // Their path searches meet the hinted objects' `AiHintNode`
+            // points, as the vehicles' do.
+            let (objects, props, path_hints) =
+                (&world.index.objects, &self.scene.props, &self.path_hints);
+            let hints = |key: StaticKey| {
+                path_hints.of(key, |k| match k {
+                    StaticKey::Object(i) => {
+                        objects.get(i).map(|o| (o.template, o.position, o.rotation))
+                    }
+                    StaticKey::Entity(e) => props
+                        .get(e)
+                        .map(|(p, _)| (p.template, p.position, p.rotation)),
+                    _ => None,
+                })
+            };
+            self.scene.people.update_with_hints(
+                &mut world.physics,
+                &world.index.spawns,
+                focus,
+                threat,
+                &hints,
+                dt,
+            );
             self.social.step(
                 &world.index,
                 &world.destroyed,
