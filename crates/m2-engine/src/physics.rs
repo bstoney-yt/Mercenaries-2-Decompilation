@@ -6102,6 +6102,18 @@ impl Physics {
             .map_or(0.0, |v| v.jolt)
     }
 
+    /// Vehicle `id`'s velocity one 360 update ago (the older of its
+    /// history's two, before any jolt [`vehicle_jolt`](Self::vehicle_jolt)
+    /// measures): the +0x140 the car physics keeps (0x8218A138), which its
+    /// crash ejection hands its riders.
+    pub fn vehicle_velocity_pre_jolt(&self, id: VehicleId) -> Vec3 {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .and_then(|v| v.history.map(|h| h[1]))
+            .unwrap_or(Vec3::ZERO)
+    }
+
     pub fn vehicle_velocity_before(&self, id: VehicleId) -> Vec3 {
         self.vehicles
             .get(id.0)

@@ -11789,6 +11789,13 @@ fn toss_check(game: &mut Game, tick: f32, mode: &str) {
             );
             world.physics.set_vehicle_velocity(id, ahead * 20.0);
             let (mut thrown, mut knocked, mut up, mut most) = (None, None, None, 0.0f32);
+            // After the toss: her body's (its root's) height over the bike
+            // and gap to it, against Xenia's (knockdown-time.md): thrown
+            // 2.6-2.8 m over the bike, out to about 4.8 m at +1.0 s, the
+            // gap never back under about 3 m while limp.
+            let (mut top, mut far, mut far_at, mut near_after) =
+                (f32::MIN, 0.0f32, 0.0f32, f32::MAX);
+            let mut trace: Vec<String> = Vec::new();
             let mut t = 0.0;
             while t < 14.0 && up.is_none() {
                 if let Some(w) = game.scene.world.as_ref() {
@@ -11816,6 +11823,41 @@ fn toss_check(game: &mut Game, tick: f32, mode: &str) {
                 if knocked.is_some() && game.combat.knocked.is_none() && up.is_none() {
                     up = Some(t);
                 }
+                if let (Some(t0), Some(w), Some(p)) = (
+                    thrown,
+                    game.scene.world.as_ref(),
+                    game.scene.player.as_ref(),
+                ) {
+                    let her = p
+                        .ragdoll
+                        .and_then(|r| w.physics.ragdoll_nodes(r))
+                        .and_then(|n| n.first().map(|m| m.w_axis.truncate()))
+                        .unwrap_or(p.character.position);
+                    let speed = p
+                        .ragdoll
+                        .and_then(|r| w.physics.ragdoll_speed(r))
+                        .unwrap_or(0.0);
+                    if let Some(bike) = w.physics.vehicle_transform(id) {
+                        let b = bike.transform_point3(Vec3::ZERO);
+                        let gap = (her - b).with_y(0.0).length();
+                        let dt = t - t0;
+                        top = top.max(her.y - b.y);
+                        if gap > far {
+                            far = gap;
+                            far_at = dt;
+                        }
+                        if dt > 1.0 && knocked.is_some() && up.is_none() {
+                            near_after = near_after.min(gap);
+                        }
+                        if trace.len() < 400 && ((dt * 10.0).round() - dt * 10.0).abs() < tick * 5.0
+                        {
+                            trace.push(format!(
+                                "toss-check: +{dt:.1} s: her root {:.2} m over the bike, gap {gap:.2} m, body speed {speed:.2} m/s",
+                                her.y - b.y
+                            ));
+                        }
+                    }
+                }
             }
             println!(
                 "toss-check: the {label} (TossSpeedChange {toss}) into a wall at 20 m/s: \
@@ -11823,9 +11865,30 @@ fn toss_check(game: &mut Game, tick: f32, mode: &str) {
                  {knocked:?} s, up at {up:?} s; health {hp:.0} -> {:.0}",
                 game.combat.hp
             );
+            for l in &trace {
+                println!("{l}");
+            }
+            if thrown.is_some() {
+                println!(
+                    "toss-check: after the toss: highest {top:.2} m over the bike (Xenia 2.6-2.8), \
+                     farthest {far:.2} m at +{far_at:.1} s (Xenia ~4.8 m at +1.0 s), nearest while \
+                     limp after +1 s {near_after:.2} m (Xenia no closer than ~3 m)"
+                );
+            }
+            // The throw, against Xenia's (knockdown-time.md): at least 2 m
+            // over the bike, out at least 3.5 m, no nearer than 2.5 m while
+            // limp after +1 s.
+            let thrown_far = top >= 2.0 && far >= 3.5 && near_after >= 2.5;
+            if has_toss {
+                println!(
+                    "toss-check: the throw (over the bike >= 2 m, out >= 3.5 m, limp no nearer than 2.5 m): {}",
+                    verdict(thrown_far)
+                );
+            }
             let ok = if has_toss {
                 thrown.is_some()
                     && knocked.is_some()
+                    && thrown_far
                     && up.zip(knocked).is_some_and(|(u, k)| u - k < 4.0)
                     && game.combat.hp >= hp
             } else {

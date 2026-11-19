@@ -5965,7 +5965,16 @@ pub(crate) fn get_out(
         // Tossed, she is knocked down ([`crate::combat::Combat`] takes
         // it up: 0x822A1B70 sets her time down from `TossGetupSeconds`).
         player.tossed = kind == ExitKind::Toss;
-        if matches!(kind, ExitKind::Ditch | ExitKind::Toss) {
+        if kind == ExitKind::Toss {
+            // 0x822A1B70's toss: half a metre along the vehicle's up
+            // (FUN_82855F48, its up axis, times 0x82B7C128) and the
+            // velocity it is handed: the vehicle's before the jolt
+            // (inferred: the crash ejection, 0x8218A138, posts it with the
+            // exit; Xenia throws her 2.6-2.8 m up and ~4.8 m out).
+            let up = at.transform_vector3(Vec3::Y).normalize_or(Vec3::Y);
+            player.drop_at(place + up * 0.5);
+            player.character.velocity = physics.vehicle_velocity_pre_jolt(id);
+        } else if kind == ExitKind::Ditch {
             let out = place - at.transform_point3(Vec3::ZERO);
             player.character.velocity =
                 m2_engine::seats::ditch_velocity(velocity, Vec3::new(out.x, 0.0, out.z));
