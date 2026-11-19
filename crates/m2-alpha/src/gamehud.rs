@@ -618,6 +618,19 @@ m.CustomData.nTime = time
 m.CustomData.nCost = cost
 m.CustomData.nCashPerSecond = 0
 "#;
+/// As the satellite's view closes: its overlay takes no more presses
+/// (`CustomData.bExiting`), as the timing wheel's own end leaves it
+/// (`MrxGuiSatellite._CompleteMinigame` sets it; `_OpenMinigame` clears
+/// it as the view next opens). The overlay's `_HandleInput` starts the
+/// wheel (`BeginMinigame`: its pop-up sound, then a beep each time the
+/// marker enters a wedge) on any confirm press it gets while the flag is
+/// clear. The play runs the wheel itself and never ended the overlay's,
+/// so a later confirm (the HQ's Accept box) started it again and it
+/// beeped on through Fiona's briefing (playtest of e8749a2a).
+const SATELLITE_DONE: &str = r#"
+local w = MrxGui.GetWidgetByNameAndOwner("Satellite overlay", Sys.StringToGuid("0x1"))
+if w and type(w.CustomData) == "table" then w.CustomData.bExiting = true end
+"#;
 /// The HUD's tutorial box (`MrxGuiTutorial`: the line typed out under its
 /// header, right of the middle) says this, or is put away (nil).
 const TUTORIAL: &str = r#"
@@ -4532,6 +4545,11 @@ impl Thread {
         }
         if open != self.told.satellite {
             self.told.satellite = open;
+            if !open {
+                lua.load(SATELLITE_DONE)
+                    .set_name("=m2-hud satellite done")
+                    .exec()?;
+            }
             // As `MrxGuiManager.ToggleSatellite(player, open, "pmc")`
             // sends it: the minigame on, not the advanced view.
             let t = table(
@@ -7041,6 +7059,35 @@ mod tests {
         assert_eq!(stinger_place([1.0, -1.0], 4.0 / 3.0), [640.0, 480.0]);
         let [x, y] = stinger_place([1.0, -1.0], 16.0 / 9.0);
         assert!((x - 746.67).abs() < 0.01 && y == 480.0, "{x} {y}");
+    }
+
+    /// The satellite's view closed: its overlay is left exiting, so the
+    /// guard of its own `_HandleInput` (`bMinigameOn and not bExiting`)
+    /// turns a later confirm press away and the wheel doesn't start again.
+    #[test]
+    fn a_closed_satellite_view_takes_no_more_presses() {
+        let lua = Lua::new();
+        lua.load(
+            r#"
+            overlay = { CustomData = { bMinigameOn = true, bExiting = false } }
+            Sys = { StringToGuid = function(s) return s end }
+            MrxGui = { GetWidgetByNameAndOwner = function(name, owner)
+                if name == "Satellite overlay" and owner == "0x1" then return overlay end
+            end }
+            function begins(w) return w.CustomData.bMinigameOn and not w.CustomData.bExiting end
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let begins = |lua: &Lua| lua.load("return begins(overlay)").eval::<bool>().unwrap();
+        assert!(begins(&lua), "open, a press starts the wheel");
+        lua.load(SATELLITE_DONE).exec().unwrap();
+        assert!(!begins(&lua), "closed, a press is turned away");
+        // No overlay (the HUD's layout not up): nothing to do, no error.
+        lua.load("MrxGui.GetWidgetByNameAndOwner = function() end")
+            .exec()
+            .unwrap();
+        lua.load(SATELLITE_DONE).exec().unwrap();
     }
 
     /// A request to show every counter fires the event once, with no
