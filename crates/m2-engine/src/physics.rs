@@ -2227,6 +2227,11 @@ struct Hull {
     water: BoatTuning,
 }
 
+/// The 360's game step, s: its frame at 30 Hz (Xenia's per-frame read of
+/// a ditch moves her once each 1/30 s), the length of a held step
+/// ([`Character::hold`]).
+pub const HOLD_STEP: f32 = 1.0 / 30.0;
+
 /// A character's capsule and motion.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Character {
@@ -2244,6 +2249,13 @@ pub struct Character {
     /// while it goes on pushing, as a proxy keeps its contacts from step
     /// to step ([`Physics::move_character`]).
     pub wall: Option<Vec3>,
+    /// Its velocity was set outright (the 360 human's vfunc +0x90,
+    /// 0x82179ED0, which sets the proxy's velocity and its byte +0x250):
+    /// the next [`Physics::move_character`] moves it at that velocity as it
+    /// is, no walk and no gravity, as 0x8217A2D0 skips the state machine
+    /// for that one step, then clears it. Seconds of it left: the 360's
+    /// step is its frame, 1/30 s ([`HOLD_STEP`]).
+    pub hold: f32,
 }
 
 impl Character {
@@ -2257,6 +2269,7 @@ impl Character {
             height: 1.8,
             gravity: GRAVITY,
             wall: None,
+            hold: 0.0,
         }
     }
 
@@ -7505,10 +7518,19 @@ impl Physics {
         dt: f32,
     ) {
         let mut vertical = character.velocity.y;
-        if character.grounded {
-            vertical = jump.unwrap_or(0.0);
+        // A velocity just set holds for this step as it is (0x8217A2D0
+        // with +0x250 set).
+        let held = character.hold > 0.0;
+        character.hold = (character.hold - dt).max(0.0);
+        let walk = if held { character.velocity } else { walk };
+        if held {
+            character.grounded = false;
+        } else {
+            if character.grounded {
+                vertical = jump.unwrap_or(0.0);
+            }
+            vertical -= character.gravity * dt;
         }
-        vertical -= character.gravity * dt;
         let desired = Vec3::new(walk.x, 0.0, walk.z) * dt + Vec3::Y * (vertical * dt);
         let shape = r::Capsule::new_y(character.half_height(), character.radius);
         let mut hits: Vec<(r::ColliderHandle, Vec3, Vec3)> = Vec::new();
@@ -8849,6 +8871,37 @@ mod tests {
         walk(&p, &mut c, Vec3::ZERO, 2.0);
         assert!(c.grounded);
         assert!(c.position.y.abs() < 0.1, "{}", c.position.y);
+    }
+
+    /// From the 360 code (0x82179ED0 sets the proxy's velocity and +0x250;
+    /// 0x8217A2D0 then keeps it one step without the state machine): a
+    /// velocity set outright moves the character as it is for one step,
+    /// no gravity and no walk, then gravity takes over.
+    #[test]
+    fn a_velocity_set_outright_holds_one_step() {
+        let mut p = ready();
+        p.step(DT);
+        let mut c = Character::new(Vec3::new(0.0, 2.0, 0.0));
+        c.gravity = 16.5;
+        c.velocity = Vec3::new(1.5, 2.0, 0.0);
+        c.hold = HOLD_STEP;
+        // One 360 step (1/30 s): two of these.
+        p.move_character(&mut c, Vec3::ZERO, None, DT);
+        p.move_character(&mut c, Vec3::ZERO, None, DT);
+        assert!(c.hold < 1e-6, "{}", c.hold);
+        assert!((c.velocity.y - 2.0).abs() < 1e-5, "{}", c.velocity.y);
+        assert!(
+            (c.position.y - (2.0 + 4.0 * DT)).abs() < 1e-3,
+            "{}",
+            c.position.y
+        );
+        assert!((c.position.x - 3.0 * DT).abs() < 1e-3, "{}", c.position.x);
+        p.move_character(&mut c, Vec3::ZERO, None, DT);
+        assert!(
+            (c.velocity.y - (2.0 - 16.5 * DT)).abs() < 1e-4,
+            "{}",
+            c.velocity.y
+        );
     }
 
     /// Pushed against a wall a character's velocity is the walk the wall
