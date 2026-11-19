@@ -601,6 +601,31 @@ const USE_GIVE_UP: f32 = 30.0;
 
 /// Where a limp body lies: the middle of its nodes over the ground
 /// plane, at their lowest. `None` for no nodes.
+/// The way someone faces as they get up from a limp body whose nodes
+/// (world space) are `nodes`, named by `hashes`: along the ground from
+/// `Bone_Hips` to `Bone_Chest`, turned round unless they lie face down.
+///
+/// From the 360 code (the ragdoll's end, 0x824279F8): she is turned along
+/// the hips-to-chest line across the ground, the other way when a value
+/// of the ragdoll's is over -0.6 (0x820F97A4). **Inferred**: that value is
+/// how far the hips' forward (+z) points up, so lying face down (forward
+/// down) keeps the line and anything else turns it round.
+pub fn getup_yaw(nodes: &[Mat4], hashes: &[u32]) -> Option<f32> {
+    use m2_assets::ragdoll::{CHEST, HIPS};
+    let at = |h: u32| {
+        hashes
+            .iter()
+            .position(|&x| x == h)
+            .and_then(|i| nodes.get(i))
+    };
+    let (hips, chest) = (at(HIPS)?, at(CHEST)?);
+    let mut line = (chest.w_axis - hips.w_axis).truncate().with_y(0.0);
+    if hips.z_axis.y > -0.6 {
+        line = -line;
+    }
+    (line.length_squared() > 1e-8).then(|| line.x.atan2(line.z))
+}
+
 fn limp_middle(nodes: &[Mat4]) -> Option<Vec3> {
     if nodes.is_empty() {
         return None;
@@ -1321,6 +1346,10 @@ pub struct Npc {
     /// A shove not yet given to their body (m/s): they went limp, or
     /// were hit again after.
     fling: Option<Vec3>,
+    /// A blast's launch waiting for the limp body
+    /// ([`m2_engine::ragdoll_launch::Launch`]): thrown bone by bone once it
+    /// goes limp within its updates, else dropped.
+    pub launch: Option<m2_engine::ragdoll_launch::Launch>,
     /// Knocked down and limp, they get up (or are subdued) this step:
     /// the limp body is given up and they are where it lay.
     rise: bool,
@@ -1477,6 +1506,43 @@ pub enum Down {
     Carried,
 }
 
+/// A vehicle's hit on a person of at least this much gives away the
+/// disguise of every player riding it, whoever the person (0x82445938:
+/// 1.0 at 0x820BAEE8).
+pub const VEHICLE_HIT_GIVES_AWAY: f32 = 1.0;
+
+/// A rig with no skeleton and no clips: a stand-in for checks that run
+/// people without their models (`--disguise-check`).
+pub fn empty_rig() -> Rig {
+    Rig {
+        skeleton: std::sync::Arc::new(m2_engine::Skeleton::from_nodes(&[])),
+        clips: std::sync::Arc::new(Vec::new()),
+        locomotion: None,
+        animator: m2_engine::Animator::default(),
+        gait: Gait::Idle,
+        upper: None,
+        two_handed: false,
+        aim: None,
+        hands: Default::default(),
+        sweeps: Default::default(),
+        sweep_upper: false,
+        kick: Default::default(),
+        aim_legs: false,
+        aim_walk: Default::default(),
+        lip: None,
+        shuffling: false,
+        aim_clock: 0.0,
+        cues: Vec::new(),
+        own: Default::default(),
+        foreign: Default::default(),
+        theirs: Default::default(),
+        aim_clip: None,
+        barrel: true,
+        scripted: None,
+        time_scales: Default::default(),
+    }
+}
+
 /// When someone knocked down stands up again. From the 360 code
 /// (0x8225CAE0, for a person in `KnockedDown` `Idle`): `Stand` is posted
 /// once they have been in that state longer than their time down (the
@@ -1537,6 +1603,7 @@ impl Npc {
             dead_for: 0.0,
             ragdoll: None,
             fling: None,
+            launch: None,
             rise: false,
             limp: (0.0, 0.0),
             last_hit: None,
@@ -3643,6 +3710,9 @@ pub struct People {
     /// when not known. Someone getting out of a vehicle's way looks
     /// scared for as long.
     pub threat_seconds: Option<f32>,
+    /// The cars (indices into what [`People::traffic`] was given) that hit
+    /// someone for at least [`VEHICLE_HIT_GIVES_AWAY`] since last taken.
+    pub vehicle_hits: Vec<usize>,
     /// Those the scripts keep from dying (`Object.SetUnkillable`), by
     /// spawn entity, here or still to come.
     unkillable: HashSet<u32>,
@@ -5359,7 +5429,8 @@ impl People {
                 && npc.alive
                 && let Some(id) = npc.ragdoll.take()
             {
-                if let Some(at) = physics.ragdoll_nodes(id).and_then(|n| limp_middle(&n)) {
+                let nodes = physics.ragdoll_nodes(id);
+                if let Some(at) = nodes.as_deref().and_then(limp_middle) {
                     let from = at + Vec3::Y;
                     let y = physics
                         .cast_ray(from, -Vec3::Y, 6.0)
@@ -5367,12 +5438,37 @@ impl People {
                     npc.character.position = Vec3::new(at.x, y, at.z);
                     npc.character.velocity = Vec3::ZERO;
                 }
+                if let Some(yaw) = nodes
+                    .as_deref()
+                    .and_then(|n| getup_yaw(n, &npc.rig.skeleton.name_hashes))
+                {
+                    npc.facing = yaw;
+                }
                 physics.remove_ragdoll(id);
             }
+            // A blast's launch: thrown once limp (a body limp already
+            // next update), dropped when the blast's window passes without
+            // (from the 360 code: 0x8215C560, 0x82428910).
+            if let Some(mut l) = npc.launch.take() {
+                match npc.ragdoll.filter(|_| npc.fling.is_none()) {
+                    Some(id) => physics.launch_ragdoll(id, l.velocity, l.point),
+                    None if npc.fling.is_some() => npc.launch = Some(l),
+                    None => {
+                        if l.wait(dt) {
+                            npc.launch = Some(l);
+                        }
+                    }
+                }
+            }
             // The dead, and the knocked down, go limp from where they
-            // stood, shoved as they were hit.
+            // stood, shoved as they were hit (by a blast: launched).
             let Some(push) = npc.fling.take() else {
                 continue;
+            };
+            let push = if npc.launch.is_some() {
+                Vec3::ZERO
+            } else {
+                push
             };
             match npc.ragdoll {
                 Some(id) => physics.push_ragdoll(id, push),
@@ -5380,9 +5476,17 @@ impl People {
                     let (nodes, _) = npc.rig.posed();
                     let body = npc.model_matrix();
                     let world: Vec<Mat4> = nodes.iter().map(|m| body * *m).collect();
-                    let id = physics.add_ragdoll(&npc.rig.skeleton.parents, &world, push);
+                    let id = physics.add_ragdoll_named(
+                        &npc.rig.skeleton.name_hashes,
+                        &npc.rig.skeleton.parents,
+                        &world,
+                        push,
+                    );
                     npc.ragdoll = Some(id);
                 }
+            }
+            if let (Some(l), Some(id)) = (npc.launch.take(), npc.ragdoll) {
+                physics.launch_ragdoll(id, l.velocity, l.point);
             }
         }
         // Smarter: those near a soldier who spots her are told where she is.
@@ -5434,7 +5538,7 @@ impl People {
         let human = m2_assets::name_hash("Human");
         let kind = m2_assets::name_hash(m2_engine::durability::RAM_KIND);
         let mut killed = 0;
-        for &(at, velocity, (lo, hi), mass) in cars {
+        for (car, &(at, velocity, (lo, hi), mass)) in cars.iter().enumerate() {
             let speed = velocity.length();
             if speed < RUN_OVER {
                 continue;
@@ -5455,6 +5559,9 @@ impl People {
                         let row = n.ai.modifier.unwrap_or(human);
                         m2_engine::durability::run_over(t, row, kind, mass, speed)
                     });
+                    if damage >= VEHICLE_HIT_GIVES_AWAY && !self.vehicle_hits.contains(&car) {
+                        self.vehicle_hits.push(car);
+                    }
                     if n.hurt(damage, push) {
                         killed += usize::from(n.soldier);
                     } else {
@@ -6444,6 +6551,31 @@ pub fn locking_launcher<'a>(
 pub(crate) mod tests {
     use super::*;
 
+    /// Up from lying: face down (the hips' forward pointing down) they
+    /// face along the line from hips to chest; on their back, the other
+    /// way (0x820F97A4).
+    #[test]
+    fn they_get_up_facing_along_where_the_body_lay() {
+        use m2_assets::ragdoll::{CHEST, HIPS};
+        let hashes = [HIPS, CHEST];
+        let lying = |forward_y: f32| {
+            let hips = Mat4::from_cols(
+                Vec3::X.extend(0.0),
+                Vec3::Z.extend(0.0),
+                Vec3::new(0.0, forward_y, 0.0).extend(0.0),
+                Vec3::new(0.0, 0.2, 0.0).extend(1.0),
+            );
+            let chest = Mat4::from_translation(Vec3::new(0.0, 0.2, 0.5));
+            [hips, chest]
+        };
+        // Face down: along +z, hips to chest.
+        let down = getup_yaw(&lying(-1.0), &hashes).unwrap();
+        assert!(down.abs() < 1e-5, "{down}");
+        // On the back: the other way.
+        let up = getup_yaw(&lying(1.0), &hashes).unwrap();
+        assert!((up.abs() - std::f32::consts::PI).abs() < 1e-5, "{up}");
+    }
+
     #[test]
     fn the_nearest_fighting_soldier_of_its_faction_runs_to_raise_the_alarm() {
         let post = || Brain::Post { facing: 0.0 };
@@ -6523,7 +6655,7 @@ pub(crate) mod tests {
         // Standing well above the roof.
         assert!(!in_ram(Vec3::new(0.0, 2.5, 0.0), hull));
     }
-    use m2_engine::{Animator, CollisionShape, Skeleton, StaticKey};
+    use m2_engine::{CollisionShape, StaticKey};
     use m2_math::glam::Quat;
 
     #[test]
@@ -6652,33 +6784,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn rig() -> Rig {
-        Rig {
-            skeleton: Arc::new(Skeleton::from_nodes(&[])),
-            clips: Arc::new(Vec::new()),
-            locomotion: None,
-            animator: Animator::default(),
-            gait: Gait::Idle,
-            upper: None,
-            two_handed: false,
-            aim: None,
-            hands: Default::default(),
-            sweeps: Default::default(),
-            sweep_upper: false,
-            kick: Default::default(),
-            aim_legs: false,
-            aim_walk: Default::default(),
-            lip: None,
-            shuffling: false,
-            aim_clock: 0.0,
-            cues: Vec::new(),
-            own: Default::default(),
-            foreign: Default::default(),
-            theirs: Default::default(),
-            aim_clip: None,
-            barrel: true,
-            scripted: None,
-            time_scales: Default::default(),
-        }
+        super::empty_rig()
     }
 
     #[test]
@@ -8573,6 +8679,9 @@ pub(crate) mod tests {
         };
         assert!(!hit.alive && hit.fling.is_some_and(|v| v.z > 10.0 && v.y > 2.0));
         assert!(ahead.alive && ahead.flee.is_some(), "dives aside");
+        // The car hit a passer-by (no faction): it counts for the
+        // disguise of whoever rides it (0x82445938).
+        assert_eq!(people.vehicle_hits, [0]);
         assert!(behind.alive && behind.flee.is_none());
         // Getting out of its way, the one ahead looks scared; the one
         // behind does not.
