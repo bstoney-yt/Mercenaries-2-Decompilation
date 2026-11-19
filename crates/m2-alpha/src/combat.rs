@@ -4213,8 +4213,7 @@ impl Combat {
             self.knocked = None;
             return;
         };
-        let speed = f.physics.ragdoll_speed(id);
-        k.step(speed, dt);
+        k.step(crate::npc::limp_root(f.physics, id), dt);
         if !k.stands() {
             return;
         }
@@ -7170,10 +7169,10 @@ pub const HER_PLAYER_RECORD: bool = true;
 /// From the 360 code (0x8225CAE0, for a person in `KnockedDown` `Idle`):
 /// `Stand` is posted once she has been down longer than her time down
 /// and, her body being limp (kind 0xC), it has lain still over 0.5 s or
-/// been limp over 19 s, as for the people ([`crate::npc`]'s `LIMP_STILL`
-/// and `LIMP_LONGEST`). Inferred, as for the people: those floats are the
-/// seconds still and limp, still being under 0.2 m/s; her time counts
-/// from the knockdown (the fall's own moment is not separated). She
+/// been limp over 19 s, kept as for the people by the limp body's update
+/// 0x82190470 ([`crate::npc::LimpTimers`]: still is the body staying
+/// within 0.1 m of where it settled). Inferred: her time counts from the
+/// knockdown (the fall's own moment is not separated). She
 /// rises where the body lay, into her rig's `KnockedDown` `Getup` clip
 /// (the on-foot tables' handle ade601a9, clip 0xAEB6C9BD; from samples),
 /// as the people do.
@@ -7181,31 +7180,22 @@ pub const HER_PLAYER_RECORD: bool = true;
 pub struct KnockedHer {
     pub seconds: f32,
     pub down_for: f32,
-    pub still: f32,
-    pub limp: f32,
+    pub body: crate::npc::LimpTimers,
     /// Getting up: seconds of the get-up clip left.
     pub rising: Option<f32>,
 }
 
 impl KnockedHer {
-    /// Seconds still and limp over which she may stand (0x820D9EDC,
-    /// 0x820F8C84), and the speed under which the body is still.
-    const STILL: f32 = 0.5;
-    const LONGEST: f32 = 19.0;
-    const AT_REST: f32 = 0.2;
-
-    /// A step of `dt` with her limp body moving at `speed` (None: not
+    /// A step of `dt` with her limp body's root at `at` (None: not
     /// known).
-    pub fn step(&mut self, speed: Option<f32>, dt: f32) {
+    pub fn step(&mut self, at: Option<Vec3>, dt: f32) {
         self.down_for += dt;
-        self.limp += dt;
-        let still = speed.is_none_or(|v| v < Self::AT_REST);
-        self.still = if still { self.still + dt } else { 0.0 };
+        self.body.step(at, dt);
     }
 
     /// Whether she gets up now (0x8225CAE0).
     pub fn stands(&self) -> bool {
-        self.down_for > self.seconds && (self.still > Self::STILL || self.limp > Self::LONGEST)
+        self.down_for > self.seconds && self.body.settled()
     }
 }
 
@@ -7367,21 +7357,36 @@ mod tests {
             ..KnockedHer::default()
         };
         for _ in 0..50 {
-            k.step(Some(0.0), 0.1);
+            k.step(Some(Vec3::ZERO), 0.1);
         }
         assert!(!k.stands(), "{k:?}");
-        k.step(Some(0.0), 0.11);
+        k.step(Some(Vec3::ZERO), 0.11);
         assert!(k.stands());
+        // Rolling 0.1 m a step: never still, up only past 19 s limp.
         let mut rolling = KnockedHer {
             seconds: 5.0,
             ..KnockedHer::default()
         };
+        let mut x = 0.0;
         for _ in 0..189 {
-            rolling.step(Some(1.0), 0.1);
+            x += 0.1;
+            rolling.step(Some(Vec3::X * x), 0.1);
         }
         assert!(!rolling.stands());
-        rolling.step(Some(1.0), 0.2);
+        rolling.step(Some(Vec3::X * (x + 0.1)), 0.2);
         assert!(rolling.stands());
+        // A body lying put while a limb swings (0x82190470 reads only the
+        // body's place): it drifts 5 cm about where it settled, and is
+        // still.
+        let mut twitching = KnockedHer {
+            seconds: 1.0,
+            ..KnockedHer::default()
+        };
+        for i in 0..20 {
+            let wobble = if i % 2 == 0 { 0.05 } else { -0.04 };
+            twitching.step(Some(Vec3::new(wobble, 0.0, 0.0)), 0.1);
+        }
+        assert!(twitching.stands(), "{twitching:?}");
     }
 
     /// A knockdown's length is spread by the engine's own random draws

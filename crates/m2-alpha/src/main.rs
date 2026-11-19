@@ -11796,8 +11796,9 @@ fn toss_check(game: &mut Game, tick: f32, mode: &str) {
             let (mut top, mut far, mut far_at, mut near_after) =
                 (f32::MIN, 0.0f32, 0.0f32, f32::MAX);
             let mut trace: Vec<String> = Vec::new();
+            let mut last_root: Option<Vec3> = None;
             let mut t = 0.0;
-            while t < 14.0 && up.is_none() {
+            while t < 20.0 && up.is_none() {
                 if let Some(w) = game.scene.world.as_ref() {
                     most = most.max(w.physics.vehicle_jolt(id));
                 }
@@ -11851,9 +11852,23 @@ fn toss_check(game: &mut Game, tick: f32, mode: &str) {
                         }
                         if trace.len() < 400 && ((dt * 10.0).round() - dt * 10.0).abs() < tick * 5.0
                         {
+                            let limbs = p
+                                .ragdoll
+                                .map(|r| w.physics.ragdoll_limb_speeds(r))
+                                .unwrap_or_default();
+                            let moved_from = last_root.replace(her);
+                            let moving: Vec<String> = limbs
+                                .iter()
+                                .filter(|l| l.1 >= 0.2)
+                                .map(|l| format!("{}:{:.2}{}", l.0, l.1, l.2))
+                                .collect();
                             trace.push(format!(
-                                "toss-check: +{dt:.1} s: her root {:.2} m over the bike, gap {gap:.2} m, body speed {speed:.2} m/s",
-                                her.y - b.y
+                                "toss-check: +{dt:.1} s: her root {:.2} m over the bike, gap {gap:.2} m, body speed {speed:.2} m/s, root moved {:.2} m in 0.1 s; limbs over 0.2 m/s (index:speed, touching v vehicle s itself g ground); bike {:.2} m/s [{}] of {}",
+                                her.y - b.y,
+                                moved_from.map_or(0.0, |q: Vec3| q.distance(her)),
+                                w.physics.vehicle_velocity(id).length(),
+                                moving.join(" "),
+                                limbs.len()
                             ));
                         }
                     }

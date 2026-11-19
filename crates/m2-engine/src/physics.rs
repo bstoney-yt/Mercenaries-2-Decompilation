@@ -6625,6 +6625,53 @@ impl Physics {
         )
     }
 
+    /// Each limb's speed, m/s, and whether it touches anything (for
+    /// tracing what keeps a limp body from lying still).
+    /// What each touches: `v` a vehicle, `s` another limb of the same
+    /// body, `g` anything else (the ground, a wall), empty nothing.
+    pub fn ragdoll_limb_speeds(&self, id: RagdollId) -> Vec<(usize, f32, String)> {
+        let Some(doll) = self.ragdolls.get(id.0).and_then(Option::as_ref) else {
+            return Vec::new();
+        };
+        let chassis: Vec<_> = self
+            .vehicles
+            .iter()
+            .flatten()
+            .map(|v| v.controller.chassis)
+            .collect();
+        let own: Vec<_> = doll.bodies.iter().flatten().copied().collect();
+        doll.bodies
+            .iter()
+            .enumerate()
+            .filter_map(|(k, h)| {
+                let b = self.world.bodies.get((*h)?)?;
+                let mut what = String::new();
+                for &c in b.colliders() {
+                    for p in self.world.narrow_phase.contact_pairs_with(c) {
+                        if !p.has_any_active_contact() {
+                            continue;
+                        }
+                        let other = if p.collider1 == c {
+                            p.collider2
+                        } else {
+                            p.collider1
+                        };
+                        let parent = self.world.colliders.get(other).and_then(|o| o.parent());
+                        let tag = match parent {
+                            Some(q) if chassis.contains(&q) => 'v',
+                            Some(q) if own.contains(&q) => 's',
+                            _ => 'g',
+                        };
+                        if !what.contains(tag) {
+                            what.push(tag);
+                        }
+                    }
+                }
+                Some((k, vec3(b.linvel()).length(), what))
+            })
+            .collect()
+    }
+
     /// Shoves every limb of a ragdoll by `velocity` (m/s).
     pub fn push_ragdoll(&mut self, id: RagdollId, velocity: Vec3) {
         let Some(doll) = self.ragdolls.get(id.0).and_then(Option::as_ref) else {
