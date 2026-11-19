@@ -1870,6 +1870,18 @@ impl Props {
             .keys()
             .filter_map(|e| Some((e, self.seen(physics, e)?)))
             .collect();
+        for e in self.disposer.keys().filter(|e| !seen.contains_key(e)) {
+            eprintln!(
+                "props: the disposer drops {e:#x}: gone ({})",
+                if e & ISLAND != 0 {
+                    "its body is gone"
+                } else if self.shown.contains_key(&e) {
+                    "its model is not in"
+                } else {
+                    "no longer shown"
+                }
+            );
+        }
         self.disposer.update(self.clock, |e| seen.get(&e).copied());
         // Gates swung open: their collision with their leaves open; one
         // whose model came in without a hinge stops swinging.

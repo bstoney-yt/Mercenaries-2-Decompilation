@@ -12915,6 +12915,38 @@ fn prop_limits_check(
         }
     }
     let centre = game.focus();
+    // `fx_Explosion_Large`'s blast and its `PhysicalLink`'d frag
+    // (`Explosion (RPG Frag)`), 7 m and 15 m, as the template database
+    // has them, both at the blast's point.
+    let blasts: Vec<(Vec3, m2_engine::weapons::Blast)> = game
+        .scene
+        .world
+        .as_ref()
+        .map(|w| {
+            let db = &w.index.template_db;
+            [0x8000_5695u32, 0x8000_a27b]
+                .into_iter()
+                .filter_map(|t| {
+                    let e = db.explosions.get(&t)?;
+                    Some((
+                        Vec3::ZERO,
+                        m2_engine::weapons::Blast {
+                            template: t,
+                            radius: e.radius,
+                            damage: e.damage,
+                            min_damage: e.least,
+                            max_force: e.force,
+                            key: (e.kind != 0).then_some(e.kind),
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    eprintln!(
+        "prop-limits-check: each blast is {:08x?}",
+        blasts.iter().map(|(_, b)| b.template).collect::<Vec<_>>()
+    );
     let (mut most, mut disposed) = (0, 0);
     let every = (0.5 / tick).round().max(1.0) as u32;
     for i in 0..(20.0 / tick) as u32 {
@@ -12930,7 +12962,17 @@ fn prop_limits_check(
                     .cast_ray(top, Vec3::NEG_Y, 400.0)
                     .map(|(t, _)| top - Vec3::Y * t)
             });
-            game.combat.set_off(ground.unwrap_or(at), None);
+            // A car's death blasts, as the game has them (q744d: the
+            // alpha's old blast, `None`, pushes nothing, so what it
+            // knocked loose lay where it stood and the disposer dropped
+            // it unseen, and it never reached the island's bodies).
+            let at = ground.unwrap_or(at);
+            if blasts.is_empty() {
+                game.combat.set_off(at, None);
+            }
+            for &(offset, b) in &blasts {
+                game.combat.set_off(at + offset, Some(b));
+            }
         }
         step(game, Intent::default(), &mut ms)?;
         most = most.max(game.scene.props.disposer_held());
