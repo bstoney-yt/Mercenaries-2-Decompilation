@@ -4762,6 +4762,16 @@ fn knock_loose(
                 place.transform_point3((lo + hi) * 0.5),
                 (hi - lo).length() * 0.5,
             ));
+            // And goods that are bodies of their own (they came in before
+            // the vehicle was placed): where their bodies lie.
+            for e in props.bodies_standing_near(
+                &world.physics,
+                place.transform_point3((lo + hi) * 0.5),
+                (hi - lo).length() * 0.5,
+            ) {
+                props.follow_body(&world.physics, e);
+                near.push(e);
+            }
             near.sort_unstable();
             near.dedup();
             // Once the props round it have loaded: what stands round the

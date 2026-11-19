@@ -713,6 +713,11 @@ impl Props {
         (index, id): (usize, m2_engine::VehicleId),
         bed: Option<&CollisionShape>,
     ) -> bool {
+        // A body of its own from the start (the goods came in before the
+        // vehicle): its bodies give way to its ride.
+        if self.as_body.contains(&entity) {
+            self.drop_bodies(physics, entity);
+        }
         let Some(p) = self.shown.get(&entity) else {
             return false;
         };
@@ -1268,6 +1273,14 @@ impl Props {
         if !has_wreck {
             return false;
         }
+        self.drop_bodies(physics, entity);
+        true
+    }
+
+    /// `entity`, a body of its own from the start, gives up its bodies:
+    /// the prop is put where they had taken it (its first body's place,
+    /// as it started against the prop's).
+    fn drop_bodies(&mut self, physics: &mut Physics, entity: u32) {
         let ids = self.knocked.remove(&entity).unwrap_or_default();
         let moved = (|| {
             let p = self.shown.get(&entity)?;
@@ -1287,7 +1300,49 @@ impl Props {
             p.position = position;
         }
         self.changed();
-        true
+    }
+
+    /// The props that are bodies of their own from the start whose first
+    /// body lies within `reach` of `at`: goods a vehicle's layers put on
+    /// its load bed come in as such before the vehicle is placed.
+    pub fn bodies_standing_near(&self, physics: &Physics, at: Vec3, reach: f32) -> Vec<u32> {
+        self.as_body
+            .iter()
+            .filter(|e| {
+                self.knocked
+                    .get(e)
+                    .and_then(|v| physics.debris_place(*v.first()?))
+                    .is_some_and(|m| m.w_axis.truncate().distance(at) <= reach)
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Where the body of `entity` (a body of its own from the start) has
+    /// taken it, put on the prop ([`drop_bodies`](Self::drop_bodies)
+    /// keeps the bodies): for what asks where the prop is.
+    pub fn follow_body(&mut self, physics: &Physics, entity: u32) {
+        let moved = (|| {
+            let ids = self.knocked.get(&entity)?;
+            let p = self.shown.get(&entity)?;
+            let loose = self.loose(entity)?;
+            let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+            let start = *loose.starts(placed).first()?;
+            let now = physics.debris_place(*ids.first()?)?;
+            Some((now * start.inverse() * placed, now, start))
+        })();
+        let Some((m, now, start)) = moved else {
+            return;
+        };
+        if now.w_axis.distance(start.w_axis) < 0.01 {
+            return;
+        }
+        // Its bodies' starts move with it: they are taken as from here on.
+        let (_, rotation, position) = m.to_scale_rotation_translation();
+        if let Some(p) = self.shown.get_mut(&entity) {
+            p.rotation = rotation.normalize();
+            p.position = position;
+        }
     }
 
     /// The props that are bodies of their own from the start
