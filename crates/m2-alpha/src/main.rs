@@ -9032,6 +9032,9 @@ fn cargo_check(game: &mut Game, tick: f32) {
             .map_or(0.0, |w| w.physics.vehicle_speed(id))
     };
     let mut table = Vec::new();
+    // Each phase's median and most shift of those aboard, how many off,
+    // and how many in all: for the verdict.
+    let mut ends: Vec<(&str, f32, f32, usize, usize)> = Vec::new();
     let every = ((0.25 / tick) as u32).max(1);
     for (phase, seconds) in [
         ("standing", 3.0f32),
@@ -9102,11 +9105,55 @@ fn cargo_check(game: &mut Game, tick: f32) {
         );
         eprintln!("cargo-check: {line}");
         table.push(line);
+        ends.push((phase, median, most, off, now.len()));
     }
     eprintln!("cargo-check: TABLE (shift from start in the truck's frame, of those still aboard)");
     for l in table {
         eprintln!("cargo-check:   {l}");
     }
+    let verdict = cargo_verdict(&ends);
+    match verdict {
+        Ok(()) => eprintln!(
+            "cargo-check: PASS the crates kept still standing, stayed aboard driving straight, and slid as they went"
+        ),
+        Err(why) => eprintln!("cargo-check: FAIL {why}"),
+    }
+}
+
+/// `--cargo-check`'s verdict on its phases' ends (phase, median and most
+/// shift of those aboard, how many off, how many in all), against Xenia's
+/// run eg2 (`elgrande-crates.md`: still 0.00 / 0.01 m; straight 0.33 /
+/// 0.52 m, none off; 3 of 19 off in the hard turn; 0.68 / 2.68 m at the
+/// end): they keep still standing (most shift at most 0.05 m, none off),
+/// none comes off driving straight, they do slide (some shift past 0.1 m
+/// by the end), and not more than half come off. The thresholds are the
+/// check's own, around Xenia's numbers.
+fn cargo_verdict(ends: &[(&str, f32, f32, usize, usize)]) -> Result<(), String> {
+    let at = |name: &str| ends.iter().find(|e| e.0 == name).copied();
+    let (Some(still), Some(straight), Some(last)) =
+        (at("standing"), at("straight"), at("standing after"))
+    else {
+        return Err("the drive ended before all its phases".into());
+    };
+    if still.4 == 0 {
+        return Err("no crates aboard".into());
+    }
+    if still.2 > 0.05 || still.3 > 0 {
+        return Err(format!(
+            "standing they moved: max {:.2} m, {} off",
+            still.2, still.3
+        ));
+    }
+    if straight.3 > 0 {
+        return Err(format!("{} came off driving straight", straight.3));
+    }
+    if last.2 <= 0.1 {
+        return Err(format!("they never slid (max {:.2} m)", last.2));
+    }
+    if last.3 * 2 > last.4 {
+        return Err(format!("{} of {} came off", last.3, last.4));
+    }
+    Ok(())
 }
 
 /// The median and the most of `shifts` (0 for none), as the Xenia
@@ -13012,5 +13059,30 @@ mod disguise_check_tests {
     #[test]
     fn the_disguise_check_passes() {
         assert!(super::disguise_check());
+    }
+}
+
+#[cfg(test)]
+mod cargo_verdict_tests {
+    use super::cargo_verdict;
+
+    // Xenia's run eg2 passes; crates that never move, or fall off driving
+    // straight, fail.
+    #[test]
+    fn xenias_crates_pass_and_frozen_or_spilled_ones_fail() {
+        let xenia = [
+            ("standing", 0.0, 0.01, 0, 19),
+            ("straight", 0.33, 0.52, 0, 19),
+            ("hard turn", 0.54, 1.80, 3, 19),
+            ("braking", 0.70, 2.36, 3, 19),
+            ("standing after", 0.68, 2.68, 3, 19),
+        ];
+        assert_eq!(cargo_verdict(&xenia), Ok(()));
+        let mut frozen = xenia;
+        frozen[4] = ("standing after", 0.0, 0.0, 0, 19);
+        assert!(cargo_verdict(&frozen).is_err());
+        let mut spilled = xenia;
+        spilled[1] = ("straight", 0.3, 0.5, 2, 19);
+        assert!(cargo_verdict(&spilled).is_err());
     }
 }
