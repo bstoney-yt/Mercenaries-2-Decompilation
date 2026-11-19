@@ -1753,6 +1753,9 @@ struct VehicleBody {
     hull: Option<Hull>,
     /// A helicopter's: it flies.
     rotor: Option<Rotorcraft>,
+    /// A car's sleep when it keeps still ([`Rest`]; a tank's is its
+    /// tracks', a boat's and a helicopter's aren't run).
+    rest: Rest,
 }
 
 /// How hard a helicopter's turbulence pushes it, m/s² a radian of its
@@ -2376,8 +2379,9 @@ impl Tracks {
     }
 }
 
-/// How a tank's body goes to sleep when it keeps still, which is all that
-/// holds an empty one on a hill.
+/// How a tank's or a car's body goes to sleep when it keeps still, which
+/// is all that holds an empty tank on a hill (an empty car's tyres' rolling
+/// grip slows it first).
 ///
 /// From the 360 code: its chassis body is built (0x8216A290) from the
 /// rigid-body defaults (0x82621820), which leave Havok's spatial
@@ -3634,6 +3638,28 @@ impl Physics {
                 let still = !v.wrecked && tank.rest.step(vec3(b.center_of_mass()), dt);
                 rest_hand_off(b, still);
             }
+            // A car's body sleeps the same way: no set-up of a car calls
+            // the deactivator setter (0x82629CF0; its only callers are the
+            // jet's 0x8218CAA8 and 0x82160FF8), so it keeps the rigid-body
+            // defaults' spatial deactivation (0x82621820), as a tank does.
+            // Asleep, its wheels and engine don't run; any input wakes it
+            // ([`Physics::drive`], 0x82189AC8 -> 0x8261EEB0).
+            if v.tank.is_none()
+                && v.hull.is_none()
+                && v.rotor.is_none()
+                && let Some(b) = w.bodies.get_mut(v.controller.chassis)
+            {
+                if b.is_sleeping() {
+                    v.rest.asleep = true;
+                    rest_hand_off(b, false);
+                    continue;
+                }
+                if v.rest.asleep {
+                    v.rest.wake();
+                }
+                let still = !v.wrecked && v.rest.step(vec3(b.center_of_mass()), dt);
+                rest_hand_off(b, still);
+            }
             let filter = ground().exclude_rigid_body(v.controller.chassis);
             let queries = w.broad_phase.as_query_pipeline_mut(
                 w.narrow_phase.query_dispatcher(),
@@ -4868,6 +4894,7 @@ impl Physics {
             spin_before: Vec3::ZERO,
             hull,
             rotor,
+            rest: Rest::default(),
         }));
         id
     }
@@ -10407,6 +10434,59 @@ mod tests {
         let up = push(&mut t, full - 0.29);
         let want = 32000.0 * (20.0 * 0.29 - 2.5 * 0.01 / DT) * 0.29 * DT;
         assert!((up.y - want).abs() < want * 1e-3, "{up}");
+    }
+
+    // An empty car keeps Havok's default deactivation, as a tank does
+    // (no car set-up calls 0x82629CF0): standing still it sleeps after six
+    // still checks, 0.2 s apart; rolling, it doesn't; an input wakes it
+    // (0x82189AC8 -> 0x8261EEB0) and it drives off.
+    #[test]
+    fn an_empty_car_sleeps_when_still_and_wakes_to_its_input() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 600.0);
+        p.step(DT);
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, -500.0), 0.0);
+        let empty = VehicleControls::default();
+        let mut slept = None;
+        for i in 0..(6.0 / DT) as usize {
+            p.drive(id, empty);
+            p.step(DT);
+            if slept.is_none() && p.vehicle_asleep(id) {
+                slept = Some(i);
+            }
+        }
+        assert!(slept.is_some(), "never slept standing still");
+        assert!(p.vehicle_asleep(id));
+        // Asleep, it stays where it is.
+        let at = p.vehicle_transform(id).expect("car").w_axis;
+        for _ in 0..60 {
+            p.drive(id, empty);
+            p.step(DT);
+        }
+        assert_eq!(p.vehicle_transform(id).expect("car").w_axis, at);
+        // Its throttle wakes it, and it drives off.
+        for _ in 0..120 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        assert!(!p.vehicle_asleep(id));
+        assert!(p.vehicle_speed(id) > 2.0, "{}", p.vehicle_speed(id));
+        // Let go rolling, it doesn't sleep while it rolls.
+        for _ in 0..30 {
+            p.drive(id, empty);
+            p.step(DT);
+            assert!(
+                !p.vehicle_asleep(id),
+                "asleep at {} m/s",
+                p.vehicle_speed(id)
+            );
+        }
     }
 
     #[test]
