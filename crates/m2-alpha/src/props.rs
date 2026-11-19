@@ -833,6 +833,18 @@ impl Props {
             .collect()
     }
 
+    /// The bodies of what rides aboard vehicle `vehicle` still.
+    pub fn cargo_pieces(&self, vehicle: usize) -> Vec<DebrisId> {
+        let mut out: Vec<(u32, DebrisId)> = self
+            .cargo
+            .iter()
+            .filter(|(_, r)| r.vehicle == vehicle && r.aboard)
+            .map(|(&e, r)| (e, r.piece))
+            .collect();
+        out.sort_by_key(|&(e, _)| e);
+        out.into_iter().map(|(_, d)| d).collect()
+    }
+
     /// Whether `entity` was loaded on a vehicle ([`load`](Self::load)),
     /// aboard still or fallen off.
     pub fn is_cargo(&self, entity: u32) -> bool {
