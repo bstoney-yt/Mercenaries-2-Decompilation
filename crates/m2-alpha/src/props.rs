@@ -1137,6 +1137,7 @@ impl Props {
             && let Some(shape) = &m.collision
             && !p.wrecked
             && stands(entity)
+            && !self.bodiless.contains(&entity)
         {
             physics.add_static_as(
                 StaticKey::Entity(entity),
@@ -1786,7 +1787,11 @@ impl Props {
                 if through_on_island(p, shape) {
                     through.push(format!("{e:#x} (template {:08x})", p.template));
                 }
-                if !p.wrecked && !self.knocked.contains_key(&e) && !self.swings.contains_key(&e) {
+                // As at every other place its collision goes up
+                // ([`walled`](Self::walled)): q618h, the paradrop plane's
+                // model coming in after it was shown put its collision up
+                // here, bodiless or not.
+                if self.walled(e, p) {
                     physics.add_static_as(
                         StaticKey::Entity(e),
                         shape,
