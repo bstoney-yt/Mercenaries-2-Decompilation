@@ -3363,6 +3363,11 @@ pub struct Physics {
     /// ([`add_prop_body`](Self::add_prop_body)): each sleeps by the 360's
     /// rule ([`Rest`]), as a tank's body does.
     prop_rest: HashMap<r::RigidBodyHandle, Rest>,
+    /// Each prop body's velocity before the last step (still for one
+    /// asleep): what it met a vehicle with ([`vehicle_prop_hits`]).
+    ///
+    /// [`vehicle_prop_hits`]: Physics::vehicle_prop_hits
+    prop_before: HashMap<r::RigidBodyHandle, Vec3>,
     /// Props placed asleep, put to sleep once their first step has made
     /// their contacts (a new contact wakes a body in rapier).
     prop_sleep: Vec<r::RigidBodyHandle>,
@@ -3439,6 +3444,7 @@ impl Physics {
             human_ragdoll: None,
             debris: Vec::new(),
             prop_rest: HashMap::new(),
+            prop_before: HashMap::new(),
             prop_sleep: Vec::new(),
             last_step_ms: 0.0,
             water: None,
@@ -3619,6 +3625,17 @@ impl Physics {
     /// again; still for long enough, its island may sleep this step.
     fn rest_props(&mut self, dt: f32) {
         let w = &mut self.world;
+        self.prop_before.clear();
+        for h in self.prop_rest.keys() {
+            if let Some(b) = w.bodies.get(*h) {
+                let v = if b.is_sleeping() {
+                    Vec3::ZERO
+                } else {
+                    vec3(b.linvel())
+                };
+                self.prop_before.insert(*h, v);
+            }
+        }
         self.prop_rest.retain(|h, rest| {
             let Some(b) = w.bodies.get_mut(*h) else {
                 return false;
@@ -5738,6 +5755,76 @@ impl Physics {
                         (vec3(b.mins), vec3(b.maxs))
                     });
                 out.push((key, vec3(own.position().transform_point(local)), span));
+            }
+        }
+        out
+    }
+
+    /// The props that are bodies of their own ([`add_prop_body`]) a
+    /// vehicle's body is in contact with after the last step, each once:
+    /// the prop's piece, the point of deepest contact (world), the speed
+    /// they closed at along the contact normal before the step (m/s; the
+    /// vehicle's velocity at that point less the prop's), and the prop
+    /// body's mass. From the 360 code: a collision event's size takes the
+    /// contacts' closing speed (0x82162BB8) and the two masses (0x82163758,
+    /// [`crate::durability::crash_size`]).
+    ///
+    /// [`add_prop_body`]: Physics::add_prop_body
+    pub fn vehicle_prop_hits(&self, id: VehicleId) -> Vec<(DebrisId, Vec3, f32, f32)> {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return Vec::new();
+        };
+        let Some(body) = self.world.bodies.get(v.controller.chassis) else {
+            return Vec::new();
+        };
+        let centre = vec3(body.center_of_mass());
+        let mut out: Vec<(DebrisId, Vec3, f32, f32)> = Vec::new();
+        for &c in body.colliders() {
+            let Some(mine) = self.world.colliders.get(c) else {
+                continue;
+            };
+            for pair in self.world.narrow_phase.contact_pairs_with(c) {
+                if !pair.has_any_active_contact() {
+                    continue;
+                }
+                let first = pair.collider1 == c;
+                let other = if first {
+                    pair.collider2
+                } else {
+                    pair.collider1
+                };
+                let Some(h) = self.world.colliders.get(other).and_then(|o| o.parent()) else {
+                    continue;
+                };
+                if !self.prop_rest.contains_key(&h) {
+                    continue;
+                }
+                let Some(d) = self.debris.iter().position(|x| *x == Some(h)).map(DebrisId) else {
+                    continue;
+                };
+                if out.iter().any(|o| o.0 == d) {
+                    continue;
+                }
+                let Some((manifold, deepest)) = pair
+                    .manifolds()
+                    .iter()
+                    .flat_map(|m| m.points.iter().map(move |p| (m, p)))
+                    .min_by(|a, b| a.1.dist.total_cmp(&b.1.dist))
+                else {
+                    continue;
+                };
+                let (local, normal) = if first {
+                    (deepest.local_p1, vec3(manifold.data.normal))
+                } else {
+                    (deepest.local_p2, -vec3(manifold.data.normal))
+                };
+                let at = vec3(mine.position().transform_point(local));
+                let n = normal.normalize_or_zero();
+                let vehicle = v.before + v.spin_before.cross(at - centre);
+                let prop = self.prop_before.get(&h).copied().unwrap_or(Vec3::ZERO);
+                let closing = (vehicle - prop).dot(n).max(0.0);
+                let mass = self.world.bodies.get(h).map_or(0.0, |b| b.mass());
+                out.push((d, at, closing, mass));
             }
         }
         out
@@ -11439,6 +11526,49 @@ mod tests {
         assert!(posed[0].abs_diff_eq(rest[0], 1e-4));
         let lamp = (placed * posed[2]).w_axis.truncate();
         assert!(lamp.distance(Vec3::new(101.0, 1.1, 0.0)) < 1e-4, "{lamp}");
+    }
+
+    // A car driven into a prop that is a body of its own (asleep where it
+    // stands) reports the meeting with the speed they closed at and the
+    // prop's mass: what the crash rules take (0x82162BB8, 0x82163758).
+    #[test]
+    fn a_car_meeting_a_prop_body_reports_its_closing_speed_and_mass() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
+        let crate_ = LoosePiece {
+            node: None,
+            shape: r::SharedShape::cuboid(0.5, 0.5, 0.5),
+            mass: 80.0,
+            material: BodyMaterial::DEBRIS,
+            from_model: Mat4::IDENTITY,
+        };
+        let d = p.add_prop_body(
+            &crate_,
+            Mat4::from_translation(Vec3::new(0.0, 0.5, 12.0)),
+            true,
+        );
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        for _ in 0..30 {
+            p.step(DT);
+        }
+        let mut met = None;
+        for _ in 0..240 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+            if let Some(h) = p.vehicle_prop_hits(id).into_iter().find(|h| h.0 == d) {
+                met = Some(h);
+                break;
+            }
+        }
+        let (_, _, closing, mass) = met.expect("the car met the crate");
+        assert!(closing > 1.0, "closing at {closing} m/s");
+        assert!((mass - 80.0).abs() < 1.0, "{mass} kg");
     }
 
     // Was `vehicles_drive_through_loose_pieces` (invented, round 90).

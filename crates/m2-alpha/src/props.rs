@@ -154,9 +154,11 @@ pub struct Props {
     heard: HashSet<u32>,
     /// Knocked loose since [`take_knocked`](Self::take_knocked).
     fresh_knocks: Vec<u32>,
-    /// Whether props that come loose whole are bodies of their own from
-    /// the start (gap P7, [`as_bodies`](Self::as_bodies)).
-    pub bodies_on: bool,
+    /// Props that come loose whole are bodies of their own from the start
+    /// (gap P7, [`as_bodies`](Self::as_bodies)), as the 360's props are;
+    /// this keeps them fixed until knocked instead (the port's old way,
+    /// for comparing).
+    pub bodies_off: bool,
     /// Those that are: put up as sleeping bodies, not knocked by anything.
     as_body: HashSet<u32>,
     /// The material animations playing on them
@@ -236,6 +238,9 @@ pub struct Props {
     disposed: Vec<u32>,
     /// How many props blasts have thrown.
     thrown: usize,
+    /// Vehicles (by index) and prop bodies in contact the step before
+    /// ([`met_bodies`](Self::met_bodies)).
+    bumping: HashSet<(usize, DebrisId)>,
 }
 
 /// A prop's parts' states applied ([`Props::apply_states`]): which nodes
@@ -253,6 +258,10 @@ pub struct Applied {
     /// How many of its parts are down now.
     pub down: usize,
 }
+
+/// A prop that is a body of its own near a blast ([`Props::bodies_near`]):
+/// its entity, its template, its bodies and its box as it now stands.
+pub type BodyNear = (u32, u32, Vec<DebrisId>, (Vec3, Vec3));
 
 /// Which parts of a prop are broken ([`m2_engine::ModelParts`]), and the
 /// nodes hidden for it.
@@ -1058,6 +1067,47 @@ impl Props {
         self.thrown
     }
 
+    /// The prop whose body from the start `d` is ([`make_body`](Self::make_body)).
+    pub fn body_entity(&self, d: DebrisId) -> Option<u32> {
+        self.as_body
+            .iter()
+            .find(|e| self.knocked.get(e).is_some_and(|v| v.contains(&d)))
+            .copied()
+    }
+
+    /// The vehicles (by index) and prop bodies in contact this step:
+    /// those that weren't the step before, a meeting each (the 360 sends
+    /// one collision event for each new contact).
+    pub fn met_bodies(&mut self, now: &[(usize, DebrisId)]) -> Vec<(usize, DebrisId)> {
+        let fresh: Vec<(usize, DebrisId)> = now
+            .iter()
+            .copied()
+            .filter(|p| !self.bumping.contains(p))
+            .collect();
+        self.bumping = now.iter().copied().collect();
+        fresh
+    }
+
+    /// The props that are bodies of their own from the start within
+    /// `reach` of `at` (their first body's place): each entity, its
+    /// template, its bodies and its box as it now stands.
+    pub fn bodies_near(&self, physics: &Physics, at: Vec3, reach: f32) -> Vec<BodyNear> {
+        self.as_body
+            .iter()
+            .filter_map(|&e| {
+                let ids = self.knocked.get(&e)?;
+                let place = physics.debris_place(*ids.first()?)?;
+                let p = self.shown.get(&e)?;
+                let m = self.models.get(&p.model)?.as_ref()?;
+                let (lo, hi) = m.gpu.bounds;
+                let centre = place.w_axis.truncate();
+                let half = (hi - lo) * 0.5;
+                (centre.distance(at) - half.length() <= reach)
+                    .then(|| (e, p.template, ids.clone(), (centre - half, centre + half)))
+            })
+            .collect()
+    }
+
     /// Every piece lying knocked loose (not a body from the start).
     pub fn knocked_pieces(&self) -> Vec<DebrisId> {
         self.knocked
@@ -1068,6 +1118,12 @@ impl Props {
     }
 
     fn wreck_hit(&mut self, physics: &mut Physics, entity: u32, hit: Hit) -> bool {
+        // A body of its own from the start: already loose. With a wreck to
+        // show, its bodies go and the wreck comes where it now stands;
+        // without, it stays as its bodies (nothing more to break).
+        if self.as_body.contains(&entity) && !self.unbody(physics, entity) {
+            return false;
+        }
         // Its box in the world, for a blast's push on it whole.
         let whole = self
             .placed_bounds(entity)
@@ -1199,8 +1255,44 @@ impl Props {
         self.as_body.insert(entity);
     }
 
+    /// `entity`, a body of its own from the start, is to be wrecked: if
+    /// its model has a wreck to show, its bodies go and the prop is put
+    /// where they had taken it (its first body's place, as it started
+    /// against the prop's), true; else false and it stays as it is.
+    fn unbody(&mut self, physics: &mut Physics, entity: u32) -> bool {
+        let has_wreck = self
+            .shown
+            .get(&entity)
+            .and_then(|p| self.models.get(&p.model)?.as_ref())
+            .is_some_and(|m| m.gpu.has_wreck());
+        if !has_wreck {
+            return false;
+        }
+        let ids = self.knocked.remove(&entity).unwrap_or_default();
+        let moved = (|| {
+            let p = self.shown.get(&entity)?;
+            let loose = self.loose(entity)?;
+            let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+            let start = *loose.starts(placed).first()?;
+            let now = physics.debris_place(*ids.first()?)?;
+            Some(now * start.inverse() * placed)
+        })();
+        for d in ids {
+            physics.remove_debris(d);
+        }
+        self.as_body.remove(&entity);
+        if let (Some(m), Some(p)) = (moved, self.shown.get_mut(&entity)) {
+            let (_, rotation, position) = m.to_scale_rotation_translation();
+            p.rotation = rotation.normalize();
+            p.position = position;
+        }
+        self.changed();
+        true
+    }
+
     /// The props that are bodies of their own from the start
-    /// ([`bodies_on`](Self::bodies_on)): each entity and its bodies.
+    /// (unless [`bodies_off`](Self::bodies_off)): each entity and its
+    /// bodies.
     pub fn as_bodies(&self) -> impl Iterator<Item = (u32, &[DebrisId])> + '_ {
         self.as_body
             .iter()
@@ -1733,8 +1825,9 @@ impl Props {
             let whole = self
                 .loose(e)
                 .is_some_and(|l| !l.breaks && !l.pieces.is_empty());
-            if self.bodies_on
+            if !self.bodies_off
                 && whole
+                && !self.sturdy.contains(&e)
                 && stands(e)
                 && !p.wrecked
                 && !self.knocked.contains_key(&e)

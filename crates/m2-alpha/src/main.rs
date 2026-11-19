@@ -7618,7 +7618,6 @@ fn drive_for_screenshot(
     install: Option<&Install>,
 ) -> anyhow::Result<()> {
     game.combat.homing_check = options.homing_check;
-    game.scene.props.bodies_on = options.prop_bodies_check;
     let tick = TICK.as_secs_f32();
     let started = Instant::now();
     loop {
@@ -12773,7 +12772,11 @@ fn prop_bodies_check(
          at {speed:.1} m/s after",
         game.scene.vehicles[i].spec.label
     );
-    if !bodies.is_empty() && awake == 0 && moved > 0.5 {
+    let (met, broke) = game.destruction.bodies_met;
+    eprintln!(
+        "prop-bodies-check: the crash rules took {met} meetings of vehicles and prop bodies, {broke} broke"
+    );
+    if !bodies.is_empty() && awake == 0 && moved > 0.5 && met > 0 {
         eprintln!("prop-bodies-check: PASS");
     } else {
         eprintln!(

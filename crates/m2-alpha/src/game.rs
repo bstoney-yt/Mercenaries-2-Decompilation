@@ -4724,6 +4724,7 @@ fn knock_loose(
     install: Option<&Install>,
 ) -> Vec<(m2_engine::VehicleId, String, f32)> {
     let mut knocked = Vec::new();
+    let mut met = Vec::new();
     for (index, (v, bed)) in vehicles
         .iter()
         .zip(beds.iter().chain(std::iter::repeat(&None)))
@@ -4790,6 +4791,31 @@ fn knock_loose(
             }
         }
         let before = world.physics.vehicle_velocity_before(id);
+        // Props that are bodies of their own it met in the step: the
+        // crash rules on the real contact (its closing speed and both
+        // masses), each meeting once ([`Destruction::crash_body`]).
+        if let Some(place) = world.physics.vehicle_transform(id) {
+            let db = &world.index.template_db;
+            let sound = vehicle_sound_key(db, &v.spec.label, v.spec.model).unwrap_or(0);
+            for (d, _, closing, prop_mass) in world.physics.vehicle_prop_hits(id) {
+                if let Some(e) = props.body_entity(d) {
+                    met.push((
+                        index,
+                        d,
+                        e,
+                        closing,
+                        prop_mass,
+                        Crasher {
+                            place,
+                            bounds: v.model.bounds,
+                            velocity: before,
+                            mass: v.spec.mass,
+                            sound,
+                        },
+                    ));
+                }
+            }
+        }
         let mut speed = before.length();
         if world.physics.vehicle_pulling(id) {
             speed = speed.max(PUSH_SPEED);
@@ -4829,6 +4855,15 @@ fn knock_loose(
             world.physics.set_vehicle_velocity(id, before * keep);
             world.physics.set_vehicle_spin(id, spin * keep);
             knocked.push((id, v.spec.label.clone(), before.y));
+        }
+    }
+    let pairs: Vec<(usize, m2_engine::DebrisId)> = met.iter().map(|m| (m.0, m.1)).collect();
+    let fresh = props.met_bodies(&pairs);
+    if let Some(install) = install {
+        for (index, d, e, closing, prop_mass, crasher) in met {
+            if fresh.contains(&(index, d)) {
+                destruction.crash_body(world, props, install, &crasher, e, closing, prop_mass);
+            }
         }
     }
     knocked
@@ -4940,7 +4975,10 @@ fn run_into(
         let (fling, topple) = flung(vehicle.velocity, mass, m);
         let knocked = match key {
             StaticKey::Object(i) => world.knock(i, fling, topple),
-            StaticKey::Entity(e) => props.knock(&mut world.physics, e, fling, topple, false),
+            // A prop that comes loose is a body of its own: the vehicle
+            // meets it in the physics, and the crash rules take the real
+            // contact ([`Destruction::crash_body`]).
+            StaticKey::Entity(_) => false,
             _ => false,
         };
         if knocked {
@@ -5235,6 +5273,21 @@ fn blast_loose(world: &mut World, props: &mut Props, pushes: &[BlastPush], strik
             if props.knock(&mut world.physics, e, velocity, spin, strike) {
                 props.blast_thrown(&mut world.physics, e);
             }
+        }
+        // Props that are bodies of their own: pushed where they now lie,
+        // as a blast pushes any moving body it reaches (0x8215C560 ->
+        // 0x8215CBC8), each body by the push on the prop's box.
+        for (e, template, ids, (lo, hi)) in props.bodies_near(&world.physics, push.at, push.radius)
+        {
+            let db = &world.index.template_db;
+            if !strike && !blown_loose(db, template) {
+                continue;
+            }
+            let (velocity, _) = push.throw(lo, hi, fudge(db, template));
+            for d in ids {
+                world.physics.push_debris(d, velocity);
+            }
+            props.blast_thrown(&mut world.physics, e);
         }
     }
 }

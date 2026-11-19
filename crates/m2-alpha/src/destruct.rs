@@ -364,6 +364,9 @@ pub type Shows = Vec<(u32, Vec3)>;
 /// The damage done to the island's placed objects, and those coming down.
 #[derive(Debug, Default)]
 pub struct Destruction {
+    /// Meetings of vehicles and prop bodies the crash rules took
+    /// ([`crash_body`](Self::crash_body)): how many, and how many broke.
+    pub bodies_met: (u32, u32),
     /// Damage taken so far, by placed object.
     taken: HashMap<usize, f32>,
     /// Destroyed, put up as props, waiting for their models to load to
@@ -760,6 +763,54 @@ impl Destruction {
             0.0,
         );
         self.wear_by(world, props, Some(install), key, hit, cause)
+    }
+
+    /// `vehicle` met prop `e`, a body of its own of `prop_mass` kg, closing
+    /// at `closing` m/s along the contact: the crash rules on that real
+    /// contact. Its size is [`m2_engine::durability::crash_size`] of both
+    /// masses (0x82163758, 0x82162BB8); a hundredth of it, nothing under
+    /// [`m2_engine::durability::CRASH_FLOOR`] (0x8228B5F0), wears the prop
+    /// by its row of the damage table for a vehicle's ram (0x82287CF8,
+    /// [`RAM_KIND`]). True if it broke.
+    #[allow(clippy::too_many_arguments)]
+    pub fn crash_body(
+        &mut self,
+        world: &mut World,
+        props: &mut Props,
+        install: &Install,
+        vehicle: &Crasher,
+        e: u32,
+        closing: f32,
+        prop_mass: f32,
+    ) -> bool {
+        let size = m2_engine::durability::crash_size(vehicle.mass, prop_mass, closing);
+        let base = m2_engine::durability::crash_base(size);
+        self.bodies_met.0 += 1;
+        if base <= 0.0 {
+            return false;
+        }
+        let cause = Cause::Crash {
+            velocity: vehicle.velocity,
+            mass: vehicle.mass,
+            sound: vehicle.sound,
+        };
+        let hit = (base, m2_assets::name_hash(RAM_KIND), 0.0);
+        let broke = self.wear_by(
+            world,
+            props,
+            Some(install),
+            StaticKey::Entity(e),
+            hit,
+            cause,
+        );
+        eprintln!(
+            "destruct: a {:.0} kg vehicle met prop {e:#x} ({prop_mass:.0} kg) closing at \
+             {closing:.1} m/s: size {size:.1}, {base:.2} before its cell{}",
+            vehicle.mass,
+            if broke { ", it breaks" } else { "" }
+        );
+        self.bodies_met.1 += u32::from(broke);
+        broke
     }
 
     /// Wears down what `blast` reaches ([`wear`](Self::wear)), the
