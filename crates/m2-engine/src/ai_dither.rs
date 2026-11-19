@@ -22,9 +22,11 @@
 //! takes it; with all four active and none near, nothing is recorded.
 //! The timers run down by each update's step (0x822C8530).
 //!
-//! **Inferred** (which chooser reads the list was not found): that a
-//! destination within 2 m on x/z of an active spot is passed over
-//! ([`Dither::bad`]).
+//! Nothing in the 360 reads the list: it is written (60 s here, 10 s by
+//! 0x822C7CF0 for a destination that failed its check, 20 s by
+//! 0x822C6138 for a goal re-seeded at his spot), merged and counted down,
+//! but no chooser passes its spots over. [`Dither::bad`] is for checking
+//! only.
 
 use m2_math::glam::{Vec2, Vec3};
 
@@ -96,8 +98,8 @@ impl Dither {
         }
     }
 
-    /// Whether `at` is within 2 m on x/z of a bad spot: a destination
-    /// passed over (inferred, see the module's notes).
+    /// Whether `at` is within 2 m on x/z of a bad spot (for checking: the
+    /// game reads the list nowhere).
     pub fn bad(&self, at: Vec3) -> bool {
         self.spots.iter().flatten().any(|(p, _)| near(*p, at))
     }
