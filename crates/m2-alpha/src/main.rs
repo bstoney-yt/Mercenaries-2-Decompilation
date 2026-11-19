@@ -9408,6 +9408,19 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
         still(game);
         game.step(Intent::default(), tick);
     }
+    // Down on the ground before the wreck (a blast hurts only her on
+    // it): up to 5 s more.
+    for _ in 0..(5.0 / tick) as u32 {
+        if game.scene.player.as_ref().is_some_and(|p| p.landed) {
+            break;
+        }
+        still(game);
+        game.step(Intent::default(), tick);
+    }
+    if !game.scene.player.as_ref().is_some_and(|p| p.landed) {
+        eprintln!("wreck-blast-check: FAIL she never came down where she was put");
+        return;
+    }
     still(game);
     // As Xenia's runs (Mattias, 120 of 120): so a near blast's loss is not
     // cut by a lower whole health or her clamp.
@@ -9435,8 +9448,12 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
         game.combat.wreck_now(&mut world.physics, v, i);
     }
     let (mut top, mut top_at, mut fastest, mut landed) = (0.0f32, 0.0, 0.0f32, None);
+    // Her least health in the watch: the blasts' loss, before her health
+    // comes back (4 s on, at 25 a second: by 6 s some 50 of it).
+    let mut least = game.combat.hp;
     for k in 0..(6.0 / tick) as u32 {
         game.step(Intent::default(), tick);
+        least = least.min(game.combat.hp);
         let t = (k + 1) as f32 * tick;
         let Some((at, v)) = place(game) else {
             break;
@@ -9456,13 +9473,13 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
     eprintln!(
         "wreck-blast-check: rose {top:.1} m at {top_at:.2} s (360 {rise}), landed {} m off (360 {off}), top speed {fastest:.1} m/s (360 {speed}); she lost {:.1} (360 {lost}) and moved {:.1} m",
         landed.map_or("never".to_owned(), |d| format!("{d:.1}")),
-        hp - game.combat.hp,
+        hp - least,
         her(game)
             .zip(her_from)
             .map_or(0.0, |(a, b)| a.with_y(0.0).distance(b.with_y(0.0)))
     );
     let away = at.unwrap_or(5.9);
-    let lost = hp - game.combat.hp;
+    let lost = hp - least;
     let fired = &game.combat.part_blasts_fired;
     let missing: Vec<String> = WRECK_BLASTS
         .iter()

@@ -7161,10 +7161,25 @@ impl Combat {
             }
         }
         self.blast_explosives(f.explosives, at, reach, |d| b.damage_at(d), b.key);
-        if f.player.driving.is_none() && f.player.landed {
-            let d = (f.player.character.position + Vec3::Y).distance(at);
-            if d < reach {
+        let d = (f.player.character.position + Vec3::Y).distance(at);
+        if d < reach * 2.0 && !(f.player.driving.is_none() && f.player.landed && d < reach) {
+            eprintln!(
+                "blast: {:08x} {d:.1} m off spares her: {}",
+                b.template,
+                if f.player.driving.is_some() {
+                    "she is in a vehicle"
+                } else if !f.player.landed {
+                    "she is not down on the ground"
+                } else {
+                    "past its reach"
+                }
+            );
+        }
+        if f.player.driving.is_none() && f.player.landed && d < reach {
+            {
+                let before = self.hp;
                 let lost = self.hurt_player(f, b.damage_at(d) * hers, Some(at));
+                eprintln!("hurt: her health {before:.1} -> {:.1}", self.hp);
                 eprintln!(
                     "blast: {:08x} reaches her {d:.1} m off: {:.1} x {hers} = {lost:.1} lost",
                     b.template,
