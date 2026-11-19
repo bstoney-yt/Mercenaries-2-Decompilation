@@ -552,6 +552,9 @@ struct Options {
     /// then a helicopter set down on the sea, each held past its
     /// `Buoyancy` delay; PASS when each sinks and she is put out.
     sink_check: bool,
+    /// `--sink-jennifer`: `--sink-check` as Xenia's Jennifer run (100 of
+    /// 100): the car's put-out must leave her at the health clamp's floor.
+    sink_jennifer: bool,
     /// `--mine-check`: in the mission, the nearest placed mine is blasted
     /// by an RPG and, should it stand, run into by a jeep; logs
     /// `mine-check:` lines ([`mines::MineCheck`]).
@@ -979,6 +982,11 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--sink-check" => {
                 o.sink_check = true;
+                o.drive = true;
+            }
+            "--sink-jennifer" => {
+                o.sink_check = true;
+                o.sink_jennifer = true;
                 o.drive = true;
             }
             "--mine-check" => {
@@ -8048,7 +8056,7 @@ fn drive_for_screenshot(
         return Ok(());
     }
     if options.sink_check {
-        sink_check(game, tick);
+        sink_check(game, tick, options.sink_jennifer);
         return Ok(());
     }
     if options.impact_check {
@@ -9197,7 +9205,7 @@ const SINK_XENIA: (f32, f32) = (5.8, 100.4);
 /// How near Xenia's the car's put-out must come: seconds, health.
 const SINK_SLACK: (f32, f32) = (0.6, 1.0);
 
-fn sink_check(game: &mut Game, tick: f32) {
+fn sink_check(game: &mut Game, tick: f32, jennifer: bool) {
     use m2_math::glam::Vec3;
     let mut fails: Vec<String> = Vec::new();
     let mut passed: Vec<String> = Vec::new();
@@ -9253,12 +9261,37 @@ fn sink_check(game: &mut Game, tick: f32) {
         let every = ((1.0 / tick) as u32).max(1);
         let mut sunk_at = None;
         // As Xenia's run (Mattias, 120 of 120): her whole health 120, so
-        // the loss isn't cut by a lower whole.
-        game.combat.max_hp = 120.0;
-        game.combat.hp = 120.0;
+        // the loss isn't cut by a lower whole; with `--sink-jennifer` as
+        // Jennifer's (100 of 100), where the clamp stops it.
+        let whole = if jennifer { 100.0 } else { 120.0 };
+        game.combat.max_hp = whole;
+        game.combat.hp = whole;
+        // As the scripts have it in play (`Player.SetHealthClamp`: Xenia's
+        // Jennifer run was in a mission); this check runs no scripts.
+        if jennifer {
+            game.combat.health_clamp = true;
+        }
         let mut lost = 0.0;
+        let mut left = whole;
+        // Her least health from going in to 2 s after she is out: her
+        // health comes back after (the q760 run read 1.42: 1 and 0.42 of
+        // it).
+        let mut least = whole;
+        let mut out_at = None;
         for t in 0..ticks {
             game.step(Intent::default(), tick);
+            if out_at.is_none_or(|o| t < o + (2.0 / tick) as u32) {
+                least = least.min(game.combat.hp);
+            }
+            if out_at.is_none()
+                && game
+                    .scene
+                    .player
+                    .as_ref()
+                    .is_some_and(|p| p.driving != Some(i))
+            {
+                out_at = Some(t);
+            }
             if t % every == 0 {
                 eprintln!(
                     "sink-check: {:.0} s: {:.1} s a quarter under, sunk {}",
@@ -9269,7 +9302,12 @@ fn sink_check(game: &mut Game, tick: f32) {
             }
             if game.sunk(i) && sunk_at.is_none() {
                 sunk_at = Some(t as f32 * tick);
-                lost = 120.0 - game.combat.hp;
+                lost = whole - game.combat.hp;
+                left = if jennifer { least } else { game.combat.hp };
+                eprintln!(
+                    "sink-check: {kind} put her out: {whole:.0} -> {left:.2} (clamp {})",
+                    game.combat.health_clamp
+                );
             }
         }
         let out = game
@@ -9281,7 +9319,13 @@ fn sink_check(game: &mut Game, tick: f32) {
             Some(s) if out && game.scene.vehicles[i].wrecked => fails.push(format!(
                 "{kind} sank at {s:.1} s but was wrecked (the 360's stays whole)"
             )),
-            Some(s) if out && !heli && (lost - SINK_XENIA.1).abs() > SINK_SLACK.1 => {
+            // Jennifer (Xenia: 100 -> 3.00): the clamp's floor, 3.
+            Some(s) if out && !heli && jennifer && (left - 3.0).abs() > 0.01 => {
+                fails.push(format!(
+                    "{kind} sank at {s:.1} s, she is out at {left:.2} health (Xenia's Jennifer 3.00)"
+                ))
+            }
+            Some(s) if out && !heli && !jennifer && (lost - SINK_XENIA.1).abs() > SINK_SLACK.1 => {
                 fails.push(format!(
                     "{kind} sank at {s:.1} s, she is out but lost {lost:.1} (Xenia {})",
                     SINK_XENIA.1
