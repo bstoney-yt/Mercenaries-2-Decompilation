@@ -17,10 +17,17 @@
 //! - From the data: a seat's role is its `SeatParameters`' (driver,
 //!   gunner, else passenger); a gunner fires the vehicle's weapons of her
 //!   seat (`VehicleArmament`'s seat), a passenger rides.
+//! - From the 360 code: no key moves her to another seat. In a vehicle
+//!   its input (0x8242E7A0) sends only an exit on Y (the action button,
+//!   held off by the player's exit lock +0x44E and a refusal timer,
+//!   0x8242FA70); the d-pad's up and down show the HUD's counters, Back
+//!   the PDA. Seat moves (request 8 on the vehicle queue 0x831C2498, run
+//!   by 0x822A6FF0) come only from the AI (0x822D2E80, 0x82470CB8) and
+//!   the scripts' `Vehicle.TransferToSeat` (hero.lua's slide-over). She
+//!   reaches a gunner's seat by its own entrance, by a script, or not
+//!   at all.
 //! - Invented: in a gunner's or passenger's seat the vehicle stops (the
-//!   alpha's riders don't drive it on); the seat key (Y) moves her over a
-//!   `SeatToSeat` link to a free seat (0x822A6FF0's rule; no player button
-//!   for it was found in the 360 code). A rider of a seat she takes or
+//!   alpha's riders don't drive it on). A rider of a seat she takes or
 //!   slides into is put out at once (the 360 waits for them to get out).
 
 use m2_engine::seats::{self, DriverRider, Role, SlideOver, VehicleSeats};
@@ -196,18 +203,6 @@ pub fn armed_index(ride: Ride<'_>, seat: Option<u32>, armed: &[u32]) -> usize {
     }
 }
 
-/// The seat she moves to from seat `from` (`None`: the driver's) at the
-/// seat key: over its first `SeatToSeat` link to a free seat (0x822A6FF0).
-pub fn transfer(ride: Ride<'_>, from: Option<u32>) -> Option<u32> {
-    let s = ride.seating?;
-    let from = match from {
-        Some(n) => s.seat(n)?,
-        None => s.driver()?,
-    };
-    let to = seats::transfer_to(&s.seats, from, |i| ride.rider(s.seats[i].name).is_some())?;
-    Some(s.seats[to].name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn a_passenger_has_no_gun_and_the_seat_key_moves_her_over() {
+    fn a_passenger_has_no_gun() {
         let s = VehicleSeats {
             seats: vec![
                 seat("seat_driver", "entrance_driver", true, false, &[]),
@@ -379,7 +374,7 @@ mod tests {
             turrets: Vec::new(),
             doors: Vec::new(),
         };
-        let mut ride = Ride {
+        let ride = Ride {
             seating: Some(&s),
             crew: &[],
         };
@@ -388,10 +383,6 @@ mod tests {
         assert_eq!(ride.role(rear), Role::Passenger);
         assert_eq!(armed_index(ride, rear, &armed), crate::combat::NO_GUN);
         assert_eq!(armed_index(ride, None, &armed), 0);
-        assert_eq!(transfer(ride, rear), Some(name_hash("seat_driver")));
-        let driven = crew(&[("seat_driver", "VZ Soldier")]);
-        ride.crew = &driven;
-        assert_eq!(transfer(ride, rear), None);
     }
 
     #[test]

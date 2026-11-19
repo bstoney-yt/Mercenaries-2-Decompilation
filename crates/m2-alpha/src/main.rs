@@ -261,7 +261,8 @@ struct Options {
     log_check: bool,
     /// With `--drive`: stop and put this many rifle rounds into its parts.
     shoot_up: Option<u32>,
-    /// With `--drive`: fire from the next seat with a weapon.
+    /// With `--drive`: fire from the next seat with a weapon (put there
+    /// directly: no key moves her in play).
     gunner: bool,
     /// With `--drive`: a vehicle whose name holds this.
     vehicle: Option<String>,
@@ -8168,10 +8169,13 @@ fn drive_for_screenshot(
             } else {
                 m2_math::glam::Vec2::ZERO
             };
+            // `--gunner`: put at the vehicle's next armed seat first (a
+            // test's shortcut: no key moves her there in play).
+            if options.gunner && i == 0 {
+                game.combat.seat = 1;
+            }
             let trigger = combat::Trigger {
                 fire: options.fire && i == 89,
-                // `--gunner`: to the gunner's seat first.
-                seat: options.gunner && i == 0,
                 ..combat::Trigger::default()
             };
             game.step(
