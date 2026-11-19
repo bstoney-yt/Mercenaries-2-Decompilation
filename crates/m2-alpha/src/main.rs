@@ -546,6 +546,9 @@ struct Options {
     /// swim her forward walking, at her pace and sprinting, logging how
     /// fast she goes (`swim-check:` lines).
     swim_check: bool,
+    /// `--cargo-check`: Xenia's El Grande drive with its crates aboard
+    /// ([`cargo_check`]): each crate's shift, phase by phase.
+    cargo_check: bool,
     /// `--prop-bodies-check`: props that come loose whole as bodies of
     /// their own from the start (gap P7, [`prop_bodies_check`]).
     prop_bodies_check: bool,
@@ -976,6 +979,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.vehicle.get_or_insert_with(|| "m151".to_owned());
             }
             "--swim-check" => o.swim_check = true,
+            "--cargo-check" => {
+                o.cargo_check = true;
+                o.mission = true;
+            }
             "--prop-bodies-check" => {
                 o.prop_bodies_check = true;
                 o.drive = true;
@@ -5105,6 +5112,7 @@ fn mission_for_screenshot(
     let mut death_check = options.death_check.then(DeathCheck::default);
     // Seconds she has been where --props-check hits the props.
     let mut props_ready = 0.0;
+    let mut cargo_wait = options.cargo_check.then(CargoWait::default);
     let mut shop_check = options.shop_check.clone().map(shopcheck::ShopCheck::new);
     let mut cheat_check = options.cheat_check.then(cheats::Check::default);
     let mut context = ContextCheck::default();
@@ -5688,6 +5696,21 @@ fn mission_for_screenshot(
             && game.scene.player.as_ref().is_some_and(|p| p.landed)
         {
             placed::check(game, &mut placed_tried, tick);
+        }
+        // With --cargo-check, once the contract has put out a vehicle with
+        // cargo aboard (she is put by it so it streams in), it is driven
+        // ([`cargo_check`]); then the run ends.
+        if let Some(w) = &mut cargo_wait
+            && i % (1.0 / tick).round() as u32 == 0
+            && w.tick(
+                game,
+                link.place_named(CARGO_TRUCK),
+                &link.marked_places(),
+                1.0,
+            )
+        {
+            cargo_check(game, tick);
+            break;
         }
         // With --props-check, every placed prop is hit once she has been
         // ashore (and in --props-area, if given) a while, for the
@@ -9193,6 +9216,408 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 /// `--swim-check`: she is put in the nearest water over 4 m deep (looked
 /// for in rings out to 600 m) and swims forward for 4 s walking, at her
 /// pace and sprinting, through the game's tick; logs her speed each time.
+/// `--cargo-check`: Xenia's El Grande profile (`elgrande-crates.md`) on
+/// the first vehicle with cargo aboard (OilCon020's El Grande and its
+/// crates), her at the wheel: standing 3 s, full throttle straight 6 s
+/// (held to 11 m/s), a hard left turn at speed 2 s, hard braking (reverse
+/// throttle) until it stops or 4 s, then standing 3 s. Each crate's shift
+/// in the truck's frame from where it started is logged 4 times a
+/// second, and at each phase's end the median and most shift of those
+/// still aboard and how many have come off, as `cargo-check: <phase>:
+/// median <m> m, max <m> m, <n> of <k> off`.
+/// How long `--cargo-check` waits for a vehicle with cargo aboard after
+/// she is put by one that might carry some, seconds.
+const CARGO_WAIT: f32 = 60.0;
+
+/// OilCon020's El Grande with the gun crates: its layer entity's name
+/// (`vz_state_oilcon020`, guid 0xFA056, at about [2756, -34, -423]).
+/// From samples. The q680g run went to the scripts' first marker instead,
+/// [2632, -14, -998], 590 m from the truck, and it never streamed in.
+const CARGO_TRUCK: &str = "GunPickup";
+
+/// `--cargo-check`'s wait in the mission for a vehicle with cargo aboard
+/// (the contract's layers put out OilCon020's El Grande and its crates):
+/// each second, once a vehicle carries cargo it is time; before that,
+/// she is put 8 m from an El Grande that is out, else from the contract's
+/// truck where its layer has it ([`CARGO_TRUCK`]), else from the place the
+/// scripts mark first, else from
+/// the first vehicle, so the truck and its crates stream in; [`CARGO_WAIT`] s after, a `FAIL` with what was there.
+#[derive(Debug, Default)]
+struct CargoWait {
+    t: f32,
+    put_at: Option<f32>,
+    done: bool,
+}
+
+impl CargoWait {
+    fn tick(
+        &mut self,
+        game: &mut Game,
+        truck: Option<m2_math::glam::Vec3>,
+        marks: &[m2_math::glam::Vec3],
+        dt: f32,
+    ) -> bool {
+        use m2_math::glam::Vec3;
+        if self.done {
+            return false;
+        }
+        self.t += dt;
+        let vehicles = &game.scene.vehicles;
+        if (0..vehicles.len()).any(|i| {
+            vehicles[i].id.is_some() && !vehicles[i].wrecked && game.scene.props.carrying(i)
+        }) {
+            self.done = true;
+            eprintln!(
+                "cargo-check: a vehicle has cargo aboard after {:.0} s",
+                self.t
+            );
+            return true;
+        }
+        // Not before the contract's layers have had a moment.
+        if self.put_at.is_none() && self.t >= 10.0 {
+            // The El Grande if it is out; else the contract's truck where
+            // its layer has it (so it and its crates stream in there);
+            // else the place the scripts mark first; else the first
+            // vehicle.
+            let grande = vehicles
+                .iter()
+                .position(|v| v.id.is_some() && !v.wrecked && v.spec.label.contains("El Grande"));
+            if grande.is_none()
+                && let Some(at) = truck
+            {
+                eprintln!(
+                    "cargo-check: she is put 8 m from the contract's truck {CARGO_TRUCK} at {at:.0}"
+                );
+                if let Some(p) = game.scene.player.as_mut() {
+                    p.driving = None;
+                    p.drop_at(at + Vec3::X * 8.0 + Vec3::Y * 2.0);
+                }
+                game.ride = None;
+                game.on_foot = true;
+                self.put_at = Some(self.t);
+                return false;
+            }
+            let to_mark = grande.is_none().then(|| marks.first().copied()).flatten();
+            if let Some(at) = to_mark {
+                eprintln!("cargo-check: she is put 8 m from the scripts' marker at {at:.0}");
+                if let Some(p) = game.scene.player.as_mut() {
+                    p.driving = None;
+                    p.drop_at(at + Vec3::X * 8.0 + Vec3::Y * 2.0);
+                }
+                game.ride = None;
+                game.on_foot = true;
+                self.put_at = Some(self.t);
+                return false;
+            }
+            let pick =
+                grande.or_else(|| vehicles.iter().position(|v| v.id.is_some() && !v.wrecked));
+            let at = pick.and_then(|i| {
+                let id = vehicles[i].id?;
+                let m = game.scene.world.as_ref()?.physics.vehicle_transform(id)?;
+                Some((i, m.w_axis.truncate(), m.x_axis.truncate()))
+            });
+            match at {
+                Some((i, at, side)) => {
+                    eprintln!(
+                        "cargo-check: she is put 8 m from the {} at {at:.0}",
+                        vehicles[i].spec.label
+                    );
+                    if let Some(p) = game.scene.player.as_mut() {
+                        p.driving = None;
+                        p.drop_at(at + side.normalize_or(Vec3::X) * 8.0 + Vec3::Y);
+                    }
+                    game.ride = None;
+                    game.on_foot = true;
+                }
+                None => eprintln!("cargo-check: no vehicle out yet at {:.0} s", self.t),
+            }
+            self.put_at = Some(self.t);
+        }
+        if self.put_at.is_some_and(|t| self.t - t > CARGO_WAIT) {
+            self.done = true;
+            let props = &game.scene.props;
+            eprintln!(
+                "cargo-check: FAIL no vehicle with cargo aboard {CARGO_WAIT} s after she was put by one ({} vehicles, {} props loaded on any, {} shown)",
+                game.scene.vehicles.len(),
+                props.cargo_places().len(),
+                props.shown().count()
+            );
+        }
+        false
+    }
+}
+
+fn cargo_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::{Vec2, Vec3};
+    let vehicles = &game.scene.vehicles;
+    let Some(i) = (0..vehicles.len()).find(|&i| {
+        vehicles[i].id.is_some() && !vehicles[i].wrecked && game.scene.props.carrying(i)
+    }) else {
+        eprintln!("cargo-check: FAIL no vehicle with cargo aboard");
+        return;
+    };
+    let Some(id) = game.scene.vehicles[i].id else {
+        return;
+    };
+    let label = game.scene.vehicles[i].spec.label.clone();
+    if let Some(p) = game.scene.player.as_mut() {
+        p.driving = Some(i);
+        p.landed = true;
+    }
+    // A clear, level straight to drive (q680h drove its parked heading
+    // into a tall rock 25 m on): its heading if that is clear, else the
+    // first of seven others, the truck and its cargo turned to it where
+    // it stands.
+    if !cargo_clear_straight(game, i, id, &label) {
+        return;
+    }
+    let local = |game: &Game| -> Vec<(u32, Vec3, bool)> {
+        let Some(world) = game.scene.world.as_ref() else {
+            return Vec::new();
+        };
+        let Some(at) = world.physics.vehicle_transform(id) else {
+            return Vec::new();
+        };
+        let inv = at.inverse();
+        game.scene
+            .props
+            .cargo_riding()
+            .into_iter()
+            .filter(|c| c.1 == i)
+            .map(|(e, _, centre, aboard)| (e, inv.transform_point3(centre), aboard))
+            .collect()
+    };
+    let start = local(game);
+    eprintln!("cargo-check: the {label}, {} crates aboard", start.len());
+    let yaw = |game: &Game| {
+        game.scene
+            .world
+            .as_ref()
+            .and_then(|w| w.physics.vehicle_transform(id))
+            .map_or(0.0, |m| {
+                let f = m.transform_vector3(Vec3::Z);
+                f.x.atan2(f.z).to_degrees()
+            })
+    };
+    let speed = |game: &Game| {
+        game.scene
+            .world
+            .as_ref()
+            .map_or(0.0, |w| w.physics.vehicle_speed(id))
+    };
+    let mut table = Vec::new();
+    // Each phase's median and most shift of those aboard, how many off,
+    // and how many in all: for the verdict.
+    let mut ends: Vec<(&str, f32, f32, usize, usize)> = Vec::new();
+    let every = ((0.25 / tick) as u32).max(1);
+    for (phase, seconds) in [
+        ("standing", 3.0f32),
+        ("straight", 6.0),
+        ("hard turn", 2.0),
+        ("braking", 4.0),
+        ("standing after", 3.0),
+    ] {
+        let ticks = (seconds / tick) as u32;
+        let yaw0 = yaw(game);
+        for t in 0..ticks {
+            let v = speed(game);
+            let movement = match phase {
+                "straight" => Vec2::new(0.0, if v < 11.0 { 1.0 } else { 0.0 }),
+                "hard turn" => Vec2::new(-1.0, if v < 11.0 { 1.0 } else { 0.0 }),
+                "braking" => Vec2::new(0.0, if v > 0.5 { -1.0 } else { 0.0 }),
+                _ => Vec2::ZERO,
+            };
+            game.step(
+                crate::player::Intent {
+                    movement,
+                    ..Default::default()
+                },
+                tick,
+            );
+            if t % every == 0 {
+                let now = local(game);
+                let shifts: Vec<String> = now
+                    .iter()
+                    .filter_map(|(e, p, aboard)| {
+                        let s = start.iter().find(|s| s.0 == *e)?;
+                        let d = *p - s.1;
+                        Some(format!(
+                            "{e:#x} {:+.2},{:+.2},{:+.2}{}",
+                            d.x,
+                            d.y,
+                            d.z,
+                            if *aboard { "" } else { " off" }
+                        ))
+                    })
+                    .collect();
+                eprintln!(
+                    "cargo-check: {phase} {:.2} s, {:.1} m/s, yaw {:.0}: {}",
+                    t as f32 * tick,
+                    speed(game),
+                    yaw(game),
+                    shifts.join("; ")
+                );
+            }
+            if phase == "braking" && speed(game) < 0.5 && t as f32 * tick > 0.5 {
+                break;
+            }
+        }
+        let now = local(game);
+        let mut aboard: Vec<f32> = now
+            .iter()
+            .filter(|c| c.2)
+            .filter_map(|(e, p, _)| Some((*p - start.iter().find(|s| s.0 == *e)?.1).length()))
+            .collect();
+        let off = now.iter().filter(|c| !c.2).count();
+        let (median, most) = median_and_most(&mut aboard);
+        let line = format!(
+            "{phase}: median {median:.2} m, max {most:.2} m, {off} of {} off (yaw {:.0} -> {:.0}, {:.1} m/s)",
+            now.len(),
+            yaw0,
+            yaw(game),
+            speed(game)
+        );
+        eprintln!("cargo-check: {line}");
+        table.push(line);
+        ends.push((phase, median, most, off, now.len()));
+    }
+    eprintln!("cargo-check: TABLE (shift from start in the truck's frame, of those still aboard)");
+    for l in table {
+        eprintln!("cargo-check:   {l}");
+    }
+    let verdict = cargo_verdict(&ends);
+    match verdict {
+        Ok(()) => eprintln!(
+            "cargo-check: PASS the crates kept still standing, stayed aboard driving straight, and slid as they went"
+        ),
+        Err(why) => eprintln!("cargo-check: FAIL {why}"),
+    }
+}
+
+/// How long `--cargo-check`'s straight must be, level and open, metres:
+/// its 6 s held to 11 m/s.
+const CARGO_STRAIGHT: f32 = 40.0;
+
+/// Finds `--cargo-check` a clear, level [`CARGO_STRAIGHT`] for vehicle
+/// `i` (`id`): its own heading if clear, else the first clear one of the
+/// seven others 45 degrees apart, to which the truck and what rides on it
+/// are turned where they stand. A heading is clear when the ground under
+/// a sample every 4 m stays within 1.5 m of the truck's and a 3.2 m wide,
+/// 2.1 m tall box over each is free of every placed object and building
+/// (as `--prop-limits-check`'s lane). False, with `cargo-check: FAIL no
+/// clear straight`, if none is.
+fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, label: &str) -> bool {
+    use m2_math::glam::{Mat4, Quat, Vec3};
+    let Some(world) = game.scene.world.as_mut() else {
+        return false;
+    };
+    let Some(m) = world.physics.vehicle_transform(id) else {
+        return false;
+    };
+    let here = m.w_axis.truncate();
+    let ahead = m
+        .transform_vector3(Vec3::Z)
+        .with_y(0.0)
+        .normalize_or(Vec3::Z);
+    let physics = &world.physics;
+    let ground = |x: f32, z: f32| {
+        physics
+            .cast_ray(Vec3::new(x, here.y + 20.0, z), Vec3::NEG_Y, 60.0)
+            .map(|(d, _)| here.y + 20.0 - d)
+    };
+    let Some(floor) = ground(here.x, here.z) else {
+        eprintln!("cargo-check: FAIL no clear straight (no ground under the {label})");
+        return false;
+    };
+    let clear = |way: Vec3| {
+        (0..=((CARGO_STRAIGHT / 4.0) as i32)).all(|k| {
+            let c = here + way * (5.0 + 4.0 * k as f32);
+            let Some(y) = ground(c.x, c.z).filter(|y| (y - floor).abs() <= 1.5) else {
+                return false;
+            };
+            let c = Vec3::new(c.x, y, c.z);
+            physics.box_clear(
+                c + Vec3::new(-1.6, 0.4, -1.6),
+                c + Vec3::new(1.6, 2.5, 1.6),
+                |key| !matches!(key, m2_engine::StaticKey::Cell(_)),
+            )
+        })
+    };
+    let Some(k) = (0..8)
+        .find(|&k| clear(Quat::from_rotation_y(k as f32 * std::f32::consts::FRAC_PI_4) * ahead))
+    else {
+        eprintln!(
+            "cargo-check: FAIL no clear straight: none of eight headings from the {label} at {here:.0} has {CARGO_STRAIGHT} m of level, open ground"
+        );
+        return false;
+    };
+    if k == 0 {
+        eprintln!("cargo-check: the {label}'s own heading is clear for {CARGO_STRAIGHT} m");
+        return true;
+    }
+    // Turned about where it stands, its cargo with it.
+    let turn = Mat4::from_translation(here)
+        * Mat4::from_rotation_y(k as f32 * std::f32::consts::FRAC_PI_4)
+        * Mat4::from_translation(-here);
+    world.physics.place_vehicle(id, turn * m);
+    for d in game.scene.props.cargo_pieces(i) {
+        if let Some(at) = world.physics.debris_place(d) {
+            world.physics.move_debris(d, turn * at);
+        }
+    }
+    eprintln!(
+        "cargo-check: the {label} is turned {} degrees where it stands: its own heading is blocked, that one is clear for {CARGO_STRAIGHT} m",
+        k * 45
+    );
+    true
+}
+
+/// `--cargo-check`'s verdict on its phases' ends (phase, median and most
+/// shift of those aboard, how many off, how many in all), against Xenia's
+/// run eg2 (`elgrande-crates.md`: still 0.00 / 0.01 m; straight 0.33 /
+/// 0.52 m, none off; 3 of 19 off in the hard turn; 0.68 / 2.68 m at the
+/// end): they keep still standing (most shift at most 0.05 m, none off),
+/// none comes off driving straight, they do slide (some shift past 0.1 m
+/// by the end), and not more than half come off. The thresholds are the
+/// check's own, around Xenia's numbers.
+fn cargo_verdict(ends: &[(&str, f32, f32, usize, usize)]) -> Result<(), String> {
+    let at = |name: &str| ends.iter().find(|e| e.0 == name).copied();
+    let (Some(still), Some(straight), Some(last)) =
+        (at("standing"), at("straight"), at("standing after"))
+    else {
+        return Err("the drive ended before all its phases".into());
+    };
+    if still.4 == 0 {
+        return Err("no crates aboard".into());
+    }
+    if still.2 > 0.05 || still.3 > 0 {
+        return Err(format!(
+            "standing they moved: max {:.2} m, {} off",
+            still.2, still.3
+        ));
+    }
+    if straight.3 > 0 {
+        return Err(format!("{} came off driving straight", straight.3));
+    }
+    if last.2 <= 0.1 {
+        return Err(format!("they never slid (max {:.2} m)", last.2));
+    }
+    if last.3 * 2 > last.4 {
+        return Err(format!("{} of {} came off", last.3, last.4));
+    }
+    Ok(())
+}
+
+/// The median and the most of `shifts` (0 for none), as the Xenia
+/// table gives them: the upper middle of an even count.
+fn median_and_most(shifts: &mut [f32]) -> (f32, f32) {
+    shifts.sort_by(f32::total_cmp);
+    (
+        shifts.get(shifts.len() / 2).copied().unwrap_or(0.0),
+        shifts.last().copied().unwrap_or(0.0),
+    )
+}
+
 /// `--sink-check`: the first car loaded (no boat, no helicopter; parked
 /// or, with nowhere to park by her, not) is put on water more than 6 m
 /// deep near her with her at the wheel, and held
@@ -12944,6 +13369,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_cargo_check_tables_the_median_and_most_shift() {
+        assert_eq!(median_and_most(&mut [0.5, 0.1, 2.0]), (0.5, 2.0));
+        assert_eq!(median_and_most(&mut [0.3, 0.1]), (0.3, 0.3));
+        assert_eq!(median_and_most(&mut []), (0.0, 0.0));
+    }
+
+    #[test]
     fn autoplay_retries_a_failed_contract_only_with_a_retry_save_and_not_forever() {
         assert!(retry_or_continue(true, 0));
         assert!(retry_or_continue(true, AUTOPLAY_RETRIES - 1));
@@ -13670,6 +14102,31 @@ mod disguise_check_tests {
     #[test]
     fn the_disguise_check_passes() {
         assert!(super::disguise_check());
+    }
+}
+
+#[cfg(test)]
+mod cargo_verdict_tests {
+    use super::cargo_verdict;
+
+    // Xenia's run eg2 passes; crates that never move, or fall off driving
+    // straight, fail.
+    #[test]
+    fn xenias_crates_pass_and_frozen_or_spilled_ones_fail() {
+        let xenia = [
+            ("standing", 0.0, 0.01, 0, 19),
+            ("straight", 0.33, 0.52, 0, 19),
+            ("hard turn", 0.54, 1.80, 3, 19),
+            ("braking", 0.70, 2.36, 3, 19),
+            ("standing after", 0.68, 2.68, 3, 19),
+        ];
+        assert_eq!(cargo_verdict(&xenia), Ok(()));
+        let mut frozen = xenia;
+        frozen[4] = ("standing after", 0.0, 0.0, 0, 19);
+        assert!(cargo_verdict(&frozen).is_err());
+        let mut spilled = xenia;
+        spilled[1] = ("straight", 0.3, 0.5, 2, 19);
+        assert!(cargo_verdict(&spilled).is_err());
     }
 }
 

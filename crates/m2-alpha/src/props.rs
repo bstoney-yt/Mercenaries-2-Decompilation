@@ -212,6 +212,10 @@ pub struct Props {
     /// The templates whose objects are physics props (`_PropPhysics`), by
     /// id: those whose model has no body that moves come loose as one.
     pub physics_props: HashMap<u32, m2_engine::durability::PropPhysics>,
+    /// Each template's `PhysicsPropertyGravityScaler`, by id: its bodies
+    /// are pulled that many times the world's gravity
+    /// ([`Physics::set_debris_gravity`]).
+    pub gravity_scales: HashMap<u32, f32>,
     /// Shown since their model came in, their collision not yet up.
     unwalled: HashSet<u32>,
     /// Put up by the scripts from a template with no physics component
@@ -792,16 +796,32 @@ impl Props {
         let mut at = Mat4::from_rotation_translation(p.rotation, p.position);
         if let (Some(bed), Some(place)) = (bed, physics.vehicle_transform(id)) {
             let local = place.inverse() * at;
-            let (blo, bhi) = box_around(local, bounds);
-            let middle = (blo + bhi) * 0.5;
-            if let Some(floor) = bed.floor_under(middle.x, bhi.y, middle.z) {
-                let lift = (floor + BED_CLEAR - blo.y).max(0.0);
+            let (lo, _) = box_around(local, bounds);
+            let lift = bed.lift_onto(box_around(local, bounds), BED_CLEAR);
+            if lift > 0.0 {
                 at = place * Mat4::from_translation(Vec3::Y * lift) * local;
             }
+            // Where it starts, in the vehicle's frame: its box's bottom
+            // against the bed's floor under it (the floor is BED_CLEAR
+            // under the bottom once lifted).
+            let floor = if lift > 0.0 {
+                format!("bed floor {:.2}", lo.y + lift - BED_CLEAR)
+            } else {
+                "on or over the bed already".to_owned()
+            };
+            eprintln!(
+                "cargo: {entity:#x} loaded: lifted {lift:.2} m, its bottom {:.2} -> {:.2} m up the vehicle ({floor})",
+                lo.y,
+                lo.y + lift
+            );
         }
+        let template = p.template;
         let velocity = physics.vehicle_velocity(id);
         physics.remove_static(StaticKey::Entity(entity));
         let piece = physics.add_cargo(&piece, at, velocity);
+        if let Some(&g) = self.gravity_scales.get(&template) {
+            physics.set_debris_gravity(piece, g);
+        }
         self.cargo.insert(
             entity,
             Riding {
@@ -833,6 +853,32 @@ impl Props {
     /// Whether anything is still aboard vehicle `index`.
     pub fn carrying(&self, index: usize) -> bool {
         self.cargo.values().any(|r| r.vehicle == index && r.aboard)
+    }
+
+    /// What is loaded on vehicles: each prop, its vehicle's index, the
+    /// middle of its collision box (world) and whether it is still aboard.
+    pub fn cargo_riding(&self) -> Vec<(u32, usize, Vec3, bool)> {
+        self.cargo
+            .iter()
+            .filter_map(|(&e, r)| {
+                let p = self.shown.get(&e)?;
+                let at = Mat4::from_rotation_translation(p.rotation, p.position);
+                let (lo, hi) = r.bounds;
+                Some((e, r.vehicle, at.transform_point3((lo + hi) * 0.5), r.aboard))
+            })
+            .collect()
+    }
+
+    /// The bodies of what rides aboard vehicle `vehicle` still.
+    pub fn cargo_pieces(&self, vehicle: usize) -> Vec<DebrisId> {
+        let mut out: Vec<(u32, DebrisId)> = self
+            .cargo
+            .iter()
+            .filter(|(_, r)| r.vehicle == vehicle && r.aboard)
+            .map(|(&e, r)| (e, r.piece))
+            .collect();
+        out.sort_by_key(|&(e, _)| e);
+        out.into_iter().map(|(_, d)| d).collect()
     }
 
     /// Whether `entity` was loaded on a vehicle ([`load`](Self::load)),
@@ -1297,6 +1343,11 @@ impl Props {
             .zip(loose.starts(placed))
             .map(|(piece, at)| physics.add_debris(piece, at, velocity, spin))
             .collect::<Vec<_>>();
+        if let Some(&g) = self.gravity_scales.get(&p.template) {
+            for &d in &pieces {
+                physics.set_debris_gravity(d, g);
+            }
+        }
         physics.group_debris(&pieces, placed);
         self.knocked.insert(entity, pieces);
         self.fresh_knocks.push(entity);
@@ -1324,6 +1375,11 @@ impl Props {
             .zip(loose.starts(placed))
             .map(|(piece, at)| physics.add_prop_body(piece, at, true))
             .collect::<Vec<_>>();
+        if let Some(&g) = self.gravity_scales.get(&p.template) {
+            for &d in &pieces {
+                physics.set_debris_gravity(d, g);
+            }
+        }
         physics.group_debris(&pieces, placed);
         self.knocked.insert(entity, pieces);
         self.as_body.insert(entity);
