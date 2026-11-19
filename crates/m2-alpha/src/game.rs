@@ -6771,6 +6771,12 @@ mod picture_tests {
 /// own filters are not modelled); the threat's eye is taken 1.3 m over
 /// where she stands (inferred).
 fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
+    crate::npc::fight_time::time(crate::npc::fight_time::COVER, || {
+        serve_cover_untimed(world, people)
+    });
+}
+
+fn serve_cover_untimed(world: &m2_engine::World, people: &mut crate::npc::People) {
     use m2_engine::ai_cover::{self, Placed, Request};
     let asks: Vec<(usize, Vec3, Vec3)> = people
         .npcs

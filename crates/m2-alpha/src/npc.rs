@@ -2738,6 +2738,10 @@ impl Npc {
     /// Not ported: the "arrived" message within 3 m of the way's end
     /// (nothing here waits on it).
     fn steer_to(&mut self, goal: Vec3, speed: f32, dt: f32) -> Vec3 {
+        fight_time::time(fight_time::STEER, || self.steer_to_untimed(goal, speed, dt))
+    }
+
+    fn steer_to_untimed(&mut self, goal: Vec3, speed: f32, dt: f32) -> Vec3 {
         let at = self.character.position;
         let flat = |v: Vec3| v.with_y(0.0);
         let d2 = flat(goal - at).length_squared();
@@ -3016,8 +3020,9 @@ impl Npc {
             self.striking -= dt;
             wanted = Vec3::ZERO;
         }
-        self.move_dry(physics, wanted, dt);
+        fight_time::time(fight_time::MOVE, || self.move_dry(physics, wanted, dt));
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
+        fight_time::ticked(self.pushed > 0.3);
         // Swinging back and forth in the fight: as the 360's `HumanCombat`
         // path step does (0x822B3130), only a step to a destination that
         // made no progress counts its swings (0x822CB340, 0x822BF4D8);
@@ -3033,7 +3038,7 @@ impl Npc {
         } else {
             Vec2::ZERO
         };
-        let gave_up = self.dither.step(way, dt);
+        let gave_up = fight_time::time(fight_time::GIVE_UP, || self.dither.step(way, dt));
         if gave_up {
             // What he was doing, for finding which pick keeps coming back.
             let doing = if hiding {
@@ -3047,12 +3052,22 @@ impl Npc {
             } else {
                 "chasing"
             };
+            let way = self.route.way.as_ref().map(|w| {
+                let length: f32 = w.points.windows(2).map(|p| p[0].distance(p[1])).sum();
+                format!("{} points, {length:.1} m", w.points.len())
+            });
             eprintln!(
                 "people: {:08x} dithers at {:.1}: gives the move up ({doing}, cover spot {:.1?}, \
-                 her {distance:.1} m off, seen {seen})",
+                 her {distance:.1} m off, seen {seen}; making for {:.1?}, way {}, search under way \
+                 {}, asked {:.1}, moved {moved:.2} m/s, stalled {})",
                 self.spawn.unwrap_or(u32::MAX),
                 self.character.position,
-                self.cover_spot
+                self.cover_spot,
+                self.route.goal,
+                way.as_deref().unwrap_or("none"),
+                self.route.pending.is_some(),
+                wanted,
+                self.stalled
             );
             self.dither.mark(self.character.position);
             self.give_up_move();
@@ -3494,7 +3509,9 @@ impl Npc {
         // Running to raise an alarm (its goal, 9.9, outranks the fight;
         // [`People::raise_alarms`]).
         if self.alert && !sent && self.alarm.is_none() {
-            let fights = threat.is_some_and(|t| self.fight(physics, t, rng, dt));
+            let fights = threat.is_some_and(|t| {
+                fight_time::time(fight_time::FIGHT, || self.fight(physics, t, rng, dt))
+            });
             lap.mark("person: fight");
             match threat {
                 Some(_) if fights => return,
@@ -3778,6 +3795,80 @@ pub struct Route {
     /// The search under way, stepped by the manager
     /// ([`People::serve_paths`]); meanwhile he heads straight at the goal.
     pending: Option<Box<m2_engine::path_search::Pending>>,
+}
+
+/// Where the soldiers' fight time goes, by part, since last logged (the
+/// `soldier time:` line every 30 s), and how many fight ticks moved him:
+/// for finding what #752/#754 made dearer. Measuring only.
+pub mod fight_time {
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+
+    /// The parts timed.
+    pub const PARTS: [&str; 7] = [
+        "fight (whole)",
+        "steer",
+        "move",
+        "give-up check",
+        "cover claims",
+        "cover service",
+        "path searches",
+    ];
+    pub const FIGHT: usize = 0;
+    pub const STEER: usize = 1;
+    pub const MOVE: usize = 2;
+    pub const GIVE_UP: usize = 3;
+    pub const CLAIMS: usize = 4;
+    pub const COVER: usize = 5;
+    pub const PATHS: usize = 6;
+
+    thread_local! {
+        static SPENT: RefCell<([Duration; 7], [u64; 7])> =
+            const { RefCell::new(([Duration::ZERO; 7], [0; 7])) };
+        /// Fight ticks, and those in which he pushed to move.
+        static MOVING: RefCell<(u64, u64)> = const { RefCell::new((0, 0)) };
+    }
+
+    /// Runs `f`, adding its time to part `i`, and as a span of that name.
+    pub fn time<T>(i: usize, f: impl FnOnce() -> T) -> T {
+        let t0 = Instant::now();
+        let out = crate::spans::time(PARTS[i], f);
+        let took = t0.elapsed();
+        SPENT.with(|s| {
+            let mut s = s.borrow_mut();
+            s.0[i] += took;
+            s.1[i] += 1;
+        });
+        out
+    }
+
+    /// A fight tick, and whether he pushed to move in it.
+    pub fn ticked(moving: bool) {
+        MOVING.with(|m| {
+            let mut m = m.borrow_mut();
+            m.0 += 1;
+            m.1 += u64::from(moving);
+        });
+    }
+
+    /// The tally since last taken, as a log line's body, over `seconds`.
+    pub fn take(seconds: f32) -> String {
+        let (spent, calls) = SPENT.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        let (ticks, moving) = MOVING.with(|m| std::mem::take(&mut *m.borrow_mut()));
+        let mut parts: Vec<String> = PARTS
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                format!(
+                    "{name} {:.3} ms a second ({} calls)",
+                    spent[i].as_secs_f64() * 1e3 / f64::from(seconds.max(1e-3)),
+                    calls[i]
+                )
+            })
+            .collect();
+        parts.push(format!("{moving} of {ticks} fight ticks moving"));
+        parts.join(", ")
+    }
 }
 
 /// The search manager's tally since it was last logged: searches begun,
@@ -5532,6 +5623,7 @@ impl People {
         self.war_log -= dt;
         if self.war_log <= 0.0 {
             self.war_log = 30.0;
+            eprintln!("soldier time: {}", fight_time::take(30.0));
             // The search manager's tally over the last 30 s.
             let st = std::mem::take(&mut self.path_stats);
             let pending = self
@@ -5681,7 +5773,9 @@ impl People {
             crate::spans::time("people: each one's update", || {
                 npc.update(physics, &mut self.rng, threat, dt)
             });
-            Self::renew_cover_claim(&mut self.cover_claims, i as u32, npc, dt);
+            fight_time::time(fight_time::CLAIMS, || {
+                Self::renew_cover_claim(&mut self.cover_claims, i as u32, npc, dt)
+            });
 
             let p = npc.character.position;
             crate::spans::time("people: checks", || {
@@ -5770,7 +5864,7 @@ impl People {
                 physics.launch_ragdoll(id, l.velocity, l.point);
             }
         }
-        crate::spans::time("people: path searches", || self.serve_paths(physics, hints));
+        fight_time::time(fight_time::PATHS, || self.serve_paths(physics, hints));
         // Smarter: those near a soldier who spots her are told where she is.
         if let Some(t) = threat {
             let range = self.smarter.callout_range;
@@ -9137,7 +9231,11 @@ pub(crate) mod tests {
             people.npcs.push(n);
         }
         let mut ticks = 0;
-        while people.npcs.iter().any(|n| n.route.asked || n.route.pending.is_some()) {
+        while people
+            .npcs
+            .iter()
+            .any(|n| n.route.asked || n.route.pending.is_some())
+        {
             people.serve_paths(&physics, &|_| Vec::new());
             ticks += 1;
             assert!(people.path_stats.most_steps <= PATH_STEPS);
