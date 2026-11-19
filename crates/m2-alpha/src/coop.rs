@@ -130,6 +130,8 @@ impl Coop {
         for e in self.session.poll() {
             self.event(e, game, backend);
         }
+        // A friend in the game lowers the health clamp's floor.
+        game.combat.coop = self.peer.is_some();
         // On the session's clock, not the game's: a slow frame still
         // sends on time (at most one a frame).
         let now = self.session.now();

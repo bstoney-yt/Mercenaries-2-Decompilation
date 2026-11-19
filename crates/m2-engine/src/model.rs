@@ -690,6 +690,24 @@ fn mips_dropped(width: u32, height: u32, drop: u32) -> u32 {
     n
 }
 
+/// The full mip chain [`upload_texture`] would upload for `t`: its own
+/// when complete, else one generated from its top level. Done ahead (the
+/// asset loader does it on its thread), so the upload need not: a
+/// 1024x1024 map took the main thread 5 ms to filter, a 2048x2048 one 20.
+pub fn complete_mips(t: &mut DecodedTexture) {
+    if t.mips.is_empty() {
+        return;
+    }
+    let full = TextureDesc {
+        width: t.width,
+        height: t.height,
+        format: TextureFormat::Rgba8Srgb,
+    };
+    if t.mips.len() as u32 != full.full_chain_len() {
+        t.mips = generate_mips(t.width, t.height, &t.mips[0]);
+    }
+}
+
 /// Uploads a decoded texture, generating any mips its chain lacks.
 pub fn upload_texture(
     backend: &mut dyn RenderBackend,
@@ -1167,6 +1185,55 @@ impl ModelParts {
         self.states.part_of(node as u16)
     }
 
+    /// Where message `msg` sends part `k` from its intact state (or its
+    /// `InitState`, for a part that never leaves it), by its handlers there (the verb [`ON_MESSAGE`]): the part's node name hash
+    /// (the machine an object script's `OnStateChange` is told of) and the
+    /// state's name hash. `None` when the intact state has no handler for
+    /// it, or one that drops it.
+    ///
+    /// [`ON_MESSAGE`]: m2_assets::model::ON_MESSAGE
+    pub fn on_message(&self, k: usize, msg: u32) -> Option<(u32, u32)> {
+        let m = self.states.machines.get(k)?;
+        // A part whose `InitState` puts it nowhere stays there.
+        let s = m2_assets::model::PartStates::intact_state(m).or_else(|| {
+            m.states
+                .iter()
+                .position(|x| x.0 == m2_assets::model::STATE_INIT)
+        })?;
+        let to = m
+            .acts
+            .get(s)?
+            .on
+            .iter()
+            .find(|(x, _)| *x == msg)
+            .map(|&(_, to)| to)
+            .filter(|&to| to != 0 && to != m.states[s].0)?;
+        let node = self.nodes.get(usize::from(m.node?))?.name_hash;
+        Some((node, to))
+    }
+
+    /// The name hashes of the nodes part `k` shows only while it stands,
+    /// and of every node under them: what its breaking hides.
+    pub fn hidden_by(&self, k: usize) -> Vec<u32> {
+        let Some(shows) = self.shows.get(k) else {
+            return Vec::new();
+        };
+        (0..self.nodes.len())
+            .filter(|&i| {
+                let mut at = Some(i as u16);
+                for _ in 0..=self.nodes.len() {
+                    match at {
+                        Some(n) if shows.contains(&n) => return true,
+                        Some(n) => at = self.nodes[usize::from(n)].parent,
+                        None => return false,
+                    }
+                }
+                false
+            })
+            .map(|i| self.nodes[i].name_hash)
+            .collect()
+    }
+
     /// The box of what part `k` shows intact (model space), if anything.
     pub fn part_box(&self, k: usize) -> Option<(Vec3, Vec3)> {
         self.boxes.get(k).copied().flatten()
@@ -1197,6 +1264,95 @@ impl ModelParts {
             .hidden_parts(&self.nodes, |k| wrecked.get(k).copied().unwrap_or(false))
     }
 
+    /// Per node, whether it is hidden with each part in the state `state`
+    /// names for it (a state's name hash, by part; `None`, or a state the
+    /// part has not, leaves it intact): what the states entered show and
+    /// hide. The 360 rebuilds an object's shown nodes from its parts'
+    /// states a step after a state changes (0x8222D2F0 -> 0x821C7648).
+    pub fn hidden_in_states(&self, state: impl Fn(usize) -> Option<u32>) -> Vec<bool> {
+        self.states.hidden_in(&self.nodes, |k, m| {
+            state(k)
+                .and_then(|s| m.states.iter().position(|x| x.0 == s))
+                .or_else(|| m2_assets::model::PartStates::intact_state(m))
+        })
+    }
+
+    /// The parts' states applied (0x8222D2F0 -> 0x821C7648): with part
+    /// `k` in state `state(k)`, what of the model shows, which parts are
+    /// down, and against `before` (what was hidden; `None`: the model
+    /// intact) the nodes newly shown and newly hidden, by name hash.
+    pub fn apply_states(
+        &self,
+        state: impl Fn(usize) -> Option<u32>,
+        before: Option<&[bool]>,
+    ) -> StatesApplied {
+        let hidden = self.hidden_in_states(state);
+        let wrecked = self.down_in(&hidden);
+        let intact;
+        let before = match before {
+            Some(b) => b,
+            None => {
+                intact = self.hidden(&[]);
+                &intact
+            }
+        };
+        let was = |i: usize| before.get(i).copied().unwrap_or(false);
+        let names = |f: &dyn Fn(usize) -> bool| -> Vec<u32> {
+            (0..hidden.len())
+                .filter(|&i| f(i))
+                .filter_map(|i| self.node_name(i))
+                .collect()
+        };
+        let shown = names(&|i| was(i) && !hidden[i]);
+        let gone = names(&|i| !was(i) && hidden[i]);
+        StatesApplied {
+            hidden,
+            wrecked,
+            shown,
+            gone,
+        }
+    }
+
+    /// Which parts are down with the nodes `hidden` marks hidden: those
+    /// that show something of their own intact, none of it shown now.
+    pub fn down_in(&self, hidden: &[bool]) -> Vec<bool> {
+        self.shows
+            .iter()
+            .map(|s| {
+                !s.is_empty()
+                    && s.iter()
+                        .all(|&n| hidden.get(usize::from(n)).copied().unwrap_or(false))
+            })
+            .collect()
+    }
+
+    /// The name hash of node `n`.
+    pub fn node_name(&self, n: usize) -> Option<u32> {
+        self.nodes.get(n).map(|x| x.name_hash)
+    }
+
+    /// What entering state `state` of the part whose machine is named
+    /// `machine` (its node's name hash) shows and hides, in order: (node
+    /// name hash, shown). Empty for no such part or state.
+    pub fn entered(&self, machine: u32, state: u32) -> Vec<(u32, bool)> {
+        let Some(m) = self.states.machines.iter().find(|m| {
+            m.node
+                .and_then(|n| self.node_name(usize::from(n)))
+                .is_some_and(|h| h == machine)
+        }) else {
+            return Vec::new();
+        };
+        m.states
+            .iter()
+            .find(|x| x.0 == state)
+            .map(|x| {
+                x.1.iter()
+                    .filter_map(|&(n, shown)| Some((self.node_name(usize::from(n))?, shown)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Its collision with the parts `wrecked` marks taken away: `None` if
     /// nothing is left, or if its collision has no shapes of its own (one
     /// cut from its drawn triangles stays whole until all of it breaks).
@@ -1224,6 +1380,18 @@ impl ModelParts {
         }
         Some(shape)
     }
+}
+
+/// What applying a model's parts' states did ([`ModelParts::apply_states`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct StatesApplied {
+    /// Per node, hidden now.
+    pub hidden: Vec<bool>,
+    /// Per part, down now.
+    pub wrecked: Vec<bool>,
+    /// Nodes newly shown and newly hidden, by name hash.
+    pub shown: Vec<u32>,
+    pub gone: Vec<u32>,
 }
 
 /// The collision of one building of a merged batch (a `TINY` model).
@@ -1439,6 +1607,8 @@ impl CpuModel {
             .map(|(hash, linear)| {
                 let t = source.texture(hash, max_width).ok().map(|mut t| {
                     t.linear = linear;
+                    // Filtered here, on the loading thread, not at upload.
+                    complete_mips(&mut t);
                     t
                 });
                 (hash, t)
@@ -2302,6 +2472,113 @@ mod tests {
     use super::*;
     use m2_render::NullBackend;
 
+    // A part's DestroyMsg handler in its intact state sends it on: the
+    // fortress's part told its object script's OnStateChange.
+    #[test]
+    fn a_part_message_names_its_node_and_new_state() {
+        use m2_assets::model::{DESTROY_MSG, PartMachine, PartStates, StateActs};
+        let machine = PartMachine {
+            node: Some(1),
+            states: vec![(0x0ace_072a, vec![]), (0x6946_83eb, vec![(2, true)])],
+            // As the island fortress's whole: no start out of InitState.
+            starts: [None, Some(0x7687_df41)],
+            acts: vec![
+                StateActs {
+                    on: vec![(DESTROY_MSG, 0x6946_83eb), (0xc650_7ee1, 0)],
+                    ..Default::default()
+                },
+                StateActs::default(),
+            ],
+        };
+        let nodes = vec![
+            m2_assets::model::Node::default(),
+            m2_assets::model::Node {
+                name_hash: 0xcf37_044a,
+                ..Default::default()
+            },
+        ];
+        let parts = ModelParts {
+            states: PartStates {
+                machines: vec![machine],
+                ..Default::default()
+            },
+            nodes,
+            shows: vec![vec![]],
+            boxes: vec![None],
+            meshes: Vec::new(),
+        };
+        assert_eq!(
+            parts.on_message(0, DESTROY_MSG),
+            Some((0xcf37_044a, 0x6946_83eb))
+        );
+        // A handler that drops it, none, or no such part.
+        assert_eq!(parts.on_message(0, 0xc650_7ee1), None);
+        assert_eq!(parts.on_message(0, 0x1234), None);
+        assert_eq!(parts.on_message(1, DESTROY_MSG), None);
+        // What part 0 hides: node 1 and a locator under it.
+        let mut parts = parts;
+        parts.shows = vec![vec![1]];
+        parts.nodes.push(m2_assets::model::Node {
+            name_hash: 0x26c4_7dc0,
+            parent: Some(1),
+            ..Default::default()
+        });
+        assert_eq!(parts.hidden_by(0), [0xcf37_044a, 0x26c4_7dc0]);
+        assert!(parts.hidden_by(1).is_empty());
+    }
+
+    // Two slices of a building, each its own part: the states they are
+    // in say what shows (0x821C7648 rebuilds the shown nodes from them),
+    // and a slice whose own nodes are all hidden is down.
+    #[test]
+    fn what_shows_follows_the_states_the_parts_are_in() {
+        use m2_assets::model::{PartMachine, PartStates, STATE_INTACT, STATE_WRECKED};
+        // Nodes: 0 root, 1 and 2 the slices intact, 3 and 4 their rubble.
+        let slice = |node: u16, rubble: u16| PartMachine {
+            node: Some(node),
+            states: vec![
+                (STATE_INTACT, vec![(node, true), (rubble, false)]),
+                (STATE_WRECKED, vec![(node, false), (rubble, true)]),
+            ],
+            starts: [None, None],
+            acts: Vec::new(),
+        };
+        let nodes = (0..5u32)
+            .map(|i| m2_assets::model::Node {
+                name_hash: 0x100 + i,
+                parent: (i > 0).then_some(0),
+                ..Default::default()
+            })
+            .collect();
+        let parts = ModelParts {
+            states: PartStates {
+                switchable: vec![1, 2, 3, 4],
+                machines: vec![slice(1, 3), slice(2, 4)],
+                ..Default::default()
+            },
+            nodes,
+            shows: vec![vec![1], vec![2]],
+            boxes: vec![None, None],
+            meshes: Vec::new(),
+        };
+        // Never sent anywhere: both intact.
+        let intact = parts.hidden_in_states(|_| None);
+        assert_eq!(intact, [false, false, false, true, true]);
+        assert_eq!(parts.down_in(&intact), [false, false]);
+        // The first destroyed: its slice hidden, its rubble shown.
+        let one = parts.hidden_in_states(|k| (k == 0).then_some(STATE_WRECKED));
+        assert_eq!(one, [false, true, false, false, true]);
+        assert_eq!(parts.down_in(&one), [true, false]);
+        // A state the part hasn't leaves it intact.
+        assert_eq!(parts.hidden_in_states(|_| Some(0xdead)), intact);
+        // What entering the wreck shows and hides, by name.
+        assert_eq!(
+            parts.entered(0x101, STATE_WRECKED),
+            [(0x101, false), (0x103, true)]
+        );
+        assert!(parts.entered(0x109, STATE_WRECKED).is_empty());
+    }
+
     #[test]
     fn a_phone_drops_top_mips_only_while_the_texture_stays_over_256() {
         assert_eq!(mips_dropped(1024, 1024, 0), 0);
@@ -2644,5 +2921,50 @@ mod tests {
         assert_ne!(early, late);
         assert!(backend.material(late).texture.is_some());
         assert_eq!(backend.live_buffers().texture, 3);
+    }
+}
+
+#[cfg(test)]
+mod complete_mips_tests {
+    use super::*;
+
+    fn texture(width: u32, height: u32, levels: usize) -> DecodedTexture {
+        let mut mips = Vec::new();
+        let (mut w, mut h) = (width, height);
+        for i in 0..levels {
+            mips.push(
+                (0..w * h * 4)
+                    .map(|b| (b as usize * 7 + i * 31) as u8)
+                    .collect(),
+            );
+            (w, h) = ((w / 2).max(1), (h / 2).max(1));
+        }
+        DecodedTexture {
+            width,
+            height,
+            mips,
+            alpha: false,
+            linear: false,
+        }
+    }
+
+    #[test]
+    fn a_short_chain_is_made_as_the_upload_made_it() {
+        // 16x16 has a five-level chain; three given.
+        let mut t = texture(16, 16, 3);
+        let expected = generate_mips(16, 16, &t.mips[0]);
+        complete_mips(&mut t);
+        assert_eq!(t.mips, expected);
+    }
+
+    #[test]
+    fn a_full_chain_and_no_chain_are_left_alone() {
+        let mut t = texture(16, 8, 5);
+        let before = t.mips.clone();
+        complete_mips(&mut t);
+        assert_eq!(t.mips, before);
+        let mut empty = texture(16, 16, 0);
+        complete_mips(&mut empty);
+        assert!(empty.mips.is_empty());
     }
 }

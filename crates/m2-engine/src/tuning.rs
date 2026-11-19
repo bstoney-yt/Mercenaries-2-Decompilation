@@ -1336,12 +1336,77 @@ impl KeyTable {
             .filter(|&v| v != 0)
     }
 
+    /// Cell `row` by `column` where both are the table's own keys (no
+    /// first-row stand-in); `None` for 0.
+    pub fn get_exact(&self, row: u32, column: u32) -> Option<u32> {
+        let r = self.rows.iter().position(|&k| k == row)?;
+        let c = self.columns.iter().position(|&k| k == column)?;
+        self.cells
+            .get(r * self.columns.len() + c)
+            .map(|c| c.0)
+            .filter(|&v| v != 0)
+    }
+
     /// The cell for keys `a` and `b` one way, else the other (the sound
     /// table's lookup).
     pub fn either(&self, a: u32, b: u32) -> Option<u32> {
         self.get(a, b).or_else(|| self.get(b, a))
     }
+
+    /// Whether `key` is one of its rows' or columns' keys (not looked up
+    /// as the first).
+    pub fn has(&self, key: u32) -> bool {
+        self.rows.contains(&key) || self.columns.contains(&key)
+    }
+
+    /// Both words of cell `row` by `column` (keys missing find the first
+    /// row or column).
+    fn words(&self, row: u32, column: u32) -> (u32, u32) {
+        let r = self.rows.iter().position(|&k| k == row).unwrap_or(0);
+        let c = self.columns.iter().position(|&k| k == column).unwrap_or(0);
+        self.cells
+            .get(r * self.columns.len() + c)
+            .copied()
+            .unwrap_or((0, 0))
+    }
+
+    /// The sound table's cue for two things of `SoundKey`s `a` and `b`
+    /// meeting, `damaging` when the damage table's cell for the two is
+    /// over 0. From the 360 code (0x8235E850 -> 0x82398958): the cell
+    /// for `a`, `b`, else (both its words 0) for `b`, `a`; its first word
+    /// where the second is 0 or the meeting is damaging, else its second;
+    /// `None` where that is 0.
+    pub fn contact_cue(&self, a: u32, b: u32, damaging: bool) -> Option<u32> {
+        let (mut first, mut second) = self.words(a, b);
+        if first == 0 && second == 0 {
+            (first, second) = self.words(b, a);
+        }
+        let cue = if first != 0 && (second == 0 || damaging) {
+            first
+        } else {
+            second
+        };
+        (cue != 0).then_some(cue)
+    }
 }
+
+/// How loud a contact's cue plays (of its usual) for `closing` (m/s,
+/// the contact's closing speed): `closing / (closing + 5)`. From the 360
+/// code: 0x8235E798 plays a contact at 1 - 5 / (x + 5) (0x820BAEE8 1.0,
+/// 0x820BAF84 5.0), x the collision event's closing speed (its +0x38, the
+/// contacts' summed closing speed, 0x82162BB8).
+pub fn contact_level(closing: f32) -> f32 {
+    let x = closing.max(0.0);
+    x / (x + CONTACT_SOFTNESS)
+}
+
+/// The closing speed (m/s) at which a contact plays at half: 0x820BAF84.
+pub const CONTACT_SOFTNESS: f32 = 5.0;
+
+/// How many contacts are heard a frame: the 360's sound pump keeps the
+/// three of the most mass between them (0x82361CE8, three slots, the
+/// least replaced by one of more).
+pub const CONTACTS_HEARD: usize = 3;
 
 /// The damage table's asset type.
 pub const DAMAGE_TABLE_TYPE: u32 = 0xde98_2d61;
@@ -2448,6 +2513,43 @@ mod tests {
     }
 
     use super::*;
+
+    /// A sound table of rows and columns keys 1 and 2: 1 x 2 has both
+    /// words (0xa, 0xb), 2 x 1 has only a second (0, 0xc), 2 x 2 only a
+    /// first (0xd, 0), 1 x 1 none.
+    fn contact_table() -> KeyTable {
+        let mut d = vec![0u8; 0x50];
+        d[0x48..0x4c].copy_from_slice(&2u32.to_le_bytes());
+        d[0x4c..0x50].copy_from_slice(&2u32.to_le_bytes());
+        for w in [1u32, 2, 1, 2, 0, 0, 0xa, 0xb, 0, 0xc, 0xd, 0] {
+            d.extend_from_slice(&w.to_le_bytes());
+        }
+        KeyTable::parse(&d).expect("a table")
+    }
+
+    #[test]
+    fn a_contact_is_heard_by_the_cells_first_word_if_damaging_else_its_second() {
+        let t = contact_table();
+        assert_eq!(t.contact_cue(1, 2, true), Some(0xa));
+        assert_eq!(t.contact_cue(1, 2, false), Some(0xb));
+        // Only a second word: it, damaging or not.
+        assert_eq!(t.contact_cue(2, 1, true), Some(0xc));
+        // Only a first word: it either way.
+        assert_eq!(t.contact_cue(2, 2, false), Some(0xd));
+        // An empty cell looks the other way round: 1 x 1 is its own
+        // other way, so none.
+        assert_eq!(t.contact_cue(1, 1, true), None);
+        // A key the table lacks finds the first row (1).
+        assert_eq!(t.contact_cue(9, 2, false), Some(0xb));
+    }
+
+    #[test]
+    fn a_contact_plays_louder_the_faster_it_closes() {
+        assert_eq!(contact_level(0.0), 0.0);
+        assert_eq!(contact_level(5.0), 0.5);
+        assert!((contact_level(15.0) - 0.75).abs() < 1e-6);
+        assert_eq!(contact_level(-1.0), 0.0);
+    }
 
     // The field names hash to the keys the AMX-30's components use.
     #[test]
