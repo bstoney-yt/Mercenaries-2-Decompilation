@@ -1137,6 +1137,8 @@ pub struct MissionLink {
     /// The factions' pursuit lists of units ([`crate::gunships::Lists`]).
     pursuit_lists: Option<crate::gunships::Lists>,
     reinforcements: crate::reinforce::Reinforcements,
+    /// `--paradrop-check` ([`crate::paradrop_check`]).
+    paradrop_check: Option<crate::paradrop_check::Check>,
     /// The scripts' drop zone tests being searched ([`crate::drop_zones`]).
     drop_zones: crate::drop_zones::DropZones,
     /// Seconds since the scripts said the contract was completed.
@@ -1356,6 +1358,7 @@ impl MissionLink {
             pursuit_counts: None,
             pursuit_lists: None,
             reinforcements: crate::reinforce::Reinforcements::default(),
+            paradrop_check: None,
             drop_zones: crate::drop_zones::DropZones::default(),
             completed: None,
             contracts: 0,
@@ -1680,6 +1683,15 @@ impl MissionLink {
             job.near = near;
         }
         self
+    }
+
+    /// With `--paradrop-check`: the paradrop plane put over her and its
+    /// drop followed ([`crate::paradrop_check`]).
+    pub fn with_paradrop_check(self, on: bool) -> Self {
+        Self {
+            paradrop_check: on.then(Default::default),
+            ..self
+        }
     }
 
     /// Stocks and calls in these support items once the scripts run.
@@ -2678,7 +2690,7 @@ impl MissionLink {
         if self.ashore > 0 && game.scene.player.as_ref().is_some_and(|p| p.landed) {
             self.ashore -= 1;
             // Thousands of rays a look: twice a second is plenty.
-            if self.ashore.is_multiple_of(30) && go_ashore(game) {
+            if self.ashore.is_multiple_of(30) && go_ashore(game, &[]).is_some() {
                 self.ashore = 0;
             }
         }
@@ -3221,6 +3233,17 @@ impl MissionLink {
                 }
             }
         }
+        if let Some(check) = &mut self.paradrop_check
+            && check.tick(game, mission, dt) == crate::paradrop_check::Ask::Ashore
+            && game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.landed || p.swimming())
+        {
+            let to = go_ashore(game, check.failed());
+            check.put_ashore(to);
+        }
         if let Some(check) = &mut self.object_sound_check {
             check.tick(game, mission, dt);
         }
@@ -3657,6 +3680,11 @@ impl MissionLink {
             // counts them.
             let hero = mission.world().borrow().player;
             let hers = game.scene.people.her_kills();
+            // Their health as it changes (a fall, a round), for the scripts
+            // watching it: the paratrooper's chute comes off below 100.
+            for (guid, hp) in game.scene.people.take_health_changes() {
+                mission.set_health(guid, hp);
+            }
             for guid in game.scene.people.all_killed() {
                 match hero.filter(|_| hers.contains(&guid)) {
                     Some(h) => mission.kill_by(guid, h),
@@ -6737,38 +6765,93 @@ impl SatBlipCheck {
     }
 }
 
-fn go_ashore(game: &mut Game) -> bool {
+fn go_ashore(game: &mut Game, avoid: &[Vec3]) -> Option<Vec3> {
     let (Some(world), Some(player)) = (&game.scene.world, &mut game.scene.player) else {
-        return true;
+        return None;
     };
     // Boats and docks the layers place float at -36 m: dry ground is
     // above that, whatever height the sea is drawn at.
     let sea = world.settings.sea_level.max(WATERLINE);
-    let from = player.character.position;
-    if from.y > sea {
-        return true;
-    }
+    // The island's own ground only (its terrain's cells), not a dock or
+    // a boat's deck over the water, and not where a put failed.
     let ground = |x: f32, z: f32| {
+        if avoid
+            .iter()
+            .any(|a| a.with_y(0.0).distance(Vec3::new(x, 0.0, z)) < AVOID)
+        {
+            return None;
+        }
         let top = 600.0;
-        let (t, normal) = world
-            .physics
-            .cast_ray(Vec3::new(x, top, z), Vec3::NEG_Y, 1200.0)?;
-        let y = top - t;
-        (y > sea + 0.5 && normal.y > 0.7).then_some(Vec3::new(x, y + 1.0, z))
+        let (t, normal, key, _) =
+            world
+                .physics
+                .cast_ray_surface(Vec3::new(x, top, z), Vec3::NEG_Y, 1200.0)?;
+        matches!(key, Some(m2_engine::StaticKey::Cell(_))).then_some((top - t, normal.y))
     };
+    let to = dry_spot(
+        player.character.position,
+        ground,
+        |x, z| world.physics.water_at(x, z),
+        sea,
+    )?;
+    // Already standing on it: left as she is.
+    let from = player.character.position;
+    if player.landed && (to - from).with_y(0.0).length() < 1e-3 {
+        return Some(to);
+    }
+    // Out of any seat first: seated (VzaCon001 starts her at the wheel
+    // of its speed boat) she stays where the seat is, and the put came to
+    // nothing (the #618 game check: put ashore three times, each time
+    // back in the boat at the start).
+    let seated = player.driving.take().is_some();
+    if seated {
+        player.seated = false;
+        player.chase_target = None;
+        eprintln!("ashore: she leaves the vehicle she sits in to be put ashore");
+    }
+    // As a teleport puts her down (her swim and landing state too).
+    player.drop_at(to);
+    if seated {
+        game.ride = None;
+        game.on_foot = true;
+    }
+    Some(to)
+}
+
+/// How far from a spot she was put ashore on and wasn't dry after the
+/// next try must be, metres.
+const AVOID: f32 = 25.0;
+
+/// The nearest dry ground to `from` (its own spot first, then rings out
+/// every 25 m to 1.5 km): where the ground (`ground`: its height and the
+/// up part of its normal at x, z) is level enough (normal over 0.7) and
+/// more than 0.5 m over the water there (`water`, else `sea`, and never
+/// under `sea`), as the paradrop check's own dry test has it. A metre
+/// over that ground, to drop onto it; `None` where there is none.
+pub(crate) fn dry_spot(
+    from: Vec3,
+    ground: impl Fn(f32, f32) -> Option<(f32, f32)>,
+    water: impl Fn(f32, f32) -> Option<f32>,
+    sea: f32,
+) -> Option<Vec3> {
+    let dry = |x: f32, z: f32| {
+        let (y, up) = ground(x, z)?;
+        let surface = water(x, z).unwrap_or(sea).max(sea);
+        (y > surface + 0.5 && up > 0.7).then_some(Vec3::new(x, y + 1.0, z))
+    };
+    if let Some(here) = dry(from.x, from.z) {
+        return Some(here);
+    }
     for r in (1..=60).map(|i| i as f32 * 25.0) {
         let n = ((r / 10.0) as usize).max(8);
         for k in 0..n {
             let a = k as f32 / n as f32 * std::f32::consts::TAU;
-            if let Some(to) = ground(from.x + r * a.cos(), from.z + r * a.sin()) {
-                player.character.position = to;
-                player.character.velocity = Vec3::ZERO;
-                player.landed = false;
-                return true;
+            if let Some(to) = dry(from.x + r * a.cos(), from.z + r * a.sin()) {
+                return Some(to);
             }
         }
     }
-    false
+    None
 }
 
 /// Whether `guid` is a layer entity that places a person.
@@ -8278,12 +8361,18 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             position,
             yaw,
         } => {
-            if let Some(s) = game.scene.world.as_ref().and_then(|w| {
-                w.index
-                    .template_db
-                    .scripted_spawn(*guid, what, Vec3::from(*position), *yaw)
+            // One whose template scales gravity (a paratrooper) falls from
+            // where it was made.
+            if let Some((s, scale)) = game.scene.world.as_ref().and_then(|w| {
+                let db = &w.index.template_db;
+                let s = db.scripted_spawn(*guid, what, Vec3::from(*position), *yaw)?;
+                let scale = db
+                    .ids(what)
+                    .first()
+                    .and_then(|id| db.gravity_scales.get(id).copied());
+                Some((s, scale))
             }) {
-                game.scene.people.scripted_spawn(s);
+                game.scene.people.scripted_spawn(s, scale);
             }
             // A prop of theirs (PirCon004's organ boxes) stands as a
             // layer's would.
@@ -8308,7 +8397,9 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
         }
         Command::Remove(guid) => {
             game.scene.people.priority.remove(guid);
-            game.scene.people.scripted_gone(*guid);
+            game.scene
+                .people
+                .scripted_gone(game.scene.world.as_mut().map(|w| &mut w.physics), *guid);
             if let Some(w) = game.scene.world.as_mut() {
                 game.scene.props.hide(&mut w.physics, [*guid]);
             }
@@ -10586,6 +10677,40 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn she_is_put_on_dry_ground_not_on_the_sea() {
+        // The sea at -36 everywhere; an island whose shore is 100 m east
+        // of her (ground at -34 from x 100 on, the sea floor -50 before),
+        // and a lagoon over it at -33.8 from x 100 to 120.
+        let sea = -36.0;
+        let ground = |x: f32, _z: f32| {
+            Some(if x >= 100.0 {
+                (-34.0, 1.0)
+            } else {
+                (-50.0, 1.0)
+            })
+        };
+        let water = |x: f32, _z: f32| {
+            Some(if (100.0..120.0).contains(&x) {
+                -33.8
+            } else {
+                -36.0
+            })
+        };
+        let at = dry_spot(Vec3::new(0.0, -36.0, 0.0), ground, water, sea).unwrap();
+        // Out of the lagoon, on the ground past it, a metre over it.
+        assert!(at.x >= 120.0, "{at}");
+        assert!((at.y - -33.0).abs() < 1e-3, "{at}");
+        // Already on dry ground: where she is.
+        let here = dry_spot(Vec3::new(130.0, -34.0, 0.0), ground, water, sea).unwrap();
+        assert_eq!(here, Vec3::new(130.0, -33.0, 0.0));
+        // A slope too steep, or all sea: nowhere.
+        assert!(dry_spot(Vec3::ZERO, |_, _| Some((-34.0, 0.5)), |_, _| None, sea).is_none());
+        assert!(dry_spot(Vec3::ZERO, |_, _| Some((-50.0, 1.0)), |_, _| None, sea).is_none());
+        // Ground under the waterline where no water is reported: still sea.
+        assert!(dry_spot(Vec3::ZERO, |_, _| Some((-35.8, 1.0)), |_, _| None, sea).is_none());
+    }
 
     #[test]
     fn the_object_sound_check_counts_its_charges_cue_only() {
