@@ -4570,10 +4570,19 @@ impl Combat {
         // The second of a pair starts half a metre over its heart
         // ([`m2_engine::blast_sight::ray_starts`]).
         let starts = m2_engine::blast_sight::ray_starts(rays.at, rays.to.len());
+        // Seated, her rays pass through the vehicle she rides: the
+        // alpha's body for it is one box over its whole hull, which her
+        // bones are inside, where the 360's are its model's own shapes
+        // (an open M151's cabin is open above its doors).
+        let riding = f
+            .player
+            .driving
+            .and_then(|i| f.vehicles.get(i))
+            .and_then(|v| v.id);
         let clear: Vec<bool> = starts
             .iter()
             .zip(&rays.to)
-            .map(|(&from, &to)| f.physics.line_clear(from, to, None))
+            .map(|(&from, &to)| f.physics.line_clear(from, to, riding))
             .collect();
         let share = m2_engine::blast_sight::clear_share(&clear);
         let b = rays.blast;

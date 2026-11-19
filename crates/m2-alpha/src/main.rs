@@ -9607,6 +9607,10 @@ fn blast_sight_check(game: &mut Game, tick: f32) {
         }
         (losses, game.combat.sight_results.clone())
     };
+    // Her car stands the blasts (the check's, not the game's: an M151
+    // takes fx_Explosion_Large's 160 and is wrecked, and its own blasts
+    // go off under her).
+    game.scene.vehicles[i].spec.tuning.health = Some(1.0e6);
     let (open, casts) = go(game);
     let wrecked = game.scene.vehicles[i].wrecked;
     let open_ok = match casts.first() {
