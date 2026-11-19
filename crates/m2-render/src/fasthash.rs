@@ -1,7 +1,9 @@
-//! A fast hasher for the backend's small look-up keys (material ids,
-//! pipeline keys), which are looked up several times for every draw.
-//! The standard library's hasher resists crafted keys, which these never
-//! are, at several times the cost.
+//! A fast hasher for small look-up keys looked up many times a frame
+//! (material ids and pipeline keys for every draw, model and object ids
+//! for every placed object near the camera). The standard library's
+//! hasher resists crafted keys, which these never are, at several times
+//! the cost. Its order of iteration is as arbitrary as the standard
+//! one's (which differs from run to run), so nothing may depend on it.
 //!
 //! The mixing step (rotate, xor, multiply by an odd constant) is the
 //! well-known "Fx" scheme. Provenance: invented (renderer plumbing).
@@ -10,13 +12,16 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
 /// A [`HashMap`] hashed with [`FastHasher`].
-pub(crate) type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
+pub type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
+
+/// A [`HashSet`](std::collections::HashSet) hashed with [`FastHasher`].
+pub type FastSet<K> = std::collections::HashSet<K, BuildHasherDefault<FastHasher>>;
 
 const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
 
 /// Hashes word by word: rotate the state, mix the word in, multiply.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct FastHasher {
+pub struct FastHasher {
     hash: u64,
 }
 

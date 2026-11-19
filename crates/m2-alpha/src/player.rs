@@ -1943,7 +1943,19 @@ impl Player {
         }
     }
 
-    pub fn stagger(&mut self, event: &m2_engine::stagger::Event) -> bool {
+    /// `immune`: the scripts made her invincible (`Object.SetInvincible`,
+    /// any reason, survival mode's `Survival` too): the 360's picker gives
+    /// her none while `Object.GetInvincible` holds (0x8228CB80, from
+    /// 0x824220B0). Aimed in she is `Crouched` (0xC8886020), when it gives
+    /// her none but for a melee bash.
+    /// Forgets her last stagger, so the next is not held back by the
+    /// cooldown (`--stagger-check` runs its cases back to back).
+    pub fn forget_stagger(&mut self) {
+        self.since_stagger = None;
+        self.stagger_pending = None;
+    }
+
+    pub fn stagger(&mut self, event: &m2_engine::stagger::Event, immune: bool) -> bool {
         use m2_engine::stagger::{self, Person};
         if self.down || self.driving.is_some() || self.seated || !self.character.grounded {
             return false;
@@ -1956,8 +1968,8 @@ impl Player {
             &Person {
                 facing: self.facing,
                 player: true,
-                immune: false,
-                crouched: false,
+                immune,
+                crouched: self.aiming,
                 moving: v.x.hypot(v.z) > STAGGER_MOVING,
                 since: self.since_stagger,
                 cooldown: stagger::COOLDOWN,
@@ -2854,12 +2866,15 @@ mod tests {
             held: vec![held],
             ..Moves::default()
         };
-        assert!(p.stagger(&m2_engine::stagger::Event {
-            direction: Vec3::NEG_Z,
-            direct: true,
-            melee: true,
-            key: None,
-        }));
+        assert!(p.stagger(
+            &m2_engine::stagger::Event {
+                direction: Vec3::NEG_Z,
+                direct: true,
+                melee: true,
+                key: None,
+            },
+            false
+        ));
         assert!(p.face.plays(ANGRY));
     }
 
@@ -2917,9 +2932,9 @@ mod tests {
             key,
         };
         // Facing +z: a bullet does nothing, a bash from ahead staggers.
-        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, false, None)));
+        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, false, None), false));
         p.facing = 0.3;
-        assert!(p.stagger(&hit(Vec3::NEG_Z, true, true, None)));
+        assert!(p.stagger(&hit(Vec3::NEG_Z, true, true, None), false));
         assert_eq!(
             p.stagger_pending,
             Some((11, m2_engine::blend::action::STAGGER_IN_PLACE))
@@ -2929,16 +2944,27 @@ mod tests {
         assert!(p.facing.abs() < 1e-5, "{}", p.facing);
         // Not again within a quarter of a second.
         p.since_stagger = Some(0.1);
-        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None)));
+        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None), false));
         // A blast behind her: the long one. Without its clip, nothing.
         p.since_stagger = Some(2.0);
-        assert!(p.stagger(&hit(Vec3::Z, false, false, Some(EXPLOSION))));
+        assert!(p.stagger(&hit(Vec3::Z, false, false, Some(EXPLOSION)), false));
         assert_eq!(p.stagger_pending.map(|s| s.0), Some(12));
         p.since_stagger = Some(2.0);
-        assert!(!p.stagger(&hit(Vec3::X, false, false, Some(EXPLOSION))));
+        assert!(!p.stagger(&hit(Vec3::X, false, false, Some(EXPLOSION)), false));
+        // Invincible (`Object.GetInvincible`, 0x8228CB80): none, even
+        // to a bash.
+        p.since_stagger = Some(2.0);
+        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None), true));
+        assert!(!p.stagger(&hit(Vec3::Z, false, false, Some(EXPLOSION)), true));
+        // Aimed in (`Crouched`): a blast gives her none, a bash still does.
+        p.aiming = true;
+        assert!(!p.stagger(&hit(Vec3::Z, false, false, Some(EXPLOSION)), false));
+        assert!(p.stagger(&hit(Vec3::NEG_Z, true, true, None), false));
+        p.aiming = false;
         // In the air, never.
+        p.since_stagger = Some(2.0);
         p.character.grounded = false;
-        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None)));
+        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None), false));
     }
 
     #[test]
