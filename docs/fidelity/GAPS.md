@@ -42,7 +42,8 @@ available, (6) Correction, (7) Verification and (8) Risk.
 | [A8](#a8) | Decoder residuals: wavelet seam steps on 14 clips, unknown header fields | Visual | P3 | Data, Ghidra |
 | [P5](#p5) | Collision materials: friction and restitution per surface not read | Behavioral | P3 | Data, Ghidra |
 | [P6](#p6) | Projectile guidance law, drag and range not established from code | Behavioral | P3 | Ghidra |
-| [P7](#p7) | Props stand static until knocked loose; a vehicle's spin restored when one gives way (invented) | Behavioral | P2 | Ghidra |
+| [P7](#p7) | Props as bodies: the fake-prop mass changer, prop-to-prop and prop-to-person contacts, crash rules on island objects' bodies | Behavioral | P2 | Ghidra, footage |
+| [I1](#i1) | Layer `Anchor` component not ported: anchor distances and threat-release bits unread | Behavioral | P2 | Ghidra, data |
 | [U6](#u6) | Flash text: one color per field, no kerning, HTML reduced to `<font color>` | Visual | P3 | Data census |
 | [M4](#m4) | Swimming depths, float height, speed and stroke rate invented | Animation/movement | P3 | Footage, Ghidra |
 
@@ -659,16 +660,30 @@ P2
 
 ### P7
 
-**Props as static bodies until touched** · Behavioral discrepancy · P2
+**Props as physics bodies** · Behavioral discrepancy · P2
 
-1. **Original:** From the 360 code (partly traced): a prop with physics is a Havok rigid body from the start. A vehicle meeting it is a contact between two bodies. Crashable records, the mass changer and the blast's per-body push (0x8215CBC8) all act on that body. *Unknown:* the functions that create a prop's body and wake it on first touch are not yet named.
-2. **Ours:** Props stand as static collision until something knocks them loose (`Props::knock`, `Destruction::crash`). Only then are they made loose bodies. A vehicle that knocks one loose loses speed by the mass shifted (`game::flung`). It gets back its spin in the same share before the step (#676, merged: the pre-step spin restore). **Invented:** that restore is the port's own correction for the static-then-loose props. The 360 has nothing to restore, because its props are bodies from the first contact.
-3. **Difference:** Not measured. A car clipping a prop may turn differently from the 360's, where the contact itself is solved.
-4. **Likely cause:** The port's choice to keep the island's thousands of props static for cost.
-5. **Evidence:** 360 code: the prop's physics setup (0x821831B0 for rigid bodies), its activation, and the contact solver's mass changer.
-6. **Correction:** Make props loose bodies from first contact, as the 360 does. A scoping note on the cost (a town's worth of props) comes first; no code before a decision.
-7. **Verification:** A car at 10 m/s clipping a crate and a lamppost: heading change and speed loss against footage or an emulator of the traced code.
-8. **Risk:** Medium to high. The cost per frame, and every crash, push and cargo behaviour built on static props.
+1. **Original:** From the 360 code:
+   - A prop's physics object is made with its bodies when it is created (0x821831B0, each body by 0x8216A290 from the rigid-body defaults 0x82621820). It sleeps by the world's rule: checked every 0.2 s against 0.02 m, asleep after 6 still checks (0x820AA278, 0x824CE9C8).
+   - Its physics is rebuilt for the parts its state shows (0x82182CE8 -> 0x82152780).
+   - What a blast throws goes to the disposer (`PgDebrisManager`, 0x822085A8). The blast pool holds 40 and takes 16 per update; entries are weighed half by youth and half by on-screen size, and the lightest is disposed of (0x82246A08, 0x822470E0, 0x82246C08, 0x82247230, 0x822480A8).
+   - A vehicle's contact with a prop is a collision event: its closing speed and both masses give its size (0x82162BB8, 0x82163758), with a floor and a hundredth (0x8228B5F0) and each side's cell (0x82287CF8).
+   - A fake prop's contact with a real body goes through Havok's mass changer (0x821620F0, `FakeToRealMassRatio`).
+2. **Ours:**
+   - Props that come loose whole are sleeping bodies from stream-in (#740) and meet vehicles' hulls (#744).
+   - The disposer's blast pool is ported (#744), without the pools' other per-update rules and without the queue for objects still in view.
+   - The crash rules read the real contact (`Physics::vehicle_prop_hits` -> `Destruction::crash_body`, #753).
+   - A body prop that breaks gives up its bodies for its wreck where it lies, and goods that came in as bodies give them up to ride a load bed.
+   - Not ported:
+     - the mass changer: a body prop is felt at its full mass;
+     - prop body against prop body: knocked pieces still pass through each other and through body props;
+     - prop body against people;
+     - the crash rules on the island's placed objects' bodies: they are bodies of their own (#740, as the 360's base-layer `_PropPhysics` entities through 0x823E6AB8 -> 0x82408C30 -> 0x823FD338 -> 0x821831B0) and are pushed by vehicles and blasts, but `Destruction::crash_body` takes only props' bodies yet; #676's felt-mass and spin give-back still stand in `run_into` for island objects that are not bodies (those that break apart).
+3. **Difference:** Not measured in game yet. Expected: light fake props push a vehicle harder than on the 360 (full mass); piles of knocked pieces don't stack.
+4. **Likely cause:** The mass changer is a Havok contact modifier with no Rapier equivalent wired in. Island objects' bodies have no crash path of their own yet.
+5. **Evidence:** 360 code as listed. Bench: `propbench town` (#739/#740), 0 awake at rest, about 0.07 ms a step while still. Checks: `--prop-bodies-check`, `--prop-limits-check`.
+6. **Correction:** Add a contact-modification hook that scales the vehicle's side by `min(1, m_prop / m_vehicle x ratio)` for fake props. Let debris meet debris once pieces start apart. Give island objects' bodies the crash rules, then drop #676's corrections.
+7. **Verification:** `--prop-bodies-check` and `--prop-limits-check` in a town (`--spawn 2800,-1100`), `--cargo-check` at OilCon020 (goods that came in as bodies must ride), `--wreck-blast-check` (blasts push body props), and Xenia drives into café furniture against the port's speed loss.
+8. **Risk:** Medium. Every prop that comes loose is now a body: watch frame time in dense towns, and goods on load beds.
 
 ## UI
 
@@ -879,6 +894,14 @@ P2
 8. **Risk:** Low to medium. Text metrics feed wrapping and line counts,
    so check every movie's screenshot at the five resolutions for changed
    line breaks.
+
+## AI
+
+### I1
+
+**Layer anchors** · Behavioral discrepancy · P2
+
+Layer `Anchor` component (table 0x83653630, read by 0x823ED9D8 and applied by 0x822D7310 from AI setup 0x822BB608/0x822D7778) is not ported: AnchorDist, AnchorResetDist and the threat-release bits (bCanScriptDisable, bPercieveThreat, bEnemyShouts, bExplosion, bThreatWithinRange, ThreatRange) are not read. Only the script `Ai.Anchor` and the spawner anchor exist (m2_engine::ai_anchor).
 
 ## Closed
 
