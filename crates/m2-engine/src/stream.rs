@@ -592,6 +592,14 @@ pub struct WorldStats {
 /// The streamed island.
 #[derive(Debug)]
 pub struct World {
+    /// Whether the island's placed objects that come loose whole are put
+    /// up as sleeping bodies of their own (gap P7), as the 360's props are
+    /// (a prop's physics object is made with its bodies: 0x821831B0,
+    /// 0x8216A290), instead of fixed collision until knocked.
+    pub bodies_on: bool,
+    /// Those that are ([`bodies_on`](Self::bodies_on)): their bodies are
+    /// their [`knocked`](Self::knocked) pieces.
+    as_body: HashSet<usize>,
     pub index: Arc<WorldIndex>,
     pub settings: WorldSettings,
     loader: Loader,
@@ -810,6 +818,8 @@ impl World {
             destroyed: HashSet::new(),
             loose: HashMap::new(),
             knocked: FastMap::default(),
+            bodies_on: false,
+            as_body: HashSet::new(),
             taken: FastSet::default(),
             felled: HashSet::new(),
             member_of: HashMap::new(),
@@ -899,9 +909,58 @@ impl World {
     /// one.
     pub fn knocked_loose(&self, i: usize) -> Option<bool> {
         let o = self.index.objects.get(i)?;
-        self.knocked
-            .contains_key(&i)
+        // A body of its own from the start was knocked by nothing.
+        (self.knocked.contains_key(&i) && !self.as_body.contains(&i))
             .then(|| self.loose.get(&o.model).is_some_and(|l| l.breaks))
+    }
+
+    /// Turns [`bodies_on`](Self::bodies_on) on: those already standing
+    /// as fixed collision that come loose whole are put up as sleeping
+    /// bodies of their own where they stand (those to come are as their
+    /// models load). Returns how many.
+    pub fn make_bodies(&mut self) -> usize {
+        self.bodies_on = true;
+        let mut made = 0;
+        let models: Vec<(u32, Arc<Loose>)> = self
+            .loose
+            .iter()
+            .filter(|(_, l)| !l.breaks && !l.pieces.is_empty())
+            .map(|(&h, l)| (h, l.clone()))
+            .collect();
+        for (hash, l) in models {
+            let objects: Vec<usize> = self.by_model.get(&hash).cloned().unwrap_or_default();
+            for i in objects {
+                if self.taken.contains(&i)
+                    || self.destroyed.contains(&i)
+                    || self.knocked.contains_key(&i)
+                    || !self.physics.has_static(StaticKey::Object(i))
+                {
+                    continue;
+                }
+                let o = self.index.objects[i];
+                let at = Mat4::from_rotation_translation(o.rotation, o.position);
+                self.remove_object_static(i);
+                let pieces: Vec<_> = l
+                    .pieces
+                    .iter()
+                    .zip(l.starts(at))
+                    .map(|(piece, start)| self.physics.add_prop_body(piece, start, true))
+                    .collect();
+                self.physics.group_debris(&pieces, at);
+                self.knocked.insert(i, pieces);
+                self.as_body.insert(i);
+                made += 1;
+            }
+        }
+        made
+    }
+
+    /// The placed objects that are bodies of their own from the start
+    /// ([`bodies_on`](Self::bodies_on)): each object and its bodies.
+    pub fn as_bodies(&self) -> impl Iterator<Item = (usize, &[DebrisId])> + '_ {
+        self.as_body
+            .iter()
+            .filter_map(|i| Some((*i, self.knocked.get(i)?.as_slice())))
     }
 
     /// Placed objects standing that come loose with any of their model
@@ -1316,6 +1375,34 @@ impl World {
                             };
                             for &i in placed {
                                 let o = &self.index.objects[i];
+                                // One that comes loose whole is put up as
+                                // sleeping bodies of its own, not fixed
+                                // collision ([`World::bodies_on`]).
+                                if self.bodies_on
+                                    && !self.taken.contains(&i)
+                                    && !self.destroyed.contains(&i)
+                                    && !self.knocked.contains_key(&i)
+                                    && let Some(l) = self
+                                        .loose
+                                        .get(&hash)
+                                        .filter(|l| !l.breaks && !l.pieces.is_empty())
+                                        .cloned()
+                                {
+                                    let at =
+                                        Mat4::from_rotation_translation(o.rotation, o.position);
+                                    let pieces: Vec<_> = l
+                                        .pieces
+                                        .iter()
+                                        .zip(l.starts(at))
+                                        .map(|(piece, start)| {
+                                            self.physics.add_prop_body(piece, start, true)
+                                        })
+                                        .collect();
+                                    self.physics.group_debris(&pieces, at);
+                                    self.knocked.insert(i, pieces);
+                                    self.as_body.insert(i);
+                                    continue;
+                                }
                                 // A prop placed by name with no collision
                                 // of its own (a bush, a plant) has none:
                                 // vehicles and people go through it. Nor
