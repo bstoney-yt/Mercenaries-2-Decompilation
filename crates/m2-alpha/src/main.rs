@@ -13116,6 +13116,29 @@ fn prop_bodies_check(
             movement: Vec2::new(0.0, throttle),
             ..Intent::default()
         };
+        // Each quarter second: where it is and what its body touches
+        // (q740f: 4.3 then 1.5 m/s, stopped short of the prop, which the
+        // a18f368d run from the same spot reached).
+        if k % (each / 4).max(1) == 0
+            && let Some(w) = game.scene.world.as_ref()
+        {
+            let at = w
+                .physics
+                .vehicle_transform(car)
+                .map_or(Vec3::ZERO, |m| m.w_axis.truncate());
+            let touching: Vec<String> = w
+                .physics
+                .vehicle_touching(car)
+                .into_iter()
+                .map(|(key, point, _)| format!("{key:?} at {point:.2}"))
+                .collect();
+            eprintln!(
+                "prop-bodies-check: t {:.2} s: the car at {at:.2}, {:.1} m/s, touching [{}]",
+                k as f32 * tick,
+                w.physics.vehicle_speed(car),
+                touching.join("; ")
+            );
+        }
         // Each second: the throttle asked, and how fast it goes.
         if k % each == 0 {
             eprintln!(
