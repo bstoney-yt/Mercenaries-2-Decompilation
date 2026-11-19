@@ -2560,7 +2560,7 @@ impl Game {
             let chosen_key = chosen.map(crate::flights::Pickup::key);
             let near = chosen.map(|p| {
                 let refill = crate::mission::refill(templates, &self.combat, &p.what);
-                let usable = p.what.is_money() || self.combat.can_use(refill, p.what.health);
+                let usable = usable_pickup(templates, &self.combat, &p.what, refill);
                 let offer = crate::mission::offer(templates, &self.combat, &p.what);
                 // Each pickup she stands at and leaves lying, once, with
                 // why: what each record would go to and its room.
@@ -6248,9 +6248,30 @@ fn would_leave(
     p: &crate::flights::Pickup,
 ) -> u8 {
     let refill = crate::mission::refill(templates, combat, &p.what);
-    let usable = p.what.is_money() || combat.can_use(refill, p.what.health);
+    let usable = usable_pickup(templates, combat, &p.what, refill);
     let offer = crate::mission::offer(templates, combat, &p.what);
     u8::from(!usable && offer != crate::mission::Offer::Equip)
+}
+
+/// Whether what lies there (`what`, giving `refill`) is hers to take.
+/// From the 360 code (0x8228F5E8, the pickup's records by `Type`): one
+/// with no ammunition record (`Type` 1) is always taken (health, as much
+/// as there is room for; a munitions laptop, `Type` 0, whose script is
+/// then told); money always; one with ammunition records when a weapon of
+/// hers takes one and she has room (the room is the port's own: the 360
+/// takes it whenever one of hers matches).
+fn usable_pickup(
+    templates: &m2_engine::Templates,
+    combat: &Combat,
+    what: &crate::flights::Leaves,
+    refill: crate::combat::Refill,
+) -> bool {
+    let no_ammo = templates
+        .leavings
+        .pickups
+        .get(&what.template)
+        .is_some_and(|t| t.walked.is_empty() && t.kind != m2_engine::pickup::EQUIPMENT);
+    what.is_money() || (no_ammo && what.weapon.is_none()) || combat.can_use(refill, what.health)
 }
 
 /// What a press of the weapon switch picks.
@@ -6413,6 +6434,45 @@ mod tests {
     use m2_engine::TemplateInfo;
 
     use super::*;
+
+    // The 360's pickup rule by `Type` (0x8228F5E8): a pickup with no
+    // ammunition record (a munitions laptop, `Type` 0 with 1 health) is
+    // taken though she is whole and none of her weapons fires what it
+    // names; one with ammunition records she has no weapon for is not.
+    #[test]
+    fn a_pickup_with_no_ammunition_record_is_always_taken() {
+        use m2_engine::pickup::{AMMUNITION, HEALTH, PickupInfo};
+        let mut templates = m2_engine::Templates::default();
+        let info = |kind, walked: Vec<(u32, u32)>| PickupInfo {
+            kind,
+            radius: 1.0,
+            ammo: Some(0x8000_844c),
+            rounds: 1,
+            gives: vec![(0x8000_844c, 1)],
+            walked,
+            heals: 1,
+            icon: None,
+            effect: None,
+        };
+        templates.leavings.pickups.insert(1, info(HEALTH, vec![]));
+        templates
+            .leavings
+            .pickups
+            .insert(2, info(AMMUNITION, vec![(0x8000_844c, 1)]));
+        let combat = Combat::default();
+        let laptop = crate::flights::Leaves {
+            template: 1,
+            health: 1.0,
+            ..Default::default()
+        };
+        let coilgun_ammo = crate::flights::Leaves {
+            template: 2,
+            ..Default::default()
+        };
+        let none = crate::combat::Refill::default();
+        assert!(usable_pickup(&templates, &combat, &laptop, none));
+        assert!(!usable_pickup(&templates, &combat, &coilgun_ammo, none));
+    }
 
     #[test]
     fn she_is_heard_struck_by_her_hero_templates_sound_key() {
