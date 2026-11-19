@@ -343,6 +343,13 @@ pub struct Game {
     /// ([`crate::config::EnhancedConfig::semi_engine_gain`]).
     pub semi_gain: f32,
     honks: u32,
+    /// Seconds each vehicle (by index) has had a quarter or more of its
+    /// box under the water, and those that have sunk ([`Game::sink`]).
+    in_water: HashMap<usize, f32>,
+    sunk: HashSet<usize>,
+    /// The mission vehicles that sank, not yet told to the scripts
+    /// ([`Game::take_sunk`]).
+    sunk_guids: Vec<u32>,
     /// Vehicles that knocked something loose: each one's id, label, its
     /// vertical velocity just before, and seconds until it is looked at
     /// again (the knock-up check's log, [`KICK_LOOK`]).
@@ -598,6 +605,9 @@ impl Game {
             pursued: false,
             honking: false,
             honks: 0,
+            in_water: HashMap::new(),
+            sunk: HashSet::new(),
+            sunk_guids: Vec::new(),
             kicks: Vec::new(),
             semi_gain: crate::config::SEMI_ENGINE_GAIN,
             disguise: crate::disguise::Disguise::default(),
@@ -1914,6 +1924,8 @@ impl Game {
             .map(|v| self.bed_shapes.get(&v.spec.model).cloned().flatten())
             .collect();
         let focus = self.focus();
+        // Vehicles under the water long enough sink.
+        self.sink(dt);
         if let Some(world) = &mut self.scene.world {
             let driven = self
                 .scene
@@ -3680,6 +3692,96 @@ impl Game {
 
     /// The horn presses since the last call (the faction gates, the
     /// disguise and the friendly soldiers hear each one).
+    /// The mission vehicles that sank since the last call (their
+    /// `VehicleSinking` physics event).
+    pub fn take_sunk(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.sunk_guids)
+    }
+
+    /// Vehicles in the water `dt` seconds more: each but a boat with a
+    /// quarter or more of its box under the sea counts its time there,
+    /// and once that reaches its template's `Buoyancy` delay (5 s
+    /// without one) it sinks: it stays whole (the 360's sinking only takes
+    /// its lift; Xenia: 100/100 for 60 s on the bottom), she is put out
+    /// with 100 of her health gone ([`Combat::sank_out`]) if she is in it, and a mission vehicle's
+    /// `VehicleSinking` goes to the scripts. From the 360 code: the time,
+    /// the share and the event ([`m2_engine::durability::Buoyancy`]). The
+    /// boats float by their own hulls here ([`m2_engine::Physics`]'s
+    /// boats) and are left to them.
+    fn sink(&mut self, dt: f32) {
+        use m2_engine::durability::{SINK_SHARE, submerged_share};
+        let Some(world) = &mut self.scene.world else {
+            return;
+        };
+        let Some(sea) = world.physics.water() else {
+            return;
+        };
+        let mut sinking = Vec::new();
+        for (i, v) in self.scene.vehicles.iter().enumerate() {
+            if v.wrecked || v.spec.is_boat() || self.sunk.contains(&i) {
+                continue;
+            }
+            let Some(at) = v.id.and_then(|id| world.physics.vehicle_transform(id)) else {
+                continue;
+            };
+            let (lo, hi) = v.spec.bounds;
+            let (mut bottom, mut top) = (f32::MAX, f32::MIN);
+            for x in [lo.x, hi.x] {
+                for y in [lo.y, hi.y] {
+                    for z in [lo.z, hi.z] {
+                        let y = at.transform_point3(Vec3::new(x, y, z)).y;
+                        bottom = bottom.min(y);
+                        top = top.max(y);
+                    }
+                }
+            }
+            if submerged_share(bottom, top, sea) < SINK_SHARE {
+                continue;
+            }
+            let t = self.in_water.entry(i).or_insert(0.0);
+            *t += dt;
+            let after = world
+                .index
+                .template_db
+                .buoyancy_for(&v.spec.label)
+                .sink_after;
+            if *t >= after {
+                sinking.push((i, *t));
+            }
+        }
+        for (i, t) in sinking {
+            self.sunk.insert(i);
+            self.in_water.remove(&i);
+            let v = &mut self.scene.vehicles[i];
+            eprintln!(
+                "sink: the {} has been in the water {t:.1} s: it sinks{}",
+                v.spec.label,
+                v.guid
+                    .map_or(String::new(), |g| format!(" (VehicleSinking for {g:#x})"))
+            );
+            if let Some(g) = v.guid {
+                self.sunk_guids.push(g);
+            }
+            if let Some(p) = self.scene.player.as_mut()
+                && p.driving == Some(i)
+            {
+                self.combat.sank_out();
+                let seat = self.ride.filter(|r| r.0 == i).map(|r| r.1);
+                get_out(&world.physics, &self.scene.vehicles[i], seat, p);
+                self.ride = None;
+            }
+        }
+    }
+
+    /// Whether vehicle `i` has sunk ([`Game::sink`]), and how long it has
+    /// been a quarter or more under the water.
+    pub fn sunk(&self, i: usize) -> bool {
+        self.sunk.contains(&i)
+    }
+    pub fn in_water(&self, i: usize) -> f32 {
+        self.in_water.get(&i).copied().unwrap_or(0.0)
+    }
+
     pub fn take_honks(&mut self) -> u32 {
         std::mem::take(&mut self.honks)
     }
@@ -4739,6 +4841,7 @@ fn knock_loose(
     install: Option<&Install>,
 ) -> Vec<(m2_engine::VehicleId, String, f32)> {
     let mut knocked = Vec::new();
+    let mut met = Vec::new();
     for (index, (v, bed)) in vehicles
         .iter()
         .zip(beds.iter().chain(std::iter::repeat(&None)))
@@ -4776,6 +4879,16 @@ fn knock_loose(
                 place.transform_point3((lo + hi) * 0.5),
                 (hi - lo).length() * 0.5,
             ));
+            // And goods that are bodies of their own (they came in before
+            // the vehicle was placed): where their bodies lie.
+            for e in props.bodies_standing_near(
+                &world.physics,
+                place.transform_point3((lo + hi) * 0.5),
+                (hi - lo).length() * 0.5,
+            ) {
+                props.follow_body(&world.physics, e);
+                near.push(e);
+            }
             near.sort_unstable();
             near.dedup();
             // Once the props round it have loaded: what stands round the
@@ -4805,6 +4918,40 @@ fn knock_loose(
             }
         }
         let before = world.physics.vehicle_velocity_before(id);
+        // Props that are bodies of their own it met in the step: the
+        // crash rules on the real contact (its closing speed and both
+        // masses), each meeting once ([`Destruction::crash_body`]).
+        if let Some(place) = world.physics.vehicle_transform(id) {
+            let db = &world.index.template_db;
+            let sound = vehicle_sound_key(db, &v.spec.label, v.spec.model).unwrap_or(0);
+            for (d, _, closing, prop_mass) in world.physics.vehicle_prop_hits(id) {
+                // A state layer's prop, or one of the island's placed
+                // objects that is a body of its own (q753e: the check's
+                // was one of these, and no meeting was ever taken).
+                let key = props.body_entity(d).map(StaticKey::Entity).or_else(|| {
+                    world
+                        .as_bodies()
+                        .find(|(_, ids)| ids.contains(&d))
+                        .map(|(i, _)| StaticKey::Object(i))
+                });
+                if let Some(key) = key {
+                    met.push((
+                        index,
+                        d,
+                        key,
+                        closing,
+                        prop_mass,
+                        Crasher {
+                            place,
+                            bounds: v.model.bounds,
+                            velocity: before,
+                            mass: v.spec.mass,
+                            sound,
+                        },
+                    ));
+                }
+            }
+        }
         let mut speed = before.length();
         if world.physics.vehicle_pulling(id) {
             speed = speed.max(PUSH_SPEED);
@@ -4844,6 +4991,15 @@ fn knock_loose(
             world.physics.set_vehicle_velocity(id, before * keep);
             world.physics.set_vehicle_spin(id, spin * keep);
             knocked.push((id, v.spec.label.clone(), before.y));
+        }
+    }
+    let pairs: Vec<(usize, m2_engine::DebrisId)> = met.iter().map(|m| (m.0, m.1)).collect();
+    let fresh = props.met_bodies(&pairs);
+    if let Some(install) = install {
+        for (index, d, e, closing, prop_mass, crasher) in met {
+            if fresh.contains(&(index, d)) {
+                destruction.crash_body(world, props, install, &crasher, e, closing, prop_mass);
+            }
         }
     }
     knocked
@@ -4955,7 +5111,10 @@ fn run_into(
         let (fling, topple) = flung(vehicle.velocity, mass, m);
         let knocked = match key {
             StaticKey::Object(i) => world.knock(i, fling, topple),
-            StaticKey::Entity(e) => props.knock(&mut world.physics, e, fling, topple, false),
+            // A prop that comes loose is a body of its own: the vehicle
+            // meets it in the physics, and the crash rules take the real
+            // contact ([`Destruction::crash_body`]).
+            StaticKey::Entity(_) => false,
             _ => false,
         };
         if knocked {
@@ -5247,7 +5406,58 @@ fn blast_loose(world: &mut World, props: &mut Props, pushes: &[BlastPush], strik
                 .placed_bounds(e)
                 .map_or((p, p), |(at, bounds)| crate::props::box_around(at, bounds));
             let (velocity, spin) = push.throw(lo, hi, fudge(db, template));
-            props.knock(&mut world.physics, e, velocity, spin, strike);
+            if props.knock(&mut world.physics, e, velocity, spin, strike) {
+                props.blast_thrown(&mut world.physics, e);
+            }
+        }
+        // The island's placed objects that are bodies of their own:
+        // pushed where they lie, as a blast pushes any moving body it
+        // reaches (0x8215C560 -> 0x8215CBC8), and handed to the disposer
+        // as every object a blast pushes is (0x82289F40 -> 0x82246A08).
+        let island: Vec<(usize, Vec<m2_engine::DebrisId>)> = world
+            .as_bodies()
+            .map(|(i, ids)| (i, ids.to_vec()))
+            .collect();
+        for (i, ids) in island {
+            let Some(&first) = ids.first() else { continue };
+            let Some(at) = world.physics.debris_place(first) else {
+                continue;
+            };
+            let centre = at.w_axis.truncate();
+            let o = world.index.objects[i];
+            let half = world
+                .object_model(i)
+                .map_or(Vec3::splat(0.5), |m| (m.bounds.1 - m.bounds.0) * 0.5);
+            if centre.distance(push.at) - half.length() > push.radius {
+                continue;
+            }
+            let db = &world.index.template_db;
+            if !strike && !blown_loose(db, o.template) {
+                continue;
+            }
+            let (velocity, _) = push.throw(centre - half, centre + half, fudge(db, o.template));
+            for d in ids {
+                world.physics.push_debris(d, velocity);
+            }
+            props.island_thrown(&mut world.physics, i, first, half.length());
+        }
+        for i in props.take_disposed_island() {
+            world.dispose(i);
+        }
+        // Props that are bodies of their own: pushed where they now lie,
+        // as a blast pushes any moving body it reaches (0x8215C560 ->
+        // 0x8215CBC8), each body by the push on the prop's box.
+        for (e, template, ids, (lo, hi)) in props.bodies_near(&world.physics, push.at, push.radius)
+        {
+            let db = &world.index.template_db;
+            if !strike && !blown_loose(db, template) {
+                continue;
+            }
+            let (velocity, _) = push.throw(lo, hi, fudge(db, template));
+            for d in ids {
+                world.physics.push_debris(d, velocity);
+            }
+            props.blast_thrown(&mut world.physics, e);
         }
     }
 }
@@ -5317,6 +5527,32 @@ fn exhaust_smoke(
 /// A vehicle of ours (not the mission's or the island's) still to park.
 fn parkable(v: &ParkedVehicle) -> bool {
     v.id.is_none() && v.guid.is_none() && v.spot.is_none()
+}
+
+/// The nearest spot to `from` where the water (`water`: its height at
+/// x, z) stands more than `depth` metres over the ground there (`ground`:
+/// its height at x, z), on the water's surface: rings out every 20 m to
+/// 600 m. For `--sink-check` (a car put in water deeper than it is
+/// tall). `None` where there is none.
+pub(crate) fn deep_spot(
+    from: Vec3,
+    ground: impl Fn(f32, f32) -> Option<f32>,
+    water: impl Fn(f32, f32) -> Option<f32>,
+    depth: f32,
+) -> Option<Vec3> {
+    for r in (0..=600).step_by(20) {
+        let n = (r / 5).max(1);
+        for k in 0..n {
+            let a = k as f32 / n as f32 * std::f32::consts::TAU;
+            let (x, z) = (from.x + a.sin() * r as f32, from.z + a.cos() * r as f32);
+            if let (Some(w), Some(g)) = (water(x, z), ground(x, z))
+                && w - g > depth
+            {
+                return Some(Vec3::new(x, w, z));
+            }
+        }
+    }
+    None
 }
 
 /// Spray off both sides of each boat going fast on the water, a third of
@@ -6165,7 +6401,7 @@ pub(crate) fn get_out_at(
     facing: f32,
 ) {
     get_out(physics, v, seat, player);
-    player.drop_at(place);
+    player.step_out_at(place);
     player.facing = facing;
     eprintln!(
         "boarding: out of the {} where her clip ends, at {:.2?}",
@@ -6190,13 +6426,18 @@ pub(crate) fn get_out(
         use m2_engine::seats::ExitKind;
         let velocity = physics.vehicle_velocity(id);
         let (kind, place) = exit_plan(physics, v, seat, at, velocity);
-        // At the hull's height: onto the ground by the door, not onto a
-        // boulder or roof over it.
-        player.drop_at(place);
         if matches!(kind, ExitKind::Ditch | ExitKind::Toss) {
+            // Ditching (0x822A1B70): half a metre over the exit's place,
+            // pushed off, in the air: she lands as from a jump.
             let out = place - at.transform_point3(Vec3::ZERO);
-            player.character.velocity =
-                m2_engine::seats::ditch_velocity(velocity, Vec3::new(out.x, 0.0, out.z));
+            player.launch(
+                place + Vec3::Y * m2_engine::seats::DITCH_RISE,
+                m2_engine::seats::ditch_velocity(velocity, Vec3::new(out.x, 0.0, out.z)),
+            );
+        } else {
+            // At the hull's height: onto the ground by the door, not onto
+            // a boulder or roof over it; at once (the ground is in).
+            player.step_out_at(place);
         }
         let f = at.transform_vector3(Vec3::Z);
         player.facing = f.x.atan2(f.z);
@@ -6472,6 +6713,27 @@ mod tests {
         let none = crate::combat::Refill::default();
         assert!(usable_pickup(&templates, &combat, &laptop, none));
         assert!(!usable_pickup(&templates, &combat, &coilgun_ammo, none));
+    }
+
+    #[test]
+    fn the_sink_check_finds_water_deeper_than_a_car() {
+        // The sea at -36; the sea floor falls away east of x 100 (-40 to
+        // x 200, -60 from it): 6 m deep is first met at x 200.
+        let water = |_: f32, _: f32| Some(-36.0);
+        let ground = |x: f32, _: f32| {
+            Some(if x < 100.0 {
+                -30.0
+            } else if x < 200.0 {
+                -40.0
+            } else {
+                -60.0
+            })
+        };
+        let at = deep_spot(Vec3::ZERO, ground, water, 6.0).unwrap();
+        assert!(at.x >= 200.0 && at.y == -36.0, "{at}");
+        // Shallow everywhere, or dry: none.
+        assert!(deep_spot(Vec3::ZERO, |_, _| Some(-38.0), water, 6.0).is_none());
+        assert!(deep_spot(Vec3::ZERO, ground, |_, _| None, 6.0).is_none());
     }
 
     #[test]
