@@ -671,8 +671,13 @@ pub struct EngineTuning {
     pub primary: f32,
     pub gears: [f32; 5],
     pub reverse: f32,
-    /// The rear wheels' radius, metres (`RearWheelRadius` 0.39).
+    /// The rear wheels' radius, metres (`RearWheelRadius` 0.39), and the
+    /// front's (`FrontWheelRadius`). The 360 code keeps each wheel's own
+    /// at its +0x108 (0x8219EF90) and both the engine's speed
+    /// (0x8219E678) and the drive's push (0x8219CAE8) go by it, not the
+    /// model's wheels; both default to 0.42 (0x823EB210).
     pub radius: f32,
+    pub front_radius: f32,
     /// Of its most torque, what it gives at idle and at its most rpm
     /// (`TorqueFactorAtMinRPM` 0.8 and `TorqueFactorAtMaxRPM` 1.0).
     pub torque_at: (f32, f32),
@@ -1115,11 +1120,23 @@ impl EngineTuning {
         gears: [3.0, 2.25, 1.5, 0.75, 0.4],
         reverse: 1.0,
         radius: 0.42,
+        front_radius: 0.42,
         torque_at: (1.0, 1.0),
         reverse_speed: 50.0 / 3.6,
         slip: 2000.0,
         split: 1.0,
     };
+
+    /// The template radius of a front (`true`) or rear wheel, metres,
+    /// as the engine and the drive see it (the 360 code's wheel +0x108).
+    pub fn wheel_radius(&self, front: bool) -> f32 {
+        if front {
+            self.front_radius
+        } else {
+            self.radius
+        }
+        .max(0.05)
+    }
 
     /// A gear's ratio, final drive included (0 reverse, backwards; a gear
     /// it hasn't, 0).
@@ -1981,6 +1998,8 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         ],
                         reverse: f("GearRatioReverse")?,
                         radius: f("RearWheelRadius")?,
+                        front_radius: f("FrontWheelRadius")
+                            .unwrap_or(EngineTuning::DEFAULT.front_radius),
                         torque_at: (f("TorqueFactorAtMinRPM")?, f("TorqueFactorAtMaxRPM")?),
                         reverse_speed: f("ReverseMaxSpeed")? / 3.6,
                         slip: f("GearSlipRPM")
@@ -1993,6 +2012,7 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                     (e.torque > 0.0
                         && e.primary > 0.0
                         && e.radius > 0.05
+                        && e.front_radius > 0.05
                         && e.gears[0] > 0.0
                         && e.rpm.0 < e.rpm.1
                         && e.rpm.1 < e.rpm.2)
@@ -2518,6 +2538,7 @@ mod tests {
             gears: [4.0, 3.1, 2.4, 2.0, 1.5],
             reverse: 3.7,
             radius: 0.39,
+            front_radius: 0.39,
             torque_at: (0.8, 1.0),
             reverse_speed: 55.0 / 3.6,
             slip: 1000.0,
