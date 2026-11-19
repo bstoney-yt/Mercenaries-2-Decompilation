@@ -6424,6 +6424,19 @@ impl Physics {
         }
     }
 
+    /// Puts a vehicle at `position` facing `rotation`, at rest (for the
+    /// offscreen checks).
+    pub fn place_vehicle(&mut self, id: VehicleId, position: Vec3, rotation: Quat) {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
+            body.set_position(pose(position, rotation.normalize()), true);
+            body.set_linvel(vector(Vec3::ZERO), true);
+            body.set_angvel(vector(Vec3::ZERO), true);
+        }
+    }
+
     /// Turns an overturned vehicle upright where it is.
     pub fn right_vehicle(&mut self, id: VehicleId) {
         let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
