@@ -248,6 +248,9 @@ struct Options {
     plough: Option<String>,
     /// With `--drive`: wreck it at speed at the end and watch it stop.
     wreck: bool,
+    /// `--exit-land-check`: she gets out of the car she drives and must
+    /// land at once, whatever streams ([`exit_land_check`]).
+    exit_land_check: bool,
     /// With `--drive` and `--wreck` or `--shoot-up`: get out of the wreck,
     /// walk to the fuel can it left and take it (testing).
     fuel_check: bool,
@@ -834,6 +837,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--plough" => o.plough = Some(value()?.to_ascii_lowercase()),
             "--wreck" => o.wreck = true,
+            "--exit-land-check" => {
+                o.exit_land_check = true;
+                o.drive = true;
+            }
             "--fuel-check" => o.fuel_check = true,
             "--survival-check" => o.survival_check = true,
             "--log-check" => o.log_check = true,
@@ -8124,6 +8131,10 @@ fn drive_for_screenshot(
             .collect::<Vec<_>>()
             .join(", ")
     );
+    if options.exit_land_check {
+        exit_land_check(game, tick);
+        return Ok(());
+    }
     if options.wreck {
         wreck_at_speed(game, tick);
     }
@@ -9464,6 +9475,59 @@ fn fuel_check(game: &mut Game, tick: f32) {
 
 /// Wrecks the vehicle she drives, as it goes, and logs how it comes to
 /// rest: how fast it went, how far it slid, and how much lower it sits.
+/// `--exit-land-check` (it turns on `--drive`): the car she drives is
+/// stopped, she gets out as the game gets her out ([`game::get_out`]) and
+/// is played on foot; logs each step's world loads pending and whether
+/// she has landed. `PASS` when she lands within 0.5 s, else `FAIL` with
+/// her landing state at 2 s (q728d, q673j: put out while the world still
+/// streamed, she hung where she got out).
+fn exit_land_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::Vec3;
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("exit-land-check: FAIL she drives nothing");
+        return;
+    };
+    let Some(id) = game.scene.vehicles[i].id else {
+        eprintln!("exit-land-check: FAIL her vehicle has no body");
+        return;
+    };
+    for _ in 0..(1.0 / tick) as u32 {
+        if let Some(w) = game.scene.world.as_mut() {
+            w.physics.set_vehicle_velocity(id, Vec3::ZERO);
+        }
+        game.step(Intent::default(), tick);
+    }
+    if let (Some(world), Some(p)) = (game.scene.world.as_ref(), game.scene.player.as_mut()) {
+        game::get_out(&world.physics, &game.scene.vehicles[i], None, p);
+    }
+    game.ride = None;
+    game.on_foot = true;
+    let mut landed_at = None;
+    let mut pending_max = 0;
+    for k in 0..(2.0 / tick) as u32 {
+        game.step(Intent::default(), tick);
+        let pending = game.scene.world.as_ref().map_or(0, |w| w.stats().pending);
+        pending_max = pending_max.max(pending);
+        if landed_at.is_none() && game.scene.player.as_ref().is_some_and(|p| p.landed) {
+            landed_at = Some(k as f32 * tick);
+        }
+    }
+    eprintln!(
+        "exit-land-check: landed {} s after getting out; the world's loads pending up to {pending_max}",
+        landed_at.map_or("never".to_owned(), |t| format!("{t:.2}"))
+    );
+    match landed_at {
+        Some(t) if t <= 0.5 => eprintln!("exit-land-check: PASS"),
+        _ => eprintln!(
+            "exit-land-check: FAIL {}",
+            game.scene
+                .player
+                .as_ref()
+                .map_or("no player".to_owned(), |p| p.landing_state())
+        ),
+    }
+}
+
 fn wreck_at_speed(game: &mut Game, tick: f32) {
     let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
         return;
