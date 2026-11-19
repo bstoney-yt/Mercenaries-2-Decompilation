@@ -136,6 +136,48 @@ impl BlastPush {
     /// hardest, tipping it away from the blast. The spin is that of a
     /// solid box (inferred: the 360 leaves it to its physics), about the
     /// level axis across the way it is pushed.
+    /// The five impulses it gives a moving rigid body (a vehicle, a
+    /// loose prop, debris) whose world box is `lo` to `hi`, each per kg of
+    /// the body's mass, and where each lands. `fudge` is the body's
+    /// `ExplosionFudge` (1 without one).
+    ///
+    /// From the 360 code (0x8215CBC8, read from its disassembly: VMX128
+    /// the decompiler can't follow), for each body not fixed (mass not
+    /// 0):
+    /// - Falloff: `max(1 - d / radius, LEAST_PUSH)`, `d` from the blast to
+    ///   the body (+0x228 radius, +0x230 least).
+    /// - Size share: [`PUSH_BY_SIZE`] for its box's volume, times
+    ///   `MaxForce` (+0x22C), the falloff, 0.004 (0x820F962C) and the fudge.
+    /// - Five impulses, `i` from 0 to 4, each `(1 + 0.25 i)` times that
+    ///   (0x820DABDC), times the body's mass (0x8262C120), along
+    ///   `(away.x, 1, away.z)`. `away` is the level unit from the blast to
+    ///   the body, or none if the blast is right under or over it.
+    /// - Each lands at the body's place across the ground, and at
+    ///   `0.5` (0x820D9EDC) of the box's height under it plus `0.25 i` of
+    ///   the height: bottom to top, the top pushed hardest, so it tips
+    ///   away (0x8216DD38, an impulse at a point).
+    ///
+    /// Inferred: the body's place is its box's middle.
+    pub fn rigid_pushes(&self, lo: Vec3, hi: Vec3, fudge: f32) -> [(Vec3, Vec3); 5] {
+        let centre = (lo + hi) * 0.5;
+        let d = self.at.clamp(lo, hi).distance(self.at);
+        let falloff = (1.0 - d / self.radius.max(0.01)).max(LEAST_PUSH);
+        let extent = hi - lo;
+        let size = extent.x * extent.y * extent.z;
+        let by_size = PUSH_BY_SIZE
+            .iter()
+            .find(|&&(most, _)| size < most)
+            .map_or(0.0, |&(_, k)| k);
+        let push = self.force * by_size * falloff * 0.004 * fudge;
+        let away = (centre - self.at).with_y(0.0).normalize_or_zero();
+        let bottom = centre.y - 0.5 * extent.y;
+        std::array::from_fn(|i| {
+            let step = 0.25 * i as f32;
+            let at = Vec3::new(centre.x, bottom + step * extent.y, centre.z);
+            ((away + Vec3::Y) * (push * (1.0 + step)), at)
+        })
+    }
+
     pub fn throw(&self, lo: Vec3, hi: Vec3, fudge: f32) -> (Vec3, Vec3) {
         let centre = (lo + hi) * 0.5;
         let d = self.at.clamp(lo, hi).distance(self.at);
@@ -738,7 +780,8 @@ pub const RAM_KIND: &str = "Car";
 /// event's amount is at least the float at 0x82DE887C, 2.0 in the image.
 /// The knockdown happens when the attacker is an object of kind 2, 3, 4,
 /// 8 or 10 (2 is `_CarPhysicsV2`, 10 the boats) and the person is not
-/// player-kind; it posts `KnockDown` (0x9C9F3F13) and sets the time down
+/// disguised (table 0x83657FA8, the disguise records) nor in a list at
+/// 0x82F13B80; it posts `KnockDown` (0x9C9F3F13) and sets the time down
 /// by 0x82423848 from 5.0 (the float at 0x820BAF84).
 ///
 /// **Inferred**: kinds 3, 4 and 8 read as the other vehicles (not
@@ -863,6 +906,36 @@ pub fn explosions(db: &Layer<'_>) -> HashMap<u32, Explosion> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The rigid push: five impulses bottom to top, 1 to 2 times as hard,
+    // adding up to the broken piece's throw; a 10 m³ car at the heart of
+    // a 500 push gets 0.5 x 500 x 0.004 = 1 a kg at its bottom, 2 at its
+    // top, 7.5 m/s out and 7.5 up in all.
+    #[test]
+    fn a_blast_pushes_a_body_five_times_up_its_height() {
+        let blast = BlastPush {
+            at: Vec3::new(-3.0, 0.5, 0.0),
+            radius: 20.0,
+            force: 500.0,
+        };
+        let (lo, hi) = (Vec3::new(-2.0, 0.0, -1.0), Vec3::new(2.0, 1.25, 1.0));
+        let pushes = blast.rigid_pushes(lo, hi, 1.0);
+        let d = 1.0f32;
+        let falloff = 1.0 - d / 20.0;
+        let k = 0.5 * 500.0 * 0.004 * falloff;
+        assert!((pushes[0].0 - Vec3::new(k, k, 0.0)).length() < 1e-4);
+        assert!((pushes[4].0 - Vec3::new(2.0 * k, 2.0 * k, 0.0)).length() < 1e-4);
+        assert_eq!(pushes[0].1, Vec3::new(0.0, 0.0, 0.0));
+        assert_eq!(pushes[4].1, Vec3::new(0.0, 1.25, 0.0));
+        let sum: Vec3 = pushes.iter().map(|p| p.0).sum();
+        assert!((sum - blast.throw(lo, hi, 1.0).0).length() < 1e-4);
+        // Right under it: straight up.
+        let under = BlastPush {
+            at: Vec3::new(0.0, -0.5, 0.0),
+            ..blast
+        };
+        assert_eq!(under.rigid_pushes(lo, hi, 1.0)[0].0.x, 0.0);
+    }
 
     // A blast falls off with the distance to none at its edge, but never
     // under its least within reach (`fx_Explosion_HugeOil`'s 400, 95, 8 m).

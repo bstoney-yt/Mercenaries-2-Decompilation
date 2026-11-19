@@ -1749,6 +1749,11 @@ struct VehicleBody {
     before: Vec3,
     /// Its spin before the last step, radians a second about each axis.
     spin_before: Vec3,
+    /// Its velocities as the last two steps began, newest first
+    /// (`None` before its first step), and how much its velocity changed
+    /// over that one 360 update ([`Physics::vehicle_jolt`]).
+    history: Option<[Vec3; 2]>,
+    jolt: f32,
     /// A boat's: it floats instead of rolling on wheels.
     hull: Option<Hull>,
     /// A helicopter's: it flies.
@@ -3709,6 +3714,11 @@ impl Physics {
                 .bodies
                 .get(v.controller.chassis)
                 .map_or(Vec3::ZERO, |b| vec3(b.angvel()));
+            // Its velocity's change over one 360 update (1/30 s: two of
+            // these steps).
+            let h = v.history.get_or_insert([v.before; 2]);
+            v.jolt = (v.before - h[1]).length();
+            *h = [v.before, h[0]];
             if v.held {
                 continue;
             }
@@ -4994,6 +5004,8 @@ impl Physics {
             held: false,
             before: Vec3::ZERO,
             spin_before: Vec3::ZERO,
+            history: None,
+            jolt: 0.0,
             hull,
             rotor,
         }));
@@ -6335,6 +6347,31 @@ impl Physics {
 
     /// A vehicle's velocity before the last step, m/s: what it hit things
     /// with (a crash stops it within the step).
+    /// How much vehicle `id`'s velocity changed over the last 360 update
+    /// (1/30 s, two of these steps), m/s: what its seats'
+    /// `TossSpeedChange` is measured against. From the 360 code: the car
+    /// physics' update (0x8218A138) keeps `|v - v_last|²` at +0x14C (v
+    /// from vfunc +0x4C, v_last at +0x140), which its vfunc +0x68
+    /// (0x82188A78) answers and the exit kind (0x822A2B60) tests.
+    pub fn vehicle_jolt(&self, id: VehicleId) -> f32 {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map_or(0.0, |v| v.jolt)
+    }
+
+    /// Vehicle `id`'s velocity one 360 update ago (the older of its
+    /// history's two, before any jolt [`vehicle_jolt`](Self::vehicle_jolt)
+    /// measures): the +0x140 the car physics keeps (0x8218A138), which its
+    /// crash ejection hands its riders.
+    pub fn vehicle_velocity_pre_jolt(&self, id: VehicleId) -> Vec3 {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .and_then(|v| v.history.map(|h| h[1]))
+            .unwrap_or(Vec3::ZERO)
+    }
+
     pub fn vehicle_velocity_before(&self, id: VehicleId) -> Vec3 {
         self.vehicles
             .get(id.0)
@@ -6364,6 +6401,21 @@ impl Physics {
     /// Sets a vehicle's velocity, m/s (as it was before something it hit
     /// gave way).
     pub fn set_vehicle_velocity(&mut self, id: VehicleId, velocity: Vec3) {
+        let Some(v) = self.vehicles.get_mut(id.0).and_then(Option::as_mut) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
+            body.set_linvel(vector(velocity), true);
+        }
+        // Set, not driven into: no jolt ([`Physics::vehicle_jolt`]).
+        v.history = None;
+        v.jolt = 0.0;
+    }
+
+    /// Holds a vehicle at `velocity`, m/s, keeping its velocity history:
+    /// a run-up for the offscreen checks, so a crash after it still counts
+    /// as a jolt ([`vehicle_jolt`](Self::vehicle_jolt)).
+    pub fn hold_vehicle_velocity(&mut self, id: VehicleId, velocity: Vec3) {
         let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
             return;
         };
@@ -6440,6 +6492,27 @@ impl Physics {
     /// boat alike, vtable +0x60 0x82182418) sums its bodies' masses, each
     /// one over its inverse mass (0x8262C120), and answers 0 at the first
     /// body whose inverse mass is 0.
+    /// The world box round vehicle `id`'s chassis body's collision (what
+    /// a blast's rigid push sizes it by: the 360 takes the box of the
+    /// Havok body it pushes, 0x82170500 in 0x8215CBC8).
+    pub fn vehicle_body_box(&self, id: VehicleId) -> Option<(Vec3, Vec3)> {
+        let v = self.vehicles.get(id.0)?.as_ref()?;
+        let body = self.world.bodies.get(v.controller.chassis)?;
+        let mut out: Option<r::Aabb> = None;
+        for &h in body.colliders() {
+            let Some(c) = self.world.colliders.get(h) else {
+                continue;
+            };
+            let a = c.compute_aabb();
+            out = Some(match out {
+                Some(o) => rapier3d::geometry::BoundingVolume::merged(&o, &a),
+                None => a,
+            });
+        }
+        let a = out?;
+        Some((vec3(a.mins), vec3(a.maxs)))
+    }
+
     pub fn vehicle_mass(&self, id: VehicleId) -> Option<f32> {
         let v = self.vehicles.get(id.0)?.as_ref()?;
         let hinge = v.hinge.as_ref();
@@ -6854,6 +6927,53 @@ impl Physics {
                 .map(|b| vec3(b.linvel()).length())
                 .fold(0.0, f32::max),
         )
+    }
+
+    /// Each limb's speed, m/s, and whether it touches anything (for
+    /// tracing what keeps a limp body from lying still).
+    /// What each touches: `v` a vehicle, `s` another limb of the same
+    /// body, `g` anything else (the ground, a wall), empty nothing.
+    pub fn ragdoll_limb_speeds(&self, id: RagdollId) -> Vec<(usize, f32, String)> {
+        let Some(doll) = self.ragdolls.get(id.0).and_then(Option::as_ref) else {
+            return Vec::new();
+        };
+        let chassis: Vec<_> = self
+            .vehicles
+            .iter()
+            .flatten()
+            .map(|v| v.controller.chassis)
+            .collect();
+        let own: Vec<_> = doll.bodies.iter().flatten().copied().collect();
+        doll.bodies
+            .iter()
+            .enumerate()
+            .filter_map(|(k, h)| {
+                let b = self.world.bodies.get((*h)?)?;
+                let mut what = String::new();
+                for &c in b.colliders() {
+                    for p in self.world.narrow_phase.contact_pairs_with(c) {
+                        if !p.has_any_active_contact() {
+                            continue;
+                        }
+                        let other = if p.collider1 == c {
+                            p.collider2
+                        } else {
+                            p.collider1
+                        };
+                        let parent = self.world.colliders.get(other).and_then(|o| o.parent());
+                        let tag = match parent {
+                            Some(q) if chassis.contains(&q) => 'v',
+                            Some(q) if own.contains(&q) => 's',
+                            _ => 'g',
+                        };
+                        if !what.contains(tag) {
+                            what.push(tag);
+                        }
+                    }
+                }
+                Some((k, vec3(b.linvel()).length(), what))
+            })
+            .collect()
     }
 
     /// Shoves every limb of a ragdoll by `velocity` (m/s).
@@ -7795,8 +7915,6 @@ mod tests {
         assert_eq!(ai_wobble(3.0, 0.6), [0.0; 3]);
     }
 
-    // 0x82153B30: a building, the ground or debris lets a road vehicle
-    // come out in its box; a prop there doesn't.
     #[test]
     fn a_spawn_box_is_kept_by_props_not_by_buildings() {
         let mut p = Physics::new();

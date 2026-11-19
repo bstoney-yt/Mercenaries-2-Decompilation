@@ -488,11 +488,51 @@ impl Game {
             combat.hp = hp;
         }
         combat.hero_damage = scene.hero_damage();
+        if let Some(t) = scene.hero_toss_getup() {
+            combat.toss_getup = t;
+        }
         if let Some(rifle) = scene.hero_rifle() {
             combat.take_own_rifle(rifle);
         }
         if let Some(arms) = scene.arms() {
             combat.arm(arms, scene.damage_table());
+        }
+        if let Some(w) = &scene.world {
+            let db = &w.index.template_db;
+            // Each effect template by name hash: its own `Explosive`, and
+            // each `PhysicalLink`'d template's (fx_Explosion_Large's
+            // `Explosion (RPG Frag)`), with the link's offset. From the
+            // 360 code: a template's object spawns its `PhysicalLink`s at
+            // its own transform with the link's (0x82408C30 -> 0x82409AA8).
+            let blast = |t: u32| {
+                db.explosions.get(&t).map(|e| m2_engine::weapons::Blast {
+                    template: t,
+                    radius: e.radius,
+                    damage: e.damage,
+                    min_damage: e.least,
+                    max_force: e.force,
+                    key: (e.kind != 0).then_some(e.kind),
+                })
+            };
+            combat.wreck_blasts = db
+                .names
+                .iter()
+                .filter_map(|(&t, name)| {
+                    let mut all: Vec<(Vec3, m2_engine::weapons::Blast)> =
+                        blast(t).map(|b| (Vec3::ZERO, b)).into_iter().collect();
+                    for l in db.links.get(&t).into_iter().flatten() {
+                        all.extend(blast(l.child).map(|b| (l.offset, b)));
+                    }
+                    (!all.is_empty()).then(|| (m2_assets::name_hash(name), all))
+                })
+                .collect();
+            combat.blast_effects = db
+                .explosions
+                .iter()
+                .filter_map(|(t, e)| {
+                    Some((m2_assets::name_hash(db.names.get(t)?), (e.radius, e.force)))
+                })
+                .collect();
         }
         combat.particle_table = scene.particle_table();
         own_explosives(&mut combat, scene.hero_explosives());
@@ -2184,6 +2224,25 @@ impl Game {
                     "cargo: {e:#x} comes off the {} at {at:.1}, it going {speed:.1} m/s",
                     v.spec.label
                 );
+            }
+            // A crash throws her off the seat she rides, no exit pressed
+            // (0x8218A138's rider loop: its velocity changed by more than
+            // her seat's `TossSpeedChange` in one update; Xenia: a Chopper
+            // stopping from 19.4 m/s, |dv| 18.34 then 21.08 m/s).
+            if let Some(player) = &mut self.scene.player
+                && let Some(i) = player.driving
+                && let Some(v) = self.scene.vehicles.get(i)
+            {
+                let seat = self.ride.filter(|r| r.0 == i).map(|r| r.1);
+                let jolt = v.id.map_or(0.0, |id| world.physics.vehicle_jolt(id));
+                if her_seat_of(v, seat).is_some_and(|s| s.tosses_at(jolt)) {
+                    eprintln!(
+                        "toss: the {} lurches {jolt:.1} m/s in an update: she is thrown off",
+                        v.spec.label
+                    );
+                    get_out(&world.physics, v, seat, player);
+                    self.ride = None;
+                }
             }
             // Vehicles running into each other hurt each other and the
             // parts where they met.
@@ -6298,6 +6357,16 @@ const WADE: f32 = 1.4;
 /// the hull by the door when the way there is blocked (Invented stand-in
 /// for 0x822A13D0's clear point) or the hardpoint lies within the hull (a
 /// boat's driver gets out at the seat itself).
+/// Her seat in `v` (its `SeatLink` name `her_seat`; `None`, the
+/// driver's), as [`exit_plan`] finds it.
+fn her_seat_of(v: &ParkedVehicle, her_seat: Option<u32>) -> Option<&m2_engine::seats::Seat> {
+    let seating = v.spec.seating.as_deref()?;
+    let index = her_seat
+        .and_then(|n| seating.seat(n))
+        .or_else(|| seating.driver())?;
+    seating.seats.get(index)
+}
+
 fn exit_plan(
     physics: &Physics,
     v: &ParkedVehicle,
@@ -6311,26 +6380,16 @@ fn exit_plan(
     let index = seating.and_then(|s| her_seat.and_then(|n| s.seat(n)).or_else(|| s.driver()));
     let seat = seating.zip(index).map(|(s, i)| &s.seats[i]);
     let exit = seating.zip(index).and_then(|(s, i)| s.exit_of(i));
-    let local = exit
-        .and_then(|e| v.spec.entrance_at(e.name))
-        .map(|p| Vec3::new(p.x, 0.0, p.z));
-    let (lo, hi) = v.spec.bounds;
-    let local = local.filter(|p| !(lo.x..=hi.x).contains(&p.x) || !(lo.z..=hi.z).contains(&p.z));
-    let place = local.map(|p| at.transform_point3(p));
-    // The 360 sweeps her capsule (0.4 m, 0.6 to 1.8 m up) from her seat to
-    // the hardpoint (0x8229AC90); here one ray at 1.2 m.
-    let blocked = place.zip(v.id).is_some_and(|(to, id)| {
-        let from = at.transform_point3(v.spec.seat.unwrap_or(Vec3::ZERO)) + Vec3::Y * 1.2;
-        let way = to + Vec3::Y * 1.2 - from;
-        physics.cast_ray_past(from, way, way.length(), id).is_some()
-    });
+    let (place, blocked) = exit_way(physics, v, her_seat, at);
     let up_y = at.transform_vector3(Vec3::Y).normalize_or_zero().y;
     // A helicopter's landed share is not modelled: it counts as landed
     // (Invented; 0x822A2B60 ditches from one in the air).
+    let jolt = v.id.map_or(0.0, |id| physics.vehicle_jolt(id));
     let kind = seats::exit_kind(
         seat,
         exit.map(|e| &e.params),
         velocity.length(),
+        jolt,
         false,
         up_y,
         blocked,
@@ -6340,6 +6399,89 @@ fn exit_plan(
         (_, Some(p)) => p,
     };
     (kind, place)
+}
+
+/// Her way out of `v` (standing at `at`) from `her_seat` (else the
+/// driver's): the exit point by its entrance, if it lies outside the hull,
+/// and whether the way there is blocked. The 360 sweeps her capsule (0.4
+/// m, 0.6 to 1.8 m up) from her seat to the hardpoint (0x8229AC90); here
+/// one ray at 1.2 m.
+fn exit_way(
+    physics: &Physics,
+    v: &ParkedVehicle,
+    her_seat: Option<u32>,
+    at: Mat4,
+) -> (Option<Vec3>, bool) {
+    let seating = v.spec.seating.as_deref();
+    let index = seating.and_then(|s| her_seat.and_then(|n| s.seat(n)).or_else(|| s.driver()));
+    let exit = seating.zip(index).and_then(|(s, i)| s.exit_of(i));
+    let local = exit
+        .and_then(|e| v.spec.entrance_at(e.name))
+        .map(|p| Vec3::new(p.x, 0.0, p.z));
+    let (lo, hi) = v.spec.bounds;
+    let local = local.filter(|p| !(lo.x..=hi.x).contains(&p.x) || !(lo.z..=hi.z).contains(&p.z));
+    let place = local.map(|p| at.transform_point3(p));
+    let blocked = place.zip(v.id).is_some_and(|(to, id)| {
+        let from = at.transform_point3(v.spec.seat.unwrap_or(Vec3::ZERO)) + Vec3::Y * 1.2;
+        let way = to + Vec3::Y * 1.2 - from;
+        physics.cast_ray_past(from, way, way.length(), id).is_some()
+    });
+    (place, blocked)
+}
+
+/// The launch her ragdoll takes out of a vehicle that died under her, m/s,
+/// level, away from it (0x82428EA0: 0x82DE889C 10.0 for the player, at
+/// the angle 0x82DE88A0, 0.0).
+pub const DEATH_EXIT_LAUNCH: f32 = 10.0;
+/// How long she is held down after that exit, seconds (0x822A2178 sets
+/// her record's +0x38 from 0x82423848(3.0, …); that it is her time down
+/// is inferred).
+pub const DEATH_EXIT_DOWN: f32 = 3.0;
+
+/// Out of `v`, which died under her: the 360's death exit (exit 4,
+/// 0x822A2178, chosen by 0x822A2B60 for the death message's mode 3,
+/// posted by 0x82205BE0). She is put at her seat's own place when her way
+/// out is clear, else out at a clear point (0x8229AC90 blocked:
+/// 0x822A13D0); no velocity. Her ragdoll is to start with
+/// [`death_launch`]. Returns the vehicle's origin, or `None` if it isn't
+/// placed.
+pub(crate) fn death_exit(
+    physics: &Physics,
+    v: &ParkedVehicle,
+    player: &mut Player,
+) -> Option<Vec3> {
+    let id = v.id?;
+    let at = physics.vehicle_transform(id).filter(|m| m.is_finite())?;
+    let (_, blocked) = exit_way(physics, v, None, at);
+    let place = if blocked {
+        door_out(at, &v.spec)
+    } else {
+        at.transform_point3(v.spec.seat.unwrap_or(Vec3::ZERO))
+    };
+    player.step_out_at(place);
+    player.character.velocity = Vec3::ZERO;
+    player.driving = None;
+    player.chase_target = None;
+    player.seated = false;
+    player.seat_frame = None;
+    eprintln!(
+        "exit: {} death exit at {place:.2} ({})",
+        v.spec.label,
+        if blocked {
+            "way blocked: put out clear"
+        } else {
+            "at her seat"
+        }
+    );
+    Some(at.transform_point3(Vec3::ZERO))
+}
+
+/// Her ragdoll's launch out of a vehicle that died with its origin at
+/// `vehicle`, she at `her`: [`DEATH_EXIT_LAUNCH`] level, from it to her
+/// (0x82428EA0); straight along +Z if she is right over it.
+pub fn death_launch(vehicle: Vec3, her: Vec3) -> Vec3 {
+    let away = Vec3::new(her.x - vehicle.x, 0.0, her.z - vehicle.z).normalize_or(Vec3::Z);
+    away * DEATH_EXIT_LAUNCH
 }
 
 /// Whether `v`, standing at `at`, is a boat afloat: its origin (its
@@ -6426,7 +6568,23 @@ pub(crate) fn get_out(
         use m2_engine::seats::ExitKind;
         let velocity = physics.vehicle_velocity(id);
         let (kind, place) = exit_plan(physics, v, seat, at, velocity);
-        if matches!(kind, ExitKind::Ditch | ExitKind::Toss) {
+        // Tossed, she is knocked down ([`crate::combat::Combat`] takes
+        // it up: 0x822A1B70 sets her time down from `TossGetupSeconds`).
+        player.tossed = kind == ExitKind::Toss;
+        if kind == ExitKind::Toss {
+            // 0x822A1B70's toss only places her: half a metre along the
+            // vehicle's up (FUN_82855F48, its up axis, times 0x82B7C128).
+            // The exit message carries the vehicle's velocity before the
+            // jolt (0x8218A138), and her ragdoll starts with the launch
+            // the controller makes of it (0x82428658).
+            let up = at.transform_vector3(Vec3::Y).normalize_or(Vec3::Y);
+            player.drop_at(place + up * 0.5);
+            player.character.velocity = Vec3::ZERO;
+            let carried = physics.vehicle_velocity_pre_jolt(id);
+            let launch = m2_engine::ragdoll_launch::exit_launch(carried);
+            player.launch = Some(launch);
+            player.last_toss = Some((carried, launch));
+        } else if kind == ExitKind::Ditch {
             // Ditching (0x822A1B70): half a metre over the exit's place,
             // pushed off, in the air: she lands as from a jump.
             let out = place - at.transform_point3(Vec3::ZERO);
@@ -6558,6 +6716,15 @@ fn switch_weapon(
 
 #[cfg(test)]
 mod tests {
+
+    // Out of a vehicle that died under her: 10 m/s level, from its origin
+    // to her (0x82428EA0); straight along +Z right over it.
+    #[test]
+    fn a_death_exit_launches_her_level_away_from_the_vehicle() {
+        let v = death_launch(Vec3::new(1.0, 5.0, 1.0), Vec3::new(4.0, 7.0, 5.0));
+        assert!((v - Vec3::new(6.0, 0.0, 8.0)).length() < 1e-4, "{v}");
+        assert_eq!(death_launch(Vec3::ZERO, Vec3::Y * 2.0), Vec3::Z * 10.0);
+    }
     use std::collections::HashMap;
 
     #[test]
