@@ -7619,6 +7619,18 @@ fn drive_for_screenshot(
 ) -> anyhow::Result<()> {
     game.combat.homing_check = options.homing_check;
     game.scene.props.bodies_on = options.prop_bodies_check;
+    if options.prop_bodies_check
+        && let Some(w) = game.scene.world.as_mut()
+    {
+        // The island's placed objects that come loose whole (the café
+        // chairs, barricades and planters of a town are these, not a
+        // state layer's props): bodies too, those standing already now.
+        let made = w.make_bodies();
+        eprintln!(
+            "prop-bodies-check: she is at {:.0}; {made} placed objects standing became bodies",
+            game.focus()
+        );
+    }
     let tick = TICK.as_secs_f32();
     let started = Instant::now();
     loop {
@@ -12692,13 +12704,28 @@ fn prop_bodies_check(
         return Ok(());
     };
     let physics = &world.physics;
-    let bodies: Vec<(u32, Vec<m2_engine::DebrisId>)> = game
+    // A state layer's props and the island's placed objects alike (the
+    // latter by object index, marked with the top bit).
+    let mut bodies: Vec<(u32, Vec<m2_engine::DebrisId>)> = game
         .scene
         .props
         .as_bodies()
         .map(|(e, ids)| (e, ids.to_vec()))
         .collect();
+    let props_bodies = bodies.len();
+    bodies.extend(
+        world
+            .as_bodies()
+            .map(|(i, ids)| (i as u32 | 0x8000_0000, ids.to_vec())),
+    );
     let pieces: usize = bodies.iter().map(|b| b.1.len()).sum();
+    eprintln!(
+        "prop-bodies-check: at {:.0}: {} props shown, {props_bodies} of them bodies; {} placed \
+         objects bodies",
+        game.focus(),
+        game.scene.props.shown().count(),
+        bodies.len() - props_bodies
+    );
     let awake = physics.debris_awake();
     let (median, worst) = (
         ms.get(ms.len() / 2).copied().unwrap_or(0.0),
