@@ -98,6 +98,7 @@ mod multiply;
 mod npc;
 mod pad;
 mod padtable;
+mod paradrop_check;
 mod particles;
 mod path_hints;
 mod paths;
@@ -316,6 +317,9 @@ struct Options {
     fire: bool,
     /// `--homing-check`: her vehicle is seen by every homing weapon.
     homing_check: bool,
+    /// `--paradrop-check`: with `--mission`, the Allied paradrop plane is
+    /// put 100 m over her and its drop followed to PASS or FAIL.
+    paradrop_check: bool,
     /// `--gravity-check`: measure the physics world's gravity ([`gravity_check`]).
     gravity_check: bool,
     /// `--ditch-check`: (turns on --drive) out of her car at 18 m/s and
@@ -1163,6 +1167,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--take" => o.take = true,
             "--fire" => o.fire = true,
             "--homing-check" => o.homing_check = true,
+            "--paradrop-check" => o.paradrop_check = true,
             "--ditch-check" => {
                 o.ditch_check = true;
                 o.drive = true;
@@ -4950,7 +4955,8 @@ fn mission_for_screenshot(
         .with_skip_to(options.skip_to.clone())
         .with_job_near(options.job_near)
         .with_mine_check(options.mine_check)
-        .with_object_sound_check(options.object_sound_check);
+        .with_object_sound_check(options.object_sound_check)
+        .with_paradrop_check(options.paradrop_check);
     link.check_node_damage = options.check_node_damage;
     link.check_building_damage = options.check_building_damage;
     if options.part_destroy_check {
