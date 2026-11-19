@@ -462,6 +462,9 @@ struct Options {
     /// the scripts, each part's `DestroyMsg` through its state machine
     /// ([`mission::PartDestroyCheck`]).
     part_destroy_check: bool,
+    /// `--sat-blip-check`: the satellite bomb's radar square on and off by
+    /// the game's own scripts ([`mission::SatBlipCheck`]).
+    sat_blip_check: bool,
     /// `--check-shots <s>,<s>...` with `--screenshot` on foot: the scene
     /// is pictured at those seconds in too (`<out>-at<s>.ppm`).
     check_shots: Vec<f32>,
@@ -1141,6 +1144,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
             "--part-destroy-check" => {
                 o.part_destroy_check = true;
+                o.mission = true;
+            }
+            "--sat-blip-check" => {
+                o.sat_blip_check = true;
                 o.mission = true;
             }
             "--check-building-damage" => {
@@ -4671,6 +4678,9 @@ fn mission_for_screenshot(
     if options.part_destroy_check {
         link.part_destroy_check = Some(mission::PartDestroyCheck::default());
     }
+    if options.sat_blip_check {
+        link.sat_blip_check = Some(mission::SatBlipCheck::default());
+    }
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
@@ -6320,6 +6330,9 @@ fn mission_for_screenshot(
     // A `--part-destroy-check` that never passed or failed fails here,
     // naming the step it was waiting on.
     if let Some(c) = link.part_destroy_check.as_mut() {
+        c.finish();
+    }
+    if let Some(c) = link.sat_blip_check.as_mut() {
         c.finish();
     }
     if auto.is_some() {
