@@ -1358,6 +1358,10 @@ struct PickupEventCheck {
     laid: usize,
     next: f32,
     done: bool,
+    /// The last of the scripts' HUD calls looked at, and whether one was
+    /// the PDA's `UpdateSupport` (the laptop's `PickupMunitions`).
+    seen: u64,
+    support: bool,
 }
 
 /// The crate the check's pickups say they came from (not one of the
@@ -1399,11 +1403,21 @@ impl PickupEventCheck {
         );
     }
 
-    fn tick(&mut self, game: &mut Game, dt: f32) {
+    fn tick(&mut self, game: &mut Game, link: &mission::MissionLink, dt: f32) {
         if self.done {
             return;
         }
         self.t += dt;
+        for c in link.hud_calls_after(self.seen) {
+            if c.seq <= self.seen {
+                continue;
+            }
+            self.seen = c.seq;
+            if c.group == "PdaWidget" && c.method == "UpdateSupport" {
+                self.support = true;
+                eprintln!("pickup-event-check: pda call UpdateSupport {:?}", c.data);
+            }
+        }
         // Seated (the mission's start has her in its speed boat): she is
         // put on foot on land at the default spawn, once, for the check.
         if self.t >= 10.0
@@ -1503,10 +1517,11 @@ impl PickupEventCheck {
         }
         if self.laid > PICKUP_CHECK_ITEMS.len() && self.t >= self.next {
             let left = lying(game);
-            if left == 0 {
+            // All taken, and the laptop's script has called the PDA.
+            if left == 0 && self.support {
                 self.done = true;
                 eprintln!(
-                    "pickup-event-check: PASS {n} of {n} taken (each with its WeaponEvent line), the last ammunition for her full rifle",
+                    "pickup-event-check: PASS {n} of {n} taken (each with its WeaponEvent line), the last ammunition for her full rifle,                      and the laptop's script called the PDA's UpdateSupport",
                     n = PICKUP_CHECK_ITEMS.len() + 1
                 );
             } else if self.ammo_none {
@@ -1516,7 +1531,14 @@ impl PickupEventCheck {
                 );
             } else if self.t >= self.next + 20.0 {
                 self.done = true;
-                eprintln!("pickup-event-check: FAIL {left} still lying after 20 s");
+                if left > 0 {
+                    eprintln!("pickup-event-check: FAIL {left} still lying after 20 s");
+                } else {
+                    eprintln!(
+                        "pickup-event-check: FAIL all taken, but no pda call UpdateSupport in 20 s \
+                         (the laptop's PickupMunitions never ran)"
+                    );
+                }
             }
         }
     }
@@ -5152,7 +5174,7 @@ fn mission_for_screenshot(
         };
         lap.mark("loop: autoplay and what it reads");
         if let Some(c) = &mut pickup_check {
-            c.tick(game, tick);
+            c.tick(game, &link, tick);
         }
         if let Some(hp) = options.hurt
             && i == (HURT_AT / tick).round() as u32
