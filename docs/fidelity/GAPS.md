@@ -42,7 +42,7 @@ available, (6) Correction, (7) Verification and (8) Risk.
 | [A8](#a8) | Decoder residuals: wavelet seam steps on 14 clips, unknown header fields | Visual | P3 | Data, Ghidra |
 | [P5](#p5) | Collision materials: friction and restitution per surface not read | Behavioral | P3 | Data, Ghidra |
 | [P6](#p6) | Projectile guidance law, drag and range not established from code | Behavioral | P3 | Ghidra |
-| [P7](#p7) | Props as bodies: the fake-prop mass changer, prop-to-prop and prop-to-person contacts, island objects not yet bodies | Behavioral | P2 | Ghidra, footage |
+| [P7](#p7) | Props as bodies: the fake-prop mass changer, prop-to-prop and prop-to-person contacts, crash rules on island objects' bodies | Behavioral | P2 | Ghidra, footage |
 | [I1](#i1) | Layer `Anchor` component not ported: anchor distances and threat-release bits unread | Behavioral | P2 | Ghidra, data |
 | [U6](#u6) | Flash text: one color per field, no kerning, HTML reduced to `<font color>` | Visual | P3 | Data census |
 | [M4](#m4) | Swimming depths, float height, speed and stroke rate invented | Animation/movement | P3 | Footage, Ghidra |
@@ -677,11 +677,11 @@ P2
      - the mass changer: a body prop is felt at its full mass;
      - prop body against prop body: knocked pieces still pass through each other and through body props;
      - prop body against people;
-     - the island's placed objects, which stay fixed until knocked, with #676's felt-mass and spin give-back standing in for Havok there.
+     - the crash rules on the island's placed objects' bodies: they are bodies of their own (#740, as the 360's base-layer `_PropPhysics` entities through 0x823E6AB8 -> 0x82408C30 -> 0x823FD338 -> 0x821831B0) and are pushed by vehicles and blasts, but `Destruction::crash_body` takes only props' bodies yet; #676's felt-mass and spin give-back still stand in `run_into` for island objects that are not bodies (those that break apart).
 3. **Difference:** Not measured in game yet. Expected: light fake props push a vehicle harder than on the 360 (full mass); piles of knocked pieces don't stack.
-4. **Likely cause:** The mass changer is a Havok contact modifier with no Rapier equivalent wired in. Island objects aren't props.
+4. **Likely cause:** The mass changer is a Havok contact modifier with no Rapier equivalent wired in. Island objects' bodies have no crash path of their own yet.
 5. **Evidence:** 360 code as listed. Bench: `propbench town` (#739/#740), 0 awake at rest, about 0.07 ms a step while still. Checks: `--prop-bodies-check`, `--prop-limits-check`.
-6. **Correction:** Add a contact-modification hook that scales the vehicle's side by `min(1, m_prop / m_vehicle x ratio)` for fake props. Let debris meet debris once pieces start apart. Make the island's loose objects bodies, then drop #676's corrections.
+6. **Correction:** Add a contact-modification hook that scales the vehicle's side by `min(1, m_prop / m_vehicle x ratio)` for fake props. Let debris meet debris once pieces start apart. Give island objects' bodies the crash rules, then drop #676's corrections.
 7. **Verification:** `--prop-bodies-check` and `--prop-limits-check` in a town (`--spawn 2800,-1100`), `--cargo-check` at OilCon020 (goods that came in as bodies must ride), `--wreck-blast-check` (blasts push body props), and Xenia drives into café furniture against the port's speed loss.
 8. **Risk:** Medium. Every prop that comes loose is now a body: watch frame time in dense towns, and goods on load beds.
 
