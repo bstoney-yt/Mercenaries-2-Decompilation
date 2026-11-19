@@ -8250,7 +8250,16 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 /// (its delay 0), held 3 s, if one is loaded (else skipped, said so).
 /// Each passes when it has sunk and she is no
 /// longer in it while it stays whole (not wrecked), logging what she
-/// lost (Xenia: 100). One line `sink-check: PASS` or `FAIL ...` at the end.
+/// lost. The car passes only near Xenia's ([`SINK_XENIA`], within
+/// [`SINK_SLACK`]): put out 5.8 s after it went in, 100.4 lost, the car
+/// alive. One line `sink-check: PASS` or `FAIL ...` at the end.
+/// Xenia's car sinking with her at the wheel (`sinking.md`, run sink1:
+/// Mattias 120 of 120, the Phoenix): put out 5.8 s after it went in,
+/// 100.4 of her health lost.
+const SINK_XENIA: (f32, f32) = (5.8, 100.4);
+/// How near Xenia's the car's put-out must come: seconds, health.
+const SINK_SLACK: (f32, f32) = (0.6, 1.0);
+
 fn sink_check(game: &mut Game, tick: f32) {
     use m2_math::glam::Vec3;
     let mut fails: Vec<String> = Vec::new();
@@ -8306,6 +8315,9 @@ fn sink_check(game: &mut Game, tick: f32) {
         let ticks = ((after + extra) / tick) as u32;
         let every = ((1.0 / tick) as u32).max(1);
         let mut sunk_at = None;
+        // As Xenia's run (Mattias, 120 of 120): her whole health 120, so
+        // the loss isn't cut by a lower whole.
+        game.combat.max_hp = 120.0;
         game.combat.hp = 120.0;
         let mut lost = 0.0;
         for t in 0..ticks {
@@ -8332,8 +8344,17 @@ fn sink_check(game: &mut Game, tick: f32) {
             Some(s) if out && game.scene.vehicles[i].wrecked => fails.push(format!(
                 "{kind} sank at {s:.1} s but was wrecked (the 360's stays whole)"
             )),
+            Some(s) if out && !heli && (lost - SINK_XENIA.1).abs() > SINK_SLACK.1 => {
+                fails.push(format!(
+                    "{kind} sank at {s:.1} s, she is out but lost {lost:.1} (Xenia {})",
+                    SINK_XENIA.1
+                ))
+            }
+            Some(s) if out && !heli && (s - SINK_XENIA.0).abs() > SINK_SLACK.0 => fails.push(
+                format!("{kind} put her out at {s:.1} s (Xenia {} s)", SINK_XENIA.0),
+            ),
             Some(s) if out => passed.push(format!(
-                "{kind} sank at {s:.1} s whole, she is out, {lost:.0} of her health lost"
+                "{kind} sank at {s:.1} s whole, she is out, {lost:.1} of her health lost"
             )),
             Some(s) => fails.push(format!("{kind} sank at {s:.1} s but she is still in it")),
             None => fails.push(format!("{kind} did not sink in {:.0} s", after + extra)),
