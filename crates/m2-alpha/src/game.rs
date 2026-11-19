@@ -2560,7 +2560,7 @@ impl Game {
             let chosen_key = chosen.map(crate::flights::Pickup::key);
             let near = chosen.map(|p| {
                 let refill = crate::mission::refill(templates, &self.combat, &p.what);
-                let usable = usable_pickup(templates, &self.combat, &p.what, refill);
+                let usable = usable_pickup(templates, &p.what, refill);
                 let offer = crate::mission::offer(templates, &self.combat, &p.what);
                 // Each pickup she stands at and leaves lying, once, with
                 // why: what each record would go to and its room.
@@ -6248,7 +6248,7 @@ fn would_leave(
     p: &crate::flights::Pickup,
 ) -> u8 {
     let refill = crate::mission::refill(templates, combat, &p.what);
-    let usable = usable_pickup(templates, combat, &p.what, refill);
+    let usable = usable_pickup(templates, &p.what, refill);
     let offer = crate::mission::offer(templates, combat, &p.what);
     u8::from(!usable && offer != crate::mission::Offer::Equip)
 }
@@ -6257,12 +6257,12 @@ fn would_leave(
 /// From the 360 code (0x8228F5E8, the pickup's records by `Type`): one
 /// with no ammunition record (`Type` 1) is always taken (health, as much
 /// as there is room for; a munitions laptop, `Type` 0, whose script is
-/// then told); money always; one with ammunition records when a weapon of
-/// hers takes one and she has room (the room is the port's own: the 360
-/// takes it whenever one of hers matches).
+/// then told); money always; one with ammunition records whenever a
+/// weapon of hers takes one of them, full or not (each record to the
+/// first of her weapons that takes it, 0x82285C98, topping it up as far as
+/// it goes).
 fn usable_pickup(
     templates: &m2_engine::Templates,
-    combat: &Combat,
     what: &crate::flights::Leaves,
     refill: crate::combat::Refill,
 ) -> bool {
@@ -6271,7 +6271,11 @@ fn usable_pickup(
         .pickups
         .get(&what.template)
         .is_some_and(|t| t.walked.is_empty() && t.kind != m2_engine::pickup::EQUIPMENT);
-    what.is_money() || (no_ammo && what.weapon.is_none()) || combat.can_use(refill, what.health)
+    let matches = refill.rifle > 0 || refill.launcher > 0 || refill.grenades > 0;
+    let health_only = no_ammo && what.weapon.is_none();
+    // A pickup with ammunition records is taken only so, its health
+    // records or not (0x8228F5E8 counts a `Type` 1 match alone).
+    what.is_money() || health_only || matches
 }
 
 /// What a press of the weapon switch picks.
@@ -6459,7 +6463,6 @@ mod tests {
             .leavings
             .pickups
             .insert(2, info(AMMUNITION, vec![(0x8000_844c, 1)]));
-        let combat = Combat::default();
         let laptop = crate::flights::Leaves {
             template: 1,
             health: 1.0,
@@ -6470,8 +6473,15 @@ mod tests {
             ..Default::default()
         };
         let none = crate::combat::Refill::default();
-        assert!(usable_pickup(&templates, &combat, &laptop, none));
-        assert!(!usable_pickup(&templates, &combat, &coilgun_ammo, none));
+        assert!(usable_pickup(&templates, &laptop, none));
+        assert!(!usable_pickup(&templates, &coilgun_ammo, none));
+        // Ammunition a weapon of hers takes is taken whether or not she has
+        // room for it (0x8228F5E8 -> 0x82285C98: no room test).
+        let full = crate::combat::Refill {
+            rifle: 30,
+            ..Default::default()
+        };
+        assert!(usable_pickup(&templates, &coilgun_ammo, full));
     }
 
     #[test]

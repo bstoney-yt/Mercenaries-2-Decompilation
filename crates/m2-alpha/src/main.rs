@@ -1352,6 +1352,9 @@ struct PickupEventCheck {
     t: f32,
     /// She was taken out of the vehicle the mission seated her in.
     put_ashore: bool,
+    /// No pickup carries her rifle's rounds (the full-rifle case can't be
+    /// laid).
+    ammo_none: bool,
     laid: usize,
     next: f32,
     done: bool,
@@ -1387,7 +1390,7 @@ impl PickupEventCheck {
             format!(
                 "{} of {} laid, {lying} still lying",
                 self.laid,
-                PICKUP_CHECK_ITEMS.len()
+                PICKUP_CHECK_ITEMS.len() + 1
             )
         };
         eprintln!(
@@ -1456,13 +1459,60 @@ impl PickupEventCheck {
             self.next = self.t + 4.0;
             return;
         }
+        // Then ammunition for her rifle, her rifle full: walked over, it is
+        // taken all the same (the 360 takes ammunition whenever a weapon of
+        // hers matches, 0x8228F5E8 -> 0x82285C98).
         if self.laid == PICKUP_CHECK_ITEMS.len() && self.t >= self.next {
+            self.laid += 1;
+            self.next = self.t + 4.0;
+            let Some(world) = game.scene.world.as_ref() else {
+                return;
+            };
+            let db = &world.index.template_db;
+            let mut ids: Vec<u32> = db.leavings.pickups.keys().copied().collect();
+            ids.sort_unstable();
+            let pick = ids.into_iter().find_map(|id| {
+                let what = mission::pickup(db, id)?;
+                let rifle = mission::refill(db, &game.combat, &what).rifle;
+                (rifle > 0
+                    && what.weapon.is_none()
+                    && !what.is_money()
+                    && mission::offer(db, &game.combat, &what) == mission::Offer::Walk)
+                    .then_some((id, what))
+            });
+            let Some((id, what)) = pick else {
+                eprintln!("pickup-event-check: no walked-over pickup carries her rifle's rounds");
+                self.ammo_none = true;
+                return;
+            };
+            let full = game.combat.rifle.spare;
+            game.combat.rifle_rounds.stored = full;
+            let at = game.focus();
+            eprintln!(
+                "pickup-event-check: {} ({id:#x}) laid at her feet at {at:.1}, her {} full ({full} spare)",
+                db.names.get(&id).map_or("?", String::as_str),
+                game.combat.rifle.name
+            );
+            game.scene.flights.leave(flights::Pickup {
+                from: PICKUP_CHECK_CRATE,
+                what,
+                at,
+                yaw: 0.0,
+            });
+            return;
+        }
+        if self.laid > PICKUP_CHECK_ITEMS.len() && self.t >= self.next {
             let left = lying(game);
             if left == 0 {
                 self.done = true;
                 eprintln!(
-                    "pickup-event-check: PASS {n} of {n} taken (each with its WeaponEvent line)",
-                    n = PICKUP_CHECK_ITEMS.len()
+                    "pickup-event-check: PASS {n} of {n} taken (each with its WeaponEvent line), the last ammunition for her full rifle",
+                    n = PICKUP_CHECK_ITEMS.len() + 1
+                );
+            } else if self.ammo_none {
+                self.done = true;
+                eprintln!(
+                    "pickup-event-check: FAIL no walked-over pickup carries her rifle's rounds"
                 );
             } else if self.t >= self.next + 20.0 {
                 self.done = true;
