@@ -600,7 +600,11 @@ pub struct World {
     pub bodies_on: bool,
     /// Those that are ([`bodies_on`](Self::bodies_on)): their bodies are
     /// their [`knocked`](Self::knocked) pieces.
-    as_body: HashSet<usize>,
+    as_body: std::collections::BTreeSet<usize>,
+    /// Placed objects whose models came in this update that are to be put
+    /// up as bodies of their own, made at the update's end in object
+    /// order ([`raise_bodies`](Self::raise_bodies)).
+    to_raise: std::collections::BTreeSet<usize>,
     pub index: Arc<WorldIndex>,
     pub settings: WorldSettings,
     loader: Loader,
@@ -820,7 +824,8 @@ impl World {
             loose: HashMap::new(),
             knocked: FastMap::default(),
             bodies_on: true,
-            as_body: HashSet::new(),
+            as_body: std::collections::BTreeSet::new(),
+            to_raise: std::collections::BTreeSet::new(),
             taken: FastSet::default(),
             felled: HashSet::new(),
             member_of: HashMap::new(),
@@ -921,37 +926,61 @@ impl World {
     /// models load). Returns how many.
     pub fn make_bodies(&mut self) -> usize {
         self.bodies_on = true;
-        let mut made = 0;
-        let models: Vec<(u32, Arc<Loose>)> = self
+        let models = self
             .loose
             .iter()
             .filter(|(_, l)| !l.breaks && !l.pieces.is_empty())
-            .map(|(&h, l)| (h, l.clone()))
+            .map(|(h, _)| h);
+        let standing: Vec<usize> = in_object_order(models, &self.by_model)
+            .into_iter()
+            .filter(|&i| self.physics.has_static(StaticKey::Object(i)))
             .collect();
-        for (hash, l) in models {
-            let objects: Vec<usize> = self.by_model.get(&hash).cloned().unwrap_or_default();
-            for i in objects {
-                if self.taken.contains(&i)
-                    || self.destroyed.contains(&i)
-                    || self.knocked.contains_key(&i)
-                    || !self.physics.has_static(StaticKey::Object(i))
-                {
-                    continue;
-                }
-                let o = self.index.objects[i];
-                let at = Mat4::from_rotation_translation(o.rotation, o.position);
-                self.remove_object_static(i);
-                let pieces: Vec<_> = l
-                    .pieces
-                    .iter()
-                    .zip(l.starts(at))
-                    .map(|(piece, start)| self.physics.add_prop_body(piece, start, true))
-                    .collect();
-                self.physics.group_debris(&pieces, at);
-                self.knocked.insert(i, pieces);
-                self.as_body.insert(i);
-                made += 1;
+        self.raise_bodies(standing)
+    }
+
+    /// Puts placed objects `objects` up as sleeping bodies of their own
+    /// where they stand, in the order given, their fixed collision (if
+    /// up) taken down: those not taken, destroyed or knocked loose whose
+    /// model comes loose whole. Returns how many.
+    ///
+    /// Port infrastructure, not the game's behaviour: the bodies are made
+    /// in object order so that their physics handles, and with them the
+    /// solver's order, are the same in every run from the same start
+    /// (the standing ones' order came from a `HashMap`'s per-process seed,
+    /// and those streamed in from the loader threads' timing: q740f and
+    /// q740g, the same start, shoved a prop 0.0 and 1.0 m).
+    fn raise_bodies(&mut self, objects: impl IntoIterator<Item = usize>) -> usize {
+        let mut made = 0;
+        for i in objects {
+            if self.taken.contains(&i)
+                || self.destroyed.contains(&i)
+                || self.knocked.contains_key(&i)
+            {
+                continue;
             }
+            let o = self.index.objects[i];
+            let Some(l) = self
+                .loose
+                .get(&o.model)
+                .filter(|l| !l.breaks && !l.pieces.is_empty())
+                .cloned()
+            else {
+                continue;
+            };
+            let at = Mat4::from_rotation_translation(o.rotation, o.position);
+            if self.physics.has_static(StaticKey::Object(i)) {
+                self.remove_object_static(i);
+            }
+            let pieces: Vec<_> = l
+                .pieces
+                .iter()
+                .zip(l.starts(at))
+                .map(|(piece, start)| self.physics.add_prop_body(piece, start, true))
+                .collect();
+            self.physics.group_debris(&pieces, at);
+            self.knocked.insert(i, pieces);
+            self.as_body.insert(i);
+            made += 1;
         }
         made
     }
@@ -1393,25 +1422,14 @@ impl World {
                                     && !self.taken.contains(&i)
                                     && !self.destroyed.contains(&i)
                                     && !self.knocked.contains_key(&i)
-                                    && let Some(l) = self
+                                    && self
                                         .loose
                                         .get(&hash)
-                                        .filter(|l| !l.breaks && !l.pieces.is_empty())
-                                        .cloned()
+                                        .is_some_and(|l| !l.breaks && !l.pieces.is_empty())
                                 {
-                                    let at =
-                                        Mat4::from_rotation_translation(o.rotation, o.position);
-                                    let pieces: Vec<_> = l
-                                        .pieces
-                                        .iter()
-                                        .zip(l.starts(at))
-                                        .map(|(piece, start)| {
-                                            self.physics.add_prop_body(piece, start, true)
-                                        })
-                                        .collect();
-                                    self.physics.group_debris(&pieces, at);
-                                    self.knocked.insert(i, pieces);
-                                    self.as_body.insert(i);
+                                    // Made at the update's end, in object
+                                    // order ([`raise_bodies`](Self::raise_bodies)).
+                                    self.to_raise.insert(i);
                                     continue;
                                 }
                                 // A prop placed by name with no collision
@@ -1565,6 +1583,8 @@ impl World {
                 }
             }
         }
+        let raise = std::mem::take(&mut self.to_raise);
+        self.raise_bodies(raise);
         fn ready<T, S>(slots: &HashMap<u32, Slot<T>, S>) -> usize {
             slots
                 .values()
@@ -2639,9 +2659,49 @@ impl Frustum {
     }
 }
 
+/// The placed objects of models `models` (by `by_model`), in object
+/// order whatever order the models come in: a `HashMap`'s iteration
+/// order changes from run to run (its seed is per process), object order
+/// doesn't.
+fn in_object_order<'a, S: std::hash::BuildHasher>(
+    models: impl Iterator<Item = &'a u32>,
+    by_model: &HashMap<u32, Vec<usize>, S>,
+) -> Vec<usize> {
+    let mut out: Vec<usize> = models
+        .flat_map(|h| by_model.get(h).into_iter().flatten().copied())
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The standing objects are made bodies in the same order from two maps
+    // seeded differently (as two runs' are), so their physics handles are
+    // too.
+    #[test]
+    fn standing_objects_become_bodies_in_object_order_whatever_the_seed() {
+        use std::collections::hash_map::RandomState;
+        let fill = |seed: RandomState| {
+            let mut models: HashMap<u32, (), RandomState> = HashMap::with_hasher(seed);
+            let mut by_model: HashMap<u32, Vec<usize>> = HashMap::new();
+            for m in 0..200u32 {
+                models.insert(m * 7919, ());
+                by_model.insert(m * 7919, vec![(m as usize * 37) % 211, 400 + m as usize]);
+            }
+            (models, by_model)
+        };
+        let (a, by_a) = fill(RandomState::new());
+        let (b, by_b) = fill(RandomState::new());
+        let first = in_object_order(a.keys(), &by_a);
+        let second = in_object_order(b.keys(), &by_b);
+        assert_eq!(first, second);
+        assert!(first.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(first.len(), 400);
+    }
 
     #[test]
     fn the_frustum_sees_ahead_not_behind() {
