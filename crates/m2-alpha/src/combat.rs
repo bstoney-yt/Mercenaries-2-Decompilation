@@ -4567,10 +4567,13 @@ impl Combat {
     /// damage where she is now, times the clear share
     /// ([`m2_engine::blast_sight::clear_share`]).
     fn sight_hurts_her(&mut self, f: &mut Field<'_>, rays: &SightRays) {
-        let clear: Vec<bool> = rays
-            .to
+        // The second of a pair starts half a metre over its heart
+        // ([`m2_engine::blast_sight::ray_starts`]).
+        let starts = m2_engine::blast_sight::ray_starts(rays.at, rays.to.len());
+        let clear: Vec<bool> = starts
             .iter()
-            .map(|&p| f.physics.line_clear(rays.at, p, None))
+            .zip(&rays.to)
+            .map(|(&from, &to)| f.physics.line_clear(from, to, None))
             .collect();
         let share = m2_engine::blast_sight::clear_share(&clear);
         let b = rays.blast;

@@ -117,6 +117,25 @@ pub fn details(db: &m2_assets::layer::Layer<'_>) -> std::collections::HashMap<u3
         .collect()
 }
 
+/// How far above its heart the second ray of a pair starts, metres
+/// (0x82291B88: its heart's height plus 0x820D9EDC, 0.5); the first, and
+/// a lone ray, start at its heart.
+pub const SECOND_RAY_RISE: f32 = 0.5;
+
+/// Where each of `n` rays starts from a blast's heart `at` (the second
+/// of a pair [`SECOND_RAY_RISE`] up).
+pub fn ray_starts(at: m2_math::glam::Vec3, n: usize) -> Vec<m2_math::glam::Vec3> {
+    (0..n)
+        .map(|k| {
+            if k == 1 {
+                at + m2_math::glam::Vec3::Y * SECOND_RAY_RISE
+            } else {
+                at
+            }
+        })
+        .collect()
+}
+
 /// What a body whose rays came back `clear` takes of the blast: with
 /// none clear, none; of a pair (`High`), half for each clear; a lone ray
 /// clear, all (0x82292778: the clear rays counted, halved for a pair).
@@ -145,6 +164,14 @@ mod tests {
         assert_eq!(clear_share(&[false, false]), 0.0);
         assert_eq!(clear_share(&[true]), 1.0);
         assert_eq!(clear_share(&[false]), 0.0);
+    }
+
+    #[test]
+    fn the_second_of_a_pair_starts_half_a_metre_up() {
+        use m2_math::glam::Vec3;
+        let at = Vec3::new(1.0, 2.0, 3.0);
+        assert_eq!(ray_starts(at, 1), vec![at]);
+        assert_eq!(ray_starts(at, 2), vec![at, Vec3::new(1.0, 2.5, 3.0)]);
     }
 
     #[test]
