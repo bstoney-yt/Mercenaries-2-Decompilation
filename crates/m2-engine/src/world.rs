@@ -414,6 +414,9 @@ pub struct Templates {
     /// Each template's `_PropPhysics`, by id: the props that move when
     /// hit ([`crate::durability::prop_physics`]).
     pub prop_physics: HashMap<u32, crate::durability::PropPhysics>,
+    /// The templates whose objects have a physics body, by id
+    /// ([`crate::durability::physical`]).
+    pub physical: HashSet<u32>,
     /// The collision preset of each template whose objects aren't
     /// buildings, by id ([`crate::durability::presets`]).
     pub presets: HashMap<u32, crate::collision_layers::Preset>,
@@ -1191,6 +1194,7 @@ impl Templates {
             crash_parts: crate::durability::crash_parts(&db),
             sound_keys: crate::durability::sound_keys(&db),
             prop_physics: crate::durability::prop_physics(&db),
+            physical: crate::durability::physical(&db),
             presets: crate::durability::presets(&db),
             gravity_scales: crate::durability::gravity_scales(&db),
             projectiles: crate::durability::projectiles(&db),

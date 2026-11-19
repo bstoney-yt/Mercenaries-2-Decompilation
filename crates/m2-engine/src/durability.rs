@@ -10,7 +10,7 @@
 //! Field keys without a known name are used as they are; the comments say
 //! what each holds, read off the values.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use m2_assets::{Layer, name_hash};
 use m2_math::glam::Vec3;
@@ -488,6 +488,35 @@ pub fn fake_masses(db: &Layer<'_>) -> HashMap<u32, FakeMass> {
                 },
             ))
         })
+        .collect()
+}
+
+/// The template-database components that give an object a physics body:
+/// the kinds in the 360's physics-component creator table (0x820EABE0,
+/// each entry's name at its third word: `PropPhysics` 0x820EA774 through
+/// `BuildingPhysics` 0x820EA7E8), as the PC data names their tables.
+/// From the 360 code: an object's bodies are made only by one of these
+/// creators (0x82408C30, each calling 0x821831B0).
+pub const PHYSICS_COMPONENTS: [&str; 9] = [
+    "_PropPhysics",
+    "_DebrisPhysics",
+    "_BoatPhysics",
+    "_CarPhysicsV2",
+    "_TankPhysics",
+    "_HelicopterPhysics",
+    "_JetPhysics",
+    "_HumanPhysics",
+    "_BuildingPhysics",
+];
+
+/// The templates with any of the [`PHYSICS_COMPONENTS`], by id: those
+/// whose objects have a body. One with none (the paradrop plane
+/// `Support Vehicle (Paradrop_AL)`: a model, a script and a sound) has
+/// no collision on the 360.
+pub fn physical(db: &Layer<'_>) -> HashSet<u32> {
+    PHYSICS_COMPONENTS
+        .iter()
+        .flat_map(|name| Table::new(db, name).templates().collect::<Vec<_>>())
         .collect()
 }
 
