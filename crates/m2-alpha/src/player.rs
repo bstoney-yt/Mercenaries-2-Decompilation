@@ -971,6 +971,27 @@ impl Player {
     /// to land on what is under it once the world there has loaded: the
     /// floor or ground nearest under the spot, not the top of whatever
     /// stands over it.
+    /// Where her landing stands, for a check that waits on it: landed,
+    /// settled ticks, ticks waited, the world still streaming, models
+    /// still coming, the spot she was put at, where she is, swimming, on a
+    /// ladder, down, driving.
+    pub fn landing_state(&self) -> String {
+        format!(
+            "landed {}, settled {}, waited {}, streaming {}, models coming {}, put at {:?}, at {:.2?}, swimming {}, ladder {}, down {}, driving {:?}",
+            self.landed,
+            self.settled,
+            self.waited,
+            self.streaming,
+            self.models_coming,
+            self.land_from.map(|v| v.to_array()),
+            self.character.position.to_array(),
+            self.swimming(),
+            self.ladder.is_some(),
+            self.down,
+            self.driving
+        )
+    }
+
     pub fn drop_at(&mut self, at: Vec3) {
         self.character.position = at;
         self.character.velocity = Vec3::ZERO;
