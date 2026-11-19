@@ -1075,6 +1075,12 @@ impl World {
         out
     }
 
+    /// How many loads (tiles, models, textures, scatter) are asked for
+    /// and not yet taken in: 0 once streaming has settled here.
+    pub fn loads_pending(&self) -> usize {
+        self.in_flight.len() + self.pending.len()
+    }
+
     /// How many placed objects have been knocked loose.
     pub fn knocked(&self) -> usize {
         self.knocked.len()
