@@ -1416,6 +1416,9 @@ pub struct Npc {
     /// seconds until he may ask again ([`m2_engine::ai_cover::RETRY`]).
     pub cover_ask: Option<Vec3>,
     pub cover_spot: Option<Vec3>,
+    /// The cover object his spot is on and how long he has been heading
+    /// there, for his claim ([`People::renew_cover_claims`]).
+    pub cover_claim: Option<(u32, f32)>,
     cover_retry: f32,
     /// How they move on foot, as the 360's people do
     /// ([`m2_engine::on_foot`]): their kind's paces and turn, the way and
@@ -1713,6 +1716,7 @@ impl Npc {
             swim_speed: crate::player::SWIM_SPEED,
             cover_ask: None,
             cover_spot: None,
+            cover_claim: None,
             cover_retry: 0.0,
             motion: m2_engine::on_foot::HumanMotion::default(),
             ground: Vec2::ZERO,
@@ -4311,6 +4315,37 @@ pub fn in_ram(local: Vec3, (lo, hi): (Vec3, Vec3)) -> bool {
 }
 
 impl People {
+    /// While he heads for a cover spot, his claim on it is made again each
+    /// update from where he is, for its first
+    /// [`m2_engine::ai_cover::CLAIM_AGE`] seconds (0x822C7CF0 ->
+    /// 0x822EDA60); refused, the spot goes into his list for 10 s and he
+    /// has none. Not ported: the sweep re-check (0x822CC840) in the same
+    /// window, and what happens past the window (read as: the claim stands).
+    fn renew_cover_claim(
+        claims: &mut m2_engine::ai_cover::Claims,
+        owner: u32,
+        npc: &mut Npc,
+        dt: f32,
+    ) {
+        let (Some(spot), Some((object, age))) = (npc.cover_spot, npc.cover_claim) else {
+            npc.cover_claim = None;
+            return;
+        };
+        if age > m2_engine::ai_cover::CLAIM_AGE {
+            return;
+        }
+        npc.cover_claim = Some((object, age + dt));
+        if !claims.claim(owner, object, npc.character.position, spot) {
+            eprintln!(
+                "people: {:08x} drops cover at {spot:.1}: claimed by another",
+                npc.spawn.unwrap_or(u32::MAX)
+            );
+            npc.destination_refused(spot);
+            npc.cover_spot = None;
+            npc.cover_claim = None;
+        }
+    }
+
     /// The kind of the catalogue's model a name's role asks for
     /// ([`role_for`]), for soldiers whose template has no model of its own.
     pub fn kind_for(&self, name: &str) -> Option<usize> {
@@ -5399,7 +5434,7 @@ impl People {
             .iter()
             .map(|n| (n.shooter, n.ai.modifier.unwrap_or(human)))
             .collect();
-        for npc in &mut self.npcs {
+        for (i, npc) in self.npcs.iter_mut().enumerate() {
             npc.smart = self.smarter;
             npc.target_armour = npc.foe_armour.unwrap_or(self.target_armour).max(1);
             // What his target is and what it takes of his weapons: a
@@ -5455,6 +5490,7 @@ impl People {
             crate::spans::time("people: each one's update", || {
                 npc.update(physics, &mut self.rng, threat, dt)
             });
+            Self::renew_cover_claim(&mut self.cover_claims, i as u32, npc, dt);
             let p = npc.character.position;
             crate::spans::time("people: checks", || {
                 self.checks
@@ -6834,6 +6870,44 @@ pub(crate) mod tests {
         let mut backend = m2_render::NullBackend::default();
         let mut materials = m2_engine::MaterialCache::new();
         GpuModel::upload(&mut backend, &mut materials, &cpu).unwrap()
+    }
+
+    /// 0x822C7CF0: heading for a cover spot another holds with a better
+    /// score, his renewed claim is refused within the first 2 s and he
+    /// drops the spot; past 2 s his claim is not checked again.
+    #[test]
+    fn a_cover_spot_another_holds_is_dropped_in_the_first_two_seconds() {
+        use m2_engine::ai_cover::Claims;
+        let spot = Vec3::new(0.0, 0.0, 0.0);
+        let mut claims = Claims::default();
+        // Soldier 1, 2 m off it, holds it (score 96).
+        assert!(claims.claim(1, 7, Vec3::new(2.0, 0.0, 0.0), spot));
+        let mut n = Npc::new(
+            0,
+            &rig(),
+            Vec3::new(5.0, 0.0, 0.0),
+            0.0,
+            Brain::Post { facing: 0.0 },
+            None,
+        );
+        n.cover_spot = Some(spot);
+        n.cover_claim = Some((7, 0.0));
+        People::renew_cover_claim(&mut claims, 0, &mut n, 0.1);
+        assert_eq!(n.cover_spot, None, "refused: 75 is under 1.1 x 96");
+        assert!(n.dither.bad(spot), "in his list (read by nothing)");
+        // Past the window: kept, not checked.
+        let mut n = Npc::new(
+            0,
+            &rig(),
+            Vec3::new(5.0, 0.0, 0.0),
+            0.0,
+            Brain::Post { facing: 0.0 },
+            None,
+        );
+        n.cover_spot = Some(spot);
+        n.cover_claim = Some((7, 2.5));
+        People::renew_cover_claim(&mut claims, 0, &mut n, 0.1);
+        assert_eq!(n.cover_spot, Some(spot));
     }
 
     pub(crate) fn rig() -> Rig {

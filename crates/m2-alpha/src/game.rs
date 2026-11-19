@@ -6809,14 +6809,13 @@ fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
                 .is_some_and(|(d, _)| d < to.length() - 0.05)
         };
         let picked = ai_cover::choose_index(&req, &cands, ground, blocked);
-        // Heading there, he claims it (0x822C7CF0 -> 0x822EDA60): refused,
-        // the spot goes into his list for 10 s and he has none.
-        // Inferred: the claim is made as the spot is picked (the 360 makes
-        // it in the destination check while the goal is under 2 s old).
+        // As he starts for it, he claims it (0x822C7CF0 -> 0x822EDA60), and
+        // again each update for 2 s ([`crate::npc::People`]): refused, the
+        // spot goes into his list for 10 s and he has none.
         let found = picked.and_then(|(at, k)| {
             let object = objects[k];
             if people.cover_claims.claim(i as u32, object, centre, at) {
-                Some(at)
+                Some((at, object))
             } else {
                 eprintln!(
                     "people: {:08x} cover at {at:.1} refused: claimed by another",
@@ -6828,6 +6827,8 @@ fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
         });
         let n = &mut people.npcs[i];
         n.cover_ask = None;
+        n.cover_claim = found.map(|(_, object)| (object, 0.0));
+        let found = found.map(|(at, _)| at);
         n.cover_spot = found;
         if let Some(at) = found {
             eprintln!(

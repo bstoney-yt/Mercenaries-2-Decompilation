@@ -341,12 +341,19 @@ pub struct Claim {
     pub at: Vec3,
 }
 
-/// The cover claims (0x822EDA60, asked by 0x822C7CF0 as the person heads
-/// for the spot): one per owner, his latest.
+/// The cover claims (0x822EDA60): one per owner, his latest. 0x822C7CF0
+/// claims as the person starts for the spot and claims again every update
+/// while the destination is at most [`CLAIM_AGE`] old, each time scored
+/// from where he is then; a refusal in that window drops the destination.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Claims {
     claims: Vec<Claim>,
 }
+
+/// How long after he starts for a cover spot his claim is checked and
+/// renewed each update, seconds (0x822C7CF0: the goal age +0x98 at most
+/// 2.0).
+pub const CLAIM_AGE: f32 = 2.0;
 
 /// A claim's score: 100 less the squared flat distance from the claimer to
 /// the spot (0x822EDA60; a hint kind 13 scores 100, not mapped here).
