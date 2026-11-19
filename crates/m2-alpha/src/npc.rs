@@ -2703,6 +2703,12 @@ impl Npc {
         physics.cast_ray(eye, to / distance, distance).is_none()
     }
 
+    /// The 10 s mark a destination whose check failed leaves in his list
+    /// (0x822C7CF0; read by nothing, as in the 360).
+    pub fn destination_refused(&mut self, at: Vec3) {
+        self.dither.mark_for(at, 10.0);
+    }
+
     /// The step's caller after a move given up with no path held
     /// (0x822B34A8): he stops dead, and his destination goes so that the
     /// behaviour picks again.
@@ -3740,6 +3746,8 @@ pub fn threat_reaction_seconds(
 /// Everyone on the island but the player.
 #[derive(Debug, Default)]
 pub struct People {
+    /// The cover spots claimed ([`m2_engine::ai_cover::Claims`]).
+    pub cover_claims: m2_engine::ai_cover::Claims,
     pub kinds: Vec<PersonKind>,
     pub npcs: Vec<Npc>,
     /// How long the `ThreatReaction` action lasts, seconds: its clip's

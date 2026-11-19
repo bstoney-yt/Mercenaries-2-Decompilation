@@ -89,12 +89,19 @@ impl Dither {
     pub fn mark(&mut self, at: Vec3) {
         self.count = 0;
         self.last = None;
+        self.mark_for(at, BAD_FOR);
+    }
+
+    /// Writes `at` into the list for `seconds` (0x822C8370 with another
+    /// time: 10 s for a destination whose check failed, 0x822C7CF0),
+    /// leaving the count alone.
+    pub fn mark_for(&mut self, at: Vec3, seconds: f32) {
         if let Some(s) = self.spots.iter_mut().flatten().find(|(p, _)| near(*p, at)) {
-            s.1 = BAD_FOR;
+            s.1 = seconds;
             return;
         }
         if let Some(slot) = self.spots.iter_mut().find(|s| s.is_none()) {
-            *slot = Some((at, BAD_FOR));
+            *slot = Some((at, seconds));
         }
     }
 
