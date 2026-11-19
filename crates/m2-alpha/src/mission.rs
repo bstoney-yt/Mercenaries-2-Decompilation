@@ -2073,6 +2073,19 @@ impl MissionLink {
         ))
     }
 
+    /// Where the scripts' object named `name` stands (a layer entity's
+    /// own name, as `GunPickup`), if one is in their world.
+    pub fn place_named(&self, name: &str) -> Option<Vec3> {
+        let State::Running(m) = &self.state else {
+            return None;
+        };
+        let w = m.world().borrow();
+        w.objects
+            .values()
+            .find(|o| o.name.eq_ignore_ascii_case(name))
+            .map(|o| Vec3::from(o.position))
+    }
+
     /// Where the scripts' markers stand: on their targets.
     pub fn marked_places(&self) -> Vec<Vec3> {
         let State::Running(m) = &self.state else {

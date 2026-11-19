@@ -5404,7 +5404,12 @@ fn mission_for_screenshot(
         // ([`cargo_check`]); then the run ends.
         if let Some(w) = &mut cargo_wait
             && i % (1.0 / tick).round() as u32 == 0
-            && w.tick(game, &link.marked_places(), 1.0)
+            && w.tick(
+                game,
+                link.place_named(CARGO_TRUCK),
+                &link.marked_places(),
+                1.0,
+            )
         {
             cargo_check(game, tick);
             break;
@@ -8891,11 +8896,18 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 /// she is put by one that might carry some, seconds.
 const CARGO_WAIT: f32 = 60.0;
 
+/// OilCon020's El Grande with the gun crates: its layer entity's name
+/// (`vz_state_oilcon020`, guid 0xFA056, at about [2756, -34, -423]).
+/// From samples. The q680g run went to the scripts' first marker instead,
+/// [2632, -14, -998], 590 m from the truck, and it never streamed in.
+const CARGO_TRUCK: &str = "GunPickup";
+
 /// `--cargo-check`'s wait in the mission for a vehicle with cargo aboard
 /// (the contract's layers put out OilCon020's El Grande and its crates):
 /// each second, once a vehicle carries cargo it is time; before that,
-/// she is put 8 m from an El Grande that is out, else from the place the
-/// scripts mark (OilCon020's `GunPickup` stands on its truck), else from
+/// she is put 8 m from an El Grande that is out, else from the contract's
+/// truck where its layer has it ([`CARGO_TRUCK`]), else from the place the
+/// scripts mark first, else from
 /// the first vehicle, so the truck and its crates stream in; [`CARGO_WAIT`] s after, a `FAIL` with what was there.
 #[derive(Debug, Default)]
 struct CargoWait {
@@ -8905,7 +8917,13 @@ struct CargoWait {
 }
 
 impl CargoWait {
-    fn tick(&mut self, game: &mut Game, marks: &[m2_math::glam::Vec3], dt: f32) -> bool {
+    fn tick(
+        &mut self,
+        game: &mut Game,
+        truck: Option<m2_math::glam::Vec3>,
+        marks: &[m2_math::glam::Vec3],
+        dt: f32,
+    ) -> bool {
         use m2_math::glam::Vec3;
         if self.done {
             return false;
@@ -8924,12 +8942,28 @@ impl CargoWait {
         }
         // Not before the contract's layers have had a moment.
         if self.put_at.is_none() && self.t >= 10.0 {
-            // The El Grande if it is out; else the place the scripts mark
-            // (OilCon020's `GunPickup` marker stands on its truck, so it
-            // and its crates stream in there); else the first vehicle.
+            // The El Grande if it is out; else the contract's truck where
+            // its layer has it (so it and its crates stream in there);
+            // else the place the scripts mark first; else the first
+            // vehicle.
             let grande = vehicles
                 .iter()
                 .position(|v| v.id.is_some() && !v.wrecked && v.spec.label.contains("El Grande"));
+            if grande.is_none()
+                && let Some(at) = truck
+            {
+                eprintln!(
+                    "cargo-check: she is put 8 m from the contract's truck {CARGO_TRUCK} at {at:.0}"
+                );
+                if let Some(p) = game.scene.player.as_mut() {
+                    p.driving = None;
+                    p.drop_at(at + Vec3::X * 8.0 + Vec3::Y * 2.0);
+                }
+                game.ride = None;
+                game.on_foot = true;
+                self.put_at = Some(self.t);
+                return false;
+            }
             let to_mark = grande.is_none().then(|| marks.first().copied()).flatten();
             if let Some(at) = to_mark {
                 eprintln!("cargo-check: she is put 8 m from the scripts' marker at {at:.0}");
