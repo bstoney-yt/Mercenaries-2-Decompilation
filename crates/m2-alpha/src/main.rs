@@ -13414,16 +13414,30 @@ fn prop_bodies_check(
     // Steps with loads still coming in (models, tiles: bodies and
     // collision going up), to leave out of the settled median.
     let mut loading = Vec::new();
+    let mut last = None;
     for _ in 0..(10.0 / tick) as u32 {
         game.step(Intent::default(), tick);
         render(backend, game, fov, aspect, None)?;
         if let Some(w) = game.scene.world.as_ref() {
             ms.push(w.physics.last_step_ms);
-            loading.push(w.loads_pending() > 0);
+            // What the world has in: anything arriving (a tile, a cell, a
+            // model, a body) or still asked for changes it (q764: a pending
+            // count alone read empty at once, before models came in).
+            let st = w.stats();
+            let now = (
+                st.tiles,
+                st.cells,
+                st.models,
+                w.as_bodies().count(),
+                game.scene.props.as_bodies().count(),
+                w.loads_pending(),
+            );
+            loading.push(last != Some(now) || now.5 > 0);
+            last = Some(now);
         }
     }
     // The step cost once streaming has settled: the steps after the last
-    // one with a load pending. Steps while loads come in also time the
+    // one with anything arriving or pending. Steps while loads come in also time the
     // bodies and collision being put up and the loader threads' share of
     // the machine; the cost of the bodies standing is what is measured
     // (q764: whole-watch medians 1.47, 2.77, 1.30 ms from one start, run
@@ -13504,6 +13518,35 @@ fn prop_bodies_check(
             .map(|(i, ids)| (i as u32 | 0x8000_0000, ids.to_vec())),
     );
     let pieces: usize = bodies.iter().map(|b| b.1.len()).sum();
+    // Each body by a key that is the same every run (a placed object's
+    // layer entity id, a prop's own entity), and the order its bodies were
+    // made in (their handles): one hash for all, the same run to run if
+    // the bodies were made in the same order.
+    let stable = |e: u32| -> u32 {
+        if e & 0x8000_0000 != 0 {
+            world
+                .index
+                .objects
+                .get((e & 0x7fff_ffff) as usize)
+                .map_or(e, |o| o.entity)
+        } else {
+            e
+        }
+    };
+    let mut keyed: Vec<(u32, String)> = bodies
+        .iter()
+        .map(|(e, ids)| (stable(*e), format!("{ids:?}")))
+        .collect();
+    keyed.sort();
+    let order = keyed.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, (k, ids)| {
+        format!("{k:x}:{ids};")
+            .bytes()
+            .fold(h, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+    });
+    eprintln!(
+        "prop-bodies-check: body order {order:016x} over {} bodies by layer entity",
+        keyed.len()
+    );
     eprintln!(
         "prop-bodies-check: at {:.0}: {} props shown, {props_bodies} of them bodies; {} placed \
          objects bodies",
@@ -13618,6 +13661,7 @@ fn prop_bodies_check(
         );
         return Ok(());
     };
+    let prop_entity = stable(e);
     eprintln!("prop-bodies-check: the car is put at {start:.1}, 12 m short of {e:#x} at {at:.1}");
     let yaw = way.x.atan2(way.z);
     if let Some(world) = game.scene.world.as_mut() {
@@ -13690,7 +13734,7 @@ fn prop_bodies_check(
         .map_or(0.0, |m| m.w_axis.truncate().distance(at));
     let speed = world.physics.vehicle_speed(car);
     eprintln!(
-        "prop-bodies-check: the {} driven at prop {e:#x}: the prop moved {moved:.1} m, the car \
+        "prop-bodies-check: the {} driven at prop {e:#x} (layer entity {prop_entity:#x}): the prop moved {moved:.1} m, the car \
          at {speed:.1} m/s after",
         game.scene.vehicles[i].spec.label
     );
