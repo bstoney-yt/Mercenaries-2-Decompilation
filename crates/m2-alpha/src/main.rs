@@ -13423,10 +13423,21 @@ fn toss_check(game: &mut Game, tick: f32, mode: &str) {
             // The throw, against Xenia's (knockdown-time.md): at least 2 m
             // over the bike, out at least 3.5 m, no nearer than 2.5 m while
             // limp after +1 s.
-            let thrown_far = top >= 2.0 && far >= 3.5 && near_after >= 2.5;
+            // The launch, from the code (0x82428658): out min(L, 15), up
+            // 0.4 of it. The run-out against a flat wall is for the record.
+            let last = game.scene.player.as_ref().and_then(|p| p.last_toss);
+            let thrown_far = last.is_some_and(|(carried, launch)| {
+                let level = carried.with_y(0.0).length();
+                let out = launch.with_y(0.0).length();
+                println!(
+                    "toss-check: launch: level {level:.2} m/s before the jolt -> out {out:.2} m/s, up {:.2} m/s",
+                    launch.y
+                );
+                (out - level.min(15.0)).abs() < 0.05 && (launch.y - 0.4 * out).abs() < 0.05
+            });
             if has_toss {
                 println!(
-                    "toss-check: the throw (over the bike >= 2 m, out >= 3.5 m, limp no nearer than 2.5 m): {}",
+                    "toss-check: the launch (out min(L, 15), up 0.4 of it; 0x82428658): {}",
                     verdict(thrown_far)
                 );
             }

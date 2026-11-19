@@ -4502,7 +4502,10 @@ impl Combat {
             &rig.skeleton.name_hashes,
             &rig.skeleton.parents,
             &world,
-            f.player.character.velocity,
+            f.player
+                .launch
+                .take()
+                .unwrap_or(f.player.character.velocity),
         );
         f.player.ragdoll = Some(id);
         f.player.down = true;

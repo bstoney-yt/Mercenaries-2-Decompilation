@@ -6464,14 +6464,18 @@ pub(crate) fn get_out(
         // it up: 0x822A1B70 sets her time down from `TossGetupSeconds`).
         player.tossed = kind == ExitKind::Toss;
         if kind == ExitKind::Toss {
-            // 0x822A1B70's toss: half a metre along the vehicle's up
-            // (FUN_82855F48, its up axis, times 0x82B7C128) and the
-            // velocity it is handed: the vehicle's before the jolt
-            // (inferred: the crash ejection, 0x8218A138, posts it with the
-            // exit; Xenia throws her 2.6-2.8 m up and ~4.8 m out).
+            // 0x822A1B70's toss only places her: half a metre along the
+            // vehicle's up (FUN_82855F48, its up axis, times 0x82B7C128).
+            // The exit message carries the vehicle's velocity before the
+            // jolt (0x8218A138), and her ragdoll starts with the launch
+            // the controller makes of it (0x82428658).
             let up = at.transform_vector3(Vec3::Y).normalize_or(Vec3::Y);
             player.drop_at(place + up * 0.5);
-            player.character.velocity = physics.vehicle_velocity_pre_jolt(id);
+            player.character.velocity = Vec3::ZERO;
+            let carried = physics.vehicle_velocity_pre_jolt(id);
+            let launch = m2_engine::ragdoll_launch::exit_launch(carried);
+            player.launch = Some(launch);
+            player.last_toss = Some((carried, launch));
         } else if kind == ExitKind::Ditch {
             // Ditching (0x822A1B70): half a metre over the exit's place,
             // pushed off, in the air: she lands as from a jump.
