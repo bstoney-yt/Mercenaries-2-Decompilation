@@ -12826,6 +12826,35 @@ fn prop_limits_check(
         step(game, Intent::default(), &mut ms)?;
     }
     ms.clear();
+    // At no wheel (the check runs before `--drive` seats her): she takes
+    // the nearest land vehicle standing, for the drive at the end.
+    if game
+        .scene
+        .player
+        .as_ref()
+        .is_some_and(|p| p.driving.is_none())
+    {
+        let here = game.focus();
+        let pick = game.scene.world.as_ref().and_then(|world| {
+            (game.scene.vehicles.iter().enumerate())
+                .filter(|(_, v)| !v.wrecked && !v.spec.is_boat())
+                .filter_map(|(i, v)| {
+                    let at = world.physics.vehicle_transform(v.id?)?.w_axis.truncate();
+                    Some((i, at.distance(here)))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        });
+        if let (Some(i), Some(p)) = (pick, game.scene.player.as_mut()) {
+            p.driving = Some(i);
+            p.landed = true;
+            game.take_from_driver(i);
+            eprintln!(
+                "prop-limits-check: she takes the {} (not at a wheel)",
+                game.scene.vehicles[i].spec.label
+            );
+        }
+    }
     let centre = game.focus();
     let (mut most, mut disposed) = (0, 0);
     let every = (0.5 / tick).round().max(1.0) as u32;
