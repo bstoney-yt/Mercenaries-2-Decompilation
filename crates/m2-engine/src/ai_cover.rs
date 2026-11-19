@@ -77,8 +77,25 @@ pub struct Request {
 
 /// The search radius when not anchored (0x822C43B8).
 pub const SEARCH: f32 = 20.0;
-/// A failed search is tried again after this long, seconds.
-pub const RETRY: f32 = 5.0;
+/// After a cover attempt the next waits `RETRY + RETRY_SPREAD x
+/// random(0..1)` seconds (0x822C7348 sets the move block's cover timer
+/// +0xB4 so; 0x822C8530 counts it down).
+pub const RETRY: f32 = 15.0;
+pub const RETRY_SPREAD: f32 = 10.0;
+/// Cover is asked for only with the target this far off, metres
+/// (0x822C6B78: between 0x820BAEEC and 0x820BAFA8).
+pub const ASK_NEAR: f32 = 10.0;
+pub const ASK_FAR: f32 = 40.0;
+
+/// Whether a person may ask for cover now (the gate 0x822C6B78): his
+/// cover timer run out and the target between [`ASK_NEAR`] and
+/// [`ASK_FAR`]. Inferred or left out of the gate: the cover-capable
+/// entry (+0x4EC), the global pause, the target's validity, the state
+/// and flag checks (+0x128, +0xCC bit 0x80, +0x8C) and 0x822C04A0, all
+/// taken to pass.
+pub fn may_ask(timer: f32, distance: f32) -> bool {
+    timer < 0.0 && (ASK_NEAR..=ASK_FAR).contains(&distance)
+}
 /// How near a spot to avoid rules a candidate out, metres.
 const AVOID: f32 = 2.2;
 /// How far a Point spot stands off its obstacle, and how far a lean
@@ -395,6 +412,13 @@ mod tests {
             no_x: false,
             no_z: false,
         }
+    }
+
+    #[test]
+    fn cover_is_asked_for_between_10_and_40_m_once_the_timer_is_out() {
+        assert!(may_ask(-0.1, 25.0));
+        assert!(!may_ask(0.5, 25.0), "timer running");
+        assert!(!may_ask(-0.1, 9.0) && !may_ask(-0.1, 41.0));
     }
 
     /// 0x822EDA60: a claim near another's on the same object is refused

@@ -2833,10 +2833,18 @@ impl Npc {
         if !beyond {
             self.cover_spot = None;
         }
+        // The cover gate (0x822C6B78, [`m2_engine::ai_cover::may_ask`]):
+        // its timer out and her 10 to 40 m off; after an attempt the timer
+        // is 15 to 25 s (0x822C7348).
         self.cover_retry -= dt;
-        if beyond && !hiding && self.cover_spot.is_none() && self.cover_retry <= 0.0 {
+        if beyond
+            && !hiding
+            && self.cover_spot.is_none()
+            && m2_engine::ai_cover::may_ask(self.cover_retry, distance)
+        {
             self.cover_ask = Some(threat);
-            self.cover_retry = m2_engine::ai_cover::RETRY;
+            self.cover_retry = m2_engine::ai_cover::RETRY
+                + m2_engine::ai_cover::RETRY_SPREAD * rng.range(0.0, 1.0);
         }
         let to_cover = self.push(self.ai.combat_speed);
         let covered = match self.cover_spot.filter(|_| beyond && !hiding) {
