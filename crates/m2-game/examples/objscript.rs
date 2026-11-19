@@ -14,7 +14,9 @@
 //! what they ask of the first one. For `AntiAir` it spawns a crewed
 //! `M113 AA (VZ) (Driver)` where the first stands, comes near it, has it
 //! lock on her and fire, and counts the radar calls the scripts make
-//! (`antiair:` lines). For `autogunship` it flies the gunship over her
+//! (`antiair:` lines). For `Laptop` it stands her beside the first and
+//! has her pick it up, printing the marker count and what it says
+//! (headless there is no PDA: the HUD's). For `autogunship` it flies the gunship over her
 //! with a hostile vehicle near her and prints the shells it fires
 //! (`gunship:` lines). For `C4` and `beacon` it throws one (`C4
 //! Projectile`, `ammo_designator_beacon`), leaves it 3 s and takes it
@@ -143,6 +145,27 @@ fn main() -> Result<()> {
             offered(&mission),
             alive(&mission)
         );
+    }
+    if name.eq_ignore_ascii_case("Laptop")
+        && let Some(&(_, first, at)) = on.first()
+    {
+        // Beside it, so that it wakes and puts its blip up; then the hero
+        // picks it up (`WeaponEvent` "pickup"), as the game raises it.
+        mission.put_player([at[0] + 2.0, at[1], at[2]]);
+        run(&mut mission, 1.0);
+        println!("markers beside the first: {}", markers(&mission));
+        mission.weapon_event(m2_game::mission::PLAYER, "pickup", first);
+        let mut said = Vec::new();
+        for _ in 0..4 {
+            mission.tick(0.25);
+            said.extend(
+                mission
+                    .take_log()
+                    .into_iter()
+                    .filter(|l| l.contains("print")),
+            );
+        }
+        println!("picked up: {said:?}");
     }
     if name.starts_with("tree_") {
         // An island tree of a template that runs it, burnt down: what

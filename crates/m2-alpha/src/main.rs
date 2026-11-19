@@ -623,6 +623,9 @@ struct Options {
     /// With `--mission --screenshot`: her health drops to this eight
     /// seconds in, to see the scripts' healing and survival rescue.
     hurt: Option<f32>,
+    /// `--pickup-event-check`: a crate's contents laid at her feet and
+    /// taken, its `WeaponEvent` "pickup" logged ([`PickupEventCheck`]).
+    pickup_event_check: bool,
     /// `--death-check`: lethal damage dealt her until she dies, then her
     /// death through the scripts to their revive logged (`death-check:`
     /// lines, [`DeathCheck`]).
@@ -1161,6 +1164,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--autoplay" => o.autoplay = true,
             "--smarter-ai" => o.smarter_ai = true,
             "--hurt" => o.hurt = Some(value()?.parse().context("--hurt expects health")?),
+            "--pickup-event-check" => {
+                o.pickup_event_check = true;
+                o.mission = true;
+            }
             "--death-check" => {
                 o.death_check = true;
                 o.mission = true;
@@ -1359,6 +1366,177 @@ fn keep_crash_reports() {
 /// When `--hurt` takes her health: after the start's fade, which keeps her
 /// from harm.
 const HURT_AT: f32 = 8.0;
+
+/// The pickups `--pickup-event-check` lays at her feet, one after the
+/// other, as a crate's contents would lie: cash, then fuel (both taken
+/// by walking onto them), then a munitions laptop (#660: its script's
+/// `PickupMunitions` calls the HUD's PDA, `UpdateSupport`).
+const PICKUP_CHECK_ITEMS: [&str; 3] = ["Cash (Small)", "Fuel Pickup (Large)", "Munitions (Laptop)"];
+
+/// The least a `--pickup-event-check` run plays, seconds: its 10 s, the
+/// three items 4 s apart and 20 s to take them, with time to spare for her to
+/// come down on foot.
+const PICKUP_CHECK_SECONDS: f32 = 90.0;
+
+/// `--pickup-event-check`: from 10 s in (if she is seated then, as the
+/// mission's start seats her in its speed boat, she is put on foot at the
+/// default spawn, logged), once she is on foot and down,
+/// each of [`PICKUP_CHECK_ITEMS`] is laid at her feet as a crate's
+/// contents lie (no object of its own here, `flights::Pickup` from a
+/// crate 0xC4EC0001 of the check's own), 4 s apart, for her to take as
+/// she would. Each taken logs `mission: she picks up <name> (<guid>,
+/// loose: WeaponEvent pickup)` (the mission's). Ends `pickup-event-check:
+/// PASS N of N taken` once all are gone from the ground, else `FAIL`
+/// after 20 s; a run that ends before then says `FAIL` and the step it
+/// was on ([`finish`](Self::finish)). The run plays at least
+/// [`PICKUP_CHECK_SECONDS`].
+#[derive(Debug, Default)]
+struct PickupEventCheck {
+    t: f32,
+    /// She was taken out of the vehicle the mission seated her in.
+    put_ashore: bool,
+    laid: usize,
+    next: f32,
+    done: bool,
+    /// The last of the scripts' HUD calls looked at, and whether one was
+    /// the PDA's `UpdateSupport` (the laptop's `PickupMunitions`).
+    seen: u64,
+    support: bool,
+}
+
+/// The crate the check's pickups say they came from (not one of the
+/// scripts': its own, so no placed pickup's).
+const PICKUP_CHECK_CRATE: u32 = 0xc4ec_0001;
+
+impl PickupEventCheck {
+    /// The run ended: `FAIL` and where the check stood, unless it is done.
+    fn finish(&self, game: &Game) {
+        if self.done {
+            return;
+        }
+        let p = game.scene.player.as_ref();
+        let step = if self.t < 10.0 {
+            format!("waiting for 10 s in (the run ended at {:.1} s)", self.t)
+        } else if self.laid == 0 {
+            format!(
+                "waiting for her on foot and down (landed {}, driving {})",
+                p.is_some_and(|p| p.landed),
+                p.is_some_and(|p| p.driving.is_some())
+            )
+        } else {
+            let lying = game
+                .scene
+                .flights
+                .pickups()
+                .iter()
+                .filter(|p| p.from == PICKUP_CHECK_CRATE)
+                .count();
+            format!(
+                "{} of {} laid, {lying} still lying",
+                self.laid,
+                PICKUP_CHECK_ITEMS.len()
+            )
+        };
+        eprintln!(
+            "pickup-event-check: FAIL the run ended {:.1} s in: {step}",
+            self.t
+        );
+    }
+
+    fn tick(&mut self, game: &mut Game, link: &mission::MissionLink, dt: f32) {
+        if self.done {
+            return;
+        }
+        self.t += dt;
+        for c in link.hud_calls_after(self.seen) {
+            if c.seq <= self.seen {
+                continue;
+            }
+            self.seen = c.seq;
+            if c.group == "PdaWidget" && c.method == "UpdateSupport" {
+                self.support = true;
+                eprintln!("pickup-event-check: pda call UpdateSupport {:?}", c.data);
+            }
+        }
+        // Seated (the mission's start has her in its speed boat): she is
+        // put on foot on land at the default spawn, once, for the check.
+        if self.t >= 10.0
+            && !self.put_ashore
+            && let Some(p) = game.scene.player.as_mut()
+            && p.driving.is_some()
+        {
+            self.put_ashore = true;
+            p.driving = None;
+            let (x, z) = crate::scene::DEFAULT_SPAWN;
+            p.drop_at(m2_math::glam::Vec3::new(x, 400.0, z));
+            game.ride = None;
+            game.on_foot = true;
+            eprintln!("pickup-event-check: she was seated; put on foot at ({x:.0}, {z:.0})");
+        }
+        let ready = game
+            .scene
+            .player
+            .as_ref()
+            .is_some_and(|p| p.landed && p.driving.is_none());
+        if self.t < 10.0 || !ready {
+            return;
+        }
+        let lying = |game: &Game| {
+            game.scene
+                .flights
+                .pickups()
+                .iter()
+                .filter(|p| p.from == PICKUP_CHECK_CRATE)
+                .count()
+        };
+        if self.laid < PICKUP_CHECK_ITEMS.len() && self.t >= self.next {
+            let name = PICKUP_CHECK_ITEMS[self.laid];
+            let Some(world) = game.scene.world.as_ref() else {
+                return;
+            };
+            let db = &world.index.template_db;
+            let what = db.id(name).and_then(|id| mission::pickup(db, id));
+            let at = game.focus();
+            match what {
+                Some(what) => {
+                    eprintln!("pickup-event-check: {name} laid at her feet at {at:.1}");
+                    game.scene.flights.leave(flights::Pickup {
+                        from: PICKUP_CHECK_CRATE,
+                        what,
+                        at,
+                        yaw: 0.0,
+                    });
+                }
+                None => eprintln!("pickup-event-check: no pickup template {name}"),
+            }
+            self.laid += 1;
+            self.next = self.t + 4.0;
+            return;
+        }
+        if self.laid == PICKUP_CHECK_ITEMS.len() && self.t >= self.next {
+            let left = lying(game);
+            // All taken, and the laptop's script has called the PDA.
+            if left == 0 && self.support {
+                self.done = true;
+                eprintln!(
+                    "pickup-event-check: PASS {n} of {n} taken (each with its WeaponEvent line), \
+                     and the laptop's script called the PDA's UpdateSupport",
+                    n = PICKUP_CHECK_ITEMS.len()
+                );
+            } else if self.t >= self.next + 20.0 {
+                self.done = true;
+                if left > 0 {
+                    eprintln!("pickup-event-check: FAIL {left} still lying after 20 s");
+                } else {
+                    eprintln!(
+                        "pickup-event-check: FAIL all taken, but no pda call UpdateSupport in 20 s \
+                         (the laptop's PickupMunitions never ran)"
+                    );
+                }
+            }
+        }
+    }
+}
 
 /// `--death-check`: from [`HURT_AT`] on, lethal damage is dealt her each
 /// [`DEATH_HIT_EVERY`] s until she dies (the scripts' health clamp turns
@@ -4742,6 +4920,13 @@ fn mission_for_screenshot(
     } else {
         10.0
     };
+    // `--pickup-event-check` needs its 10 s, two items 4 s apart and
+    // 20 s to take them: a run long enough for all of it.
+    let seconds = if options.pickup_event_check {
+        seconds.max(PICKUP_CHECK_SECONDS)
+    } else {
+        seconds
+    };
     let mut auto = options.autoplay.then(autoplay::Autoplay::default);
     // How long the scripts' transit map has been up.
     let mut transit_up = 0.0f32;
@@ -4846,6 +5031,7 @@ fn mission_for_screenshot(
     let (mut hijack_running, mut hijack_shots) = (0.0f32, 0u32);
     let mut action_since: Option<u32> = None;
     let mut placed_tried = std::collections::HashSet::new();
+    let mut pickup_check = options.pickup_event_check.then(PickupEventCheck::default);
     let mut death_check = options.death_check.then(DeathCheck::default);
     // Seconds she has been where --props-check hits the props.
     let mut props_ready = 0.0;
@@ -4984,6 +5170,9 @@ fn mission_for_screenshot(
             None => Intent::default(),
         };
         lap.mark("loop: autoplay and what it reads");
+        if let Some(c) = &mut pickup_check {
+            c.tick(game, &link, tick);
+        }
         if let Some(hp) = options.hurt
             && i == (HURT_AT / tick).round() as u32
         {
@@ -6331,6 +6520,9 @@ fn mission_for_screenshot(
         if play_done.is_some_and(|d| i >= d + (options.after_contract / tick).round() as u32) {
             break;
         }
+    }
+    if let Some(c) = &pickup_check {
+        c.finish(game);
     }
     if let Some(sc) = &shop_check {
         for line in sc.summary() {
