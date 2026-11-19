@@ -1334,7 +1334,9 @@ const PICKUP_CHECK_ITEMS: [&str; 2] = ["Cash (Small)", "Fuel Pickup (Large)"];
 /// come down on foot.
 const PICKUP_CHECK_SECONDS: f32 = 90.0;
 
-/// `--pickup-event-check`: from 10 s in, once she is on foot and down,
+/// `--pickup-event-check`: from 10 s in (if she is seated then, as the
+/// mission's start seats her in its speed boat, she is put on foot at the
+/// default spawn, logged), once she is on foot and down,
 /// each of [`PICKUP_CHECK_ITEMS`] is laid at her feet as a crate's
 /// contents lie (no object of its own here, `flights::Pickup` from a
 /// crate 0xC4EC0001 of the check's own), 4 s apart, for her to take as
@@ -1347,6 +1349,8 @@ const PICKUP_CHECK_SECONDS: f32 = 90.0;
 #[derive(Debug, Default)]
 struct PickupEventCheck {
     t: f32,
+    /// She was taken out of the vehicle the mission seated her in.
+    put_ashore: bool,
     laid: usize,
     next: f32,
     done: bool,
@@ -1396,6 +1400,21 @@ impl PickupEventCheck {
             return;
         }
         self.t += dt;
+        // Seated (the mission's start has her in its speed boat): she is
+        // put on foot on land at the default spawn, once, for the check.
+        if self.t >= 10.0
+            && !self.put_ashore
+            && let Some(p) = game.scene.player.as_mut()
+            && p.driving.is_some()
+        {
+            self.put_ashore = true;
+            p.driving = None;
+            let (x, z) = crate::scene::DEFAULT_SPAWN;
+            p.drop_at(m2_math::glam::Vec3::new(x, 400.0, z));
+            game.ride = None;
+            game.on_foot = true;
+            eprintln!("pickup-event-check: she was seated; put on foot at ({x:.0}, {z:.0})");
+        }
         let ready = game
             .scene
             .player
