@@ -223,12 +223,6 @@ m2-alpha [options]
                          camera-check: PASS/FAIL lines and a RESULT line
                          (exit 1 on a failure); kinds: tank, turret, heli,
                          heli-follow, turret-limits, gunner
-  --seat-check           with --screenshot (no --drive needed): stand at the
-                         nearest parked vehicle's gunner's own entrance
-                         (--vehicle narrows it), press use with getting in
-                         locked, then unlocked, then use with getting out
-                         locked, then unlocked; prints seat-check: PASS or
-                         FAIL lines and seat-check: RESULT PASS/FAIL
   --seat-check           with --screenshot (no --drive needed): park a
                          --vehicle (default M151) with a gunner's own
                          entrance near her if none is (trying its models one
