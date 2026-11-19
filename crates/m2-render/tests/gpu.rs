@@ -1094,3 +1094,128 @@ fn a_draws_texture_transform_moves_its_coordinates() {
     assert_eq!(pixel(&rgba, 40, 24), [0, 255, 0, 255], "moved u 0, top");
     assert_eq!(pixel(&rgba, 24, 24), [255, 0, 0, 255], "moved u 1, top");
 }
+
+/// The game's tone map, as the islands' default record has it.
+fn game_tone() -> ToneMap {
+    ToneMap {
+        target: 0.4,
+        min: 0.01,
+        max: 0.8,
+        min_key: 2.5,
+        max_key: 0.85,
+        retention: 0.0,
+        speed: 30.0,
+        contrast_limit: 0.145,
+        contrast: 1.95,
+        log_average: false,
+        average_power: -1.0,
+    }
+}
+
+/// How many pixels of the middle row are neither near the darkest nor
+/// near the brightest: the width of the white quad's blurred edge.
+fn soft_edge(b: &mut WgpuBackend, last: &View, now: &View, motion_blur: f32) -> usize {
+    let (vb, ib) = quad(b);
+    b.set_material(
+        MaterialId(1),
+        &MaterialDesc {
+            color: [1.0, 1.0, 1.0, 1.0],
+            lit: false,
+            ..MaterialDesc::default()
+        },
+    )
+    .unwrap();
+    // The quad's right half covers the left of the screen at 10 m.
+    let world =
+        Mat4::from_translation(Vec3::new(5.0, 0.0, 10.0)) * Mat4::from_scale(Vec3::splat(5.0));
+    let mut row = Vec::new();
+    for v in [last, now, last, now] {
+        let mut v = *v;
+        v.lighting.tone_map = Some(game_tone());
+        v.lighting.sky_color = Vec3::ZERO;
+        v.lighting.motion_blur = motion_blur;
+        b.begin_frame(&v).unwrap();
+        b.draw(&draw(vb, ib, 1, world)).unwrap();
+        b.end_frame().unwrap();
+        let rgba = b.read_pixels().unwrap();
+        row = (0..SIZE).map(|x| pixel(&rgba, x, SIZE / 2)[0]).collect();
+    }
+    let (lo, hi) = (*row.iter().min().unwrap(), *row.iter().max().unwrap());
+    let span = hi.saturating_sub(lo);
+    row.iter()
+        .filter(|&&c| c > lo + span / 10 && c < hi - span / 10)
+        .count()
+}
+
+/// The game's motion blur (its composite's four taps along each pixel's
+/// move since the last frame): a turning camera softens the quad's edge,
+/// a still one or no blur leaves it sharp.
+#[test]
+fn a_turning_camera_blurs_the_frame() {
+    let Some(mut b) = backend() else { return };
+    let look = |x: f32| {
+        View::perspective(
+            Vec3::ZERO,
+            Vec3::new(x, 0.0, 1.0).normalize(),
+            60f32.to_radians(),
+            1.0,
+            0.1,
+            100.0,
+        )
+    };
+    let still = soft_edge(&mut b, &look(0.0), &look(0.0), 0.25);
+    let off = soft_edge(&mut b, &look(0.0), &look(0.3), 0.0);
+    let turning = soft_edge(&mut b, &look(0.0), &look(0.3), 2.5);
+    eprintln!(
+        "soft edge pixels: still {still}, turning unblurred {off}, turning blurred {turning}"
+    );
+    assert!(still <= 2 && off <= 2, "{still} {off}");
+    assert!(turning >= still + 3, "{turning}");
+}
+
+/// The post pass's GPU time at 2560 x 1440 with the game's tone map, its
+/// motion blur off and on (`cargo test -p m2-render --features wgpu
+/// --release --test gpu -- --ignored post_cost --nocapture`).
+#[test]
+#[ignore = "a timing, run by hand"]
+fn post_cost_at_1440p() {
+    let _turn = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Ok(mut b) = WgpuBackend::headless(2560, 1440) else {
+        eprintln!("no GPU");
+        return;
+    };
+    eprintln!("adapter: {:?}", b.adapter_summary());
+    for blur in [0.0, 0.25, 0.0, 0.25] {
+        let mut ms = Vec::new();
+        for i in 0..240 {
+            let x = (i as f32 * 0.01).sin() * 0.2;
+            let mut v = View::perspective(
+                Vec3::ZERO,
+                Vec3::new(x, 0.0, 1.0).normalize(),
+                60f32.to_radians(),
+                16.0 / 9.0,
+                0.1,
+                100.0,
+            );
+            v.lighting.tone_map = Some(game_tone());
+            v.lighting.motion_blur = blur;
+            b.begin_frame(&v).unwrap();
+            b.end_frame().unwrap();
+            if i == 40 {
+                let _ = b.take_gpu_times();
+            }
+        }
+        b.read_pixels().unwrap();
+        if let Some(t) = b.take_gpu_times() {
+            ms.push(t.stages[4] / f64::from(t.frames.max(1)));
+            eprintln!(
+                "motion blur {blur}: post {:.3} ms a frame over {} frames",
+                ms[0], t.frames
+            );
+        } else {
+            eprintln!("no GPU timestamps");
+        }
+    }
+}

@@ -1234,6 +1234,13 @@ impl Destruction {
         for shows in self.alight.drain(..) {
             combat.state_shows(shows);
         }
+        // The parts' states changed a step ago, applied: what of each
+        // shows, its collision, and the effects of those a message
+        // entered ([`Props::apply_states`]).
+        let shows = props.apply_states(&mut world.physics);
+        if !shows.is_empty() {
+            combat.state_shows(shows);
+        }
         // Their part machines' changes (from [`Props::destroy_parts`] on):
         // what each state starts (but the collapse's, which the bring-down
         // below shows), and for the scripts, the island's by their entity

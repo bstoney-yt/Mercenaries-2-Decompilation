@@ -165,8 +165,27 @@ pub struct Props {
     /// The part machines of those destroyed, running on
     /// ([`destroy_parts`](Self::destroy_parts)).
     part_runners: HashMap<u32, m2_engine::part_runner::Runner>,
+    /// Props whose parts take messages one at a time (a building's node
+    /// destroyed by the scripts): their runners are kept for the parts'
+    /// states, settled or not ([`send_part`](Self::send_part)).
+    kept_runners: HashSet<u32>,
     /// Their changes since last asked: (entity, change).
     part_changes: Vec<(u32, m2_engine::part_runner::Change)>,
+    /// The step [`apply_states`](Self::apply_states) is on (one a call,
+    /// a game step).
+    steps: u32,
+    /// Kept runners whose parts' states changed, to be applied the step
+    /// after: (entity, the step it changed on). The 360 queues an
+    /// object's change of state (0x83232DB0) and applies it a step on
+    /// (0x8222D2F0): its shown nodes rebuilt from its parts' states
+    /// (0x821C7648), its physics rebuilt for the parts shown
+    /// (0x82182CE8), the state's commands run (0x82231520).
+    due_states: Vec<(u32, u32)>,
+    /// The states a message put parts in ([`send_part`](Self::send_part)),
+    /// whose effects start as they are applied: (entity, state, step).
+    due_fx: Vec<(u32, u32, u32)>,
+    /// Applied since [`take_applied`](Self::take_applied).
+    applied: Vec<Applied>,
     /// Node matrices of those that move on their own, by entity
     /// ([`crate::moving`]).
     poses: HashMap<u32, Vec<Mat4>>,
@@ -206,6 +225,22 @@ pub struct Props {
     /// Wrecked since [`take_fallen`](Self::take_fallen): what falls with
     /// them is brought down too (`DestructionLink`).
     fallen: Vec<u32>,
+}
+
+/// A prop's parts' states applied ([`Props::apply_states`]): which nodes
+/// that showed and hid, by name hash, and the steps.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Applied {
+    pub entity: u32,
+    /// The step the states changed on (the message's), and the step they
+    /// were applied on.
+    pub sent: u32,
+    pub landed: u32,
+    /// Nodes shown that were hidden, and hidden that were shown.
+    pub shown: Vec<u32>,
+    pub hidden: Vec<u32>,
+    /// How many of its parts are down now.
+    pub down: usize,
 }
 
 /// Which parts of a prop are broken ([`m2_engine::ModelParts`]), and the
@@ -333,6 +368,12 @@ impl Props {
     /// has them ([`m2_engine::ModelParts`]) and it stands.
     pub fn model_parts(&self, entity: u32) -> Option<&Arc<m2_engine::ModelParts>> {
         let p = self.shown.get(&entity).filter(|p| !p.wrecked)?;
+        self.models.get(&p.model)?.as_ref()?.gpu.parts.as_ref()
+    }
+
+    /// `entity`'s model parts, wrecked or not.
+    fn any_model_parts(&self, entity: u32) -> Option<&Arc<m2_engine::ModelParts>> {
+        let p = self.shown.get(&entity)?;
         self.models.get(&p.model)?.as_ref()?.gpu.parts.as_ref()
     }
 
@@ -1862,10 +1903,16 @@ impl Props {
         }
         for (e, r) in self.part_runners.iter_mut() {
             r.advance(dt);
+            let changes = r.take_changes();
+            if !changes.is_empty() && self.kept_runners.contains(e) {
+                self.due_states.push((*e, self.steps));
+            }
             self.part_changes
-                .extend(r.take_changes().into_iter().map(|c| (*e, c)));
+                .extend(changes.into_iter().map(|c| (*e, c)));
         }
-        self.part_runners.retain(|_, r| !r.settled());
+        let kept = &self.kept_runners;
+        self.part_runners
+            .retain(|e, r| !r.settled() || kept.contains(e));
         // Gates swing on; a shut one stands in the way again
         // ([`update`](Self::update) puts its collision back).
         // Each at its widest leaf's pace, a quarter turn where its model
@@ -1925,6 +1972,142 @@ impl Props {
         if !runner.settled() {
             self.part_runners.insert(entity, runner);
         }
+    }
+
+    /// Part `machine` (its node's name hash) of `entity` takes `message`
+    /// (a node's `DestroyMsg` from the scripts) from the state it is in
+    /// now: the part machines are run as the 360 runs them on the object
+    /// (0x82289020 -> the part's state machine, [`m2_engine::part_runner`]),
+    /// each part keeping its state between messages. Returns the changes
+    /// it makes at once (later ones come with
+    /// [`take_part_changes`](Self::take_part_changes)); none for a model
+    /// with no part states or no such part.
+    pub fn send_part(
+        &mut self,
+        entity: u32,
+        machine: u32,
+        message: u32,
+    ) -> Vec<m2_engine::part_runner::Change> {
+        if !self.part_runners.contains_key(&entity) {
+            let Some(states) = self
+                .shown
+                .get(&entity)
+                .and_then(|p| self.models.get(&p.model)?.as_ref())
+                .and_then(|m| m.gpu.part_states.clone())
+            else {
+                return Vec::new();
+            };
+            let (machines, names) = &*states;
+            let name = |n: u16| names.get(usize::from(n)).copied().unwrap_or(0);
+            self.part_runners.insert(
+                entity,
+                m2_engine::part_runner::Runner::new(machines, name, entity),
+            );
+        }
+        self.kept_runners.insert(entity);
+        let Some(r) = self.part_runners.get_mut(&entity) else {
+            return Vec::new();
+        };
+        r.deliver_named(machine, message);
+        let changes = r.take_changes();
+        if !changes.is_empty() {
+            self.due_states.push((entity, self.steps));
+            self.due_fx
+                .extend(changes.iter().map(|c| (entity, c.state, self.steps)));
+        }
+        changes
+    }
+
+    /// Whether `entity`'s parts take messages one at a time
+    /// ([`send_part`](Self::send_part)): their states, not a part's wreck,
+    /// say what of it shows.
+    pub fn parts_by_state(&self, entity: u32) -> bool {
+        self.kept_runners.contains(&entity)
+    }
+
+    /// The parts' states changed before this step, applied: what of each
+    /// prop shows is rebuilt from the states its parts are in (each
+    /// state's own nodes shown and hidden, [`m2_engine::ModelParts::hidden_in_states`]),
+    /// the parts with nothing of their own left shown are down, and its
+    /// collision is rebuilt once for the rest. Returns the effects the
+    /// states a message entered start (as [`state_effects`](Self::state_effects));
+    /// those of states due later come with
+    /// [`take_part_changes`](Self::take_part_changes).
+    pub fn apply_states(&mut self, physics: &mut Physics) -> Vec<(u32, Vec3)> {
+        self.steps += 1;
+        let now = self.steps;
+        let (ready, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut self.due_states)
+            .into_iter()
+            .partition(|&(_, step)| step < now);
+        self.due_states = wait;
+        let (fx, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut self.due_fx)
+            .into_iter()
+            .partition(|&(_, _, step)| step < now);
+        self.due_fx = wait;
+        let mut done = HashSet::new();
+        for (e, sent) in ready {
+            if !done.insert(e) {
+                continue;
+            }
+            // Applied even once the object is wrecked: its death sends
+            // its nodes' messages in the same step (0x82289F40), and the
+            // 360 applies the queued states all the same.
+            let Some(parts) = self.any_model_parts(e).cloned() else {
+                continue;
+            };
+            let Some(states) = self.part_runners.get(&e).map(|r| r.states()) else {
+                continue;
+            };
+            let m2_engine::model::StatesApplied {
+                hidden,
+                wrecked,
+                shown,
+                gone,
+            } = parts.apply_states(
+                |k| states.get(k).copied().flatten(),
+                self.parts_down.get(&e).map(|d| d.hidden.as_slice()),
+            );
+            let collision_changed = self
+                .parts_down
+                .get(&e)
+                .map_or(wrecked.contains(&true), |d| d.wrecked != wrecked);
+            let down = wrecked.iter().filter(|&&w| w).count();
+            self.parts_down.insert(
+                e,
+                PartsDown {
+                    wrecked: wrecked.clone(),
+                    hidden,
+                },
+            );
+            self.changed();
+            // Its physics for the parts shown, once.
+            if collision_changed
+                && !parts.meshes.is_empty()
+                && let Some(p) = self.shown.get(&e)
+            {
+                physics.remove_static(StaticKey::Entity(e));
+                if let Some(shape) = parts.collision(&wrecked) {
+                    physics.add_static(StaticKey::Entity(e), &shape, p.position, p.rotation);
+                }
+            }
+            self.applied.push(Applied {
+                entity: e,
+                sent,
+                landed: now,
+                shown,
+                hidden: gone,
+                down,
+            });
+        }
+        fx.into_iter()
+            .flat_map(|(e, state, _)| self.state_effects(e, state))
+            .collect()
+    }
+
+    /// The parts' states applied since last asked
+    /// ([`apply_states`](Self::apply_states)).
+    pub fn take_applied(&mut self) -> Vec<Applied> {
+        std::mem::take(&mut self.applied)
     }
 
     /// The part machines' changes since last asked ([`destroy_parts`]).
