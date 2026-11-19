@@ -252,6 +252,12 @@ pub struct Lighting {
     /// Scale on the alpha of searchlight beams ([`MaterialDesc::beam`]):
     /// 0 puts them out, 1 shows them as drawn.
     pub beam_gain: f32,
+    /// With the game's tone map: its motion blur's velocity multiplier
+    /// (the post pass's `MotionBlurVelocityScale.x`, the game's post
+    /// object +0x34): each pixel is blurred along this share of how far
+    /// it moved on screen since the last frame. 0 turns it off; the game
+    /// keeps 0.25 (see the post pass).
+    pub motion_blur: f32,
     /// Film grain over the finished frame: how far each speck (two
     /// pixels square, new each frame) moves a display value either way;
     /// 0 for none.
@@ -462,6 +468,7 @@ impl Default for Lighting {
             tone_map: None,
             monochrome: None,
             beam_gain: 1.0,
+            motion_blur: 0.0,
             grain: 0.0,
             gamma_light: false,
         }
