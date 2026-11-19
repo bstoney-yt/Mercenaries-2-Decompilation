@@ -115,7 +115,6 @@ fn run(spec: &VehicleSpec, count: usize, loose: bool) {
     let mut p = Physics::new();
     // Every crate a body of its own (the port holds all but the newest
     // [`m2_engine::physics`]'s 160 loose pieces fixed).
-    p.set_debris_cap(usize::MAX);
     let half = 1000.0;
     let v = [
         Vec3::new(-half, 0.0, -half),
@@ -350,7 +349,6 @@ fn timed(p: &mut Physics, seconds: f32, ms: &mut Vec<f64>) -> (usize, Option<f32
 /// stand-in for the terrain under it, which the flat floor isn't).
 fn town_run(placed: &[Placed], lo: Vec3, loose: bool, asleep: bool, slabs: bool) {
     let mut p = Physics::new();
-    p.set_debris_cap(usize::MAX);
     let mut pieces = Vec::new();
     for (k, o) in placed.iter().enumerate() {
         let (_, rotation, translation) = o.at.to_scale_rotation_translation();

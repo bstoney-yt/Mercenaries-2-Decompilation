@@ -11,10 +11,18 @@
 //! on a winch, lets it go and destroys it, printing the marker count
 //! after each. For `collectable` it stands her beside the first one and
 //! takes its context action; for `pmcgate` and `repairpad` it counts
-//! what they ask of the first one. For `AntiAir` it spawns a crewed
+//! what they ask of the first one. For `paradroplocation` it stands her
+//! by the first location and prints the flyby it asks for; for
+//! `paradrop` (or `paratrooper`) it puts the paradrop plane (an optional
+//! third argument names its template) 100 m over her, counts the men it
+//! drops in 20 s, sets their health to 0 and counts the soldiers put in
+//! their places.
+//! For `AntiAir` it spawns a crewed
 //! `M113 AA (VZ) (Driver)` where the first stands, comes near it, has it
 //! lock on her and fire, and counts the radar calls the scripts make
-//! (`antiair:` lines). For `autogunship` it flies the gunship over her
+//! (`antiair:` lines). For `Laptop` it stands her beside the first and
+//! has her pick it up, printing the marker count and what it says
+//! (headless there is no PDA: the HUD's). For `autogunship` it flies the gunship over her
 //! with a hostile vehicle near her and prints the shells it fires
 //! (`gunship:` lines). For `C4` and `beacon` it throws one (`C4
 //! Projectile`, `ammo_designator_beacon`), leaves it 3 s and takes it
@@ -144,6 +152,27 @@ fn main() -> Result<()> {
             alive(&mission)
         );
     }
+    if name.eq_ignore_ascii_case("Laptop")
+        && let Some(&(_, first, at)) = on.first()
+    {
+        // Beside it, so that it wakes and puts its blip up; then the hero
+        // picks it up (`WeaponEvent` "pickup"), as the game raises it.
+        mission.put_player([at[0] + 2.0, at[1], at[2]]);
+        run(&mut mission, 1.0);
+        println!("markers beside the first: {}", markers(&mission));
+        mission.weapon_event(m2_game::mission::PLAYER, "pickup", first);
+        let mut said = Vec::new();
+        for _ in 0..4 {
+            mission.tick(0.25);
+            said.extend(
+                mission
+                    .take_log()
+                    .into_iter()
+                    .filter(|l| l.contains("print")),
+            );
+        }
+        println!("picked up: {said:?}");
+    }
     if name.starts_with("tree_") {
         // An island tree of a template that runs it, burnt down: what
         // its script plays.
@@ -268,6 +297,31 @@ fn main() -> Result<()> {
         let level = args.get(3).is_some_and(|a| a == "level");
         autogunship(&mut mission, args.get(2).map(String::as_str), level)?;
     }
+    if name.eq_ignore_ascii_case("paradroplocation") {
+        // What the locations fly once awake: stood beside the first.
+        if let Some(&(_, _, at)) = on.first() {
+            mission.put_player([at[0] + 5.0, at[1], at[2]]);
+        }
+        let end = mission.now() + 2.0;
+        while mission.now() < end {
+            mission.tick(0.25);
+            for c in mission.take_commands() {
+                if let Command::Flyby {
+                    what,
+                    from,
+                    to,
+                    speed,
+                    ..
+                } = c
+                {
+                    println!("flyby of {what:?} from {from:.0?} to {to:.0?} at {speed} m/s");
+                }
+            }
+        }
+    }
+    if name.eq_ignore_ascii_case("paradrop") || name.eq_ignore_ascii_case("paratrooper") {
+        paradrop(&mut mission, args.get(2).map(String::as_str));
+    }
     if ["c4", "beacon"].contains(&name.to_ascii_lowercase().as_str()) {
         thrown(&mut mission, name);
     }
@@ -279,6 +333,55 @@ fn main() -> Result<()> {
     }
     println!("{name} lines logged: {failures}");
     Ok(())
+}
+
+/// The paradrop plane (`template`, the Allied one by default) put 100 m
+/// over her: counts the paratroopers it drops in 20 s, then has each
+/// land hurt (health 0, as a deadly fall leaves him) and counts the
+/// soldiers put in their places.
+fn paradrop(mission: &mut Mission, template: Option<&str>) {
+    let template = template.unwrap_or("Support Vehicle (Paradrop_AL)");
+    mission.put_player([0.0, 0.0, 0.0]);
+    let plane = mission.spawn(template, [0.0, 100.0, 0.0]);
+    println!("spawned {template}: {plane:?}");
+    let mut jumpers: Vec<(u32, String, [f32; 3])> = Vec::new();
+    let end = mission.now() + 20.0;
+    while mission.now() < end {
+        mission.tick(0.25);
+        for c in mission.take_commands() {
+            if let Command::Spawn {
+                guid,
+                what,
+                position,
+                ..
+            } = c
+            {
+                jumpers.push((guid, what, position));
+            }
+        }
+    }
+    println!("{} dropped in 20 s", jumpers.len());
+    for (_, what, at) in jumpers.iter().take(3) {
+        println!("  {what} at {at:.1?}");
+    }
+    let mut soldiers: Vec<String> = Vec::new();
+    let mut removed = 0;
+    for &(guid, ..) in &jumpers {
+        mission.set_health(guid, 0.0);
+    }
+    let end = mission.now() + 2.0;
+    while mission.now() < end {
+        mission.tick(0.25);
+        for c in mission.take_commands() {
+            match c {
+                Command::Spawn { what, .. } => soldiers.push(what),
+                Command::Remove(_) => removed += 1,
+                _ => {}
+            }
+        }
+    }
+    soldiers.dedup();
+    println!("landed: {removed} jumpers removed, soldiers put in: {soldiers:?}");
 }
 
 /// The island fortress's part whose `DestroyMsg` its script waits for.
