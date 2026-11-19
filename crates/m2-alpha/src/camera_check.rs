@@ -13,7 +13,8 @@
 //! `heli` (a helicopter pilot's, [`m2_engine::pad_camera::HeliLook`]),
 //! `heli-follow` (that camera following the helicopter's turn, nose and
 //! bank, [`m2_engine::pad_camera::HeliFollow`], with the helicopter's
-//! motion scripted).
+//! motion scripted), `turret-limits` (the turret camera's eased input
+//! dropped at a limit, and the M113 AA driver's turret camera).
 
 use std::collections::HashMap;
 
@@ -174,9 +175,10 @@ pub fn run(install: &Install, kind: &str) -> anyhow::Result<bool> {
         "turret" => turret(&records, &mut t),
         "heli" => heli(&records, &mut t),
         "heli-follow" => heli_follow(&records, &mut t),
-        other => {
-            anyhow::bail!("--camera-check: no kind {other:?} (tank, turret, heli, heli-follow)")
-        }
+        "turret-limits" => turret_limits(&records, &mut t),
+        other => anyhow::bail!(
+            "--camera-check: no kind {other:?} (tank, turret, heli, heli-follow, turret-limits)"
+        ),
     }
     Ok(t.finish())
 }
@@ -362,4 +364,62 @@ fn heli_follow(records: &Records, t: &mut Tally) {
         13.0,
         0.05,
     );
+}
+
+/// #713's recipe: at a limit, pushing on drops the axis's eased input to
+/// 0 before the frame's step (0x824C9538, 0x824C9058), so it reads one
+/// step from rest after it; reversed, it is non-zero on the first frame. And the M113 AA's driver's seat has its turret camera.
+fn turret_limits(records: &Records, t: &mut Tally) {
+    let Some((name, tuning)) = records.turret("quad") else {
+        t.missing("turret quad");
+        return;
+    };
+    let push = |pad: &mut Pad, stick: [f32; 2], frames: usize| {
+        let mut input = Input::default();
+        let s = PadState {
+            right_raw: stick,
+            ..PadState::default()
+        };
+        for _ in 0..frames {
+            pad.feed(&mut input, s, Mode::OnFoot, DT);
+            input.take_pad_turn();
+            input.take_pad_look();
+        }
+    };
+    let (_, high) = tuning.pitch_up();
+    let mut pad = Pad::default();
+    pad.turret_tuning = Some(tuning);
+    pad.turret_base = Some(0.0);
+    pad.yaw = 0.0;
+    // Eased up to speed below the limit, then held at the limit pushing on.
+    pad.pitch = 0.0;
+    push(&mut pad, [0.0, 1.0], 60);
+    let before = pad.turret_camera.pitch.value;
+    pad.pitch = high;
+    push(&mut pad, [0.0, 1.0], 1);
+    let at = pad.turret_camera.pitch.value;
+    // Dropped to 0 before the frame's step, then one step from rest:
+    // (1 - keep) of the input.
+    let one_step = 1.0 - tuning.pitch_keep[0];
+    t.line(
+        before > 0.5 && (at - one_step).abs() < 1e-4,
+        &format!(
+            "turret-limits {name}: at the pitch limit pushing on, eased input {before:.3} -> {at:.3} (360: dropped to 0, then one step {one_step:.3})"
+        ),
+    );
+    push(&mut pad, [0.0, -1.0], 1);
+    let back = pad.turret_camera.pitch.value;
+    t.line(
+        back != 0.0,
+        &format!(
+            "turret-limits {name}: reversed, first frame eased input {back:.3} (360: non-zero)"
+        ),
+    );
+    match records.find("m113", |v| v.driver_turret.map(|_| ())) {
+        Some((m113, ())) => t.line(
+            true,
+            &format!("turret-limits {m113}: driver's seat has its CameraTurret"),
+        ),
+        None => t.missing("turret-limits m113 driver's CameraTurret"),
+    }
 }

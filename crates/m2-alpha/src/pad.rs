@@ -386,6 +386,10 @@ pub struct Pad {
     /// with a `CameraTurret`, and its state.
     pub turret_tuning: Option<m2_engine::pad_camera::TurretLookTuning>,
     pub turret_camera: m2_engine::pad_camera::TurretLook,
+    /// The gun's base heading while she mans one (its turret camera's
+    /// limits are about it), and her view's yaw now.
+    pub turret_base: Option<f32>,
+    pub yaw: f32,
     /// A helicopter's: its pilot camera's tuning while she flies one with
     /// a `CameraHelicopter`, and its state.
     pub heli_tuning: Option<m2_engine::pad_camera::HeliLookTuning>,
@@ -609,12 +613,20 @@ impl Pad {
         }
         // Look. On foot as the 360's camera turns ([`look_on_foot`]);
         // elsewhere squared, so small pushes aim finely.
-        if let (Mode::OnFoot, Some(t)) = (mode, self.turret_tuning) {
-            // Manning a gun, as the 360's turret camera turns
-            // ([`m2_engine::pad_camera::TurretLook`]).
+        if let Some(t) = self.turret_tuning {
+            // Manning a gun, or driving from a seat that aims one (the
+            // M113 AA's), as the 360's turret camera turns
+            // ([`m2_engine::pad_camera::TurretLook`]); at a limit, pushing
+            // on drops its eased value first.
+            use m2_engine::pad_camera as cam;
             let [x, y] = s.right_raw;
             let y = if self.invert { -y } else { y };
-            let stick = m2_engine::pad_camera::stick(x, y);
+            let stick = cam::stick(x, y);
+            if let Some(base) = self.turret_base {
+                let yaw_at = cam::turret_at(self.yaw, base, t.yaw);
+                let pitch_at = cam::turret_at(self.pitch, 0.0, t.pitch_up());
+                self.turret_camera.hold(stick, yaw_at, pitch_at);
+            }
             let (yaw, pitch) = self.turret_camera.step(stick, &t, dt as f32);
             input.pad_turn(f64::from(yaw), f64::from(pitch));
         } else if mode == Mode::OnFoot {
