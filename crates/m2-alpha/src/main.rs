@@ -7618,8 +7618,8 @@ fn drive_for_screenshot(
     install: Option<&Install>,
 ) -> anyhow::Result<()> {
     game.combat.homing_check = options.homing_check;
-    game.scene.props.bodies_on = options.prop_bodies_check;
-    if options.prop_bodies_check
+    game.scene.props.bodies_on = options.prop_bodies_check || options.prop_limits_check;
+    if (options.prop_bodies_check || options.prop_limits_check)
         && let Some(w) = game.scene.world.as_mut()
     {
         // The island's placed objects that come loose whole (the café
@@ -12957,19 +12957,54 @@ fn prop_limits_check(
         .id
         .and_then(|c| world.physics.vehicle_transform(c))
         .map_or(centre, |m| m.w_axis.truncate());
-    let target = game
+    // A piece lying loose (a prop's, or an island object's body), the
+    // nearest with 12 m of level, open ground before it from any of eight
+    // sides: the car is put on the ground there (the q744c run's car,
+    // put among walls, never moved).
+    let mut near: Vec<(m2_engine::DebrisId, Vec3)> = game
         .scene
         .props
         .knocked_pieces()
         .into_iter()
+        .chain(
+            world
+                .as_bodies()
+                .filter_map(|(_, ids)| ids.first().copied()),
+        )
         .filter_map(|id| Some((id, world.physics.debris_place(id)?.w_axis.truncate())))
-        .min_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)));
-    let Some((id, at)) = target else {
-        eprintln!("prop-limits-check: FAIL no piece lies knocked loose");
+        .collect();
+    near.sort_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)));
+    let physics = &world.physics;
+    let ground = |x: f32, z: f32, from: f32| {
+        physics
+            .cast_ray(Vec3::new(x, from + 20.0, z), Vec3::NEG_Y, 60.0)
+            .map(|(d, _)| from + 20.0 - d)
+    };
+    let run = near.iter().take(60).find_map(|&(id, at)| {
+        (0..8).find_map(|k| {
+            let a = k as f32 * std::f32::consts::FRAC_PI_4;
+            let way = Vec3::new(a.sin(), 0.0, a.cos());
+            let start = at - way * 12.0;
+            let floor = ground(start.x, start.z, at.y)?;
+            if (floor - at.y).abs() > 1.5 {
+                return None;
+            }
+            let from = Vec3::new(start.x, floor + 0.8, start.z);
+            let to = Vec3::new(at.x, floor + 0.8, at.z);
+            let gap = physics
+                .cast_ray(from, (to - from).normalize_or(way), 14.0)
+                .map_or(f32::MAX, |(d, _)| d);
+            (gap >= 10.5).then_some((id, at, way, Vec3::new(start.x, floor, start.z)))
+        })
+    });
+    let Some((id, at, way, start)) = run else {
+        eprintln!(
+            "prop-limits-check: FAIL no piece lying loose has 12 m of open ground before it ({} looked at)",
+            near.len().min(60)
+        );
         return Ok(());
     };
-    let way = (at - here).with_y(0.0).normalize_or(Vec3::Z);
-    let start = at - way * 12.0;
+    eprintln!("prop-limits-check: the car is put at {start:.1}, 12 m short of a piece at {at:.1}");
     let yaw = way.x.atan2(way.z);
     if let Some(world) = game.scene.world.as_mut() {
         let v = &mut game.scene.vehicles[i];
