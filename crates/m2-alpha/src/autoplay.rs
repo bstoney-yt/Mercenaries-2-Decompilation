@@ -6698,6 +6698,7 @@ mod tests {
             links: Vec::new(),
             turret: None,
             flags: Default::default(),
+            camera: None,
         };
         let entrance = |name: u32| Entrance {
             name,
