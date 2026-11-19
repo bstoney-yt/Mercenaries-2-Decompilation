@@ -6021,7 +6021,13 @@ impl Fleet {
                         .filter(|o| o.alive && o.position[1] > HIDDEN_BELOW)
                     && !w.winch.get(&g).is_some_and(Option::is_some)
                     && !game.scene.flights.carrying(g)
-                    && place(physics, v, Vec3::from(o.position), o.yaw)
+                    && place(
+                        physics,
+                        v,
+                        Vec3::from(o.position),
+                        o.yaw,
+                        o.rotation.map(m2_math::glam::Quat::from_array),
+                    )
                     && self.reenter == Some(g)
                     && let Some(p) = game.scene.player.as_mut()
                 {

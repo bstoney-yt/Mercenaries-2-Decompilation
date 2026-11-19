@@ -35,6 +35,8 @@ struct Spot<'a> {
     name: &'a str,
     at: Vec3,
     yaw: f32,
+    /// Its whole authored turn.
+    rotation: Quat,
 }
 
 /// How quickly her lens eases to its gun's share aiming and back, a second
@@ -147,6 +149,9 @@ pub struct Game {
     pub winches: crate::winches::Winches,
     /// Layer entities of the island's vehicles asked for so far.
     fetched: HashSet<u32>,
+    /// The layers' parked vehicles' whole authored turns, by entity:
+    /// placed as authored ([`place`]).
+    authored: HashMap<u32, Quat>,
     /// The island's traffic spawners and what they have out.
     pub traffic: crate::traffic::Traffic,
     /// A pursuit's gunships ([`crate::gunships`]).
@@ -533,6 +538,7 @@ impl Game {
             beds_told: HashSet::new(),
             winches: Default::default(),
             fetched: HashSet::new(),
+            authored: HashMap::new(),
             traffic: crate::traffic::Traffic::default(),
             gunships: crate::gunships::Gunships::default(),
             pursuers: crate::pursuers::Pursuers::default(),
@@ -758,7 +764,13 @@ impl Game {
                 continue;
             }
             if let Some((entity, at, yaw)) = v.spot
-                && place(&mut world.physics, v, at, yaw)
+                && place(
+                    &mut world.physics,
+                    v,
+                    at,
+                    yaw,
+                    self.authored.get(&entity).copied(),
+                )
             {
                 eprintln!(
                     "island vehicle {entity:#x}: {} parked at ({:.0}, {:.0}, {:.0})",
@@ -800,6 +812,7 @@ impl Game {
                     name: &t.name,
                     at: t.position,
                     yaw: f.x.atan2(f.z),
+                    rotation: t.rotation,
                 }
             })
             .chain(state_layers.iter().map(|e| Spot {
@@ -807,6 +820,7 @@ impl Game {
                 name: &e.name,
                 at: e.position,
                 yaw: e.yaw,
+                rotation: e.rotation,
             }))
             .filter(|t| !self.fetched.contains(&t.entity) && t.at.y > HIDDEN_BELOW)
             .filter_map(|t| {
@@ -843,6 +857,7 @@ impl Game {
                 scene.ruins.insert(t.entity);
             }
             let crew = world.index.template_db.crew(t.name);
+            self.authored.insert(t.entity, t.rotation);
             loads.push((t.entity, t.at, t.yaw, crew, models));
         }
         for (entity, at, yaw, crew, models) in loads {
@@ -4309,8 +4324,13 @@ const PARK_LOOK: f32 = 60.0;
 const PARK_SHORE: f32 = 0.5;
 const PARK_SLACK: f32 = 2.0;
 /// Vehicles are let go this far above where they rest, to settle onto
-/// their wheels, metres.
+/// their wheels, metres (those not placed as authored: invented).
 const DROP: f32 = 0.3;
+/// A vehicle placed as authored waits for something under its origin
+/// within this many metres (its deck, bridge or ground), metres.
+/// Invented: the survey's vehicles stand within 0.2 m of what is under
+/// them, bar those on what loads later.
+pub const AUTHORED_FLOOR: f32 = 1.5;
 /// Room left between parked vehicles, metres.
 const PARK_GAP: f32 = 1.5;
 
@@ -5604,10 +5624,39 @@ fn spray(world: &World, vehicles: &[ParkedVehicle], combat: &mut Combat) {
     }
 }
 
-/// Puts a vehicle on the ground at `at` facing `yaw`, tilted to the
-/// ground under its wheels; false while the ground there hasn't loaded.
-/// A boat on the sea floats on it.
-pub(crate) fn place(physics: &mut Physics, v: &mut ParkedVehicle, at: Vec3, yaw: f32) -> bool {
+impl Game {
+    /// The authored turn of the layers' parked vehicle `entity`, if one
+    /// was placed as authored ([`place`]).
+    pub fn authored_turn(&self, entity: u32) -> Option<Quat> {
+        self.authored.get(&entity).copied()
+    }
+}
+
+/// Puts a vehicle where it stands: false while what it stands on hasn't
+/// loaded. A boat on the sea floats on it.
+///
+/// One a layer placed (`authored`: its `Transform`'s whole turn) is put
+/// **as authored**, at `at` turned by `authored`, with no fit to the ground
+/// and no drop. From the 360 code: a layer's vehicle is made by the layer
+/// loader (0x823E6AB8 -> 0x82408C30 -> its physics creator, 0x823FDB60
+/// for a car -> 0x821831B0), its body at the object's own matrix
+/// (0x8218CAA8: 0x82185FE0 -> vfunc +0x128) with nothing reading the
+/// ground. The layers author them at rest (survey of 1397 state-layer
+/// and 35 static cars and tanks: 871 within 5 cm of the wheels' rest on
+/// the terrain). It waits until there is something under it within
+/// [`AUTHORED_FLOOR`] (its deck or bridge loaded, not only the terrain far
+/// below): invented, the 360 makes it with its layer.
+///
+/// Any other (a script's, `None`) is put on the ground at `at` facing
+/// `yaw`, tilted to the ground under its wheels, and let go [`DROP`] over
+/// it: **invented** (the 360's spawn, 0x82409B38, is not yet traced).
+pub(crate) fn place(
+    physics: &mut Physics,
+    v: &mut ParkedVehicle,
+    at: Vec3,
+    yaw: f32,
+    authored: Option<Quat>,
+) -> bool {
     // From a little above where the layers put it (so one under a bridge
     // or a gantry stays under it), else from well above.
     let ground = |p: Vec3| {
@@ -5627,6 +5676,17 @@ pub(crate) fn place(physics: &mut Physics, v: &mut ParkedVehicle, at: Vec3, yaw:
     if let Some(water) = float {
         let at = Vec3::new(at.x, water - float_depth(&v.spec), at.z);
         v.id = Some(physics.add_vehicle_turned(&v.spec, at, Quat::from_rotation_y(yaw)));
+        return true;
+    }
+    // As authored: where its layer put it, turned as it put it.
+    if let Some(turn) = authored.filter(|q| q.is_finite() && !v.spec.is_boat()) {
+        let floor = physics
+            .cast_ray(at + Vec3::Y * 2.0, Vec3::NEG_Y, 2.0 + AUTHORED_FLOOR)
+            .is_some();
+        if !floor {
+            return false;
+        }
+        v.id = Some(physics.add_vehicle_turned(&v.spec, at, turn.normalize()));
         return true;
     }
     // (Never where it came out NaN: round 88 lost the start boat, and her
@@ -6559,6 +6619,79 @@ fn switch_weapon(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    // A layer's parked vehicle is put as authored: where and as turned as
+    // its `Transform` says (here a little tilted, 0.05 m over the ground),
+    // with no fit to the ground and no drop; a script's still rests on the
+    // ground under it and is let go DROP over it.
+    #[test]
+    fn a_layer_vehicle_is_placed_as_authored_a_scripts_on_the_ground() {
+        use m2_math::glam::{Quat, Vec3};
+        let mut physics = m2_engine::Physics::new();
+        let ground = m2_engine::CollisionShape::cuboid(Vec3::new(50.0, 0.5, 50.0));
+        physics.add_static(
+            m2_engine::StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -0.5, 0.0),
+            Quat::IDENTITY,
+        );
+        physics.step(1.0 / 60.0);
+        let parked = || crate::scene::ParkedVehicle {
+            spec: crate::npc::tests::tank(m2_engine::tuning::VehicleTuning::default()),
+            model: crate::npc::tests::empty_model(),
+            id: None,
+            wrecked: false,
+            guid: None,
+            spot: None,
+            crew: Vec::new(),
+            turret: 0.0,
+            hijack_nodes: Vec::new(),
+            door_turns: Vec::new(),
+            gun: 0.0,
+            aims: Vec::new(),
+            rolled: 0.0,
+            fired: 0,
+            mg_fired: 0,
+            damage: 0.0,
+            hit: 0.0,
+            parts: None,
+            loose: Vec::new(),
+            debris_thrown: false,
+        };
+        let turn = Quat::from_rotation_y(0.7) * Quat::from_rotation_x(0.03);
+        let at = Vec3::new(3.0, 0.05, -2.0);
+        let mut v = parked();
+        assert!(super::place(&mut physics, &mut v, at, 0.7, Some(turn)));
+        let m = physics.vehicle_transform(v.id.unwrap()).unwrap();
+        let (_, r, p) = m.to_scale_rotation_translation();
+        assert!(p.distance(at) < 1e-3, "{p}");
+        assert!(r.angle_between(turn) < 1e-3);
+        // Nothing under it within reach: it waits.
+        let mut high = parked();
+        assert!(!super::place(
+            &mut physics,
+            &mut high,
+            at + Vec3::Y * 10.0,
+            0.0,
+            Some(turn)
+        ));
+        assert!(high.id.is_none());
+        // A script's: on the ground, let go DROP over its rest.
+        let mut s = parked();
+        assert!(super::place(
+            &mut physics,
+            &mut s,
+            Vec3::new(-10.0, 5.0, 0.0),
+            0.0,
+            None
+        ));
+        let y = physics.vehicle_transform(s.id.unwrap()).unwrap().w_axis.y;
+        let rest = s.spec.ride_height();
+        assert!(
+            (y - (rest + super::DROP)).abs() < 0.05,
+            "{y} against {rest}"
+        );
+    }
 
     #[test]
     fn a_pickup_taken_sets_off_its_pickup_effect() {

@@ -5409,7 +5409,7 @@ impl Autoplay {
                     Some(spot) => {
                         world.physics.remove_vehicle(id);
                         v.id = None;
-                        if !place(&mut world.physics, v, spot, yaw) {
+                        if !place(&mut world.physics, v, spot, yaw, None) {
                             eprintln!(
                                 "autoplay: no water to put the {} on at {spot:.1}",
                                 v.spec.label
@@ -5449,7 +5449,7 @@ impl Autoplay {
                 if let Some(id) = v.id.take() {
                     world.physics.remove_vehicle(id);
                 }
-                if !place(&mut world.physics, v, to, yaw) {
+                if !place(&mut world.physics, v, to, yaw, None) {
                     eprintln!(
                         "autoplay: no ground to put the {} on at {to:.1}",
                         v.spec.label
