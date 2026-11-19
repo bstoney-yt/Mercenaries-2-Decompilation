@@ -9409,6 +9409,10 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
         game.step(Intent::default(), tick);
     }
     still(game);
+    // As Xenia's runs (Mattias, 120 of 120): so a near blast's loss is not
+    // cut by a lower whole health or her clamp.
+    game.combat.max_hp = 120.0;
+    game.combat.hp = 120.0;
     let her = |game: &Game| game.scene.player.as_ref().map(|p| p.character.position);
     let (hp, her_from) = (game.combat.hp, her(game));
     // Where the car is now, as it is wrecked: her distance from its
