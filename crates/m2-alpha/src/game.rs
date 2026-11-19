@@ -4910,11 +4910,20 @@ fn knock_loose(
             let db = &world.index.template_db;
             let sound = vehicle_sound_key(db, &v.spec.label, v.spec.model).unwrap_or(0);
             for (d, _, closing, prop_mass) in world.physics.vehicle_prop_hits(id) {
-                if let Some(e) = props.body_entity(d) {
+                // A state layer's prop, or one of the island's placed
+                // objects that is a body of its own (q753e: the check's
+                // was one of these, and no meeting was ever taken).
+                let key = props.body_entity(d).map(StaticKey::Entity).or_else(|| {
+                    world
+                        .as_bodies()
+                        .find(|(_, ids)| ids.contains(&d))
+                        .map(|(i, _)| StaticKey::Object(i))
+                });
+                if let Some(key) = key {
                     met.push((
                         index,
                         d,
-                        e,
+                        key,
                         closing,
                         prop_mass,
                         Crasher {

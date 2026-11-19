@@ -779,7 +779,7 @@ impl Destruction {
         props: &mut Props,
         install: &Install,
         vehicle: &Crasher,
-        e: u32,
+        key: StaticKey,
         closing: f32,
         prop_mass: f32,
     ) -> bool {
@@ -795,16 +795,9 @@ impl Destruction {
             sound: vehicle.sound,
         };
         let hit = (base, m2_assets::name_hash(RAM_KIND), 0.0);
-        let broke = self.wear_by(
-            world,
-            props,
-            Some(install),
-            StaticKey::Entity(e),
-            hit,
-            cause,
-        );
+        let broke = self.wear_by(world, props, Some(install), key, hit, cause);
         eprintln!(
-            "destruct: a {:.0} kg vehicle met prop {e:#x} ({prop_mass:.0} kg) closing at \
+            "destruct: a {:.0} kg vehicle met prop {key:?} ({prop_mass:.0} kg) closing at \
              {closing:.1} m/s: size {size:.1}, {base:.2} before its cell{}",
             vehicle.mass,
             if broke { ", it breaks" } else { "" }

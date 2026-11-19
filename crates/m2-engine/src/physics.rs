@@ -2431,12 +2431,17 @@ const REST_DISTANCE: f32 = 0.02;
 const REST_CHECKS: u8 = 6;
 
 impl Rest {
-    /// One step of `dt` s at `centre`: whether it now sleeps.
+    /// One step of `dt` s at `centre`: whether it may sleep now. Once its
+    /// checks have found it still it may, between checks too, until a
+    /// check finds it moved: two bodies touching, their checks falling on
+    /// different steps, were never both allowed on one step, and their
+    /// island never slept (q753e: two pairs of placed objects standing in
+    /// each other, awake after 10 s at 0.09 and 0.00 m/s).
     fn step(&mut self, centre: Vec3, dt: f32) -> bool {
         let from = *self.from.get_or_insert(centre);
         self.clock += dt;
         if self.clock + 1e-6 < REST_PERIOD {
-            return false;
+            return self.still >= REST_CHECKS;
         }
         self.clock -= REST_PERIOD;
         self.still = if (centre - from).length() < REST_DISTANCE {
@@ -10678,6 +10683,19 @@ mod tests {
         // At 0.05 m/s (0.01 m a check) it still sleeps.
         let mut slow = Rest::default();
         assert_eq!(steps(&mut slow, 0.05), Some(72));
+        // Once still it may sleep on every step after, not only on a
+        // check's: two bodies whose checks fall on different steps.
+        let mut a = Rest::default();
+        let mut b = Rest {
+            clock: 0.1,
+            ..Rest::default()
+        };
+        let both = (1..=120).find(|&_i| {
+            let x = a.step(Vec3::ZERO, dt);
+            let y = b.step(Vec3::ZERO, dt);
+            x && y
+        });
+        assert!(both.is_some(), "never both on one step");
     }
 
     #[test]
