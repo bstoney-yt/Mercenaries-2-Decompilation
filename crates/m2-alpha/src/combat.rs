@@ -5750,11 +5750,17 @@ impl Combat {
     /// clamp's floor, [`CLAMP_FLOOR`], 0x822889F8). With no clamp set,
     /// never below 1 here (invented: she swam away in every run). The
     /// vehicle itself is not wrecked: it stays whole at the bottom.
+    ///
+    /// A hit like any other: her quiet time, after which her health comes
+    /// back ([`REGEN_AFTER`]), starts again from it. Before, it didn't:
+    /// sat still in the sinking car for over 4 s, she healed 25 x 1/60 =
+    /// 0.42 on the very next step (q760: 3.42 against Xenia's 3.00).
     pub fn sank_out(&mut self) {
         if self.hurts.len() >= MAX_HURTS {
             self.hurts.remove(0);
         }
         self.hurts.push((SANK_OUT, None));
+        self.quiet = 0.0;
         let floor = if self.health_clamp {
             self.clamp_floor()
         } else {
@@ -7839,6 +7845,23 @@ mod tests {
         c.sank_out();
         assert_eq!(c.hp, CLAMP_FLOOR);
         assert_eq!(CLAMP_FLOOR, 3.0);
+    }
+
+    // Put out after sitting quiet past the regen delay, she does not heal
+    // on the next step: the sinking is a hit, and her quiet time starts
+    // again from it (q760 read 3.42, Xenia 3.00).
+    #[test]
+    fn sinking_starts_her_quiet_time_again() {
+        let mut c = Combat {
+            hp: 100.0,
+            max_hp: 100.0,
+            health_clamp: true,
+            quiet: REGEN_AFTER + 1.0,
+            ..Combat::default()
+        };
+        c.sank_out();
+        assert_eq!(c.quiet, 0.0);
+        assert_eq!(c.hp, CLAMP_FLOOR);
     }
 
     #[test]
