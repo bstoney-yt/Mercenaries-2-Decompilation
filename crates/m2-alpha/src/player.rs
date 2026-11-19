@@ -2,6 +2,7 @@
 //! controller, with a third-person camera behind her.
 
 use m2_engine::on_foot::{self, AimLegs, HumanMotion, Pace, RunStop, Start, StopEvent, Turn};
+use m2_engine::pad_camera::PITCH_RANGE;
 use m2_engine::{Character, Gait, GpuModel, Physics, VehicleId, VehicleSpec};
 use m2_math::glam::{Mat4, Vec2, Vec3};
 use m2_render::View;
@@ -42,8 +43,10 @@ pub const JENNIFER: HumanMotion = HumanMotion {
 };
 /// Seconds after take-off before touching the ground counts as landing.
 const MIN_AIR: f32 = 0.15;
-/// Seconds before a landing clip's end that the gait takes over again
-/// (and a bash's).
+/// Seconds before a bash's clip ends that the gait takes over again
+/// (invented). A landing plays to its clip's end: the state table's
+/// `Complete` on the clip's end takes `JumpLandStationary` to `Idle`
+/// (Xenia: 0.49 s, the clip's length).
 const LAND_FADE: f32 = 0.1;
 /// Speeds (m/s) above which she takes off and lands on the run.
 const RUNNING_JUMP: f32 = 1.0;
@@ -119,6 +122,9 @@ pub struct ChaseRig {
     /// How far above the camera's line the crosshair (and the gun's aim)
     /// sits, radians.
     pub aim_lift: f32,
+    /// A car's or a boat's 360 camera preset: its drift back behind it and
+    /// its pitch, as the 360's ([`m2_engine::pad_camera::CarFollow`]).
+    pub car: Option<m2_engine::pad_camera::CarPreset>,
 }
 
 /// How far above the middle of the screen a tank's crosshair sits,
@@ -147,6 +153,7 @@ impl ChaseRig {
                 pitch_range: (-1.2, 0.9),
                 follows_aim: false,
                 aim_lift: 0.0,
+                car: None,
             };
         }
         match spec.tuning.camera {
@@ -157,15 +164,28 @@ impl ChaseRig {
                 pitch_range: c.pitch_range,
                 follows_aim: true,
                 aim_lift: TANK_AIM_LIFT,
+                car: None,
             },
-            None => Self {
-                pivot: Vec3::Y * 2.0,
-                distance: (spec.bounds.1.z - spec.bounds.0.z) * 0.9 + 3.0,
-                pitch: None,
-                pitch_range: (-1.2, 0.9),
-                follows_aim: spec.tracked,
-                aim_lift: 0.0,
-            },
+            None => {
+                // A car or a boat with its 360 camera preset: its
+                // `DefaultPitch` and the camera's pitch limits
+                // ([`m2_engine::pad_camera::CAR_PITCH_LIMITS`]).
+                let car = spec.tuning.car_camera.filter(|_| !spec.tracked);
+                let [low, high] = m2_engine::pad_camera::CAR_PITCH_LIMITS;
+                Self {
+                    pivot: Vec3::Y * 2.0,
+                    distance: (spec.bounds.1.z - spec.bounds.0.z) * 0.9 + 3.0,
+                    pitch: car.map(|c| c.default_pitch),
+                    pitch_range: if car.is_some() {
+                        (low, high)
+                    } else {
+                        (-1.2, 0.9)
+                    },
+                    follows_aim: spec.tracked,
+                    aim_lift: 0.0,
+                    car,
+                }
+            }
         }
     }
 }
@@ -237,11 +257,12 @@ impl Intent {
 
     pub fn from_input(input: &mut Input, config: &CameraConfig, mouse_look: bool) -> Self {
         let (dx, dy) = input.take_look(mouse_look);
+        let (yaw, pitch) = input.take_pad_turn();
         let invert = if config.invert_y { -1.0 } else { 1.0 };
         // Turning right turns the yaw (from +z towards +x) back.
         let look = Vec2::new(
-            -dx as f32 * config.mouse_sensitivity,
-            -dy as f32 * config.mouse_sensitivity * invert,
+            -dx as f32 * config.mouse_sensitivity - yaw as f32,
+            -dy as f32 * config.mouse_sensitivity * invert + pitch as f32 * invert,
         );
         Self {
             movement: Vec2::new(
@@ -324,6 +345,8 @@ pub struct Player {
     camera_distance: f32,
     /// Seconds since the mouse last turned the camera.
     look_still: f32,
+    /// A car camera's drift back behind it ([`ChaseRig::car`]).
+    car_follow: m2_engine::pad_camera::CarFollow,
     /// While driving: the point the chase camera turns about, and how far
     /// behind it the camera sits ([`ChaseRig`]).
     pub chase_target: Option<(Vec3, f32)>,
@@ -419,6 +442,10 @@ pub struct Player {
     /// ([`m2_engine::human_state`]), and whether the air's loop plays.
     human: m2_engine::human_state::HumanState,
     air_looped: bool,
+    /// Seconds she has touched the ground while in the air's `Leap`: the
+    /// landing starts once she has for one 360 step
+    /// ([`m2_engine::physics::HOLD_STEP`]).
+    touchdown: f32,
     /// A stagger picked for her, to start on her rig this step (its clip
     /// and action), and the seconds since her last began
     /// ([`m2_engine::stagger`]).
@@ -637,6 +664,7 @@ impl Player {
             chase_target: None,
             aim_lift: 0.0,
             look_still: 0.0,
+            car_follow: Default::default(),
             landed: false,
             land_from: None,
             streaming: false,
@@ -674,6 +702,7 @@ impl Player {
             jump_queued: false,
             human: m2_engine::human_state::HumanState::default(),
             air_looped: false,
+            touchdown: 0.0,
             stagger_pending: None,
             since_stagger: None,
             carrying: false,
@@ -942,6 +971,29 @@ impl Player {
         self.floor_gone = false;
     }
 
+    /// Out of a vehicle into the air (a ditch or toss, 0x822A1B70): at
+    /// `at` (0.5 m over her exit's place, [`m2_engine::seats::DITCH_RISE`])
+    /// going at `velocity` ([`m2_engine::seats::ditch_velocity`]), off the
+    /// ground in her `Jump` (`InAir`), to land as from a jump
+    /// (`JumpLandStationary` or `JumpLandMoving`). Unlike
+    /// [`drop_at`](Self::drop_at) she is not put down on what is under her
+    /// first: the world is already in under her.
+    pub fn launch(&mut self, at: Vec3, velocity: Vec3) {
+        self.character.position = at;
+        self.character.velocity = velocity;
+        self.character.grounded = false;
+        // Set outright: held one step as it is (0x82179ED0's +0x250).
+        self.character.hold = m2_engine::physics::HOLD_STEP;
+        self.ground = Vec2::ZERO;
+        self.run_stop = RunStop::default();
+        self.leap = Leap::Air(0.0);
+        self.air_looped = true;
+        if let (Some((_, rig)), Some(air)) = (&mut self.model, self.clips.jump) {
+            rig.animator
+                .play_action(air, false, m2_engine::blend::action::JUMP);
+        }
+    }
+
     /// The floor she stands on was taken down (a state layer went): she
     /// stays where she is until the layers' models coming in have loaded
     /// (at most [`LAND_WAIT`]), then lands on the floor nearest under her.
@@ -1028,8 +1080,21 @@ impl Player {
             (*seed >> 40) as f32 / (1u64 << 24) as f32
         });
         self.yaw += intent.look.x;
-        self.pitch = (self.pitch + intent.look.y).clamp(-1.2, 0.9);
+        self.pitch =
+            (self.pitch + intent.look.y).clamp(self.pitch_limits()[0], self.pitch_limits()[1]);
         self.camera(physics);
+    }
+
+    /// How far she looks down and up, radians: the camera's offsets'
+    /// angles for her stance ([`m2_engine::pad_camera::pitch_at`]): -47.0
+    /// to +50.2 degrees standing, -33.2 to +50.7 aiming in.
+    fn pitch_limits(&self) -> [f32; 2] {
+        use m2_engine::pad_camera::{AIMING, pitch_at};
+        if self.aiming {
+            [pitch_at(0.0, &AIMING), pitch_at(1.0, &AIMING)]
+        } else {
+            PITCH_RANGE
+        }
     }
 
     pub fn update(&mut self, physics: &Physics, intent: Intent, dt: f32) {
@@ -1047,7 +1112,8 @@ impl Player {
             }
         }
         self.yaw += intent.look.x;
-        self.pitch = (self.pitch + intent.look.y).clamp(-1.2, 0.9);
+        self.pitch =
+            (self.pitch + intent.look.y).clamp(self.pitch_limits()[0], self.pitch_limits()[1]);
 
         if let Some(l) = self.ladder {
             self.hang(l, dt);
@@ -1443,9 +1509,19 @@ impl Player {
             } else {
                 let states = self.moves.states.clone();
                 let was_landing = matches!(self.leap, Leap::Land(..));
+                // The 360 lands her the step after the one she touches
+                // down on (Xenia: touching down at 0.40 s, `Jump` gives way
+                // at 0.44 s; inferred, the proxy's state reaches the
+                // animation driver a step later).
+                self.touchdown = if self.character.grounded {
+                    self.touchdown + dt
+                } else {
+                    0.0
+                };
+                let touched = self.touchdown >= m2_engine::physics::HOLD_STEP - 1e-4;
                 self.leap = match self.leap {
                     Leap::Windup(..) => self.leap,
-                    Leap::Air(t) if t > MIN_AIR && self.character.grounded => {
+                    Leap::Air(t) if t > MIN_AIR && self.character.grounded && touched => {
                         // The physics' message on touching down picks the
                         // landing by the state table; without it, by her
                         // speed as before.
@@ -1505,7 +1581,7 @@ impl Player {
                     }
                     // A standing landing gives way when she sets off.
                     Leap::Land(t, clip)
-                        if t + LAND_FADE < rig.clips[clip].info.duration
+                        if t < rig.clips[clip].info.duration
                             && !(Some(clip) == clips.land_still && moved > RUNNING_JUMP) =>
                     {
                         Leap::Land(t + dt, clip)
@@ -1883,7 +1959,19 @@ impl Player {
         }
     }
 
-    pub fn stagger(&mut self, event: &m2_engine::stagger::Event) -> bool {
+    /// `immune`: the scripts made her invincible (`Object.SetInvincible`,
+    /// any reason, survival mode's `Survival` too): the 360's picker gives
+    /// her none while `Object.GetInvincible` holds (0x8228CB80, from
+    /// 0x824220B0). Aimed in she is `Crouched` (0xC8886020), when it gives
+    /// her none but for a melee bash.
+    /// Forgets her last stagger, so the next is not held back by the
+    /// cooldown (`--stagger-check` runs its cases back to back).
+    pub fn forget_stagger(&mut self) {
+        self.since_stagger = None;
+        self.stagger_pending = None;
+    }
+
+    pub fn stagger(&mut self, event: &m2_engine::stagger::Event, immune: bool) -> bool {
         use m2_engine::stagger::{self, Person};
         if self.down || self.driving.is_some() || self.seated || !self.character.grounded {
             return false;
@@ -1896,8 +1984,8 @@ impl Player {
             &Person {
                 facing: self.facing,
                 player: true,
-                immune: false,
-                crouched: false,
+                immune,
+                crouched: self.aiming,
                 moving: v.x.hypot(v.z) > STAGGER_MOVING,
                 since: self.since_stagger,
                 cooldown: stagger::COOLDOWN,
@@ -2030,6 +2118,7 @@ impl Player {
         let f = transform.transform_vector3(Vec3::Z);
         let heading = f.x.atan2(f.z);
         if self.chase_target.is_none() {
+            self.car_follow = Default::default();
             if let Some(pitch) = rig.pitch {
                 self.pitch = pitch;
             }
@@ -2048,7 +2137,18 @@ impl Player {
         } else {
             0.0
         };
-        if !rig.follows_aim && self.look_still > CHASE_HOLD && speed.abs() > 2.0 {
+        if let Some(preset) = &rig.car {
+            // The 360's drift back behind it: a turn of the stick's yaw
+            // over its threshold holds the look (taken from the turn's
+            // rate: over the car camera's 2 rad/s at the threshold).
+            let held = look.x.abs()
+                > m2_engine::pad_camera::CAR_RATES[0]
+                    * m2_engine::pad_camera::CAR_YAW_THRESHOLD
+                    * dt;
+            self.yaw = self
+                .car_follow
+                .step(preset, self.yaw, heading, speed, held, dt);
+        } else if !rig.follows_aim && self.look_still > CHASE_HOLD && speed.abs() > 2.0 {
             let mut turn = (heading - self.yaw).rem_euclid(std::f32::consts::TAU);
             if turn > std::f32::consts::PI {
                 turn -= std::f32::consts::TAU;
@@ -2740,12 +2840,15 @@ mod tests {
             held: vec![held],
             ..Moves::default()
         };
-        assert!(p.stagger(&m2_engine::stagger::Event {
-            direction: Vec3::NEG_Z,
-            direct: true,
-            melee: true,
-            key: None,
-        }));
+        assert!(p.stagger(
+            &m2_engine::stagger::Event {
+                direction: Vec3::NEG_Z,
+                direct: true,
+                melee: true,
+                key: None,
+            },
+            false
+        ));
         assert!(p.face.plays(ANGRY));
     }
 
@@ -2803,9 +2906,9 @@ mod tests {
             key,
         };
         // Facing +z: a bullet does nothing, a bash from ahead staggers.
-        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, false, None)));
+        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, false, None), false));
         p.facing = 0.3;
-        assert!(p.stagger(&hit(Vec3::NEG_Z, true, true, None)));
+        assert!(p.stagger(&hit(Vec3::NEG_Z, true, true, None), false));
         assert_eq!(
             p.stagger_pending,
             Some((11, m2_engine::blend::action::STAGGER_IN_PLACE))
@@ -2815,16 +2918,27 @@ mod tests {
         assert!(p.facing.abs() < 1e-5, "{}", p.facing);
         // Not again within a quarter of a second.
         p.since_stagger = Some(0.1);
-        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None)));
+        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None), false));
         // A blast behind her: the long one. Without its clip, nothing.
         p.since_stagger = Some(2.0);
-        assert!(p.stagger(&hit(Vec3::Z, false, false, Some(EXPLOSION))));
+        assert!(p.stagger(&hit(Vec3::Z, false, false, Some(EXPLOSION)), false));
         assert_eq!(p.stagger_pending.map(|s| s.0), Some(12));
         p.since_stagger = Some(2.0);
-        assert!(!p.stagger(&hit(Vec3::X, false, false, Some(EXPLOSION))));
+        assert!(!p.stagger(&hit(Vec3::X, false, false, Some(EXPLOSION)), false));
+        // Invincible (`Object.GetInvincible`, 0x8228CB80): none, even
+        // to a bash.
+        p.since_stagger = Some(2.0);
+        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None), true));
+        assert!(!p.stagger(&hit(Vec3::Z, false, false, Some(EXPLOSION)), true));
+        // Aimed in (`Crouched`): a blast gives her none, a bash still does.
+        p.aiming = true;
+        assert!(!p.stagger(&hit(Vec3::Z, false, false, Some(EXPLOSION)), false));
+        assert!(p.stagger(&hit(Vec3::NEG_Z, true, true, None), false));
+        p.aiming = false;
         // In the air, never.
+        p.since_stagger = Some(2.0);
         p.character.grounded = false;
-        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None)));
+        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None), false));
     }
 
     #[test]
