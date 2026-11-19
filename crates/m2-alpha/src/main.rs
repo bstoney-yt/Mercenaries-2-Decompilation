@@ -553,6 +553,9 @@ struct Options {
     /// `--prop-bodies-check`: props that come loose whole as bodies of
     /// their own from the start (gap P7, [`prop_bodies_check`]).
     prop_bodies_check: bool,
+    /// `--parked-settle-check`: the layers' parked vehicles, placed as
+    /// authored, keep to their authored pose ([`parked_settle_check`]).
+    parked_settle_check: bool,
     /// `--prop-limits-check`: what blasts throw, kept in check by the
     /// disposer, and hulls meeting loose pieces ([`prop_limits_check`]).
     prop_limits_check: bool,
@@ -982,6 +985,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--swim-check" => o.swim_check = true,
             "--prop-bodies-check" => {
                 o.prop_bodies_check = true;
+                o.drive = true;
+            }
+            "--parked-settle-check" => {
+                o.parked_settle_check = true;
                 o.drive = true;
             }
             "--prop-limits-check" => {
@@ -8062,6 +8069,9 @@ fn drive_for_screenshot(
     if options.prop_bodies_check {
         return prop_bodies_check(backend, game, fov, aspect, tick);
     }
+    if options.parked_settle_check {
+        return parked_settle_check(backend, game, fov, aspect, tick);
+    }
     if options.prop_limits_check {
         return prop_limits_check(backend, game, fov, aspect, tick);
     }
@@ -13531,6 +13541,124 @@ mod gravity_check_tests {
 /// it goes (props stream in only so), and if she is at no wheel (the
 /// check runs before `--drive` seats her) she takes the nearest land
 /// vehicle standing, logged.
+/// How long `--parked-settle-check` watches, seconds, and how long after
+/// its placing each vehicle is judged.
+const SETTLE_WATCH: f32 = 45.0;
+const SETTLE_AFTER: f32 = 5.0;
+/// What `--parked-settle-check` allows a vehicle placed as authored, 5 s
+/// on: metres from its authored place, degrees from its authored turn,
+/// and m/s.
+const SETTLE_MOST: (f32, f32, f32) = (0.25, 5.0, 0.05);
+
+/// `--parked-settle-check` (it turns on `--drive`; give a `--spawn`): for
+/// [`SETTLE_WATCH`] s the game runs as played, the layers' parked vehicles
+/// coming in as she stands there, each placed as authored ([`game::place`]).
+/// Each is judged [`SETTLE_AFTER`] s after it was placed against its
+/// authored pose, structures included: within [`SETTLE_MOST`] of its place
+/// and turn, not on its side or roof, and still. A failing one is named
+/// with how far, how turned, how fast, and what is under it now (the
+/// terrain, something else, or nothing within 3 m), as its likely cause.
+/// One `parked-settle-check: PASS` or `FAIL ...` line.
+fn parked_settle_check(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    tick: f32,
+) -> anyhow::Result<()> {
+    use m2_math::glam::{Quat, Vec3};
+    use std::collections::HashMap;
+    // Entity -> (authored place, authored turn, seconds since placed).
+    let mut watched: HashMap<u32, (Vec3, Quat, f32, String)> = HashMap::new();
+    let (mut passed, mut failed) = (0usize, Vec::new());
+    let mut judged = std::collections::HashSet::new();
+    let mut t = 0.0f32;
+    while t < SETTLE_WATCH {
+        game.step(Intent::default(), tick);
+        render(backend, game, fov, aspect, None)?;
+        t += tick;
+        let Some(world) = game.scene.world.as_ref() else {
+            continue;
+        };
+        for v in &game.scene.vehicles {
+            let (Some((entity, at, _)), Some(_)) = (v.spot, v.id) else {
+                continue;
+            };
+            if judged.contains(&entity) || watched.contains_key(&entity) {
+                continue;
+            }
+            if let Some(turn) = game.authored_turn(entity) {
+                watched.insert(entity, (at, turn, 0.0, v.spec.label.clone()));
+            }
+        }
+        let mut done = Vec::new();
+        for (&entity, (at, turn, since, label)) in &mut watched {
+            *since += tick;
+            if *since < SETTLE_AFTER {
+                continue;
+            }
+            done.push(entity);
+            let Some(id) = game
+                .scene
+                .vehicles
+                .iter()
+                .find(|v| v.spot.is_some_and(|s| s.0 == entity))
+                .and_then(|v| v.id)
+            else {
+                continue;
+            };
+            let Some(m) = world.physics.vehicle_transform(id) else {
+                continue;
+            };
+            let (_, now_turn, now_at) = m.to_scale_rotation_translation();
+            let moved = now_at.distance(*at);
+            let turned = now_turn.angle_between(*turn).to_degrees();
+            let up = m.transform_vector3(Vec3::Y).normalize_or_zero().y;
+            let speed = world.physics.vehicle_speed(id);
+            let ok = moved <= SETTLE_MOST.0
+                && turned <= SETTLE_MOST.1
+                && up > 0.5
+                && speed < SETTLE_MOST.2;
+            if ok {
+                passed += 1;
+            } else {
+                let from = *at + Vec3::Y * 2.0;
+                let under = world.physics.cast_ray(from, Vec3::NEG_Y, 5.0).map_or(
+                    "nothing within 3 m under its authored place".to_owned(),
+                    |(d, _)| format!("something {:.2} m under its authored place", d - 2.0),
+                );
+                let line = format!(
+                    "{entity:#x} {label}: {moved:.2} m from its authored place, {turned:.1} deg turned, up {up:.2}, {speed:.2} m/s; {under}"
+                );
+                eprintln!("parked-settle-check: off: {line}");
+                failed.push(line);
+            }
+        }
+        for e in done {
+            watched.remove(&e);
+            judged.insert(e);
+        }
+    }
+    eprintln!(
+        "parked-settle-check: {} judged ({passed} kept their authored pose), {} still settling at the end",
+        judged.len(),
+        watched.len()
+    );
+    if judged.is_empty() {
+        eprintln!("parked-settle-check: FAIL no parked vehicle placed as authored here");
+    } else if failed.is_empty() {
+        eprintln!("parked-settle-check: PASS {passed} parked vehicles kept their authored pose");
+    } else {
+        eprintln!(
+            "parked-settle-check: FAIL {} of {} left their authored pose: {}",
+            failed.len(),
+            judged.len(),
+            failed.join("; ")
+        );
+    }
+    Ok(())
+}
+
 fn prop_bodies_check(
     backend: &mut WgpuBackend,
     game: &mut Game,
