@@ -5745,13 +5745,22 @@ impl Combat {
     /// She is put out of a vehicle that sank under her: 100 of her health
     /// (from footage: Xenia, 120 -> 19.6 as the seat lets her go, three
     /// runs 100.1-100.5; what posts it in the 360 code is not traced),
-    /// never below 1 here (invented: she swam away in all three). The
+    /// stopped by the scripts' health clamp as any hit is (Xenia, Jennifer
+    /// at 100 of 100: 100 -> 3.00 in one sample, then she swam: the
+    /// clamp's floor, [`CLAMP_FLOOR`], 0x822889F8). With no clamp set,
+    /// never below 1 here (invented: she swam away in every run). The
     /// vehicle itself is not wrecked: it stays whole at the bottom.
     pub fn sank_out(&mut self) {
-        self.hurt_from(SANK_OUT, Vec3::ZERO);
-        if let Some(h) = self.hurts.last_mut() {
-            h.1 = None;
+        if self.hurts.len() >= MAX_HURTS {
+            self.hurts.remove(0);
         }
+        self.hurts.push((SANK_OUT, None));
+        let floor = if self.health_clamp {
+            self.clamp_floor()
+        } else {
+            1.0
+        };
+        self.hp = (self.hp - SANK_OUT).max(floor.min(self.hp));
     }
 
     fn wreck(&mut self, physics: &mut Physics, v: &mut ParkedVehicle, i: usize) {
@@ -7819,6 +7828,17 @@ mod tests {
         c.hp = 30.0;
         c.sank_out();
         assert_eq!(c.hp, 1.0);
+        // The scripts' clamp on (as they set it): Jennifer, 100 of 100,
+        // stops at its floor, 3, as Xenia's run did.
+        let mut c = Combat {
+            hp: 100.0,
+            max_hp: 100.0,
+            health_clamp: true,
+            ..Combat::default()
+        };
+        c.sank_out();
+        assert_eq!(c.hp, CLAMP_FLOOR);
+        assert_eq!(CLAMP_FLOOR, 3.0);
     }
 
     #[test]
