@@ -9415,6 +9415,9 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
         p.drop_at(start + side * at.unwrap_or(5.9));
     }
     game.ride = None;
+    // On foot: only then is she stepped, and lands where she was put
+    // (the q728c runs: never set, she hung where she was dropped).
+    game.on_foot = true;
     for _ in 0..(1.0 / tick) as u32 {
         still(game);
         game.step(Intent::default(), tick);
@@ -9459,6 +9462,7 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
         game.combat.wreck_now(&mut world.physics, v, i);
     }
     let (mut top, mut top_at, mut fastest, mut landed) = (0.0f32, 0.0, 0.0f32, None);
+    let mut falling = false;
     // Her least health in the watch: the blasts' loss, before her health
     // comes back (4 s on, at 25 a second: by 6 s some 50 of it).
     let mut least = game.combat.hp;
@@ -9476,7 +9480,13 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
         if t <= 0.5 {
             fastest = fastest.max(v.length());
         }
-        if landed.is_none() && top > 0.5 && t > top_at && rise < 0.3 {
+        // Down again: falling after its height, then its fall stopped (a
+        // wreck at rest on its side or roof keeps its middle higher than
+        // it began: the q728c runs never saw it within 0.3 m).
+        if v.y < -2.0 && t > top_at {
+            falling = true;
+        }
+        if landed.is_none() && top > 0.5 && falling && v.y > -0.5 {
             landed = Some(at.with_y(0.0).distance(start.with_y(0.0)));
         }
     }
