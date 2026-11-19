@@ -588,3 +588,19 @@ def scan_word(g: Guest, word: int, lo: int = 0, hi: int = 0xA000_0000, limit: in
                 if len(hits) >= limit:
                     return hits
     return hits
+
+
+def state_quat(g: Guest, index: int):
+    """The quaternion (x, y, z, w) of state-table entry <index> (as state_entries numbers them), or None."""
+    hdr = g.read(0x83658140, 0x80)
+    if not hdr:
+        return None
+    mask = struct.unpack_from(">I", hdr, 0x20)[0]
+    esz, shift = struct.unpack_from(">hh", hdr, 0x24)
+    pages = struct.unpack_from(">I", hdr, 0x70)[0]
+    pb = g.read(pages + (index >> shift) * 4, 4)
+    page = struct.unpack(">I", pb)[0] if pb else 0
+    if not page:
+        return None
+    b = g.read(page + (index & (mask - 1)) * esz + 0x10, 16)
+    return struct.unpack(">4f", b) if b and len(b) == 16 else None

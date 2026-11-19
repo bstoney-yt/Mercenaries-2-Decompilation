@@ -17,6 +17,11 @@ with open(sys.argv[1], "w", newline="") as fh:
         last = fc
         hv = struct.unpack(">f", g.read(ha + 4, 4))[0]; dtb = g.read(0x82B7C730, 4)
         near = [(i, p) for i, p in xmem.state_entries(g).items() if 0.3 < math.dist(p, (hx, hy, hz)) < R]
+        # each nearby record with its quaternion (yaw rate offline from successive frames)
+        cells = []
+        for i, p in near:
+            q = xmem.state_quat(g, i)
+            cells.append(f"{i}:{p[0]:.3f},{p[1]:.3f},{p[2]:.3f}" + (f",{q[0]:.4f},{q[1]:.4f},{q[2]:.4f},{q[3]:.4f}" if q else ""))
         wr.writerow([f"{time.time()-t0:.4f}", fc, f"{struct.unpack('>f', dtb)[0]:.5f}" if dtb else "", f"{hv:.3f}",
-                     f"{hx:.3f}", f"{hy:.3f}", f"{hz:.3f}", ";".join(f"{i}:{p[0]:.2f},{p[1]:.2f},{p[2]:.2f}" for i, p in near)])
+                     f"{hx:.3f}", f"{hy:.3f}", f"{hz:.3f}", ";".join(cells)])
         fh.flush()
