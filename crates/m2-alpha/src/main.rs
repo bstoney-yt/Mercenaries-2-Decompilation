@@ -13105,7 +13105,32 @@ fn prop_bodies_check(
     };
     let ticks = (4.0 / tick) as u32;
     let each = (1.0 / tick).round().max(1.0) as u32;
+    // The car's body meeting the prop's (a body touched within 3 m of the
+    // prop's place), and the prop woken after (moved over 0.02 m from
+    // where it lay, or moving over 0.01 m/s, in a step after the contact).
+    let mut touched_at = None;
+    let mut woke = false;
     for k in 0..ticks {
+        if let Some(w) = game.scene.world.as_ref() {
+            let prop_at = w
+                .physics
+                .debris_place(id)
+                .map_or(at, |m| m.w_axis.truncate());
+            if touched_at.is_none()
+                && w.physics
+                    .vehicle_touching(car)
+                    .iter()
+                    .any(|(key, point, _)| key.is_none() && point.distance(prop_at) < 3.0)
+            {
+                touched_at = Some(k as f32 * tick);
+            } else if touched_at.is_some() && !woke {
+                let speed = w
+                    .physics
+                    .debris_velocity(id)
+                    .map_or(0.0, |(v, _)| v.length());
+                woke = prop_at.distance(at) > 0.02 || speed > 0.01;
+            }
+        }
         let speed = game
             .scene
             .world
@@ -13163,14 +13188,25 @@ fn prop_bodies_check(
          at {speed:.1} m/s after",
         game.scene.vehicles[i].spec.label
     );
-    if !bodies.is_empty() && awake == 0 && moved > 0.5 {
-        eprintln!("prop-bodies-check: PASS");
-    } else {
+    eprintln!(
+        "prop-bodies-check: the car's body met the prop's at {}; the prop woke after: {woke}",
+        touched_at.map_or("never".to_owned(), |t| format!("{t:.2} s"))
+    );
+    // How far the prop goes is the crash rules' (#753), not gated here
+    // (q740f 0.0 m, q740g 1.0 m from the same start).
+    if bodies.is_empty() {
+        eprintln!("prop-bodies-check: FAIL no prop is a body here");
+    } else if awake != 0 {
         eprintln!(
-            "prop-bodies-check: FAIL {} props as bodies, {awake} awake at rest, the prop moved \
-             {moved:.1} m",
+            "prop-bodies-check: FAIL {} props as bodies, {awake} awake at rest",
             bodies.len()
         );
+    } else if touched_at.is_none() {
+        eprintln!("prop-bodies-check: FAIL the car never touched the prop");
+    } else if !woke {
+        eprintln!("prop-bodies-check: FAIL the prop never woke");
+    } else {
+        eprintln!("prop-bodies-check: PASS");
     }
     Ok(())
 }
