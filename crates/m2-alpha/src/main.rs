@@ -9369,8 +9369,18 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
         eprintln!("wreck-blast-check: FAIL her vehicle has no body");
         return;
     };
-    // Stopped, a while, then her out and 5.9 m off its middle.
+    // Stopped, a while, then her out and 5.9 m off its middle. The car
+    // is held still all the while (driverless it would roll on, and her
+    // distance from it with it: the q728 runs' blasts went off 1 to 5 m
+    // from where she was measured from).
+    let still = |game: &mut Game| {
+        if let Some(w) = game.scene.world.as_mut() {
+            w.physics.set_vehicle_velocity(id, Vec3::ZERO);
+            w.physics.set_vehicle_spin(id, Vec3::ZERO);
+        }
+    };
     for _ in 0..(1.0 / tick) as u32 {
+        still(game);
         game.step(Intent::default(), tick);
     }
     let place = |game: &Game| {
@@ -9395,15 +9405,27 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
     }
     game.ride = None;
     for _ in 0..(1.0 / tick) as u32 {
+        still(game);
         game.step(Intent::default(), tick);
     }
+    still(game);
     let her = |game: &Game| game.scene.player.as_ref().map(|p| p.character.position);
     let (hp, her_from) = (game.combat.hp, her(game));
+    // Where the car is now, as it is wrecked: her distance from its
+    // middle is what Xenia's are.
+    let start = place(game).map_or(start, |(m, _)| m);
+    let off = her_from.map_or(0.0, |h| h.with_y(0.0).distance(start.with_y(0.0)));
     eprintln!(
-        "wreck-blast-check: the {} at {start:.1}, she {:.1} m off with {hp:.1} health",
+        "wreck-blast-check: the {} at {start:.1}, she {off:.1} m off with {hp:.1} health",
         game.scene.vehicles[i].spec.label,
-        her_from.map_or(0.0, |h| h.with_y(0.0).distance(start.with_y(0.0)))
     );
+    if (off - at.unwrap_or(5.9)).abs() > 0.3 {
+        eprintln!(
+            "wreck-blast-check: FAIL she stands {off:.1} m from the car's middle, not {:.2}",
+            at.unwrap_or(5.9)
+        );
+        return;
+    }
     if let Some(world) = game.scene.world.as_mut() {
         let v = &mut game.scene.vehicles[i];
         game.combat.wreck_now(&mut world.physics, v, i);
