@@ -1141,6 +1141,9 @@ pub struct MissionLink {
     /// Objects made for loose pickups she took, to take away again once
     /// their `WeaponEvent` has been heard.
     loose_items: Vec<u32>,
+    /// Loose items made last step whose `pickup` is told this step: by
+    /// then their own scripts are waiting for it ([`Self::loose_items`]).
+    loose_pickups: Vec<u32>,
     /// `--mine-check` ([`crate::mines::MineCheck`]).
     mine_check: Option<crate::mines::MineCheck>,
     /// Sounds the scripts cued on an object (`Sound.CueSound(object,
@@ -1341,6 +1344,7 @@ impl MissionLink {
             hushed: Vec::new(),
             voice_banks: Vec::new(),
             loose_items: Vec::new(),
+            loose_pickups: Vec::new(),
             sounds: Vec::new(),
             mine_check: None,
             object_sounds: Vec::new(),
@@ -3560,6 +3564,16 @@ impl MissionLink {
             for g in std::mem::take(&mut self.loose_items) {
                 mission.ammo_gone(g);
             }
+            // Last step's loose items: their `pickup` now, a step after
+            // they were made, so their own scripts are already waiting
+            // for it (a munitions laptop's `Laptop` waits for
+            // `WeaponEvent { "hero", "pickup", <itself> }`, and a wait
+            // hears only events after it was made: told in the step that
+            // made it, its `PickupMunitions` never ran, q736h).
+            for g in std::mem::take(&mut self.loose_pickups) {
+                mission.weapon_event(PLAYER, "pickup", g);
+                self.loose_items.push(g);
+            }
             // Something with no object of its own here (a crate's
             // contents, a dropped gun, cash): an object of its template is
             // made where it lay for the event to name, then taken away.
@@ -3574,8 +3588,7 @@ impl MissionLink {
                 };
                 let g = mission.ammo_spawned(&name, at.to_array());
                 eprintln!("mission: she picks up {name} ({g:#x}, loose: WeaponEvent pickup)");
-                mission.weapon_event(PLAYER, "pickup", g);
-                self.loose_items.push(g);
+                self.loose_pickups.push(g);
             }
             for (g, at, yaw, (lo, hi)) in game.scene.props.cargo_places() {
                 mission.place(g, at.to_array(), yaw);
