@@ -42,6 +42,7 @@ available, (6) Correction, (7) Verification and (8) Risk.
 | [A8](#a8) | Decoder residuals: wavelet seam steps on 14 clips, unknown header fields | Visual | P3 | Data, Ghidra |
 | [P5](#p5) | Collision materials: friction and restitution per surface not read | Behavioral | P3 | Data, Ghidra |
 | [P6](#p6) | Projectile guidance law, drag and range not established from code | Behavioral | P3 | Ghidra |
+| [P7](#p7) | Props as bodies: the fake-prop mass changer, prop-to-prop and prop-to-person contacts, crash rules on island objects' bodies | Behavioral | P2 | Ghidra, footage |
 | [I1](#i1) | Layer `Anchor` component not ported: anchor distances and threat-release bits unread | Behavioral | P2 | Ghidra, data |
 | [U6](#u6) | Flash text: one color per field, no kerning, HTML reduced to `<font color>` | Visual | P3 | Data census |
 | [M4](#m4) | Swimming depths, float height, speed and stroke rate invented | Animation/movement | P3 | Footage, Ghidra |
@@ -656,6 +657,33 @@ P2
    Report path error and time of flight.
 8. **Risk:** Medium. Autoplay's anti-vehicle and helicopter fights depend
    on hit rates, so re-run the contracts that use launchers.
+
+### P7
+
+**Props as physics bodies** · Behavioral discrepancy · P2
+
+1. **Original:** From the 360 code:
+   - A prop's physics object is made with its bodies when it is created (0x821831B0, each body by 0x8216A290 from the rigid-body defaults 0x82621820). It sleeps by the world's rule: checked every 0.2 s against 0.02 m, asleep after 6 still checks (0x820AA278, 0x824CE9C8).
+   - Its physics is rebuilt for the parts its state shows (0x82182CE8 -> 0x82152780).
+   - What a blast throws goes to the disposer (`PgDebrisManager`, 0x822085A8). The blast pool holds 40 and takes 16 per update; entries are weighed half by youth and half by on-screen size, and the lightest is disposed of (0x82246A08, 0x822470E0, 0x82246C08, 0x82247230, 0x822480A8).
+   - A vehicle's contact with a prop is a collision event: its closing speed and both masses give its size (0x82162BB8, 0x82163758), with a floor and a hundredth (0x8228B5F0) and each side's cell (0x82287CF8).
+   - A fake prop's contact with a real body goes through Havok's mass changer (0x821620F0, `FakeToRealMassRatio`).
+2. **Ours:**
+   - Props that come loose whole are sleeping bodies from stream-in (#740) and meet vehicles' hulls (#744).
+   - The disposer's blast pool is ported (#744), without the pools' other per-update rules and without the queue for objects still in view.
+   - The crash rules read the real contact (`Physics::vehicle_prop_hits` -> `Destruction::crash_body`, #753).
+   - A body prop that breaks gives up its bodies for its wreck where it lies, and goods that came in as bodies give them up to ride a load bed.
+   - Not ported:
+     - the mass changer: a body prop is felt at its full mass;
+     - prop body against prop body: knocked pieces still pass through each other and through body props;
+     - prop body against people;
+     - the crash rules on the island's placed objects' bodies: they are bodies of their own (#740, as the 360's base-layer `_PropPhysics` entities through 0x823E6AB8 -> 0x82408C30 -> 0x823FD338 -> 0x821831B0) and are pushed by vehicles and blasts, but `Destruction::crash_body` takes only props' bodies yet; #676's felt-mass and spin give-back still stand in `run_into` for island objects that are not bodies (those that break apart).
+3. **Difference:** Not measured in game yet. Expected: light fake props push a vehicle harder than on the 360 (full mass); piles of knocked pieces don't stack.
+4. **Likely cause:** The mass changer is a Havok contact modifier with no Rapier equivalent wired in. Island objects' bodies have no crash path of their own yet.
+5. **Evidence:** 360 code as listed. Bench: `propbench town` (#739/#740), 0 awake at rest, about 0.07 ms a step while still. Checks: `--prop-bodies-check`, `--prop-limits-check`.
+6. **Correction:** Add a contact-modification hook that scales the vehicle's side by `min(1, m_prop / m_vehicle x ratio)` for fake props. Let debris meet debris once pieces start apart. Give island objects' bodies the crash rules, then drop #676's corrections.
+7. **Verification:** `--prop-bodies-check` and `--prop-limits-check` in a town (`--spawn 2800,-1100`), `--cargo-check` at OilCon020 (goods that came in as bodies must ride), `--wreck-blast-check` (blasts push body props), and Xenia drives into café furniture against the port's speed loss.
+8. **Risk:** Medium. Every prop that comes loose is now a body: watch frame time in dense towns, and goods on load beds.
 
 ## UI
 

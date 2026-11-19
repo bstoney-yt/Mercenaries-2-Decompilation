@@ -7653,13 +7653,11 @@ fn drive_for_screenshot(
     install: Option<&Install>,
 ) -> anyhow::Result<()> {
     game.combat.homing_check = options.homing_check;
-    game.scene.props.bodies_on = options.prop_bodies_check || options.prop_limits_check;
     if (options.prop_bodies_check || options.prop_limits_check)
         && let Some(w) = game.scene.world.as_mut()
     {
-        // The island's placed objects that come loose whole (the café
-        // chairs, barricades and planters of a town are these, not a
-        // state layer's props): bodies too, those standing already now.
+        // The island's placed objects that come loose whole are bodies
+        // from stream-in (`World::bodies_on`); any standing already now.
         let made = w.make_bodies();
         eprintln!(
             "prop-bodies-check: she is at {:.0}; {made} placed objects standing became bodies",
@@ -13088,6 +13086,18 @@ fn prop_bodies_check(
         bodies.len() - props_bodies
     );
     let awake = physics.debris_awake();
+    // Which (q753d: 4 awake at rest): whose, where, how fast, how far from
+    // her.
+    for (id, at, speed) in physics.debris_awake_list().into_iter().take(10) {
+        let whose = bodies
+            .iter()
+            .find(|(_, ids)| ids.contains(&id))
+            .map_or("none of the bodies".to_owned(), |(e, _)| format!("{e:#x}"));
+        eprintln!(
+            "prop-bodies-check: awake at rest: piece {id:?} of {whose} at {at:.1}, {speed:.2} m/s, {:.1} m from her",
+            at.distance(game.focus())
+        );
+    }
     let (median, worst) = (
         ms.get(ms.len() / 2).copied().unwrap_or(0.0),
         ms.last().copied().unwrap_or(0.0),
@@ -13237,7 +13247,11 @@ fn prop_bodies_check(
          at {speed:.1} m/s after",
         game.scene.vehicles[i].spec.label
     );
-    if !bodies.is_empty() && awake == 0 && moved > 0.5 {
+    let (met, broke) = game.destruction.bodies_met;
+    eprintln!(
+        "prop-bodies-check: the crash rules took {met} meetings of vehicles and prop bodies, {broke} broke"
+    );
+    if !bodies.is_empty() && awake == 0 && moved > 0.5 && met > 0 {
         eprintln!("prop-bodies-check: PASS");
     } else {
         eprintln!(

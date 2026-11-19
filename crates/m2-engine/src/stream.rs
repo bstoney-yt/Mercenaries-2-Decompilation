@@ -593,7 +593,8 @@ pub struct WorldStats {
 #[derive(Debug)]
 pub struct World {
     /// Whether the island's placed objects that come loose whole are put
-    /// up as sleeping bodies of their own (gap P7), as the 360's props are
+    /// up as sleeping bodies of their own (gap P7; on unless turned off),
+    /// as the 360's props are
     /// (a prop's physics object is made with its bodies: 0x821831B0,
     /// 0x8216A290), instead of fixed collision until knocked.
     pub bodies_on: bool,
@@ -818,7 +819,7 @@ impl World {
             destroyed: HashSet::new(),
             loose: HashMap::new(),
             knocked: FastMap::default(),
-            bodies_on: false,
+            bodies_on: true,
             as_body: HashSet::new(),
             taken: FastSet::default(),
             felled: HashSet::new(),
