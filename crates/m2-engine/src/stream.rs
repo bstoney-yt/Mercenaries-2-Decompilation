@@ -149,6 +149,9 @@ impl Loader {
                             let t = match source.texture(hash, max) {
                                 Ok(mut t) => {
                                     t.linear = linear;
+                                    // Its mips filtered here, not on the
+                                    // main thread at upload.
+                                    crate::model::complete_mips(&mut t);
                                     Some(t)
                                 }
                                 Err(e) => {
@@ -764,6 +767,7 @@ impl World {
         }
         let heights = water_heights(&mut source);
         let inland = inland_water(backend, heights.as_ref(), settings.sea_level)?;
+        let ragdoll = human_ragdoll(&mut source);
         drop(source);
         let loader = Loader::spawn(install, index.clone(), TextureLimits::default())?;
         let mut objects: FastMap<(i32, i32), Vec<usize>> = FastMap::default();
@@ -823,6 +827,10 @@ impl World {
         // rivers), as out of the sea's.
         if let Some(h) = heights {
             world.physics.set_inland(std::sync::Arc::new(h));
+        }
+        // Everyone goes limp on the game's own ragdoll.
+        if let Some(r) = ragdoll {
+            world.physics.set_human_ragdoll(std::sync::Arc::new(r));
         }
         // Every tile, so the whole island shows from the start.
         let mut tiles: Vec<u32> = world.index.tiles.keys().copied().collect();
@@ -2266,6 +2274,41 @@ impl SeaConstants {
 }
 
 /// The game's water heights (its one `watr` asset), if it reads.
+/// The game's human ragdoll ([`m2_assets::ragdoll`]): its model asset's
+/// bones and joints, as the 360 builds every person's from it
+/// (0x8218F980); `None`, logged, where it does not read.
+fn human_ragdoll<R: std::io::Read + std::io::Seek>(
+    source: &mut crate::assets::AssetSource<R>,
+) -> Option<m2_assets::ragdoll::HumanRagdoll> {
+    use m2_assets::ragdoll::{HumanRagdoll, RAGDOLL};
+    let read = |data: &[u8]| -> Result<HumanRagdoll, String> {
+        let u = m2_assets::Ucfx::parse(data).map_err(|e| e.to_string())?;
+        let model = m2_assets::Model::parse(data).map_err(|e| e.to_string())?;
+        let phy2 = u.top_level(*b"PHY2").ok_or("no PHY2")?;
+        let p = m2_assets::Physics::parse(phy2).map_err(|e| e.to_string())?;
+        HumanRagdoll::from_model(&model, &p).map_err(|e| e.to_string())
+    };
+    match source
+        .asset(RAGDOLL, m2_assets::model::MODEL_TYPE)
+        .map_err(|e| e.to_string())
+        .and_then(|d| read(&d))
+    {
+        Ok(r) => {
+            eprintln!(
+                "ragdoll {RAGDOLL:08x}: {} bones, {:.1} kg, {} joints",
+                r.bones.len(),
+                r.mass(),
+                r.joints.len()
+            );
+            Some(r)
+        }
+        Err(e) => {
+            eprintln!("ragdoll {RAGDOLL:08x}: {e}; people go limp on their skeletons");
+            None
+        }
+    }
+}
+
 fn water_heights<R: std::io::Read + std::io::Seek>(
     source: &mut crate::assets::AssetSource<R>,
 ) -> Option<WaterHeights> {
