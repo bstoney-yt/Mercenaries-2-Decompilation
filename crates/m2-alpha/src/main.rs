@@ -9393,6 +9393,10 @@ fn wreck_rider_check(game: &mut Game, tick: f32) {
         }
         game.combat.wreck_landing = None;
         let hp = game.combat.hp;
+        // Played, as in the game (`--drive` starts with the free camera):
+        // only then is she stepped once put out, and lands (q673i: thrown
+        // 13.2 m/s out and up by the semi's blast, never grounded).
+        game.on_foot = true;
         if let Some(world) = game.scene.world.as_mut() {
             let v = &mut game.scene.vehicles[i];
             game.combat.kill_vehicle(&mut world.physics, v, i);
