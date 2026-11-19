@@ -190,7 +190,7 @@ impl ChaseRig {
 
 /// Ticks the world must have been quiet before she lands: a building's
 /// collision can arrive a few frames after the ground under it.
-const SETTLED: u8 = 3;
+pub(crate) const SETTLED: u8 = 3;
 /// Ticks she waits for the world to stop coming in before she lands
 /// anyway (ten seconds; invented: models that never load hold no one up).
 const LAND_WAIT: u16 = 600;

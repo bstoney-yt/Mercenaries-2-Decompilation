@@ -7338,7 +7338,13 @@ impl Combat {
         if f.player.driving.is_none() && f.player.landed && !self.spare_her {
             let d = (f.player.character.position + Vec3::Y).distance(at);
             if d < reach {
-                self.tally.taken_blasts += self.hurt_player(f, b.damage_at(d) * hers, Some(at));
+                let lost = self.hurt_player(f, b.damage_at(d) * hers, Some(at));
+                eprintln!(
+                    "blast: {:08x} reaches her {d:.1} m off: {:.1} x {hers} = {lost:.1} lost",
+                    b.template,
+                    b.damage_at(d)
+                );
+                self.tally.taken_blasts += lost;
                 self.blast_staggers_her(f, at, b.key);
             }
         }
@@ -8103,6 +8109,63 @@ mod tests {
     // `Explosion` cell 0.2) and its `Explosion (RPG Frag)` (15 m, 300 to
     // 40, her `Bullet` cell 0.25), each `max(least, damage x falloff)`
     // (0x82291640), come within 6% of every loss Xenia measured.
+    // The game's own path for a car's wreck on her: both blasts through
+    // `explode_keyed` in one step, as `part_blasts` sets them off.
+    #[test]
+    fn a_wrecks_two_blasts_through_the_game_hurt_her_as_xenia_measured() {
+        let blast = |template, radius, damage, min_damage, max_force, key: &str| Blast {
+            template,
+            radius,
+            damage,
+            min_damage,
+            max_force,
+            key: Some(m2_assets::name_hash(key)),
+        };
+        let a = blast(0x8000_5695, 7.0, 160.0, 150.0, 300.0, "Explosion");
+        let b = blast(0x8000_a27b, 15.0, 300.0, 40.0, 500.0, "Bullet");
+        for (d, seen) in [(2.9, 88.7), (3.21, 85.1), (5.8, 73.2), (6.42, 69.2)] {
+            let mut physics = crate::npc::tests::ground();
+            let mut player = Player::new(0.0, 0.0, 0.0, None);
+            for _ in 0..usize::from(crate::player::SETTLED) {
+                player.update(&physics, crate::player::Intent::default(), 1.0 / 60.0);
+            }
+            let mut people = People::default();
+            let arsenal = Arsenal::default();
+            let mut vehicles: Vec<ParkedVehicle> = Vec::new();
+            // The damage table's `Hero` row as read: `Explosion` 0.2,
+            // `Bullet` 0.25 (and its first column 0).
+            let h = m2_assets::name_hash;
+            let mut combat = Combat {
+                hp: 120.0,
+                max_hp: 120.0,
+                damage_table: Some(DamageTable::from_cells(
+                    vec![h("Hero")],
+                    vec![0xed05_7225, h("Bullet"), h("Explosion")],
+                    vec![0.0, 0.25, 0.2],
+                )),
+                ..Combat::default()
+            };
+            let mut field = Field {
+                physics: &mut physics,
+                player: &mut player,
+                people: &mut people,
+                vehicles: &mut vehicles,
+                arsenal: &arsenal,
+                explosives: &mut [],
+            };
+            // The blast at her chest height, `d` off across the ground.
+            let at = field.player.character.position + Vec3::new(d, 1.0, 0.0);
+            combat.explode_keyed(&mut field, at, Some(a), a.key);
+            combat.explode_keyed(&mut field, at, Some(b), b.key);
+            let lost = 120.0 - combat.hp;
+            eprintln!("{d} m: lost {lost}");
+            assert!(
+                (lost - seen).abs() <= seen * 0.06,
+                "{d} m: {lost} against {seen}"
+            );
+        }
+    }
+
     #[test]
     fn a_wrecks_two_blasts_hurt_her_as_xenia_measured() {
         use m2_engine::durability::blast_damage;

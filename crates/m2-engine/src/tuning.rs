@@ -1441,6 +1441,16 @@ impl DamageTable {
         self.cells.get(r * self.columns.len() + c).copied()
     }
 
+    /// A table of `rows` (target keys) by `columns` (damage keys), its
+    /// `cells` row by row (for tests and tools).
+    pub fn from_cells(rows: Vec<u32>, columns: Vec<u32>, cells: Vec<f32>) -> Self {
+        Self {
+            rows,
+            columns,
+            cells,
+        }
+    }
+
     /// As [`scale`](Self::scale), as the 360's area damage looks it up
     /// (0x823987D0): a key the table lacks finds its first row or column
     /// (0 for an empty table).
