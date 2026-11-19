@@ -12776,7 +12776,19 @@ fn prop_bodies_check(
             let gap = physics
                 .cast_ray(from, (to - from).normalize_or(way), 14.0)
                 .map_or(f32::MAX, |(d, _)| d);
-            (gap >= 10.5).then_some((e, id, at, way, Vec3::new(start.x, floor, start.z)))
+            // And the lane itself free of any placed object or building,
+            // from where the car stands to 2 m short of the prop: a ray
+            // from inside a wall doesn't see it (q740d: the car was put
+            // inside a building's member and held at full throttle).
+            let lane = (0..=10).all(|k| {
+                let c = Vec3::new(start.x, floor, start.z) + way * (k as f32);
+                physics.box_clear(
+                    c + Vec3::new(-1.3, 0.4, -1.3),
+                    c + Vec3::new(1.3, 1.8, 1.3),
+                    |key| !matches!(key, m2_engine::StaticKey::Cell(_)),
+                )
+            });
+            (gap >= 10.5 && lane).then_some((e, id, at, way, Vec3::new(start.x, floor, start.z)))
         })
     });
     let Some((e, id, at, way, start)) = run else {
@@ -12802,16 +12814,27 @@ fn prop_bodies_check(
     let Some(car) = game.scene.vehicles[i].id else {
         return Ok(());
     };
-    for _ in 0..(4.0 / tick) as u32 {
+    let ticks = (4.0 / tick) as u32;
+    let each = (1.0 / tick).round().max(1.0) as u32;
+    for k in 0..ticks {
         let speed = game
             .scene
             .world
             .as_ref()
             .map_or(0.0, |w| w.physics.vehicle_speed(car));
+        let throttle = if speed < 12.0 { 1.0 } else { 0.0 };
         let intent = Intent {
-            movement: Vec2::new(0.0, if speed < 12.0 { 1.0 } else { 0.0 }),
+            movement: Vec2::new(0.0, throttle),
             ..Intent::default()
         };
+        // Each second: the throttle asked, and how fast it goes.
+        if k % each == 0 {
+            eprintln!(
+                "prop-bodies-check: t {:.0} s: throttle {throttle:.1}, {speed:.1} m/s, driving {:?}",
+                k as f32 * tick,
+                game.scene.player.as_ref().and_then(|p| p.driving)
+            );
+        }
         game.step(intent, tick);
         render(backend, game, fov, aspect, None)?;
     }
