@@ -683,9 +683,136 @@ impl TankLook {
     }
 }
 
+/// A turret seat's camera (an emplaced gun's, a gunner's), as the 360's
+/// `CameraTurret` camera (class 0x820F0390, built by 0x824C8E80 from the
+/// seat's record, 0x8243EAC0): `YawSpeed` and `PitchSpeed` (radians a
+/// second), `YawMin`/`YawMax` and `PitchMin`/`PitchMax` from its base,
+/// and each axis's input inertias (`...InputInertia` for both input
+/// keeps, `...NoInputInertia`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TurretLookTuning {
+    pub yaw_speed: f32,
+    pub pitch_speed: f32,
+    pub yaw: (f32, f32),
+    pub pitch: (f32, f32),
+    pub yaw_keep: [f32; 3],
+    pub pitch_keep: [f32; 3],
+}
+
+impl TurretLookTuning {
+    /// The view's pitch limits from the base, radians up positive: the
+    /// record's are the camera's, positive down (as the car's and the
+    /// helicopter's turn), so `-PitchMax` to `-PitchMin` (inferred).
+    pub fn pitch_up(&self) -> (f32, f32) {
+        (-self.pitch.1, -self.pitch.0)
+    }
+}
+
+/// A turret seat's camera's stick look (0x824C9198).
+///
+/// From the 360 code: its handler (0x824C94F8) keeps the look-yaw input
+/// (the stick's x after [`stick`]) at +0x604 and the look-pitch (its y)
+/// at +0x600. Each update (0x824C9058) eases them, negated, through
+/// [`Inertia3`]: the yaw on +0x628 with the record's yaw keeps (+0x10,
+/// +0x14: with input for both, without), the pitch on +0x610 (+0x24,
+/// +0x28). It turns the yaw by `YawSpeed` (+0x658) and the pitch by
+/// `PitchSpeed` (+0x65C) times the eased input times the time, radians,
+/// with no curve (unlike the tank's, no 30). It then holds each between its
+/// limits from the base (0x824C95F0: `YawMin`/`YawMax` at +0x668/+0x66C,
+/// `PitchMin`/`PitchMax` at +0x660/+0x664). At a limit and pushing on,
+/// its eased value is dropped (0x824C9538, [`TurretLook::stop`]).
+///
+/// **Not ported**: its aim assist (0x824C9768).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TurretLook {
+    pub yaw: Inertia3,
+    pub pitch: Inertia3,
+}
+
+impl TurretLook {
+    /// A step of `dt` seconds with the stick at `stick` (after
+    /// [`stick`]): the yaw turned (radians, towards the stick's +x) and
+    /// the pitch moved (radians, towards its +y).
+    pub fn step(&mut self, stick: [f32; 2], t: &TurretLookTuning, dt: f32) -> (f32, f32) {
+        self.yaw.step(stick[0], &t.yaw_keep, dt);
+        self.pitch.step(stick[1], &t.pitch_keep, dt);
+        (
+            t.yaw_speed * self.yaw.value * dt,
+            t.pitch_speed * self.pitch.value * dt,
+        )
+    }
+
+    /// At a limit, pushing on: that axis's eased value dropped
+    /// (0x824C9538), yaw or pitch, by which way it pushes (+ the stick's
+    /// +x or +y).
+    pub fn stop(&mut self, yaw: Option<f32>, pitch: Option<f32>) {
+        for (axis, way) in [(&mut self.yaw, yaw), (&mut self.pitch, pitch)] {
+            if way.is_some_and(|w| axis.value * w > 0.0) {
+                axis.value = 0.0;
+            }
+        }
+    }
+}
+
+/// `angle` held to `limits` (radians) about `base` (0x824C95F0), wrapped.
+pub fn turret_clamp(angle: f32, base: f32, limits: (f32, f32)) -> (f32, Option<f32>) {
+    use std::f32::consts::{PI, TAU};
+    let wrap = |a: f32| (a + PI).rem_euclid(TAU) - PI;
+    if limits.1 - limits.0 >= TAU {
+        return (angle, None);
+    }
+    let off = wrap(angle - base);
+    if off < limits.0 {
+        (wrap(base + limits.0), Some(-1.0))
+    } else if off > limits.1 {
+        (wrap(base + limits.1), Some(1.0))
+    } else {
+        (angle, None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_turret_camera_turns_at_its_speed_and_stops_at_its_limits() {
+        // An emplaced Quad 50's: 2 and 2 rad/s, yaw all round, pitch -0.5
+        // to 0.4 (positive down: 0.4 down to 0.5 up); keeps as the seat's.
+        let quad = TurretLookTuning {
+            yaw_speed: 2.0,
+            pitch_speed: 2.0,
+            yaw: (-4.0, 4.0),
+            pitch: (-0.5, 0.4),
+            yaw_keep: [0.9, 0.9, 0.5],
+            pitch_keep: [0.9, 0.9, 0.5],
+        };
+        let dt = 1.0 / 60.0;
+        let mut c = TurretLook::default();
+        let mut last = 0.0;
+        for _ in 0..120 {
+            last = c.step(stick(1.0, 0.0), &quad, dt).0;
+        }
+        // Full: 2 rad/s, 114.6 deg/s; linear past the dead zone.
+        assert!((last.to_degrees() / dt - 114.6).abs() < 0.5);
+        let mut c = TurretLook::default();
+        for _ in 0..120 {
+            last = c.step(stick(0.75, 0.0), &quad, dt).0;
+        }
+        assert!((last.to_degrees() / dt - 63.4).abs() < 0.5);
+        assert_eq!(quad.pitch_up(), (-0.4, 0.5));
+        // Its yaw all round (8 rad) is never held; its pitch is.
+        assert_eq!(turret_clamp(3.0, 0.0, quad.yaw), (3.0, None));
+        let (p, way) = turret_clamp(0.7, 0.0, quad.pitch_up());
+        assert_eq!((p, way), (0.5, Some(1.0)));
+        // Held there, pushing on drops its eased value; easing off doesn't.
+        c.pitch.value = 0.8;
+        c.stop(None, way);
+        assert_eq!(c.pitch.value, 0.0);
+        c.pitch.value = -0.8;
+        c.stop(None, way);
+        assert_eq!(c.pitch.value, -0.8);
+    }
 
     #[test]
     fn a_tank_camera_turns_at_its_seats_speed_eased_by_its_inertia() {

@@ -8,7 +8,8 @@
 //! Prints `camera-check: PASS ...` or `camera-check: FAIL ...` per case
 //! and `camera-check: RESULT PASS` (or `FAIL`) at the end.
 //!
-//! Kinds: `tank` (the tank camera, [`m2_engine::pad_camera::TankLook`]).
+//! Kinds: `tank` (the tank camera, [`m2_engine::pad_camera::TankLook`]),
+//! `turret` (an emplaced gun's, [`m2_engine::pad_camera::TurretLook`]).
 
 use std::collections::HashMap;
 
@@ -27,6 +28,8 @@ pub const DT: f64 = 1.0 / 60.0;
 pub struct Records {
     pub tunings: HashMap<u32, VehicleTuning>,
     pub names: HashMap<u32, String>,
+    /// Each template's turret camera (an emplaced gun's).
+    pub turrets: HashMap<u32, m2_engine::pad_camera::TurretLookTuning>,
 }
 
 impl Records {
@@ -45,6 +48,7 @@ impl Records {
         let db = Layer::parse(&data)?;
         Ok(Self {
             tunings: m2_engine::tuning::read(&db, None),
+            turrets: m2_engine::tuning::turret_cameras(&db),
             names: db
                 .names()
                 .into_iter()
@@ -69,6 +73,22 @@ impl Records {
                 return None;
             }
             Some((name.clone(), pick(&self.tunings[&id])?))
+        })
+    }
+}
+
+impl Records {
+    /// The first template (by id) whose name holds `part` (any case) with
+    /// a turret camera.
+    pub fn turret(&self, part: &str) -> Option<(String, m2_engine::pad_camera::TurretLookTuning)> {
+        let part = part.to_ascii_lowercase();
+        let mut ids: Vec<_> = self.turrets.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter().find_map(|id| {
+            let name = self.names.get(&id)?;
+            name.to_ascii_lowercase()
+                .contains(&part)
+                .then(|| (name.clone(), self.turrets[&id]))
         })
     }
 }
@@ -147,7 +167,8 @@ pub fn run(install: &Install, kind: &str) -> anyhow::Result<bool> {
     let mut t = Tally::default();
     match kind {
         "tank" => tank(&records, &mut t),
-        other => anyhow::bail!("--camera-check: no kind {other:?} (tank)"),
+        "turret" => turret(&records, &mut t),
+        other => anyhow::bail!("--camera-check: no kind {other:?} (tank, turret)"),
     }
     Ok(t.finish())
 }
@@ -176,4 +197,38 @@ fn tank(records: &Records, t: &mut Tally) {
             );
         }
     }
+}
+
+/// #705's recipe: an emplaced Quad 50 at x = 1.0 / 0.75 / 0.5 for 2 s,
+/// about 115 / 63 / 12 deg/s once eased; its pitch held to 28.6 deg up
+/// and 22.9 down.
+fn turret(records: &Records, t: &mut Tally) {
+    let Some((name, tuning)) = records.turret("quad") else {
+        t.missing("turret quad");
+        return;
+    };
+    for (x, want, tol) in [(1.0, 115.0, 0.05), (0.75, 63.0, 0.05), (0.5, 12.0, 0.15)] {
+        let mut pad = Pad::default();
+        pad.turret_tuning = Some(tuning);
+        let (yaw, _) = hold(&mut pad, Mode::OnFoot, [x, 0.0], 2.0);
+        t.near(
+            &format!("turret {name} stick x {x}: yaw rate deg/s"),
+            yaw.abs(),
+            want,
+            tol,
+        );
+    }
+    let (low, high) = tuning.pitch_up();
+    t.near(
+        &format!("turret {name}: pitch up limit deg"),
+        f64::from(high.to_degrees()),
+        28.6,
+        0.01,
+    );
+    t.near(
+        &format!("turret {name}: pitch down limit deg"),
+        f64::from(-low.to_degrees()),
+        22.9,
+        0.01,
+    );
 }

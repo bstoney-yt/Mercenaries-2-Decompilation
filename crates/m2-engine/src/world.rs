@@ -398,6 +398,9 @@ pub struct Templates {
     /// Each item template's camera row's inputs, by id
     /// ([`crate::tuning::camera_modifiers`]).
     pub camera_modifiers: HashMap<u32, (u32, f32)>,
+    /// Each template's turret camera, by id
+    /// ([`crate::tuning::turret_cameras`]).
+    pub turret_cameras: HashMap<u32, crate::pad_camera::TurretLookTuning>,
     /// Hand-held guns that fire rounds, by id ([`crate::tuning::hand_guns`]).
     pub guns: HashMap<u32, HandGun>,
     /// What each template's `EquipmentLink`s hand it, by id.
@@ -1204,6 +1207,7 @@ impl Templates {
             human_sets: crate::tuning::human_animation_sets(&db),
             face_actors: crate::tuning::face_actors(&db),
             camera_modifiers: crate::tuning::camera_modifiers(&db),
+            turret_cameras: crate::tuning::turret_cameras(&db),
             guns: crate::tuning::hand_guns(&db),
             equipment: crate::tuning::equipment(&db),
             arms: crate::weapons::read(&db),

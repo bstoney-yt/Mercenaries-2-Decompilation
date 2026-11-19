@@ -1725,8 +1725,25 @@ impl Game {
                         // Seated on it by its seat's clip, she only looks;
                         // its turret turns after the view, at its own pace
                         // ([`crate::combat::MannedTurret`]).
+                        // Its turret camera's limits about the way it faces
+                        // ([`m2_engine::pad_camera::turret_clamp`]).
+                        let turret = self.combat.manned.as_ref().and_then(|m| {
+                            Some((
+                                m.facing,
+                                *world.index.template_db.turret_cameras.get(&m.template)?,
+                            ))
+                        });
+                        player.look_limits = turret.map(|(_, t)| {
+                            let (low, high) = t.pitch_up();
+                            [low, high]
+                        });
                         if self.combat.manned.is_some() && player.seated {
                             player.look(physics, intent, dt);
+                            if let Some((facing, t)) = turret {
+                                player.yaw =
+                                    m2_engine::pad_camera::turret_clamp(player.yaw, facing, t.yaw)
+                                        .0;
+                            }
                         } else {
                             player.update(physics, intent, dt);
                         }

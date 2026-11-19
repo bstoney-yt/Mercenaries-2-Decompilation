@@ -384,6 +384,9 @@ pub struct Player {
     pub driving: Option<usize>,
     /// Aiming: she faces the camera's way with the rifle shouldered.
     pub aiming: bool,
+    /// Her view's pitch limits while something else's hold it (an
+    /// emplaced gun's turret camera), radians up positive.
+    pub look_limits: Option<[f32; 2]>,
     /// Her lens' share of the field of view (her gun's, aiming:
     /// [`crate::game::Game`]'s `aim_lens`), 1 at rest.
     pub lens: f32,
@@ -672,6 +675,7 @@ impl Player {
             ladder_step: None,
             driving: None,
             aiming: false,
+            look_limits: None,
             lens: 1.0,
             scope: None,
             clips: FightClips::default(),
@@ -1060,7 +1064,9 @@ impl Player {
     /// to +50.2 degrees standing, -33.2 to +50.7 aiming in.
     fn pitch_limits(&self) -> [f32; 2] {
         use m2_engine::pad_camera::{AIMING, pitch_at};
-        if self.aiming {
+        if let Some(limits) = self.look_limits {
+            limits
+        } else if self.aiming {
             [pitch_at(0.0, &AIMING), pitch_at(1.0, &AIMING)]
         } else {
             PITCH_RANGE
