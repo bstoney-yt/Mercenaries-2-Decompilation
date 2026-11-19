@@ -533,6 +533,10 @@ struct Options {
     /// swim her forward walking, at her pace and sprinting, logging how
     /// fast she goes (`swim-check:` lines).
     swim_check: bool,
+    /// `--sink-check`: a parked car is put in deep water with her in it,
+    /// then a helicopter set down on the sea, each held past its
+    /// `Buoyancy` delay; PASS when each sinks and she is put out.
+    sink_check: bool,
     /// `--mine-check`: in the mission, the nearest placed mine is blasted
     /// by an RPG and, should it stand, run into by a jeep; logs
     /// `mine-check:` lines ([`mines::MineCheck`]).
@@ -939,6 +943,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.vehicle.get_or_insert_with(|| "m151".to_owned());
             }
             "--swim-check" => o.swim_check = true,
+            "--sink-check" => {
+                o.sink_check = true;
+                o.drive = true;
+            }
             "--mine-check" => {
                 o.mine_check = true;
                 o.mission = true;
@@ -7740,6 +7748,10 @@ fn drive_for_screenshot(
         swim_check(game, tick);
         return Ok(());
     }
+    if options.sink_check {
+        sink_check(game, tick);
+        return Ok(());
+    }
     if options.impact_check {
         impact_check(game, tick);
         return Ok(());
@@ -8860,6 +8872,135 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 /// `--swim-check`: she is put in the nearest water over 4 m deep (looked
 /// for in rings out to 600 m) and swims forward for 4 s walking, at her
 /// pace and sprinting, through the game's tick; logs her speed each time.
+/// `--sink-check`: the first car loaded (no boat, no helicopter; parked
+/// or, with nowhere to park by her, not) is put on water more than 6 m
+/// deep near her with her at the wheel, and held
+/// its `Buoyancy` delay (5 s without one) and 10 s more, its time under
+/// the water logged each second; then the first helicopter likewise
+/// (its delay 0), held 3 s, if one is loaded (else skipped, said so).
+/// Each passes when it has sunk and she is no
+/// longer in it while it stays whole (not wrecked), logging what she
+/// lost. The car passes only near Xenia's ([`SINK_XENIA`], within
+/// [`SINK_SLACK`]): put out 5.8 s after it went in, 100.4 lost, the car
+/// alive. One line `sink-check: PASS` or `FAIL ...` at the end.
+/// Xenia's car sinking with her at the wheel (`sinking.md`, run sink1:
+/// Mattias 120 of 120, the Phoenix): put out 5.8 s after it went in,
+/// 100.4 of her health lost.
+const SINK_XENIA: (f32, f32) = (5.8, 100.4);
+/// How near Xenia's the car's put-out must come: seconds, health.
+const SINK_SLACK: (f32, f32) = (0.6, 1.0);
+
+fn sink_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::Vec3;
+    let mut fails: Vec<String> = Vec::new();
+    let mut passed: Vec<String> = Vec::new();
+    for (kind, heli, extra) in [("car", false, 10.0f32), ("helicopter", true, 3.0)] {
+        let Some(world) = game.scene.world.as_ref() else {
+            fails.push("no island".into());
+            break;
+        };
+        let here = game.focus();
+        // Any loaded vehicle of the kind, parked or not (with nowhere to
+        // park by her, the loaded ones wait unplaced): the check places
+        // it itself.
+        let pick = game
+            .scene
+            .vehicles
+            .iter()
+            .position(|v| !v.wrecked && !v.spec.is_boat() && v.spec.is_helicopter() == heli);
+        let Some(i) = pick else {
+            if heli {
+                eprintln!("sink-check: no helicopter model loaded here: its part is skipped");
+            } else {
+                fails.push(format!("no {kind} model loaded"));
+            }
+            continue;
+        };
+        let physics = &world.physics;
+        let ground = |x: f32, z: f32| {
+            let top = 600.0;
+            physics
+                .cast_ray(Vec3::new(x, top, z), Vec3::NEG_Y, 1200.0)
+                .map(|(d, _)| top - d)
+        };
+        let Some(at) = crate::game::deep_spot(here, ground, |x, z| physics.water_at(x, z), 6.0)
+        else {
+            fails.push(format!("no water 6 m deep within 600 m of {here:.0}"));
+            break;
+        };
+        let label = game.scene.vehicles[i].spec.label.clone();
+        let after = world.index.template_db.buoyancy_for(&label).sink_after;
+        eprintln!("sink-check: the {label} ({kind}) put in at {at:.1}, its delay {after} s");
+        // On the water, at rest, her at the wheel.
+        let world = game.scene.world.as_mut().expect("an island");
+        let v = &mut game.scene.vehicles[i];
+        if let Some(id) = v.id.take() {
+            world.physics.remove_vehicle(id);
+        }
+        v.id = Some(world.physics.add_vehicle(&v.spec, at + Vec3::Y * 0.5, 0.0));
+        if let Some(p) = game.scene.player.as_mut() {
+            p.driving = Some(i);
+            p.landed = true;
+        }
+        let ticks = ((after + extra) / tick) as u32;
+        let every = ((1.0 / tick) as u32).max(1);
+        let mut sunk_at = None;
+        // As Xenia's run (Mattias, 120 of 120): her whole health 120, so
+        // the loss isn't cut by a lower whole.
+        game.combat.max_hp = 120.0;
+        game.combat.hp = 120.0;
+        let mut lost = 0.0;
+        for t in 0..ticks {
+            game.step(Intent::default(), tick);
+            if t % every == 0 {
+                eprintln!(
+                    "sink-check: {:.0} s: {:.1} s a quarter under, sunk {}",
+                    t as f32 * tick,
+                    game.in_water(i),
+                    game.sunk(i)
+                );
+            }
+            if game.sunk(i) && sunk_at.is_none() {
+                sunk_at = Some(t as f32 * tick);
+                lost = 120.0 - game.combat.hp;
+            }
+        }
+        let out = game
+            .scene
+            .player
+            .as_ref()
+            .is_none_or(|p| p.driving != Some(i));
+        match sunk_at {
+            Some(s) if out && game.scene.vehicles[i].wrecked => fails.push(format!(
+                "{kind} sank at {s:.1} s but was wrecked (the 360's stays whole)"
+            )),
+            Some(s) if out && !heli && (lost - SINK_XENIA.1).abs() > SINK_SLACK.1 => {
+                fails.push(format!(
+                    "{kind} sank at {s:.1} s, she is out but lost {lost:.1} (Xenia {})",
+                    SINK_XENIA.1
+                ))
+            }
+            Some(s) if out && !heli && (s - SINK_XENIA.0).abs() > SINK_SLACK.0 => fails.push(
+                format!("{kind} put her out at {s:.1} s (Xenia {} s)", SINK_XENIA.0),
+            ),
+            Some(s) if out => passed.push(format!(
+                "{kind} sank at {s:.1} s whole, she is out, {lost:.1} of her health lost"
+            )),
+            Some(s) => fails.push(format!("{kind} sank at {s:.1} s but she is still in it")),
+            None => fails.push(format!("{kind} did not sink in {:.0} s", after + extra)),
+        }
+    }
+    if fails.is_empty() {
+        eprintln!("sink-check: PASS {}", passed.join("; "));
+    } else {
+        eprintln!(
+            "sink-check: FAIL {} (passed: {})",
+            fails.join("; "),
+            passed.join("; ")
+        );
+    }
+}
+
 /// `--impact-check`: rounds fired straight down at the ground every 4 m
 /// over 200 m round her (and at the water where there is any), each
 /// struck as one of hers strikes the world ([`Combat::impact_probe`]):
