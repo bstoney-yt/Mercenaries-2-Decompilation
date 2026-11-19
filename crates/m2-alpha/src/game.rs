@@ -484,6 +484,36 @@ impl Game {
         if let Some(arms) = scene.arms() {
             combat.arm(arms, scene.damage_table());
         }
+        if let Some(w) = &scene.world {
+            let db = &w.index.template_db;
+            // Each effect template by name hash: its own `Explosive`, and
+            // each `PhysicalLink`'d template's (fx_Explosion_Large's
+            // `Explosion (RPG Frag)`), with the link's offset. From the
+            // 360 code: a template's object spawns its `PhysicalLink`s at
+            // its own transform with the link's (0x82408C30 -> 0x82409AA8).
+            let blast = |t: u32| {
+                db.explosions.get(&t).map(|e| m2_engine::weapons::Blast {
+                    template: t,
+                    radius: e.radius,
+                    damage: e.damage,
+                    min_damage: e.least,
+                    max_force: e.force,
+                    key: (e.kind != 0).then_some(e.kind),
+                })
+            };
+            combat.wreck_blasts = db
+                .names
+                .iter()
+                .filter_map(|(&t, name)| {
+                    let mut all: Vec<(Vec3, m2_engine::weapons::Blast)> =
+                        blast(t).map(|b| (Vec3::ZERO, b)).into_iter().collect();
+                    for l in db.links.get(&t).into_iter().flatten() {
+                        all.extend(blast(l.child).map(|b| (l.offset, b)));
+                    }
+                    (!all.is_empty()).then(|| (m2_assets::name_hash(name), all))
+                })
+                .collect();
+        }
         combat.particle_table = scene.particle_table();
         own_explosives(&mut combat, scene.hero_explosives());
         eprintln!(

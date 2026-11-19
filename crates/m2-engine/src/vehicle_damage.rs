@@ -380,6 +380,11 @@ pub struct PartDamage {
     /// The effects running: (part, effect name hash, node), started by
     /// a state and kept up until a state the part leaves stops them.
     running: Vec<(usize, u32, u16)>,
+    /// The effects started since last asked ([`take_started`]): as
+    /// `running`, each once as its state starts it.
+    ///
+    /// [`take_started`]: Self::take_started
+    started: Vec<(usize, u32, u16)>,
     /// States entered by message, counted (for the logs).
     pub entered: usize,
 }
@@ -397,6 +402,7 @@ impl PartDamage {
             body: healths.burn_part.and_then(|h| model.part_named(h)),
             detached: Vec::new(),
             running: Vec::new(),
+            started: Vec::new(),
             entered: 0,
         };
         for h in &healths.parts {
@@ -488,6 +494,7 @@ impl PartDamage {
                 && !self.running.contains(&(k, fx, n))
             {
                 self.running.push((k, fx, n));
+                self.started.push((k, fx, n));
             }
         }
         for node in acts.detaches {
@@ -599,6 +606,13 @@ impl PartDamage {
             self.sent[k][1] = true;
             self.send(model, k, DESTROY_MSG);
         }
+    }
+
+    /// The effects the parts' states started since last asked (each
+    /// `StartEmitter` that ran: 0x8222FA30 spawns its template at its
+    /// node): (part, effect name hash, node).
+    pub fn take_started(&mut self) -> Vec<(usize, u32, u16)> {
+        std::mem::take(&mut self.started)
     }
 
     /// The parts thrown off since last asked.

@@ -6242,6 +6242,27 @@ impl Physics {
     /// boat alike, vtable +0x60 0x82182418) sums its bodies' masses, each
     /// one over its inverse mass (0x8262C120), and answers 0 at the first
     /// body whose inverse mass is 0.
+    /// The world box round vehicle `id`'s chassis body's collision (what
+    /// a blast's rigid push sizes it by: the 360 takes the box of the
+    /// Havok body it pushes, 0x82170500 in 0x8215CBC8).
+    pub fn vehicle_body_box(&self, id: VehicleId) -> Option<(Vec3, Vec3)> {
+        let v = self.vehicles.get(id.0)?.as_ref()?;
+        let body = self.world.bodies.get(v.controller.chassis)?;
+        let mut out: Option<r::Aabb> = None;
+        for &h in body.colliders() {
+            let Some(c) = self.world.colliders.get(h) else {
+                continue;
+            };
+            let a = c.compute_aabb();
+            out = Some(match out {
+                Some(o) => rapier3d::geometry::BoundingVolume::merged(&o, &a),
+                None => a,
+            });
+        }
+        let a = out?;
+        Some((vec3(a.mins), vec3(a.maxs)))
+    }
+
     pub fn vehicle_mass(&self, id: VehicleId) -> Option<f32> {
         let v = self.vehicles.get(id.0)?.as_ref()?;
         let hinge = v.hinge.as_ref();
