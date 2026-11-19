@@ -312,6 +312,9 @@ struct Options {
     homing_check: bool,
     /// `--gravity-check`: measure the physics world's gravity ([`gravity_check`]).
     gravity_check: bool,
+    /// `--ditch-check`: (turns on --drive) out of her car at 18 m/s and
+    /// what she plays on foot after ([`ditch_check`]).
+    ditch_check: bool,
     /// `--stagger-check`: her stagger's exemptions ([`stagger_check`]).
     stagger_check: bool,
     /// `--disguise-check`: her vehicle disguise and a run-over
@@ -1103,6 +1106,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--take" => o.take = true,
             "--fire" => o.fire = true,
             "--homing-check" => o.homing_check = true,
+            "--ditch-check" => {
+                o.ditch_check = true;
+                o.drive = true;
+            }
             "--gravity-check" => {
                 o.gravity_check = true;
                 o.drive = true;
@@ -7780,6 +7787,10 @@ fn drive_for_screenshot(
         gravity_check(game);
         return Ok(());
     }
+    if options.ditch_check {
+        ditch_check(game, tick);
+        return Ok(());
+    }
     let label = game
         .scene
         .player
@@ -12445,6 +12456,125 @@ mod tests {
 /// 20 m, the vehicle she is in driven off a 10 m ledge, and a parked boat
 /// (if one is near) left to settle on still water. Prints a line each and
 /// PASS or FAIL.
+/// The 360's bail-out at 18 m/s, as the Xenia capture of a car exit has
+/// it (knockdown-time.md, the per-frame read): no knockdown and no
+/// damage; put 0.5 m over the car's origin, she plays `Jump`
+/// (0x6FBE1165) for 0.44 s, then `JumpLandStationary` (0xC9592BE4) for
+/// 0.49 s, then stands.
+const DITCH_SPEED: f32 = 18.0;
+const DITCH_JUMP: (u32, f32) = (0x6fbe_1165, 0.44);
+const DITCH_LAND: (u32, f32) = (0xc959_2be4, 0.49);
+/// How far off Xenia's times an action may run, seconds (two frames at
+/// 30 fps, and the capture's own frame).
+const DITCH_SLACK: f32 = 0.1;
+
+/// `--ditch-check`: her car, on the ground where she got in, set going at
+/// [`DITCH_SPEED`] along its heading; the use key pressed as a player
+/// presses it (the game's own exit path); then 3 s on foot, logging each
+/// action she plays and for how long, her root's highest rise over where
+/// she stood, her health and any knockdown. Prints `ditch-check:` lines
+/// and PASS or FAIL against Xenia's [`DITCH_JUMP`] and [`DITCH_LAND`].
+fn ditch_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::Vec3;
+    let verdict = |ok: bool| if ok { "PASS" } else { "FAIL" };
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("ditch-check: FAIL not in a vehicle");
+        return;
+    };
+    let label = game.scene.vehicles[i].spec.label.clone();
+    let Some(world) = game.scene.world.as_mut() else {
+        eprintln!("ditch-check: FAIL no world");
+        return;
+    };
+    let Some(id) = game.scene.vehicles[i].id else {
+        eprintln!("ditch-check: FAIL the {label} has no body");
+        return;
+    };
+    let Some(at) = world.physics.vehicle_transform(id) else {
+        eprintln!("ditch-check: FAIL the {label} has no place");
+        return;
+    };
+    let ahead = at
+        .transform_vector3(Vec3::Z)
+        .with_y(0.0)
+        .normalize_or(Vec3::Z);
+    world.physics.set_vehicle_velocity(id, ahead * DITCH_SPEED);
+    let hp = game.combat.hp;
+    let mut input = input::Input::default();
+    input.button(input::Action::Use, true);
+    // From the tick she gets out on: the press, the release, then 3 s.
+    let mut actions: Vec<(u32, f32)> = Vec::new();
+    let mut rise = 0.0f32;
+    let mut knocked = false;
+    let mut base = None;
+    let mut sample = |game: &Game| {
+        let Some(p) = game.scene.player.as_ref() else {
+            return;
+        };
+        if p.driving.is_some() {
+            return;
+        }
+        let y0 = *base.get_or_insert(p.character.position.y);
+        knocked |= p.down || p.ragdoll.is_some();
+        rise = rise.max(p.character.position.y - y0);
+        let a = p
+            .model
+            .as_ref()
+            .and_then(|(_, r)| r.animator.action())
+            .unwrap_or(0);
+        match actions.last_mut() {
+            Some((last, d)) if *last == a => *d += tick,
+            _ => actions.push((a, tick)),
+        }
+    };
+    game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+    sample(game);
+    let mut input = input::Input::default();
+    input.button(input::Action::Use, false);
+    game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+    sample(game);
+    let on_foot = game
+        .scene
+        .player
+        .as_ref()
+        .is_some_and(|p| p.driving.is_none());
+    let mut t = 0.0;
+    while t < 3.0 {
+        game.step(Intent::default(), tick);
+        t += tick;
+        sample(game);
+    }
+    let line: Vec<String> = actions
+        .iter()
+        .map(|(a, d)| format!("{a:08x} {d:.2} s"))
+        .collect();
+    eprintln!(
+        "ditch-check: out of the {label} at {DITCH_SPEED} m/s: on foot {on_foot}; actions {}",
+        line.join(", ")
+    );
+    let find = |want: u32| actions.iter().position(|&(a, _)| a == want);
+    let (jump, land) = (find(DITCH_JUMP.0), find(DITCH_LAND.0));
+    let near =
+        |k: Option<usize>, want: f32| k.is_some_and(|k| (actions[k].1 - want).abs() <= DITCH_SLACK);
+    let ok_order = matches!((jump, land), (Some(j), Some(l)) if j < l);
+    let ok = on_foot && ok_order && near(jump, DITCH_JUMP.1) && near(land, DITCH_LAND.1);
+    eprintln!(
+        "ditch-check: Jump {:.2} s (Xenia {}), JumpLandStationary {:.2} s (Xenia {}), in that order: {}",
+        jump.map_or(0.0, |k| actions[k].1),
+        DITCH_JUMP.1,
+        land.map_or(0.0, |k| actions[k].1),
+        DITCH_LAND.1,
+        verdict(ok)
+    );
+    let ok2 = !knocked && game.combat.hp >= hp;
+    eprintln!(
+        "ditch-check: root rose {rise:.2} m over where she was put (Xenia 0.05 at 30 Hz), health {hp:.0} -> {:.0}, knocked down {knocked}: {}",
+        game.combat.hp,
+        verdict(ok2)
+    );
+    eprintln!("ditch-check: {}", verdict(ok && ok2));
+}
+
 fn gravity_check(game: &Game) {
     use m2_engine::physics::{WORLD_GRAVITY, float_depth};
     use m2_engine::{CollisionShape, Physics, StaticKey, VehicleControls};
