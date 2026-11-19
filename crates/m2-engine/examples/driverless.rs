@@ -15,6 +15,11 @@
 //! gearbox model). The helicopter (an MD-500): lifted to 50 m,
 //! then every input 0 and its lift 0 for 10 s, its height logged.
 //!
+//! Then the car's sleep: placed on the flat with every input 0 it sleeps
+//! within 3 s (Havok's default deactivation, 6 still checks 0.2 s apart,
+//! which no car set-up turns off), and coasting it never sleeps while it
+//! rolls faster than 0.1 m/s.
+//!
 //! Prints `driverless: PASS ...` or `FAIL ...` lines, `driverless: INFO
 //! ...` lines for what the 360 numbers don't settle, and `driverless:
 //! RESULT PASS` (or `FAIL`); exits 1 on a failure. Offscreen: no window,
@@ -144,6 +149,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => line(false, "no M151 car template".to_owned()),
     }
 
+    // Its sleep: Havok's default spatial deactivation, which no car
+    // set-up turns off (0x82629CF0's only callers are 0x8218CAA8, the
+    // jet's, and 0x82160FF8): 6 checks in a row 0.2 s apart within 0.02
+    // m, so asleep 1.2 s after it keeps still.
+    match spec_of("_CarPhysicsV2", "M151", "car") {
+        Some((name, spec)) => {
+            let (slept, moving) = rests(&spec);
+            line(
+                slept.is_some_and(|t| t <= 3.0),
+                format!(
+                    "{name}: placed on the flat with every input 0, it sleeps {} (360: 6 still checks 0.2 s apart, within 3 s of being placed)",
+                    slept.map_or("never".to_owned(), |t| format!(
+                        "{t:.2} s after being placed"
+                    ))
+                ),
+            );
+            line(
+                moving.is_none(),
+                format!(
+                    "{name}: let go at {LET_GO} m/s, it never sleeps while it rolls faster than 0.1 m/s{}",
+                    moving.map_or(String::new(), |v| format!(" (asleep at {v:.2} m/s)"))
+                ),
+            );
+        }
+        None => line(false, "no M151 car template".to_owned()),
+    }
+
     match spec_of(
         "_HelicopterPhysics",
         "MD-500",
@@ -228,6 +260,60 @@ fn coast(spec: &VehicleSpec, after: VehicleControls) -> Vec<f32> {
         out.push(p.vehicle_speed(id));
     }
     out
+}
+
+/// When `spec`, placed on the flat with every input 0, first sleeps
+/// (seconds after being placed, within 6 s), and the speed it was at if
+/// it ever slept faster than 0.1 m/s while coasting 10 s from
+/// [`LET_GO`].
+fn rests(spec: &VehicleSpec) -> (Option<f32>, Option<f32>) {
+    let mut p = Physics::new();
+    let half = 8000.0;
+    let v = [
+        Vec3::new(-half, 0.0, -half),
+        Vec3::new(half, 0.0, -half),
+        Vec3::new(half, 0.0, half),
+        Vec3::new(-half, 0.0, half),
+    ];
+    let shape = CollisionShape::mesh(&v, &[[0, 1, 2], [0, 2, 3]]).expect("plane");
+    p.add_static(StaticKey::Cell(1), &shape, Vec3::ZERO, Quat::IDENTITY);
+    p.step(DT);
+    let id = p.add_vehicle_turned(
+        spec,
+        Vec3::new(0.0, 0.2 - spec.hull.0.y, -7000.0),
+        Quat::IDENTITY,
+    );
+    let mut slept = None;
+    for i in 1..=(6.0 / DT) as usize {
+        p.drive(id, VehicleControls::default());
+        p.step(DT);
+        if p.vehicle_asleep(id) {
+            slept = Some(i as f32 * DT);
+            break;
+        }
+    }
+    let mut t = 0.0;
+    while p.vehicle_speed(id) < LET_GO && t < 30.0 {
+        p.drive(
+            id,
+            VehicleControls {
+                throttle: 1.0,
+                ..VehicleControls::default()
+            },
+        );
+        p.step(DT);
+        t += DT;
+    }
+    let mut moving = None;
+    for _ in 0..(10.0 / DT) as usize {
+        let before = p.vehicle_speed(id);
+        p.drive(id, VehicleControls::default());
+        p.step(DT);
+        if moving.is_none() && p.vehicle_asleep(id) && before.abs() > 0.1 {
+            moving = Some(before);
+        }
+    }
+    (slept, moving)
 }
 
 /// Climbed to about 50 m, then every input 0 and lift 0 for 10 s: its
