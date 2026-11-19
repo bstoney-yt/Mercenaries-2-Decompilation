@@ -6412,6 +6412,18 @@ impl Physics {
         v.jolt = 0.0;
     }
 
+    /// Holds a vehicle at `velocity`, m/s, keeping its velocity history:
+    /// a run-up for the offscreen checks, so a crash after it still counts
+    /// as a jolt ([`vehicle_jolt`](Self::vehicle_jolt)).
+    pub fn hold_vehicle_velocity(&mut self, id: VehicleId, velocity: Vec3) {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
+            body.set_linvel(vector(velocity), true);
+        }
+    }
+
     /// Turns an overturned vehicle upright where it is.
     pub fn right_vehicle(&mut self, id: VehicleId) {
         let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {

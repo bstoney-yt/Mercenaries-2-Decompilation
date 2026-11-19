@@ -13300,21 +13300,21 @@ fn toss_check(game: &mut Game, tick: f32, mode: &str) {
             let mut last_root: Option<Vec3> = None;
             let mut t = 0.0;
             while t < 20.0 && up.is_none() {
-                // The run-up: held at 20 m/s along her heading until it
-                // meets the wall (a rider's throttle on the 360; here the
-                // bike's drag would bleed it off in the 16 m), so the toss
-                // is the head-on crash.
+                // The run-up: held at 20 m/s along her heading each update
+                // until its middle is 13 m along (the bike's drag would bleed
+                // it off in the 16 m), then let go the last 2 m to the wall's
+                // face so the crash's drop counts as the jolt; the toss is
+                // the head-on crash.
                 if thrown.is_none()
                     && let Some(w) = game.scene.world.as_mut()
                 {
-                    let p = w
-                        .physics
-                        .vehicle_transform(id)
-                        .map_or(Vec3::ZERO, |m| m.transform_point3(Vec3::ZERO));
-                    if (p - origin).dot(ahead) < 12.0 {
+                    let along = w.physics.vehicle_transform(id).map_or(0.0, |m| {
+                        (m.transform_point3(Vec3::ZERO) - origin).dot(ahead)
+                    });
+                    if along < 13.0 {
                         let v = w.physics.vehicle_velocity(id);
                         w.physics
-                            .set_vehicle_velocity(id, ahead * 20.0 + Vec3::Y * v.y);
+                            .hold_vehicle_velocity(id, ahead * 20.0 + Vec3::Y * v.y);
                     }
                 }
                 if let Some(w) = game.scene.world.as_ref() {
