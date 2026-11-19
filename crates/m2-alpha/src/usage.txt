@@ -221,7 +221,7 @@ m2-alpha [options]
   --camera-check <kind>  offscreen, no world: the pad's cameras driven by a
                          scripted right stick against the game's records,
                          camera-check: PASS/FAIL lines and a RESULT line
-                         (exit 1 on a failure); kinds: tank, turret
+                         (exit 1 on a failure); kinds: tank, turret, heli
   --seat-check           with --screenshot (no --drive needed): park a
                          --vehicle (default M151) with a gunner's own
                          entrance near her if none is (trying its models one

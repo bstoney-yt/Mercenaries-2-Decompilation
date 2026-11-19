@@ -91,6 +91,10 @@ pub struct VehicleTuning {
     /// A car's or a boat's driver camera's preset (its
     /// `CameraCarPresetLink`'s `PresetTemplate`'s `CameraCarPreset`).
     pub car_camera: Option<crate::pad_camera::CarPreset>,
+    /// A helicopter's pilot camera's stick look (its `CameraHelicopter`'s
+    /// `PitchSpeed`, `MinPitch`/`MaxPitch`, `PitchLimitCushion` and pitch
+    /// inertias).
+    pub heli_camera: Option<crate::pad_camera::HeliLookTuning>,
 }
 
 /// How a tracked vehicle drives, from its `_TankPhysics` (names from the
@@ -2342,6 +2346,22 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         heli_camera.float(r, CHASE_DISTANCE)?,
                         heli_camera.float(r, name_hash("DefaultPitch"))?,
                     ))
+                })(),
+                heli_camera: (|| {
+                    let records = heli_camera.of_template(id);
+                    let seat = name_hash("SeatName");
+                    let r = records
+                        .iter()
+                        .find(|r| heli_camera.word(r, seat) == Some(name_hash("seat_driver")))
+                        .or(records.first())?;
+                    let f = |n: &str| heli_camera.float(r, name_hash(n));
+                    let input = f("PitchInputInertia")?;
+                    Some(crate::pad_camera::HeliLookTuning {
+                        pitch_speed: f("PitchSpeed")?,
+                        pitch: (f("MinPitch")?, f("MaxPitch")?),
+                        cushion: f("PitchLimitCushion")?,
+                        keep: [input, input, f("PitchNoInputInertia")?],
+                    })
                 })(),
                 car_camera: (|| {
                     // The driver's seat's link, else its first; its

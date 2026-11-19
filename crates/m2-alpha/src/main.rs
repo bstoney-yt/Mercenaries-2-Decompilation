@@ -11110,6 +11110,18 @@ impl Running {
         self.pad.pda = (self.game.support.pda || store) && !self.hud.menu;
         // Aiming in, the camera turns by its aimed presets.
         self.pad.aiming = self.game.scene.player.as_ref().is_some_and(|p| p.aiming);
+        // A helicopter's pilot camera, while she flies one.
+        let heli = self
+            .game
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| p.driving)
+            .and_then(|i| self.game.scene.vehicles.get(i)?.spec.tuning.heli_camera);
+        if heli != self.pad.heli_tuning {
+            self.pad.heli_camera = Default::default();
+        }
+        self.pad.heli_tuning = heli;
         // An emplaced gun's turret camera, while she mans one.
         let turret = self.game.combat.manned.as_ref().and_then(|m| {
             let w = self.game.scene.world.as_ref()?;

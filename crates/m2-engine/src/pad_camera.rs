@@ -771,9 +771,107 @@ pub fn turret_clamp(angle: f32, base: f32, limits: (f32, f32)) -> (f32, Option<f
     }
 }
 
+/// A helicopter pilot's camera's stick look, as the 360's
+/// `CameraHelicopter` camera (class 0x820F0240, built by 0x824C1D30 from
+/// the seat's record, 0x8243EAC0; `PitchSpeed` +0x24 to +0x648,
+/// `MinPitch`/`MaxPitch` +0x38/+0x3C to +0x638/+0x63C,
+/// `PitchLimitCushion` +0x40 to +0x640, `PitchInputInertia` +0x48 for
+/// both input keeps and `PitchNoInputInertia` +0x4C, the block +0x620).
+/// Its pitch is the camera's: positive down.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeliLookTuning {
+    pub pitch_speed: f32,
+    pub pitch: (f32, f32),
+    pub cushion: f32,
+    pub keep: [f32; 3],
+}
+
+impl HeliLookTuning {
+    /// The view's pitch limits, radians up positive: `-MaxPitch` to
+    /// `-MinPitch`.
+    pub fn pitch_up(&self) -> (f32, f32) {
+        (-self.pitch.1, -self.pitch.0)
+    }
+}
+
+/// A helicopter pilot's camera's stick look (0x824C1EB0).
+///
+/// From the 360 code: its handler (0x824C2480) takes the look-pitch
+/// input only (the stick's y after [`stick`], +0x600); the stick's x
+/// turns nothing, the camera's yaw following the helicopter's (`YawLag`).
+/// Within `PitchLimitCushion` of a limit, an input pushing toward it is
+/// scaled down by the distance left over the cushion; the input is then
+/// eased through [`Inertia3`] and the pitch (+0x604, positive down) moves
+/// by `-PitchSpeed` times it times the time, held to `MinPitch` ..
+/// `MaxPitch`: no curve.
+///
+/// **Not ported**: the yaw's lag behind the helicopter (`YawLag`) and the
+/// roll and pitch amplitudes and lags (`RollAmp`, `PitchAmp`...).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HeliLook {
+    pub pitch: Inertia3,
+}
+
+impl HeliLook {
+    /// A step of `dt` seconds with the stick at `stick` (after [`stick`])
+    /// and the view's pitch now `pitch` (radians up positive): the pitch
+    /// moved, radians up.
+    pub fn step(&mut self, stick: [f32; 2], pitch: f32, t: &HeliLookTuning, dt: f32) -> f32 {
+        let (min, max) = t.pitch;
+        let down = -pitch;
+        let mut input = stick[1];
+        let cushion = t.cushion.max(1e-4);
+        if down < min + cushion && input > 0.0 {
+            input *= ((down - min) / cushion).clamp(0.0, 1.0);
+        }
+        if max - cushion < down && input < 0.0 {
+            input *= ((max - down) / cushion).clamp(0.0, 1.0);
+        }
+        self.pitch.step(input, &t.keep, dt);
+        t.pitch_speed * self.pitch.value * dt
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_helicopter_camera_pitches_only_slowing_into_its_limits() {
+        // An MD-500's pilot: 2.8 rad/s, -0.5 to 1.0 (positive down),
+        // cushion 1.7, keeps 0.7 and 0.5.
+        let md = HeliLookTuning {
+            pitch_speed: 2.8,
+            pitch: (-0.5, 1.0),
+            cushion: 1.7,
+            keep: [0.7, 0.7, 0.5],
+        };
+        let dt = 1.0 / 60.0;
+        assert_eq!(md.pitch_up(), (-1.0, 0.5));
+        // From its default, 0.25 down: up toward its 0.5 up limit, the
+        // input scaled by 0.75 / 1.7 (0.44): 2.8 * 0.44 = 1.24 rad/s.
+        let mut c = HeliLook::default();
+        let mut last = 0.0;
+        for _ in 0..60 {
+            last = c.step(stick(0.0, 1.0), -0.25, &md, dt);
+        }
+        assert!((last / dt - 1.235).abs() < 0.01, "{}", last / dt);
+        // At the limit, nothing more.
+        let mut c = HeliLook::default();
+        for _ in 0..60 {
+            last = c.step(stick(0.0, 1.0), 0.5, &md, dt);
+        }
+        assert_eq!(last, 0.0);
+        // Down from level, the other limit 1.0 away: scaled by 1/1.7.
+        let mut c = HeliLook::default();
+        for _ in 0..60 {
+            last = c.step(stick(0.0, -1.0), 0.0, &md, dt);
+        }
+        assert!((last / dt + 2.8 / 1.7).abs() < 0.01, "{}", last / dt);
+        // The stick's x turns nothing.
+        let mut c = HeliLook::default();
+        assert_eq!(c.step(stick(1.0, 0.0), 0.0, &md, dt), 0.0);
+    }
 
     #[test]
     fn a_turret_camera_turns_at_its_speed_and_stops_at_its_limits() {
