@@ -8972,10 +8972,32 @@ fn sink_check(game: &mut Game, tick: f32, jennifer: bool) {
         let whole = if jennifer { 100.0 } else { 120.0 };
         game.combat.max_hp = whole;
         game.combat.hp = whole;
+        // As the scripts have it in play (`Player.SetHealthClamp`: Xenia's
+        // Jennifer run was in a mission); this check runs no scripts.
+        if jennifer {
+            game.combat.health_clamp = true;
+        }
         let mut lost = 0.0;
         let mut left = whole;
+        // Her least health from going in to 2 s after she is out: her
+        // health comes back after (the q760 run read 1.42: 1 and 0.42 of
+        // it).
+        let mut least = whole;
+        let mut out_at = None;
         for t in 0..ticks {
             game.step(Intent::default(), tick);
+            if out_at.is_none_or(|o| t < o + (2.0 / tick) as u32) {
+                least = least.min(game.combat.hp);
+            }
+            if out_at.is_none()
+                && game
+                    .scene
+                    .player
+                    .as_ref()
+                    .is_some_and(|p| p.driving != Some(i))
+            {
+                out_at = Some(t);
+            }
             if t % every == 0 {
                 eprintln!(
                     "sink-check: {:.0} s: {:.1} s a quarter under, sunk {}",
@@ -8987,7 +9009,7 @@ fn sink_check(game: &mut Game, tick: f32, jennifer: bool) {
             if game.sunk(i) && sunk_at.is_none() {
                 sunk_at = Some(t as f32 * tick);
                 lost = whole - game.combat.hp;
-                left = game.combat.hp;
+                left = if jennifer { least } else { game.combat.hp };
                 eprintln!(
                     "sink-check: {kind} put her out: {whole:.0} -> {left:.2} (clamp {})",
                     game.combat.health_clamp
