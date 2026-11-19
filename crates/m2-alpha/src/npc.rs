@@ -626,7 +626,7 @@ pub fn getup_yaw(nodes: &[Mat4], hashes: &[u32]) -> Option<f32> {
     (line.length_squared() > 1e-8).then(|| line.x.atan2(line.z))
 }
 
-fn limp_middle(nodes: &[Mat4]) -> Option<Vec3> {
+pub(crate) fn limp_middle(nodes: &[Mat4]) -> Option<Vec3> {
     if nodes.is_empty() {
         return None;
     }
@@ -1355,7 +1355,7 @@ pub struct Npc {
     rise: bool,
     /// Knocked down and limp: seconds the body has lain still, and
     /// seconds it has been limp ([`LIMP_STILL`], [`LIMP_LONGEST`]).
-    limp: (f32, f32),
+    limp: LimpTimers,
     /// Where the round now striking them landed and the way it flew, set
     /// by the shot just before [`hurt`](Self::hurt) and read by it.
     pub last_hit: Option<(Vec3, Vec3)>,
@@ -1550,13 +1550,75 @@ pub fn empty_rig() -> Rig {
 /// their physics object is of kind 0xC, once a float of it (+0x300) is
 /// over 0.5 (0x820D9EDC) or another (+0x304) over 19.0 (0x820F8C84).
 ///
-/// **Inferred**: kind 0xC is the limp body, the first float the seconds
-/// it has lain still and the second the seconds it has been limp. So
-/// they do not get up while still tumbling, but always after 19 s.
-/// Under [`LIMP_AT_REST`] m/s counts as still (invented).
-const LIMP_STILL: f32 = 0.5;
-const LIMP_LONGEST: f32 = 19.0;
-const LIMP_AT_REST: f32 = 0.2;
+/// Both floats are kept by the limp body's update, 0x82190470 (see
+/// [`LimpTimers`]): +0x300 the seconds it has lain still, +0x304 the
+/// seconds it has been limp. So they do not get up while still tumbling,
+/// but always after 19 s.
+pub const LIMP_STILL: f32 = 0.5;
+pub const LIMP_LONGEST: f32 = 19.0;
+
+/// A limp body's two timers, as its update 0x82190470 keeps them.
+///
+/// From the 360 code:
+/// - The body's position (its object transform's translation,
+///   0x82185FE0) is held against an anchor (+0x2AC). Once it is 0.1 m or
+///   more from it (squared 0.01, 0x820C8114), the anchor moves there and
+///   the still time (+0x300) goes back to 0; otherwise the still time
+///   grows by the step. So "still" is the body staying within 0.1 m of
+///   where it last settled, not any limb's speed: a limb swinging about
+///   a body that lies put does not hold it down.
+/// - The limp time (+0x304) grows by the step, held at 20 s (0x820BB204).
+/// - Both start at 0 as it goes limp (0x82190F48, 0x8218F200).
+///
+/// **Inferred**: the object's position is the ragdoll's root bone (its
+/// first node). **Not ported**: two other ways 0x82190470 counts the body
+/// as still (a contact counter +0x2F0 over two updates, and a held part
+/// +0x310 with a positive +0x50); what sets them is not traced.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LimpTimers {
+    /// Seconds it has lain within [`Self::RADIUS`] of [`Self::anchor`].
+    pub still: f32,
+    /// Seconds it has been limp, up to [`Self::MOST`].
+    pub limp: f32,
+    pub anchor: Option<Vec3>,
+}
+
+impl LimpTimers {
+    /// 0x820C8114 is its square.
+    pub const RADIUS: f32 = 0.1;
+    /// 0x820BB204.
+    pub const MOST: f32 = 20.0;
+
+    /// A step of `dt` with the body's root at `at` (None: not known,
+    /// counted as still).
+    pub fn step(&mut self, at: Option<Vec3>, dt: f32) {
+        let moved = match (at, self.anchor) {
+            (Some(p), Some(a)) => p.distance_squared(a) >= Self::RADIUS * Self::RADIUS,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if moved {
+            self.anchor = at;
+            self.still = 0.0;
+        } else {
+            self.still += dt;
+        }
+        self.limp = (self.limp + dt).min(Self::MOST);
+    }
+
+    /// Lain still over 0.5 s, or limp over 19 s (0x8225CAE0).
+    pub fn settled(&self) -> bool {
+        self.still > LIMP_STILL || self.limp > LIMP_LONGEST
+    }
+}
+
+/// A limp body's root (its first node), for [`LimpTimers`].
+pub fn limp_root(physics: &m2_engine::Physics, id: m2_engine::RagdollId) -> Option<Vec3> {
+    physics
+        .ragdoll_nodes(id)?
+        .first()
+        .map(|m| m.w_axis.truncate())
+}
 
 /// Seconds a fall takes, someone lies knocked down, gets up, and is
 /// subdued (all invented). The time down the 360 sets counts from when
@@ -1605,7 +1667,7 @@ impl Npc {
             fling: None,
             launch: None,
             rise: false,
-            limp: (0.0, 0.0),
+            limp: LimpTimers::default(),
             last_hit: None,
             dying: None,
             face: {
@@ -2376,12 +2438,7 @@ impl Npc {
             Down::Falling(t) => Some(Down::Falling(t - dt)),
             // Their time down over, but the limp body still tumbling:
             // not yet.
-            Down::Knocked(t)
-                if t - dt <= 0.0
-                    && self.ragdoll.is_some()
-                    && self.limp.0 <= LIMP_STILL
-                    && self.limp.1 <= LIMP_LONGEST =>
-            {
+            Down::Knocked(t) if t - dt <= 0.0 && self.ragdoll.is_some() && !self.limp.settled() => {
                 Some(Down::Knocked(0.0))
             }
             Down::Knocked(t) if t - dt <= 0.0 => {
@@ -5417,11 +5474,9 @@ impl People {
             // limp.
             match npc.ragdoll.filter(|_| npc.alive) {
                 Some(id) => {
-                    let still = physics.ragdoll_speed(id).is_none_or(|v| v < LIMP_AT_REST);
-                    npc.limp.0 = if still { npc.limp.0 + dt } else { 0.0 };
-                    npc.limp.1 += dt;
+                    npc.limp.step(limp_root(physics, id), dt);
                 }
-                None => npc.limp = (0.0, 0.0),
+                None => npc.limp = LimpTimers::default(),
             }
             // Up from a knockdown (or subdued): where the limp body lay,
             // on the ground under it.
@@ -9240,11 +9295,18 @@ pub(crate) mod tests {
         m.ragdoll = Some(ground().add_ragdoll(&[None], &[Mat4::IDENTITY], Vec3::ZERO));
         m.update_down(0.1);
         assert_eq!(m.down, Some(Down::Knocked(0.0)));
-        m.limp = (0.0, LIMP_LONGEST + 0.1);
+        m.limp = LimpTimers {
+            limp: LIMP_LONGEST + 0.1,
+            ..LimpTimers::default()
+        };
         m.update_down(0.1);
         assert!(matches!(m.down, Some(Down::GettingUp(_))) && m.rise);
         m.down = Some(Down::Knocked(0.0));
-        m.limp = (LIMP_STILL + 0.1, 1.0);
+        m.limp = LimpTimers {
+            still: LIMP_STILL + 0.1,
+            limp: 1.0,
+            ..LimpTimers::default()
+        };
         m.update_down(0.1);
         assert!(matches!(m.down, Some(Down::GettingUp(_))));
         step(&mut n, FALL_SECONDS + 0.1, &mut rng);

@@ -329,6 +329,9 @@ struct Options {
     homing_check: bool,
     /// `--gravity-check`: measure the physics world's gravity ([`gravity_check`]).
     gravity_check: bool,
+    /// `--toss-check crash|exit`: (turns on --drive) her vehicle into a
+    /// wall, or left at 17.5 m/s, against the 360's toss ([`toss_check`]).
+    toss_check: Option<String>,
     /// `--ditch-check`: (turns on --drive) out of her car at 18 m/s and
     /// what she plays on foot after ([`ditch_check`]).
     ditch_check: bool,
@@ -1188,6 +1191,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--gravity-check" => {
                 o.gravity_check = true;
+                o.drive = true;
+            }
+            "--toss-check" => {
+                o.toss_check = Some(value()?.to_ascii_lowercase());
                 o.drive = true;
             }
             "--stagger-check" => o.stagger_check = true,
@@ -8132,6 +8139,10 @@ fn drive_for_screenshot(
         gravity_check(game);
         return Ok(());
     }
+    if let Some(mode) = options.toss_check.as_deref() {
+        toss_check(game, tick, mode);
+        return Ok(());
+    }
     if options.ditch_check {
         ditch_check(game, tick);
         return Ok(());
@@ -13604,6 +13615,270 @@ fn ditch_check(game: &mut Game, tick: f32) {
         verdict(ok2)
     );
     eprintln!("ditch-check: {}", verdict(ok && ok2));
+}
+
+/// `--toss-check crash|exit`, against the 360's toss (0x822A2B60,
+/// 0x8218A138) and Xenia's runs (knockdown-time.md).
+///
+/// - `crash`: a wall stood 15 m ahead of her vehicle, which is set going
+///   at 20 m/s into it. On a seat with a `TossSpeedChange` (a bike: the
+///   Chopper's 15) she is thrown off on the update it lurches past it,
+///   knocked down, and up again within 4 s, losing no health (Xenia:
+///   |dv| 18.34 and 21.08 m/s, limp 1.70 and 2.44 s, get-up 0.95 s,
+///   health 100 -> 100). On a seat without one (a car) she stays in
+///   (Xenia: a Phoenix at |dv| 28.58 m/s).
+/// - `exit`: her vehicle at a steady 17.5 m/s and the use key pressed:
+///   a ditch, not a toss, and no knockdown (Xenia: the Chopper at 17.5).
+///
+/// Prints `toss-check:` lines and PASS or FAIL.
+fn toss_check(game: &mut Game, tick: f32, mode: &str) {
+    use m2_engine::{CollisionShape, StaticKey};
+    use m2_math::glam::{Quat, Vec3};
+    let verdict = |ok: bool| if ok { "PASS" } else { "FAIL" };
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        println!("toss-check: FAIL not in a vehicle");
+        return;
+    };
+    let label = game.scene.vehicles[i].spec.label.clone();
+    let toss = game.scene.vehicles[i]
+        .spec
+        .seating
+        .as_deref()
+        .and_then(|s| s.driver().map(|d| s.seats[d].toss_speed))
+        .unwrap_or(-1.0);
+    let Some(id) = game.scene.vehicles[i].id else {
+        println!("toss-check: FAIL the {label} has no body");
+        return;
+    };
+    let Some(world) = game.scene.world.as_mut() else {
+        println!("toss-check: FAIL no world");
+        return;
+    };
+    let Some(at) = world.physics.vehicle_transform(id) else {
+        println!("toss-check: FAIL the {label} has no place");
+        return;
+    };
+    let ahead = at
+        .transform_vector3(Vec3::Z)
+        .with_y(0.0)
+        .normalize_or(Vec3::Z);
+    let origin = at.transform_point3(Vec3::ZERO);
+    let hp = game.combat.hp;
+    let has_toss = toss > 0.0;
+    match mode {
+        "crash" => {
+            let wall = CollisionShape::cuboid(Vec3::new(15.0, 4.0, 1.0));
+            let facing = Quat::from_rotation_y(ahead.x.atan2(ahead.z));
+            world.physics.add_static(
+                StaticKey::Cell(0xffff_fff0),
+                &wall,
+                origin + ahead * 16.0 + Vec3::Y * 3.0,
+                facing,
+            );
+            world.physics.set_vehicle_velocity(id, ahead * 20.0);
+            let (mut thrown, mut knocked, mut up, mut most) = (None, None, None, 0.0f32);
+            // After the toss: her body's (its root's) height over the bike
+            // and gap to it, against Xenia's (knockdown-time.md): thrown
+            // 2.6-2.8 m over the bike, out to about 4.8 m at +1.0 s, the
+            // gap never back under about 3 m while limp.
+            let (mut top, mut far, mut far_at, mut near_after) =
+                (f32::MIN, 0.0f32, 0.0f32, f32::MAX);
+            let mut trace: Vec<String> = Vec::new();
+            let mut last_root: Option<Vec3> = None;
+            let mut t = 0.0;
+            while t < 20.0 && up.is_none() {
+                // The run-up: held at 20 m/s along her heading each update
+                // until its middle is 13 m along (the bike's drag would bleed
+                // it off in the 16 m), then let go the last 2 m to the wall's
+                // face so the crash's drop counts as the jolt; the toss is
+                // the head-on crash.
+                if thrown.is_none()
+                    && let Some(w) = game.scene.world.as_mut()
+                {
+                    let along = w.physics.vehicle_transform(id).map_or(0.0, |m| {
+                        (m.transform_point3(Vec3::ZERO) - origin).dot(ahead)
+                    });
+                    if along < 13.0 {
+                        let v = w.physics.vehicle_velocity(id);
+                        w.physics
+                            .hold_vehicle_velocity(id, ahead * 20.0 + Vec3::Y * v.y);
+                    }
+                }
+                if let Some(w) = game.scene.world.as_ref() {
+                    most = most.max(w.physics.vehicle_jolt(id));
+                    if thrown.is_none() && ((t * 4.0f32).round() - t * 4.0).abs() < tick * 2.0 {
+                        let p = w
+                            .physics
+                            .vehicle_transform(id)
+                            .map_or(Vec3::ZERO, |m| m.transform_point3(Vec3::ZERO));
+                        println!(
+                            "toss-check: before: {t:.2} s: the {label} {:.2} m along, {:.2} m/s, held {}, wall at 16",
+                            (p - origin).dot(ahead),
+                            w.physics.vehicle_velocity(id).length(),
+                            w.physics.vehicle_held(id)
+                        );
+                    }
+                }
+                game.step(
+                    Intent {
+                        movement: m2_math::glam::Vec2::new(0.0, 1.0),
+                        ..Intent::default()
+                    },
+                    tick,
+                );
+                t += tick;
+                let out = game
+                    .scene
+                    .player
+                    .as_ref()
+                    .is_some_and(|p| p.driving.is_none());
+                if out && thrown.is_none() {
+                    thrown = Some(t);
+                }
+                if game.combat.knocked.is_some() && knocked.is_none() {
+                    knocked = Some(t);
+                }
+                if knocked.is_some() && game.combat.knocked.is_none() && up.is_none() {
+                    up = Some(t);
+                }
+                if let (Some(t0), Some(w), Some(p)) = (
+                    thrown,
+                    game.scene.world.as_ref(),
+                    game.scene.player.as_ref(),
+                ) {
+                    let her = p
+                        .ragdoll
+                        .and_then(|r| w.physics.ragdoll_nodes(r))
+                        .and_then(|n| n.first().map(|m| m.w_axis.truncate()))
+                        .unwrap_or(p.character.position);
+                    let speed = p
+                        .ragdoll
+                        .and_then(|r| w.physics.ragdoll_speed(r))
+                        .unwrap_or(0.0);
+                    if let Some(bike) = w.physics.vehicle_transform(id) {
+                        let b = bike.transform_point3(Vec3::ZERO);
+                        let gap = (her - b).with_y(0.0).length();
+                        let dt = t - t0;
+                        top = top.max(her.y - b.y);
+                        if gap > far {
+                            far = gap;
+                            far_at = dt;
+                        }
+                        if dt > 1.0 && knocked.is_some() && up.is_none() {
+                            near_after = near_after.min(gap);
+                        }
+                        if trace.len() < 400 && ((dt * 10.0).round() - dt * 10.0).abs() < tick * 5.0
+                        {
+                            let limbs = p
+                                .ragdoll
+                                .map(|r| w.physics.ragdoll_limb_speeds(r))
+                                .unwrap_or_default();
+                            let moved_from = last_root.replace(her);
+                            let moving: Vec<String> = limbs
+                                .iter()
+                                .filter(|l| l.1 >= 0.2)
+                                .map(|l| format!("{}:{:.2}{}", l.0, l.1, l.2))
+                                .collect();
+                            trace.push(format!(
+                                "toss-check: +{dt:.1} s: her root {:.2} m over the bike, gap {gap:.2} m, body speed {speed:.2} m/s, root moved {:.2} m in 0.1 s; limbs over 0.2 m/s (index:speed, touching v vehicle s itself g ground); bike {:.2} m/s [{}] of {}",
+                                her.y - b.y,
+                                moved_from.map_or(0.0, |q: Vec3| q.distance(her)),
+                                w.physics.vehicle_velocity(id).length(),
+                                moving.join(" "),
+                                limbs.len()
+                            ));
+                        }
+                    }
+                }
+            }
+            println!(
+                "toss-check: the {label} (TossSpeedChange {toss}) into a wall at 20 m/s: \
+                 most |dv| in an update {most:.1} m/s; thrown at {thrown:?} s, knocked down at \
+                 {knocked:?} s, up at {up:?} s; health {hp:.0} -> {:.0}",
+                game.combat.hp
+            );
+            for l in &trace {
+                println!("{l}");
+            }
+            if thrown.is_some() {
+                println!(
+                    "toss-check: after the toss: highest {top:.2} m over the bike (Xenia 2.6-2.8), \
+                     farthest {far:.2} m at +{far_at:.1} s (Xenia ~4.8 m at +1.0 s), nearest while \
+                     limp after +1 s {near_after:.2} m (Xenia no closer than ~3 m)"
+                );
+            }
+            // The throw, against Xenia's (knockdown-time.md): at least 2 m
+            // over the bike, out at least 3.5 m, no nearer than 2.5 m while
+            // limp after +1 s.
+            // The launch, from the code (0x82428658): out min(L, 15), up
+            // 0.4 of it. The run-out against a flat wall is for the record.
+            let last = game.scene.player.as_ref().and_then(|p| p.last_toss);
+            let thrown_far = last.is_some_and(|(carried, launch)| {
+                let level = carried.with_y(0.0).length();
+                let out = launch.with_y(0.0).length();
+                println!(
+                    "toss-check: launch: level {level:.2} m/s before the jolt -> out {out:.2} m/s, up {:.2} m/s",
+                    launch.y
+                );
+                (out - level.min(15.0)).abs() < 0.05 && (launch.y - 0.4 * out).abs() < 0.05
+            });
+            if has_toss {
+                println!(
+                    "toss-check: the launch (out min(L, 15), up 0.4 of it; 0x82428658): {}",
+                    verdict(thrown_far)
+                );
+            }
+            let ok = if has_toss {
+                thrown.is_some()
+                    && knocked.is_some()
+                    && thrown_far
+                    && up.zip(knocked).is_some_and(|(u, k)| u - k < 4.0)
+                    && game.combat.hp >= hp
+            } else {
+                thrown.is_none() && knocked.is_none()
+            };
+            println!(
+                "toss-check: {}: {}",
+                if has_toss {
+                    "thrown off, knocked down and up again within 4 s, no health lost"
+                } else {
+                    "no TossSpeedChange: she stays in"
+                },
+                verdict(ok)
+            );
+            println!("toss-check: {}", verdict(ok));
+        }
+        "exit" => {
+            world.physics.set_vehicle_velocity(id, ahead * 17.5);
+            let mut input = input::Input::default();
+            input.button(input::Action::Use, true);
+            game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+            let mut input = input::Input::default();
+            input.button(input::Action::Use, false);
+            game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+            let out = game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.driving.is_none());
+            let mut knocked = false;
+            let mut t = 0.0;
+            while t < 3.0 {
+                game.step(Intent::default(), tick);
+                t += tick;
+                knocked |= game.combat.knocked.is_some();
+            }
+            let ok = out && !knocked && game.combat.hp >= hp;
+            println!(
+                "toss-check: out of the {label} (TossSpeedChange {toss}) at a steady 17.5 m/s: \
+                 out {out}, knocked down {knocked}, health {hp:.0} -> {:.0}: {}",
+                game.combat.hp,
+                verdict(ok)
+            );
+            println!("toss-check: {}", verdict(ok));
+        }
+        _ => println!("toss-check: FAIL unknown mode {mode:?} (crash or exit)"),
+    }
 }
 
 fn gravity_check(game: &Game) {
