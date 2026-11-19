@@ -305,6 +305,9 @@ struct Options {
     homing_check: bool,
     /// `--gravity-check`: measure the physics world's gravity ([`gravity_check`]).
     gravity_check: bool,
+    /// `--toss-check crash|exit`: (turns on --drive) her vehicle into a
+    /// wall, or left at 17.5 m/s, against the 360's toss ([`toss_check`]).
+    toss_check: Option<String>,
     /// With `--screenshot` on foot: hits she takes just before the
     /// picture, from these directions (degrees clockwise from where the
     /// camera looks), to see the HUD's hit arcs.
@@ -793,6 +796,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 )
             }
             "--vehicle" => o.vehicle = Some(value()?.to_ascii_lowercase()),
+            "--toss-check" => {
+                o.toss_check = Some(value()?.to_ascii_lowercase());
+                o.drive = true;
+            }
             "--look" => {
                 o.look = value()?
                     .parse::<f32>()
@@ -7381,6 +7388,10 @@ fn drive_for_screenshot(
         gravity_check(game);
         return Ok(());
     }
+    if let Some(mode) = options.toss_check.as_deref() {
+        toss_check(game, tick, mode);
+        return Ok(());
+    }
     let label = game
         .scene
         .player
@@ -11718,6 +11729,152 @@ mod tests {
 /// 20 m, the vehicle she is in driven off a 10 m ledge, and a parked boat
 /// (if one is near) left to settle on still water. Prints a line each and
 /// PASS or FAIL.
+/// `--toss-check crash|exit`, against the 360's toss (0x822A2B60,
+/// 0x8218A138) and Xenia's runs (knockdown-time.md).
+///
+/// - `crash`: a wall stood 15 m ahead of her vehicle, which is set going
+///   at 20 m/s into it. On a seat with a `TossSpeedChange` (a bike: the
+///   Chopper's 15) she is thrown off on the update it lurches past it,
+///   knocked down, and up again within 4 s, losing no health (Xenia:
+///   |dv| 18.34 and 21.08 m/s, limp 1.70 and 2.44 s, get-up 0.95 s,
+///   health 100 -> 100). On a seat without one (a car) she stays in
+///   (Xenia: a Phoenix at |dv| 28.58 m/s).
+/// - `exit`: her vehicle at a steady 17.5 m/s and the use key pressed:
+///   a ditch, not a toss, and no knockdown (Xenia: the Chopper at 17.5).
+///
+/// Prints `toss-check:` lines and PASS or FAIL.
+fn toss_check(game: &mut Game, tick: f32, mode: &str) {
+    use m2_engine::{CollisionShape, StaticKey};
+    use m2_math::glam::{Quat, Vec3};
+    let verdict = |ok: bool| if ok { "PASS" } else { "FAIL" };
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        println!("toss-check: FAIL not in a vehicle");
+        return;
+    };
+    let label = game.scene.vehicles[i].spec.label.clone();
+    let toss = game.scene.vehicles[i]
+        .spec
+        .seating
+        .as_deref()
+        .and_then(|s| s.driver().map(|d| s.seats[d].toss_speed))
+        .unwrap_or(-1.0);
+    let Some(id) = game.scene.vehicles[i].id else {
+        println!("toss-check: FAIL the {label} has no body");
+        return;
+    };
+    let Some(world) = game.scene.world.as_mut() else {
+        println!("toss-check: FAIL no world");
+        return;
+    };
+    let Some(at) = world.physics.vehicle_transform(id) else {
+        println!("toss-check: FAIL the {label} has no place");
+        return;
+    };
+    let ahead = at
+        .transform_vector3(Vec3::Z)
+        .with_y(0.0)
+        .normalize_or(Vec3::Z);
+    let origin = at.transform_point3(Vec3::ZERO);
+    let hp = game.combat.hp;
+    let has_toss = toss > 0.0;
+    match mode {
+        "crash" => {
+            let wall = CollisionShape::cuboid(Vec3::new(15.0, 4.0, 1.0));
+            let facing = Quat::from_rotation_y(ahead.x.atan2(ahead.z));
+            world.physics.add_static(
+                StaticKey::Cell(0xffff_fff0),
+                &wall,
+                origin + ahead * 16.0 + Vec3::Y * 3.0,
+                facing,
+            );
+            world.physics.set_vehicle_velocity(id, ahead * 20.0);
+            let (mut thrown, mut knocked, mut up, mut most) = (None, None, None, 0.0f32);
+            let mut t = 0.0;
+            while t < 14.0 && up.is_none() {
+                if let Some(w) = game.scene.world.as_ref() {
+                    most = most.max(w.physics.vehicle_jolt(id));
+                }
+                game.step(
+                    Intent {
+                        movement: m2_math::glam::Vec2::new(0.0, 1.0),
+                        ..Intent::default()
+                    },
+                    tick,
+                );
+                t += tick;
+                let out = game
+                    .scene
+                    .player
+                    .as_ref()
+                    .is_some_and(|p| p.driving.is_none());
+                if out && thrown.is_none() {
+                    thrown = Some(t);
+                }
+                if game.combat.knocked.is_some() && knocked.is_none() {
+                    knocked = Some(t);
+                }
+                if knocked.is_some() && game.combat.knocked.is_none() && up.is_none() {
+                    up = Some(t);
+                }
+            }
+            println!(
+                "toss-check: the {label} (TossSpeedChange {toss}) into a wall at 20 m/s: \
+                 most |dv| in an update {most:.1} m/s; thrown at {thrown:?} s, knocked down at \
+                 {knocked:?} s, up at {up:?} s; health {hp:.0} -> {:.0}",
+                game.combat.hp
+            );
+            let ok = if has_toss {
+                thrown.is_some()
+                    && knocked.is_some()
+                    && up.zip(knocked).is_some_and(|(u, k)| u - k < 4.0)
+                    && game.combat.hp >= hp
+            } else {
+                thrown.is_none() && knocked.is_none()
+            };
+            println!(
+                "toss-check: {}: {}",
+                if has_toss {
+                    "thrown off, knocked down and up again within 4 s, no health lost"
+                } else {
+                    "no TossSpeedChange: she stays in"
+                },
+                verdict(ok)
+            );
+            println!("toss-check: {}", verdict(ok));
+        }
+        "exit" => {
+            world.physics.set_vehicle_velocity(id, ahead * 17.5);
+            let mut input = input::Input::default();
+            input.button(input::Action::Use, true);
+            game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+            let mut input = input::Input::default();
+            input.button(input::Action::Use, false);
+            game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+            let out = game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.driving.is_none());
+            let mut knocked = false;
+            let mut t = 0.0;
+            while t < 3.0 {
+                game.step(Intent::default(), tick);
+                t += tick;
+                knocked |= game.combat.knocked.is_some();
+            }
+            let ok = out && !knocked && game.combat.hp >= hp;
+            println!(
+                "toss-check: out of the {label} (TossSpeedChange {toss}) at a steady 17.5 m/s: \
+                 out {out}, knocked down {knocked}, health {hp:.0} -> {:.0}: {}",
+                game.combat.hp,
+                verdict(ok)
+            );
+            println!("toss-check: {}", verdict(ok));
+        }
+        _ => println!("toss-check: FAIL unknown mode {mode:?} (crash or exit)"),
+    }
+}
+
 fn gravity_check(game: &Game) {
     use m2_engine::physics::{WORLD_GRAVITY, float_depth};
     use m2_engine::{CollisionShape, Physics, StaticKey, VehicleControls};

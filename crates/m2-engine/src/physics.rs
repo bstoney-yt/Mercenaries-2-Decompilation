@@ -6131,12 +6131,15 @@ impl Physics {
     /// Sets a vehicle's velocity, m/s (as it was before something it hit
     /// gave way).
     pub fn set_vehicle_velocity(&mut self, id: VehicleId, velocity: Vec3) {
-        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+        let Some(v) = self.vehicles.get_mut(id.0).and_then(Option::as_mut) else {
             return;
         };
         if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
             body.set_linvel(vector(velocity), true);
         }
+        // Set, not driven into: no jolt ([`Physics::vehicle_jolt`]).
+        v.history = None;
+        v.jolt = 0.0;
     }
 
     /// Turns an overturned vehicle upright where it is.
