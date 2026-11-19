@@ -208,6 +208,17 @@ pub fn transfer(ride: Ride<'_>, from: Option<u32>) -> Option<u32> {
     Some(s.seats[to].name)
 }
 
+/// The turret camera of the seat she rides (`None`: the driver's), if its
+/// vehicle has one for it ([`m2_engine::seats::SeatCamera`]).
+pub fn seat_camera(ride: Ride<'_>, seat: Option<u32>) -> Option<m2_engine::seats::SeatCamera> {
+    let s = ride.seating?;
+    let i = match seat {
+        Some(n) => s.seat(n)?,
+        None => s.driver()?,
+    };
+    s.seats[i].camera
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +403,34 @@ mod tests {
         let driven = crew(&[("seat_driver", "VZ Soldier")]);
         ride.crew = &driven;
         assert_eq!(transfer(ride, rear), None);
+    }
+
+    #[test]
+    fn her_seat_s_turret_camera_is_its_own_record() {
+        let cam = m2_engine::seats::SeatCamera {
+            yaw_speed: 2.0,
+            pitch_speed: 1.8,
+            yaw: (-1.25, 1.25),
+            pitch: (-0.19, 0.85),
+            yaw_keep: [0.95, 0.91],
+            pitch_keep: [0.97, 0.9],
+        };
+        let mut gunner = seat("seat_gunner", "entrance_rear", false, true, &[]);
+        gunner.camera = Some(cam);
+        let s = VehicleSeats {
+            seats: vec![
+                seat("seat_driver", "entrance_driver", true, false, &[]),
+                gunner,
+            ],
+            ..Default::default()
+        };
+        let ride = Ride {
+            seating: Some(&s),
+            crew: &[],
+        };
+        assert_eq!(seat_camera(ride, Some(name_hash("seat_gunner"))), Some(cam));
+        // The driver's seat (`None`) has none here.
+        assert_eq!(seat_camera(ride, None), None);
     }
 
     #[test]

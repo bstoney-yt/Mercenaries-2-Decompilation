@@ -95,9 +95,6 @@ pub struct VehicleTuning {
     /// `PitchSpeed`, `MinPitch`/`MaxPitch`, `PitchLimitCushion` and pitch
     /// inertias).
     pub heli_camera: Option<crate::pad_camera::HeliLookTuning>,
-    /// The driver's seat's turret camera, where its driver aims its gun
-    /// (the M113 AA's `CameraTurret` on `seat_driver`).
-    pub driver_turret: Option<crate::pad_camera::TurretLookTuning>,
 }
 
 /// How a tracked vehicle drives, from its `_TankPhysics` (names from the
@@ -1952,7 +1949,6 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
     let pilot = Table::new(db, "AiHelicopter");
     let heli_camera = Table::new(db, "CameraHelicopter");
     let car_link = Table::new(db, "CameraCarPresetLink");
-    let turret_camera = Table::new(db, "CameraTurret");
     let car_preset = Table::new(db, "CameraCarPreset");
     let guns = Guns {
         weapon: Table::new(db, "WeaponProjectileBase"),
@@ -2370,14 +2366,6 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         pitch_amp: f("PitchAmp")?,
                         pitch_lag: f("PitchLag")?,
                     })
-                })(),
-                driver_turret: (|| {
-                    let seat = name_hash("SeatName");
-                    let r = turret_camera
-                        .of_template(id)
-                        .iter()
-                        .find(|r| turret_camera.word(r, seat) == Some(name_hash("seat_driver")))?;
-                    turret_look(&turret_camera, r)
                 })(),
                 car_camera: (|| {
                     // The driver's seat's link, else its first; its
