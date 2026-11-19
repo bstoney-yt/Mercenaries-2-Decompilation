@@ -9408,31 +9408,51 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
     };
     if let (Some(world), Some(p)) = (game.scene.world.as_ref(), game.scene.player.as_mut()) {
         game::get_out(&world.physics, &game.scene.vehicles[i], None, p);
-        let side = game.scene.vehicles[i]
+    }
+    let side = game.scene.world.as_ref().map_or(Vec3::X, |world| {
+        game.scene.vehicles[i]
             .id
             .and_then(|id| world.physics.vehicle_transform(id))
-            .map_or(Vec3::X, |m| m.x_axis.truncate().normalize_or(Vec3::X));
-        p.drop_at(start + side * at.unwrap_or(5.9));
-    }
+            .map_or(Vec3::X, |m| m.x_axis.truncate().normalize_or(Vec3::X))
+    });
     game.ride = None;
     // On foot: only then is she stepped, and lands where she was put
     // (the q728c runs: never set, she hung where she was dropped).
     game.on_foot = true;
+    // Put down at its side, then, if she doesn't come down there (the
+    // q728d runs at 2.9 and 3.8 m), at the other side: the distance from
+    // its middle is what Xenia's are, not the side. Each waits 1 s, then
+    // up to 5 s more for her to land.
+    let mut down = false;
+    for (k, way) in [side, -side].into_iter().enumerate() {
+        if let Some(p) = game.scene.player.as_mut() {
+            p.drop_at(start + way * at.unwrap_or(5.9));
+        }
+        for _ in 0..(6.0 / tick) as u32 {
+            if game.scene.player.as_ref().is_some_and(|p| p.landed) {
+                break;
+            }
+            still(game);
+            game.step(Intent::default(), tick);
+        }
+        if game.scene.player.as_ref().is_some_and(|p| p.landed) {
+            down = true;
+            break;
+        }
+        eprintln!(
+            "wreck-blast-check: side {k}: she did not come down: {}",
+            game.scene
+                .player
+                .as_ref()
+                .map_or("no player".to_owned(), |p| p.landing_state())
+        );
+    }
     for _ in 0..(1.0 / tick) as u32 {
         still(game);
         game.step(Intent::default(), tick);
     }
-    // Down on the ground before the wreck (a blast hurts only her on
-    // it): up to 5 s more.
-    for _ in 0..(5.0 / tick) as u32 {
-        if game.scene.player.as_ref().is_some_and(|p| p.landed) {
-            break;
-        }
-        still(game);
-        game.step(Intent::default(), tick);
-    }
-    if !game.scene.player.as_ref().is_some_and(|p| p.landed) {
-        eprintln!("wreck-blast-check: FAIL she never came down where she was put");
+    if !down || !game.scene.player.as_ref().is_some_and(|p| p.landed) {
+        eprintln!("wreck-blast-check: FAIL she never came down where she was put (either side)");
         return;
     }
     still(game);
