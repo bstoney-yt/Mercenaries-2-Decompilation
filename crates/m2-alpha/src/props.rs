@@ -160,7 +160,7 @@ pub struct Props {
     /// for comparing).
     pub bodies_off: bool,
     /// Those that are: put up as sleeping bodies, not knocked by anything.
-    as_body: HashSet<u32>,
+    as_body: std::collections::BTreeSet<u32>,
     /// The material animations playing on them
     /// ([`play_material_animation`](Self::play_material_animation)).
     material_anims: HashMap<u32, m2_engine::material_anim::Playing>,
@@ -1780,6 +1780,11 @@ impl Props {
     pub fn get(&self, entity: u32) -> Option<(&Prop, bool)> {
         let p = self.shown.get(&entity)?;
         Some((p, self.models.get(&p.model).is_some_and(Option::is_some)))
+    }
+
+    /// Where `entity` was shown (put up), if it is.
+    pub fn place_of(&self, entity: u32) -> Option<Vec3> {
+        self.shown.get(&entity).map(|p| p.position)
     }
 
     /// Those shown, by entity.

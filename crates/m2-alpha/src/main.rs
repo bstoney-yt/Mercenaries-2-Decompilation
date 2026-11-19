@@ -13361,12 +13361,37 @@ fn prop_bodies_check(
 ) -> anyhow::Result<()> {
     use m2_math::glam::{Vec2, Vec3};
     let mut ms = Vec::new();
+    // Steps with loads still coming in (models, tiles: bodies and
+    // collision going up), to leave out of the settled median.
+    let mut loading = Vec::new();
     for _ in 0..(10.0 / tick) as u32 {
         game.step(Intent::default(), tick);
         render(backend, game, fov, aspect, None)?;
         if let Some(w) = game.scene.world.as_ref() {
             ms.push(w.physics.last_step_ms);
+            loading.push(w.loads_pending() > 0);
         }
+    }
+    // The step cost once streaming has settled: the steps after the last
+    // one with a load pending. Steps while loads come in also time the
+    // bodies and collision being put up and the loader threads' share of
+    // the machine; the cost of the bodies standing is what is measured
+    // (q764: whole-watch medians 1.47, 2.77, 1.30 ms from one start, run
+    // b's slow steps all 0.48-1.42 s in, while models came in).
+    let settled_from = loading.iter().rposition(|&l| l).map_or(0, |k| k + 1);
+    let mut settled: Vec<f32> = ms[settled_from.min(ms.len())..].to_vec();
+    settled.sort_by(f32::total_cmp);
+    match settled.get(settled.len() / 2) {
+        Some(m) if settled.len() as f32 * tick >= 2.0 => eprintln!(
+            "prop-bodies-check: streaming settled {:.2} s in: physics step median {m:.2} ms, worst {:.2} ms over the {} steps after",
+            settled_from as f32 * tick,
+            settled.last().copied().unwrap_or(0.0),
+            settled.len()
+        ),
+        _ => eprintln!(
+            "prop-bodies-check: FAIL streaming never settled for 2 s of the watch (last load {:.2} s in)",
+            settled_from as f32 * tick
+        ),
     }
     if game
         .scene
@@ -13478,7 +13503,28 @@ fn prop_bodies_check(
         .filter_map(|(e, ids)| Some((*e, *ids.first()?)))
         .filter_map(|(e, id)| Some((e, id, physics.debris_place(id)?.w_axis.truncate())))
         .collect();
-    near.sort_by(|a, b| a.2.distance(here).total_cmp(&b.2.distance(here)));
+    // Nearest first by where each was placed (a placed object's layer
+    // place, a prop's shown place), not where its body has settled, and
+    // by id between equals: objects placed together (q764: three at
+    // [2952.6, -35.5, -991.9]) settle a little differently as the frame
+    // their model came in differs, which picked a different one each run.
+    let placed = |e: u32, body: Vec3| {
+        if e & 0x8000_0000 != 0 {
+            world
+                .index
+                .objects
+                .get((e & 0x7fff_ffff) as usize)
+                .map_or(body, |o| o.position)
+        } else {
+            game.scene.props.place_of(e).unwrap_or(body)
+        }
+    };
+    near.sort_by(|a, b| {
+        placed(a.0, a.2)
+            .distance(here)
+            .total_cmp(&placed(b.0, b.2).distance(here))
+            .then(a.0.cmp(&b.0))
+    });
     let ground = |x: f32, z: f32, from: f32| {
         physics
             .cast_ray(Vec3::new(x, from + 20.0, z), Vec3::NEG_Y, 60.0)
