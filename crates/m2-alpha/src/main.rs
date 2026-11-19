@@ -539,6 +539,9 @@ struct Options {
     /// swim her forward walking, at her pace and sprinting, logging how
     /// fast she goes (`swim-check:` lines).
     swim_check: bool,
+    /// `--prop-bodies-check`: props that come loose whole as bodies of
+    /// their own from the start (gap P7, [`prop_bodies_check`]).
+    prop_bodies_check: bool,
     /// `--sink-check`: a parked car is put in deep water with her in it,
     /// then a helicopter set down on the sea, each held past its
     /// `Buoyancy` delay; PASS when each sinks and she is put out.
@@ -953,6 +956,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.vehicle.get_or_insert_with(|| "m151".to_owned());
             }
             "--swim-check" => o.swim_check = true,
+            "--prop-bodies-check" => {
+                o.prop_bodies_check = true;
+                o.drive = true;
+            }
             "--sink-check" => {
                 o.sink_check = true;
                 o.drive = true;
@@ -7639,6 +7646,19 @@ fn drive_for_screenshot(
     install: Option<&Install>,
 ) -> anyhow::Result<()> {
     game.combat.homing_check = options.homing_check;
+    game.scene.props.bodies_on = options.prop_bodies_check;
+    if options.prop_bodies_check
+        && let Some(w) = game.scene.world.as_mut()
+    {
+        // The island's placed objects that come loose whole (the café
+        // chairs, barricades and planters of a town are these, not a
+        // state layer's props): bodies too, those standing already now.
+        let made = w.make_bodies();
+        eprintln!(
+            "prop-bodies-check: she is at {:.0}; {made} placed objects standing became bodies",
+            game.focus()
+        );
+    }
     let tick = TICK.as_secs_f32();
     let started = Instant::now();
     loop {
@@ -7763,6 +7783,9 @@ fn drive_for_screenshot(
             return board_animated(backend, game, fov, aspect, options, install);
         }
         return board_for_check(game, options, tick);
+    }
+    if options.prop_bodies_check {
+        return prop_bodies_check(backend, game, fov, aspect, tick);
     }
     if options.swim_check {
         swim_check(game, tick);
@@ -12956,6 +12979,264 @@ mod gravity_check_tests {
         let want = (2.0 * 20.0 / m2_engine::physics::WORLD_GRAVITY).sqrt();
         assert!((t - want).abs() < 0.05, "{t} vs {want}");
     }
+}
+
+/// `--prop-bodies-check` (it turns on `--drive`, with props that come
+/// loose whole as bodies of their own from the start: gap P7): 10 s at
+/// rest where she spawns (a town: `--spawn`), then the car she drives is
+/// put 12 m short of the nearest such prop, facing it, and driven at it
+/// for 4 s. Logs how many props are bodies, how many of their bodies are
+/// awake after the rest, the physics step's median and worst
+/// milliseconds, and how far the prop moved and how fast the car went
+/// on. `prop-bodies-check: PASS` when there are some, none is awake at
+/// rest and the car moved the prop, else `FAIL`. The world is drawn as
+/// it goes (props stream in only so), and if she is at no wheel (the
+/// check runs before `--drive` seats her) she takes the nearest land
+/// vehicle standing, logged.
+fn prop_bodies_check(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    tick: f32,
+) -> anyhow::Result<()> {
+    use m2_math::glam::{Vec2, Vec3};
+    let mut ms = Vec::new();
+    for _ in 0..(10.0 / tick) as u32 {
+        game.step(Intent::default(), tick);
+        render(backend, game, fov, aspect, None)?;
+        if let Some(w) = game.scene.world.as_ref() {
+            ms.push(w.physics.last_step_ms);
+        }
+    }
+    if game
+        .scene
+        .player
+        .as_ref()
+        .is_some_and(|p| p.driving.is_none())
+    {
+        let here = game.focus();
+        let pick = game.scene.world.as_ref().and_then(|world| {
+            (game.scene.vehicles.iter().enumerate())
+                .filter(|(_, v)| !v.wrecked && !v.spec.is_boat())
+                .filter_map(|(i, v)| {
+                    let at = world.physics.vehicle_transform(v.id?)?.w_axis.truncate();
+                    Some((i, at.distance(here)))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        });
+        if let (Some(i), Some(p)) = (pick, game.scene.player.as_mut()) {
+            p.driving = Some(i);
+            p.landed = true;
+            game.take_from_driver(i);
+            eprintln!(
+                "prop-bodies-check: she takes the {} (not at a wheel)",
+                game.scene.vehicles[i].spec.label
+            );
+        }
+    }
+    // The slowest steps of the watch, and when (q740e: one of 149 ms
+    // against a median of 3).
+    let mut slowest: Vec<(usize, f32)> = ms.iter().copied().enumerate().collect();
+    slowest.sort_by(|a, b| b.1.total_cmp(&a.1));
+    eprintln!(
+        "prop-bodies-check: slowest physics steps of the watch: {}",
+        slowest
+            .iter()
+            .take(3)
+            .map(|&(k, t)| format!("{t:.1} ms at step {k} ({:.2} s in)", k as f32 * tick))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    ms.sort_by(f32::total_cmp);
+    let Some(world) = game.scene.world.as_ref() else {
+        eprintln!("prop-bodies-check: FAIL no island");
+        return Ok(());
+    };
+    let physics = &world.physics;
+    // A state layer's props and the island's placed objects alike (the
+    // latter by object index, marked with the top bit).
+    let mut bodies: Vec<(u32, Vec<m2_engine::DebrisId>)> = game
+        .scene
+        .props
+        .as_bodies()
+        .map(|(e, ids)| (e, ids.to_vec()))
+        .collect();
+    let props_bodies = bodies.len();
+    bodies.extend(
+        world
+            .as_bodies()
+            .map(|(i, ids)| (i as u32 | 0x8000_0000, ids.to_vec())),
+    );
+    let pieces: usize = bodies.iter().map(|b| b.1.len()).sum();
+    eprintln!(
+        "prop-bodies-check: at {:.0}: {} props shown, {props_bodies} of them bodies; {} placed \
+         objects bodies",
+        game.focus(),
+        game.scene.props.shown().count(),
+        bodies.len() - props_bodies
+    );
+    let awake = physics.debris_awake();
+    let (median, worst) = (
+        ms.get(ms.len() / 2).copied().unwrap_or(0.0),
+        ms.last().copied().unwrap_or(0.0),
+    );
+    eprintln!(
+        "prop-bodies-check: {} props are bodies ({pieces} bodies); after 10 s at rest {awake} \
+         awake; physics step median {median:.2} ms, worst {worst:.2} ms",
+        bodies.len()
+    );
+    // The car at the nearest one.
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("prop-bodies-check: FAIL she drives nothing");
+        return Ok(());
+    };
+    let Some(car) = game.scene.vehicles[i].id else {
+        eprintln!("prop-bodies-check: FAIL her vehicle has no body");
+        return Ok(());
+    };
+    let here = physics
+        .vehicle_transform(car)
+        .map_or(Vec3::ZERO, |m| m.w_axis.truncate());
+    // The nearest with a clear run at it: 12 m of open ground short of it
+    // (the q740c run put the car among a town's walls and it never moved),
+    // from any of eight sides.
+    let mut near: Vec<(u32, m2_engine::DebrisId, Vec3)> = bodies
+        .iter()
+        .filter_map(|(e, ids)| Some((*e, *ids.first()?)))
+        .filter_map(|(e, id)| Some((e, id, physics.debris_place(id)?.w_axis.truncate())))
+        .collect();
+    near.sort_by(|a, b| a.2.distance(here).total_cmp(&b.2.distance(here)));
+    let ground = |x: f32, z: f32, from: f32| {
+        physics
+            .cast_ray(Vec3::new(x, from + 20.0, z), Vec3::NEG_Y, 60.0)
+            .map(|(d, _)| from + 20.0 - d)
+    };
+    let run = near.iter().take(60).find_map(|&(e, id, at)| {
+        (0..8).find_map(|k| {
+            let a = k as f32 * std::f32::consts::FRAC_PI_4;
+            let way = Vec3::new(a.sin(), 0.0, a.cos());
+            let start = at - way * 12.0;
+            let floor = ground(start.x, start.z, at.y)?;
+            // Level enough, and nothing in the way at bonnet height until
+            // the prop itself.
+            if (floor - at.y).abs() > 1.5 {
+                return None;
+            }
+            let from = Vec3::new(start.x, floor + 0.8, start.z);
+            let to = Vec3::new(at.x, floor + 0.8, at.z);
+            let gap = physics
+                .cast_ray(from, (to - from).normalize_or(way), 14.0)
+                .map_or(f32::MAX, |(d, _)| d);
+            // And the lane itself free of any placed object or building,
+            // from where the car stands to 2 m short of the prop: a ray
+            // from inside a wall doesn't see it (q740d: the car was put
+            // inside a building's member and held at full throttle).
+            let lane = (0..=10).all(|k| {
+                let c = Vec3::new(start.x, floor, start.z) + way * (k as f32);
+                physics.box_clear(
+                    c + Vec3::new(-1.3, 0.4, -1.3),
+                    c + Vec3::new(1.3, 1.8, 1.3),
+                    |key| !matches!(key, m2_engine::StaticKey::Cell(_)),
+                )
+            });
+            (gap >= 10.5 && lane).then_some((e, id, at, way, Vec3::new(start.x, floor, start.z)))
+        })
+    });
+    let Some((e, id, at, way, start)) = run else {
+        eprintln!(
+            "prop-bodies-check: FAIL no body here has 12 m of open ground before it ({} looked at)",
+            near.len().min(60)
+        );
+        return Ok(());
+    };
+    eprintln!("prop-bodies-check: the car is put at {start:.1}, 12 m short of {e:#x} at {at:.1}");
+    let yaw = way.x.atan2(way.z);
+    if let Some(world) = game.scene.world.as_mut() {
+        let v = &mut game.scene.vehicles[i];
+        if let Some(old) = v.id.take() {
+            world.physics.remove_vehicle(old);
+        }
+        v.id = Some(
+            world
+                .physics
+                .add_vehicle(&v.spec, start + Vec3::Y * 0.5, yaw),
+        );
+    }
+    let Some(car) = game.scene.vehicles[i].id else {
+        return Ok(());
+    };
+    let ticks = (4.0 / tick) as u32;
+    let each = (1.0 / tick).round().max(1.0) as u32;
+    for k in 0..ticks {
+        let speed = game
+            .scene
+            .world
+            .as_ref()
+            .map_or(0.0, |w| w.physics.vehicle_speed(car));
+        let throttle = if speed < 12.0 { 1.0 } else { 0.0 };
+        let intent = Intent {
+            movement: Vec2::new(0.0, throttle),
+            ..Intent::default()
+        };
+        // Each quarter second: where it is and what its body touches
+        // (q740f: 4.3 then 1.5 m/s, stopped short of the prop, which the
+        // a18f368d run from the same spot reached).
+        if k % (each / 4).max(1) == 0
+            && let Some(w) = game.scene.world.as_ref()
+        {
+            let at = w
+                .physics
+                .vehicle_transform(car)
+                .map_or(Vec3::ZERO, |m| m.w_axis.truncate());
+            let touching: Vec<String> = w
+                .physics
+                .vehicle_touching(car)
+                .into_iter()
+                .map(|(key, point, _)| format!("{key:?} at {point:.2}"))
+                .collect();
+            eprintln!(
+                "prop-bodies-check: t {:.2} s: the car at {at:.2}, {:.1} m/s, touching [{}]",
+                k as f32 * tick,
+                w.physics.vehicle_speed(car),
+                touching.join("; ")
+            );
+        }
+        // Each second: the throttle asked, and how fast it goes.
+        if k % each == 0 {
+            eprintln!(
+                "prop-bodies-check: t {:.0} s: throttle {throttle:.1}, {speed:.1} m/s, driving {:?}",
+                k as f32 * tick,
+                game.scene.player.as_ref().and_then(|p| p.driving)
+            );
+        }
+        game.step(intent, tick);
+        render(backend, game, fov, aspect, None)?;
+    }
+    let Some(world) = game.scene.world.as_ref() else {
+        return Ok(());
+    };
+    let moved = world
+        .physics
+        .debris_place(id)
+        .map_or(0.0, |m| m.w_axis.truncate().distance(at));
+    let speed = world.physics.vehicle_speed(car);
+    eprintln!(
+        "prop-bodies-check: the {} driven at prop {e:#x}: the prop moved {moved:.1} m, the car \
+         at {speed:.1} m/s after",
+        game.scene.vehicles[i].spec.label
+    );
+    if !bodies.is_empty() && awake == 0 && moved > 0.5 {
+        eprintln!("prop-bodies-check: PASS");
+    } else {
+        eprintln!(
+            "prop-bodies-check: FAIL {} props as bodies, {awake} awake at rest, the prop moved \
+             {moved:.1} m",
+            bodies.len()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

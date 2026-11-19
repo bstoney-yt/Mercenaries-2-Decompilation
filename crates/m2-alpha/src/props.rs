@@ -154,6 +154,11 @@ pub struct Props {
     heard: HashSet<u32>,
     /// Knocked loose since [`take_knocked`](Self::take_knocked).
     fresh_knocks: Vec<u32>,
+    /// Whether props that come loose whole are bodies of their own from
+    /// the start (gap P7, [`as_bodies`](Self::as_bodies)).
+    pub bodies_on: bool,
+    /// Those that are: put up as sleeping bodies, not knocked by anything.
+    as_body: HashSet<u32>,
     /// The material animations playing on them
     /// ([`play_material_animation`](Self::play_material_animation)).
     material_anims: HashMap<u32, m2_engine::material_anim::Playing>,
@@ -599,6 +604,7 @@ impl Props {
     /// too).
     pub fn hide(&mut self, physics: &mut Physics, entities: impl IntoIterator<Item = u32>) {
         for e in entities {
+            self.as_body.remove(&e);
             if self.shown.remove(&e).is_some() {
                 physics.remove_static(StaticKey::Entity(e));
                 self.changed();
@@ -819,8 +825,8 @@ impl Props {
     /// Whether `entity` was knocked loose (`None` if not): broken into
     /// its pieces, its model's [`Loose::breaks`], or gone as one.
     pub fn knocked_loose(&self, entity: u32) -> Option<bool> {
-        self.knocked
-            .contains_key(&entity)
+        // A body of its own from the start was knocked by nothing.
+        (!self.as_body.contains(&entity) && self.knocked.contains_key(&entity))
             .then(|| self.loose(entity).is_some_and(|l| l.breaks))
     }
 
@@ -1079,6 +1085,40 @@ impl Props {
         self.knocked.insert(entity, pieces);
         self.fresh_knocks.push(entity);
         true
+    }
+
+    /// `entity`, which comes loose whole, put up as sleeping bodies of its
+    /// own where it stands (its model's `PHY2` bodies that move, their
+    /// shapes and mass: [`m2_engine::physics::Loose`]), not as fixed
+    /// collision. From the 360 code: a prop's physics object is made with
+    /// its bodies (0x821831B0, each by 0x8216A290 from the rigid-body
+    /// defaults 0x82621820, its mass the record's +0x34), at rest until
+    /// something touches it, and sleeps by the world's rule
+    /// ([`Physics::add_prop_body`]). One that breaks apart keeps its fixed
+    /// intact body until it breaks (its pieces' bodies are made for the
+    /// parts its broken state shows: 0x82182CE8 -> 0x82152780).
+    fn make_body(&mut self, physics: &mut Physics, entity: u32) {
+        let (Some(p), Some(loose)) = (self.shown.get(&entity), self.loose(entity)) else {
+            return;
+        };
+        let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+        let pieces = loose
+            .pieces
+            .iter()
+            .zip(loose.starts(placed))
+            .map(|(piece, at)| physics.add_prop_body(piece, at, true))
+            .collect::<Vec<_>>();
+        physics.group_debris(&pieces, placed);
+        self.knocked.insert(entity, pieces);
+        self.as_body.insert(entity);
+    }
+
+    /// The props that are bodies of their own from the start
+    /// ([`bodies_on`](Self::bodies_on)): each entity and its bodies.
+    pub fn as_bodies(&self) -> impl Iterator<Item = (u32, &[DebrisId])> + '_ {
+        self.as_body
+            .iter()
+            .filter_map(|e| Some((*e, self.knocked.get(e)?.as_slice())))
     }
 
     /// Whether `entity` broke apart (its pieces thrown).
@@ -1596,6 +1636,20 @@ impl Props {
                 Some(s) => s.as_ref(),
                 None => shape,
             };
+            let whole = self
+                .loose(e)
+                .is_some_and(|l| !l.breaks && !l.pieces.is_empty());
+            if self.bodies_on
+                && whole
+                && stands(e)
+                && !p.wrecked
+                && !self.knocked.contains_key(&e)
+                && !self.swings.contains_key(&e)
+                && !self.cargo.contains_key(&e)
+            {
+                self.make_body(physics, e);
+                continue;
+            }
             if let Some(shape) = shape
                 && stands(e)
                 && !p.wrecked

@@ -3374,6 +3374,15 @@ pub struct Physics {
     /// Loose pieces tumbling at once at most ([`MAX_DEBRIS`]; a benchmark
     /// raises it, [`set_debris_cap`](Physics::set_debris_cap)).
     debris_cap: usize,
+    /// Props that are bodies of their own from the start
+    /// ([`add_prop_body`](Self::add_prop_body)): each sleeps by the 360's
+    /// rule ([`Rest`]), as a tank's body does.
+    prop_rest: HashMap<r::RigidBodyHandle, Rest>,
+    /// Props placed asleep, put to sleep once their first step has made
+    /// their contacts (a new contact wakes a body in rapier).
+    prop_sleep: Vec<r::RigidBodyHandle>,
+    /// How long the last [`step`](Self::step) took, milliseconds.
+    pub last_step_ms: f32,
     /// The water's surface boats float on, if there is any.
     water: Option<f32>,
     /// The game's water heights: rivers, pools and lakes above the sea
@@ -3448,6 +3457,9 @@ impl Physics {
             human_ragdoll: None,
             debris: Vec::new(),
             debris_cap: MAX_DEBRIS,
+            prop_rest: HashMap::new(),
+            prop_sleep: Vec::new(),
+            last_step_ms: 0.0,
             water: None,
             inland: None,
             time: 0.0,
@@ -3606,6 +3618,48 @@ impl Physics {
     /// Advances the simulation by `dt` seconds (and brings colliders added
     /// since the last step into scene queries).
     pub fn step(&mut self, dt: f32) {
+        let started = std::time::Instant::now();
+        self.rest_props(dt);
+        self.step_inner(dt);
+        for h in std::mem::take(&mut self.prop_sleep) {
+            if let Some(b) = self.world.bodies.get_mut(h) {
+                b.sleep();
+            }
+            if let Some(rest) = self.prop_rest.get_mut(&h) {
+                rest.asleep = true;
+            }
+        }
+        self.last_step_ms = started.elapsed().as_secs_f32() * 1000.0;
+    }
+
+    /// The props that are bodies of their own sleep as the 360's do
+    /// ([`Rest`], as [`step`](Self::step) has a tank's body sleep): a body
+    /// asleep with its island stays so until woken; woken, it counts
+    /// again; still for long enough, its island may sleep this step.
+    fn rest_props(&mut self, dt: f32) {
+        let w = &mut self.world;
+        self.prop_rest.retain(|h, rest| {
+            let Some(b) = w.bodies.get_mut(*h) else {
+                return false;
+            };
+            if !b.is_dynamic() {
+                return false;
+            }
+            if b.is_sleeping() {
+                rest.asleep = true;
+                rest_hand_off(b, false);
+                return true;
+            }
+            if rest.asleep {
+                rest.wake();
+            }
+            let still = rest.step(vec3(b.center_of_mass()), dt);
+            rest_hand_off(b, still);
+            true
+        });
+    }
+
+    fn step_inner(&mut self, dt: f32) {
         self.world.integration_parameters.dt = dt;
         self.time += dt;
         let w = &mut self.world;
@@ -4000,8 +4054,19 @@ impl Physics {
         );
         // Put to sleep where it is placed (`asleep`): it stays until
         // something touches it, as a prop at rest in its layer.
-        if asleep && let Some(b) = self.debris[id.0].and_then(|h| self.world.bodies.get_mut(h)) {
-            b.sleep();
+        if let Some(h) = self.debris[id.0] {
+            let mut rest = Rest::default();
+            if let Some(b) = self.world.bodies.get_mut(h) {
+                // Rapier's own sleep off first (touching its activation
+                // wakes it), then asleep if so placed.
+                rest_hand_off(b, false);
+                if asleep {
+                    b.sleep();
+                    rest.asleep = true;
+                    self.prop_sleep.push(h);
+                }
+            }
+            self.prop_rest.insert(h, rest);
         }
         id
     }
@@ -7467,6 +7532,47 @@ pub fn solved_walk(walk: Vec3, walls: &[Vec3]) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A prop that is a body of its own from the start: put down asleep it
+    // stays asleep; put down awake on the ground it falls still and sleeps
+    // by the 360's rule ([`Rest`]: 6 checks of 0.2 s within 0.02 m), not
+    // rapier's own, within a couple of seconds.
+    #[test]
+    fn a_prop_body_sleeps_by_the_360s_rule() {
+        let mut p = Physics::new();
+        let v = [
+            Vec3::new(-50.0, 0.0, -50.0),
+            Vec3::new(50.0, 0.0, -50.0),
+            Vec3::new(50.0, 0.0, 50.0),
+            Vec3::new(-50.0, 0.0, 50.0),
+        ];
+        let ground = CollisionShape::mesh(&v, &[[0, 1, 2], [0, 2, 3]]).unwrap();
+        p.add_static(StaticKey::Cell(1), &ground, Vec3::ZERO, Quat::IDENTITY);
+        p.step(1.0 / 60.0);
+        let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.5), 50.0);
+        let asleep = p.add_prop_body(
+            &piece,
+            Mat4::from_translation(Vec3::new(0.0, 0.5, 0.0)),
+            true,
+        );
+        let awake = p.add_prop_body(
+            &piece,
+            Mat4::from_translation(Vec3::new(5.0, 0.6, 0.0)),
+            false,
+        );
+        let body =
+            |p: &Physics, id: DebrisId| p.world.bodies[p.debris[id.0].unwrap()].is_sleeping();
+        for _ in 0..30 {
+            p.step(1.0 / 60.0);
+        }
+        assert!(body(&p, asleep), "put down asleep, it stays so");
+        assert!(!body(&p, awake), "not yet: under 1.2 s");
+        for _ in 0..(3.0 * 60.0) as usize {
+            p.step(1.0 / 60.0);
+        }
+        assert!(body(&p, awake), "still for 6 checks: asleep");
+        assert_eq!(p.debris_awake(), 0);
+    }
 
     // On its handbrake a boat slides across with less of the water's drag
     // (`HandBrakeAntiSideDrag`, by its share of its top speed) and the
