@@ -1014,6 +1014,8 @@ pub struct MissionLink {
     pub check_building_damage: Option<f32>,
     /// `--part-destroy-check` ([`PartDestroyCheck`]).
     pub part_destroy_check: Option<PartDestroyCheck>,
+    /// `--sat-blip-check` ([`SatBlipCheck`]).
+    pub sat_blip_check: Option<SatBlipCheck>,
     /// The face rigs and sets read, and the sets the scripts mounted
     /// ([`m2_engine::lip_sync`]).
     faces: m2_engine::lip_sync::Library,
@@ -1272,6 +1274,7 @@ impl MissionLink {
             check_node_damage: None,
             check_building_damage: None,
             part_destroy_check: None,
+            sat_blip_check: None,
             prop_nodes: HashMap::new(),
             faces: Default::default(),
             movies: false,
@@ -2858,6 +2861,9 @@ impl MissionLink {
         // vehicle she rides, as the scripts have it; the faction's
         // soldiers take her for one of theirs while it holds, and the
         // scripts and the HUD's gauge hear how it stands.
+        for g in game.take_sunk() {
+            mission.vehicle_sinking(g);
+        }
         let honks = game.take_honks();
         if honks > 0 {
             mission.honk();
@@ -3168,6 +3174,9 @@ impl MissionLink {
             }
         }
         if let Some(check) = &mut self.object_sound_check {
+            check.tick(game, mission, dt);
+        }
+        if let Some(check) = &mut self.sat_blip_check {
             check.tick(game, mission, dt);
         }
         // A pursuit run out: the scripts read level 0 again.
@@ -6554,6 +6563,89 @@ impl ObjectSoundCheck {
                     );
                 }
             }
+        }
+    }
+}
+
+/// `--sat-blip-check`: the satellite bomb's square on the radar, put on
+/// and taken off by the game's own scripts. Two seconds into play a
+/// `Smart Bomb Projectile` is spawned 60 m over her and blipped as the
+/// satellite bomb's script blips it (`MrxSupport.BlipAircraft(bomb,
+/// {255, 0, 0})`, which takes the square off on the bomb's
+/// `ObjectDeath` or `ObjectHibernation`); a second later it goes off
+/// ([`m2_game::mission::Mission::ordnance_burst`]), and two seconds after
+/// that the radar is looked at. Prints `sat-blip-check: PASS` when the
+/// square was on and is gone, else `sat-blip-check: FAIL <why>`; a run
+/// that ends first fails ([`SatBlipCheck::finish`]).
+#[derive(Debug, Default)]
+pub struct SatBlipCheck {
+    t: f32,
+    bomb: Option<(u32, Vec3)>,
+    burst: bool,
+    done: bool,
+}
+
+impl SatBlipCheck {
+    /// Whether the scripts' radar has a blip on `guid`.
+    fn blipped(mission: &m2_game::mission::Mission, guid: u32) -> bool {
+        let w = mission.world().borrow();
+        w.hud.radar.values().any(|b| b.target == Some(guid))
+    }
+
+    fn fail(&mut self, why: &str) {
+        self.done = true;
+        eprintln!("sat-blip-check: FAIL {why}");
+    }
+
+    fn tick(&mut self, game: &Game, mission: &mut m2_game::mission::Mission, dt: f32) {
+        if self.done {
+            return;
+        }
+        self.t += dt;
+        if self.bomb.is_none() && self.t > 2.0 {
+            let at = game.focus() + Vec3::Y * 60.0;
+            let g = mission.ammo_spawned("Smart Bomb Projectile", at.to_array());
+            let blip = mission
+                .lua()
+                .load(
+                    "local bomb = ...                      if type(MrxSupport) ~= 'table' or type(MrxSupport.BlipAircraft) ~= 'function' then                        return false end                      MrxSupport.BlipAircraft(bomb, { 255, 0, 0 }) return true",
+                )
+                .set_name("=sat-blip-check")
+                .call::<bool>(m2_game::events::guid_value(g));
+            eprintln!("sat-blip-check: bomb {g:#x} at {at:.1}, blipped by the scripts: {blip:?}");
+            self.bomb = Some((g, at));
+            match blip {
+                Ok(true) if Self::blipped(mission, g) => {}
+                Ok(true) => return self.fail("BlipAircraft put no blip on the radar"),
+                Ok(false) => return self.fail("the scripts have no MrxSupport.BlipAircraft"),
+                Err(e) => return self.fail(&format!("BlipAircraft: {e}")),
+            }
+        }
+        let Some((g, at)) = self.bomb else { return };
+        if !self.burst && self.t > 3.0 {
+            self.burst = true;
+            eprintln!("sat-blip-check: bomb {g:#x} goes off");
+            mission.ordnance_burst(g, at.to_array());
+        }
+        if self.burst && self.t > 5.0 {
+            self.done = true;
+            if Self::blipped(mission, g) {
+                eprintln!(
+                    "sat-blip-check: FAIL its square is still on the radar 2 s after it went off"
+                );
+            } else {
+                eprintln!("sat-blip-check: PASS its square came off the radar as it went off");
+            }
+        }
+    }
+
+    /// The run ended: one with no verdict fails.
+    pub fn finish(&mut self) {
+        if !self.done {
+            self.fail(&format!(
+                "the run ended at {:.1} s of play, before a verdict",
+                self.t
+            ));
         }
     }
 }
@@ -11213,6 +11305,13 @@ mod tests {
 
     // A part-destroy check the run ends on without a verdict fails,
     // naming its step; its steps are logged once each.
+    #[test]
+    fn a_sat_blip_check_without_a_verdict_fails_at_the_end() {
+        let mut check = SatBlipCheck::default();
+        check.finish();
+        assert!(check.done, "a run with no verdict ends failed");
+    }
+
     #[test]
     fn a_part_destroy_check_without_a_verdict_fails_at_the_end() {
         let mut c = super::PartDestroyCheck::default();
