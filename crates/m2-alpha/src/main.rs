@@ -13275,14 +13275,15 @@ fn prop_limits_check(
         let mut at: Vec<Vec3> = w
             .as_bodies()
             .filter_map(|(_, ids)| Some(w.physics.debris_place(*ids.first()?)?.w_axis.truncate()))
-            .filter(|p| p.distance(centre) < 120.0)
             .collect();
         at.sort_by(|a, b| a.distance(centre).total_cmp(&b.distance(centre)));
         // One blast for each spread of bodies: none closer than 6 m to the
         // last chosen.
         let mut picked: Vec<Vec3> = Vec::new();
+        // The nearest, whatever the distance (q744f: none within 120 m of
+        // her), at most the 40 blasts' worth.
         for p in at {
-            if picked.iter().all(|q| q.distance(p) > 6.0) {
+            if picked.len() < 40 && picked.iter().all(|q| q.distance(p) > 6.0) {
                 picked.push(p);
             }
         }
@@ -13430,6 +13431,27 @@ fn prop_limits_check(
             movement: Vec2::new(0.0, if speed < 12.0 { 1.0 } else { 0.0 }),
             ..Intent::default()
         };
+        // Where the car is, how fast, and what its body touches (q744f:
+        // the piece moved 0.0 m).
+        if let Some(w) = game.scene.world.as_ref() {
+            let t = ms.len();
+            if t % 15 == 0 {
+                let at = w
+                    .physics
+                    .vehicle_transform(car)
+                    .map_or(Vec3::ZERO, |m| m.w_axis.truncate());
+                let touching: Vec<String> = w
+                    .physics
+                    .vehicle_touching(car)
+                    .into_iter()
+                    .map(|(key, point, _)| format!("{key:?} at {point:.2}"))
+                    .collect();
+                eprintln!(
+                    "prop-limits-check: the car at {at:.2}, {speed:.1} m/s, touching [{}]",
+                    touching.join("; ")
+                );
+            }
+        }
         step(game, intent, &mut ms)?;
     }
     let moved = game
