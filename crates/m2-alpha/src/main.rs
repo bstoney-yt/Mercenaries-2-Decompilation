@@ -9946,9 +9946,11 @@ fn soldier_sight(
         w.physics.remove_static(wall);
     }
     let open = go(game);
+    let damage = blast.damage_at(chest.distance(at));
     eprintln!(
-        "blast-sight-check: soldier {j} {:.1} m from her: behind the wall lost {walled:.1}, in the open {open:.1}",
-        chest.distance(her)
+        "blast-sight-check: soldier {j}, {:.1} m from her and {:.1} m from the blast (its damage there {damage:.1} before his cell): behind the wall lost {walled:.1}, in the open {open:.1}",
+        chest.distance(her),
+        chest.distance(at)
     );
     if walled > 0.01 {
         Err(format!("the soldier lost {walled:.1} behind the wall"))
