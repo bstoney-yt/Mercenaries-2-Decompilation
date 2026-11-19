@@ -387,6 +387,9 @@ pub struct Templates {
     /// Each person template's jump, gravity, turn and paces, by id
     /// ([`crate::tuning::human_motion`]).
     pub human_motion: HashMap<u32, crate::on_foot::HumanMotion>,
+    /// Each person template's `TossGetupSeconds`
+    /// ([`crate::tuning::toss_getup_seconds`]).
+    pub toss_getup: HashMap<u32, f32>,
     /// Each template's cover hints, by id ([`crate::tuning::cover_hints`]).
     pub cover_hints: HashMap<u32, Vec<crate::ai_cover::Hint>>,
     /// Each person template's `HumanAnimationSet` gender and character
@@ -414,6 +417,9 @@ pub struct Templates {
     /// Each template's `_PropPhysics`, by id: the props that move when
     /// hit ([`crate::durability::prop_physics`]).
     pub prop_physics: HashMap<u32, crate::durability::PropPhysics>,
+    /// The templates whose objects have a physics body, by id
+    /// ([`crate::durability::physical`]).
+    pub physical: HashSet<u32>,
     /// The collision preset of each template whose objects aren't
     /// buildings, by id ([`crate::durability::presets`]).
     pub presets: HashMap<u32, crate::collision_layers::Preset>,
@@ -427,6 +433,9 @@ pub struct Templates {
     /// says what each kind of damage does to its objects (`PropFragile`,
     /// `Prop`, `Fence`, `Car`, ...).
     pub modifiers: HashMap<u32, u32>,
+    /// Each template's `Buoyancy` record, by id (20 of them; the rest go
+    /// by [`crate::durability::Buoyancy::default`]).
+    pub buoyancy: HashMap<u32, crate::durability::Buoyancy>,
     /// Each `_PropPhysics` template's fake mass ratios, by id
     /// ([`crate::durability::FakeMass`]).
     pub fake_masses: HashMap<u32, crate::durability::FakeMass>,
@@ -673,6 +682,13 @@ impl Templates {
             .find_map(|id| self.swim_speeds.get(id).copied())
     }
 
+    /// Template `name`'s `TossGetupSeconds`, whatever its case.
+    pub fn toss_getup_seconds(&self, name: &str) -> Option<f32> {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.toss_getup.get(id).copied())
+    }
+
     /// Template `name`'s jump, gravity, turn and paces, whatever its case.
     pub fn human_motion(&self, name: &str) -> Option<crate::on_foot::HumanMotion> {
         self.ids(name)
@@ -810,6 +826,15 @@ impl Templates {
     /// The tuning of template `name` (a vehicle's own, `AMX30 (Full)`),
     /// else of a template of its `model`
     /// ([`tuning_for_model`](Self::tuning_for_model)).
+    /// Template `name`'s `Buoyancy` record, else the 360's defaults
+    /// ([`crate::durability::Buoyancy::default`]).
+    pub fn buoyancy_for(&self, name: &str) -> crate::durability::Buoyancy {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.buoyancy.get(id).copied())
+            .unwrap_or_default()
+    }
+
     pub fn tuning_for(&self, name: &str, model: u32) -> Option<VehicleTuning> {
         self.ids(name)
             .iter()
@@ -1191,15 +1216,18 @@ impl Templates {
             crash_parts: crate::durability::crash_parts(&db),
             sound_keys: crate::durability::sound_keys(&db),
             prop_physics: crate::durability::prop_physics(&db),
+            physical: crate::durability::physical(&db),
             presets: crate::durability::presets(&db),
             gravity_scales: crate::durability::gravity_scales(&db),
             projectiles: crate::durability::projectiles(&db),
             modifiers: crate::durability::modifier_keys(&db),
+            buoyancy: crate::durability::buoyancy(&db),
             fake_masses: crate::durability::fake_masses(&db),
             health: crate::tuning::healths(&db),
             speeds: crate::tuning::human_speeds(&db),
             swim_speeds: crate::tuning::human_swim_speeds(&db),
             human_motion: crate::tuning::human_motion(&db),
+            toss_getup: crate::tuning::toss_getup_seconds(&db),
             cover_hints: crate::tuning::cover_hints(&db),
             human_sets: crate::tuning::human_animation_sets(&db),
             face_actors: crate::tuning::face_actors(&db),

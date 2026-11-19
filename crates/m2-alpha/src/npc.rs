@@ -142,6 +142,10 @@ pub const VEHICLES: u32 = 0x4000_0000;
 pub const HER: u32 = u32::MAX;
 
 /// Soldiers come and go within these distances of the player, metres.
+/// Metres: one dropped from the air (a paratrooper) who falls below this
+/// height without meeting ground is taken as down where they are
+/// (invented: a catch for a drop over a hole in the collision).
+const LOWEST: f32 = -50.0;
 const ACTIVE: f32 = 450.0;
 const INACTIVE: f32 = 500.0;
 /// Most soldiers about at once, and most passers-by on the roads
@@ -626,7 +630,7 @@ pub fn getup_yaw(nodes: &[Mat4], hashes: &[u32]) -> Option<f32> {
     (line.length_squared() > 1e-8).then(|| line.x.atan2(line.z))
 }
 
-fn limp_middle(nodes: &[Mat4]) -> Option<Vec3> {
+pub(crate) fn limp_middle(nodes: &[Mat4]) -> Option<Vec3> {
     if nodes.is_empty() {
         return None;
     }
@@ -1170,6 +1174,16 @@ pub struct Npc {
     pub rig: Rig,
     /// False until there is ground under them to stand on.
     pub landed: bool,
+    /// Made in the air by the scripts with their template's gravity scale
+    /// (a paratrooper under his chute): until [`landed`](Self::landed) they
+    /// fall from where they were made rather than being set on the ground.
+    pub dropped: bool,
+    /// Whether they are off the ground and where they left it: a fall
+    /// that hurts as they come down ([`m2_engine::on_foot::fall_impact`]).
+    pub fall: m2_engine::on_foot::FallWatch,
+    /// Their health as the scripts last heard it
+    /// ([`People::take_health_changes`]).
+    reported_hp: Option<f32>,
     /// The layer entity that placed them (soldiers).
     pub spawn: Option<u32>,
     /// The layer that placed them (a state layer or a static sub-layer):
@@ -1355,7 +1369,7 @@ pub struct Npc {
     rise: bool,
     /// Knocked down and limp: seconds the body has lain still, and
     /// seconds it has been limp ([`LIMP_STILL`], [`LIMP_LONGEST`]).
-    limp: (f32, f32),
+    limp: LimpTimers,
     /// Where the round now striking them landed and the way it flew, set
     /// by the shot just before [`hurt`](Self::hurt) and read by it.
     pub last_hit: Option<(Vec3, Vec3)>,
@@ -1506,6 +1520,43 @@ pub enum Down {
     Carried,
 }
 
+/// A vehicle's hit on a person of at least this much gives away the
+/// disguise of every player riding it, whoever the person (0x82445938:
+/// 1.0 at 0x820BAEE8).
+pub const VEHICLE_HIT_GIVES_AWAY: f32 = 1.0;
+
+/// A rig with no skeleton and no clips: a stand-in for checks that run
+/// people without their models (`--disguise-check`).
+pub fn empty_rig() -> Rig {
+    Rig {
+        skeleton: std::sync::Arc::new(m2_engine::Skeleton::from_nodes(&[])),
+        clips: std::sync::Arc::new(Vec::new()),
+        locomotion: None,
+        animator: m2_engine::Animator::default(),
+        gait: Gait::Idle,
+        upper: None,
+        two_handed: false,
+        aim: None,
+        hands: Default::default(),
+        sweeps: Default::default(),
+        sweep_upper: false,
+        kick: Default::default(),
+        aim_legs: false,
+        aim_walk: Default::default(),
+        lip: None,
+        shuffling: false,
+        aim_clock: 0.0,
+        cues: Vec::new(),
+        own: Default::default(),
+        foreign: Default::default(),
+        theirs: Default::default(),
+        aim_clip: None,
+        barrel: true,
+        scripted: None,
+        time_scales: Default::default(),
+    }
+}
+
 /// When someone knocked down stands up again. From the 360 code
 /// (0x8225CAE0, for a person in `KnockedDown` `Idle`): `Stand` is posted
 /// once they have been in that state longer than their time down (the
@@ -1513,13 +1564,75 @@ pub enum Down {
 /// their physics object is of kind 0xC, once a float of it (+0x300) is
 /// over 0.5 (0x820D9EDC) or another (+0x304) over 19.0 (0x820F8C84).
 ///
-/// **Inferred**: kind 0xC is the limp body, the first float the seconds
-/// it has lain still and the second the seconds it has been limp. So
-/// they do not get up while still tumbling, but always after 19 s.
-/// Under [`LIMP_AT_REST`] m/s counts as still (invented).
-const LIMP_STILL: f32 = 0.5;
-const LIMP_LONGEST: f32 = 19.0;
-const LIMP_AT_REST: f32 = 0.2;
+/// Both floats are kept by the limp body's update, 0x82190470 (see
+/// [`LimpTimers`]): +0x300 the seconds it has lain still, +0x304 the
+/// seconds it has been limp. So they do not get up while still tumbling,
+/// but always after 19 s.
+pub const LIMP_STILL: f32 = 0.5;
+pub const LIMP_LONGEST: f32 = 19.0;
+
+/// A limp body's two timers, as its update 0x82190470 keeps them.
+///
+/// From the 360 code:
+/// - The body's position (its object transform's translation,
+///   0x82185FE0) is held against an anchor (+0x2AC). Once it is 0.1 m or
+///   more from it (squared 0.01, 0x820C8114), the anchor moves there and
+///   the still time (+0x300) goes back to 0; otherwise the still time
+///   grows by the step. So "still" is the body staying within 0.1 m of
+///   where it last settled, not any limb's speed: a limb swinging about
+///   a body that lies put does not hold it down.
+/// - The limp time (+0x304) grows by the step, held at 20 s (0x820BB204).
+/// - Both start at 0 as it goes limp (0x82190F48, 0x8218F200).
+///
+/// **Inferred**: the object's position is the ragdoll's root bone (its
+/// first node). **Not ported**: two other ways 0x82190470 counts the body
+/// as still (a contact counter +0x2F0 over two updates, and a held part
+/// +0x310 with a positive +0x50); what sets them is not traced.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LimpTimers {
+    /// Seconds it has lain within [`Self::RADIUS`] of [`Self::anchor`].
+    pub still: f32,
+    /// Seconds it has been limp, up to [`Self::MOST`].
+    pub limp: f32,
+    pub anchor: Option<Vec3>,
+}
+
+impl LimpTimers {
+    /// 0x820C8114 is its square.
+    pub const RADIUS: f32 = 0.1;
+    /// 0x820BB204.
+    pub const MOST: f32 = 20.0;
+
+    /// A step of `dt` with the body's root at `at` (None: not known,
+    /// counted as still).
+    pub fn step(&mut self, at: Option<Vec3>, dt: f32) {
+        let moved = match (at, self.anchor) {
+            (Some(p), Some(a)) => p.distance_squared(a) >= Self::RADIUS * Self::RADIUS,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if moved {
+            self.anchor = at;
+            self.still = 0.0;
+        } else {
+            self.still += dt;
+        }
+        self.limp = (self.limp + dt).min(Self::MOST);
+    }
+
+    /// Lain still over 0.5 s, or limp over 19 s (0x8225CAE0).
+    pub fn settled(&self) -> bool {
+        self.still > LIMP_STILL || self.limp > LIMP_LONGEST
+    }
+}
+
+/// A limp body's root (its first node), for [`LimpTimers`].
+pub fn limp_root(physics: &m2_engine::Physics, id: m2_engine::RagdollId) -> Option<Vec3> {
+    physics
+        .ragdoll_nodes(id)?
+        .first()
+        .map(|m| m.w_axis.truncate())
+}
 
 /// Seconds a fall takes, someone lies knocked down, gets up, and is
 /// subdued (all invented). The time down the 360 sets counts from when
@@ -1568,7 +1681,7 @@ impl Npc {
             fling: None,
             launch: None,
             rise: false,
-            limp: (0.0, 0.0),
+            limp: LimpTimers::default(),
             last_hit: None,
             dying: None,
             face: {
@@ -1599,6 +1712,9 @@ impl Npc {
             facing,
             rig,
             landed: false,
+            dropped: false,
+            fall: m2_engine::on_foot::FallWatch::default(),
+            reported_hp: None,
             spawn,
             layer: None,
             held: false,
@@ -1845,6 +1961,38 @@ impl Npc {
             self.rig.clips.iter().position(|c| c.hash == hash)
         })?;
         Some((direction, clip))
+    }
+
+    /// Came down from a fall of `distance` metres: what it costs by their
+    /// template's limits ([`m2_engine::on_foot::fall_impact`]), taken as
+    /// the fall's damage (no shooter's: not hers, and no fight comes of
+    /// it). True if it killed.
+    ///
+    /// From the 360 code (0x82205F20, fed by the landing 0x8217C410 as a
+    /// physics event of kind 7): the same rule for every person; the skip
+    /// it makes by a record found through 0x82467B70 (+0x40 of 1 or 2) is
+    /// the players' (its other callers are `Player.*` natives), so nobody
+    /// here is skipped. Not ported: the `FallImpactLight`/`Heavy` actions
+    /// on the people's rigs, and the camera message for each.
+    pub fn land(&mut self, distance: f32) -> bool {
+        let Some(fell) = m2_engine::on_foot::fall_impact(&self.motion.falls, distance) else {
+            return false;
+        };
+        if !self.alive {
+            return false;
+        }
+        eprintln!(
+            "people: {:08x} falls {distance:.1} m and takes {} damage",
+            self.spawn.unwrap_or(0),
+            fell.damage
+        );
+        let (by_her, killed_by_her, alert) = (self.hurt_by_her, self.killed_by_her, self.alert);
+        self.last_hit = None;
+        let killed = self.hurt(fell.damage, Vec3::ZERO);
+        self.hurt_by_her = by_her;
+        self.killed_by_her = killed_by_her;
+        self.alert = alert;
+        killed
     }
 
     /// Takes `damage`; at no health left, falls: true if it killed.
@@ -2339,12 +2487,7 @@ impl Npc {
             Down::Falling(t) => Some(Down::Falling(t - dt)),
             // Their time down over, but the limp body still tumbling:
             // not yet.
-            Down::Knocked(t)
-                if t - dt <= 0.0
-                    && self.ragdoll.is_some()
-                    && self.limp.0 <= LIMP_STILL
-                    && self.limp.1 <= LIMP_LONGEST =>
-            {
+            Down::Knocked(t) if t - dt <= 0.0 && self.ragdoll.is_some() && !self.limp.settled() => {
                 Some(Down::Knocked(0.0))
             }
             Down::Knocked(t) if t - dt <= 0.0 => {
@@ -2445,6 +2588,10 @@ impl Npc {
         let before = self.character.position;
         physics.move_character(&mut self.character, wanted, None, dt);
         let now = self.character.position;
+        // Off an edge and down again: the fall hurts as hers does.
+        if let Some(d) = self.fall.step(!self.character.grounded, now.y) {
+            self.land(d);
+        }
         // In it deeper than a wade, or over ground that is (stepping off a
         // dock or a bank): back where they were, unless they were in it
         // already (then they may walk out). Well above the water (no ground
@@ -3302,6 +3449,26 @@ impl Npc {
             });
             self.rig.step_lip(dt);
         }
+        if !self.landed && self.dropped {
+            // Made in the air with their template's gravity scale: they
+            // fall as anyone falls, slowly, and the landing hurts as any
+            // fall does.
+            physics.move_character(&mut self.character, Vec3::ZERO, None, dt);
+            let p = self.character.position;
+            let fell = self.fall.step(!self.character.grounded, p.y);
+            // Into the sea, or under the island: down where they are.
+            let wet = physics.water_at(p.x, p.z).is_some_and(|w| p.y < w);
+            if self.character.grounded || wet || p.y < LOWEST {
+                self.landed = true;
+                self.dropped = false;
+                self.fall = m2_engine::on_foot::FallWatch::default();
+                if let Some(d) = fell {
+                    self.land(d);
+                }
+            }
+            self.rig.advance(dt);
+            return;
+        }
         if !self.landed {
             // Onto the ground (or the roof or floor of their post) under
             // where they were placed.
@@ -3673,6 +3840,9 @@ pub struct People {
     /// when not known. Someone getting out of a vehicle's way looks
     /// scared for as long.
     pub threat_seconds: Option<f32>,
+    /// The cars (indices into what [`People::traffic`] was given) that hit
+    /// someone for at least [`VEHICLE_HIT_GIVES_AWAY`] since last taken.
+    pub vehicle_hits: Vec<usize>,
     /// Those the scripts keep from dying (`Object.SetUnkillable`), by
     /// spawn entity, here or still to come.
     unkillable: HashSet<u32>,
@@ -3714,6 +3884,11 @@ pub struct People {
     /// People the scripts made (`Pg.Spawn`: GurCon002's Mendez), standing
     /// as a layer's would ([`People::scripted_spawn`]).
     scripted: Vec<SpawnPoint>,
+    /// Of those, the ones made in the air whose template scales gravity
+    /// (`PhysicsPropertyGravityScaler`: the paratroopers' 0.2), by spawn
+    /// entity: they fall from where they were made, pulled that much
+    /// ([`Npc::dropped`]).
+    drops: HashMap<u32, f32>,
     /// Those the scripts have following her, by spawn entity, and how near
     /// they keep ([`People::follow`]).
     following: HashMap<u32, f32>,
@@ -5377,11 +5552,9 @@ impl People {
             // limp.
             match npc.ragdoll.filter(|_| npc.alive) {
                 Some(id) => {
-                    let still = physics.ragdoll_speed(id).is_none_or(|v| v < LIMP_AT_REST);
-                    npc.limp.0 = if still { npc.limp.0 + dt } else { 0.0 };
-                    npc.limp.1 += dt;
+                    npc.limp.step(limp_root(physics, id), dt);
                 }
-                None => npc.limp = (0.0, 0.0),
+                None => npc.limp = LimpTimers::default(),
             }
             // Up from a knockdown (or subdued): where the limp body lay,
             // on the ground under it.
@@ -5498,7 +5671,7 @@ impl People {
         let human = m2_assets::name_hash("Human");
         let kind = m2_assets::name_hash(m2_engine::durability::RAM_KIND);
         let mut killed = 0;
-        for &(at, velocity, (lo, hi), mass) in cars {
+        for (car, &(at, velocity, (lo, hi), mass)) in cars.iter().enumerate() {
             let speed = velocity.length();
             if speed < RUN_OVER {
                 continue;
@@ -5519,6 +5692,9 @@ impl People {
                         let row = n.ai.modifier.unwrap_or(human);
                         m2_engine::durability::run_over(t, row, kind, mass, speed)
                     });
+                    if damage >= VEHICLE_HIT_GIVES_AWAY && !self.vehicle_hits.contains(&car) {
+                        self.vehicle_hits.push(car);
+                    }
                     if n.hurt(damage, push) {
                         killed += usize::from(n.soldier);
                     } else {
@@ -5630,18 +5806,69 @@ impl People {
 
     /// The scripts made a person (`Pg.Spawn` of a person's template): they
     /// come into play as a layer's spawn does, once she is near.
-    pub fn scripted_spawn(&mut self, spawn: SpawnPoint) {
+    ///
+    /// `gravity_scale` is their template's `PhysicsPropertyGravityScaler`
+    /// if it has one: then they come into play where they were made, in
+    /// the air or not, and fall from there pulled that much
+    /// ([`m2_engine::on_foot::scaled_gravity`]), as the 360 has every
+    /// object fall. Those without one are set on the ground under where
+    /// they were made, as a layer's are (the port's way; invented).
+    pub fn scripted_spawn(&mut self, spawn: SpawnPoint, gravity_scale: Option<f32>) {
         eprintln!(
-            "people: the scripts make {:?} ({:08x}) at {:.1}",
-            spawn.name, spawn.entity, spawn.position
+            "people: the scripts make {:?} ({:08x}) at {:.1}{}",
+            spawn.name,
+            spawn.entity,
+            spawn.position,
+            gravity_scale.map_or(String::new(), |g| format!(", falling at {g} x gravity"))
         );
+        match gravity_scale {
+            Some(g) => self.drops.insert(spawn.entity, g),
+            None => self.drops.remove(&spawn.entity),
+        };
         self.scripted.retain(|s| s.entity != spawn.entity);
         self.scripted.push(spawn);
     }
 
-    /// The scripts took away a person they made: they don't come again.
-    pub fn scripted_gone(&mut self, entity: u32) {
+    /// The scripts took away a person they made (`Object.Remove`): they
+    /// go, and don't come again.
+    pub fn scripted_gone(&mut self, physics: Option<&mut Physics>, entity: u32) {
         self.scripted.retain(|s| s.entity != entity);
+        self.drops.remove(&entity);
+        let gone: Vec<Option<RagdollId>> = self
+            .npcs
+            .iter()
+            .filter(|n| n.spawn == Some(entity))
+            .map(|n| n.ragdoll)
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        if let Some(physics) = physics {
+            for doll in gone.into_iter().flatten() {
+                physics.remove_ragdoll(doll);
+            }
+        }
+        self.npcs.retain(|n| n.spawn != Some(entity));
+        self.active.remove(&entity);
+    }
+
+    /// The people whose health changed since the scripts last heard it,
+    /// by spawn entity, with their health now: the scripts read it
+    /// (`Object.GetHealth`) and watch it (`Event.ObjectHealth`: the
+    /// paratrooper sheds his chute below 100). Each is told once a change.
+    pub fn take_health_changes(&mut self) -> Vec<(u32, f32)> {
+        self.npcs
+            .iter_mut()
+            .filter_map(|n| {
+                let entity = n.spawn?;
+                let hp = n.hp.max(0.0);
+                if n.reported_hp == Some(hp) || (n.reported_hp.is_none() && hp >= n.most_hp) {
+                    return None;
+                }
+                n.reported_hp = Some(hp);
+                Some((entity, hp))
+            })
+            .collect()
     }
 
     /// The people who got to the end of a route the scripts sent them
@@ -6132,8 +6359,13 @@ impl People {
         // A mission's targets, and those the scripts sent somewhere (the
         // villa's waves, `Ai.Goal` `PathMove`), come first.
         let (targets, routes, following) = (&self.mission_soldiers, &self.routes, &self.following);
-        let wanted =
-            |e: &u32| targets.contains(e) || routes.contains_key(e) || following.contains_key(e);
+        let drops = &self.drops;
+        let wanted = |e: &u32| {
+            targets.contains(e)
+                || routes.contains_key(e)
+                || following.contains_key(e)
+                || drops.contains_key(e)
+        };
         near.sort_by(|a, b| {
             (!wanted(&a.1.entity))
                 .cmp(&!wanted(&b.1.entity))
@@ -6145,9 +6377,12 @@ impl People {
         let mut walker_room = self.walker_cap.min(MAX_WALKERS).saturating_sub(walkers);
         for (_, s, at) in near {
             let target = self.mission_soldiers.contains(&s.entity);
-            // Sent somewhere, or following her (a VIP released).
-            let sent =
-                self.routes.contains_key(&s.entity) || self.following.contains_key(&s.entity);
+            // Sent somewhere, or following her (a VIP released), or made
+            // in the air by the scripts (a paratrooper: the 360's script
+            // objects are in the world from creation, 0x823FE2A0).
+            let sent = self.routes.contains_key(&s.entity)
+                || self.following.contains_key(&s.entity)
+                || self.drops.contains_key(&s.entity);
             let room = if is_walker(s.entity) {
                 &mut walker_room
             } else {
@@ -6249,6 +6484,16 @@ impl People {
                         radius: SPAWNER_RADIUS,
                     })
             });
+            // Made in the air with a gravity scale (a paratrooper): falling
+            // from where they were made, pulled that much of their
+            // template's `Gravity`.
+            if let Some(&scale) = self.drops.get(&s.entity) {
+                let gravity = self.kinds[kind]
+                    .motion
+                    .map_or(m2_engine::physics::GRAVITY, |m| m.gravity);
+                npc.dropped = true;
+                npc.character.gravity = m2_engine::on_foot::scaled_gravity(gravity, scale);
+            }
             self.tell(s, &npc);
             self.npcs.push(npc);
         }
@@ -6612,7 +6857,7 @@ pub(crate) mod tests {
         // Standing well above the roof.
         assert!(!in_ram(Vec3::new(0.0, 2.5, 0.0), hull));
     }
-    use m2_engine::{Animator, CollisionShape, Skeleton, StaticKey};
+    use m2_engine::{CollisionShape, StaticKey};
     use m2_math::glam::Quat;
 
     #[test]
@@ -6741,33 +6986,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn rig() -> Rig {
-        Rig {
-            skeleton: Arc::new(Skeleton::from_nodes(&[])),
-            clips: Arc::new(Vec::new()),
-            locomotion: None,
-            animator: Animator::default(),
-            gait: Gait::Idle,
-            upper: None,
-            two_handed: false,
-            aim: None,
-            hands: Default::default(),
-            sweeps: Default::default(),
-            sweep_upper: false,
-            kick: Default::default(),
-            aim_legs: false,
-            aim_walk: Default::default(),
-            lip: None,
-            shuffling: false,
-            aim_clock: 0.0,
-            cues: Vec::new(),
-            own: Default::default(),
-            foreign: Default::default(),
-            theirs: Default::default(),
-            aim_clip: None,
-            barrel: true,
-            scripted: None,
-            time_scales: Default::default(),
-        }
+        super::empty_rig()
     }
 
     #[test]
@@ -8662,6 +8881,9 @@ pub(crate) mod tests {
         };
         assert!(!hit.alive && hit.fling.is_some_and(|v| v.z > 10.0 && v.y > 2.0));
         assert!(ahead.alive && ahead.flee.is_some(), "dives aside");
+        // The car hit a passer-by (no faction): it counts for the
+        // disguise of whoever rides it (0x82445938).
+        assert_eq!(people.vehicle_hits, [0]);
         assert!(behind.alive && behind.flee.is_none());
         // Getting out of its way, the one ahead looks scared; the one
         // behind does not.
@@ -9026,6 +9248,158 @@ pub(crate) mod tests {
         assert_eq!(came, [1]);
     }
 
+    // A paratrooper (gravity x 0.2) made 20 m up falls from there, slower
+    // than a man would, and the landing takes the deadly fall's damage
+    // (a soldier's limits: 4 m or more), which the scripts hear.
+    #[test]
+    fn a_dropped_man_falls_slowly_and_the_landing_hurts() {
+        let physics = ground();
+        let mut rng = Rng::default();
+        let mut npc = Npc::new(
+            0,
+            &rig(),
+            Vec3::new(0.0, 20.0, 0.0),
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(7),
+        );
+        npc.hp = 150.0;
+        npc.most_hp = 150.0;
+        npc.dropped = true;
+        npc.character.gravity = m2_engine::on_foot::scaled_gravity(9.8, 0.2);
+        // One second in: 1.96 m/s² takes about a metre, not five.
+        for _ in 0..60 {
+            npc.update(&physics, &mut rng, None, 1.0 / 60.0);
+        }
+        let y = npc.character.position.y;
+        assert!(!npc.landed && (18.5..19.5).contains(&y), "{y}");
+        for _ in 0..60 * 10 {
+            npc.update(&physics, &mut rng, None, 1.0 / 60.0);
+        }
+        assert!(npc.landed && !npc.dropped);
+        assert!(!npc.alive && npc.hp <= 0.0, "{}", npc.hp);
+        // The fall's doing, not hers.
+        assert!(!npc.killed_by_her && !npc.hurt_by_her);
+        let mut people = People::default();
+        people.npcs.push(npc);
+        assert_eq!(people.take_health_changes(), [(7, 0.0)]);
+        assert!(people.take_health_changes().is_empty());
+    }
+
+    // One dropped over the sea comes down in it unhurt, however far he
+    // fell: in the water there is no landing to hurt him, so his chute is
+    // never shed (why the paradrop check drops over dry ground).
+    #[test]
+    fn a_man_dropped_into_the_sea_lands_unhurt() {
+        let mut physics = ground();
+        physics.set_water(5.0);
+        let mut rng = Rng::default();
+        let mut npc = Npc::new(
+            0,
+            &rig(),
+            Vec3::new(0.0, 60.0, 0.0),
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(8),
+        );
+        npc.dropped = true;
+        npc.character.gravity = m2_engine::on_foot::scaled_gravity(9.8, 0.2);
+        for _ in 0..60 * 12 {
+            npc.update(&physics, &mut rng, None, 1.0 / 60.0);
+        }
+        assert!(npc.landed && !npc.dropped);
+        assert!(npc.character.position.y < 5.0 + 0.5);
+        assert!(npc.alive, "no landing hurt him: {}", npc.hp);
+        let mut people = People::default();
+        people.npcs.push(npc);
+        assert!(people.take_health_changes().is_empty());
+    }
+
+    // The fall rule by distance, for one walking: under 2 m nothing,
+    // under 3 m 10, under 4 m 50 (a soldier's limits).
+    #[test]
+    fn a_fall_costs_a_soldier_by_how_far_it_was() {
+        let mut npc = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(1),
+        );
+        npc.hp = 100.0;
+        assert!(!npc.land(1.9));
+        assert_eq!(npc.hp, 100.0);
+        assert!(!npc.land(2.5));
+        assert_eq!(npc.hp, 90.0);
+        assert!(!npc.land(3.5));
+        assert_eq!(npc.hp, 40.0);
+        assert!(npc.land(4.0));
+        assert!(!npc.alive);
+    }
+
+    // Shot below his full health he is reported; one never hurt is not.
+    #[test]
+    fn the_scripts_hear_health_only_as_it_changes() {
+        let mut people = People::default();
+        for e in [1, 2] {
+            let mut n = Npc::new(
+                0,
+                &rig(),
+                Vec3::ZERO,
+                0.0,
+                Brain::Post { facing: 0.0 },
+                Some(e),
+            );
+            n.hp = 150.0;
+            n.most_hp = 150.0;
+            people.npcs.push(n);
+        }
+        assert!(people.take_health_changes().is_empty());
+        people.npcs[1].hurt(30.0, Vec3::ZERO);
+        assert_eq!(people.take_health_changes(), [(2, 120.0)]);
+        assert!(people.take_health_changes().is_empty());
+    }
+
+    // `Object.Remove` of a person the scripts made (the paratrooper
+    // shedding his chute): he goes from play and does not come again.
+    #[test]
+    fn a_person_the_scripts_remove_goes() {
+        let mut people = People::default();
+        people.scripted_spawn(
+            SpawnPoint {
+                entity: 9,
+                name: "Allied Paratrooper".into(),
+                template: None,
+                position: Vec3::new(0.0, 100.0, 0.0),
+                rotation: Quat::IDENTITY,
+                route: Vec::new(),
+                layer: None,
+                static_layer: false,
+                model: None,
+                list: Vec::new(),
+                ai: None,
+                gun: None,
+                launcher: None,
+                cycle: None,
+            },
+            Some(0.2),
+        );
+        assert_eq!(people.drops.get(&9), Some(&0.2));
+        people.npcs.push(Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(9),
+        ));
+        people.active.insert(9);
+        people.scripted_gone(None, 9);
+        assert!(people.npcs.is_empty() && people.scripted.is_empty());
+        assert!(!people.active.contains(&9) && people.drops.is_empty());
+    }
+
     // Playtest 8: soldiers stood under the sea. Placed over water whose
     // floor is the sea bed (a dock not in yet), they don't land; and a
     // patrol into the sea stops at its edge.
@@ -9220,11 +9594,18 @@ pub(crate) mod tests {
         m.ragdoll = Some(ground().add_ragdoll(&[None], &[Mat4::IDENTITY], Vec3::ZERO));
         m.update_down(0.1);
         assert_eq!(m.down, Some(Down::Knocked(0.0)));
-        m.limp = (0.0, LIMP_LONGEST + 0.1);
+        m.limp = LimpTimers {
+            limp: LIMP_LONGEST + 0.1,
+            ..LimpTimers::default()
+        };
         m.update_down(0.1);
         assert!(matches!(m.down, Some(Down::GettingUp(_))) && m.rise);
         m.down = Some(Down::Knocked(0.0));
-        m.limp = (LIMP_STILL + 0.1, 1.0);
+        m.limp = LimpTimers {
+            still: LIMP_STILL + 0.1,
+            limp: 1.0,
+            ..LimpTimers::default()
+        };
         m.update_down(0.1);
         assert!(matches!(m.down, Some(Down::GettingUp(_))));
         step(&mut n, FALL_SECONDS + 0.1, &mut rng);

@@ -63,6 +63,7 @@ mod cheats;
 mod combat;
 mod config;
 mod coop;
+mod death;
 mod destruct;
 mod disguise;
 mod display;
@@ -89,6 +90,7 @@ mod keytable;
 mod ladders;
 mod loading;
 mod marker_models;
+mod mines;
 mod mission;
 mod movie;
 mod moving;
@@ -96,6 +98,7 @@ mod multiply;
 mod npc;
 mod pad;
 mod padtable;
+mod paradrop_check;
 mod particles;
 mod path_hints;
 mod paths;
@@ -246,9 +249,20 @@ struct Options {
     plough: Option<String>,
     /// With `--drive`: wreck it at speed at the end and watch it stop.
     wreck: bool,
+    /// `--exit-land-check`: she gets out of the car she drives and must
+    /// land at once, whatever streams ([`exit_land_check`]).
+    exit_land_check: bool,
+    /// `--no-blast-check`: a chain cannon's round (no blast) fired at a
+    /// soldier ([`no_blast_check`]).
+    no_blast_check: bool,
     /// With `--drive` and `--wreck` or `--shoot-up`: get out of the wreck,
     /// walk to the fuel can it left and take it (testing).
     fuel_check: bool,
+    /// `--survival-check`: her health clamp and survival mode on the
+    /// game's own code, offscreen ([`combat::survival_check`]); then exit.
+    survival_check: bool,
+    /// `--log-check`: the log's own check ([`errlog::check`]); then exit.
+    log_check: bool,
     /// With `--drive`: stop and put this many rifle rounds into its parts.
     shoot_up: Option<u32>,
     /// With `--drive`: fire from the next seat with a weapon.
@@ -303,8 +317,26 @@ struct Options {
     fire: bool,
     /// `--homing-check`: her vehicle is seen by every homing weapon.
     homing_check: bool,
+    /// `--paradrop-check`: with `--mission`, the Allied paradrop plane is
+    /// put 100 m over her and its drop followed to PASS or FAIL.
+    paradrop_check: bool,
     /// `--gravity-check`: measure the physics world's gravity ([`gravity_check`]).
     gravity_check: bool,
+    /// `--toss-check crash|exit`: (turns on --drive) her vehicle into a
+    /// wall, or left at 17.5 m/s, against the 360's toss ([`toss_check`]).
+    toss_check: Option<String>,
+    /// `--runover-check`: (turns on --drive) her vehicle driven into her
+    /// on foot at set speeds, against the 360's proxy contact damage
+    /// ([`runover_check`]).
+    runover_check: bool,
+    /// `--ditch-check`: (turns on --drive) out of her car at 18 m/s and
+    /// what she plays on foot after ([`ditch_check`]).
+    ditch_check: bool,
+    /// `--stagger-check`: her stagger's exemptions ([`stagger_check`]).
+    stagger_check: bool,
+    /// `--disguise-check`: her vehicle disguise and a run-over
+    /// ([`disguise_check`]).
+    disguise_check: bool,
     /// With `--screenshot` on foot: hits she takes just before the
     /// picture, from these directions (degrees clockwise from where the
     /// camera looks), to see the HUD's hit arcs.
@@ -437,6 +469,19 @@ struct Options {
     /// `ObjectState.SendDamage`; `nodedamage` lines log its health before
     /// and after and the message the node took.
     check_node_damage: Option<f32>,
+    /// `--check-building-damage <s>` with `--screenshot`: that many
+    /// seconds into play, the scripts' object nearest her (not a vehicle)
+    /// whose template gives node health has every node sent a share of 1,
+    /// one at a time, until it is destroyed; `buildingdamage` lines log
+    /// its node and object health and whether it was.
+    check_building_damage: Option<f32>,
+    /// `--part-destroy-check`: the island fortress's nodes destroyed by
+    /// the scripts, each part's `DestroyMsg` through its state machine
+    /// ([`mission::PartDestroyCheck`]).
+    part_destroy_check: bool,
+    /// `--sat-blip-check`: the satellite bomb's radar square on and off by
+    /// the game's own scripts ([`mission::SatBlipCheck`]).
+    sat_blip_check: bool,
     /// `--check-shots <s>,<s>...` with `--screenshot` on foot: the scene
     /// is pictured at those seconds in too (`<out>-at<s>.ppm`).
     check_shots: Vec<f32>,
@@ -508,9 +553,36 @@ struct Options {
     /// swim her forward walking, at her pace and sprinting, logging how
     /// fast she goes (`swim-check:` lines).
     swim_check: bool,
+    /// `--prop-bodies-check`: props that come loose whole as bodies of
+    /// their own from the start (gap P7, [`prop_bodies_check`]).
+    prop_bodies_check: bool,
+    /// `--prop-limits-check`: what blasts throw, kept in check by the
+    /// disposer, and hulls meeting loose pieces ([`prop_limits_check`]).
+    prop_limits_check: bool,
+    /// `--sink-check`: a parked car is put in deep water with her in it,
+    /// then a helicopter set down on the sea, each held past its
+    /// `Buoyancy` delay; PASS when each sinks and she is put out.
+    sink_check: bool,
+    /// `--sink-jennifer`: `--sink-check` as Xenia's Jennifer run (100 of
+    /// 100): the car's put-out must leave her at the health clamp's floor.
+    sink_jennifer: bool,
+    /// `--mine-check`: in the mission, the nearest placed mine is blasted
+    /// by an RPG and, should it stand, run into by a jeep; logs
+    /// `mine-check:` lines ([`mines::MineCheck`]).
+    mine_check: bool,
+    /// `--object-sound-check`: her C4 put down in the mission, its
+    /// object-attached beep logged ([`mission::ObjectSoundCheck`]).
+    object_sound_check: bool,
+    /// `--impact-check`: rounds struck into the ground round her, by
+    /// surface ([`impact_check`]).
+    impact_check: bool,
     /// With `--board`: the entrance she stands at, by name or hash
     /// (`entrance_driver`, `8efe45f3`); else the front right one.
     entrance: Option<u32>,
+    /// `--seat-check`: as `--board`, by the first gunner's seat's own
+    /// entrance of the nearest vehicle that has one; logs the seat she
+    /// sits in and its turret camera record.
+    seat_check: bool,
     /// With `--board`: how far out from the entrance she is put, metres
     /// (0.6 when not given; further, off a boat, she swims).
     board_off: Option<f32>,
@@ -568,6 +640,13 @@ struct Options {
     /// With `--mission --screenshot`: her health drops to this eight
     /// seconds in, to see the scripts' healing and survival rescue.
     hurt: Option<f32>,
+    /// `--pickup-event-check`: a crate's contents laid at her feet and
+    /// taken, its `WeaponEvent` "pickup" logged ([`PickupEventCheck`]).
+    pickup_event_check: bool,
+    /// `--death-check`: lethal damage dealt her until she dies, then her
+    /// death through the scripts to their revive logged (`death-check:`
+    /// lines, [`DeathCheck`]).
+    death_check: bool,
     /// With `--mission`: driving, the horn is held half a second every
     /// this many seconds (to hear it, and what the gates, the disguise
     /// and friendly soldiers make of it).
@@ -784,7 +863,17 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--plough" => o.plough = Some(value()?.to_ascii_lowercase()),
             "--wreck" => o.wreck = true,
+            "--exit-land-check" => {
+                o.exit_land_check = true;
+                o.drive = true;
+            }
+            "--no-blast-check" => {
+                o.no_blast_check = true;
+                o.drive = true;
+            }
             "--fuel-check" => o.fuel_check = true,
+            "--survival-check" => o.survival_check = true,
+            "--log-check" => o.log_check = true,
             "--shoot-up" => {
                 o.shoot_up = Some(
                     value()?
@@ -885,7 +974,44 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--seated" => o.seated = true,
             "--board" => o.board = true,
+            // Needs no `--drive`: it runs where `--board` does.
+            "--seat-check" => {
+                o.drive = true;
+                o.board = true;
+                o.seat_check = true;
+                // The M151 unless `--vehicle` names another (either order).
+                o.vehicle.get_or_insert_with(|| "m151".to_owned());
+            }
             "--swim-check" => o.swim_check = true,
+            "--prop-bodies-check" => {
+                o.prop_bodies_check = true;
+                o.drive = true;
+            }
+            "--prop-limits-check" => {
+                o.prop_limits_check = true;
+                o.drive = true;
+            }
+            "--sink-check" => {
+                o.sink_check = true;
+                o.drive = true;
+            }
+            "--sink-jennifer" => {
+                o.sink_check = true;
+                o.sink_jennifer = true;
+                o.drive = true;
+            }
+            "--mine-check" => {
+                o.mine_check = true;
+                o.mission = true;
+            }
+            "--object-sound-check" => {
+                o.object_sound_check = true;
+                o.mission = true;
+            }
+            "--impact-check" => {
+                o.impact_check = true;
+                o.drive = true;
+            }
             "--ladder-check" => {
                 o.ladder_check = Some(
                     value()?
@@ -1041,10 +1167,25 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--take" => o.take = true,
             "--fire" => o.fire = true,
             "--homing-check" => o.homing_check = true,
+            "--paradrop-check" => o.paradrop_check = true,
+            "--ditch-check" => {
+                o.ditch_check = true;
+                o.drive = true;
+            }
             "--gravity-check" => {
                 o.gravity_check = true;
                 o.drive = true;
             }
+            "--toss-check" => {
+                o.toss_check = Some(value()?.to_ascii_lowercase());
+                o.drive = true;
+            }
+            "--runover-check" => {
+                o.runover_check = true;
+                o.drive = true;
+            }
+            "--stagger-check" => o.stagger_check = true,
+            "--disguise-check" => o.disguise_check = true,
             "--look-pickup" => {
                 o.look_pickup = Some(value()?.parse().context("--look-pickup expects metres")?)
             }
@@ -1058,12 +1199,35 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--autoplay" => o.autoplay = true,
             "--smarter-ai" => o.smarter_ai = true,
             "--hurt" => o.hurt = Some(value()?.parse().context("--hurt expects health")?),
+            "--pickup-event-check" => {
+                o.pickup_event_check = true;
+                o.mission = true;
+            }
+            "--death-check" => {
+                o.death_check = true;
+                o.mission = true;
+            }
             "--honk-every" => {
                 o.honk_every = Some(value()?.parse().context("--honk-every expects seconds")?)
             }
             "--gates" => o.gates = true,
             "--marker-test" => o.marker_test = true,
             "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
+            "--part-destroy-check" => {
+                o.part_destroy_check = true;
+                o.mission = true;
+            }
+            "--sat-blip-check" => {
+                o.sat_blip_check = true;
+                o.mission = true;
+            }
+            "--check-building-damage" => {
+                o.check_building_damage = Some(
+                    value()?
+                        .parse()
+                        .context("--check-building-damage expects seconds")?,
+                )
+            }
             "--check-node-damage" => {
                 o.check_node_damage = Some(
                     value()?
@@ -1116,7 +1280,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--write-config" => o.write_config = true,
             "-h" | "--help" => {
                 println!("{}", include_str!("usage.txt"));
-                std::process::exit(0);
+                errlog::exit(0);
             }
             _ => bail!("unknown argument {arg} (try --help)"),
         }
@@ -1238,6 +1402,309 @@ fn keep_crash_reports() {
 /// from harm.
 const HURT_AT: f32 = 8.0;
 
+/// The pickups `--pickup-event-check` lays at her feet, one after the
+/// other, as a crate's contents would lie: cash, then fuel (both taken
+/// by walking onto them), then a munitions laptop (#660: its script's
+/// `PickupMunitions` calls the HUD's PDA, `UpdateSupport`).
+const PICKUP_CHECK_ITEMS: [&str; 3] = ["Cash (Small)", "Fuel Pickup (Large)", "Munitions (Laptop)"];
+
+/// The least a `--pickup-event-check` run plays, seconds: its 10 s, the
+/// three items 4 s apart and 20 s to take them, with time to spare for her to
+/// come down on foot.
+const PICKUP_CHECK_SECONDS: f32 = 90.0;
+
+/// `--pickup-event-check`: from 10 s in (if she is seated then, as the
+/// mission's start seats her in its speed boat, she is put on foot at the
+/// default spawn, logged), once she is on foot and down,
+/// each of [`PICKUP_CHECK_ITEMS`] is laid at her feet as a crate's
+/// contents lie (no object of its own here, `flights::Pickup` from a
+/// crate 0xC4EC0001 of the check's own), 4 s apart, for her to take as
+/// she would. Each taken logs `mission: she picks up <name> (<guid>,
+/// loose: WeaponEvent pickup)` (the mission's). Ends `pickup-event-check:
+/// PASS N of N taken` once all are gone from the ground, else `FAIL`
+/// after 20 s; a run that ends before then says `FAIL` and the step it
+/// was on ([`finish`](Self::finish)). The run plays at least
+/// [`PICKUP_CHECK_SECONDS`].
+#[derive(Debug, Default)]
+struct PickupEventCheck {
+    t: f32,
+    /// She was taken out of the vehicle the mission seated her in.
+    put_ashore: bool,
+    /// No pickup carries her rifle's rounds (the full-rifle case can't be
+    /// laid).
+    ammo_none: bool,
+    laid: usize,
+    next: f32,
+    done: bool,
+    /// The last of the scripts' HUD calls looked at, and whether one was
+    /// the PDA's `UpdateSupport` (the laptop's `PickupMunitions`).
+    seen: u64,
+    support: bool,
+}
+
+/// The crate the check's pickups say they came from (not one of the
+/// scripts': its own, so no placed pickup's).
+const PICKUP_CHECK_CRATE: u32 = 0xc4ec_0001;
+
+impl PickupEventCheck {
+    /// The run ended: `FAIL` and where the check stood, unless it is done.
+    fn finish(&self, game: &Game) {
+        if self.done {
+            return;
+        }
+        let p = game.scene.player.as_ref();
+        let step = if self.t < 10.0 {
+            format!("waiting for 10 s in (the run ended at {:.1} s)", self.t)
+        } else if self.laid == 0 {
+            format!(
+                "waiting for her on foot and down (landed {}, driving {})",
+                p.is_some_and(|p| p.landed),
+                p.is_some_and(|p| p.driving.is_some())
+            )
+        } else {
+            let lying = game
+                .scene
+                .flights
+                .pickups()
+                .iter()
+                .filter(|p| p.from == PICKUP_CHECK_CRATE)
+                .count();
+            format!(
+                "{} of {} laid, {lying} still lying",
+                self.laid,
+                PICKUP_CHECK_ITEMS.len() + 1
+            )
+        };
+        eprintln!(
+            "pickup-event-check: FAIL the run ended {:.1} s in: {step}",
+            self.t
+        );
+    }
+
+    fn tick(&mut self, game: &mut Game, link: &mission::MissionLink, dt: f32) {
+        if self.done {
+            return;
+        }
+        self.t += dt;
+        for c in link.hud_calls_after(self.seen) {
+            if c.seq <= self.seen {
+                continue;
+            }
+            self.seen = c.seq;
+            if c.group == "PdaWidget" && c.method == "UpdateSupport" {
+                self.support = true;
+                eprintln!("pickup-event-check: pda call UpdateSupport {:?}", c.data);
+            }
+        }
+        // Seated (the mission's start has her in its speed boat): she is
+        // put on foot on land at the default spawn, once, for the check.
+        if self.t >= 10.0
+            && !self.put_ashore
+            && let Some(p) = game.scene.player.as_mut()
+            && p.driving.is_some()
+        {
+            self.put_ashore = true;
+            p.driving = None;
+            let (x, z) = crate::scene::DEFAULT_SPAWN;
+            p.drop_at(m2_math::glam::Vec3::new(x, 400.0, z));
+            game.ride = None;
+            game.on_foot = true;
+            eprintln!("pickup-event-check: she was seated; put on foot at ({x:.0}, {z:.0})");
+        }
+        let ready = game
+            .scene
+            .player
+            .as_ref()
+            .is_some_and(|p| p.landed && p.driving.is_none());
+        if self.t < 10.0 || !ready {
+            return;
+        }
+        let lying = |game: &Game| {
+            game.scene
+                .flights
+                .pickups()
+                .iter()
+                .filter(|p| p.from == PICKUP_CHECK_CRATE)
+                .count()
+        };
+        if self.laid < PICKUP_CHECK_ITEMS.len() && self.t >= self.next {
+            let name = PICKUP_CHECK_ITEMS[self.laid];
+            let Some(world) = game.scene.world.as_ref() else {
+                return;
+            };
+            let db = &world.index.template_db;
+            let what = db.id(name).and_then(|id| mission::pickup(db, id));
+            let at = game.focus();
+            match what {
+                Some(what) => {
+                    eprintln!("pickup-event-check: {name} laid at her feet at {at:.1}");
+                    game.scene.flights.leave(flights::Pickup {
+                        from: PICKUP_CHECK_CRATE,
+                        what,
+                        at,
+                        yaw: 0.0,
+                    });
+                }
+                None => eprintln!("pickup-event-check: no pickup template {name}"),
+            }
+            self.laid += 1;
+            self.next = self.t + 4.0;
+            return;
+        }
+        // Then ammunition for her rifle, her rifle full: walked over, it is
+        // taken all the same (the 360 takes ammunition whenever a weapon of
+        // hers matches, 0x8228F5E8 -> 0x82285C98).
+        if self.laid == PICKUP_CHECK_ITEMS.len() && self.t >= self.next {
+            self.laid += 1;
+            self.next = self.t + 4.0;
+            let Some(world) = game.scene.world.as_ref() else {
+                return;
+            };
+            let db = &world.index.template_db;
+            let mut ids: Vec<u32> = db.leavings.pickups.keys().copied().collect();
+            ids.sort_unstable();
+            let pick = ids.into_iter().find_map(|id| {
+                let what = mission::pickup(db, id)?;
+                let rifle = mission::refill(db, &game.combat, &what).rifle;
+                (rifle > 0
+                    && what.weapon.is_none()
+                    && !what.is_money()
+                    && mission::offer(db, &game.combat, &what) == mission::Offer::Walk)
+                    .then_some((id, what))
+            });
+            let Some((id, what)) = pick else {
+                eprintln!("pickup-event-check: no walked-over pickup carries her rifle's rounds");
+                self.ammo_none = true;
+                return;
+            };
+            let full = game.combat.rifle.spare;
+            game.combat.rifle_rounds.stored = full;
+            let at = game.focus();
+            eprintln!(
+                "pickup-event-check: {} ({id:#x}) laid at her feet at {at:.1}, her {} full ({full} spare)",
+                db.names.get(&id).map_or("?", String::as_str),
+                game.combat.rifle.name
+            );
+            game.scene.flights.leave(flights::Pickup {
+                from: PICKUP_CHECK_CRATE,
+                what,
+                at,
+                yaw: 0.0,
+            });
+            return;
+        }
+        if self.laid > PICKUP_CHECK_ITEMS.len() && self.t >= self.next {
+            let left = lying(game);
+            // All taken, and the laptop's script has called the PDA.
+            if left == 0 && self.support {
+                self.done = true;
+                eprintln!(
+                    "pickup-event-check: PASS {n} of {n} taken (each with its WeaponEvent line), the last ammunition for her full rifle,                      and the laptop's script called the PDA's UpdateSupport",
+                    n = PICKUP_CHECK_ITEMS.len() + 1
+                );
+            } else if self.ammo_none {
+                self.done = true;
+                eprintln!(
+                    "pickup-event-check: FAIL no walked-over pickup carries her rifle's rounds"
+                );
+            } else if self.t >= self.next + 20.0 {
+                self.done = true;
+                if left > 0 {
+                    eprintln!("pickup-event-check: FAIL {left} still lying after 20 s");
+                } else {
+                    eprintln!(
+                        "pickup-event-check: FAIL all taken, but no pda call UpdateSupport in 20 s \
+                         (the laptop's PickupMunitions never ran)"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `--death-check`: from [`HURT_AT`] on, lethal damage is dealt her each
+/// [`DEATH_HIT_EVERY`] s until she dies (the scripts' health clamp turns
+/// the first into their survival rescue; with it off, the next kills).
+/// Then it waits up to [`DEATH_WAIT`] s for the scripts' revive (their
+/// `PlayerDied` -> `MoveToSickbay` -> `Object.Revive`). Logs
+/// `death-check: PASS died at T s, revived at T2 s with H health at P`,
+/// else `FAIL <why>`.
+#[derive(Debug, Default)]
+struct DeathCheck {
+    t: f32,
+    next_hit: f32,
+    hits: u32,
+    died_at: Option<f32>,
+    answered: bool,
+    done: bool,
+}
+
+const DEATH_HIT_EVERY: f32 = 3.0;
+const DEATH_HITS: u32 = 10;
+const DEATH_WAIT: f32 = 90.0;
+
+impl DeathCheck {
+    fn tick(&mut self, game: &mut Game, dt: f32) {
+        if self.done {
+            return;
+        }
+        self.t += dt;
+        if self.t < HURT_AT {
+            return;
+        }
+        let c = &game.combat;
+        match self.died_at {
+            None if c.down > 0.0 && c.hp < crate::death::DEATH_BELOW => {
+                self.died_at = Some(self.t);
+                eprintln!(
+                    "death-check: she died at {:.1} s after {} hits",
+                    self.t, self.hits
+                );
+            }
+            None if self.hits >= DEATH_HITS && self.t >= self.next_hit => {
+                self.done = true;
+                eprintln!(
+                    "death-check: FAIL {DEATH_HITS} lethal hits and she lives ({:.1} health, clamp {})",
+                    c.hp, c.health_clamp
+                );
+            }
+            None if self.t >= self.next_hit => {
+                self.hits += 1;
+                self.next_hit = self.t + DEATH_HIT_EVERY;
+                eprintln!(
+                    "death-check: lethal hit {} (health {:.1}, clamp {})",
+                    self.hits, c.hp, c.health_clamp
+                );
+                game.combat.pending_hurt.push(1.0e6);
+            }
+            Some(at)
+                if c.down <= 0.0
+                    && c.hp >= crate::death::DEATH_BELOW
+                    && c.revived_by_scripts == Some(false) =>
+            {
+                self.done = true;
+                eprintln!(
+                    "death-check: FAIL died at {at:.1} s, stood up at {:.1} s by the alpha's own fallback, not the scripts' revive",
+                    self.t
+                );
+            }
+            Some(at) if c.down <= 0.0 && c.hp >= crate::death::DEATH_BELOW => {
+                self.done = true;
+                let her = game.focus();
+                eprintln!(
+                    "death-check: PASS died at {at:.1} s, revived at {:.1} s with {:.1} health at {her:.0}",
+                    self.t, c.hp
+                );
+            }
+            Some(at) if self.t - at > DEATH_WAIT => {
+                self.done = true;
+                eprintln!("death-check: FAIL died at {at:.1} s, no revive in {DEATH_WAIT} s");
+            }
+            _ => {}
+        }
+    }
+}
+
 /// With `--mission --hijack`, how long an action marker's vehicle is left
 /// before she hijacks it, seconds: the villa tank comes through the hall
 /// wall first (in the PC footage it bursts in 4 s before "Hijack tank" is
@@ -1293,6 +1760,13 @@ fn run(
 ) -> anyhow::Result<()> {
     spans::start_profiler();
     let mut options = parse_args(args)?;
+    if options.log_check {
+        errlog::check();
+    }
+    if options.survival_check {
+        // Exit 1 on a failure, as the other checks do.
+        errlog::exit(if combat::survival_check() { 0 } else { 1 });
+    }
     let ignored = screenshot_only_ignored(args);
     if !ignored.is_empty() {
         eprintln!(
@@ -2377,6 +2851,10 @@ fn screenshot(
             stage,
             options.fight_wait,
         )?;
+    } else if options.stagger_check && game.on_foot && game.scene.player.is_some() {
+        stagger_check(&mut game);
+    } else if options.disguise_check {
+        disguise_check();
     } else if options.shuffle_test && game.on_foot && game.scene.player.is_some() {
         shuffle_test(&mut game);
     } else if options.fight && game.on_foot && game.scene.player.is_some() {
@@ -4483,8 +4961,18 @@ fn mission_for_screenshot(
         .with_skip_mode_off(options.skip_mode_off)
         .with_script_join(options.script_join)
         .with_skip_to(options.skip_to.clone())
-        .with_job_near(options.job_near);
+        .with_job_near(options.job_near)
+        .with_mine_check(options.mine_check)
+        .with_object_sound_check(options.object_sound_check)
+        .with_paradrop_check(options.paradrop_check);
     link.check_node_damage = options.check_node_damage;
+    link.check_building_damage = options.check_building_damage;
+    if options.part_destroy_check {
+        link.part_destroy_check = Some(mission::PartDestroyCheck::default());
+    }
+    if options.sat_blip_check {
+        link.sat_blip_check = Some(mission::SatBlipCheck::default());
+    }
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
@@ -4516,6 +5004,13 @@ fn mission_for_screenshot(
         options.mission_seconds
     } else {
         10.0
+    };
+    // `--pickup-event-check` needs its 10 s, two items 4 s apart and
+    // 20 s to take them: a run long enough for all of it.
+    let seconds = if options.pickup_event_check {
+        seconds.max(PICKUP_CHECK_SECONDS)
+    } else {
+        seconds
     };
     let mut auto = options.autoplay.then(autoplay::Autoplay::default);
     // How long the scripts' transit map has been up.
@@ -4621,6 +5116,8 @@ fn mission_for_screenshot(
     let (mut hijack_running, mut hijack_shots) = (0.0f32, 0u32);
     let mut action_since: Option<u32> = None;
     let mut placed_tried = std::collections::HashSet::new();
+    let mut pickup_check = options.pickup_event_check.then(PickupEventCheck::default);
+    let mut death_check = options.death_check.then(DeathCheck::default);
     // Seconds she has been where --props-check hits the props.
     let mut props_ready = 0.0;
     let mut shop_check = options.shop_check.clone().map(shopcheck::ShopCheck::new);
@@ -4758,11 +5255,38 @@ fn mission_for_screenshot(
             None => Intent::default(),
         };
         lap.mark("loop: autoplay and what it reads");
+        if let Some(c) = &mut pickup_check {
+            c.tick(game, &link, tick);
+        }
         if let Some(hp) = options.hurt
             && i == (HURT_AT / tick).round() as u32
         {
-            eprintln!("hurt: her health {:.1} -> {hp:.1}", game.combat.hp);
-            game.combat.hp = hp;
+            // Through the health change, as a hit's damage (her floor, the
+            // scripts' clamp and her death apply), not set outright.
+            let damage = (game.combat.hp - hp).max(0.0);
+            eprintln!(
+                "hurt: {damage:.1} to deal her ({:.1} -> {hp:.1})",
+                game.combat.hp
+            );
+            game.combat.pending_hurt.push(damage);
+        }
+        if let Some(c) = &mut death_check {
+            c.tick(game, tick);
+            // Her death cancels the contract under way (`PlayerDied`:
+            // `mission:Cancel()`), whose fanfare waits for her answer;
+            // Continue (not Retry) ends it (`MrxTaskContract`'s end,
+            // 2f0b1589 line 560: no retry, her character dead) in
+            // `MrxPlayer.MoveToSickbay`. 3 s on it is answered so.
+            if c.died_at.is_some_and(|at| c.t >= at + 3.0)
+                && !c.answered
+                && let Some(seq) = link.waiting_fanfare()
+            {
+                c.answered = true;
+                eprintln!(
+                    "death-check: she takes Continue on the failed contract's fanfare (HUD call {seq})"
+                );
+                link.answer_fanfare(seq, false);
+            }
         }
         // With --support she throws the marker the scripts hand her.
         let mut intent = intent;
@@ -5044,6 +5568,23 @@ fn mission_for_screenshot(
         lap.mark("loop: before the step");
         spans::time("game", || game.step(intent, tick));
         spans::time("scripts", || link.tick(game, tick));
+        // `--part-destroy-check`'s pictures of the fortress, from above
+        // and off its side.
+        let shots = (link.part_destroy_check.as_mut()).map_or_else(Vec::new, |c| c.take_shots());
+        for (name, at) in shots {
+            let eye = at + m2_math::glam::Vec3::new(70.0, 45.0, 30.0);
+            delivery_picture(
+                backend,
+                game,
+                fov,
+                aspect,
+                at,
+                at,
+                Some(eye),
+                &picture(format!("fortress-{name}")),
+            )?;
+            eprintln!("part-destroy-check: pictured the fortress {name}");
+        }
         if let Some(audio) = &mut audio {
             spans::time("sound", || {
                 mission_sounds(audio, &mut link);
@@ -6065,6 +6606,9 @@ fn mission_for_screenshot(
             break;
         }
     }
+    if let Some(c) = &pickup_check {
+        c.finish(game);
+    }
     if let Some(sc) = &shop_check {
         for line in sc.summary() {
             eprintln!("{line}");
@@ -6088,6 +6632,14 @@ fn mission_for_screenshot(
             sounds.len(),
             rows.join(", ")
         );
+    }
+    // A `--part-destroy-check` that never passed or failed fails here,
+    // naming the step it was waiting on.
+    if let Some(c) = link.part_destroy_check.as_mut() {
+        c.finish();
+    }
+    if let Some(c) = link.sat_blip_check.as_mut() {
+        c.finish();
     }
     if auto.is_some() {
         link.log_recruits("at the end");
@@ -7058,6 +7610,129 @@ const HOMING_CHECK_SECONDS: f32 = 60.0;
 /// launcher up, and the run waits up to [`HOMING_CHECK_SECONDS`] for his
 /// lock, his shot and its hit. Logs `homing-check: PASS ...` or
 /// `homing-check: FAIL <why>`.
+/// `--stagger-check`: her stagger as the 360's picker (0x824220B0) has it
+/// for a player, run on her own clips: a grenade's blast behind her
+/// staggers her standing (control); not aimed in (`Crouched`); not while
+/// invincible (`Object.GetInvincible`, 0x8228CB80); a bash aimed in
+/// still does. Prints a line each and PASS or FAIL.
+fn stagger_check(game: &mut Game) {
+    use m2_engine::stagger::Event;
+    use m2_math::glam::Vec3;
+    let Some(p) = game.scene.player.as_mut() else {
+        eprintln!("stagger-check: FAIL no player");
+        return;
+    };
+    let blast = Event {
+        direction: Vec3::new(p.facing.sin(), 0.0, p.facing.cos()),
+        direct: false,
+        melee: false,
+        key: Some(m2_assets::name_hash("Explosion")),
+    };
+    let bash = Event {
+        direction: -Vec3::new(p.facing.sin(), 0.0, p.facing.cos()),
+        direct: true,
+        melee: true,
+        key: None,
+    };
+    let cases: [(&str, &Event, bool, bool, bool); 4] = [
+        ("standing, a blast behind her", &blast, false, false, true),
+        ("aimed in, a blast behind her", &blast, true, false, false),
+        ("invincible, a blast behind her", &blast, false, true, false),
+        ("aimed in, a bash from ahead", &bash, true, false, true),
+    ];
+    let mut all = true;
+    for (what, event, aimed, invincible, want) in cases {
+        p.forget_stagger();
+        p.aiming = aimed;
+        let got = p.stagger(event, invincible);
+        let ok = got == want;
+        all &= ok;
+        eprintln!(
+            "stagger-check: {what}: {}, want {}: {}",
+            if got { "staggers" } else { "no stagger" },
+            if want { "staggers" } else { "no stagger" },
+            if ok { "PASS" } else { "FAIL" }
+        );
+    }
+    p.aiming = false;
+    p.forget_stagger();
+    eprintln!("stagger-check: {}", if all { "PASS" } else { "FAIL" });
+}
+
+/// `--disguise-check`: her vehicle disguise against a run-over, on the
+/// game's own people and disguise code, offscreen: disguised as the VZ in
+/// their vehicle (scene vehicle 0), the car hits a passer-by of no
+/// faction at 10 m/s ([`crate::npc::People::traffic`]); the hit is
+/// counted for the vehicle she rides and gives the disguise away
+/// ([`crate::npc::VEHICLE_HIT_GIVES_AWAY`], 0x82445938). Control: a
+/// parked car hits nobody and the disguise holds. Prints a line each and
+/// PASS or FAIL.
+fn disguise_check() -> bool {
+    use crate::disguise::{Disguise, Tick};
+    use crate::npc::{Brain, Npc, People};
+    use m2_math::glam::{Mat4, Vec3};
+    let bounds = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.5, 2.0));
+    let run = |speed: f32| -> (bool, bool) {
+        let mut people = People::default();
+        let mut n = Npc::new(
+            0,
+            &crate::npc::empty_rig(),
+            Vec3::new(0.3, 0.0, 1.5),
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(9),
+        );
+        n.landed = true;
+        n.soldier = false;
+        n.faction = None;
+        people.npcs.push(n);
+        people.traffic(
+            &[(Mat4::IDENTITY, Vec3::new(0.0, 0.0, speed), bounds, 1500.0)],
+            None,
+        );
+        let ran_over = people.vehicle_hits.contains(&0);
+        let mut d = Disguise::default();
+        let tick = |hurt| Tick {
+            enabled: true,
+            vehicle: Some(0),
+            faction: Some("Vza"),
+            honks: 0,
+            near: 0,
+            hurt_someone: hurt,
+        };
+        d.update(tick(false), 1.0 / 60.0);
+        let holds = d.update(tick(ran_over), 1.0 / 60.0).is_some_and(|(_, h)| h);
+        (ran_over, holds)
+    };
+    let mut all = true;
+    for (what, speed, want_hit, want_holds) in [
+        (
+            "disguised in a VZ jeep at 10 m/s into a passer-by",
+            10.0,
+            true,
+            false,
+        ),
+        (
+            "disguised in a VZ jeep, parked by a passer-by",
+            0.0,
+            false,
+            true,
+        ),
+    ] {
+        let (hit, holds) = run(speed);
+        let ok = hit == want_hit && holds == want_holds;
+        all &= ok;
+        eprintln!(
+            "disguise-check: {what}: {}, disguise {}: {}",
+            if hit { "hit" } else { "no hit" },
+            if holds { "holds" } else { "given away" },
+            if ok { "PASS" } else { "FAIL" }
+        );
+    }
+    eprintln!("disguise-check: {}", if all { "PASS" } else { "FAIL" });
+    all
+}
+
 fn homing_check(game: &mut Game, tick: f32) {
     use m2_math::glam::Vec3;
     let Some(world) = game.scene.world.as_ref() else {
@@ -7255,6 +7930,17 @@ fn drive_for_screenshot(
     install: Option<&Install>,
 ) -> anyhow::Result<()> {
     game.combat.homing_check = options.homing_check;
+    if (options.prop_bodies_check || options.prop_limits_check)
+        && let Some(w) = game.scene.world.as_mut()
+    {
+        // The island's placed objects that come loose whole are bodies
+        // from stream-in (`World::bodies_on`); any standing already now.
+        let made = w.make_bodies();
+        eprintln!(
+            "prop-bodies-check: she is at {:.0}; {made} placed objects standing became bodies",
+            game.focus()
+        );
+    }
     let tick = TICK.as_secs_f32();
     let started = Instant::now();
     loop {
@@ -7279,13 +7965,21 @@ fn drive_for_screenshot(
     for _ in 0..90 {
         game.step(Intent::default(), tick);
     }
-    // A vehicle asked for that isn't parked here: one is parked.
+    // A vehicle asked for that isn't parked here: one is parked. With
+    // `--seat-check` it must have a gunner's own entrance (the island's
+    // own M151 Softtop has none), so the start position doesn't matter.
     if let Some(want) = &options.vehicle {
-        let have = |game: &Game| {
-            game.scene.vehicles.iter().any(|v| {
-                v.id.is_some() && v.spec.label.to_ascii_lowercase().contains(want.as_str())
-            })
+        let fits = |v: &crate::scene::ParkedVehicle| {
+            v.id.is_some()
+                && v.spec.label.to_ascii_lowercase().contains(want.as_str())
+                && (!options.seat_check
+                    || v.spec
+                        .seating
+                        .as_deref()
+                        .and_then(m2_engine::seats::gunner_entrance)
+                        .is_some())
         };
+        let have = |game: &Game| game.scene.vehicles.iter().any(fits);
         if !have(game) {
             let models: Vec<m2_engine::CatalogueEntry> = game
                 .scene
@@ -7307,7 +8001,45 @@ fn drive_for_screenshot(
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            if !models.is_empty() {
+            if options.seat_check {
+                // One model at a time: the first parked has a gunner's
+                // entrance, or the next is tried (its seats come from the
+                // first of its model's templates that has any).
+                for m in models {
+                    let placed = |game: &Game| {
+                        game.scene
+                            .vehicles
+                            .iter()
+                            .filter(|v| v.id.is_some())
+                            .count()
+                    };
+                    let before = placed(game);
+                    let label = m.label.clone();
+                    game.park_more(vec![m]);
+                    let waited = Instant::now();
+                    while placed(game) == before && waited.elapsed() < Duration::from_secs(30) {
+                        game.step(Intent::default(), tick);
+                        render(backend, game, fov, aspect, None)?;
+                    }
+                    for _ in 0..90 {
+                        game.step(Intent::default(), tick);
+                    }
+                    let ok = have(game);
+                    eprintln!(
+                        "seat-check: parked {label}: {}",
+                        if placed(game) == before {
+                            "not placed in 30 s"
+                        } else if ok {
+                            "has a gunner's own entrance"
+                        } else {
+                            "no gunner's own entrance, trying the next"
+                        }
+                    );
+                    if ok {
+                        break;
+                    }
+                }
+            } else if !models.is_empty() {
                 game.park_more(models);
                 let waited = Instant::now();
                 while !have(game) && waited.elapsed() < Duration::from_secs(90) {
@@ -7334,8 +8066,22 @@ fn drive_for_screenshot(
         }
         return board_for_check(game, options, tick);
     }
+    if options.prop_bodies_check {
+        return prop_bodies_check(backend, game, fov, aspect, tick);
+    }
+    if options.prop_limits_check {
+        return prop_limits_check(backend, game, fov, aspect, tick);
+    }
     if options.swim_check {
         swim_check(game, tick);
+        return Ok(());
+    }
+    if options.sink_check {
+        sink_check(game, tick, options.sink_jennifer);
+        return Ok(());
+    }
+    if options.impact_check {
+        impact_check(game, tick);
         return Ok(());
     }
     if let Some(hold) = options.ladder_check {
@@ -7379,6 +8125,18 @@ fn drive_for_screenshot(
     }
     if options.gravity_check {
         gravity_check(game);
+        return Ok(());
+    }
+    if let Some(mode) = options.toss_check.as_deref() {
+        toss_check(game, tick, mode);
+        return Ok(());
+    }
+    if options.runover_check {
+        let ok = runover_check(game, tick);
+        errlog::exit(if ok { 0 } else { 1 });
+    }
+    if options.ditch_check {
+        ditch_check(game, tick);
         return Ok(());
     }
     let label = game
@@ -7689,6 +8447,14 @@ fn drive_for_screenshot(
             .collect::<Vec<_>>()
             .join(", ")
     );
+    if options.exit_land_check {
+        exit_land_check(game, tick);
+        return Ok(());
+    }
+    if options.no_blast_check {
+        no_blast_check(game, tick);
+        return Ok(());
+    }
     if options.wreck {
         wreck_at_speed(game, tick);
     }
@@ -7791,9 +8557,133 @@ fn drive_for_screenshot(
 /// exit the rules chose.
 fn board_for_check(game: &mut Game, options: &Options, tick: f32) -> anyhow::Result<()> {
     let Some((i, at)) = board_stand(game, options, tick) else {
+        if options.seat_check {
+            eprintln!("seat-check: FAIL no parked vehicle with a gunner's own entrance");
+            eprintln!("seat-check: RESULT FAIL");
+        }
         return Ok(());
     };
+    if options.seat_check {
+        seat_check(game, tick, i);
+        return Ok(());
+    }
     board_pressed(game, options, tick, i, at)
+}
+
+/// The M151's gunner's seat and its `CameraTurret` record, as the data
+/// and the 360 give them (#717's recipe): seat `1b217b8a`, 2.0 and 1.8
+/// rad/s, yaw -1.25..1.25, pitch -0.19..0.85, keeps 0.95/0.91 and
+/// 0.97/0.9.
+const M151_GUNNER: (u32, m2_engine::seats::SeatCamera) = (
+    0x1b21_7b8a,
+    m2_engine::seats::SeatCamera {
+        yaw_speed: 2.0,
+        pitch_speed: 1.8,
+        yaw: (-1.25, 1.25),
+        pitch: (-0.19, 0.85),
+        yaw_keep: [0.95, 0.91],
+        pitch_keep: [0.97, 0.9],
+    },
+);
+
+/// `--seat-check`, standing at vehicle `i`'s gunner's own entrance
+/// ([`board_stand`]): the use key with getting in locked, then unlocked;
+/// her seat, its turret and camera record; the use key with getting out
+/// locked, then unlocked. Prints `seat-check: PASS ...` or `FAIL ...` for
+/// each and `seat-check: RESULT PASS` when all pass.
+fn seat_check(game: &mut Game, tick: f32, i: usize) {
+    let mut ok = true;
+    let mut check = |pass: bool, what: String| {
+        ok &= pass;
+        eprintln!("seat-check: {} {what}", if pass { "PASS" } else { "FAIL" });
+    };
+    let use_key = Intent {
+        use_pressed: true,
+        ..Intent::default()
+    };
+    let label = game.scene.vehicles[i].spec.label.clone();
+    let seating = game.scene.vehicles[i].spec.seating.clone();
+    let Some((want, entrance)) = seating
+        .as_deref()
+        .and_then(m2_engine::seats::gunner_entrance)
+    else {
+        check(false, format!("the {label} has no gunner's own entrance"));
+        eprintln!("seat-check: RESULT FAIL");
+        return;
+    };
+    let seats = seating.as_deref().map_or(&[][..], |s| &s.seats[..]);
+    let want_seat = seats[want].clone();
+    let driving = |game: &Game| game.scene.player.as_ref().and_then(|p| p.driving);
+    // Waits up to `limit` seconds for `done`.
+    let wait = |game: &mut Game, limit: f32, done: &dyn Fn(&Game) -> bool| {
+        let mut t = 0.0;
+        while t < limit && !done(game) {
+            game.step(Intent::default(), tick);
+            t += tick;
+        }
+        done(game)
+    };
+    // Getting in locked (+0x44D clear): the use key seats her nowhere.
+    game.seat_locks = [false, true, true];
+    game.step(use_key, tick);
+    let held_out = !wait(game, 2.0, &|g| driving(g).is_some());
+    check(
+        held_out,
+        format!("enter lock: use at entrance {entrance:08x} with +0x44D clear leaves her out"),
+    );
+    // Unlocked: she gets in by the gunner's entrance, into the gunner's seat.
+    game.seat_locks = [true; 3];
+    game.step(use_key, tick);
+    let boarded = wait(game, 6.0, &|g| {
+        driving(g) == Some(i) && g.boarding.is_none()
+    });
+    let seat = game.ride.filter(|r| r.0 == i).map(|r| r.1);
+    check(
+        boarded && seat == Some(want_seat.name),
+        format!(
+            "boarded the {label} by entrance {entrance:08x}: seat {seat:08x?}, expected {:08x} ({:?})",
+            want_seat.name,
+            want_seat.role()
+        ),
+    );
+    check(
+        want_seat.role() == m2_engine::seats::Role::Gunner,
+        format!("seat {:08x} is a gunner's seat", want_seat.name),
+    );
+    eprintln!(
+        "seat-check: seat {:08x} turret {:08x?} camera {:?}",
+        want_seat.name, want_seat.turret, want_seat.camera
+    );
+    check(
+        want_seat.camera.is_some(),
+        format!("seat {:08x} has its CameraTurret record", want_seat.name),
+    );
+    if label.to_ascii_lowercase().contains("m151") {
+        check(
+            want_seat.name == M151_GUNNER.0 && want_seat.camera == Some(M151_GUNNER.1),
+            format!(
+                "M151 gunner seat {:08x} and camera match 1b217b8a, 2.0/1.8 rad/s, yaw -1.25..1.25, pitch -0.19..0.85",
+                want_seat.name
+            ),
+        );
+    }
+    // Getting out locked (+0x44E clear): the use key keeps her in.
+    game.seat_locks = [true, false, true];
+    game.step(use_key, tick);
+    let kept_in = !wait(game, 2.0, &|g| driving(g).is_none());
+    check(
+        kept_in,
+        "exit lock: use with +0x44E clear keeps her in".to_owned(),
+    );
+    // Unlocked: out.
+    game.seat_locks = [true; 3];
+    game.step(use_key, tick);
+    let out = wait(game, 6.0, &|g| driving(g).is_none() && g.boarding.is_none());
+    check(
+        out,
+        "exit: use with the locks clear gets her out".to_owned(),
+    );
+    eprintln!("seat-check: RESULT {}", if ok { "PASS" } else { "FAIL" });
 }
 
 /// `--board --seated`: as `--board`, with the clips of her getting in and
@@ -7916,6 +8806,14 @@ fn board_stand(
         .enumerate()
         .filter(|(_, v)| v.spec.label.to_ascii_lowercase().contains(want))
         .filter(|(_, v)| !v.spec.entrances.is_empty())
+        .filter(|(_, v)| {
+            !options.seat_check
+                || v.spec
+                    .seating
+                    .as_deref()
+                    .and_then(m2_engine::seats::gunner_entrance)
+                    .is_some()
+        })
         .filter_map(|(i, v)| {
             let at = world?.physics.vehicle_transform(v.id?)?;
             Some((i, at, at.transform_point3(Vec3::ZERO).distance(here)))
@@ -7926,8 +8824,24 @@ fn board_stand(
         return None;
     };
     let spec = &game.scene.vehicles[i].spec;
+    // `--seat-check`: the gunner's seat's own entrance.
+    let gunner = options
+        .seat_check
+        .then(|| {
+            spec.seating
+                .as_deref()
+                .and_then(m2_engine::seats::gunner_entrance)
+        })
+        .flatten();
+    if let (Some((seat, e)), Some(s)) = (gunner, spec.seating.as_deref()) {
+        eprintln!(
+            "seat-check: the {}: gunner's seat {:08x} by its entrance {e:08x}",
+            spec.label, s.seats[seat].name
+        );
+    }
     let right = options
         .entrance
+        .or(gunner.map(|g| g.1))
         .unwrap_or_else(|| m2_assets::name_hash("entrance_front_right"));
     let &(e, local) = spec
         .entrances
@@ -8049,6 +8963,23 @@ fn board_pressed(
         game.combat.seat,
         game.hud_info(None).driving.map(|d| d.0)
     );
+    if options.seat_check {
+        let v = &game.scene.vehicles[i];
+        let seat = game.ride.filter(|r| r.0 == i).and_then(|r| {
+            let s = v.spec.seating.as_deref()?;
+            s.seats.get(s.seat(r.1)?)
+        });
+        match seat {
+            Some(s) => eprintln!(
+                "seat-check: she sits in {:08x} ({:?}), aiming turret {:08x?}, its camera {:?}",
+                s.name,
+                s.role(),
+                s.turret,
+                s.camera
+            ),
+            None => eprintln!("seat-check: she sits in no seat of the {}", v.spec.label),
+        }
+    }
     // `--look`: the camera swung, and the turret her seat aims following
     // (to the end of its arc, at its pace).
     if options.look != 0.0 {
@@ -8285,6 +9216,330 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 /// `--swim-check`: she is put in the nearest water over 4 m deep (looked
 /// for in rings out to 600 m) and swims forward for 4 s walking, at her
 /// pace and sprinting, through the game's tick; logs her speed each time.
+/// `--sink-check`: the first car loaded (no boat, no helicopter; parked
+/// or, with nowhere to park by her, not) is put on water more than 6 m
+/// deep near her with her at the wheel, and held
+/// its `Buoyancy` delay (5 s without one) and 10 s more, its time under
+/// the water logged each second; then the first helicopter likewise
+/// (its delay 0), held 3 s, if one is loaded (else skipped, said so).
+/// Each passes when it has sunk and she is no
+/// longer in it while it stays whole (not wrecked), logging what she
+/// lost. The car passes only near Xenia's ([`SINK_XENIA`], within
+/// [`SINK_SLACK`]): put out 5.8 s after it went in, 100.4 lost, the car
+/// alive. One line `sink-check: PASS` or `FAIL ...` at the end.
+/// Xenia's car sinking with her at the wheel (`sinking.md`, run sink1:
+/// Mattias 120 of 120, the Phoenix): put out 5.8 s after it went in,
+/// 100.4 of her health lost.
+const SINK_XENIA: (f32, f32) = (5.8, 100.4);
+/// How near Xenia's the car's put-out must come: seconds, health.
+const SINK_SLACK: (f32, f32) = (0.6, 1.0);
+
+fn sink_check(game: &mut Game, tick: f32, jennifer: bool) {
+    use m2_math::glam::Vec3;
+    let mut fails: Vec<String> = Vec::new();
+    let mut passed: Vec<String> = Vec::new();
+    for (kind, heli, extra) in [("car", false, 10.0f32), ("helicopter", true, 3.0)] {
+        let Some(world) = game.scene.world.as_ref() else {
+            fails.push("no island".into());
+            break;
+        };
+        let here = game.focus();
+        // Any loaded vehicle of the kind, parked or not (with nowhere to
+        // park by her, the loaded ones wait unplaced): the check places
+        // it itself.
+        let pick = game
+            .scene
+            .vehicles
+            .iter()
+            .position(|v| !v.wrecked && !v.spec.is_boat() && v.spec.is_helicopter() == heli);
+        let Some(i) = pick else {
+            if heli {
+                eprintln!("sink-check: no helicopter model loaded here: its part is skipped");
+            } else {
+                fails.push(format!("no {kind} model loaded"));
+            }
+            continue;
+        };
+        let physics = &world.physics;
+        let ground = |x: f32, z: f32| {
+            let top = 600.0;
+            physics
+                .cast_ray(Vec3::new(x, top, z), Vec3::NEG_Y, 1200.0)
+                .map(|(d, _)| top - d)
+        };
+        let Some(at) = crate::game::deep_spot(here, ground, |x, z| physics.water_at(x, z), 6.0)
+        else {
+            fails.push(format!("no water 6 m deep within 600 m of {here:.0}"));
+            break;
+        };
+        let label = game.scene.vehicles[i].spec.label.clone();
+        let after = world.index.template_db.buoyancy_for(&label).sink_after;
+        eprintln!("sink-check: the {label} ({kind}) put in at {at:.1}, its delay {after} s");
+        // On the water, at rest, her at the wheel.
+        let world = game.scene.world.as_mut().expect("an island");
+        let v = &mut game.scene.vehicles[i];
+        if let Some(id) = v.id.take() {
+            world.physics.remove_vehicle(id);
+        }
+        v.id = Some(world.physics.add_vehicle(&v.spec, at + Vec3::Y * 0.5, 0.0));
+        if let Some(p) = game.scene.player.as_mut() {
+            p.driving = Some(i);
+            p.landed = true;
+        }
+        let ticks = ((after + extra) / tick) as u32;
+        let every = ((1.0 / tick) as u32).max(1);
+        let mut sunk_at = None;
+        // As Xenia's run (Mattias, 120 of 120): her whole health 120, so
+        // the loss isn't cut by a lower whole; with `--sink-jennifer` as
+        // Jennifer's (100 of 100), where the clamp stops it.
+        let whole = if jennifer { 100.0 } else { 120.0 };
+        game.combat.max_hp = whole;
+        game.combat.hp = whole;
+        // As the scripts have it in play (`Player.SetHealthClamp`: Xenia's
+        // Jennifer run was in a mission); this check runs no scripts.
+        if jennifer {
+            game.combat.health_clamp = true;
+        }
+        let mut lost = 0.0;
+        let mut left = whole;
+        // Her least health from going in to 2 s after she is out: her
+        // health comes back after (the q760 run read 1.42: 1 and 0.42 of
+        // it).
+        let mut least = whole;
+        let mut out_at = None;
+        for t in 0..ticks {
+            game.step(Intent::default(), tick);
+            if out_at.is_none_or(|o| t < o + (2.0 / tick) as u32) {
+                least = least.min(game.combat.hp);
+            }
+            if out_at.is_none()
+                && game
+                    .scene
+                    .player
+                    .as_ref()
+                    .is_some_and(|p| p.driving != Some(i))
+            {
+                out_at = Some(t);
+            }
+            if t % every == 0 {
+                eprintln!(
+                    "sink-check: {:.0} s: {:.1} s a quarter under, sunk {}",
+                    t as f32 * tick,
+                    game.in_water(i),
+                    game.sunk(i)
+                );
+            }
+            if game.sunk(i) && sunk_at.is_none() {
+                sunk_at = Some(t as f32 * tick);
+                lost = whole - game.combat.hp;
+                left = if jennifer { least } else { game.combat.hp };
+                eprintln!(
+                    "sink-check: {kind} put her out: {whole:.0} -> {left:.2} (clamp {})",
+                    game.combat.health_clamp
+                );
+            }
+        }
+        let out = game
+            .scene
+            .player
+            .as_ref()
+            .is_none_or(|p| p.driving != Some(i));
+        match sunk_at {
+            Some(s) if out && game.scene.vehicles[i].wrecked => fails.push(format!(
+                "{kind} sank at {s:.1} s but was wrecked (the 360's stays whole)"
+            )),
+            // Jennifer (Xenia: 100 -> 3.00): the clamp's floor, 3.
+            Some(s) if out && !heli && jennifer && (left - 3.0).abs() > 0.01 => {
+                fails.push(format!(
+                    "{kind} sank at {s:.1} s, she is out at {left:.2} health (Xenia's Jennifer 3.00)"
+                ))
+            }
+            Some(s) if out && !heli && !jennifer && (lost - SINK_XENIA.1).abs() > SINK_SLACK.1 => {
+                fails.push(format!(
+                    "{kind} sank at {s:.1} s, she is out but lost {lost:.1} (Xenia {})",
+                    SINK_XENIA.1
+                ))
+            }
+            Some(s) if out && !heli && (s - SINK_XENIA.0).abs() > SINK_SLACK.0 => fails.push(
+                format!("{kind} put her out at {s:.1} s (Xenia {} s)", SINK_XENIA.0),
+            ),
+            Some(s) if out => passed.push(format!(
+                "{kind} sank at {s:.1} s whole, she is out, {lost:.1} of her health lost"
+            )),
+            Some(s) => fails.push(format!("{kind} sank at {s:.1} s but she is still in it")),
+            None => fails.push(format!("{kind} did not sink in {:.0} s", after + extra)),
+        }
+    }
+    if fails.is_empty() {
+        eprintln!("sink-check: PASS {}", passed.join("; "));
+    } else {
+        eprintln!(
+            "sink-check: FAIL {} (passed: {})",
+            fails.join("; "),
+            passed.join("; ")
+        );
+    }
+}
+
+/// `--impact-check`: rounds fired straight down at the ground every 4 m
+/// over 200 m round her (and at the water where there is any), each
+/// struck as one of hers strikes the world ([`Combat::impact_probe`]):
+/// one line per surface word met, how many rounds struck it, and whether
+/// the particle table gave its effect (`by the table`) or the surface's
+/// own pick did (`by its own pick`); then the vehicles' crash cues the
+/// sound table gives for every pair of the scene's vehicles. For the
+/// impact tables (#684): grass, dirt and water are seldom struck in play.
+fn impact_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::Vec3;
+    use std::collections::BTreeMap;
+    let here = game.focus();
+    let Some(world) = game.scene.world.as_ref() else {
+        eprintln!("impact-check: FAIL no island");
+        return;
+    };
+    let physics = &world.physics;
+    let mut by: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+    for i in -50..=50 {
+        for k in -50..=50 {
+            let from = Vec3::new(
+                here.x + i as f32 * 4.0,
+                here.y + 300.0,
+                here.z + k as f32 * 4.0,
+            );
+            let Some((t, _)) = physics.cast_ray(from, Vec3::NEG_Y, 1200.0) else {
+                continue;
+            };
+            let (surface, by_table) = game.combat.impact_probe(physics, from, Vec3::NEG_Y, t);
+            let word = m2_engine::surface::word(surface)
+                .map_or_else(|| format!("{surface:08x}"), str::to_owned);
+            let e = by.entry(word).or_default();
+            e.0 += 1;
+            e.1 += u32::from(by_table);
+        }
+    }
+    for (word, (n, table)) in &by {
+        eprintln!(
+            "impact-check: {word}: {n} rounds, {table} by the table, {} by its own pick",
+            n - table
+        );
+    }
+    let db = &world.index.template_db;
+    let key = |v: &crate::scene::ParkedVehicle| {
+        crate::game::vehicle_sound_key(db, &v.spec.label, v.spec.model)
+    };
+    let (mut pairs, mut cued) = (0, 0);
+    let vehicles = &game.scene.vehicles;
+    for (a, va) in vehicles.iter().enumerate() {
+        for vb in &vehicles[a + 1..] {
+            pairs += 1;
+            if let (Some(ka), Some(kb), Some(t)) = (key(va), key(vb), db.sound_table.as_ref())
+                && t.either(ka, kb).is_some()
+            {
+                cued += 1;
+            }
+        }
+    }
+    eprintln!("impact-check: vehicle pairs {pairs}, {cued} with a crash cue");
+    eprintln!(
+        "impact-check: {} surface words met, {} decided by the table",
+        by.len(),
+        by.values().filter(|v| v.1 > 0).count()
+    );
+    car_into_car(game, tick);
+}
+
+/// `--impact-check`'s car-into-car hit: she takes the nearest land
+/// vehicle if she is at no wheel (waiting up to 30 s for the parked ones),
+/// then the car she drives is driven at
+/// 8 m/s into another vehicle (the first other one loaded, put 10 m ahead
+/// of it, still), 3 s. Logs `impact-check: car into car: the <a> into
+/// the <b>: N vehicle contacts heard` (the heard ones log their own
+/// `contact: the … met Vehicle(…)` lines).
+fn car_into_car(game: &mut Game, tick: f32) {
+    use m2_math::glam::{Vec2, Vec3};
+    // Not at a wheel (the recipe's default spawn, no `--spawn`): she takes
+    // the nearest land vehicle that stands, once the parked ones are in.
+    if game
+        .scene
+        .player
+        .as_ref()
+        .is_some_and(|p| p.driving.is_none())
+    {
+        for _ in 0..(30.0 / tick) as u32 {
+            if !game.scene.vehicles_loading() && game.parking_done() {
+                break;
+            }
+            game.step(crate::player::Intent::default(), tick);
+        }
+        let here = game.focus();
+        let pick = game.scene.world.as_ref().and_then(|world| {
+            (game.scene.vehicles.iter().enumerate())
+                .filter(|(_, v)| !v.wrecked && !v.spec.is_boat())
+                .filter_map(|(i, v)| {
+                    let at = world.physics.vehicle_transform(v.id?)?.w_axis.truncate();
+                    Some((i, at.distance(here)))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        });
+        if let (Some(i), Some(p)) = (pick, game.scene.player.as_mut()) {
+            p.driving = Some(i);
+            p.landed = true;
+            game.take_from_driver(i);
+            eprintln!(
+                "impact-check: car into car: she takes the {} (not at a wheel)",
+                game.scene.vehicles[i].spec.label
+            );
+        }
+    }
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("impact-check: car into car: FAIL she drives nothing (no land vehicle loaded)");
+        return;
+    };
+    let Some(j) = (0..game.scene.vehicles.len()).find(|&j| {
+        j != i && !game.scene.vehicles[j].wrecked && !game.scene.vehicles[j].spec.is_boat()
+    }) else {
+        eprintln!("impact-check: car into car: FAIL no other vehicle loaded");
+        return;
+    };
+    let (Some(world), Some(a)) = (game.scene.world.as_mut(), game.scene.vehicles[i].id) else {
+        return;
+    };
+    let Some(at) = world.physics.vehicle_transform(a) else {
+        return;
+    };
+    let ahead = at
+        .transform_vector3(Vec3::Z)
+        .with_y(0.0)
+        .normalize_or(Vec3::Z);
+    let yaw = ahead.x.atan2(ahead.z);
+    let spot = at.w_axis.truncate() + ahead * 10.0 + Vec3::Y * 0.5;
+    let v = &mut game.scene.vehicles[j];
+    if let Some(id) = v.id.take() {
+        world.physics.remove_vehicle(id);
+    }
+    v.id = Some(world.physics.add_vehicle(&v.spec, spot, yaw));
+    let before = game.combat.vehicle_contacts_heard;
+    for _ in 0..(3.0 / tick) as u32 {
+        let speed = game
+            .scene
+            .world
+            .as_ref()
+            .map_or(0.0, |w| w.physics.vehicle_speed(a));
+        let intent = crate::player::Intent {
+            movement: Vec2::new(0.0, if speed < 8.0 { 1.0 } else { 0.0 }),
+            ..crate::player::Intent::default()
+        };
+        game.step(intent, tick);
+    }
+    eprintln!(
+        "impact-check: car into car: the {} into the {}: {} vehicle contacts heard",
+        game.scene.vehicles[i].spec.label,
+        game.scene.vehicles[j].spec.label,
+        game.combat.vehicle_contacts_heard - before
+    );
+}
+
 fn swim_check(game: &mut Game, tick: f32) {
     use m2_math::glam::{Vec2, Vec3};
     let here = game.focus();
@@ -8576,6 +9831,158 @@ fn fuel_check(game: &mut Game, tick: f32) {
 
 /// Wrecks the vehicle she drives, as it goes, and logs how it comes to
 /// rest: how fast it went, how far it slid, and how much lower it sits.
+/// `--exit-land-check` (it turns on `--drive`): the car she drives is
+/// stopped, she gets out as the game gets her out ([`game::get_out`]) and
+/// is played on foot; logs each step's world loads pending and whether
+/// she has landed. `PASS` when she lands within 0.5 s, else `FAIL` with
+/// her landing state at 2 s (q728d, q673j: put out while the world still
+/// streamed, she hung where she got out).
+fn exit_land_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::Vec3;
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("exit-land-check: FAIL she drives nothing");
+        return;
+    };
+    let Some(id) = game.scene.vehicles[i].id else {
+        eprintln!("exit-land-check: FAIL her vehicle has no body");
+        return;
+    };
+    for _ in 0..(1.0 / tick) as u32 {
+        if let Some(w) = game.scene.world.as_mut() {
+            w.physics.set_vehicle_velocity(id, Vec3::ZERO);
+        }
+        game.step(Intent::default(), tick);
+    }
+    if let (Some(world), Some(p)) = (game.scene.world.as_ref(), game.scene.player.as_mut()) {
+        game::get_out(&world.physics, &game.scene.vehicles[i], None, p);
+    }
+    game.ride = None;
+    game.on_foot = true;
+    let mut landed_at = None;
+    let mut pending_max = 0;
+    for k in 0..(2.0 / tick) as u32 {
+        game.step(Intent::default(), tick);
+        let pending = game.scene.world.as_ref().map_or(0, |w| w.stats().pending);
+        pending_max = pending_max.max(pending);
+        if landed_at.is_none() && game.scene.player.as_ref().is_some_and(|p| p.landed) {
+            landed_at = Some(k as f32 * tick);
+        }
+    }
+    eprintln!(
+        "exit-land-check: landed {} s after getting out; the world's loads pending up to {pending_max}",
+        landed_at.map_or("never".to_owned(), |t| format!("{t:.2}"))
+    );
+    match landed_at {
+        Some(t) if t <= 0.5 => eprintln!("exit-land-check: PASS"),
+        _ => eprintln!(
+            "exit-land-check: FAIL {}",
+            game.scene
+                .player
+                .as_ref()
+                .map_or("no player".to_owned(), |p| p.landing_state())
+        ),
+    }
+}
+
+/// `--no-blast-check` (it turns on `--drive`): the `Mounted Chain
+/// Cannon`'s round (`Minigun Bullet`: no `Explosive` reached from it, so
+/// no area damage on the 360) is fired from 10 m at the soldier nearest
+/// her, and 1 s is watched. `PASS` when the soldier struck lost health,
+/// every other person within 6 m of him lost none and was not pushed
+/// (speed changed by under 0.5 m/s), and she lost none; else `FAIL` with
+/// why. Logs each bystander's distance, health and speed before and
+/// after.
+fn no_blast_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::Vec3;
+    let ammo = game
+        .scene
+        .arms()
+        .and_then(|a| a.named("Mounted Chain Cannon"))
+        .map(|w| w.ammo);
+    let Some(ammo) = ammo else {
+        eprintln!("no-blast-check: FAIL no Mounted Chain Cannon template");
+        return;
+    };
+    if ammo.burst().is_some() {
+        eprintln!(
+            "no-blast-check: FAIL its round has a blast ({:?})",
+            ammo.burst()
+        );
+        return;
+    }
+    let her = game.focus();
+    let people = &game.scene.people.npcs;
+    let Some(t) = (0..people.len())
+        .filter(|&j| people[j].alive)
+        .min_by(|&a, &b| {
+            people[a]
+                .chest()
+                .distance(her)
+                .total_cmp(&people[b].chest().distance(her))
+        })
+    else {
+        eprintln!("no-blast-check: FAIL no one about");
+        return;
+    };
+    let chest = people[t].chest();
+    let near: Vec<usize> = (0..people.len())
+        .filter(|&j| j != t && people[j].alive && people[j].chest().distance(chest) < 6.0)
+        .collect();
+    let before: Vec<(f32, f32)> = near
+        .iter()
+        .map(|&j| (people[j].hp, people[j].character.velocity.length()))
+        .collect();
+    let (target_hp, her_hp) = (people[t].hp, game.combat.hp);
+    // From 10 m off, level, from the side away from her.
+    let away = (chest - her).with_y(0.0).normalize_or(Vec3::X);
+    let from = chest + away * 10.0;
+    eprintln!(
+        "no-blast-check: Mounted Chain Cannon ({:.0} damage, key {:08x}) fired at a soldier {:.1} m from her, {} within 6 m of him",
+        ammo.damage,
+        ammo.key.unwrap_or(0),
+        chest.distance(her),
+        near.len()
+    );
+    game.combat.fire_round(from, chest, &ammo);
+    let mut most_push = 0.0f32;
+    for _ in 0..(1.0 / tick) as u32 {
+        game.step(Intent::default(), tick);
+        let people = &game.scene.people.npcs;
+        for (k, &j) in near.iter().enumerate() {
+            if let Some(n) = people.get(j) {
+                most_push = most_push.max((n.character.velocity.length() - before[k].1).abs());
+            }
+        }
+    }
+    let people = &game.scene.people.npcs;
+    let struck = people.get(t).map_or(0.0, |n| target_hp - n.hp);
+    let mut hurt = Vec::new();
+    for (k, &j) in near.iter().enumerate() {
+        let Some(n) = people.get(j) else { continue };
+        eprintln!(
+            "no-blast-check: bystander {j} {:.1} m off: health {:.1} -> {:.1}",
+            n.chest().distance(chest),
+            before[k].0,
+            n.hp
+        );
+        if n.hp < before[k].0 {
+            hurt.push(j);
+        }
+    }
+    let her_lost = her_hp - game.combat.hp;
+    eprintln!(
+        "no-blast-check: the soldier struck lost {struck:.1}; bystanders hurt {hurt:?}, most speed change {most_push:.2} m/s; she lost {her_lost:.1}"
+    );
+    if struck > 0.0 && hurt.is_empty() && most_push < 0.5 && her_lost <= 0.0 {
+        eprintln!("no-blast-check: PASS");
+    } else {
+        eprintln!(
+            "no-blast-check: FAIL struck {struck:.1}, bystanders hurt {}, pushed {most_push:.2} m/s, she lost {her_lost:.1}",
+            hurt.len()
+        );
+    }
+}
+
 fn wreck_at_speed(game: &mut Game, tick: f32) {
     let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
         return;
@@ -11124,6 +12531,10 @@ fn mission_sounds(audio: &mut sound::GameAudio, m: &mut mission::MissionLink) {
             audio.ui_sound(&cue);
         }
     }
+    for (guid, cue, stop, at) in m.take_object_sounds() {
+        audio.object_sound(guid, &cue, at, stop);
+    }
+    audio.follow_objects(|g| m.object_at(g));
     if let Some(cue) = m.take_music() {
         audio.music_cue_at(cue.as_deref(), m.music_at());
     }
@@ -11718,6 +13129,506 @@ mod tests {
 /// 20 m, the vehicle she is in driven off a 10 m ledge, and a parked boat
 /// (if one is near) left to settle on still water. Prints a line each and
 /// PASS or FAIL.
+/// The 360's bail-out at 18 m/s, as the Xenia capture of a car exit has
+/// it (knockdown-time.md, the per-frame read): no knockdown and no
+/// damage; put 0.5 m over the car's origin, she plays `Jump`
+/// (0x6FBE1165) for 0.44 s, then `JumpLandStationary` (0xC9592BE4) for
+/// 0.49 s, then stands.
+const DITCH_SPEED: f32 = 18.0;
+const DITCH_JUMP: (u32, f32) = (0x6fbe_1165, 0.44);
+const DITCH_LAND: (u32, f32) = (0xc959_2be4, 0.49);
+/// How far off Xenia's times an action may run, seconds (two frames at
+/// 30 fps, and the capture's own frame).
+const DITCH_SLACK: f32 = 0.1;
+
+/// `--ditch-check`: her car, on the ground where she got in, set going at
+/// [`DITCH_SPEED`] along its heading; the use key pressed as a player
+/// presses it (the game's own exit path); then 3 s on foot, logging each
+/// action she plays and for how long, her root's highest rise over where
+/// she stood, her health and any knockdown. Prints `ditch-check:` lines
+/// and PASS or FAIL against Xenia's [`DITCH_JUMP`] and [`DITCH_LAND`].
+fn ditch_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::Vec3;
+    let verdict = |ok: bool| if ok { "PASS" } else { "FAIL" };
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("ditch-check: FAIL not in a vehicle");
+        return;
+    };
+    let label = game.scene.vehicles[i].spec.label.clone();
+    let Some(world) = game.scene.world.as_mut() else {
+        eprintln!("ditch-check: FAIL no world");
+        return;
+    };
+    let Some(id) = game.scene.vehicles[i].id else {
+        eprintln!("ditch-check: FAIL the {label} has no body");
+        return;
+    };
+    let Some(at) = world.physics.vehicle_transform(id) else {
+        eprintln!("ditch-check: FAIL the {label} has no place");
+        return;
+    };
+    let ahead = at
+        .transform_vector3(Vec3::Z)
+        .with_y(0.0)
+        .normalize_or(Vec3::Z);
+    world.physics.set_vehicle_velocity(id, ahead * DITCH_SPEED);
+    let hp = game.combat.hp;
+    let mut input = input::Input::default();
+    input.button(input::Action::Use, true);
+    // From the tick she gets out on: the press, the release, then 3 s.
+    let mut actions: Vec<(u32, f32)> = Vec::new();
+    let mut rise = 0.0f32;
+    let mut knocked = false;
+    let mut base = None;
+    let mut sample = |game: &Game| {
+        let Some(p) = game.scene.player.as_ref() else {
+            return;
+        };
+        if p.driving.is_some() {
+            return;
+        }
+        let y0 = *base.get_or_insert(p.character.position.y);
+        knocked |= p.down || p.ragdoll.is_some();
+        rise = rise.max(p.character.position.y - y0);
+        let a = p
+            .model
+            .as_ref()
+            .and_then(|(_, r)| r.animator.action())
+            .unwrap_or(0);
+        match actions.last_mut() {
+            Some((last, d)) if *last == a => *d += tick,
+            _ => actions.push((a, tick)),
+        }
+    };
+    game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+    sample(game);
+    let mut input = input::Input::default();
+    input.button(input::Action::Use, false);
+    game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+    sample(game);
+    let on_foot = game
+        .scene
+        .player
+        .as_ref()
+        .is_some_and(|p| p.driving.is_none());
+    let mut t = 0.0;
+    while t < 3.0 {
+        game.step(Intent::default(), tick);
+        t += tick;
+        sample(game);
+    }
+    let line: Vec<String> = actions
+        .iter()
+        .map(|(a, d)| format!("{a:08x} {d:.2} s"))
+        .collect();
+    eprintln!(
+        "ditch-check: out of the {label} at {DITCH_SPEED} m/s: on foot {on_foot}; actions {}",
+        line.join(", ")
+    );
+    let find = |want: u32| actions.iter().position(|&(a, _)| a == want);
+    let (jump, land) = (find(DITCH_JUMP.0), find(DITCH_LAND.0));
+    let near =
+        |k: Option<usize>, want: f32| k.is_some_and(|k| (actions[k].1 - want).abs() <= DITCH_SLACK);
+    let ok_order = matches!((jump, land), (Some(j), Some(l)) if j < l);
+    let ok = on_foot && ok_order && near(jump, DITCH_JUMP.1) && near(land, DITCH_LAND.1);
+    eprintln!(
+        "ditch-check: Jump {:.2} s (Xenia {}), JumpLandStationary {:.2} s (Xenia {}), in that order: {}",
+        jump.map_or(0.0, |k| actions[k].1),
+        DITCH_JUMP.1,
+        land.map_or(0.0, |k| actions[k].1),
+        DITCH_LAND.1,
+        verdict(ok)
+    );
+    let ok2 = !knocked && game.combat.hp >= hp;
+    eprintln!(
+        "ditch-check: root rose {rise:.2} m over where she was put (Xenia 0.05 at 30 Hz), health {hp:.0} -> {:.0}, knocked down {knocked}: {}",
+        game.combat.hp,
+        verdict(ok2)
+    );
+    eprintln!("ditch-check: {}", verdict(ok && ok2));
+}
+
+/// `--runover-check`: she gets out of her vehicle, stands 7 m ahead of
+/// it, and it is driven straight at her for 3 s at 0, 4, 8 and 12 m/s,
+/// against the 360's proxy contact damage ([`m2_engine::run_over`]). The
+/// per-update `run over: contact:` lines (stderr) give the closing, the
+/// event size and the damage.
+///
+/// Pass: at 0 m/s she loses nothing (the 360: a driverless bike lying by
+/// her); at 8 m/s she loses health; at 12 m/s more than at 8. The 4 m/s
+/// push is printed, not gated: the 360's code gives nothing there for
+/// her standing still (closing under 6 m/s), while Xenia saw 2.1-2.6 a
+/// frame on slow pushes with her walking about the lane.
+fn runover_check(game: &mut Game, tick: f32) -> bool {
+    use m2_math::glam::Vec3;
+    let verdict = |ok: bool| if ok { "PASS" } else { "FAIL" };
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        println!("runover-check: FAIL not in a vehicle");
+        return false;
+    };
+    let label = game.scene.vehicles[i].spec.label.clone();
+    let mass = game.scene.vehicles[i].spec.mass;
+    let Some(id) = game.scene.vehicles[i].id else {
+        println!("runover-check: FAIL the {label} has no body");
+        return false;
+    };
+    let mut input = input::Input::default();
+    input.button(input::Action::Use, true);
+    game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+    let mut input = input::Input::default();
+    input.button(input::Action::Use, false);
+    game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+    let mut t = 0.0;
+    while t < 2.0 {
+        game.step(Intent::default(), tick);
+        t += tick;
+    }
+    if game
+        .scene
+        .player
+        .as_ref()
+        .is_none_or(|p| p.driving.is_some())
+    {
+        println!("runover-check: FAIL she did not get out of the {label}");
+        return false;
+    }
+    let Some(start) = game
+        .scene
+        .world
+        .as_ref()
+        .and_then(|w| w.physics.vehicle_transform(id))
+    else {
+        println!("runover-check: FAIL the {label} has no place");
+        return false;
+    };
+    let (_, facing, home) = start.to_scale_rotation_translation();
+    let ahead = start
+        .transform_vector3(Vec3::Z)
+        .with_y(0.0)
+        .normalize_or(Vec3::Z);
+    let mut lost = Vec::new();
+    for speed in [0.0f32, 4.0, 8.0, 12.0] {
+        // Each run from where she parked it, her 7 m ahead.
+        if let Some(w) = game.scene.world.as_mut() {
+            w.physics.place_vehicle(id, home + Vec3::Y * 0.2, facing);
+        }
+        let spot = home + ahead * 7.0;
+        let ground = game
+            .scene
+            .world
+            .as_ref()
+            .and_then(|w| w.physics.cast_ray(spot + Vec3::Y * 3.0, -Vec3::Y, 10.0))
+            .map_or(spot.y, |(d, _)| spot.y + 3.0 - d);
+        game.combat.hp = 100.0;
+        game.combat.down = 0.0;
+        let before = game.combat.run_overs;
+        if let Some(p) = game.scene.player.as_mut() {
+            p.character.position = Vec3::new(spot.x, ground, spot.z);
+            p.character.velocity = Vec3::ZERO;
+        }
+        let mut t = 0.0;
+        while t < 3.0 {
+            if let Some(w) = game.scene.world.as_mut() {
+                let v = w.physics.vehicle_velocity(id);
+                w.physics
+                    .set_vehicle_velocity(id, ahead * speed + Vec3::Y * v.y.min(0.0));
+            }
+            game.step(Intent::default(), tick);
+            // Kept alive (her health back to full each update) so every
+            // contact update is counted: a heavy vehicle would kill her
+            // and the dead take no more (each update's damage is logged).
+            game.combat.hp = game.combat.max_hp;
+            t += tick;
+        }
+        let hits = game.combat.run_overs.0 - before.0;
+        let health = game.combat.run_overs.1 - before.1; // kept alive: the damage done
+        println!(
+            "runover-check: the {label} ({mass:.0} kg) at {speed:.0} m/s into her standing:              {hits} damaging contact updates, {health:.1} health lost"
+        );
+        lost.push(health);
+    }
+    let still = lost[0] == 0.0;
+    let fast = lost[2] > 0.0;
+    let faster = lost[3] > lost[2];
+    println!("runover-check: at rest it does nothing: {}", verdict(still));
+    println!("runover-check: at 8 m/s it hurts her: {}", verdict(fast));
+    println!(
+        "runover-check: at 12 m/s more than at 8: {}",
+        verdict(faster)
+    );
+    println!(
+        "runover-check: slow push at 4 m/s: {:.1} lost (360 code: none for her standing;          Xenia: 2.1-2.6 a frame with her walking): not gated",
+        lost[1]
+    );
+    let ok = still && fast && faster;
+    println!("runover-check: {}", verdict(ok));
+    ok
+}
+
+/// `--toss-check crash|exit`, against the 360's toss (0x822A2B60,
+/// 0x8218A138) and Xenia's runs (knockdown-time.md).
+///
+/// - `crash`: a wall stood 15 m ahead of her vehicle, which is set going
+///   at 20 m/s into it. On a seat with a `TossSpeedChange` (a bike: the
+///   Chopper's 15) she is thrown off on the update it lurches past it,
+///   knocked down, and up again within 4 s, losing no health (Xenia:
+///   |dv| 18.34 and 21.08 m/s, limp 1.70 and 2.44 s, get-up 0.95 s,
+///   health 100 -> 100). On a seat without one (a car) she stays in
+///   (Xenia: a Phoenix at |dv| 28.58 m/s).
+/// - `exit`: her vehicle at a steady 17.5 m/s and the use key pressed:
+///   a ditch, not a toss, and no knockdown (Xenia: the Chopper at 17.5).
+///
+/// Prints `toss-check:` lines and PASS or FAIL.
+fn toss_check(game: &mut Game, tick: f32, mode: &str) {
+    use m2_engine::{CollisionShape, StaticKey};
+    use m2_math::glam::{Quat, Vec3};
+    let verdict = |ok: bool| if ok { "PASS" } else { "FAIL" };
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        println!("toss-check: FAIL not in a vehicle");
+        return;
+    };
+    let label = game.scene.vehicles[i].spec.label.clone();
+    let toss = game.scene.vehicles[i]
+        .spec
+        .seating
+        .as_deref()
+        .and_then(|s| s.driver().map(|d| s.seats[d].toss_speed))
+        .unwrap_or(-1.0);
+    let Some(id) = game.scene.vehicles[i].id else {
+        println!("toss-check: FAIL the {label} has no body");
+        return;
+    };
+    let Some(world) = game.scene.world.as_mut() else {
+        println!("toss-check: FAIL no world");
+        return;
+    };
+    let Some(at) = world.physics.vehicle_transform(id) else {
+        println!("toss-check: FAIL the {label} has no place");
+        return;
+    };
+    let ahead = at
+        .transform_vector3(Vec3::Z)
+        .with_y(0.0)
+        .normalize_or(Vec3::Z);
+    let origin = at.transform_point3(Vec3::ZERO);
+    let hp = game.combat.hp;
+    let has_toss = toss > 0.0;
+    match mode {
+        "crash" => {
+            let wall = CollisionShape::cuboid(Vec3::new(15.0, 4.0, 1.0));
+            let facing = Quat::from_rotation_y(ahead.x.atan2(ahead.z));
+            world.physics.add_static(
+                StaticKey::Cell(0xffff_fff0),
+                &wall,
+                origin + ahead * 16.0 + Vec3::Y * 3.0,
+                facing,
+            );
+            world.physics.set_vehicle_velocity(id, ahead * 20.0);
+            let (mut thrown, mut knocked, mut up, mut most) = (None, None, None, 0.0f32);
+            // After the toss: her body's (its root's) height over the bike
+            // and gap to it, against Xenia's (knockdown-time.md): thrown
+            // 2.6-2.8 m over the bike, out to about 4.8 m at +1.0 s, the
+            // gap never back under about 3 m while limp.
+            let (mut top, mut far, mut far_at, mut near_after) =
+                (f32::MIN, 0.0f32, 0.0f32, f32::MAX);
+            let mut trace: Vec<String> = Vec::new();
+            let mut last_root: Option<Vec3> = None;
+            let mut t = 0.0;
+            while t < 20.0 && up.is_none() {
+                // The run-up: held at 20 m/s along her heading each update
+                // until its middle is 13 m along (the bike's drag would bleed
+                // it off in the 16 m), then let go the last 2 m to the wall's
+                // face so the crash's drop counts as the jolt; the toss is
+                // the head-on crash.
+                if thrown.is_none()
+                    && let Some(w) = game.scene.world.as_mut()
+                {
+                    let along = w.physics.vehicle_transform(id).map_or(0.0, |m| {
+                        (m.transform_point3(Vec3::ZERO) - origin).dot(ahead)
+                    });
+                    if along < 13.0 {
+                        let v = w.physics.vehicle_velocity(id);
+                        w.physics
+                            .hold_vehicle_velocity(id, ahead * 20.0 + Vec3::Y * v.y);
+                    }
+                }
+                if let Some(w) = game.scene.world.as_ref() {
+                    most = most.max(w.physics.vehicle_jolt(id));
+                    if thrown.is_none() && ((t * 4.0f32).round() - t * 4.0).abs() < tick * 2.0 {
+                        let p = w
+                            .physics
+                            .vehicle_transform(id)
+                            .map_or(Vec3::ZERO, |m| m.transform_point3(Vec3::ZERO));
+                        println!(
+                            "toss-check: before: {t:.2} s: the {label} {:.2} m along, {:.2} m/s, held {}, wall at 16",
+                            (p - origin).dot(ahead),
+                            w.physics.vehicle_velocity(id).length(),
+                            w.physics.vehicle_held(id)
+                        );
+                    }
+                }
+                game.step(
+                    Intent {
+                        movement: m2_math::glam::Vec2::new(0.0, 1.0),
+                        ..Intent::default()
+                    },
+                    tick,
+                );
+                t += tick;
+                let out = game
+                    .scene
+                    .player
+                    .as_ref()
+                    .is_some_and(|p| p.driving.is_none());
+                if out && thrown.is_none() {
+                    thrown = Some(t);
+                }
+                if game.combat.knocked.is_some() && knocked.is_none() {
+                    knocked = Some(t);
+                }
+                if knocked.is_some() && game.combat.knocked.is_none() && up.is_none() {
+                    up = Some(t);
+                }
+                if let (Some(t0), Some(w), Some(p)) = (
+                    thrown,
+                    game.scene.world.as_ref(),
+                    game.scene.player.as_ref(),
+                ) {
+                    let her = p
+                        .ragdoll
+                        .and_then(|r| w.physics.ragdoll_nodes(r))
+                        .and_then(|n| n.first().map(|m| m.w_axis.truncate()))
+                        .unwrap_or(p.character.position);
+                    let speed = p
+                        .ragdoll
+                        .and_then(|r| w.physics.ragdoll_speed(r))
+                        .unwrap_or(0.0);
+                    if let Some(bike) = w.physics.vehicle_transform(id) {
+                        let b = bike.transform_point3(Vec3::ZERO);
+                        let gap = (her - b).with_y(0.0).length();
+                        let dt = t - t0;
+                        top = top.max(her.y - b.y);
+                        if gap > far {
+                            far = gap;
+                            far_at = dt;
+                        }
+                        if dt > 1.0 && knocked.is_some() && up.is_none() {
+                            near_after = near_after.min(gap);
+                        }
+                        if trace.len() < 400 && ((dt * 10.0).round() - dt * 10.0).abs() < tick * 5.0
+                        {
+                            let limbs = p
+                                .ragdoll
+                                .map(|r| w.physics.ragdoll_limb_speeds(r))
+                                .unwrap_or_default();
+                            let moved_from = last_root.replace(her);
+                            let moving: Vec<String> = limbs
+                                .iter()
+                                .filter(|l| l.1 >= 0.2)
+                                .map(|l| format!("{}:{:.2}{}", l.0, l.1, l.2))
+                                .collect();
+                            trace.push(format!(
+                                "toss-check: +{dt:.1} s: her root {:.2} m over the bike, gap {gap:.2} m, body speed {speed:.2} m/s, root moved {:.2} m in 0.1 s; limbs over 0.2 m/s (index:speed, touching v vehicle s itself g ground); bike {:.2} m/s [{}] of {}",
+                                her.y - b.y,
+                                moved_from.map_or(0.0, |q: Vec3| q.distance(her)),
+                                w.physics.vehicle_velocity(id).length(),
+                                moving.join(" "),
+                                limbs.len()
+                            ));
+                        }
+                    }
+                }
+            }
+            println!(
+                "toss-check: the {label} (TossSpeedChange {toss}) into a wall at 20 m/s: \
+                 most |dv| in an update {most:.1} m/s; thrown at {thrown:?} s, knocked down at \
+                 {knocked:?} s, up at {up:?} s; health {hp:.0} -> {:.0}",
+                game.combat.hp
+            );
+            for l in &trace {
+                println!("{l}");
+            }
+            if thrown.is_some() {
+                println!(
+                    "toss-check: after the toss: highest {top:.2} m over the bike (Xenia 2.6-2.8), \
+                     farthest {far:.2} m at +{far_at:.1} s (Xenia ~4.8 m at +1.0 s), nearest while \
+                     limp after +1 s {near_after:.2} m (Xenia no closer than ~3 m)"
+                );
+            }
+            // The throw, against Xenia's (knockdown-time.md): at least 2 m
+            // over the bike, out at least 3.5 m, no nearer than 2.5 m while
+            // limp after +1 s.
+            // The launch, from the code (0x82428658): out min(L, 15), up
+            // 0.4 of it. The run-out against a flat wall is for the record.
+            let last = game.scene.player.as_ref().and_then(|p| p.last_toss);
+            let thrown_far = last.is_some_and(|(carried, launch)| {
+                let level = carried.with_y(0.0).length();
+                let out = launch.with_y(0.0).length();
+                println!(
+                    "toss-check: launch: level {level:.2} m/s before the jolt -> out {out:.2} m/s, up {:.2} m/s",
+                    launch.y
+                );
+                (out - level.min(15.0)).abs() < 0.05 && (launch.y - 0.4 * out).abs() < 0.05
+            });
+            if has_toss {
+                println!(
+                    "toss-check: the launch (out min(L, 15), up 0.4 of it; 0x82428658): {}",
+                    verdict(thrown_far)
+                );
+            }
+            let ok = if has_toss {
+                thrown.is_some()
+                    && knocked.is_some()
+                    && thrown_far
+                    && up.zip(knocked).is_some_and(|(u, k)| u - k < 4.0)
+                    && game.combat.hp >= hp
+            } else {
+                thrown.is_none() && knocked.is_none()
+            };
+            println!(
+                "toss-check: {}: {}",
+                if has_toss {
+                    "thrown off, knocked down and up again within 4 s, no health lost"
+                } else {
+                    "no TossSpeedChange: she stays in"
+                },
+                verdict(ok)
+            );
+            println!("toss-check: {}", verdict(ok));
+        }
+        "exit" => {
+            world.physics.set_vehicle_velocity(id, ahead * 17.5);
+            let mut input = input::Input::default();
+            input.button(input::Action::Use, true);
+            game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+            let mut input = input::Input::default();
+            input.button(input::Action::Use, false);
+            game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+            let out = game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.driving.is_none());
+            let mut knocked = false;
+            let mut t = 0.0;
+            while t < 3.0 {
+                game.step(Intent::default(), tick);
+                t += tick;
+                knocked |= game.combat.knocked.is_some();
+            }
+            let ok = out && !knocked && game.combat.hp >= hp;
+            println!(
+                "toss-check: out of the {label} (TossSpeedChange {toss}) at a steady 17.5 m/s: \
+                 out {out}, knocked down {knocked}, health {hp:.0} -> {:.0}: {}",
+                game.combat.hp,
+                verdict(ok)
+            );
+            println!("toss-check: {}", verdict(ok));
+        }
+        _ => println!("toss-check: FAIL unknown mode {mode:?} (crash or exit)"),
+    }
+}
+
 fn gravity_check(game: &Game) {
     use m2_engine::physics::{WORLD_GRAVITY, float_depth};
     use m2_engine::{CollisionShape, Physics, StaticKey, VehicleControls};
@@ -11881,4 +13792,591 @@ mod gravity_check_tests {
         let want = (2.0 * 20.0 / m2_engine::physics::WORLD_GRAVITY).sqrt();
         assert!((t - want).abs() < 0.05, "{t} vs {want}");
     }
+}
+
+/// `--prop-bodies-check` (it turns on `--drive`, with props that come
+/// loose whole as bodies of their own from the start: gap P7): 10 s at
+/// rest where she spawns (a town: `--spawn`), then the car she drives is
+/// put 12 m short of the nearest such prop, facing it, and driven at it
+/// for 4 s. Logs how many props are bodies, how many of their bodies are
+/// awake after the rest, the physics step's median and worst
+/// milliseconds, and how far the prop moved and how fast the car went
+/// on. `prop-bodies-check: PASS` when there are some, none is awake at
+/// rest and the car moved the prop, else `FAIL`. The world is drawn as
+/// it goes (props stream in only so), and if she is at no wheel (the
+/// check runs before `--drive` seats her) she takes the nearest land
+/// vehicle standing, logged.
+fn prop_bodies_check(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    tick: f32,
+) -> anyhow::Result<()> {
+    use m2_math::glam::{Vec2, Vec3};
+    let mut ms = Vec::new();
+    for _ in 0..(10.0 / tick) as u32 {
+        game.step(Intent::default(), tick);
+        render(backend, game, fov, aspect, None)?;
+        if let Some(w) = game.scene.world.as_ref() {
+            ms.push(w.physics.last_step_ms);
+        }
+    }
+    if game
+        .scene
+        .player
+        .as_ref()
+        .is_some_and(|p| p.driving.is_none())
+    {
+        let here = game.focus();
+        let pick = game.scene.world.as_ref().and_then(|world| {
+            (game.scene.vehicles.iter().enumerate())
+                .filter(|(_, v)| !v.wrecked && !v.spec.is_boat())
+                .filter_map(|(i, v)| {
+                    let at = world.physics.vehicle_transform(v.id?)?.w_axis.truncate();
+                    Some((i, at.distance(here)))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        });
+        if let (Some(i), Some(p)) = (pick, game.scene.player.as_mut()) {
+            p.driving = Some(i);
+            p.landed = true;
+            game.take_from_driver(i);
+            eprintln!(
+                "prop-bodies-check: she takes the {} (not at a wheel)",
+                game.scene.vehicles[i].spec.label
+            );
+        }
+    }
+    // The slowest steps of the watch, and when (q740e: one of 149 ms
+    // against a median of 3).
+    let mut slowest: Vec<(usize, f32)> = ms.iter().copied().enumerate().collect();
+    slowest.sort_by(|a, b| b.1.total_cmp(&a.1));
+    eprintln!(
+        "prop-bodies-check: slowest physics steps of the watch: {}",
+        slowest
+            .iter()
+            .take(3)
+            .map(|&(k, t)| format!("{t:.1} ms at step {k} ({:.2} s in)", k as f32 * tick))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    ms.sort_by(f32::total_cmp);
+    let Some(world) = game.scene.world.as_ref() else {
+        eprintln!("prop-bodies-check: FAIL no island");
+        return Ok(());
+    };
+    let physics = &world.physics;
+    // A state layer's props and the island's placed objects alike (the
+    // latter by object index, marked with the top bit).
+    let mut bodies: Vec<(u32, Vec<m2_engine::DebrisId>)> = game
+        .scene
+        .props
+        .as_bodies()
+        .map(|(e, ids)| (e, ids.to_vec()))
+        .collect();
+    let props_bodies = bodies.len();
+    bodies.extend(
+        world
+            .as_bodies()
+            .map(|(i, ids)| (i as u32 | 0x8000_0000, ids.to_vec())),
+    );
+    let pieces: usize = bodies.iter().map(|b| b.1.len()).sum();
+    eprintln!(
+        "prop-bodies-check: at {:.0}: {} props shown, {props_bodies} of them bodies; {} placed \
+         objects bodies",
+        game.focus(),
+        game.scene.props.shown().count(),
+        bodies.len() - props_bodies
+    );
+    let awake = physics.debris_awake();
+    // Which (q753d: 4 awake at rest): whose, where, how fast, how far from
+    // her.
+    for (id, at, speed) in physics.debris_awake_list().into_iter().take(10) {
+        let whose = bodies
+            .iter()
+            .find(|(_, ids)| ids.contains(&id))
+            .map_or("none of the bodies".to_owned(), |(e, _)| format!("{e:#x}"));
+        eprintln!(
+            "prop-bodies-check: awake at rest: piece {id:?} of {whose} at {at:.1}, {speed:.2} m/s, {:.1} m from her",
+            at.distance(game.focus())
+        );
+    }
+    let (median, worst) = (
+        ms.get(ms.len() / 2).copied().unwrap_or(0.0),
+        ms.last().copied().unwrap_or(0.0),
+    );
+    eprintln!(
+        "prop-bodies-check: {} props are bodies ({pieces} bodies); after 10 s at rest {awake} \
+         awake; physics step median {median:.2} ms, worst {worst:.2} ms",
+        bodies.len()
+    );
+    // The car at the nearest one.
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("prop-bodies-check: FAIL she drives nothing");
+        return Ok(());
+    };
+    let Some(car) = game.scene.vehicles[i].id else {
+        eprintln!("prop-bodies-check: FAIL her vehicle has no body");
+        return Ok(());
+    };
+    let here = physics
+        .vehicle_transform(car)
+        .map_or(Vec3::ZERO, |m| m.w_axis.truncate());
+    // The nearest with a clear run at it: 12 m of open ground short of it
+    // (the q740c run put the car among a town's walls and it never moved),
+    // from any of eight sides.
+    let mut near: Vec<(u32, m2_engine::DebrisId, Vec3)> = bodies
+        .iter()
+        .filter_map(|(e, ids)| Some((*e, *ids.first()?)))
+        .filter_map(|(e, id)| Some((e, id, physics.debris_place(id)?.w_axis.truncate())))
+        .collect();
+    near.sort_by(|a, b| a.2.distance(here).total_cmp(&b.2.distance(here)));
+    let ground = |x: f32, z: f32, from: f32| {
+        physics
+            .cast_ray(Vec3::new(x, from + 20.0, z), Vec3::NEG_Y, 60.0)
+            .map(|(d, _)| from + 20.0 - d)
+    };
+    let run = near.iter().take(60).find_map(|&(e, id, at)| {
+        (0..8).find_map(|k| {
+            let a = k as f32 * std::f32::consts::FRAC_PI_4;
+            let way = Vec3::new(a.sin(), 0.0, a.cos());
+            let start = at - way * 12.0;
+            let floor = ground(start.x, start.z, at.y)?;
+            // Level enough, and nothing in the way at bonnet height until
+            // the prop itself.
+            if (floor - at.y).abs() > 1.5 {
+                return None;
+            }
+            let from = Vec3::new(start.x, floor + 0.8, start.z);
+            let to = Vec3::new(at.x, floor + 0.8, at.z);
+            let gap = physics
+                .cast_ray(from, (to - from).normalize_or(way), 14.0)
+                .map_or(f32::MAX, |(d, _)| d);
+            // And the lane itself free of any placed object or building,
+            // from where the car stands to 2 m short of the prop: a ray
+            // from inside a wall doesn't see it (q740d: the car was put
+            // inside a building's member and held at full throttle).
+            let lane = (0..=10).all(|k| {
+                let c = Vec3::new(start.x, floor, start.z) + way * (k as f32);
+                physics.box_clear(
+                    c + Vec3::new(-1.3, 0.4, -1.3),
+                    c + Vec3::new(1.3, 1.8, 1.3),
+                    |key| !matches!(key, m2_engine::StaticKey::Cell(_)),
+                )
+            });
+            (gap >= 10.5 && lane).then_some((e, id, at, way, Vec3::new(start.x, floor, start.z)))
+        })
+    });
+    let Some((e, id, at, way, start)) = run else {
+        eprintln!(
+            "prop-bodies-check: FAIL no body here has 12 m of open ground before it ({} looked at)",
+            near.len().min(60)
+        );
+        return Ok(());
+    };
+    eprintln!("prop-bodies-check: the car is put at {start:.1}, 12 m short of {e:#x} at {at:.1}");
+    let yaw = way.x.atan2(way.z);
+    if let Some(world) = game.scene.world.as_mut() {
+        let v = &mut game.scene.vehicles[i];
+        if let Some(old) = v.id.take() {
+            world.physics.remove_vehicle(old);
+        }
+        v.id = Some(
+            world
+                .physics
+                .add_vehicle(&v.spec, start + Vec3::Y * 0.5, yaw),
+        );
+    }
+    let Some(car) = game.scene.vehicles[i].id else {
+        return Ok(());
+    };
+    let ticks = (4.0 / tick) as u32;
+    let each = (1.0 / tick).round().max(1.0) as u32;
+    for k in 0..ticks {
+        let speed = game
+            .scene
+            .world
+            .as_ref()
+            .map_or(0.0, |w| w.physics.vehicle_speed(car));
+        let throttle = if speed < 12.0 { 1.0 } else { 0.0 };
+        let intent = Intent {
+            movement: Vec2::new(0.0, throttle),
+            ..Intent::default()
+        };
+        // Each quarter second: where it is and what its body touches
+        // (q740f: 4.3 then 1.5 m/s, stopped short of the prop, which the
+        // a18f368d run from the same spot reached).
+        if k % (each / 4).max(1) == 0
+            && let Some(w) = game.scene.world.as_ref()
+        {
+            let at = w
+                .physics
+                .vehicle_transform(car)
+                .map_or(Vec3::ZERO, |m| m.w_axis.truncate());
+            let touching: Vec<String> = w
+                .physics
+                .vehicle_touching(car)
+                .into_iter()
+                .map(|(key, point, _)| format!("{key:?} at {point:.2}"))
+                .collect();
+            eprintln!(
+                "prop-bodies-check: t {:.2} s: the car at {at:.2}, {:.1} m/s, touching [{}]",
+                k as f32 * tick,
+                w.physics.vehicle_speed(car),
+                touching.join("; ")
+            );
+        }
+        // Each second: the throttle asked, and how fast it goes.
+        if k % each == 0 {
+            eprintln!(
+                "prop-bodies-check: t {:.0} s: throttle {throttle:.1}, {speed:.1} m/s, driving {:?}",
+                k as f32 * tick,
+                game.scene.player.as_ref().and_then(|p| p.driving)
+            );
+        }
+        game.step(intent, tick);
+        render(backend, game, fov, aspect, None)?;
+    }
+    let Some(world) = game.scene.world.as_ref() else {
+        return Ok(());
+    };
+    let moved = world
+        .physics
+        .debris_place(id)
+        .map_or(0.0, |m| m.w_axis.truncate().distance(at));
+    let speed = world.physics.vehicle_speed(car);
+    eprintln!(
+        "prop-bodies-check: the {} driven at prop {e:#x}: the prop moved {moved:.1} m, the car \
+         at {speed:.1} m/s after",
+        game.scene.vehicles[i].spec.label
+    );
+    let (met, broke) = game.destruction.bodies_met;
+    eprintln!(
+        "prop-bodies-check: the crash rules took {met} meetings of vehicles and prop bodies, {broke} broke"
+    );
+    if !bodies.is_empty() && awake == 0 && moved > 0.5 && met > 0 {
+        eprintln!("prop-bodies-check: PASS");
+    } else {
+        eprintln!(
+            "prop-bodies-check: FAIL {} props as bodies, {awake} awake at rest, the prop moved \
+             {moved:.1} m",
+            bodies.len()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod disguise_check_tests {
+    /// The `--disguise-check` cases pass on the game's own code.
+    #[test]
+    fn the_disguise_check_passes() {
+        assert!(super::disguise_check());
+    }
+}
+
+/// `--prop-limits-check` (it turns on `--drive`; a town: `--spawn`): 5 s
+/// at rest, then a blast every half second for 20 s, each 8 m from the
+/// last round her in rings 15 to 60 m out, throwing what loose props are
+/// there (the disposer takes each, [`m2_engine::disposer`]). Logs how many
+/// the blasts threw, the most the disposer held at once and how many it
+/// took away, and the physics step's median and worst milliseconds. Then
+/// the car she drives is put 12 m short of the nearest piece still lying
+/// knocked loose, facing it, and driven at it for 4 s (hulls meet loose
+/// pieces now): how far the piece moved. `prop-limits-check: PASS` when
+/// over 40 were thrown, the disposer never held over 40, it took away at
+/// least one, and the car moved the piece over half a metre; else `FAIL`.
+fn prop_limits_check(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    tick: f32,
+) -> anyhow::Result<()> {
+    use m2_math::glam::{Vec2, Vec3};
+    let mut ms = Vec::new();
+    let mut step = |game: &mut Game, intent: Intent, ms: &mut Vec<f32>| -> anyhow::Result<()> {
+        game.step(intent, tick);
+        render(backend, game, fov, aspect, None)?;
+        if let Some(w) = game.scene.world.as_ref() {
+            ms.push(w.physics.last_step_ms);
+        }
+        Ok(())
+    };
+    for _ in 0..(5.0 / tick) as u32 {
+        step(game, Intent::default(), &mut ms)?;
+    }
+    ms.clear();
+    // At no wheel (the check runs before `--drive` seats her): she takes
+    // the nearest land vehicle standing, for the drive at the end.
+    if game
+        .scene
+        .player
+        .as_ref()
+        .is_some_and(|p| p.driving.is_none())
+    {
+        let here = game.focus();
+        let pick = game.scene.world.as_ref().and_then(|world| {
+            (game.scene.vehicles.iter().enumerate())
+                .filter(|(_, v)| !v.wrecked && !v.spec.is_boat())
+                .filter_map(|(i, v)| {
+                    let at = world.physics.vehicle_transform(v.id?)?.w_axis.truncate();
+                    Some((i, at.distance(here)))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        });
+        if let (Some(i), Some(p)) = (pick, game.scene.player.as_mut()) {
+            p.driving = Some(i);
+            p.landed = true;
+            game.take_from_driver(i);
+            eprintln!(
+                "prop-limits-check: she takes the {} (not at a wheel)",
+                game.scene.vehicles[i].spec.label
+            );
+        }
+    }
+    let centre = game.focus();
+    // `fx_Explosion_Large`'s blast and its `PhysicalLink`'d frag
+    // (`Explosion (RPG Frag)`), 7 m and 15 m, as the template database
+    // has them, both at the blast's point.
+    let blasts: Vec<(Vec3, m2_engine::weapons::Blast)> = game
+        .scene
+        .world
+        .as_ref()
+        .map(|w| {
+            let db = &w.index.template_db;
+            [0x8000_5695u32, 0x8000_a27b]
+                .into_iter()
+                .filter_map(|t| {
+                    let e = db.explosions.get(&t)?;
+                    Some((
+                        Vec3::ZERO,
+                        m2_engine::weapons::Blast {
+                            template: t,
+                            radius: e.radius,
+                            damage: e.damage,
+                            min_damage: e.least,
+                            max_force: e.force,
+                            key: (e.kind != 0).then_some(e.kind),
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    eprintln!(
+        "prop-limits-check: each blast is {:08x?}",
+        blasts.iter().map(|(_, b)| b.template).collect::<Vec<_>>()
+    );
+    let (mut most, mut disposed) = (0, 0);
+    let every = (0.5 / tick).round().max(1.0) as u32;
+    // Where the blasts go: at the bodies of their own nearest her (the
+    // island's placed objects that came loose whole), so each throws
+    // some (q744e: blasts on rings 15 to 60 m out threw 16 in all, short
+    // of the pool's 40); the rings where there are too few.
+    let targets: Vec<Vec3> = game.scene.world.as_ref().map_or(Vec::new(), |w| {
+        let mut at: Vec<Vec3> = w
+            .as_bodies()
+            .filter_map(|(_, ids)| Some(w.physics.debris_place(*ids.first()?)?.w_axis.truncate()))
+            .collect();
+        at.sort_by(|a, b| a.distance(centre).total_cmp(&b.distance(centre)));
+        // One blast for each spread of bodies: none closer than 6 m to the
+        // last chosen.
+        let mut picked: Vec<Vec3> = Vec::new();
+        // The nearest, whatever the distance (q744f: none within 120 m of
+        // her), at most the 40 blasts' worth.
+        for p in at {
+            if picked.len() < 40 && picked.iter().all(|q| q.distance(p) > 6.0) {
+                picked.push(p);
+            }
+        }
+        picked
+    });
+    eprintln!(
+        "prop-limits-check: {} blast points at bodies near her",
+        targets.len()
+    );
+    for i in 0..(20.0 / tick) as u32 {
+        if i % every == 0 {
+            // Rings 15, 30, 45 and 60 m out, 8 m between blasts.
+            let n = i / every;
+            let ring = 15.0 * (1 + n % 4) as f32;
+            let turn = n as f32 * 8.0 / ring;
+            let at = targets
+                .get(n as usize)
+                .copied()
+                .unwrap_or(centre + Vec3::new(turn.cos(), 0.0, turn.sin()) * ring);
+            let ground = game.scene.world.as_ref().and_then(|w| {
+                let top = at + Vec3::Y * 200.0;
+                w.physics
+                    .cast_ray(top, Vec3::NEG_Y, 400.0)
+                    .map(|(t, _)| top - Vec3::Y * t)
+            });
+            // A car's death blasts, as the game has them (q744d: the
+            // alpha's old blast, `None`, pushes nothing, so what it
+            // knocked loose lay where it stood and the disposer dropped
+            // it unseen, and it never reached the island's bodies).
+            let at = ground.unwrap_or(at);
+            if blasts.is_empty() {
+                game.combat.set_off(at, None);
+            }
+            for &(offset, b) in &blasts {
+                game.combat.set_off(at + offset, Some(b));
+            }
+        }
+        step(game, Intent::default(), &mut ms)?;
+        most = most.max(game.scene.props.disposer_held());
+        disposed += game.scene.props.take_disposed().len();
+    }
+    ms.sort_by(f32::total_cmp);
+    let thrown = game.scene.props.blast_thrown_count();
+    let (median, worst) = (
+        ms.get(ms.len() / 2).copied().unwrap_or(0.0),
+        ms.last().copied().unwrap_or(0.0),
+    );
+    eprintln!(
+        "prop-limits-check: 40 blasts threw {thrown} props; the disposer held at most {most}, \
+         took {disposed} away; physics step median {median:.2} ms, worst {worst:.2} ms"
+    );
+    // The car at the nearest piece lying loose.
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("prop-limits-check: FAIL she drives nothing");
+        return Ok(());
+    };
+    let Some(world) = game.scene.world.as_ref() else {
+        eprintln!("prop-limits-check: FAIL no island");
+        return Ok(());
+    };
+    let here = game.scene.vehicles[i]
+        .id
+        .and_then(|c| world.physics.vehicle_transform(c))
+        .map_or(centre, |m| m.w_axis.truncate());
+    // A piece lying loose (a prop's, or an island object's body), the
+    // nearest with 12 m of level, open ground before it from any of eight
+    // sides: the car is put on the ground there (the q744c run's car,
+    // put among walls, never moved).
+    let mut near: Vec<(m2_engine::DebrisId, Vec3)> = game
+        .scene
+        .props
+        .knocked_pieces()
+        .into_iter()
+        .chain(
+            world
+                .as_bodies()
+                .filter_map(|(_, ids)| ids.first().copied()),
+        )
+        .filter_map(|id| Some((id, world.physics.debris_place(id)?.w_axis.truncate())))
+        .collect();
+    near.sort_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)));
+    let physics = &world.physics;
+    let ground = |x: f32, z: f32, from: f32| {
+        physics
+            .cast_ray(Vec3::new(x, from + 20.0, z), Vec3::NEG_Y, 60.0)
+            .map(|(d, _)| from + 20.0 - d)
+    };
+    let run = near.iter().take(60).find_map(|&(id, at)| {
+        (0..8).find_map(|k| {
+            let a = k as f32 * std::f32::consts::FRAC_PI_4;
+            let way = Vec3::new(a.sin(), 0.0, a.cos());
+            let start = at - way * 12.0;
+            let floor = ground(start.x, start.z, at.y)?;
+            if (floor - at.y).abs() > 1.5 {
+                return None;
+            }
+            let from = Vec3::new(start.x, floor + 0.8, start.z);
+            let to = Vec3::new(at.x, floor + 0.8, at.z);
+            let gap = physics
+                .cast_ray(from, (to - from).normalize_or(way), 14.0)
+                .map_or(f32::MAX, |(d, _)| d);
+            // And the lane free of every placed object and building (a
+            // ray from inside a wall doesn't see it: #740's q740d).
+            let lane = (0..=10).all(|k| {
+                let c = Vec3::new(start.x, floor, start.z) + way * (k as f32);
+                physics.box_clear(
+                    c + Vec3::new(-1.3, 0.4, -1.3),
+                    c + Vec3::new(1.3, 1.8, 1.3),
+                    |key| !matches!(key, m2_engine::StaticKey::Cell(_)),
+                )
+            });
+            (gap >= 10.5 && lane).then_some((id, at, way, Vec3::new(start.x, floor, start.z)))
+        })
+    });
+    let Some((id, at, way, start)) = run else {
+        eprintln!(
+            "prop-limits-check: FAIL no piece lying loose has 12 m of open ground before it ({} looked at)",
+            near.len().min(60)
+        );
+        return Ok(());
+    };
+    eprintln!("prop-limits-check: the car is put at {start:.1}, 12 m short of a piece at {at:.1}");
+    let yaw = way.x.atan2(way.z);
+    if let Some(world) = game.scene.world.as_mut() {
+        let v = &mut game.scene.vehicles[i];
+        if let Some(old) = v.id.take() {
+            world.physics.remove_vehicle(old);
+        }
+        v.id = Some(
+            world
+                .physics
+                .add_vehicle(&v.spec, start + Vec3::Y * 0.5, yaw),
+        );
+    }
+    let Some(car) = game.scene.vehicles[i].id else {
+        return Ok(());
+    };
+    for _ in 0..(4.0 / tick) as u32 {
+        let speed = game
+            .scene
+            .world
+            .as_ref()
+            .map_or(0.0, |w| w.physics.vehicle_speed(car));
+        let intent = Intent {
+            movement: Vec2::new(0.0, if speed < 12.0 { 1.0 } else { 0.0 }),
+            ..Intent::default()
+        };
+        // Where the car is, how fast, and what its body touches (q744f:
+        // the piece moved 0.0 m).
+        if let Some(w) = game.scene.world.as_ref() {
+            let t = ms.len();
+            if t % 15 == 0 {
+                let at = w
+                    .physics
+                    .vehicle_transform(car)
+                    .map_or(Vec3::ZERO, |m| m.w_axis.truncate());
+                let touching: Vec<String> = w
+                    .physics
+                    .vehicle_touching(car)
+                    .into_iter()
+                    .map(|(key, point, _)| format!("{key:?} at {point:.2}"))
+                    .collect();
+                eprintln!(
+                    "prop-limits-check: the car at {at:.2}, {speed:.1} m/s, touching [{}]",
+                    touching.join("; ")
+                );
+            }
+        }
+        step(game, intent, &mut ms)?;
+    }
+    let moved = game
+        .scene
+        .world
+        .as_ref()
+        .and_then(|w| w.physics.debris_place(id))
+        .map_or(0.0, |m| m.w_axis.truncate().distance(at));
+    eprintln!(
+        "prop-limits-check: the {} driven at a piece lying loose: it moved {moved:.1} m",
+        game.scene.vehicles[i].spec.label
+    );
+    if thrown > 40 && most <= 40 && disposed > 0 && moved > 0.5 {
+        eprintln!("prop-limits-check: PASS");
+    } else {
+        eprintln!(
+            "prop-limits-check: FAIL thrown {thrown}, held at most {most}, took away {disposed}, \
+             the piece moved {moved:.1} m"
+        );
+    }
+    Ok(())
 }

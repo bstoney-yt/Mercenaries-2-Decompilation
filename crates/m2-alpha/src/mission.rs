@@ -679,14 +679,54 @@ local function transit(pda, zones, callback, data)
     __m2_transit_box = box.__m2_dialog
 end
 -- The PDA as the scripts find it (`MrxGui.GetWidgetByNameAndOwner("PDA",
--- player)`): the HUD's, in its own Lua state, so a stand-in that opens the
--- transit map and does nothing else.
-local pda = setmetatable({ OpenTransitInterface = transit },
-    { __index = function() return function() end end })
+-- player)`): the HUD's, in its own Lua state (on the 360 one state holds
+-- both, and the scripts call the PDA widget itself: `MrxGuiManager`'s
+-- `PdaLoaded` makes it). So a stand-in that opens the transit map, and
+-- passes any other call on to the HUD's PDA as it was made (group
+-- `PdaWidget`): the munitions laptop's and crates' `UpdateSupport`.
+-- A call's arguments as they go across: plain values and guids.
+local function plain(v, depth)
+    if type(v) == "function" then return nil end
+    if type(v) ~= "table" then return v end
+    if depth > 3 then return nil end
+    local out = {}
+    for k, x in pairs(v) do out[k] = plain(x, depth + 1) end
+    return out
+end
+local pda = setmetatable({ OpenTransitInterface = transit }, {
+    __index = function(_, method)
+        return function(_, ...)
+            __m2_hud_call_count = __m2_hud_call_count + 1
+            local args = { n = select("#", ...) }
+            for i = 1, args.n do args[i] = plain((select(i, ...)), 0) end
+            __m2_keep_hud_call({ seq = __m2_hud_call_count, group = "PdaWidget",
+                method = method, data = args })
+        end
+    end,
+})
+-- The scripts' own PDA, once `MrxGuiManager.CreateGui` has made one in
+-- their state: its `UpdateSupport` (the munitions laptop's and crates'
+-- support page) is passed on to the HUD's PDA as the stand-in's calls are,
+-- then runs as it would (q736i: the laptop's `PickupMunitions` ran, its
+-- call went to the scripts' own PDA, and the HUD never heard it).
+local __m2_pda_passed = setmetatable({}, { __mode = "k" })
+local function pass_on(w)
+    if type(w) ~= "table" or __m2_pda_passed[w] then return w end
+    __m2_pda_passed[w] = true
+    local own = w.UpdateSupport
+    if type(own) == "function" then
+        w.UpdateSupport = function(self, ...)
+            pda.UpdateSupport(self, ...)
+            return own(self, ...)
+        end
+    end
+    return w
+end
 local function lookup(original)
     local f = function(name, ...)
         local w = original(name, ...)
         if w == nil and name == "PDA" then return pda end
+        if name == "PDA" then return pass_on(w) end
         return w
     end
     __m2_dialog_wrapped[f] = true
@@ -1008,6 +1048,14 @@ pub struct MissionLink {
     /// vehicle with node health has a node sent damage by the scripts'
     /// `ObjectState.SendDamage` ([`check_node_damage`]).
     pub check_node_damage: Option<f32>,
+    /// `--check-building-damage <s>`: seconds of play left before the
+    /// nearest object (not a vehicle) with node health has its nodes sent
+    /// damage ([`check_building_damage`]).
+    pub check_building_damage: Option<f32>,
+    /// `--part-destroy-check` ([`PartDestroyCheck`]).
+    pub part_destroy_check: Option<PartDestroyCheck>,
+    /// `--sat-blip-check` ([`SatBlipCheck`]).
+    pub sat_blip_check: Option<SatBlipCheck>,
     /// The face rigs and sets read, and the sets the scripts mounted
     /// ([`m2_engine::lip_sync`]).
     faces: m2_engine::lip_sync::Library,
@@ -1089,6 +1137,8 @@ pub struct MissionLink {
     /// The factions' pursuit lists of units ([`crate::gunships::Lists`]).
     pursuit_lists: Option<crate::gunships::Lists>,
     reinforcements: crate::reinforce::Reinforcements,
+    /// `--paradrop-check` ([`crate::paradrop_check`]).
+    paradrop_check: Option<crate::paradrop_check::Check>,
     /// The scripts' drop zone tests being searched ([`crate::drop_zones`]).
     drop_zones: crate::drop_zones::DropZones,
     /// Seconds since the scripts said the contract was completed.
@@ -1111,6 +1161,20 @@ pub struct MissionLink {
     /// Interface sounds the scripts cued (`ui_HUD_Objective_New`), and
     /// whether each is to stop instead.
     sounds: Vec<(String, bool)>,
+    /// Objects made for loose pickups she took, to take away again once
+    /// their `WeaponEvent` has been heard.
+    loose_items: Vec<u32>,
+    /// Loose items made last step whose `pickup` is told this step: by
+    /// then their own scripts are waiting for it ([`Self::loose_items`]).
+    loose_pickups: Vec<u32>,
+    /// `--mine-check` ([`crate::mines::MineCheck`]).
+    mine_check: Option<crate::mines::MineCheck>,
+    /// Sounds the scripts cued on an object (`Sound.CueSound(object,
+    /// cue)`: her C4's `wpn_bomb_timer_01_armed`), whether each is to stop
+    /// instead, and where the object is ([`Self::take_object_sounds`]).
+    object_sounds: Vec<(u32, String, bool, Vec3)>,
+    /// `--object-sound-check` ([`ObjectSoundCheck`]).
+    object_sound_check: Option<ObjectSoundCheck>,
     /// Sound category fades and pitches the scripts asked for.
     fades: Vec<crate::sound::CategoryChange>,
     /// The music cue the scripts last switched to (`Some(None)`: none).
@@ -1256,6 +1320,9 @@ impl MissionLink {
         Self {
             state: State::Loading(rx),
             check_node_damage: None,
+            check_building_damage: None,
+            part_destroy_check: None,
+            sat_blip_check: None,
             prop_nodes: HashMap::new(),
             faces: Default::default(),
             movies: false,
@@ -1291,6 +1358,7 @@ impl MissionLink {
             pursuit_counts: None,
             pursuit_lists: None,
             reinforcements: crate::reinforce::Reinforcements::default(),
+            paradrop_check: None,
             drop_zones: crate::drop_zones::DropZones::default(),
             completed: None,
             contracts: 0,
@@ -1300,7 +1368,12 @@ impl MissionLink {
             lines: Vec::new(),
             hushed: Vec::new(),
             voice_banks: Vec::new(),
+            loose_items: Vec::new(),
+            loose_pickups: Vec::new(),
             sounds: Vec::new(),
+            mine_check: None,
+            object_sounds: Vec::new(),
+            object_sound_check: None,
             fades: Vec::new(),
             music: None,
             music_at: None,
@@ -1588,13 +1661,37 @@ impl MissionLink {
         self.job.as_ref()
     }
 
+    /// `--mine-check`: the nearest placed mine is blasted and run into
+    /// ([`crate::mines::MineCheck`]).
+    pub fn with_mine_check(mut self, on: bool) -> Self {
+        self.mine_check = on.then(crate::mines::MineCheck::default);
+        self
+    }
+
     /// With a job to follow: she is put this far from its nearest target
     /// once it is tracked (`--job-near`).
+    /// `--object-sound-check`: a C4 charge of hers is put down beside her
+    /// once the scripts run, left 5 s and taken up again
+    /// ([`ObjectSoundCheck`]).
+    pub fn with_object_sound_check(mut self, on: bool) -> Self {
+        self.object_sound_check = on.then(ObjectSoundCheck::default);
+        self
+    }
+
     pub fn with_job_near(mut self, near: Option<f32>) -> Self {
         if let Some(job) = &mut self.job {
             job.near = near;
         }
         self
+    }
+
+    /// With `--paradrop-check`: the paradrop plane put over her and its
+    /// drop followed ([`crate::paradrop_check`]).
+    pub fn with_paradrop_check(self, on: bool) -> Self {
+        Self {
+            paradrop_check: on.then(Default::default),
+            ..self
+        }
     }
 
     /// Stocks and calls in these support items once the scripts run.
@@ -2270,6 +2367,10 @@ impl MissionLink {
         // The scripts' own expressions (`Animation.PlayFacialExpression`,
         // 0x82316078): the same table as the engine's, by the
         // expression's name; a name not in it does nothing (0x8241DF40).
+        // The scripts' seat movement locks, once set (0x8233DAD8).
+        if let Some(locks) = mission.world().borrow().sp.seat_movement_locks {
+            game.seat_locks = locks;
+        }
         let facial = std::mem::take(&mut mission.world().borrow_mut().sp.facial);
         for f in facial {
             let name = m2_assets::name_hash(&f.expression);
@@ -2589,7 +2690,7 @@ impl MissionLink {
         if self.ashore > 0 && game.scene.player.as_ref().is_some_and(|p| p.landed) {
             self.ashore -= 1;
             // Thousands of rays a look: twice a second is plenty.
-            if self.ashore.is_multiple_of(30) && go_ashore(game) {
+            if self.ashore.is_multiple_of(30) && go_ashore(game, &[]).is_some() {
                 self.ashore = 0;
             }
         }
@@ -2820,6 +2921,9 @@ impl MissionLink {
         // vehicle she rides, as the scripts have it; the faction's
         // soldiers take her for one of theirs while it holds, and the
         // scripts and the HUD's gauge hear how it stands.
+        for g in game.take_sunk() {
+            mission.vehicle_sinking(g);
+        }
         let honks = game.take_honks();
         if honks > 0 {
             mission.honk();
@@ -2844,6 +2948,11 @@ impl MissionLink {
             _ => 0,
         };
         let enabled = mission.world().borrow().vehicle_disguise;
+        // The vehicle she rides hit someone, anyone, for at least 1: the
+        // 360 gives away the disguise of every player riding it
+        // (0x82445938 → 0x824457F8).
+        let ran_over = riding.is_some_and(|i| game.vehicles_hit_someone.contains(&i));
+        game.vehicles_hit_someone.clear();
         let state = game.disguise.update(
             crate::disguise::Tick {
                 enabled,
@@ -2851,7 +2960,7 @@ impl MissionLink {
                 faction,
                 honks,
                 near,
-                hurt_someone: hurt_someone && riding.is_some(),
+                hurt_someone: (hurt_someone && riding.is_some()) || ran_over,
             },
             dt,
         );
@@ -3123,6 +3232,23 @@ impl MissionLink {
                     }
                 }
             }
+        }
+        if let Some(check) = &mut self.paradrop_check
+            && check.tick(game, mission, dt) == crate::paradrop_check::Ask::Ashore
+            && game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.landed || p.swimming())
+        {
+            let to = go_ashore(game, check.failed());
+            check.put_ashore(to);
+        }
+        if let Some(check) = &mut self.object_sound_check {
+            check.tick(game, mission, dt);
+        }
+        if let Some(check) = &mut self.sat_blip_check {
+            check.tick(game, mission, dt);
         }
         // A pursuit run out: the scripts read level 0 again.
         let pursued = !game.scene.people.pursuit.is_empty();
@@ -3476,6 +3602,45 @@ impl MissionLink {
             }
             // What rides on a vehicle is where it rides, for the scripts
             // that count it there (`Pg.GetObjectsInArea`).
+            // She took a placed pickup (the munitions laptop): as the
+            // 360's hero hears its `pickup` message (0x82281CD0, from her
+            // weapon messages 0x82282530), a `WeaponEvent` "pickup" for
+            // her and the item.
+            for item in std::mem::take(&mut game.picked_up) {
+                eprintln!("mission: she picks up {item:#x} (WeaponEvent pickup)");
+                mission.weapon_event(PLAYER, "pickup", item);
+            }
+            // Last step's loose items are taken away again: the event has
+            // been heard.
+            for g in std::mem::take(&mut self.loose_items) {
+                mission.ammo_gone(g);
+            }
+            // Last step's loose items: their `pickup` now, a step after
+            // they were made, so their own scripts are already waiting
+            // for it (a munitions laptop's `Laptop` waits for
+            // `WeaponEvent { "hero", "pickup", <itself> }`, and a wait
+            // hears only events after it was made: told in the step that
+            // made it, its `PickupMunitions` never ran, q736h).
+            for g in std::mem::take(&mut self.loose_pickups) {
+                mission.weapon_event(PLAYER, "pickup", g);
+                self.loose_items.push(g);
+            }
+            // Something with no object of its own here (a crate's
+            // contents, a dropped gun, cash): an object of its template is
+            // made where it lay for the event to name, then taken away.
+            for (template, at) in std::mem::take(&mut game.picked_up_loose) {
+                let name = game
+                    .scene
+                    .world
+                    .as_ref()
+                    .and_then(|w| w.index.template_db.names.get(&template).cloned());
+                let Some(name) = name else {
+                    continue;
+                };
+                let g = mission.ammo_spawned(&name, at.to_array());
+                eprintln!("mission: she picks up {name} ({g:#x}, loose: WeaponEvent pickup)");
+                self.loose_pickups.push(g);
+            }
             for (g, at, yaw, (lo, hi)) in game.scene.props.cargo_places() {
                 mission.place(g, at.to_array(), yaw);
                 mission.set_bounds(g, lo.to_array(), hi.to_array());
@@ -3515,6 +3680,11 @@ impl MissionLink {
             // counts them.
             let hero = mission.world().borrow().player;
             let hers = game.scene.people.her_kills();
+            // Their health as it changes (a fall, a round), for the scripts
+            // watching it: the paratrooper's chute comes off below 100.
+            for (guid, hp) in game.scene.people.take_health_changes() {
+                mission.set_health(guid, hp);
+            }
             for guid in game.scene.people.all_killed() {
                 match hero.filter(|_| hers.contains(&guid)) {
                     Some(h) => mission.kill_by(guid, h),
@@ -3553,11 +3723,24 @@ impl MissionLink {
                     .filter_map(|n| Some((n.spawn?, n.character.velocity)));
                 report_speeds(mission, vehicles.chain(people));
             }
+            // These count play time: a step is `STEP` of it (the frame's
+            // `dt` is a sixth of that; counting it ran them at a sixth of
+            // the speed).
             if let Some(left) = &mut self.check_node_damage {
-                *left -= dt;
+                *left -= STEP;
                 if *left <= 0.0 {
                     self.check_node_damage = None;
                     check_node_damage(mission, game);
+                }
+            }
+            if let Some(c) = &mut self.part_destroy_check {
+                c.tick(game, mission, STEP);
+            }
+            if let Some(left) = &mut self.check_building_damage {
+                *left -= STEP;
+                if *left <= 0.0 {
+                    self.check_building_damage = None;
+                    check_building_damage(mission, game);
                 }
             }
             // Targets to destroy: soldiers stand at those that are spawns,
@@ -3690,12 +3873,23 @@ impl MissionLink {
                     mission.kill(e);
                 }
             }
+            // Placed mines run into or blasted, her mines armed.
+            crate::mines::report(game, mission);
+            if let Some(check) = &mut self.mine_check {
+                check.tick(game, mission, STEP);
+            }
             self.blasts.clear();
             self.bombs.clear();
             // The scripts heal her and watch her health.
             game.combat.scripted_health = true;
             if std::mem::take(&mut game.combat.revived) {
                 mission.player_died();
+            }
+            // Dead with the clamp off: her object dies, and the scripts'
+            // `PlayerDied` takes it from there ([`crate::death`]).
+            if std::mem::take(&mut game.combat.died) {
+                eprintln!("death: she died: the scripts' PlayerDied runs");
+                mission.kill(PLAYER);
             }
             mission.set_health(PLAYER, game.combat.hp);
             mission.set_player_reserve(GRENADE, game.combat.grenades);
@@ -3828,6 +4022,21 @@ impl MissionLink {
             // and 28).
             m2_game::gui_runtime::tick(mission.lua(), f64::from(STEP));
             lines.extend(mission.take_log());
+            // The parts' states applied last step: what they hid no
+            // longer keeps the object alive (0x82289020's shown-piece
+            // test), what they showed does again.
+            for a in game.scene.props.take_applied() {
+                if let Some(c) = &mut self.part_destroy_check {
+                    c.landed(&a);
+                }
+                let w = mission.world();
+                let mut w = w.borrow_mut();
+                let hidden = w.hidden_nodes.entry(a.entity).or_default();
+                hidden.extend(a.hidden.iter().copied());
+                for n in &a.shown {
+                    hidden.remove(n);
+                }
+            }
             let commands = mission.take_commands();
             if let Some(h) = &mut self.hijack
                 && !h.follow(game, mission, &commands)
@@ -3879,6 +4088,28 @@ impl MissionLink {
                         self.sounds.push((cue.clone(), false));
                     }
                     Command::StopSound { at: None, cue } => self.sounds.push((cue.clone(), true)),
+                    // On an object: heard where it is, and moving with it
+                    // (the 360's `Sound.CueSound`, 0x82340F08, posts the
+                    // object and the cue to the sound queue 0x83224D60,
+                    // whose handler 0x8235ED50 starts the cue on the object
+                    // by 0x8236C0D8).
+                    Command::CueSound { at: Some(g), cue }
+                    | Command::StopSound { at: Some(g), cue } => {
+                        let stop = matches!(c, Command::StopSound { .. });
+                        let at = {
+                            let w = mission.world().borrow();
+                            w.objects.get(g).map(|o| Vec3::from_array(o.position))
+                        };
+                        let at = at.unwrap_or_else(|| game.focus());
+                        eprintln!(
+                            "object sound: {cue} on {g:#x} {} at {at:.1}",
+                            if stop { "stops" } else { "starts" }
+                        );
+                        if let Some(check) = &mut self.object_sound_check {
+                            check.heard(*g, stop);
+                        }
+                        self.object_sounds.push((*g, cue.clone(), stop, at));
+                    }
                     Command::FadeSound {
                         category,
                         level,
@@ -3910,6 +4141,28 @@ impl MissionLink {
                     Command::HealthClamp(on) => {
                         eprintln!("mission: health clamp {on}");
                         game.combat.health_clamp = *on;
+                    }
+                    // The scripts revived her (the sickbay's
+                    // `RiseFromYourGrave`): she gets up where they put her.
+                    Command::Revive { guid, health } if *guid == PLAYER => {
+                        eprintln!(
+                            "death: the scripts revive her with {health:.1} at {:.0} (the sickbay's RiseFromYourGrave)",
+                            game.focus()
+                        );
+                        game.combat.revive_hp = Some(*health);
+                    }
+                    Command::SurvivalMode { on, beat } => {
+                        eprintln!("mission: survival mode {on}");
+                        if *on != game.combat.survival {
+                            eprintln!(
+                                "combat: survival mode {} (the scripts)",
+                                if *on { "on" } else { "off" }
+                            );
+                            // The beat flag goes with a change only
+                            // (0x8243AED8).
+                            game.combat.survival_beat = *beat;
+                        }
+                        game.combat.survival = *on;
                     }
                     Command::SetHealth { guid, health } if *guid == PLAYER => {
                         eprintln!(
@@ -4074,8 +4327,21 @@ impl MissionLink {
                 support_item(&c);
                 strike(game, &c);
                 fly(game, mission, &mut self.landed, &c);
+                let changed = part_state_changes(game, &c);
                 if obey(game, mission, &mut self.vehicles, &c) {
                     self.ashore = ASHORE_TRIES;
+                }
+                if let Some(c) = &mut self.part_destroy_check {
+                    c.changes += changed.len() as u32;
+                    for &(g, machine, state) in &changed {
+                        c.entered(game, g, machine, state);
+                    }
+                }
+                for (g, machine, state) in changed {
+                    eprintln!(
+                        "nodedamage: {g:#x} part {machine:#x} to state {state:#x}: OnStateChange"
+                    );
+                    mission.object_state_changed(g, machine, state);
                 }
                 // A bunker buster's blasts (`MrxBunkerBuster` spawns
                 // "Explosion (Bunker Buster Stage 1)" and "Stage 2" where
@@ -4085,6 +4351,17 @@ impl MissionLink {
                     && what.starts_with("Explosion (Bunker Buster")
                 {
                     self.bombs.push(Vec3::from(*position));
+                }
+                // An explosion the scripts spawn (a mine's) goes off there.
+                if let Command::Spawn { what, position, .. } = &c
+                    && let Some(blast) = game
+                        .scene
+                        .world
+                        .as_ref()
+                        .and_then(|w| crate::mines::explosion_blast(&w.index.template_db, what))
+                {
+                    eprintln!("mission: the scripts set off {what} at {position:.1?}");
+                    game.combat.set_off(Vec3::from(*position), Some(blast));
                 }
                 if c == Command::Notify("Pg.ContractCompleted".into()) {
                     self.completed = Some(0.0);
@@ -4312,6 +4589,21 @@ impl MissionLink {
     }
 
     /// Interface sounds the scripts cued since the last call.
+    /// The sounds the scripts cued on objects since last asked: the
+    /// object, the cue, whether it is to stop, and where the object is.
+    pub fn take_object_sounds(&mut self) -> Vec<(u32, String, bool, Vec3)> {
+        std::mem::take(&mut self.object_sounds)
+    }
+
+    /// Where object `guid` of the scripts' world is now.
+    pub fn object_at(&self, guid: u32) -> Option<Vec3> {
+        let State::Running(mission) = &self.state else {
+            return None;
+        };
+        let w = mission.world().borrow();
+        w.objects.get(&guid).map(|o| Vec3::from_array(o.position))
+    }
+
     pub fn take_sounds(&mut self) -> Vec<(String, bool)> {
         std::mem::take(&mut self.sounds)
     }
@@ -6330,38 +6622,236 @@ const BOARDING: u32 = 1800;
 /// Moves a player standing under the sea to the nearest dry ground within
 /// 1.5 km. True once she stands on dry ground (moved there, or there
 /// already); false while none around her has loaded.
-fn go_ashore(game: &mut Game) -> bool {
+/// `--object-sound-check`: once the scripts run, her C4 charge is put
+/// down 2 m from her (`C4 Projectile`, whose `C4` object script arms and
+/// beeps it: `wpn_bomb_timer_01_armed` on the object), left 5 s and taken
+/// up (gone, which stops the beep). Logs each object sound started and
+/// stopped (`object sound:` lines) and, after, `object-sound-check: PASS`
+/// once the charge's cue started and stopped, else `FAIL`.
+#[derive(Debug, Default)]
+pub struct ObjectSoundCheck {
+    t: f32,
+    charge: Option<u32>,
+    started: u32,
+    stopped: u32,
+    done: bool,
+}
+
+impl ObjectSoundCheck {
+    /// A sound cued on object `guid` started (or stopped).
+    fn heard(&mut self, guid: u32, stop: bool) {
+        if self.charge == Some(guid) {
+            if stop {
+                self.stopped += 1;
+            } else {
+                self.started += 1;
+            }
+        }
+    }
+
+    fn tick(&mut self, game: &Game, mission: &mut m2_game::mission::Mission, dt: f32) {
+        if self.done {
+            return;
+        }
+        self.t += dt;
+        if self.charge.is_none() && self.t > 2.0 {
+            let at = game.focus() + Vec3::X * 2.0;
+            let g = mission.ammo_spawned("C4 Projectile", at.to_array());
+            eprintln!("object-sound-check: her C4 put down at {at:.1} ({g:#x})");
+            self.charge = Some(g);
+        }
+        if let Some(g) = self.charge
+            && self.t > 7.0
+        {
+            mission.ammo_gone(g);
+            if self.t > 8.0 {
+                self.done = true;
+                if self.started > 0 && self.stopped > 0 {
+                    eprintln!(
+                        "object-sound-check: PASS its cue started {} times, stopped {}",
+                        self.started, self.stopped
+                    );
+                } else {
+                    eprintln!(
+                        "object-sound-check: FAIL its cue started {} times, stopped {}",
+                        self.started, self.stopped
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `--sat-blip-check`: the satellite bomb's square on the radar, put on
+/// and taken off by the game's own scripts. Two seconds into play a
+/// `Smart Bomb Projectile` is spawned 60 m over her and blipped as the
+/// satellite bomb's script blips it (`MrxSupport.BlipAircraft(bomb,
+/// {255, 0, 0})`, which takes the square off on the bomb's
+/// `ObjectDeath` or `ObjectHibernation`); a second later it goes off
+/// ([`m2_game::mission::Mission::ordnance_burst`]), and two seconds after
+/// that the radar is looked at. Prints `sat-blip-check: PASS` when the
+/// square was on and is gone, else `sat-blip-check: FAIL <why>`; a run
+/// that ends first fails ([`SatBlipCheck::finish`]).
+#[derive(Debug, Default)]
+pub struct SatBlipCheck {
+    t: f32,
+    bomb: Option<(u32, Vec3)>,
+    burst: bool,
+    done: bool,
+}
+
+impl SatBlipCheck {
+    /// Whether the scripts' radar has a blip on `guid`.
+    fn blipped(mission: &m2_game::mission::Mission, guid: u32) -> bool {
+        let w = mission.world().borrow();
+        w.hud.radar.values().any(|b| b.target == Some(guid))
+    }
+
+    fn fail(&mut self, why: &str) {
+        self.done = true;
+        eprintln!("sat-blip-check: FAIL {why}");
+    }
+
+    fn tick(&mut self, game: &Game, mission: &mut m2_game::mission::Mission, dt: f32) {
+        if self.done {
+            return;
+        }
+        self.t += dt;
+        if self.bomb.is_none() && self.t > 2.0 {
+            let at = game.focus() + Vec3::Y * 60.0;
+            let g = mission.ammo_spawned("Smart Bomb Projectile", at.to_array());
+            let blip = mission
+                .lua()
+                .load(
+                    "local bomb = ...                      if type(MrxSupport) ~= 'table' or type(MrxSupport.BlipAircraft) ~= 'function' then                        return false end                      MrxSupport.BlipAircraft(bomb, { 255, 0, 0 }) return true",
+                )
+                .set_name("=sat-blip-check")
+                .call::<bool>(m2_game::events::guid_value(g));
+            eprintln!("sat-blip-check: bomb {g:#x} at {at:.1}, blipped by the scripts: {blip:?}");
+            self.bomb = Some((g, at));
+            match blip {
+                Ok(true) if Self::blipped(mission, g) => {}
+                Ok(true) => return self.fail("BlipAircraft put no blip on the radar"),
+                Ok(false) => return self.fail("the scripts have no MrxSupport.BlipAircraft"),
+                Err(e) => return self.fail(&format!("BlipAircraft: {e}")),
+            }
+        }
+        let Some((g, at)) = self.bomb else { return };
+        if !self.burst && self.t > 3.0 {
+            self.burst = true;
+            eprintln!("sat-blip-check: bomb {g:#x} goes off");
+            mission.ordnance_burst(g, at.to_array());
+        }
+        if self.burst && self.t > 5.0 {
+            self.done = true;
+            if Self::blipped(mission, g) {
+                eprintln!(
+                    "sat-blip-check: FAIL its square is still on the radar 2 s after it went off"
+                );
+            } else {
+                eprintln!("sat-blip-check: PASS its square came off the radar as it went off");
+            }
+        }
+    }
+
+    /// The run ended: one with no verdict fails.
+    pub fn finish(&mut self) {
+        if !self.done {
+            self.fail(&format!(
+                "the run ended at {:.1} s of play, before a verdict",
+                self.t
+            ));
+        }
+    }
+}
+
+fn go_ashore(game: &mut Game, avoid: &[Vec3]) -> Option<Vec3> {
     let (Some(world), Some(player)) = (&game.scene.world, &mut game.scene.player) else {
-        return true;
+        return None;
     };
     // Boats and docks the layers place float at -36 m: dry ground is
     // above that, whatever height the sea is drawn at.
     let sea = world.settings.sea_level.max(WATERLINE);
-    let from = player.character.position;
-    if from.y > sea {
-        return true;
-    }
+    // The island's own ground only (its terrain's cells), not a dock or
+    // a boat's deck over the water, and not where a put failed.
     let ground = |x: f32, z: f32| {
+        if avoid
+            .iter()
+            .any(|a| a.with_y(0.0).distance(Vec3::new(x, 0.0, z)) < AVOID)
+        {
+            return None;
+        }
         let top = 600.0;
-        let (t, normal) = world
-            .physics
-            .cast_ray(Vec3::new(x, top, z), Vec3::NEG_Y, 1200.0)?;
-        let y = top - t;
-        (y > sea + 0.5 && normal.y > 0.7).then_some(Vec3::new(x, y + 1.0, z))
+        let (t, normal, key, _) =
+            world
+                .physics
+                .cast_ray_surface(Vec3::new(x, top, z), Vec3::NEG_Y, 1200.0)?;
+        matches!(key, Some(m2_engine::StaticKey::Cell(_))).then_some((top - t, normal.y))
     };
+    let to = dry_spot(
+        player.character.position,
+        ground,
+        |x, z| world.physics.water_at(x, z),
+        sea,
+    )?;
+    // Already standing on it: left as she is.
+    let from = player.character.position;
+    if player.landed && (to - from).with_y(0.0).length() < 1e-3 {
+        return Some(to);
+    }
+    // Out of any seat first: seated (VzaCon001 starts her at the wheel
+    // of its speed boat) she stays where the seat is, and the put came to
+    // nothing (the #618 game check: put ashore three times, each time
+    // back in the boat at the start).
+    let seated = player.driving.take().is_some();
+    if seated {
+        player.seated = false;
+        player.chase_target = None;
+        eprintln!("ashore: she leaves the vehicle she sits in to be put ashore");
+    }
+    // As a teleport puts her down (her swim and landing state too).
+    player.drop_at(to);
+    if seated {
+        game.ride = None;
+        game.on_foot = true;
+    }
+    Some(to)
+}
+
+/// How far from a spot she was put ashore on and wasn't dry after the
+/// next try must be, metres.
+const AVOID: f32 = 25.0;
+
+/// The nearest dry ground to `from` (its own spot first, then rings out
+/// every 25 m to 1.5 km): where the ground (`ground`: its height and the
+/// up part of its normal at x, z) is level enough (normal over 0.7) and
+/// more than 0.5 m over the water there (`water`, else `sea`, and never
+/// under `sea`), as the paradrop check's own dry test has it. A metre
+/// over that ground, to drop onto it; `None` where there is none.
+pub(crate) fn dry_spot(
+    from: Vec3,
+    ground: impl Fn(f32, f32) -> Option<(f32, f32)>,
+    water: impl Fn(f32, f32) -> Option<f32>,
+    sea: f32,
+) -> Option<Vec3> {
+    let dry = |x: f32, z: f32| {
+        let (y, up) = ground(x, z)?;
+        let surface = water(x, z).unwrap_or(sea).max(sea);
+        (y > surface + 0.5 && up > 0.7).then_some(Vec3::new(x, y + 1.0, z))
+    };
+    if let Some(here) = dry(from.x, from.z) {
+        return Some(here);
+    }
     for r in (1..=60).map(|i| i as f32 * 25.0) {
         let n = ((r / 10.0) as usize).max(8);
         for k in 0..n {
             let a = k as f32 / n as f32 * std::f32::consts::TAU;
-            if let Some(to) = ground(from.x + r * a.cos(), from.z + r * a.sin()) {
-                player.character.position = to;
-                player.character.velocity = Vec3::ZERO;
-                player.landed = false;
-                return true;
+            if let Some(to) = dry(from.x + r * a.cos(), from.z + r * a.sin()) {
+                return Some(to);
             }
         }
     }
-    false
+    None
 }
 
 /// Whether `guid` is a layer entity that places a person.
@@ -6445,6 +6935,335 @@ fn check_node_damage(mission: &mut Mission, game: &Game) {
         return;
     }
     eprintln!("nodedamage check: no vehicle with node health on a damage part near");
+}
+
+/// `--check-building-damage`: the scripts' object nearest her that is
+/// not a vehicle and whose template gives node health (a building: the
+/// island fortress, a bridge) has each node with health left sent a share
+/// of 1 (`ObjectState.SendDamage`), one at a time, until it dies. Logs
+/// each node's health and the object's after it, and at the end whether
+/// the whole object was destroyed and by which node.
+fn check_building_damage(mission: &mut Mission, game: &Game) {
+    check_building_damage_on(mission, game, None);
+}
+
+/// [`check_building_damage`] on object `only` if given, else the nearest.
+/// True if it destroyed one.
+fn check_building_damage_on(mission: &mut Mission, game: &Game, only: Option<u32>) -> bool {
+    let at = game.focus();
+    let mut near: Vec<(f32, u32, String)> = {
+        let w = mission.world().borrow();
+        w.objects
+            .iter()
+            .filter(|(g, o)| o.alive && !game.scene.vehicles.iter().any(|v| v.guid == Some(**g)))
+            .filter(|(g, _)| only.is_none_or(|o| o == **g))
+            .map(|(g, o)| (Vec3::from(o.position).distance(at), *g, o.name.clone()))
+            .collect()
+    };
+    near.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (d, guid, name) in near {
+        let nodes: Vec<u32> = {
+            let mut w = mission.world().borrow_mut();
+            let Some(t) = w.node_table(guid) else {
+                continue;
+            };
+            t.entries().iter().map(|e| e.node).collect()
+        };
+        let (most, before) = {
+            let w = mission.world().borrow();
+            w.objects
+                .get(&guid)
+                .map_or((0.0, 0.0), |o| (o.max_health, o.health))
+        };
+        eprintln!(
+            "buildingdamage check: {guid:#x} {name} at {d:.1} m, {} nodes, object health {before:.1}/{most:.1}",
+            nodes.len()
+        );
+        let mut by = None;
+        for (i, n) in nodes.iter().enumerate() {
+            let left = mission
+                .world()
+                .borrow_mut()
+                .node_table(guid)
+                .map_or(0.0, |t| t.health(*n));
+            if left <= 0.0 {
+                continue;
+            }
+            let code = format!(
+                "ObjectState.SendDamage(Sys.StringToGuid('{guid:#x}'), Sys.StringToGuid('{n:#x}'), 1)"
+            );
+            let ran = mission.run(&code, "building damage check");
+            let w = mission.world().borrow();
+            let (health, alive) = w
+                .objects
+                .get(&guid)
+                .map_or((0.0, false), |o| (o.health, o.alive));
+            eprintln!(
+                "buildingdamage: node {i} {n:#x} health {left} -> 0, object health {health:.1}, alive {alive} ({})",
+                if ran.is_ok() { "ran" } else { "script error" }
+            );
+            if !alive {
+                by = Some(*n);
+                break;
+            }
+        }
+        let w = mission.world().borrow();
+        let (health, alive) = w
+            .objects
+            .get(&guid)
+            .map_or((0.0, false), |o| (o.health, o.alive));
+        eprintln!(
+            "buildingdamage check: {guid:#x} {name}: object health {before:.1} -> {health:.1}, {}",
+            match by {
+                Some(n) if !alive => format!("destroyed (node {n:#x} was its last)"),
+                _ if !alive => "destroyed".to_owned(),
+                _ => "not destroyed".to_owned(),
+            }
+        );
+        return !alive;
+    }
+    eprintln!("buildingdamage check: no object with node health near");
+    false
+}
+
+/// `--part-destroy-check`: the island fortress (the `islandfortress`
+/// entity of `vz_state_gurcon001_fortress`, alive with node health in the
+/// scripts' world) is looked for each step until 70 s of play; found, she
+/// is put 40 m from it, so its model streams in; 15 s on, its nodes are destroyed one at a time by the scripts'
+/// `ObjectState.SendDamage` ([`check_building_damage`]), each node's
+/// `DestroyMsg` going through its part's state machine
+/// ([`part_state_changes`]). Each change logs what the state entered
+/// shows and hides (`part-destroy-check: ... enters ...`), and each
+/// object's states applied log the nodes that showed and hid and how many
+/// steps after the message that was (`... the break lands 1 step after
+/// the message`: [`Props::apply_states`](crate::props::Props::apply_states)).
+/// It pictures the fortress a second before (`<out>-fortress-before.ppm`),
+/// as its states first land (`-fortress-parts`) and at the end
+/// (`-fortress-after`), the pictures kept by the machine. 30 s after it
+/// was found it logs `part-destroy-check: PASS ...` if some part changed
+/// state, the object died, and every application hid some node and
+/// landed exactly one step after its message; else `FAIL`.
+#[derive(Debug, Default)]
+pub struct PartDestroyCheck {
+    t: f32,
+    target: Option<u32>,
+    at: Option<Vec3>,
+    sent: Option<bool>,
+    pub(crate) changes: u32,
+    /// States applied one step after their message, and otherwise; how
+    /// many nodes they hid.
+    on_time: u32,
+    late: u32,
+    hid: usize,
+    /// Pictures due: (name, where the fortress is).
+    shots: Vec<(&'static str, Vec3)>,
+    pictured: HashSet<&'static str>,
+    done: bool,
+    /// Seconds of play when the fortress was found, and the find step's
+    /// conditions last logged.
+    found: Option<f32>,
+    seen: String,
+    /// The step it is waiting on, logged once each ([`waiting`]).
+    ///
+    /// [`waiting`]: Self::waiting
+    step: &'static str,
+}
+
+impl PartDestroyCheck {
+    /// It waits on `step` until `until` seconds of play: logged once, as
+    /// it starts waiting.
+    fn waiting(&mut self, step: &'static str, until: f32) {
+        if self.step != step {
+            self.step = step;
+            eprintln!(
+                "part-destroy-check: at {:.1} s of play, waiting until {until:.0} s to {step}",
+                self.t
+            );
+        }
+    }
+
+    /// The run ended: if it hadn't passed or failed, it fails, naming
+    /// the step it was on.
+    pub fn finish(&mut self) {
+        if !self.done {
+            self.done = true;
+            let step = if self.step.is_empty() {
+                "start"
+            } else {
+                self.step
+            };
+            eprintln!(
+                "part-destroy-check: FAIL the run ended at {:.1} s of play, still waiting to {step}",
+                self.t
+            );
+        }
+    }
+
+    /// Pictures due since last asked: (name, where to look).
+    pub fn take_shots(&mut self) -> Vec<(&'static str, Vec3)> {
+        std::mem::take(&mut self.shots)
+    }
+
+    fn shoot(&mut self, name: &'static str) {
+        if let Some(at) = self.at
+            && self.pictured.insert(name)
+        {
+            self.shots.push((name, at));
+        }
+    }
+
+    /// Part `machine` of `g` went to `state` on a message: what entering
+    /// it shows and hides.
+    fn entered(&self, game: &Game, g: u32, machine: u32, state: u32) {
+        let list = game
+            .scene
+            .props
+            .model_parts(g)
+            .map(|p| p.entered(machine, state))
+            .unwrap_or_default();
+        let (shows, hides): (Vec<_>, Vec<_>) = list.iter().partition(|x| x.1);
+        let names =
+            |v: &[&(u32, bool)]| v.iter().map(|x| format!("{:08x}", x.0)).collect::<Vec<_>>();
+        eprintln!(
+            "part-destroy-check: {g:#x} part {machine:08x} enters {state:08x}: shows {:?}, hides {:?}",
+            names(&shows),
+            names(&hides)
+        );
+    }
+
+    /// `a`'s states were applied.
+    fn landed(&mut self, a: &crate::props::Applied) {
+        let after = a.landed.saturating_sub(a.sent);
+        if after == 1 {
+            self.on_time += 1;
+        } else {
+            self.late += 1;
+        }
+        self.hid += a.hidden.len();
+        let hex = |v: &[u32]| v.iter().map(|n| format!("{n:08x}")).collect::<Vec<_>>();
+        eprintln!(
+            "part-destroy-check: {:#x}'s states applied at step {} (message at step {}): the break lands {after} step(s) after the message; shown {:?}, hidden {:?}; {} parts down",
+            a.entity,
+            a.landed,
+            a.sent,
+            hex(&a.shown),
+            hex(&a.hidden),
+            a.down
+        );
+        self.shoot("parts");
+    }
+
+    fn tick(&mut self, game: &mut Game, mission: &mut Mission, dt: f32) {
+        if self.done {
+            return;
+        }
+        self.t += dt;
+        let Some(found) = self.found else {
+            self.find(game, mission);
+            return;
+        };
+        let (damage_at, judge_at) = (found + Self::DAMAGE_AFTER, found + Self::JUDGE_AFTER);
+        if self.sent.is_none() {
+            self.waiting("destroy its nodes", damage_at);
+        }
+        if self.t >= damage_at - 1.0 {
+            self.shoot("before");
+        }
+        if let Some(g) = self.target
+            && self.sent.is_none()
+            && self.t >= damage_at
+        {
+            let shown = game.scene.props.model_parts(g).is_some();
+            eprintln!("part-destroy-check: its model's parts in: {shown}");
+            self.sent = Some(check_building_damage_on(mission, game, Some(g)));
+            return;
+        }
+        if self.sent.is_some() {
+            self.waiting("judge the parts' states", judge_at);
+        }
+        if let Some(destroyed) = self.sent
+            && self.t >= judge_at
+        {
+            self.done = true;
+            self.shoot("after");
+            let what = format!(
+                "{} part state changes, destroyed {destroyed}; states applied {} times one step after their message, {} otherwise, {} nodes hidden",
+                self.changes, self.on_time, self.late, self.hid
+            );
+            if self.changes > 0 && destroyed && self.on_time > 0 && self.late == 0 && self.hid > 0 {
+                eprintln!("part-destroy-check: PASS {what}");
+            } else {
+                eprintln!("part-destroy-check: FAIL {what}");
+            }
+        }
+    }
+
+    /// Seconds of play it looks for the fortress before it fails; after
+    /// it is found, when its nodes are destroyed and when it is judged.
+    /// The worst case, 70 + 30 s, ends inside a 120 s run.
+    const FIND_BY: f32 = 70.0;
+    const DAMAGE_AFTER: f32 = 15.0;
+    const JUDGE_AFTER: f32 = 30.0;
+    /// The find step, each step until it is found or [`FIND_BY`]: the
+    /// fortress is the `islandfortress` entity of the first layer (by
+    /// name) that has one, `vz_state_gurcon001_fortress`'s 0x8a5b0 (not
+    /// the ruined one of `..._destroyed`), which the scripts load early;
+    /// found once it is in the scripts' world, alive, with node health.
+    /// Each change of those conditions is logged. Found, she is put 40 m
+    /// off it.
+    ///
+    /// [`FIND_BY`]: Self::FIND_BY
+    fn find(&mut self, game: &mut Game, mission: &mut Mission) {
+        self.waiting("find the fortress and put her by it", Self::FIND_BY);
+        let entity = mission.entity_with_script(m2_game::mission::ISLAND_FORTRESS);
+        let seen = entity.as_ref().map(|(layer, g, _)| {
+            let mut w = mission.world().borrow_mut();
+            let o = w
+                .objects
+                .get(g)
+                .map(|o| (o.alive, o.health, Vec3::from(o.position)));
+            let nodes = w.node_table(*g).map(|t| t.entries().len());
+            let model = game.scene.props.model_parts(*g).is_some();
+            (layer.clone(), *g, o, nodes, model)
+        });
+        let line = match &seen {
+            None => "no layer entity runs islandfortress".to_owned(),
+            Some((layer, g, o, nodes, model)) => format!(
+                "{g:#x} of layer {layer}: in the scripts' world {}, alive {:?}, health {:?}, nodes {nodes:?}, model parts in {model}",
+                o.is_some(),
+                o.map(|o| o.0),
+                o.map(|o| o.1)
+            ),
+        };
+        if self.seen != line {
+            eprintln!("part-destroy-check: at {:.1} s of play, {line}", self.t);
+            self.seen = line;
+        }
+        if let Some((_, g, Some((true, _, at)), Some(_), _)) = seen {
+            eprintln!(
+                "part-destroy-check: {g:#x} at {at:.0} found at {:.1} s of play, she is put 40 m off",
+                self.t
+            );
+            if let Some(p) = game.scene.player.as_mut() {
+                p.driving = None;
+                p.drop_at(at + Vec3::new(40.0, 5.0, 0.0));
+            }
+            game.ride = None;
+            game.on_foot = true;
+            self.target = Some(g);
+            self.at = Some(at);
+            self.found = Some(self.t);
+            return;
+        }
+        if self.t >= Self::FIND_BY {
+            self.done = true;
+            eprintln!(
+                "part-destroy-check: FAIL no fortress with node health by {:.0} s of play ({})",
+                Self::FIND_BY,
+                self.seen
+            );
+        }
+    }
 }
 
 fn report_speeds(mission: &mut Mission, moving: impl Iterator<Item = (u32, Vec3)>) {
@@ -7426,6 +8245,43 @@ fn set_turret(
     }
 }
 
+/// A node's message to a prop's part (a building's `DestroyMsg`): the
+/// part's state machine takes it from the state it is in now
+/// ([`crate::props::Props::send_part`]), and each change of state it makes
+/// is (the object, the part's machine name hash, the state's name hash),
+/// for its object script's `OnStateChange` (0x82231380: the island
+/// fortress's hears its part `cf37044a` go to `694683eb`). From the 360
+/// code: a node destroyed sends its part's machine the message (0x82289020)
+/// and the hook is called on each real change of state, with the machine
+/// and state as name hashes ([`m2_game::object_hooks`]); the parts keep
+/// their states between messages.
+fn part_state_changes(game: &mut Game, c: &Command) -> Vec<(u32, u32, u32)> {
+    let Command::NodeDamage {
+        guid,
+        node,
+        message: Some(msg),
+        ..
+    } = c
+    else {
+        return Vec::new();
+    };
+    let props = &game.scene.props;
+    let standing = props
+        .model_parts(*guid)
+        .and_then(|parts| parts.part_named(*node))
+        .is_some_and(|k| !props.part_down(*guid, k));
+    if !standing {
+        return Vec::new();
+    }
+    game.scene
+        .props
+        .send_part(*guid, *node, *msg)
+        .into_iter()
+        .filter(|ch| !ch.sent_off)
+        .map(|ch| (*guid, ch.machine, ch.state))
+        .collect()
+}
+
 /// The scripts' local player (`Player.GetLocalPlayer`), the target's
 /// player of the locks on her.
 const LOCAL_PLAYER: u32 = 1;
@@ -7505,12 +8361,18 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             position,
             yaw,
         } => {
-            if let Some(s) = game.scene.world.as_ref().and_then(|w| {
-                w.index
-                    .template_db
-                    .scripted_spawn(*guid, what, Vec3::from(*position), *yaw)
+            // One whose template scales gravity (a paratrooper) falls from
+            // where it was made.
+            if let Some((s, scale)) = game.scene.world.as_ref().and_then(|w| {
+                let db = &w.index.template_db;
+                let s = db.scripted_spawn(*guid, what, Vec3::from(*position), *yaw)?;
+                let scale = db
+                    .ids(what)
+                    .first()
+                    .and_then(|id| db.gravity_scales.get(id).copied());
+                Some((s, scale))
             }) {
-                game.scene.people.scripted_spawn(s);
+                game.scene.people.scripted_spawn(s, scale);
             }
             // A prop of theirs (PirCon004's organ boxes) stands as a
             // layer's would.
@@ -7535,7 +8397,9 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
         }
         Command::Remove(guid) => {
             game.scene.people.priority.remove(guid);
-            game.scene.people.scripted_gone(*guid);
+            game.scene
+                .people
+                .scripted_gone(game.scene.world.as_mut().map(|w| &mut w.physics), *guid);
             if let Some(w) = game.scene.world.as_mut() {
                 game.scene.props.hide(&mut w.physics, [*guid]);
             }
@@ -8054,10 +8918,18 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
-        // `ObjectState.SendDamage`: the node's message goes to its part's
-        // state machine, as a vehicle's parts take theirs
-        // (`m2_engine::node_health`). Not yet: props' part states, and the
-        // object's share of the damage (logged).
+        // A node's damage (`ObjectState.SendDamage`, or its object's death
+        // destroying it): its message goes to its part's state machine, as
+        // a vehicle's parts take theirs (`m2_engine::node_health`). A
+        // prop's part (a building's slice) a destroying message reaches
+        // has gone to the state its machine sends it to
+        // (`part_state_changes`), which shows and hides its nodes a step
+        // on (`Props::apply_states`, as the 360's 0x8222D2F0); one whose
+        // parts take no messages breaks alone (`Props::wreck_part`;
+        // inferred: its state's own wreck shown as a vehicle's crash
+        // shows it). The object's share
+        // is already off its health (`m2_game::node_damage`); its death
+        // follows as `Kill`.
         Command::NodeDamage {
             guid,
             node,
@@ -8065,6 +8937,7 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             health,
             message,
             pass_through,
+            object_health,
         } => {
             let mut to = "no part";
             if let (Some(i), Some(msg)) = (index(guid), message) {
@@ -8075,10 +8948,49 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                     parts.send(dm, k, *msg);
                     to = "vehicle part";
                 }
+            } else if message.is_some() && game.scene.props.parts_by_state(*guid) {
+                to = "prop part (its state shows a step on)";
+            } else if let Some(msg) = message
+                && (*msg == m2_assets::model::DESTROY_MSG
+                    || *msg == m2_engine::node_health::DESTROY_OTHER_MSG)
+                && let Some(k) = game
+                    .scene
+                    .props
+                    .model_parts(*guid)
+                    .and_then(|p| p.part_named(*node))
+                && let Some(world) = game.scene.world.as_mut()
+            {
+                let hides = game
+                    .scene
+                    .props
+                    .model_parts(*guid)
+                    .map(|p| p.hidden_by(k))
+                    .unwrap_or_default();
+                let broke = game
+                    .scene
+                    .props
+                    .wreck_part(&mut world.physics, *guid, k, |_| (Vec3::ZERO, Vec3::ZERO));
+                // Its pieces, and what hangs under them, no longer keep
+                // the object alive (0x82289020's shown-piece test).
+                if broke {
+                    mission
+                        .world()
+                        .borrow_mut()
+                        .hidden_nodes
+                        .entry(*guid)
+                        .or_default()
+                        .extend(hides);
+                }
+                to = if broke {
+                    "prop part"
+                } else {
+                    "prop part (down)"
+                };
             }
             eprintln!(
                 "nodedamage: {guid:#x} node {node:#x} took {damage:.1}, health {health:?}, \
-                 message {message:x?} to {to}, object's share {pass_through:.1}"
+                 message {message:x?} to {to}, object's share {pass_through:.1}, object health \
+                 {object_health:.1}"
             );
             return false;
         }
@@ -9165,6 +10077,7 @@ mod tests {
     #[test]
     fn a_label_only_destroy_hunts_the_nearest_living_carriers() {
         use m2_math::glam::Vec3;
+
         let vz = [m2_assets::name_hash("VZ")];
         let pmc = [m2_assets::name_hash("PMC")];
         let objs: Vec<(u32, Vec3, bool, &[u32])> = vec![
@@ -9602,6 +10515,77 @@ mod tests {
         );
     }
 
+    // The PDA the scripts find (the munitions laptop's): the HUD's, in its
+    // own state, so a call on it is kept for the HUD with its arguments.
+    #[test]
+    fn a_call_on_the_pda_goes_to_the_huds() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            Hud = {}
+            MrxGui = { GetWidgetByNameAndOwner = function() return nil end }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        lua.load(DIALOG_BOXES).exec().unwrap();
+        lua.load(
+            r#"local pda = MrxGui.GetWidgetByNameAndOwner("PDA", 1)
+               pda:UpdateSupport("artillery", nil, 3)"#,
+        )
+        .exec()
+        .unwrap();
+        let calls = hud_calls(&lua);
+        let call = calls
+            .iter()
+            .find(|c| c.group == "PdaWidget")
+            .expect("a PDA call");
+        assert_eq!(call.method, "UpdateSupport");
+        let Plain::Table(args) = &call.data else {
+            panic!("{:?}", call.data);
+        };
+        assert!(args.contains(&(Plain::Number(1.0), Plain::Text("artillery".into()))));
+        assert!(args.contains(&(Plain::Number(3.0), Plain::Number(3.0))));
+        assert!(args.contains(&(Plain::Text("n".into()), Plain::Number(3.0))));
+    }
+
+    // The scripts' own PDA (made by `MrxGuiManager.CreateGui` in their
+    // state): its `UpdateSupport` is passed on to the HUD's too, and still
+    // runs on their PDA (q736i: the laptop's call went to it alone).
+    #[test]
+    fn a_call_on_the_scripts_own_pda_goes_to_the_huds_too() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            Hud = {}
+            own_pda = { got = nil }
+            function own_pda:UpdateSupport(item, x, n) self.got = { item, n } end
+            MrxGui = { GetWidgetByNameAndOwner = function(name) if name == "PDA" then return own_pda end end }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        lua.load(DIALOG_BOXES).exec().unwrap();
+        let (item, n): (String, f64) = lua
+            .load(
+                r#"local pda = MrxGui.GetWidgetByNameAndOwner("PDA", 1)
+                   pda:UpdateSupport("carpetbomb", nil, 1)
+                   -- Found again, it is passed on once, not twice.
+                   MrxGui.GetWidgetByNameAndOwner("PDA", 1)
+                   return own_pda.got[1], own_pda.got[2]"#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!((item.as_str(), n), ("carpetbomb", 1.0));
+        let calls: Vec<_> = hud_calls(&lua)
+            .into_iter()
+            .filter(|c| c.group == "PdaWidget" && c.method == "UpdateSupport")
+            .collect();
+        assert_eq!(calls.len(), 1);
+    }
+
     // A starter on a prop is gone to only once she is seated in play;
     // one on foot at once.
     #[test]
@@ -9693,6 +10677,53 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn she_is_put_on_dry_ground_not_on_the_sea() {
+        // The sea at -36 everywhere; an island whose shore is 100 m east
+        // of her (ground at -34 from x 100 on, the sea floor -50 before),
+        // and a lagoon over it at -33.8 from x 100 to 120.
+        let sea = -36.0;
+        let ground = |x: f32, _z: f32| {
+            Some(if x >= 100.0 {
+                (-34.0, 1.0)
+            } else {
+                (-50.0, 1.0)
+            })
+        };
+        let water = |x: f32, _z: f32| {
+            Some(if (100.0..120.0).contains(&x) {
+                -33.8
+            } else {
+                -36.0
+            })
+        };
+        let at = dry_spot(Vec3::new(0.0, -36.0, 0.0), ground, water, sea).unwrap();
+        // Out of the lagoon, on the ground past it, a metre over it.
+        assert!(at.x >= 120.0, "{at}");
+        assert!((at.y - -33.0).abs() < 1e-3, "{at}");
+        // Already on dry ground: where she is.
+        let here = dry_spot(Vec3::new(130.0, -34.0, 0.0), ground, water, sea).unwrap();
+        assert_eq!(here, Vec3::new(130.0, -33.0, 0.0));
+        // A slope too steep, or all sea: nowhere.
+        assert!(dry_spot(Vec3::ZERO, |_, _| Some((-34.0, 0.5)), |_, _| None, sea).is_none());
+        assert!(dry_spot(Vec3::ZERO, |_, _| Some((-50.0, 1.0)), |_, _| None, sea).is_none());
+        // Ground under the waterline where no water is reported: still sea.
+        assert!(dry_spot(Vec3::ZERO, |_, _| Some((-35.8, 1.0)), |_, _| None, sea).is_none());
+    }
+
+    #[test]
+    fn the_object_sound_check_counts_its_charges_cue_only() {
+        let mut check = ObjectSoundCheck {
+            charge: Some(0x40),
+            ..ObjectSoundCheck::default()
+        };
+        check.heard(0x40, false);
+        check.heard(0x41, false);
+        check.heard(0x40, false);
+        check.heard(0x40, true);
+        assert_eq!((check.started, check.stopped), (2, 1));
+    }
 
     // VzaCon001's "Land on the beach": `vTgtInclude =
     // Player.GetAllCharacters()` read as no target ("quota 1 of 0
@@ -10553,5 +11584,38 @@ mod tests {
             let_go_hud_calls(&lua, last);
             assert!(hud_calls(&lua).is_empty());
         }
+    }
+
+    // A part-destroy check the run ends on without a verdict fails,
+    // naming its step; its steps are logged once each.
+    #[test]
+    fn a_sat_blip_check_without_a_verdict_fails_at_the_end() {
+        let mut check = SatBlipCheck::default();
+        check.finish();
+        assert!(check.done, "a run with no verdict ends failed");
+    }
+
+    #[test]
+    fn a_part_destroy_check_without_a_verdict_fails_at_the_end() {
+        let mut c = super::PartDestroyCheck::default();
+        c.waiting("destroy its nodes", 25.0);
+        assert_eq!(c.step, "destroy its nodes");
+        c.waiting("destroy its nodes", 25.0);
+        assert!(!c.done);
+        c.finish();
+        assert!(c.done);
+        // Once done, nothing more.
+        c.finish();
+        assert!(c.done);
+    }
+
+    // The worst case (found at the deadline, judged 30 s on) ends inside
+    // the 120 s run the merge queue gives it; the help comes before the
+    // deadline, in order.
+    #[test]
+    fn a_part_destroy_check_fits_in_a_two_minute_run() {
+        use super::PartDestroyCheck as C;
+        const { assert!(C::FIND_BY + C::JUDGE_AFTER < 120.0) };
+        const { assert!(C::DAMAGE_AFTER < C::JUDGE_AFTER) };
     }
 }

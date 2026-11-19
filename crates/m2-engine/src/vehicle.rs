@@ -1964,6 +1964,7 @@ mod tests {
             links: Vec::new(),
             turret,
             flags: Default::default(),
+            camera: None,
         };
         let r = |d: f32| d.to_radians();
         let seating = VehicleSeats {

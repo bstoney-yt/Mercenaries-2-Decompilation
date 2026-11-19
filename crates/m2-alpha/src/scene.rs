@@ -2497,6 +2497,16 @@ impl Scene {
         self.world.as_ref()?.index.template_db.damage.clone()
     }
 
+    /// The game's particle table ([`m2_engine::tuning::KeyTable`]).
+    pub fn particle_table(&self) -> Option<m2_engine::tuning::KeyTable> {
+        self.world
+            .as_ref()?
+            .index
+            .template_db
+            .particle_table
+            .clone()
+    }
+
     /// The thrown weapons the hero's template's `EquipmentLink`s hand
     /// them (free roam), each with how many they carry.
     pub fn hero_explosives(&self) -> Vec<(String, u32)> {
@@ -2524,6 +2534,15 @@ impl Scene {
             explosion_large: scale("ExplosionLarge").unwrap_or(known.explosion_large),
             bullet_large: scale("BulletLarge").unwrap_or(known.bullet_large),
         }
+    }
+
+    /// The hero's `TossGetupSeconds`, from their template.
+    pub fn hero_toss_getup(&self) -> Option<f32> {
+        self.world
+            .as_ref()?
+            .index
+            .template_db
+            .toss_getup_seconds(self.hero.template())
     }
 
     /// The hero's `Health` when whole, from their template.

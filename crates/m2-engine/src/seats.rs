@@ -305,6 +305,29 @@ pub struct Seat {
     /// 0x820E85E0 to 0x820E8674, read by `Vehicle.GetSeatParams`,
     /// 0x82346AF8).
     pub flags: SeatFlags,
+    /// Its turret camera, when the vehicle template has a `CameraTurret`
+    /// record whose `SeatName` names it ([`SeatCamera`]).
+    pub camera: Option<SeatCamera>,
+}
+
+/// A seat's `CameraTurret` record: the camera its rider looks through
+/// while aiming its gun. From the 360 code: the camera factory 0x8243EAC0
+/// builds the turret camera (class 0x820F0390, 0x824C8E80) from the
+/// seat's record. From samples: the records sit on the vehicle template,
+/// one a seat, named by `SeatName` (`seat_gunner` on 125 of them,
+/// `seat_driver` on the M113 AA's 8).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SeatCamera {
+    /// `YawSpeed`, `PitchSpeed`: radians a second at full stick.
+    pub yaw_speed: f32,
+    pub pitch_speed: f32,
+    /// `YawMin`/`YawMax` and `PitchMin`/`PitchMax`, radians from the
+    /// gun's base (the pitch the camera's: positive down).
+    pub yaw: (f32, f32),
+    pub pitch: (f32, f32),
+    /// `YawInputInertia`, `YawNoInputInertia`; the pitch's the same.
+    pub yaw_keep: [f32; 2],
+    pub pitch_keep: [f32; 2],
 }
 
 /// A seat's `SeatParameters` bits the scripts read and the alpha does
@@ -590,6 +613,26 @@ pub fn slide_over(
     }
 }
 
+/// A gunner's seat she may get into through an entrance of its own
+/// (0x8229A1C8 seats her by the entrance she uses): the first, in
+/// `SeatLink` order, that is a gunner's (not the driver's), usable by
+/// her, with a `CanEnter` row naming one of the vehicle's entrances; the
+/// seat's index and that entrance's name. How she reaches a gunner's seat
+/// on the 360, which has no key for moving seats.
+pub fn gunner_entrance(v: &VehicleSeats) -> Option<(usize, u32)> {
+    v.seats.iter().enumerate().find_map(|(i, s)| {
+        if s.role() != Role::Gunner || !s.player_use {
+            return None;
+        }
+        let e = s
+            .rows
+            .iter()
+            .filter(|r| r.can_enter)
+            .find(|r| v.entrance(r.link_name).is_some())?;
+        Some((i, e.link_name))
+    })
+}
+
 /// The seat a rider of seat `from` moves to (0x822A6FF0, `TransferToSeat`,
 /// which fails for an occupied seat): the first of its `SeatToSeat` links
 /// naming another seat of the vehicle that is not `taken`.
@@ -600,6 +643,15 @@ pub fn transfer_to(seats: &[Seat], from: usize, taken: impl Fn(usize) -> bool) -
         .iter()
         .filter_map(|&n| seats.iter().position(|s| s.name == n))
         .find(|&i| i != from && !taken(i))
+}
+
+impl Seat {
+    /// Whether a change of `jolt` m/s in the vehicle's velocity over one
+    /// 360 update throws its rider (0x822A2B60's toss; 0x8218A138's crash
+    /// ejection): over its `TossSpeedChange`, where it has one above 0.
+    pub fn tosses_at(&self, jolt: f32) -> bool {
+        self.toss_speed > 0.0 && jolt > 0.0 && self.toss_speed * self.toss_speed < jolt * jolt
+    }
 }
 
 /// How she leaves a seat (0x822A2B60's result).
@@ -618,22 +670,31 @@ pub enum ExitKind {
 }
 
 /// How she gets out of `seat` through `exit`, the vehicle moving at
-/// `speed` m/s with its up axis `up_y` high; `airborne` for a helicopter
-/// whose landed share is 0.5 or less; `blocked` when the sweep from her to
-/// the exit hits something (0x822A2B60).
+/// `speed` m/s, its velocity having changed by `jolt` m/s over the last
+/// 360 update ([`crate::Physics::vehicle_jolt`]), with its up axis `up_y`
+/// high; `airborne` for a helicopter whose landed share is 0.5 or less;
+/// `blocked` when the sweep from her to the exit hits something
+/// (0x822A2B60).
+///
+/// From the 360 code: a toss is not a fast exit. 0x822A2B60 compares the
+/// seat's `TossSpeedChange` squared with the vehicle's vfunc +0x68, which
+/// for a car or bike (0x82188A78) is the squared change of its velocity
+/// over one update (+0x14C, kept by 0x8218A138): a crash. Only the ditch
+/// compares the speed itself (vfunc +0x4C) with `MinDitchSpeed`. Xenia
+/// (knockdown-time.md): a Chopper (`TossSpeedChange` 15) left at 17.5 m/s
+/// ditches; the same bike stopping from 19.4 m/s in two frames throws her.
 pub fn exit_kind(
     seat: Option<&Seat>,
     exit: Option<&EntranceParams>,
     speed: f32,
+    jolt: f32,
     airborne: bool,
     up_y: f32,
     blocked: bool,
 ) -> ExitKind {
     if !exit.is_some_and(EntranceParams::keeps_speed) {
         if let Some(s) = seat
-            && speed > 0.0
-            && s.toss_speed > 0.0
-            && s.toss_speed < speed
+            && s.tosses_at(jolt)
         {
             return ExitKind::Toss;
         }
@@ -681,6 +742,10 @@ pub fn clear_points(centre: Vec3, yaw: f32, radius: f32) -> [Vec3; 8] {
     })
 }
 
+/// How far over her exit's place she is put as she ditches out, m: up
+/// 0.5 (0x822A1B70: the world's up, 0x82B5E578, times 0x82B7C118).
+pub const DITCH_RISE: f32 = 0.5;
+
 /// Her speed as she ditches out (0x822A1B70): 2 m/s along the vehicle's
 /// way of travel, 1.5 up and 1.5 out through the exit (`out`, from the
 /// vehicle towards her).
@@ -700,6 +765,7 @@ pub fn read_vehicles(db: &Layer<'_>) -> HashMap<u32, VehicleSeats> {
     let controller = Table::new(db, "ControllerTurret");
     let ladder = Table::new(db, "ControllerLadder");
     let turret = Table::new(db, "Turret");
+    let camera_turret = Table::new(db, "CameraTurret");
     let h = name_hash;
     let (hardpoint, name) = (h("Hardpoint"), h("Name"));
     let nonzero = |v: Option<u32>| v.filter(|&v| v != 0);
@@ -745,8 +811,25 @@ pub fn read_vehicles(db: &Layer<'_>) -> HashMap<u32, VehicleSeats> {
                 let p = seat_params.of_template(template).first().copied();
                 let float =
                     |f: &str, d: f32| p.and_then(|p| seat_params.float(p, h(f))).unwrap_or(d);
+                let seat_name = seat_links.word(r, name).unwrap_or(0);
+                let camera = camera_turret
+                    .of_template(vehicle)
+                    .iter()
+                    .find(|c| camera_turret.word(c, h("SeatName")) == Some(seat_name))
+                    .and_then(|c| {
+                        let f = |n: &str| camera_turret.float(c, h(n));
+                        Some(SeatCamera {
+                            yaw_speed: f("YawSpeed")?,
+                            pitch_speed: f("PitchSpeed")?,
+                            yaw: (f("YawMin")?, f("YawMax")?),
+                            pitch: (f("PitchMin")?, f("PitchMax")?),
+                            yaw_keep: [f("YawInputInertia")?, f("YawNoInputInertia")?],
+                            pitch_keep: [f("PitchInputInertia")?, f("PitchNoInputInertia")?],
+                        })
+                    });
                 Some(Seat {
-                    name: seat_links.word(r, name).unwrap_or(0),
+                    name: seat_name,
+                    camera,
                     hardpoint: nonzero(seat_links.word(r, hardpoint)),
                     driver: p.is_some_and(|p| bit(&seat_params, p, "bIsDriverSeat")),
                     gunner: p.is_some_and(|p| bit(&seat_params, p, "bIsGunnerSeat")),
@@ -937,6 +1020,46 @@ mod tests {
     }
 
     #[test]
+    fn a_gunner_seat_is_got_into_by_its_own_entrance() {
+        // The M151's (from samples): the driver by `entrance_driver`, the
+        // front passenger by the front right, the gunner by the rear.
+        let mut gunner = seat("seat_gunner", false, &[("entrance_rear", true, true)]);
+        gunner.gunner = true;
+        let v = VehicleSeats {
+            seats: vec![
+                seat(
+                    "seat_front_right",
+                    false,
+                    &[("entrance_front_right", true, true)],
+                ),
+                gunner,
+                seat("seat_driver", true, &[("entrance_driver", true, true)]),
+            ],
+            entrances: ["entrance_driver", "entrance_front_right", "entrance_rear"]
+                .iter()
+                .map(|n| Entrance {
+                    name: name_hash(n),
+                    hardpoint: None,
+                    params: EntranceParams::default(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(gunner_entrance(&v), Some((1, name_hash("entrance_rear"))));
+        // Not by an entrance the vehicle hasn't, nor into one she can't use.
+        let mut far = v.clone();
+        far.entrances.pop();
+        assert_eq!(gunner_entrance(&far), None);
+        let mut barred = v.clone();
+        barred.seats[1].player_use = false;
+        assert_eq!(gunner_entrance(&barred), None);
+        // A tank's driver also fires: not a gunner's seat.
+        let mut tank = v.clone();
+        tank.seats[1].driver = true;
+        assert_eq!(gunner_entrance(&tank), None);
+    }
+
+    #[test]
     fn no_driver_seat_gives_nothing() {
         let (seats, entrances) = valiant();
         assert_eq!(choose(&seats, |_| false, rows, &entrances), None);
@@ -1038,6 +1161,7 @@ mod tests {
             links: Vec::new(),
             turret: None,
             flags: Default::default(),
+            camera: None,
         }
     }
 
@@ -1263,13 +1387,27 @@ mod tests {
         bike.toss_speed = 15.0;
         let plain = EntranceParams::default();
         let k = |s: &Seat, speed, airborne, up, blocked| {
-            exit_kind(Some(s), Some(&plain), speed, airborne, up, blocked)
+            exit_kind(Some(s), Some(&plain), speed, 0.0, airborne, up, blocked)
         };
         assert_eq!(k(&car, 0.0, false, 1.0, false), ExitKind::Animated);
         assert_eq!(k(&car, 5.0, false, 1.0, false), ExitKind::Animated);
         assert_eq!(k(&car, 5.01, false, 1.0, false), ExitKind::Ditch);
-        assert_eq!(k(&bike, 15.0, false, 1.0, false), ExitKind::Ditch);
-        assert_eq!(k(&bike, 15.01, false, 1.0, false), ExitKind::Toss);
+        // A bike at speed ditches like a car: its toss is a crash's.
+        assert_eq!(k(&bike, 15.01, false, 1.0, false), ExitKind::Ditch);
+        assert_eq!(k(&bike, 17.5, false, 1.0, false), ExitKind::Ditch);
+        let j = |jolt| exit_kind(Some(&bike), Some(&plain), 17.5, jolt, false, 1.0, false);
+        assert_eq!(j(15.0), ExitKind::Ditch);
+        assert_eq!(j(15.01), ExitKind::Toss);
+        assert!(!car.tosses_at(100.0), "no TossSpeedChange, no toss");
+        // Xenia (knockdown-time.md): the Chopper (15) crashing threw her at
+        // |dv| 18.34 and 21.08 m/s in an update; a Phoenix (no
+        // TossSpeedChange) going 23.1 -> 5.5 m/s (|dv| 28.58) kept her in.
+        assert!(bike.tosses_at(18.34) && bike.tosses_at(21.08));
+        assert!(!car.tosses_at(28.58));
+        assert_eq!(
+            exit_kind(Some(&car), Some(&plain), 5.5, 28.58, false, 1.0, false),
+            ExitKind::Ditch
+        );
         assert_eq!(k(&car, 0.0, true, 1.0, false), ExitKind::Ditch);
         assert_eq!(k(&car, 0.0, false, 0.49, false), ExitKind::Crawl);
         assert_eq!(k(&car, 0.0, false, 0.49, true), ExitKind::Crawl);
@@ -1280,12 +1418,12 @@ mod tests {
             ..plain
         };
         assert_eq!(
-            exit_kind(Some(&car), Some(&deck), 20.0, false, 1.0, false),
+            exit_kind(Some(&car), Some(&deck), 20.0, 40.0, false, 1.0, false),
             ExitKind::Animated
         );
         // No seat data: the 5 m/s default.
         assert_eq!(
-            exit_kind(None, None, 6.0, false, 1.0, false),
+            exit_kind(None, None, 6.0, 0.0, false, 1.0, false),
             ExitKind::Ditch
         );
     }

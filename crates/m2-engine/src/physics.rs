@@ -1749,6 +1749,11 @@ struct VehicleBody {
     before: Vec3,
     /// Its spin before the last step, radians a second about each axis.
     spin_before: Vec3,
+    /// Its velocities as the last two steps began, newest first
+    /// (`None` before its first step), and how much its velocity changed
+    /// over that one 360 update ([`Physics::vehicle_jolt`]).
+    history: Option<[Vec3; 2]>,
+    jolt: f32,
     /// A boat's: it floats instead of rolling on wheels.
     hull: Option<Hull>,
     /// A helicopter's: it flies.
@@ -2227,6 +2232,11 @@ struct Hull {
     water: BoatTuning,
 }
 
+/// The 360's game step, s: its frame at 30 Hz (Xenia's per-frame read of
+/// a ditch moves her once each 1/30 s), the length of a held step
+/// ([`Character::hold`]).
+pub const HOLD_STEP: f32 = 1.0 / 30.0;
+
 /// A character's capsule and motion.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Character {
@@ -2244,6 +2254,13 @@ pub struct Character {
     /// while it goes on pushing, as a proxy keeps its contacts from step
     /// to step ([`Physics::move_character`]).
     pub wall: Option<Vec3>,
+    /// Its velocity was set outright (the 360 human's vfunc +0x90,
+    /// 0x82179ED0, which sets the proxy's velocity and its byte +0x250):
+    /// the next [`Physics::move_character`] moves it at that velocity as it
+    /// is, no walk and no gravity, as 0x8217A2D0 skips the state machine
+    /// for that one step, then clears it. Seconds of it left: the 360's
+    /// step is its frame, 1/30 s ([`HOLD_STEP`]).
+    pub hold: f32,
 }
 
 impl Character {
@@ -2257,6 +2274,7 @@ impl Character {
             height: 1.8,
             gravity: GRAVITY,
             wall: None,
+            hold: 0.0,
         }
     }
 
@@ -2274,11 +2292,12 @@ impl Character {
 /// through them.
 const RAGDOLL: r::Group = r::Group::GROUP_2;
 
-/// The collision group of loose pieces: they land on the world and people
-/// but not on each other (a broken prop's pieces start touching: boxes
-/// round them overlap), and vehicles drive through them (round 90's tank
-/// sat lifted on three pieces of what it had knocked down, two tracks off
-/// the ground).
+/// The collision group of loose pieces: they land on the world, people
+/// and vehicles' hulls (as the 360's loose objects meet everything), but
+/// not on each other (a broken prop's pieces start touching: boxes round
+/// them overlap). Round 90's tank once sat lifted on three pieces of what
+/// it had knocked down; that was with the pieces kept tumbling, not
+/// asleep.
 const DEBRIS: r::Group = r::Group::GROUP_3;
 
 /// The collision group of vehicles' hulls and turrets.
@@ -2403,8 +2422,9 @@ impl Tracks {
 struct Rest {
     /// Where its centre of mass was at the last check (world).
     from: Option<Vec3>,
-    /// Seconds since the last check.
-    clock: f32,
+    /// The world's check its last check was ([`REST_PERIOD`]s of the
+    /// physics' time): every body is checked on the same step.
+    check: Option<i64>,
     /// Checks in a row it has kept within the distance.
     still: u8,
     /// Its body was put to sleep (or found asleep).
@@ -2417,14 +2437,36 @@ const REST_DISTANCE: f32 = 0.02;
 const REST_CHECKS: u8 = 6;
 
 impl Rest {
-    /// One step of `dt` s at `centre`: whether it now sleeps.
-    fn step(&mut self, centre: Vec3, dt: f32) -> bool {
-        let from = *self.from.get_or_insert(centre);
-        self.clock += dt;
-        if self.clock + 1e-6 < REST_PERIOD {
+    /// One step, the physics' time `now`, at `centre`: whether it may
+    /// sleep at this step.
+    ///
+    /// From the 360 code: the island check 0x824CE9C8 reads each body's
+    /// two 7-bit still counts (its motion's +0xDC and +0xDA, each tagged in
+    /// its top bits with the world's check index, +0x2C6 and +0x2C5) and
+    /// keeps the island awake while any body's larger count is under 6.
+    /// The check index is the world's: every body is checked on the same
+    /// step, and an island may sleep only then. Here the check index is
+    /// the physics' time in [`REST_PERIOD`]s, the same for every body.
+    /// Inferred, not traced: that a body's count goes up by one a check
+    /// it kept within [`REST_DISTANCE`] and back to 0 otherwise (the
+    /// integrator's update of +0xDC/+0xDA is not read).
+    ///
+    /// Before, each body had its own clock from when it was made: two
+    /// touching, their checks on different steps, were never both allowed
+    /// on one step and their island never slept (q753e: two pairs of
+    /// placed objects standing in each other, awake after 10 s).
+    fn step(&mut self, centre: Vec3, now: f32) -> bool {
+        let k = (now / REST_PERIOD).floor() as i64;
+        let Some(last) = self.check else {
+            self.check = Some(k);
+            self.from = Some(centre);
+            return false;
+        };
+        if k == last {
             return false;
         }
-        self.clock -= REST_PERIOD;
+        self.check = Some(k);
+        let from = self.from.unwrap_or(centre);
         self.still = if (centre - from).length() < REST_DISTANCE {
             self.still.saturating_add(1)
         } else {
@@ -3358,6 +3400,20 @@ pub struct Physics {
     human_ragdoll: Option<std::sync::Arc<m2_assets::ragdoll::HumanRagdoll>>,
     /// Loose props' pieces, oldest first.
     debris: Vec<Option<r::RigidBodyHandle>>,
+    /// Props that are bodies of their own from the start
+    /// ([`add_prop_body`](Self::add_prop_body)): each sleeps by the 360's
+    /// rule ([`Rest`]), as a tank's body does.
+    prop_rest: HashMap<r::RigidBodyHandle, Rest>,
+    /// Each prop body's velocity before the last step (still for one
+    /// asleep): what it met a vehicle with ([`vehicle_prop_hits`]).
+    ///
+    /// [`vehicle_prop_hits`]: Physics::vehicle_prop_hits
+    prop_before: HashMap<r::RigidBodyHandle, Vec3>,
+    /// Props placed asleep, put to sleep once their first step has made
+    /// their contacts (a new contact wakes a body in rapier).
+    prop_sleep: Vec<r::RigidBodyHandle>,
+    /// How long the last [`step`](Self::step) took, milliseconds.
+    pub last_step_ms: f32,
     /// The water's surface boats float on, if there is any.
     water: Option<f32>,
     /// The game's water heights: rivers, pools and lakes above the sea
@@ -3374,9 +3430,6 @@ pub struct Physics {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DebrisId(usize);
 
-/// Loose pieces tumbling at once at most: past this many the oldest are
-/// held where they lie.
-const MAX_DEBRIS: usize = 160;
 /// A loose piece this far down has fallen through the island (its ground
 /// streamed out) and is held.
 const DEBRIS_FLOOR: f32 = -500.0;
@@ -3431,6 +3484,10 @@ impl Physics {
             ragdolls: Vec::new(),
             human_ragdoll: None,
             debris: Vec::new(),
+            prop_rest: HashMap::new(),
+            prop_before: HashMap::new(),
+            prop_sleep: Vec::new(),
+            last_step_ms: 0.0,
             water: None,
             inland: None,
             time: 0.0,
@@ -3589,8 +3646,64 @@ impl Physics {
     /// Advances the simulation by `dt` seconds (and brings colliders added
     /// since the last step into scene queries).
     pub fn step(&mut self, dt: f32) {
+        let started = std::time::Instant::now();
+        self.rest_props(dt);
+        self.step_inner(dt);
+        for h in std::mem::take(&mut self.prop_sleep) {
+            if let Some(b) = self.world.bodies.get_mut(h) {
+                b.sleep();
+            }
+            if let Some(rest) = self.prop_rest.get_mut(&h) {
+                rest.asleep = true;
+            }
+        }
+        self.last_step_ms = started.elapsed().as_secs_f32() * 1000.0;
+    }
+
+    /// The props that are bodies of their own sleep as the 360's do
+    /// ([`Rest`], as [`step`](Self::step) has a tank's body sleep): a body
+    /// asleep with its island stays so until woken; woken, it counts
+    /// again; still for long enough, its island may sleep this step.
+    fn rest_props(&mut self, dt: f32) {
+        // This step's time ([`step_inner`](Self::step_inner) adds `dt`).
+        let now = self.time + dt;
+        let w = &mut self.world;
+        self.prop_before.clear();
+        for h in self.prop_rest.keys() {
+            if let Some(b) = w.bodies.get(*h) {
+                let v = if b.is_sleeping() {
+                    Vec3::ZERO
+                } else {
+                    vec3(b.linvel())
+                };
+                self.prop_before.insert(*h, v);
+            }
+        }
+        self.prop_rest.retain(|h, rest| {
+            let Some(b) = w.bodies.get_mut(*h) else {
+                return false;
+            };
+            if !b.is_dynamic() {
+                return false;
+            }
+            if b.is_sleeping() {
+                rest.asleep = true;
+                rest_hand_off(b, false);
+                return true;
+            }
+            if rest.asleep {
+                rest.wake();
+            }
+            let still = rest.step(vec3(b.center_of_mass()), now);
+            rest_hand_off(b, still);
+            true
+        });
+    }
+
+    fn step_inner(&mut self, dt: f32) {
         self.world.integration_parameters.dt = dt;
         self.time += dt;
+        let now = self.time;
         let w = &mut self.world;
         for v in self.vehicles.iter_mut().flatten() {
             v.before = w
@@ -3601,6 +3714,11 @@ impl Physics {
                 .bodies
                 .get(v.controller.chassis)
                 .map_or(Vec3::ZERO, |b| vec3(b.angvel()));
+            // Its velocity's change over one 360 update (1/30 s: two of
+            // these steps).
+            let h = v.history.get_or_insert([v.before; 2]);
+            v.jolt = (v.before - h[1]).length();
+            *h = [v.before, h[0]];
             if v.held {
                 continue;
             }
@@ -3627,7 +3745,7 @@ impl Physics {
                 // is never put to sleep alone: rapier would go on moving
                 // it (gravity) while its tracks no longer hold it up
                 // (PmcCon001: the villa tank fell through the HQ's floor).
-                let still = !v.wrecked && tank.rest.step(vec3(b.center_of_mass()), dt);
+                let still = !v.wrecked && tank.rest.step(vec3(b.center_of_mass()), now);
                 rest_hand_off(b, still);
             }
             let filter = ground().exclude_rigid_body(v.controller.chassis);
@@ -3858,10 +3976,11 @@ impl Physics {
         }
     }
 
-    /// Holds loose pieces fallen through the island, and the oldest past
-    /// [`MAX_DEBRIS`] still tumbling.
+    /// Holds loose pieces fallen through the island. The 360 holds no
+    /// count of them tumbling: what a blast throws is kept in check by
+    /// taking whole objects away ([`crate::disposer`]), and the rest
+    /// sleeps by the world's rule.
     fn settle_debris(&mut self) {
-        let mut tumbling = 0;
         for h in self.debris.iter().rev().flatten() {
             let Some(b) = self.world.bodies.get_mut(*h) else {
                 continue;
@@ -3869,8 +3988,7 @@ impl Physics {
             if !b.is_dynamic() {
                 continue;
             }
-            tumbling += 1;
-            if tumbling > MAX_DEBRIS || b.translation().y < DEBRIS_FLOOR {
+            if b.translation().y < DEBRIS_FLOOR {
                 b.set_body_type(r::RigidBodyType::Fixed, false);
             }
         }
@@ -3927,7 +4045,7 @@ impl Physics {
             spin,
             r::InteractionGroups::new(
                 DEBRIS,
-                r::Group::ALL.difference(DEBRIS).difference(VEHICLE),
+                r::Group::ALL.difference(DEBRIS),
                 r::InteractionTestMode::And,
             ),
         );
@@ -3963,6 +4081,41 @@ impl Physics {
                 r::InteractionTestMode::And,
             ),
         )
+    }
+
+    /// A whole prop as a loose body of its own from the start, at rest,
+    /// meeting vehicles' hulls and other props as the 360's props do (gap
+    /// P7; the port's props are fixed until knocked loose). For the
+    /// props benchmark (`propbench`); nothing in play makes these yet.
+    pub fn add_prop_body(&mut self, piece: &LoosePiece, at: Mat4, asleep: bool) -> DebrisId {
+        let id = self.add_piece(
+            piece,
+            at,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            r::InteractionGroups::new(
+                DEBRIS,
+                r::Group::ALL.difference(RUBBLE),
+                r::InteractionTestMode::And,
+            ),
+        );
+        // Put to sleep where it is placed (`asleep`): it stays until
+        // something touches it, as a prop at rest in its layer.
+        if let Some(h) = self.debris[id.0] {
+            let mut rest = Rest::default();
+            if let Some(b) = self.world.bodies.get_mut(h) {
+                // Rapier's own sleep off first (touching its activation
+                // wakes it), then asleep if so placed.
+                rest_hand_off(b, false);
+                if asleep {
+                    b.sleep();
+                    rest.asleep = true;
+                    self.prop_sleep.push(h);
+                }
+            }
+            self.prop_rest.insert(h, rest);
+        }
+        id
     }
 
     /// As [`add_debris`](Self::add_debris), a piece of goods riding loose
@@ -4118,6 +4271,51 @@ impl Physics {
             }
         }
         Some((*place, out?))
+    }
+
+    /// Adds `velocity` (m/s) to loose piece `id`'s, waking it (a blast's
+    /// push on a body that was at rest).
+    pub fn push_debris(&mut self, id: DebrisId, velocity: Vec3) {
+        let Some(h) = self.debris.get(id.0).copied().flatten() else {
+            return;
+        };
+        if let Some(b) = self.world.bodies.get_mut(h) {
+            let v = vec3(b.linvel()) + velocity;
+            b.set_linvel(vector(v), true);
+        }
+    }
+
+    /// How many loose pieces are awake (moving, not put to sleep).
+    pub fn debris_awake(&self) -> usize {
+        self.debris
+            .iter()
+            .flatten()
+            .filter(|h| {
+                self.world
+                    .bodies
+                    .get(**h)
+                    .is_some_and(|b| b.is_dynamic() && !b.is_sleeping())
+            })
+            .count()
+    }
+
+    /// The loose pieces awake ([`debris_awake`](Self::debris_awake)): each
+    /// one's id, where it is and how fast it moves.
+    pub fn debris_awake_list(&self) -> Vec<(DebrisId, Vec3, f32)> {
+        self.debris
+            .iter()
+            .enumerate()
+            .filter_map(|(i, h)| {
+                let b = self.world.bodies.get((*h)?)?;
+                (b.is_dynamic() && !b.is_sleeping()).then(|| {
+                    (
+                        DebrisId(i),
+                        vec3(b.translation()),
+                        vec3(b.linvel()).length(),
+                    )
+                })
+            })
+            .collect()
     }
 
     pub fn remove_debris(&mut self, id: DebrisId) {
@@ -4806,6 +5004,8 @@ impl Physics {
             held: false,
             before: Vec3::ZERO,
             spin_before: Vec3::ZERO,
+            history: None,
+            jolt: 0.0,
             hull,
             rotor,
         }));
@@ -5630,6 +5830,76 @@ impl Physics {
         out
     }
 
+    /// The props that are bodies of their own ([`add_prop_body`]) a
+    /// vehicle's body is in contact with after the last step, each once:
+    /// the prop's piece, the point of deepest contact (world), the speed
+    /// they closed at along the contact normal before the step (m/s; the
+    /// vehicle's velocity at that point less the prop's), and the prop
+    /// body's mass. From the 360 code: a collision event's size takes the
+    /// contacts' closing speed (0x82162BB8) and the two masses (0x82163758,
+    /// [`crate::durability::crash_size`]).
+    ///
+    /// [`add_prop_body`]: Physics::add_prop_body
+    pub fn vehicle_prop_hits(&self, id: VehicleId) -> Vec<(DebrisId, Vec3, f32, f32)> {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return Vec::new();
+        };
+        let Some(body) = self.world.bodies.get(v.controller.chassis) else {
+            return Vec::new();
+        };
+        let centre = vec3(body.center_of_mass());
+        let mut out: Vec<(DebrisId, Vec3, f32, f32)> = Vec::new();
+        for &c in body.colliders() {
+            let Some(mine) = self.world.colliders.get(c) else {
+                continue;
+            };
+            for pair in self.world.narrow_phase.contact_pairs_with(c) {
+                if !pair.has_any_active_contact() {
+                    continue;
+                }
+                let first = pair.collider1 == c;
+                let other = if first {
+                    pair.collider2
+                } else {
+                    pair.collider1
+                };
+                let Some(h) = self.world.colliders.get(other).and_then(|o| o.parent()) else {
+                    continue;
+                };
+                if !self.prop_rest.contains_key(&h) {
+                    continue;
+                }
+                let Some(d) = self.debris.iter().position(|x| *x == Some(h)).map(DebrisId) else {
+                    continue;
+                };
+                if out.iter().any(|o| o.0 == d) {
+                    continue;
+                }
+                let Some((manifold, deepest)) = pair
+                    .manifolds()
+                    .iter()
+                    .flat_map(|m| m.points.iter().map(move |p| (m, p)))
+                    .min_by(|a, b| a.1.dist.total_cmp(&b.1.dist))
+                else {
+                    continue;
+                };
+                let (local, normal) = if first {
+                    (deepest.local_p1, vec3(manifold.data.normal))
+                } else {
+                    (deepest.local_p2, -vec3(manifold.data.normal))
+                };
+                let at = vec3(mine.position().transform_point(local));
+                let n = normal.normalize_or_zero();
+                let vehicle = v.before + v.spin_before.cross(at - centre);
+                let prop = self.prop_before.get(&h).copied().unwrap_or(Vec3::ZERO);
+                let closing = (vehicle - prop).dot(n).max(0.0);
+                let mass = self.world.bodies.get(h).map_or(0.0, |b| b.mass());
+                out.push((d, at, closing, mass));
+            }
+        }
+        out
+    }
+
     /// The statics a vehicle's body is in contact with (its wheels'
     /// contacts aside): the terrain's cells, placed objects, buildings and
     /// a state layer's models, each once, with the deepest point of
@@ -6077,6 +6347,31 @@ impl Physics {
 
     /// A vehicle's velocity before the last step, m/s: what it hit things
     /// with (a crash stops it within the step).
+    /// How much vehicle `id`'s velocity changed over the last 360 update
+    /// (1/30 s, two of these steps), m/s: what its seats'
+    /// `TossSpeedChange` is measured against. From the 360 code: the car
+    /// physics' update (0x8218A138) keeps `|v - v_last|²` at +0x14C (v
+    /// from vfunc +0x4C, v_last at +0x140), which its vfunc +0x68
+    /// (0x82188A78) answers and the exit kind (0x822A2B60) tests.
+    pub fn vehicle_jolt(&self, id: VehicleId) -> f32 {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map_or(0.0, |v| v.jolt)
+    }
+
+    /// Vehicle `id`'s velocity one 360 update ago (the older of its
+    /// history's two, before any jolt [`vehicle_jolt`](Self::vehicle_jolt)
+    /// measures): the +0x140 the car physics keeps (0x8218A138), which its
+    /// crash ejection hands its riders.
+    pub fn vehicle_velocity_pre_jolt(&self, id: VehicleId) -> Vec3 {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .and_then(|v| v.history.map(|h| h[1]))
+            .unwrap_or(Vec3::ZERO)
+    }
+
     pub fn vehicle_velocity_before(&self, id: VehicleId) -> Vec3 {
         self.vehicles
             .get(id.0)
@@ -6106,11 +6401,39 @@ impl Physics {
     /// Sets a vehicle's velocity, m/s (as it was before something it hit
     /// gave way).
     pub fn set_vehicle_velocity(&mut self, id: VehicleId, velocity: Vec3) {
+        let Some(v) = self.vehicles.get_mut(id.0).and_then(Option::as_mut) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
+            body.set_linvel(vector(velocity), true);
+        }
+        // Set, not driven into: no jolt ([`Physics::vehicle_jolt`]).
+        v.history = None;
+        v.jolt = 0.0;
+    }
+
+    /// Holds a vehicle at `velocity`, m/s, keeping its velocity history:
+    /// a run-up for the offscreen checks, so a crash after it still counts
+    /// as a jolt ([`vehicle_jolt`](Self::vehicle_jolt)).
+    pub fn hold_vehicle_velocity(&mut self, id: VehicleId, velocity: Vec3) {
         let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
             return;
         };
         if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
             body.set_linvel(vector(velocity), true);
+        }
+    }
+
+    /// Puts a vehicle at `position` facing `rotation`, at rest (for the
+    /// offscreen checks).
+    pub fn place_vehicle(&mut self, id: VehicleId, position: Vec3, rotation: Quat) {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
+            body.set_position(pose(position, rotation.normalize()), true);
+            body.set_linvel(vector(Vec3::ZERO), true);
+            body.set_angvel(vector(Vec3::ZERO), true);
         }
     }
 
@@ -6583,6 +6906,53 @@ impl Physics {
                 .map(|b| vec3(b.linvel()).length())
                 .fold(0.0, f32::max),
         )
+    }
+
+    /// Each limb's speed, m/s, and whether it touches anything (for
+    /// tracing what keeps a limp body from lying still).
+    /// What each touches: `v` a vehicle, `s` another limb of the same
+    /// body, `g` anything else (the ground, a wall), empty nothing.
+    pub fn ragdoll_limb_speeds(&self, id: RagdollId) -> Vec<(usize, f32, String)> {
+        let Some(doll) = self.ragdolls.get(id.0).and_then(Option::as_ref) else {
+            return Vec::new();
+        };
+        let chassis: Vec<_> = self
+            .vehicles
+            .iter()
+            .flatten()
+            .map(|v| v.controller.chassis)
+            .collect();
+        let own: Vec<_> = doll.bodies.iter().flatten().copied().collect();
+        doll.bodies
+            .iter()
+            .enumerate()
+            .filter_map(|(k, h)| {
+                let b = self.world.bodies.get((*h)?)?;
+                let mut what = String::new();
+                for &c in b.colliders() {
+                    for p in self.world.narrow_phase.contact_pairs_with(c) {
+                        if !p.has_any_active_contact() {
+                            continue;
+                        }
+                        let other = if p.collider1 == c {
+                            p.collider2
+                        } else {
+                            p.collider1
+                        };
+                        let parent = self.world.colliders.get(other).and_then(|o| o.parent());
+                        let tag = match parent {
+                            Some(q) if chassis.contains(&q) => 'v',
+                            Some(q) if own.contains(&q) => 's',
+                            _ => 'g',
+                        };
+                        if !what.contains(tag) {
+                            what.push(tag);
+                        }
+                    }
+                }
+                Some((k, vec3(b.linvel()).length(), what))
+            })
+            .collect()
     }
 
     /// Shoves every limb of a ragdoll by `velocity` (m/s).
@@ -7286,10 +7656,19 @@ impl Physics {
         dt: f32,
     ) {
         let mut vertical = character.velocity.y;
-        if character.grounded {
-            vertical = jump.unwrap_or(0.0);
+        // A velocity just set holds for this step as it is (0x8217A2D0
+        // with +0x250 set).
+        let held = character.hold > 0.0;
+        character.hold = (character.hold - dt).max(0.0);
+        let walk = if held { character.velocity } else { walk };
+        if held {
+            character.grounded = false;
+        } else {
+            if character.grounded {
+                vertical = jump.unwrap_or(0.0);
+            }
+            vertical -= character.gravity * dt;
         }
-        vertical -= character.gravity * dt;
         let desired = Vec3::new(walk.x, 0.0, walk.z) * dt + Vec3::Y * (vertical * dt);
         let shape = r::Capsule::new_y(character.half_height(), character.radius);
         let mut hits: Vec<(r::ColliderHandle, Vec3, Vec3)> = Vec::new();
@@ -7385,6 +7764,47 @@ pub fn solved_walk(walk: Vec3, walls: &[Vec3]) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A prop that is a body of its own from the start: put down asleep it
+    // stays asleep; put down awake on the ground it falls still and sleeps
+    // by the 360's rule ([`Rest`]: 6 checks of 0.2 s within 0.02 m), not
+    // rapier's own, within a couple of seconds.
+    #[test]
+    fn a_prop_body_sleeps_by_the_360s_rule() {
+        let mut p = Physics::new();
+        let v = [
+            Vec3::new(-50.0, 0.0, -50.0),
+            Vec3::new(50.0, 0.0, -50.0),
+            Vec3::new(50.0, 0.0, 50.0),
+            Vec3::new(-50.0, 0.0, 50.0),
+        ];
+        let ground = CollisionShape::mesh(&v, &[[0, 1, 2], [0, 2, 3]]).unwrap();
+        p.add_static(StaticKey::Cell(1), &ground, Vec3::ZERO, Quat::IDENTITY);
+        p.step(1.0 / 60.0);
+        let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.5), 50.0);
+        let asleep = p.add_prop_body(
+            &piece,
+            Mat4::from_translation(Vec3::new(0.0, 0.5, 0.0)),
+            true,
+        );
+        let awake = p.add_prop_body(
+            &piece,
+            Mat4::from_translation(Vec3::new(5.0, 0.6, 0.0)),
+            false,
+        );
+        let body =
+            |p: &Physics, id: DebrisId| p.world.bodies[p.debris[id.0].unwrap()].is_sleeping();
+        for _ in 0..30 {
+            p.step(1.0 / 60.0);
+        }
+        assert!(body(&p, asleep), "put down asleep, it stays so");
+        assert!(!body(&p, awake), "not yet: under 1.2 s");
+        for _ in 0..(3.0 * 60.0) as usize {
+            p.step(1.0 / 60.0);
+        }
+        assert!(body(&p, awake), "still for 6 checks: asleep");
+        assert_eq!(p.debris_awake(), 0);
+    }
 
     // On its handbrake a boat slides across with less of the water's drag
     // (`HandBrakeAntiSideDrag`, by its share of its top speed) and the
@@ -8589,6 +9009,37 @@ mod tests {
         walk(&p, &mut c, Vec3::ZERO, 2.0);
         assert!(c.grounded);
         assert!(c.position.y.abs() < 0.1, "{}", c.position.y);
+    }
+
+    /// From the 360 code (0x82179ED0 sets the proxy's velocity and +0x250;
+    /// 0x8217A2D0 then keeps it one step without the state machine): a
+    /// velocity set outright moves the character as it is for one step,
+    /// no gravity and no walk, then gravity takes over.
+    #[test]
+    fn a_velocity_set_outright_holds_one_step() {
+        let mut p = ready();
+        p.step(DT);
+        let mut c = Character::new(Vec3::new(0.0, 2.0, 0.0));
+        c.gravity = 16.5;
+        c.velocity = Vec3::new(1.5, 2.0, 0.0);
+        c.hold = HOLD_STEP;
+        // One 360 step (1/30 s): two of these.
+        p.move_character(&mut c, Vec3::ZERO, None, DT);
+        p.move_character(&mut c, Vec3::ZERO, None, DT);
+        assert!(c.hold < 1e-6, "{}", c.hold);
+        assert!((c.velocity.y - 2.0).abs() < 1e-5, "{}", c.velocity.y);
+        assert!(
+            (c.position.y - (2.0 + 4.0 * DT)).abs() < 1e-3,
+            "{}",
+            c.position.y
+        );
+        assert!((c.position.x - 3.0 * DT).abs() < 1e-3, "{}", c.position.x);
+        p.move_character(&mut c, Vec3::ZERO, None, DT);
+        assert!(
+            (c.velocity.y - (2.0 - 16.5 * DT)).abs() < 1e-4,
+            "{}",
+            c.velocity.y
+        );
     }
 
     /// Pushed against a wall a character's velocity is the walk the wall
@@ -10354,7 +10805,7 @@ mod tests {
         let dt = 1.0 / 60.0;
         let mut still = Rest::default();
         let steps = |r: &mut Rest, speed: f32| {
-            (1..=120).find(|&i| r.step(Vec3::Z * speed * i as f32 * dt, dt))
+            (1..=120).find(|&i| r.step(Vec3::Z * speed * i as f32 * dt, i as f32 * dt))
         };
         // Still: the first check sets where it stands, then six in a row
         // within 0.02 m (each 0.2 s): asleep at 1.2 s.
@@ -10365,6 +10816,30 @@ mod tests {
         // At 0.05 m/s (0.01 m a check) it still sleeps.
         let mut slow = Rest::default();
         assert_eq!(steps(&mut slow, 0.05), Some(72));
+        // Two bodies made at different times are checked on the same
+        // steps (the world's check index), so both may sleep on one step;
+        // never between checks.
+        let mut a = Rest::default();
+        let mut b = Rest::default();
+        let mut both = None;
+        for i in 1..=200 {
+            let now = i as f32 * dt;
+            let x = a.step(Vec3::ZERO, now);
+            let y = if i > 7 {
+                b.step(Vec3::ZERO, now)
+            } else {
+                false
+            };
+            assert_eq!(
+                x || y,
+                (x || y) && i % 12 == 0,
+                "allowed off a check, step {i}"
+            );
+            if x && y {
+                both.get_or_insert(i);
+            }
+        }
+        assert!(both.is_some(), "never both on one step");
     }
 
     #[test]
@@ -11287,8 +11762,52 @@ mod tests {
         assert!(lamp.distance(Vec3::new(101.0, 1.1, 0.0)) < 1e-4, "{lamp}");
     }
 
+    // A car driven into a prop that is a body of its own (asleep where it
+    // stands) reports the meeting with the speed they closed at and the
+    // prop's mass: what the crash rules take (0x82162BB8, 0x82163758).
     #[test]
-    fn vehicles_drive_through_loose_pieces() {
+    fn a_car_meeting_a_prop_body_reports_its_closing_speed_and_mass() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
+        let crate_ = LoosePiece {
+            node: None,
+            shape: r::SharedShape::cuboid(0.5, 0.5, 0.5),
+            mass: 80.0,
+            material: BodyMaterial::DEBRIS,
+            from_model: Mat4::IDENTITY,
+        };
+        let d = p.add_prop_body(
+            &crate_,
+            Mat4::from_translation(Vec3::new(0.0, 0.5, 12.0)),
+            true,
+        );
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        for _ in 0..30 {
+            p.step(DT);
+        }
+        let mut met = None;
+        for _ in 0..240 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+            if let Some(h) = p.vehicle_prop_hits(id).into_iter().find(|h| h.0 == d) {
+                met = Some(h);
+                break;
+            }
+        }
+        let (_, _, closing, mass) = met.expect("the car met the crate");
+        assert!(closing > 1.0, "closing at {closing} m/s");
+        assert!((mass - 80.0).abs() < 1.0, "{mass} kg");
+    }
+
+    // Was `vehicles_drive_through_loose_pieces` (invented, round 90).
+    #[test]
+    fn a_vehicles_hull_meets_loose_pieces() {
         let mut p = Physics::new();
         floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
         // A heavy beam lying across the way 10 m ahead, settled.
@@ -11325,14 +11844,14 @@ mod tests {
             p.step(DT);
             highest = highest.max(p.vehicle_transform(id).unwrap().w_axis.y);
         }
-        let at = p.vehicle_transform(id).unwrap().w_axis.truncate();
-        assert!(at.z > 16.0, "drove past the beam to {at}");
-        assert!(highest < rest + 0.1, "rode up from {rest} to {highest}");
-        // And the beam lies where it was.
+        // The hull meets it, as the 360's loose objects meet everything:
+        // the beam is shoved on or ridden over, not passed through.
         let beam_at = p.debris_place(d).unwrap().w_axis.truncate();
+        let shoved = beam_at.distance(Vec3::new(0.0, 0.3, 10.0));
         assert!(
-            beam_at.distance(Vec3::new(0.0, 0.3, 10.0)) < 0.2,
-            "{beam_at}"
+            shoved > 0.3 || highest > rest + 0.1,
+            "the beam moved {shoved} m, the car rose {} m",
+            highest - rest
         );
     }
 
