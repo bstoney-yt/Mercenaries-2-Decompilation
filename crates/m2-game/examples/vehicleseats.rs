@@ -1,6 +1,6 @@
 //! Prints the seat data of vehicle templates of your own installation:
 //! each seat (`SeatLink` name, driver/gunner/hijackable/player-use bits and
-//! its `EntranceToSeat` rows) and each entrance (`EntranceLink` name and
+//! its `EntranceToSeat` rows, and its `CameraTurret` record) and each entrance (`EntranceLink` name and
 //! its parameters).
 //!
 //! ```text
@@ -61,8 +61,15 @@ fn main() -> Result<()> {
                 println!("{name} ({id:#x}):");
                 for s in &v.seats {
                     println!(
-                        "  seat {:08x} hardpoint {:x?} driver {} gunner {} hijackable {} player_use {} rows {:x?}",
-                        s.name, s.hardpoint, s.driver, s.gunner, s.hijackable, s.player_use, s.rows
+                        "  seat {:08x} hardpoint {:x?} driver {} gunner {} hijackable {} player_use {} rows {:x?} camera {:?}",
+                        s.name,
+                        s.hardpoint,
+                        s.driver,
+                        s.gunner,
+                        s.hijackable,
+                        s.player_use,
+                        s.rows,
+                        s.camera
                     );
                 }
                 for e in &v.entrances {
