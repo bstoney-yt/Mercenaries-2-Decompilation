@@ -1,0 +1,37 @@
+# PmcCon001 by the game's Mission skip, then get into the Phoenix (Racing) 19 m away.
+wait 25
+pokestr 83133F98 PmcCon001
+poke 82B7C953 0
+tap_until start Continue_without 90
+wait 2
+press up 0.3
+wait 1
+press a 0.3
+until NOTICE 30 2
+press a 0.3
+until new_game 60 2
+press a 0.3
+until Mattias 30 2
+press down 0.3
+wait 2
+ocr charsel
+press a 0.3
+wait 3
+ocr card
+press a 0.3
+tap_until a Objective 150
+trackhero
+mark PmcCon001 start
+ocr start
+walkcam 2765 -12 3 40
+enter 2765 -7 2.0 8
+rememberveh
+camlog start bike3cam
+healthlog start bike3hp
+measure a 8
+hold a 0.4
+wait 8
+ocr after
+healthlog stop
+camlog stop
+mark done
