@@ -7061,6 +7061,66 @@ mod tests {
         assert!((x - 746.67).abs() < 0.01 && y == 480.0, "{x} {y}");
     }
 
+    /// With `M2_INSTALL` set: the game's own HUD scripts, the satellite's
+    /// view opened and closed as the play drives it, then a dialog box's
+    /// accept press (`BUTTON_PAD2_D`, as the HQ's Accept box gets it):
+    /// the overlay's timing wheel must not pop up or beep after the view
+    /// closed (playtest of e8749a2a: it beeped through Fiona's briefing).
+    /// CPU only (`cargo test -p m2-alpha satellite_overlay -- --ignored
+    /// --nocapture`).
+    #[test]
+    #[ignore = "needs the player's install"]
+    fn the_satellite_overlay_stays_quiet_once_closed() {
+        use std::time::Duration;
+        let root = std::env::var_os("M2_INSTALL").expect("M2_INSTALL");
+        let install = Install::find(std::path::Path::new(&root)).unwrap();
+        let mut hud = GameHud::start(&install, crate::hero::Hero::Chris, 100.0);
+        let ctx = egui::Context::default();
+        let base = HudState {
+            size: [1280.0, 720.0],
+            dt: 1.0 / 30.0,
+            hp: 100.0,
+            ..HudState::default()
+        };
+        let mut heard: Vec<(u32, String)> = Vec::new();
+        let frame =
+            |hud: &mut GameHud, heard: &mut Vec<(u32, String)>, n: u32, state: &HudState| {
+                hud.update_and_wait(&ctx, state.clone(), Duration::from_secs(5));
+                let news = hud.take_pause_news();
+                heard.extend(news.sounds.into_iter().map(|s| (n, s)));
+            };
+        for n in 0..300 {
+            if hud.ready() || hud.failed() {
+                break;
+            }
+            frame(&mut hud, &mut heard, n, &base);
+        }
+        assert!(hud.ready() && !hud.failed(), "the HUD's scripts ran");
+        let mut open = base.clone();
+        open.support.satellite = Some((Vec3::new(0.0, 0.0, 0.0), 1.0, 0.0));
+        for n in 0..60 {
+            frame(&mut hud, &mut heard, 1000 + n, &open);
+        }
+        for n in 0..30 {
+            frame(&mut hud, &mut heard, 2000 + n, &base);
+        }
+        let closed = heard.len();
+        let mut press = base.clone();
+        press.dialog_keys.push("BUTTON_PAD2_D");
+        frame(&mut hud, &mut heard, 3000, &press);
+        for n in 1..120 {
+            frame(&mut hud, &mut heard, 3000 + n, &base);
+        }
+        for (n, s) in &heard {
+            eprintln!("frame {n}: {s}");
+        }
+        let wheel: Vec<_> = heard[closed..]
+            .iter()
+            .filter(|(_, s)| s.starts_with("ui_SatDes_Circular"))
+            .collect();
+        assert!(wheel.is_empty(), "the closed overlay's wheel: {wheel:?}");
+    }
+
     /// The satellite's view closed: its overlay is left exiting, so the
     /// guard of its own `_HandleInput` (`bMinigameOn and not bExiting`)
     /// turns a later confirm press away and the wheel doesn't start again.
