@@ -722,6 +722,11 @@ impl Animator {
     /// Plays clip `index` for the original action `action` (its name
     /// hash, [`blend::action`]), looped or `once`, fading for as long as
     /// the original does between the two actions ([`blend::time`]).
+    /// The action (its name hash) the playing clip stands for, if any.
+    pub fn action(&self) -> Option<u32> {
+        self.action
+    }
+
     pub fn play_action(&mut self, index: usize, once: bool, action: u32) {
         self.start(index, once, None, action);
     }

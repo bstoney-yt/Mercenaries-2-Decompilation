@@ -44,6 +44,7 @@ use m2_assets::name_hash;
 
 use crate::anim::Local;
 use crate::face_graph::{BonePose, FaceGraph};
+use m2_math::glam::{Quat, Vec3};
 
 /// The hash the voice manager posts when a line stops (`stop`).
 pub const STOP: u32 = 0xE2EC_63DD;
@@ -201,20 +202,49 @@ impl LipSync {
     }
 }
 
-/// Puts the face bones `poses` into a skeleton's locals: each pose
-/// replaces the local of the node whose name hash (in `names`) is its
+/// A face rig's position in the head skeleton's frame: the rigs' frame
+/// is the skeleton's mirrored in x.
+///
+/// From samples (`facerest` example): for Chris's rig (39f47e08) and
+/// Fiona's (2b5ba84c) against the head models carrying their bones,
+/// every bone's rest has x of the other sign from its node's local (the
+/// eye and brow bones 0.10 to 0.17 m apart as read, under 0.03 m once
+/// mirrored), and every rest rotation is the node's with y and z
+/// negated: the same rotation seen in a mirror across x.
+fn mirrored(v: Vec3) -> Vec3 {
+    Vec3::new(-v.x, v.y, v.z)
+}
+
+/// A face rig's rotation in the head skeleton's frame ([`mirrored`]).
+fn mirrored_turn(q: Quat) -> Quat {
+    Quat::from_xyzw(q.x, -q.y, -q.z, q.w)
+}
+
+/// Puts the face bones `poses` into a skeleton's locals: each pose's move
+/// from its rig rest, brought into the skeleton's frame ([`mirrored`]),
+/// is put on the local of the node whose name hash (in `names`) is its
 /// bone's. Bones the skeleton does not have are left out. Returns how
-/// many nodes were set.
+/// many nodes were moved.
+///
+/// The rig's rest is not the head's (one rig serves heads of different
+/// shapes: Chris's rest sits up to 3 cm off either of his heads' nodes
+/// even mirrored), so a pose is a move from it, not a place: at rest a
+/// face is its head's own. Written in raw, the rig's transforms put the
+/// eyes in the chin (playtest of e8749a2a). Inferred: that the game puts
+/// the move on its own bone (the FaceFX library's evaluation in the 360
+/// program was not read); it leaves every head as modelled at rest.
 pub fn apply(locals: &mut [Local], names: &[u32], poses: &[BonePose]) -> usize {
     let mut set = 0;
     for p in poses {
         if let Some(k) = names.iter().position(|&n| n == p.bone)
             && let Some(l) = locals.get_mut(k)
         {
+            let (rest_p, rest_r, rest_s) = p.rest;
+            let turn = mirrored_turn(p.rotation * rest_r.inverse());
             *l = Local {
-                translation: p.position,
-                rotation: p.rotation,
-                scale: p.scale,
+                translation: l.translation + mirrored(p.position - rest_p),
+                rotation: (turn * l.rotation).normalize(),
+                scale: l.scale + (p.scale - rest_s),
             };
             set += 1;
         }
@@ -346,32 +376,62 @@ mod tests {
         assert_eq!(reads, 1);
     }
 
+    /// A pose at its rig rest leaves the node as its head has it, however
+    /// far the rig's rest is from the node's; a move from rest is put on
+    /// the node, mirrored in x; nodes not named are left alone.
     #[test]
-    fn poses_replace_the_named_nodes_only() {
+    fn poses_move_the_named_nodes_from_their_own_rest() {
         let rest = Local {
-            translation: Vec3::ONE,
-            rotation: Quat::IDENTITY,
+            translation: Vec3::new(0.05, 0.09, -0.03),
+            rotation: Quat::from_xyzw(0.5, 0.5, 0.5, -0.5),
             scale: Vec3::ONE,
         };
+        // The rig's rest of the same bone, as Chris's rig has an eye's:
+        // mirrored in x, and a centimetre off.
+        let rig = (
+            Vec3::new(-0.054, 0.105, -0.032),
+            Quat::from_xyzw(0.5, -0.5, -0.5, -0.5),
+            Vec3::ONE,
+        );
         let mut locals = vec![rest; 3];
-        let names = [7, name_hash("bone_jaw"), 9];
-        let poses = [
-            BonePose {
-                bone: name_hash("bone_jaw"),
-                position: Vec3::new(0.0, -0.02, 0.0),
-                rotation: Quat::from_rotation_x(0.3),
-                scale: Vec3::ONE,
-            },
-            BonePose {
-                bone: name_hash("bone_tongue_tip"),
-                position: Vec3::ZERO,
-                rotation: Quat::IDENTITY,
-                scale: Vec3::ONE,
-            },
-        ];
-        assert_eq!(apply(&mut locals, &names, &poses), 1);
+        let names = [7, name_hash("bone_eye_l"), 9];
+        let at_rest = BonePose {
+            bone: name_hash("bone_eye_l"),
+            position: rig.0,
+            rotation: rig.1,
+            scale: rig.2,
+            rest: rig,
+        };
+        assert_eq!(apply(&mut locals, &names, &[at_rest]), 1);
+        assert!((locals[1].translation - rest.translation).length() < 1e-6);
+        assert!(locals[1].rotation.angle_between(rest.rotation) < 1e-4);
         assert_eq!(locals[0], rest);
         assert_eq!(locals[2], rest);
-        assert_eq!(locals[1].translation, Vec3::new(0.0, -0.02, 0.0));
+        // 1 cm along the rig's x and up its y: the node goes 1 cm along
+        // its own -x and up its y.
+        let moved = BonePose {
+            position: rig.0 + Vec3::new(0.01, 0.01, 0.0),
+            ..at_rest
+        };
+        let mut locals = vec![rest; 3];
+        apply(&mut locals, &names, &[moved]);
+        let d = locals[1].translation - rest.translation;
+        assert!((d - Vec3::new(-0.01, 0.01, 0.0)).length() < 1e-6, "{d}");
+        // A bone the skeleton lacks moves nothing.
+        let tongue = BonePose {
+            bone: name_hash("bone_tongue_tip"),
+            ..at_rest
+        };
+        assert_eq!(apply(&mut locals, &names, &[tongue]), 0);
+    }
+
+    /// A turn about the rig's y is a turn the other way about the
+    /// skeleton's y: a mirror across x.
+    #[test]
+    fn a_rigs_turn_is_mirrored_in_x() {
+        let q = Quat::from_rotation_y(0.4);
+        assert!(mirrored_turn(q).angle_between(Quat::from_rotation_y(-0.4)) < 1e-5);
+        let q = Quat::from_rotation_x(0.4);
+        assert!(mirrored_turn(q).angle_between(q) < 1e-5);
     }
 }
