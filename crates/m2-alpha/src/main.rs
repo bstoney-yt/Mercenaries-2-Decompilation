@@ -12064,12 +12064,13 @@ mod tests {
 /// (if one is near) left to settle on still water. Prints a line each and
 /// PASS or FAIL.
 /// The 360's bail-out at 18 m/s, as the Xenia capture of a car exit has
-/// it (knockdown-time.md): no knockdown and no damage; on foot she plays
-/// `Jump` (0x6FBE1165) for 0.41 s, her root rising 0.35 m, then
-/// `JumpLandStationary` (0xC9592BE4) for 0.52 s, then stands.
+/// it (knockdown-time.md, the per-frame read): no knockdown and no
+/// damage; put 0.5 m over the car's origin, she plays `Jump`
+/// (0x6FBE1165) for 0.44 s, then `JumpLandStationary` (0xC9592BE4) for
+/// 0.49 s, then stands.
 const DITCH_SPEED: f32 = 18.0;
-const DITCH_JUMP: (u32, f32) = (0x6fbe_1165, 0.41);
-const DITCH_LAND: (u32, f32) = (0xc959_2be4, 0.52);
+const DITCH_JUMP: (u32, f32) = (0x6fbe_1165, 0.44);
+const DITCH_LAND: (u32, f32) = (0xc959_2be4, 0.49);
 /// How far off Xenia's times an action may run, seconds (two frames at
 /// 30 fps, and the capture's own frame).
 const DITCH_SLACK: f32 = 0.1;
@@ -12108,32 +12109,21 @@ fn ditch_check(game: &mut Game, tick: f32) {
     let hp = game.combat.hp;
     let mut input = input::Input::default();
     input.button(input::Action::Use, true);
-    game.tick(&mut input, &config::CameraConfig::default(), false, tick);
-    let mut input = input::Input::default();
-    input.button(input::Action::Use, false);
-    game.tick(&mut input, &config::CameraConfig::default(), false, tick);
-    let on_foot = game
-        .scene
-        .player
-        .as_ref()
-        .is_some_and(|p| p.driving.is_none());
-    let base = game
-        .scene
-        .player
-        .as_ref()
-        .map_or(0.0, |p| p.character.position.y);
+    // From the tick she gets out on: the press, the release, then 3 s.
     let mut actions: Vec<(u32, f32)> = Vec::new();
     let mut rise = 0.0f32;
     let mut knocked = false;
-    let mut t = 0.0;
-    while t < 3.0 {
-        game.step(Intent::default(), tick);
-        t += tick;
+    let mut base = None;
+    let mut sample = |game: &Game| {
         let Some(p) = game.scene.player.as_ref() else {
-            break;
+            return;
         };
+        if p.driving.is_some() {
+            return;
+        }
+        let y0 = *base.get_or_insert(p.character.position.y);
         knocked |= p.down || p.ragdoll.is_some();
-        rise = rise.max(p.character.position.y - base);
+        rise = rise.max(p.character.position.y - y0);
         let a = p
             .model
             .as_ref()
@@ -12143,6 +12133,23 @@ fn ditch_check(game: &mut Game, tick: f32) {
             Some((last, d)) if *last == a => *d += tick,
             _ => actions.push((a, tick)),
         }
+    };
+    game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+    sample(game);
+    let mut input = input::Input::default();
+    input.button(input::Action::Use, false);
+    game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+    sample(game);
+    let on_foot = game
+        .scene
+        .player
+        .as_ref()
+        .is_some_and(|p| p.driving.is_none());
+    let mut t = 0.0;
+    while t < 3.0 {
+        game.step(Intent::default(), tick);
+        t += tick;
+        sample(game);
     }
     let line: Vec<String> = actions
         .iter()
@@ -12168,7 +12175,7 @@ fn ditch_check(game: &mut Game, tick: f32) {
     );
     let ok2 = !knocked && game.combat.hp >= hp;
     eprintln!(
-        "ditch-check: root rose {rise:.2} m (Xenia 0.35), health {hp:.0} -> {:.0}, knocked down {knocked}: {}",
+        "ditch-check: root rose {rise:.2} m over where she was put (Xenia 0.05 at 30 Hz), health {hp:.0} -> {:.0}, knocked down {knocked}: {}",
         game.combat.hp,
         verdict(ok2)
     );

@@ -2227,6 +2227,11 @@ struct Hull {
     water: BoatTuning,
 }
 
+/// The 360's game step, s: its frame at 30 Hz (Xenia's per-frame read of
+/// a ditch moves her once each 1/30 s), the length of a held step
+/// ([`Character::hold`]).
+pub const HOLD_STEP: f32 = 1.0 / 30.0;
+
 /// A character's capsule and motion.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Character {
@@ -2248,8 +2253,9 @@ pub struct Character {
     /// 0x82179ED0, which sets the proxy's velocity and its byte +0x250):
     /// the next [`Physics::move_character`] moves it at that velocity as it
     /// is, no walk and no gravity, as 0x8217A2D0 skips the state machine
-    /// for that one step, then clears it.
-    pub hold: bool,
+    /// for that one step, then clears it. Seconds of it left: the 360's
+    /// step is its frame, 1/30 s ([`HOLD_STEP`]).
+    pub hold: f32,
 }
 
 impl Character {
@@ -2263,7 +2269,7 @@ impl Character {
             height: 1.8,
             gravity: GRAVITY,
             wall: None,
-            hold: false,
+            hold: 0.0,
         }
     }
 
@@ -7355,7 +7361,8 @@ impl Physics {
         let mut vertical = character.velocity.y;
         // A velocity just set holds for this step as it is (0x8217A2D0
         // with +0x250 set).
-        let held = std::mem::take(&mut character.hold);
+        let held = character.hold > 0.0;
+        character.hold = (character.hold - dt).max(0.0);
         let walk = if held { character.velocity } else { walk };
         if held {
             character.grounded = false;
@@ -8677,16 +8684,18 @@ mod tests {
         let mut c = Character::new(Vec3::new(0.0, 2.0, 0.0));
         c.gravity = 16.5;
         c.velocity = Vec3::new(1.5, 2.0, 0.0);
-        c.hold = true;
+        c.hold = HOLD_STEP;
+        // One 360 step (1/30 s): two of these.
         p.move_character(&mut c, Vec3::ZERO, None, DT);
-        assert!(!c.hold);
+        p.move_character(&mut c, Vec3::ZERO, None, DT);
+        assert!(c.hold < 1e-6, "{}", c.hold);
         assert!((c.velocity.y - 2.0).abs() < 1e-5, "{}", c.velocity.y);
         assert!(
-            (c.position.y - (2.0 + 2.0 * DT)).abs() < 1e-3,
+            (c.position.y - (2.0 + 4.0 * DT)).abs() < 1e-3,
             "{}",
             c.position.y
         );
-        assert!((c.position.x - 1.5 * DT).abs() < 1e-3, "{}", c.position.x);
+        assert!((c.position.x - 3.0 * DT).abs() < 1e-3, "{}", c.position.x);
         p.move_character(&mut c, Vec3::ZERO, None, DT);
         assert!(
             (c.velocity.y - (2.0 - 16.5 * DT)).abs() < 1e-4,

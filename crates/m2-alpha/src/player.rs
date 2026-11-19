@@ -43,8 +43,10 @@ pub const JENNIFER: HumanMotion = HumanMotion {
 };
 /// Seconds after take-off before touching the ground counts as landing.
 const MIN_AIR: f32 = 0.15;
-/// Seconds before a landing clip's end that the gait takes over again
-/// (and a bash's).
+/// Seconds before a bash's clip ends that the gait takes over again
+/// (invented). A landing plays to its clip's end: the state table's
+/// `Complete` on the clip's end takes `JumpLandStationary` to `Idle`
+/// (Xenia: 0.49 s, the clip's length).
 const LAND_FADE: f32 = 0.1;
 /// Speeds (m/s) above which she takes off and lands on the run.
 const RUNNING_JUMP: f32 = 1.0;
@@ -440,6 +442,10 @@ pub struct Player {
     /// ([`m2_engine::human_state`]), and whether the air's loop plays.
     human: m2_engine::human_state::HumanState,
     air_looped: bool,
+    /// Seconds she has touched the ground while in the air's `Leap`: the
+    /// landing starts once she has for one 360 step
+    /// ([`m2_engine::physics::HOLD_STEP`]).
+    touchdown: f32,
     /// A stagger picked for her, to start on her rig this step (its clip
     /// and action), and the seconds since her last began
     /// ([`m2_engine::stagger`]).
@@ -696,6 +702,7 @@ impl Player {
             jump_queued: false,
             human: m2_engine::human_state::HumanState::default(),
             air_looped: false,
+            touchdown: 0.0,
             stagger_pending: None,
             since_stagger: None,
             carrying: false,
@@ -976,7 +983,7 @@ impl Player {
         self.character.velocity = velocity;
         self.character.grounded = false;
         // Set outright: held one step as it is (0x82179ED0's +0x250).
-        self.character.hold = true;
+        self.character.hold = m2_engine::physics::HOLD_STEP;
         self.ground = Vec2::ZERO;
         self.run_stop = RunStop::default();
         self.leap = Leap::Air(0.0);
@@ -1502,9 +1509,19 @@ impl Player {
             } else {
                 let states = self.moves.states.clone();
                 let was_landing = matches!(self.leap, Leap::Land(..));
+                // The 360 lands her the step after the one she touches
+                // down on (Xenia: touching down at 0.40 s, `Jump` gives way
+                // at 0.44 s; inferred, the proxy's state reaches the
+                // animation driver a step later).
+                self.touchdown = if self.character.grounded {
+                    self.touchdown + dt
+                } else {
+                    0.0
+                };
+                let touched = self.touchdown >= m2_engine::physics::HOLD_STEP - 1e-4;
                 self.leap = match self.leap {
                     Leap::Windup(..) => self.leap,
-                    Leap::Air(t) if t > MIN_AIR && self.character.grounded => {
+                    Leap::Air(t) if t > MIN_AIR && self.character.grounded && touched => {
                         // The physics' message on touching down picks the
                         // landing by the state table; without it, by her
                         // speed as before.
@@ -1564,7 +1581,7 @@ impl Player {
                     }
                     // A standing landing gives way when she sets off.
                     Leap::Land(t, clip)
-                        if t + LAND_FADE < rig.clips[clip].info.duration
+                        if t < rig.clips[clip].info.duration
                             && !(Some(clip) == clips.land_still && moved > RUNNING_JUMP) =>
                     {
                         Leap::Land(t + dt, clip)
