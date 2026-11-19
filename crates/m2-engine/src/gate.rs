@@ -230,6 +230,10 @@ mod tests {
                 limit: 180.0,
                 axis,
                 slide: (0.0, 0.0),
+                limited: false,
+                friction: 0.0,
+                ragdoll_axes: [[0.0; 3]; 2],
+                ragdoll_angles: [0.0; 6],
             }],
         }
     }
