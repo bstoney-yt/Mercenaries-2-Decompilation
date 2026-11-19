@@ -124,6 +124,16 @@ pub struct Game {
     pub combat: Combat,
     /// The island's placed objects worn down and brought down by blasts.
     pub destruction: Destruction,
+    /// The placed pickups she took since the scripts last heard (their
+    /// entities): each a `WeaponEvent` "pickup" for her
+    /// ([`crate::mission`]).
+    pub picked_up: Vec<u32>,
+    /// What she took that has no object of its own here (a crate's
+    /// contents, a dropped gun, cash): its template and where it lay. The
+    /// scripts get a `WeaponEvent` "pickup" for each, on an object made
+    /// for it ([`crate::mission`]), as the 360 raises the event for any
+    /// pickup (0x82281CD0).
+    pub picked_up_loose: Vec<(u32, Vec3)>,
     /// Each vehicle model's load bed, its `HP_Truckbed` node in its own
     /// space, by model (`None`: it has none), as looked up.
     beds: HashMap<u32, Option<Vec3>>,
@@ -263,6 +273,12 @@ pub struct Game {
     pub boarding: Option<crate::boarding::Boarding>,
     /// A helicopter's bail-out prompt ([`crate::action_prompt::ExitConfirm`]).
     pub exit_confirm: crate::action_prompt::ExitConfirm,
+    /// `Player.SetSeatMovementLocks`' three locks (the player record's
+    /// +0x44D, +0x44E, +0x44F), true letting her: get into a vehicle
+    /// (the use picker 0x82432F68 offers entrances only while +0x44D is
+    /// set), get out (the vehicle input 0x8242E7A0 sends an exit only
+    /// while +0x44E is), and a third that nothing in the 360 code reads.
+    pub seat_locks: [bool; 3],
     /// Got in by a boarding entrance (`EntranceParameters` `bBoarding`, a
     /// boat's from the water): the vehicle, and the seat it gave her,
     /// which she is put out of onto the deck once in
@@ -327,6 +343,13 @@ pub struct Game {
     /// ([`crate::config::EnhancedConfig::semi_engine_gain`]).
     pub semi_gain: f32,
     honks: u32,
+    /// Seconds each vehicle (by index) has had a quarter or more of its
+    /// box under the water, and those that have sunk ([`Game::sink`]).
+    in_water: HashMap<usize, f32>,
+    sunk: HashSet<usize>,
+    /// The mission vehicles that sank, not yet told to the scripts
+    /// ([`Game::take_sunk`]).
+    sunk_guids: Vec<u32>,
     /// Vehicles that knocked something loose: each one's id, label, its
     /// vertical velocity just before, and seconds until it is looked at
     /// again (the knock-up check's log, [`KICK_LOOK`]).
@@ -336,6 +359,10 @@ pub struct Game {
     /// Seconds the scripts asked her pad to shake (`Pg.Rumble`), for the
     /// pad to take.
     pub rumble: f64,
+    /// Scene vehicles that hit a person for at least
+    /// [`crate::npc::VEHICLE_HIT_GIVES_AWAY`] since the mission last took
+    /// them (her disguise).
+    pub vehicles_hit_someone: Vec<usize>,
     /// Keyed actions the scripts asked for (`Human.DoAction`: the player's
     /// verify photo `VerifyCamera`), each with its seconds left, ended for the
     /// scripts' `HumanActionComplete` ([`crate::mission`]).
@@ -470,6 +497,7 @@ impl Game {
         if let Some(arms) = scene.arms() {
             combat.arm(arms, scene.damage_table());
         }
+        combat.particle_table = scene.particle_table();
         own_explosives(&mut combat, scene.hero_explosives());
         eprintln!(
             "hero: carries {} grenades, {} C4, {} mines; launcher {} ({:?})",
@@ -501,6 +529,8 @@ impl Game {
             restore: Vec::new(),
             combat,
             destruction: Destruction::default(),
+            picked_up: Vec::new(),
+            picked_up_loose: Vec::new(),
             beds: HashMap::new(),
             bed_shapes: HashMap::new(),
             beds_told: HashSet::new(),
@@ -558,6 +588,7 @@ impl Game {
             ride: None,
             boarding: None,
             exit_confirm: Default::default(),
+            seat_locks: [true; 3],
             onto_deck: None,
             support_hp: 0.0,
             lens: (60.0, 16.0 / 9.0),
@@ -577,10 +608,14 @@ impl Game {
             pursued: false,
             honking: false,
             honks: 0,
+            in_water: HashMap::new(),
+            sunk: HashSet::new(),
+            sunk_guids: Vec::new(),
             kicks: Vec::new(),
             semi_gain: crate::config::SEMI_ENGINE_GAIN,
             disguise: crate::disguise::Disguise::default(),
             rumble: 0.0,
+            vehicles_hit_someone: Vec::new(),
             actions: Vec::new(),
             scripts_seated: false,
         }
@@ -1345,8 +1380,14 @@ impl Game {
                     // nearest entrance.
                     let man_it = manning.is_some()
                         && (gun.is_none() || picked.is_some_and(|(i, _)| i == EMPLACED));
-                    let manning = manning.filter(|_| man_it);
-                    let picked = picked.filter(|&(i, _)| i != EMPLACED);
+                    // Locked in place by a script: no entrance (0x82432F68
+                    // gathers none without +0x44D).
+                    let may_enter = self.seat_locks[0];
+                    if !may_enter && (manning.is_some() || picked.is_some()) {
+                        eprintln!("use: getting in is locked (Player.SetSeatMovementLocks)");
+                    }
+                    let manning = manning.filter(|_| man_it && may_enter);
+                    let picked = picked.filter(|&(i, _)| i != EMPLACED && may_enter);
                     // Of a gun lying there (or else an emplaced gun) and a
                     // vehicle's entrance, the one she faces
                     // ([`crate::action_prompt::faced`], 0x82432CF0).
@@ -1374,6 +1415,11 @@ impl Game {
                     }
                     let manning = manning.filter(|_| !to_car);
                     match player.driving {
+                        // Kept in by a script: no exit asked (0x8242E7A0
+                        // reads +0x44E before the bail-out prompt).
+                        Some(_) if !self.seat_locks[1] => {
+                            eprintln!("use: getting out is locked (Player.SetSeatMovementLocks)");
+                        }
                         // Out over deep water she swims (`Player::update_swim`).
                         // A helicopter up high asks first (0x8242FA70).
                         Some(i)
@@ -1881,6 +1927,8 @@ impl Game {
             .map(|v| self.bed_shapes.get(&v.spec.model).cloned().flatten())
             .collect();
         let focus = self.focus();
+        // Vehicles under the water long enough sink.
+        self.sink(dt);
         if let Some(world) = &mut self.scene.world {
             let driven = self
                 .scene
@@ -2161,10 +2209,10 @@ impl Game {
             }
             // Vehicles running into each other hurt each other and the
             // parts where they met.
-            for (struck, other, closing, damage) in self
+            let crashes = self
                 .combat
-                .vehicle_crashes(&mut world.physics, &mut self.scene.vehicles)
-            {
+                .vehicle_crashes(&mut world.physics, &mut self.scene.vehicles);
+            for (struck, other, closing, damage, _) in crashes {
                 let v = &self.scene.vehicles[struck];
                 eprintln!(
                     "crash: the {} hit by the {} at {closing:.1} m/s takes {damage:.1} ({:.0} of {:.0} left)",
@@ -2202,6 +2250,32 @@ impl Game {
                     (v.most_health() - v.damage).max(0.0),
                     v.most_health()
                 );
+            }
+            // Every new meeting of the two kinds above is heard, damaging or
+            // not (0x8235E3A8): the sound table's cue for the two sides'
+            // `SoundKey`s, three a frame.
+            let hits = std::mem::take(&mut self.combat.hit_events);
+            let hero = self.scene.hero.template().to_owned();
+            for (at, cue) in hit_cues(
+                &world.index,
+                &self.scene.props,
+                &self.scene.vehicles,
+                &self.scene.people,
+                &hero,
+                hits,
+            ) {
+                self.combat.contact(at, cue, 1.0);
+            }
+            let contacts = std::mem::take(&mut self.combat.contacts);
+            for (at, cue, level, vehicle) in contact_cues(
+                &world.index,
+                &world.physics,
+                &self.scene.props,
+                &self.scene.vehicles,
+                contacts,
+            ) {
+                self.combat.contact(at, cue, level);
+                self.combat.vehicle_contacts_heard += u32::from(vehicle);
             }
             // What came down (to a vehicle, the traffic's too, or a blast
             // last tick) comes down whether she is on foot or the free
@@ -2394,21 +2468,27 @@ impl Game {
                 focus,
                 dt,
             );
-            let cars: Vec<_> = self
+            let (cars, which): (Vec<_>, Vec<usize>) = self
                 .scene
                 .vehicles
                 .iter()
-                .filter_map(|v| {
+                .enumerate()
+                .filter_map(|(i, v)| {
                     let id = v.id?;
                     let at = world.physics.vehicle_transform(id)?;
                     let velocity = world.physics.vehicle_velocity(id);
-                    Some((at, velocity, v.spec.hull, v.spec.mass))
+                    Some(((at, velocity, v.spec.hull, v.spec.mass), i))
                 })
-                .collect();
+                .unzip();
             let run_over = self
                 .scene
                 .people
                 .traffic(&cars, self.combat.damage_table.as_ref());
+            // The cars that hit someone, as scene vehicles, for her
+            // disguise ([`crate::npc::VEHICLE_HIT_GIVES_AWAY`]).
+            let hits = std::mem::take(&mut self.scene.people.vehicle_hits);
+            self.vehicles_hit_someone
+                .extend(hits.into_iter().filter_map(|c| which.get(c).copied()));
             if run_over > 0 {
                 eprintln!("run over: {run_over} soldier(s) killed by a vehicle");
             }
@@ -2514,7 +2594,7 @@ impl Game {
             let chosen_key = chosen.map(crate::flights::Pickup::key);
             let near = chosen.map(|p| {
                 let refill = crate::mission::refill(templates, &self.combat, &p.what);
-                let usable = p.what.is_money() || self.combat.can_use(refill, p.what.health);
+                let usable = usable_pickup(templates, &p.what, refill);
                 let offer = crate::mission::offer(templates, &self.combat, &p.what);
                 // Each pickup she stands at and leaves lying, once, with
                 // why: what each record would go to and its room.
@@ -2586,6 +2666,9 @@ impl Game {
                 if self.placed.is_pickup(from) {
                     self.placed
                         .taken(from, &mut scene.props, &mut world.physics);
+                    self.picked_up.push(from);
+                } else {
+                    self.picked_up_loose.push((p.what.template, p.at));
                 }
             }
             // Off an emplaced gun once she is down, in a vehicle, or it
@@ -3631,6 +3714,96 @@ impl Game {
 
     /// The horn presses since the last call (the faction gates, the
     /// disguise and the friendly soldiers hear each one).
+    /// The mission vehicles that sank since the last call (their
+    /// `VehicleSinking` physics event).
+    pub fn take_sunk(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.sunk_guids)
+    }
+
+    /// Vehicles in the water `dt` seconds more: each but a boat with a
+    /// quarter or more of its box under the sea counts its time there,
+    /// and once that reaches its template's `Buoyancy` delay (5 s
+    /// without one) it sinks: it stays whole (the 360's sinking only takes
+    /// its lift; Xenia: 100/100 for 60 s on the bottom), she is put out
+    /// with 100 of her health gone ([`Combat::sank_out`]) if she is in it, and a mission vehicle's
+    /// `VehicleSinking` goes to the scripts. From the 360 code: the time,
+    /// the share and the event ([`m2_engine::durability::Buoyancy`]). The
+    /// boats float by their own hulls here ([`m2_engine::Physics`]'s
+    /// boats) and are left to them.
+    fn sink(&mut self, dt: f32) {
+        use m2_engine::durability::{SINK_SHARE, submerged_share};
+        let Some(world) = &mut self.scene.world else {
+            return;
+        };
+        let Some(sea) = world.physics.water() else {
+            return;
+        };
+        let mut sinking = Vec::new();
+        for (i, v) in self.scene.vehicles.iter().enumerate() {
+            if v.wrecked || v.spec.is_boat() || self.sunk.contains(&i) {
+                continue;
+            }
+            let Some(at) = v.id.and_then(|id| world.physics.vehicle_transform(id)) else {
+                continue;
+            };
+            let (lo, hi) = v.spec.bounds;
+            let (mut bottom, mut top) = (f32::MAX, f32::MIN);
+            for x in [lo.x, hi.x] {
+                for y in [lo.y, hi.y] {
+                    for z in [lo.z, hi.z] {
+                        let y = at.transform_point3(Vec3::new(x, y, z)).y;
+                        bottom = bottom.min(y);
+                        top = top.max(y);
+                    }
+                }
+            }
+            if submerged_share(bottom, top, sea) < SINK_SHARE {
+                continue;
+            }
+            let t = self.in_water.entry(i).or_insert(0.0);
+            *t += dt;
+            let after = world
+                .index
+                .template_db
+                .buoyancy_for(&v.spec.label)
+                .sink_after;
+            if *t >= after {
+                sinking.push((i, *t));
+            }
+        }
+        for (i, t) in sinking {
+            self.sunk.insert(i);
+            self.in_water.remove(&i);
+            let v = &mut self.scene.vehicles[i];
+            eprintln!(
+                "sink: the {} has been in the water {t:.1} s: it sinks{}",
+                v.spec.label,
+                v.guid
+                    .map_or(String::new(), |g| format!(" (VehicleSinking for {g:#x})"))
+            );
+            if let Some(g) = v.guid {
+                self.sunk_guids.push(g);
+            }
+            if let Some(p) = self.scene.player.as_mut()
+                && p.driving == Some(i)
+            {
+                self.combat.sank_out();
+                let seat = self.ride.filter(|r| r.0 == i).map(|r| r.1);
+                get_out(&world.physics, &self.scene.vehicles[i], seat, p);
+                self.ride = None;
+            }
+        }
+    }
+
+    /// Whether vehicle `i` has sunk ([`Game::sink`]), and how long it has
+    /// been a quarter or more under the water.
+    pub fn sunk(&self, i: usize) -> bool {
+        self.sunk.contains(&i)
+    }
+    pub fn in_water(&self, i: usize) -> f32 {
+        self.in_water.get(&i).copied().unwrap_or(0.0)
+    }
+
     pub fn take_honks(&mut self) -> u32 {
         std::mem::take(&mut self.honks)
     }
@@ -3845,6 +4018,8 @@ impl Game {
             satellite_look(&mut view.lighting);
         }
         self.picture.apply(&mut view.lighting);
+        // The game's motion blur, beating in her survival mode.
+        view.lighting.motion_blur = self.combat.motion_blur;
         // The effects' lights (a blast's flash, a fire), the nearest first.
         if let Some(p) = &self.scene.particles {
             let eye = view.view.inverse().w_axis.truncate();
@@ -4462,6 +4637,198 @@ fn within_bed(place: Mat4, (lo, hi): (Vec3, Vec3), bed: Vec3, c: Vec3) -> bool {
 /// run into that their weight breaks ([`Destruction::crash`]: plants,
 /// bushes, fences, lampposts, the island's and the state layers'), going
 /// on through it.
+/// Her `SoundKey`: her hero template's (`SoundMaterial (hum_hero_mattias)`
+/// on Mattias), 0 for none.
+fn her_sound_key(db: &m2_engine::Templates, hero: &str) -> u32 {
+    db.id(hero)
+        .and_then(|t| db.sound_keys.get(&t).copied())
+        .unwrap_or(0)
+}
+
+/// A round's `SoundKey`: its template's, else (a gun's template) the
+/// ammunition the gun fires's.
+fn round_sound_key(db: &m2_engine::Templates, round: u32) -> u32 {
+    db.sound_keys
+        .get(&round)
+        .or_else(|| {
+            db.leavings
+                .ammo
+                .get(&round)
+                .and_then(|a| db.sound_keys.get(a))
+        })
+        .copied()
+        .unwrap_or(0)
+}
+
+/// What `hits`, a tick's rounds striking things ([`combat::Hit`]), are
+/// heard as: the three that damage most ([`combat::heard_hits`]), each
+/// the sound table's cue ([`m2_engine::tuning::KeyTable::contact_cue`])
+/// for what it struck's `SoundKey` and the round's
+/// ([`round_sound_key`]: `projectile_bullet_rifle` on the rifles'
+/// rounds), damaging when the damage table's cell for the two is over 0,
+/// at its full level, where it struck. What it struck: a person, their
+/// template's (`hum_soldier`, `hum_civ`); her, her hero template's
+/// (`hum_hero_mattias`, `hum_hero_jen`, `hum_hero_chris`); a vehicle, its template's; the
+/// ground, the word of the triangle (`TERRAIN_GRASS`); a placed object
+/// or prop, its template's. From the 360 code: 0x8235E190 takes the
+/// struck side's key and the round's by 0x8235E600, the damage cell by
+/// 0x823987D0, and plays 0x8235E798's cue at 1.0 in the hit slots; its
+/// fixed override table (0x82398A20, data 0x82DE4A40) is empty, so every
+/// hit goes by the sound table. Inferred: a person whose kind names no
+/// template looks up as 0 (the table's first row).
+pub(crate) fn hit_cues(
+    index: &m2_engine::WorldIndex,
+    props: &Props,
+    vehicles: &[ParkedVehicle],
+    people: &crate::npc::People,
+    hero: &str,
+    hits: Vec<combat::Hit>,
+) -> Vec<(Vec3, u32)> {
+    let db = &index.template_db;
+    let Some(table) = db.sound_table.as_ref() else {
+        return Vec::new();
+    };
+    let template_key = |t: Option<u32>| t.and_then(|t| db.sound_keys.get(&t).copied()).unwrap_or(0);
+    let modifier = |t: Option<u32>| t.and_then(|t| db.modifiers.get(&t).copied());
+    let ranked: Vec<(combat::Hit, f32)> = hits
+        .into_iter()
+        .map(|h| {
+            let cell = h.cell.unwrap_or_else(|| {
+                let row = match h.struck {
+                    combat::Struck::Static(
+                        Some(StaticKey::Object(i) | StaticKey::Member(i, _)),
+                        _,
+                    ) => modifier(index.objects.get(i).map(|o| o.template)),
+                    combat::Struck::Static(Some(StaticKey::Entity(e)), _) => {
+                        modifier(props.get(e).map(|(p, _)| p.template))
+                    }
+                    _ => Some(m2_assets::name_hash(m2_engine::durability::TERRAIN_KEY)),
+                };
+                let column = if h.kind != 0 {
+                    h.kind
+                } else {
+                    m2_assets::name_hash("Bullet")
+                };
+                match (db.damage.as_ref(), row) {
+                    (Some(t), Some(r)) => t.scale(r, column).unwrap_or(0.0),
+                    _ => 0.0,
+                }
+            });
+            (h, cell)
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (h, cell) in combat::heard_hits(ranked) {
+        let struck = match h.struck {
+            combat::Struck::Person(j) => people
+                .npcs
+                .get(j)
+                .and_then(|n| people.kinds.get(n.kind))
+                .map_or(0, |k| template_key(db.id(&k.role))),
+            combat::Struck::Her => her_sound_key(db, hero),
+            combat::Struck::Vehicle(i) => vehicles.get(i).map_or(0, |v| {
+                vehicle_sound_key(db, &v.spec.label, v.spec.model).unwrap_or(0)
+            }),
+            combat::Struck::Static(Some(StaticKey::Cell(_)) | None, surface) => surface,
+            combat::Struck::Static(Some(StaticKey::Object(i) | StaticKey::Member(i, _)), _) => {
+                template_key(index.objects.get(i).map(|o| o.template))
+            }
+            combat::Struck::Static(Some(StaticKey::Entity(e)), _) => {
+                template_key(props.get(e).map(|(p, _)| p.template))
+            }
+        };
+        let round = round_sound_key(db, h.round);
+        match table.contact_cue(struck, round, cell > 0.0) {
+            Some(cue) => {
+                eprintln!(
+                    "hit: {:?} struck by round {:08x}: keys {struck:08x} x {round:08x}, cell {cell:.2} \
+                     -> cue {cue:08x}",
+                    h.struck, h.round
+                );
+                out.push((h.at, cue));
+            }
+            None => eprintln!(
+                "hit: {:?} struck by round {:08x}: keys {struck:08x} x {round:08x}: no cue, silent",
+                h.struck, h.round
+            ),
+        }
+    }
+    out
+}
+
+/// What `contacts`, a tick's new meetings of vehicles with each other
+/// and the world ([`combat::Contact`]), are heard as: the three of the
+/// most mass ([`combat::heard_contacts`]), each the sound table's cue
+/// ([`m2_engine::tuning::KeyTable::contact_cue`]) for the vehicle's
+/// `SoundKey` and what it met's: another vehicle's; the ground's, the
+/// word of the triangle met (its surface, as a round's: `TERRAIN_GRASS`);
+/// a placed object's or state layer prop's, its template's. At
+/// [`m2_engine::tuning::contact_level`] of its closing speed. Each where
+/// it met. From the 360 code: 0x8235E3A8 takes each side's key by
+/// 0x8235E600 (0x82399040: its template's sound key component
+/// 0x83654A5C, or for the ground, kind 13, the word of the material met,
+/// 0x8216F120) and plays 0x8235E798's cue at the event's place; a side
+/// with no key looks up as 0 (the table's first row or column).
+pub(crate) fn contact_cues(
+    index: &m2_engine::WorldIndex,
+    physics: &Physics,
+    props: &Props,
+    vehicles: &[ParkedVehicle],
+    contacts: Vec<combat::Contact>,
+) -> Vec<(Vec3, u32, f32, bool)> {
+    let db = &index.template_db;
+    let Some(table) = db.sound_table.as_ref() else {
+        return Vec::new();
+    };
+    let vehicle_key =
+        |v: &ParkedVehicle| vehicle_sound_key(db, &v.spec.label, v.spec.model).unwrap_or(0);
+    let mut out = Vec::new();
+    for c in combat::heard_contacts(contacts) {
+        let Some(v) = vehicles.get(c.vehicle) else {
+            continue;
+        };
+        let other = match c.met {
+            combat::Met::Vehicle(j) => vehicles.get(j).map_or(0, vehicle_key),
+            combat::Met::Static(StaticKey::Cell(_)) => physics
+                .cast_ray_surface(c.at - c.normal * 0.5, c.normal, 1.0)
+                .map_or(0, |(.., surface)| surface),
+            combat::Met::Static(StaticKey::Object(i) | StaticKey::Member(i, _)) => index
+                .objects
+                .get(i)
+                .and_then(|o| db.sound_keys.get(&o.template).copied())
+                .unwrap_or(0),
+            combat::Met::Static(StaticKey::Entity(e)) => props
+                .get(e)
+                .and_then(|(p, _)| db.sound_keys.get(&p.template).copied())
+                .unwrap_or(0),
+        };
+        let own = vehicle_key(v);
+        let level = m2_engine::tuning::contact_level(c.closing);
+        match table.contact_cue(own, other, c.damaging) {
+            Some(cue) => {
+                eprintln!(
+                    "contact: the {} met {:?} at {:.1} m/s: keys {own:08x} x {other:08x}, {} -> \
+                     cue {cue:08x} at {level:.2}",
+                    v.spec.label,
+                    c.met,
+                    c.closing,
+                    if c.damaging {
+                        "damaging"
+                    } else {
+                        "not damaging"
+                    }
+                );
+                out.push((c.at, cue, level, matches!(c.met, combat::Met::Vehicle(_))));
+            }
+            None => eprintln!(
+                "contact: the {} met {:?}: keys {own:08x} x {other:08x}: no cue, silent",
+                v.spec.label, c.met
+            ),
+        }
+    }
+    out
+}
+
 /// A vehicle's template's `SoundKey`: the template its label names that
 /// has one, else the lowest vehicle template of its `model` that has one
 /// (a traffic or mission vehicle whose label is no template's name).
@@ -4496,6 +4863,7 @@ fn knock_loose(
     install: Option<&Install>,
 ) -> Vec<(m2_engine::VehicleId, String, f32)> {
     let mut knocked = Vec::new();
+    let mut met = Vec::new();
     for (index, (v, bed)) in vehicles
         .iter()
         .zip(beds.iter().chain(std::iter::repeat(&None)))
@@ -4533,6 +4901,16 @@ fn knock_loose(
                 place.transform_point3((lo + hi) * 0.5),
                 (hi - lo).length() * 0.5,
             ));
+            // And goods that are bodies of their own (they came in before
+            // the vehicle was placed): where their bodies lie.
+            for e in props.bodies_standing_near(
+                &world.physics,
+                place.transform_point3((lo + hi) * 0.5),
+                (hi - lo).length() * 0.5,
+            ) {
+                props.follow_body(&world.physics, e);
+                near.push(e);
+            }
             near.sort_unstable();
             near.dedup();
             // Once the props round it have loaded: what stands round the
@@ -4562,6 +4940,40 @@ fn knock_loose(
             }
         }
         let before = world.physics.vehicle_velocity_before(id);
+        // Props that are bodies of their own it met in the step: the
+        // crash rules on the real contact (its closing speed and both
+        // masses), each meeting once ([`Destruction::crash_body`]).
+        if let Some(place) = world.physics.vehicle_transform(id) {
+            let db = &world.index.template_db;
+            let sound = vehicle_sound_key(db, &v.spec.label, v.spec.model).unwrap_or(0);
+            for (d, _, closing, prop_mass) in world.physics.vehicle_prop_hits(id) {
+                // A state layer's prop, or one of the island's placed
+                // objects that is a body of its own (q753e: the check's
+                // was one of these, and no meeting was ever taken).
+                let key = props.body_entity(d).map(StaticKey::Entity).or_else(|| {
+                    world
+                        .as_bodies()
+                        .find(|(_, ids)| ids.contains(&d))
+                        .map(|(i, _)| StaticKey::Object(i))
+                });
+                if let Some(key) = key {
+                    met.push((
+                        index,
+                        d,
+                        key,
+                        closing,
+                        prop_mass,
+                        Crasher {
+                            place,
+                            bounds: v.model.bounds,
+                            velocity: before,
+                            mass: v.spec.mass,
+                            sound,
+                        },
+                    ));
+                }
+            }
+        }
         let mut speed = before.length();
         if world.physics.vehicle_pulling(id) {
             speed = speed.max(PUSH_SPEED);
@@ -4601,6 +5013,15 @@ fn knock_loose(
             world.physics.set_vehicle_velocity(id, before * keep);
             world.physics.set_vehicle_spin(id, spin * keep);
             knocked.push((id, v.spec.label.clone(), before.y));
+        }
+    }
+    let pairs: Vec<(usize, m2_engine::DebrisId)> = met.iter().map(|m| (m.0, m.1)).collect();
+    let fresh = props.met_bodies(&pairs);
+    if let Some(install) = install {
+        for (index, d, e, closing, prop_mass, crasher) in met {
+            if fresh.contains(&(index, d)) {
+                destruction.crash_body(world, props, install, &crasher, e, closing, prop_mass);
+            }
         }
     }
     knocked
@@ -4712,7 +5133,10 @@ fn run_into(
         let (fling, topple) = flung(vehicle.velocity, mass, m);
         let knocked = match key {
             StaticKey::Object(i) => world.knock(i, fling, topple),
-            StaticKey::Entity(e) => props.knock(&mut world.physics, e, fling, topple, false),
+            // A prop that comes loose is a body of its own: the vehicle
+            // meets it in the physics, and the crash rules take the real
+            // contact ([`Destruction::crash_body`]).
+            StaticKey::Entity(_) => false,
             _ => false,
         };
         if knocked {
@@ -5004,7 +5428,58 @@ fn blast_loose(world: &mut World, props: &mut Props, pushes: &[BlastPush], strik
                 .placed_bounds(e)
                 .map_or((p, p), |(at, bounds)| crate::props::box_around(at, bounds));
             let (velocity, spin) = push.throw(lo, hi, fudge(db, template));
-            props.knock(&mut world.physics, e, velocity, spin, strike);
+            if props.knock(&mut world.physics, e, velocity, spin, strike) {
+                props.blast_thrown(&mut world.physics, e);
+            }
+        }
+        // The island's placed objects that are bodies of their own:
+        // pushed where they lie, as a blast pushes any moving body it
+        // reaches (0x8215C560 -> 0x8215CBC8), and handed to the disposer
+        // as every object a blast pushes is (0x82289F40 -> 0x82246A08).
+        let island: Vec<(usize, Vec<m2_engine::DebrisId>)> = world
+            .as_bodies()
+            .map(|(i, ids)| (i, ids.to_vec()))
+            .collect();
+        for (i, ids) in island {
+            let Some(&first) = ids.first() else { continue };
+            let Some(at) = world.physics.debris_place(first) else {
+                continue;
+            };
+            let centre = at.w_axis.truncate();
+            let o = world.index.objects[i];
+            let half = world
+                .object_model(i)
+                .map_or(Vec3::splat(0.5), |m| (m.bounds.1 - m.bounds.0) * 0.5);
+            if centre.distance(push.at) - half.length() > push.radius {
+                continue;
+            }
+            let db = &world.index.template_db;
+            if !strike && !blown_loose(db, o.template) {
+                continue;
+            }
+            let (velocity, _) = push.throw(centre - half, centre + half, fudge(db, o.template));
+            for d in ids {
+                world.physics.push_debris(d, velocity);
+            }
+            props.island_thrown(&mut world.physics, i, first, half.length());
+        }
+        for i in props.take_disposed_island() {
+            world.dispose(i);
+        }
+        // Props that are bodies of their own: pushed where they now lie,
+        // as a blast pushes any moving body it reaches (0x8215C560 ->
+        // 0x8215CBC8), each body by the push on the prop's box.
+        for (e, template, ids, (lo, hi)) in props.bodies_near(&world.physics, push.at, push.radius)
+        {
+            let db = &world.index.template_db;
+            if !strike && !blown_loose(db, template) {
+                continue;
+            }
+            let (velocity, _) = push.throw(lo, hi, fudge(db, template));
+            for d in ids {
+                world.physics.push_debris(d, velocity);
+            }
+            props.blast_thrown(&mut world.physics, e);
         }
     }
 }
@@ -5074,6 +5549,32 @@ fn exhaust_smoke(
 /// A vehicle of ours (not the mission's or the island's) still to park.
 fn parkable(v: &ParkedVehicle) -> bool {
     v.id.is_none() && v.guid.is_none() && v.spot.is_none()
+}
+
+/// The nearest spot to `from` where the water (`water`: its height at
+/// x, z) stands more than `depth` metres over the ground there (`ground`:
+/// its height at x, z), on the water's surface: rings out every 20 m to
+/// 600 m. For `--sink-check` (a car put in water deeper than it is
+/// tall). `None` where there is none.
+pub(crate) fn deep_spot(
+    from: Vec3,
+    ground: impl Fn(f32, f32) -> Option<f32>,
+    water: impl Fn(f32, f32) -> Option<f32>,
+    depth: f32,
+) -> Option<Vec3> {
+    for r in (0..=600).step_by(20) {
+        let n = (r / 5).max(1);
+        for k in 0..n {
+            let a = k as f32 / n as f32 * std::f32::consts::TAU;
+            let (x, z) = (from.x + a.sin() * r as f32, from.z + a.cos() * r as f32);
+            if let (Some(w), Some(g)) = (water(x, z), ground(x, z))
+                && w - g > depth
+            {
+                return Some(Vec3::new(x, w, z));
+            }
+        }
+    }
+    None
 }
 
 /// Spray off both sides of each boat going fast on the water, a third of
@@ -5934,7 +6435,7 @@ pub(crate) fn get_out_at(
     facing: f32,
 ) {
     get_out(physics, v, seat, player);
-    player.drop_at(place);
+    player.step_out_at(place);
     player.facing = facing;
     eprintln!(
         "boarding: out of the {} where her clip ends, at {:.2?}",
@@ -5959,9 +6460,6 @@ pub(crate) fn get_out(
         use m2_engine::seats::ExitKind;
         let velocity = physics.vehicle_velocity(id);
         let (kind, place) = exit_plan(physics, v, seat, at, velocity);
-        // At the hull's height: onto the ground by the door, not onto a
-        // boulder or roof over it.
-        player.drop_at(place);
         // Tossed, she is knocked down ([`crate::combat::Combat`] takes
         // it up: 0x822A1B70 sets her time down from `TossGetupSeconds`).
         player.tossed = kind == ExitKind::Toss;
@@ -5975,9 +6473,17 @@ pub(crate) fn get_out(
             player.drop_at(place + up * 0.5);
             player.character.velocity = physics.vehicle_velocity_pre_jolt(id);
         } else if kind == ExitKind::Ditch {
+            // Ditching (0x822A1B70): half a metre over the exit's place,
+            // pushed off, in the air: she lands as from a jump.
             let out = place - at.transform_point3(Vec3::ZERO);
-            player.character.velocity =
-                m2_engine::seats::ditch_velocity(velocity, Vec3::new(out.x, 0.0, out.z));
+            player.launch(
+                place + Vec3::Y * m2_engine::seats::DITCH_RISE,
+                m2_engine::seats::ditch_velocity(velocity, Vec3::new(out.x, 0.0, out.z)),
+            );
+        } else {
+            // At the hull's height: onto the ground by the door, not onto
+            // a boulder or roof over it; at once (the ground is in).
+            player.step_out_at(place);
         }
         let f = at.transform_vector3(Vec3::Z);
         player.facing = f.x.atan2(f.z);
@@ -6029,9 +6535,34 @@ fn would_leave(
     p: &crate::flights::Pickup,
 ) -> u8 {
     let refill = crate::mission::refill(templates, combat, &p.what);
-    let usable = p.what.is_money() || combat.can_use(refill, p.what.health);
+    let usable = usable_pickup(templates, &p.what, refill);
     let offer = crate::mission::offer(templates, combat, &p.what);
     u8::from(!usable && offer != crate::mission::Offer::Equip)
+}
+
+/// Whether what lies there (`what`, giving `refill`) is hers to take.
+/// From the 360 code (0x8228F5E8, the pickup's records by `Type`): one
+/// with no ammunition record (`Type` 1) is always taken (health, as much
+/// as there is room for; a munitions laptop, `Type` 0, whose script is
+/// then told); money always; one with ammunition records whenever a
+/// weapon of hers takes one of them, full or not (each record to the
+/// first of her weapons that takes it, 0x82285C98, topping it up as far as
+/// it goes).
+fn usable_pickup(
+    templates: &m2_engine::Templates,
+    what: &crate::flights::Leaves,
+    refill: crate::combat::Refill,
+) -> bool {
+    let no_ammo = templates
+        .leavings
+        .pickups
+        .get(&what.template)
+        .is_some_and(|t| t.walked.is_empty() && t.kind != m2_engine::pickup::EQUIPMENT);
+    let matches = refill.rifle > 0 || refill.launcher > 0 || refill.grenades > 0;
+    let health_only = no_ammo && what.weapon.is_none();
+    // A pickup with ammunition records is taken only so, its health
+    // records or not (0x8228F5E8 counts a `Type` 1 match alone).
+    what.is_money() || health_only || matches
 }
 
 /// What a press of the weapon switch picks.
@@ -6194,6 +6725,92 @@ mod tests {
     use m2_engine::TemplateInfo;
 
     use super::*;
+
+    // The 360's pickup rule by `Type` (0x8228F5E8): a pickup with no
+    // ammunition record (a munitions laptop, `Type` 0 with 1 health) is
+    // taken though she is whole and none of her weapons fires what it
+    // names; one with ammunition records she has no weapon for is not.
+    #[test]
+    fn a_pickup_with_no_ammunition_record_is_always_taken() {
+        use m2_engine::pickup::{AMMUNITION, HEALTH, PickupInfo};
+        let mut templates = m2_engine::Templates::default();
+        let info = |kind, walked: Vec<(u32, u32)>| PickupInfo {
+            kind,
+            radius: 1.0,
+            ammo: Some(0x8000_844c),
+            rounds: 1,
+            gives: vec![(0x8000_844c, 1)],
+            walked,
+            heals: 1,
+            icon: None,
+            effect: None,
+        };
+        templates.leavings.pickups.insert(1, info(HEALTH, vec![]));
+        templates
+            .leavings
+            .pickups
+            .insert(2, info(AMMUNITION, vec![(0x8000_844c, 1)]));
+        let laptop = crate::flights::Leaves {
+            template: 1,
+            health: 1.0,
+            ..Default::default()
+        };
+        let coilgun_ammo = crate::flights::Leaves {
+            template: 2,
+            ..Default::default()
+        };
+        let none = crate::combat::Refill::default();
+        assert!(usable_pickup(&templates, &laptop, none));
+        assert!(!usable_pickup(&templates, &coilgun_ammo, none));
+        // Ammunition a weapon of hers takes is taken whether or not she has
+        // room for it (0x8228F5E8 -> 0x82285C98: no room test).
+        let full = crate::combat::Refill {
+            rifle: 30,
+            ..Default::default()
+        };
+        assert!(usable_pickup(&templates, &coilgun_ammo, full));
+    }
+
+    #[test]
+    fn the_sink_check_finds_water_deeper_than_a_car() {
+        // The sea at -36; the sea floor falls away east of x 100 (-40 to
+        // x 200, -60 from it): 6 m deep is first met at x 200.
+        let water = |_: f32, _: f32| Some(-36.0);
+        let ground = |x: f32, _: f32| {
+            Some(if x < 100.0 {
+                -30.0
+            } else if x < 200.0 {
+                -40.0
+            } else {
+                -60.0
+            })
+        };
+        let at = deep_spot(Vec3::ZERO, ground, water, 6.0).unwrap();
+        assert!(at.x >= 200.0 && at.y == -36.0, "{at}");
+        // Shallow everywhere, or dry: none.
+        assert!(deep_spot(Vec3::ZERO, |_, _| Some(-38.0), water, 6.0).is_none());
+        assert!(deep_spot(Vec3::ZERO, ground, |_, _| None, 6.0).is_none());
+    }
+
+    #[test]
+    fn she_is_heard_struck_by_her_hero_templates_sound_key() {
+        let mut db = m2_engine::Templates::default();
+        db.names.insert(3, "mattias".into());
+        db.sound_keys.insert(3, 0x68ec_ad2a);
+        assert_eq!(her_sound_key(&db, "Mattias"), 0x68ec_ad2a);
+        assert_eq!(her_sound_key(&db, "Jennifer"), 0);
+    }
+
+    #[test]
+    fn a_round_is_heard_by_its_own_sound_key_else_its_ammunitions() {
+        let mut db = m2_engine::Templates::default();
+        // A round with a key of its own; a gun whose ammunition has one.
+        db.sound_keys.insert(7, 0x69db_8e2c);
+        db.leavings.ammo.insert(9, 7);
+        assert_eq!(round_sound_key(&db, 7), 0x69db_8e2c);
+        assert_eq!(round_sound_key(&db, 9), 0x69db_8e2c);
+        assert_eq!(round_sound_key(&db, 5), 0);
+    }
 
     #[test]
     fn a_vehicles_sound_key_is_found_by_label_else_by_model() {

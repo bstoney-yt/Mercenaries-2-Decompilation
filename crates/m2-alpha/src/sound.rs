@@ -275,6 +275,10 @@ pub struct GameAudio {
     /// nothing found for it); keys are read on a thread the first time one
     /// is heard ([`KeySounds::resolve`]).
     keys: HashMap<u32, Option<Arc<KeySounds>>>,
+    /// The sounds playing on objects ([`GameAudio::object_sound`]): by
+    /// object and cue hash, the voice (none for a cue not read yet: it
+    /// starts once it is, if still wanted).
+    on_objects: HashMap<(u32, u32), Option<VoiceId>>,
     key_loads: (Sender<KeyLoad>, Receiver<KeyLoad>),
     /// Keys whose reading has started.
     key_asked: HashSet<u32>,
@@ -284,6 +288,11 @@ pub struct GameAudio {
     /// Breaks heard before their key's sounds were read: the key, where,
     /// and when (played once read, if still fresh).
     key_waiting: Vec<(u32, Vec3, Instant)>,
+    /// Flat cues the interface's tables don't have, waiting for the
+    /// world's cue tables to be read for them (the survival mode's
+    /// `sfx_survival_lp`, a mixed cue of the world's): the cue and its
+    /// key.
+    ui_key_waiting: Vec<(String, u32)>,
     /// Which cue each gun's sound set fires with (the `Sounds` table),
     /// and the shot cues heard so far (each logged once).
     gun_cues: GunCues,
@@ -464,6 +473,18 @@ fn cue_record<'t>(
         )),
         None => Some((table.record_of(hash)?, None)),
     }
+}
+
+/// Whether an object's cue loops: as its cue data says (a cue list
+/// entry's negative seconds, [`KeySounds::looped`]); for a cue
+/// no cue list entry covers, as its name says ([`named_loop`], inferred).
+/// From the 360 code: the cue starts in the sound middleware
+/// (0x82366AC0 -> 0x82366D10 -> 0x828316F8, with its end callback
+/// 0x823667A0), which plays it as its data says; neither the request
+/// (0x82340F08) nor the pump (0x8235ED50, 0x8236C0D8, 0x8236C1F0) carries
+/// a loop flag of its own.
+fn object_cue_loops(found: &KeySounds, cue: &str) -> bool {
+    found.looped.unwrap_or_else(|| named_loop(cue))
 }
 
 /// Whether a cue's name says it loops (`ui_SatDes_BG_Loop`,
@@ -1450,10 +1471,12 @@ impl GameAudio {
                 rx
             }),
             keys: HashMap::new(),
+            on_objects: HashMap::new(),
             key_loads: channel(),
             key_asked: HashSet::new(),
             key_tables: Arc::default(),
             key_waiting: Vec::new(),
+            ui_key_waiting: Vec::new(),
             gun_cues: install.map_or_else(GunCues::default, |install| {
                 match GunCues::read(install) {
                     Ok(c) => {
@@ -1631,7 +1654,53 @@ impl GameAudio {
                     self.out.with(|m| m.stop(old));
                 }
             }
-            None => eprintln!("ui sound: {cue} not found"),
+            // Not the interface's: the 360's `Sound.CueSound` (0x82340F08)
+            // queues any cue by its name hash to the sound system, which
+            // finds it in whatever cue tables are loaded; here, the
+            // world's ([`KeySounds::resolve`]), read on a thread.
+            None => {
+                let key = m2_assets::name_hash(cue);
+                match self.keys.get(&key) {
+                    Some(Some(found)) => {
+                        let found = found.clone();
+                        self.play_flat_key(cue, &found);
+                    }
+                    Some(None) => eprintln!("ui sound: {cue} not found"),
+                    None => {
+                        eprintln!("ui sound: {cue} not the interface's; reading the world's cues");
+                        self.ask_key(key);
+                        self.ui_key_waiting.push((cue.to_owned(), key));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Plays world cue `cue` (read as `found`) flat, as the interface's:
+    /// one of its takes, at its volume, looped when its name says so
+    /// ([`named_loop`]).
+    fn play_flat_key(&mut self, cue: &str, found: &KeySounds) {
+        if found.sounds.is_empty() {
+            eprintln!("ui sound: {cue} not found");
+            return;
+        }
+        let pick = self.random();
+        let i = ((pick * found.sounds.len() as f32) as usize).min(found.sounds.len() - 1);
+        let buffer = found.sounds[i].0.clone();
+        let looped = named_loop(cue);
+        eprintln!(
+            "ui sound: {cue} ({:.2} s{}, the world's: {})",
+            buffer.seconds(),
+            if looped { ", looped" } else { "" },
+            found.how
+        );
+        let mut play = Play::flat(buffer).gain(found.volume.clamp(0.0, 2.0)).ui();
+        if looped {
+            play = play.looped();
+        }
+        let voice = self.out.with(|m| m.play(play));
+        if let Some(old) = self.ui_playing.insert(cue.to_ascii_lowercase(), voice) {
+            self.out.with(|m| m.stop(old));
         }
     }
 
@@ -1659,8 +1728,110 @@ impl GameAudio {
         }
     }
 
+    /// Starts (or `stop`s) cue `cue` on object `guid`, at `at` and moving
+    /// with it ([`follow_objects`](Self::follow_objects)): the scripts'
+    /// `Sound.CueSound(object, cue)` (the 360's 0x82340F08 -> queue
+    /// 0x83224D60 -> 0x8235ED50, which starts the cue on the object). A
+    /// cue is found as the world's sound keys are (by its name's hash),
+    /// and loops as its cue data says ([`object_cue_loops`]). A
+    /// cue started again on the same object stops its last start first,
+    /// as a cue plays once per emitter.
+    pub fn object_sound(&mut self, guid: u32, cue: &str, at: Vec3, stop: bool) {
+        let key = m2_assets::name_hash(cue);
+        if let Some(Some(voice)) = self.on_objects.remove(&(guid, key)) {
+            self.out.with(|m| m.stop(voice));
+        }
+        if stop {
+            return;
+        }
+        let found = match self.keys.get(&key) {
+            Some(Some(found)) => found.clone(),
+            Some(None) => {
+                eprintln!("object sound: {cue}: nothing found for it, silent");
+                return;
+            }
+            None => {
+                if self.install.is_some() {
+                    self.ask_key(key);
+                    self.on_objects.insert((guid, key), None);
+                }
+                return;
+            }
+        };
+        let pick = self.random();
+        let Some(buffer) = found.pick(pick).cloned() else {
+            return;
+        };
+        let (gain, pitch) = found.started(self.random(), self.random());
+        let mut play = Play {
+            pitch,
+            ..Play::at(buffer, at).gain(gain)
+        };
+        if let Some(f) = found.falloff {
+            play = play.falloff(f);
+        }
+        if object_cue_loops(&found, cue) {
+            play = play.looped();
+        }
+        let voice = self.out.with(|m| m.play(play));
+        self.on_objects.insert((guid, key), Some(voice));
+    }
+
+    /// Moves each sound playing on an object to where `at` says it is;
+    /// a sound whose object is gone stops. From the 360 code: each
+    /// frame 0x823667B8 moves an emitter's voices to its object's place
+    /// in the frame's list of objects, and stops them all
+    /// (0x82366C28(emitter, 0, 0, 1)) when its object isn't in that list
+    /// (destroyed, or streamed out). Those whose cue was not read
+    /// when cued start once it is.
+    pub fn follow_objects(&mut self, at: impl Fn(u32) -> Option<Vec3>) {
+        let waiting: Vec<(u32, u32)> = self
+            .on_objects
+            .iter()
+            .filter(|(k, v)| v.is_none() && self.keys.contains_key(&k.1))
+            .map(|(k, _)| *k)
+            .collect();
+        for (guid, key) in waiting {
+            self.on_objects.remove(&(guid, key));
+            if let (Some(Some(found)), Some(place)) = (self.keys.get(&key).cloned(), at(guid))
+                && let Some(buffer) = found.pick(self.random()).cloned()
+            {
+                let (gain, pitch) = found.started(self.random(), self.random());
+                let mut play = Play {
+                    pitch,
+                    ..Play::at(buffer, place).gain(gain)
+                };
+                if let Some(f) = found.falloff {
+                    play = play.falloff(f);
+                }
+                if found.looped == Some(true) {
+                    play = play.looped();
+                }
+                let voice = self.out.with(|m| m.play(play));
+                self.on_objects.insert((guid, key), Some(voice));
+            }
+        }
+        let playing: Vec<((u32, u32), VoiceId)> = self
+            .on_objects
+            .iter()
+            .filter_map(|(k, v)| Some((*k, (*v)?)))
+            .collect();
+        for (k, voice) in playing {
+            match at(k.0) {
+                Some(p) => self.out.with(|m| m.set_position(voice, p)),
+                None => {
+                    self.out.with(|m| m.stop(voice));
+                    self.on_objects.remove(&k);
+                }
+            }
+        }
+    }
+
     /// Stops interface sound `cue` if it plays (`Sound.StopSound`).
     pub fn stop_ui_sound(&mut self, cue: &str) {
+        // Stopped before it was read: it never starts.
+        self.ui_key_waiting
+            .retain(|(c, _)| !c.eq_ignore_ascii_case(cue));
         if let Some(voice) = self.ui_playing.remove(&cue.to_ascii_lowercase()) {
             eprintln!("ui sound: {cue} stopped");
             self.out.with(|m| m.stop(voice));
@@ -2347,6 +2518,10 @@ impl GameAudio {
                     self.play_key(key, at);
                     continue;
                 }
+                Sound::Contact { at, key, level } => {
+                    self.play_key_at(key, at, level);
+                    continue;
+                }
                 Sound::Reload { set } => {
                     let cue = set.and_then(|s| self.gun_cues.reload(s));
                     self.play_flat("reload", set, cue);
@@ -2511,6 +2686,11 @@ impl GameAudio {
     /// if still fresh ([`KEY_FRESH`]). A key that nothing answers stays
     /// silent: no other sound stands in for it.
     fn play_key(&mut self, key: u32, at: Vec3) {
+        self.play_key_at(key, at, 1.0);
+    }
+
+    /// [`play_key`](Self::play_key) at `level` of its usual.
+    fn play_key_at(&mut self, key: u32, at: Vec3, level: f32) {
         match self.keys.get(&key) {
             Some(Some(found)) => {
                 let found = found.clone();
@@ -2522,6 +2702,7 @@ impl GameAudio {
                         buffer.seconds()
                     );
                     let (gain, pitch) = found.started(self.random(), self.random());
+                    let gain = gain * level;
                     eprintln!(
                         "sound: key {key:08x} starts at level {gain:.4}, rate {pitch:.4} \
                          (its record's ranges: {:?})",
@@ -2778,6 +2959,14 @@ impl GameAudio {
     fn keys_loaded(&mut self) {
         while let Ok((key, found)) = self.key_loads.1.try_recv() {
             self.keys.insert(key, found.map(Arc::new));
+        }
+        let waiting = std::mem::take(&mut self.ui_key_waiting);
+        for (cue, key) in waiting {
+            match self.keys.get(&key).cloned() {
+                Some(Some(found)) => self.play_flat_key(&cue, &found),
+                Some(None) => eprintln!("ui sound: {cue} not found"),
+                None => self.ui_key_waiting.push((cue, key)),
+            }
         }
         let now = Instant::now();
         let waiting = std::mem::take(&mut self.key_waiting);
@@ -3470,6 +3659,23 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn an_object_cue_loops_as_its_cue_says_else_as_its_name_does() {
+        let cue = |looped| KeySounds {
+            looped,
+            ..Default::default()
+        };
+        // Its cue list entry says, whatever the name.
+        assert!(object_cue_loops(
+            &cue(Some(true)),
+            "wpn_bomb_timer_01_armed"
+        ));
+        assert!(!object_cue_loops(&cue(Some(false)), "sfx_alarm_lp"));
+        // No entry: the name.
+        assert!(object_cue_loops(&cue(None), "sfx_alarm_lp"));
+        assert!(!object_cue_loops(&cue(None), "wpn_bomb_timer_01_armed"));
+    }
 
     /// The grenade's blast as the data has it: set `701d113d`, whose
     /// only `Sounds` row is the create event's, cue `19152b89`.

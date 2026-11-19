@@ -36,6 +36,7 @@ use crate::script::{ScriptError, ScriptHost};
 
 mod ammo;
 mod homing;
+mod mines;
 pub use homing::{ANTI_AIR, HOMING_MISSILE, HomingKind, HomingPost};
 
 /// The script that starts the game (`Init`, then `LoadGame`).
@@ -365,9 +366,12 @@ pub struct GameData {
     /// Templates' `CashValue` (`Object.GetCashValue`) by the template's
     /// name in lower case.
     pub template_cash: HashMap<String, i32>,
+    /// Templates carrying `Crusher` ([`crate::crusher`]), by name in
+    /// lower case.
+    pub template_crushers: HashMap<String, f32>,
     /// Templates' `NodeHealth` records by name in lower case
     /// ([`crate::node_damage::template_nodes`]).
-    pub template_nodes: HashMap<String, Vec<m2_engine::node_health::NodeRecord>>,
+    pub template_nodes: HashMap<String, crate::node_damage::TemplateNodes>,
     /// Every template's name in the template database, in lower case:
     /// the names scripts look templates up by (`Pg.GetGuidByName("OC")`).
     pub template_names: std::collections::HashSet<String>,
@@ -484,6 +488,7 @@ impl GameData {
                 {
                     template_labels = labels_of(db.component("Label"));
                     data.template_cash = crate::cash::template_cash(&db);
+                    data.template_crushers = crate::crusher::template_crushers(&db);
                     data.template_children = crate::links::template_children(&db);
                     data.template_nodes = crate::node_damage::template_nodes(&db);
                     template_scripts = db.hashes("ObjectScript");
@@ -756,6 +761,7 @@ impl Mission {
             physical_links,
             template_children,
             template_cash,
+            template_crushers,
             template_nodes,
             template_names,
             template_drivers,
@@ -788,6 +794,7 @@ impl Mission {
             w.physical_links = physical_links;
             w.template_children = template_children;
             w.template_cash = template_cash;
+            w.template_crushers = template_crushers;
             w.template_nodes = template_nodes;
             w.template_names = template_names;
             w.template_drivers = template_drivers;
@@ -935,6 +942,17 @@ impl Mission {
         };
         mission.settle("set-up");
         Ok(mission)
+    }
+
+    /// The first entity of any layer (loaded or not) whose object script
+    /// is `script`: its layer's name, its guid and where it stands.
+    pub fn entity_with_script(&self, script: u32) -> Option<(String, u32, [f32; 3])> {
+        self.layers.iter().find_map(|(layer, entities)| {
+            entities
+                .iter()
+                .find(|e| e.script == Some(script))
+                .map(|e| (layer.clone(), e.guid, e.at))
+        })
     }
 
     /// Puts the layers whose names contain `part` (any case) in the world
@@ -1818,6 +1836,13 @@ impl Mission {
             .map_or(&[], |e| e.path.as_slice())
     }
 
+    /// Vehicle `guid` sank: its `VehicleSinking` physics event holds
+    /// (the scripts' `ObjectPhysicsEvent`; the 360 sends it once,
+    /// [`m2_engine::durability::Buoyancy`]).
+    pub fn vehicle_sinking(&mut self, guid: u32) {
+        self.world.borrow_mut().sunk.insert(guid);
+    }
+
     /// She honked: the friendly faction gates hear it for
     /// [`api::HONK_HEARD`] seconds.
     pub fn honk(&mut self) {
@@ -2111,9 +2136,19 @@ impl Mission {
         self.strike_callbacks(guid, at, true, "flyby arrived");
     }
 
-    /// Ordnance `guid` (an [`Command::Ordnance`]) went off at `at`.
+    /// Ordnance `guid` (an [`Command::Ordnance`]) went off at `at`: its
+    /// script's callbacks run, then it dies.
+    ///
+    /// From the scripts: `MrxSupport.BlipAircraft` (the satellite guided
+    /// bomb's red square on the radar) takes its blip off only on the
+    /// bomb's `ObjectDeath` or `ObjectHibernation` (its
+    /// `_RemoveBlipCallback`), so a bomb that went off and lived on kept
+    /// its square for good (playtest of e8749a2a). Inferred: that the
+    /// engine kills a projectile as it goes off (no other event takes
+    /// the blip away, and the 360 game's square goes).
     pub fn ordnance_burst(&mut self, guid: u32, at: [f32; 3]) {
         self.strike_callbacks(guid, at, false, "ordnance burst");
+        self.kill(guid);
     }
 
     fn strike_callbacks(&mut self, guid: u32, at: [f32; 3], arrival: bool, what: &str) {
@@ -3101,6 +3136,18 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             }
             if let Some(t) = &e.template {
                 w.placed_as.insert(e.guid, t.clone());
+                // Placed, an object with node health takes its template's
+                // `Health` (the 360's Health component, which placing
+                // fills: 0x8222D850), so the scripts and the checks read
+                // it from the start ([`crate::node_damage`]).
+                let most = w
+                    .template_nodes
+                    .get(&t.to_ascii_lowercase())
+                    .and_then(|n| n.health);
+                if let (Some(most), Some(o)) = (most, w.objects.get_mut(&e.guid)) {
+                    o.max_health = most;
+                    o.health = most;
+                }
             }
         } else {
             w.crews.remove(&e.guid);
@@ -3228,7 +3275,10 @@ fn seat_crew(
 /// `C4` and `beacon` are the scripts of her stuck C4 and of the Beacon
 /// Designator's beacon light: they blink and, a second on, beep until
 /// they go ([`Mission::ammo_spawned`]).
-pub const OBJECT_SCRIPTS: [(&str, u32); 24] = [
+///
+/// `mine` and `proximitymine` are the placed mines' and her planted
+/// mine's ([`Mission::placed_mines`]).
+pub const OBJECT_SCRIPTS: [(&str, u32); 28] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3247,12 +3297,16 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 24] = [
     ("HomingMissile", homing::HOMING_MISSILE),
     ("C4", ammo::C4),
     ("beacon", ammo::BEACON),
+    ("mine", mines::MINE),
+    ("proximitymine", mines::PROXIMITY_MINE),
     ("autogunship", AUTOGUNSHIP),
     ("tree_2dc6b6ed", TREE_SCRIPTS[0]),
     ("tree_e16dfae5", TREE_SCRIPTS[1]),
     ("tree_396840f6", TREE_SCRIPTS[2]),
     ("tree_6d5311e5", TREE_SCRIPTS[3]),
     ("tree_bb6fc961", TREE_SCRIPTS[4]),
+    ("Laptop", LAPTOP),
+    ("islandfortress", ISLAND_FORTRESS),
 ];
 
 /// The trees' object scripts, unnamed in the archives (so named here
@@ -3276,6 +3330,20 @@ pub const TREE_SCRIPTS: [u32; 5] = [
 /// (Autogunship)`, the gunship AllCon003 flies over her
 /// (`Airstrike.Flyby`). Its name is from the hash (`autogunship`).
 pub const AUTOGUNSHIP: u32 = 0x9ae4_b2ec;
+/// `Laptop`'s module hash: the munitions laptops (`Munitions (Laptop)`).
+/// From samples (its Lua): awake, a blip on the map and a wait for the
+/// hero to pick it up (`Event.WeaponEvent { "hero", "pickup", "Laptop" }`);
+/// then a `MunitionsPickup` post, a support item's stock up by one, the
+/// PDA's `UpdateSupport` and Fiona's line.
+pub const LAPTOP: u32 = 0x4068_2f05;
+
+/// `islandfortress`'s module hash: the script of the island fortress
+/// (`_island_bld_fortress01`'s `ObjectScript`). Its `OnStateChange` hears
+/// the part of node `cf37044a` go to state `694683eb` and brings the
+/// fortress down slice by slice (`KillNode`: `Object.GetNodeHealth`, then
+/// `ObjectState.SendDamage` of 1 and a timer for the slices next to it,
+/// [`crate::node_damage`]).
+pub const ISLAND_FORTRESS: u32 = 0x37b3_668c;
 
 /// `pursuitcopter`'s module hash.
 pub const PURSUIT_COPTER: u32 = 0x3e29_6216;
@@ -3411,8 +3479,11 @@ fn object_script(
     Some(
         lua.globals()
             .get::<mlua::Table>(*module)
-            .and_then(|m| m.get::<mlua::Function>(call))
-            .and_then(|f| f.call::<()>((crate::events::guid_value(guid), mlua::Value::Nil, data)))
+            .and_then(|m| m.get::<Option<mlua::Function>>(call))
+            .and_then(|f| match f {
+                Some(f) => f.call::<()>((crate::events::guid_value(guid), mlua::Value::Nil, data)),
+                None => Ok(()),
+            })
             .map_err(|err| format!("{module}.{call}: {}", first_lines(&err.to_string()))),
     )
 }
@@ -3537,6 +3608,47 @@ mod tests {
                 if guid == tree && name == "global_env_treepalm_anim")
         });
         assert!(played);
+    }
+
+    // Placed, an object with node health has its template's Health before
+    // anything asks for its table.
+    #[test]
+    fn a_placed_object_with_node_health_takes_its_templates_health() {
+        let mut data = GameData::default();
+        let mut e = villa_tank();
+        e.template = Some("_island_bld_fortress01".into());
+        let guid = e.guid;
+        data.layers.insert("test_layer".into(), vec![e]);
+        data.template_nodes.insert(
+            "_island_bld_fortress01".into(),
+            crate::node_damage::TemplateNodes {
+                records: Vec::new(),
+                health: Some(4000.0),
+            },
+        );
+        let mut m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
+        m.preload("test_layer");
+        let w = m.world().borrow();
+        assert_eq!(
+            (w.objects[&guid].health, w.objects[&guid].max_health),
+            (4000.0, 4000.0)
+        );
+        assert!(w.node_tables.is_empty());
+    }
+
+    #[test]
+    fn an_entity_is_found_by_its_script_in_any_layer() {
+        let mut data = GameData::default();
+        let mut e = villa_tank();
+        e.script = Some(ISLAND_FORTRESS);
+        let (guid, at) = (e.guid, e.at);
+        data.layers.insert("vz_q3".into(), vec![e]);
+        let m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
+        assert_eq!(
+            m.entity_with_script(ISLAND_FORTRESS),
+            Some(("vz_q3".into(), guid, at))
+        );
+        assert_eq!(m.entity_with_script(0x1234), None);
     }
 
     #[test]
@@ -4327,6 +4439,43 @@ mod tests {
         // An object with no script of its own: nothing is called.
         m.object_state_changed(0x999, 1, 2);
         assert_eq!(g.get::<u32>("states").unwrap(), 1);
+    }
+
+    // The satellite bomb's square (`MrxSupport.BlipAircraft`): put on the
+    // bomb with a death event to take it off. The bomb going off kills
+    // it, and the square goes (playtest of e8749a2a: it stayed for good).
+    #[test]
+    fn a_bomb_that_goes_off_dies_and_its_radar_square_goes() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        let bomb =
+            m.world
+                .borrow_mut()
+                .spawn("Smart Bomb Projectile".into(), [0.0, 80.0, 0.0], 0.0);
+        m.lua()
+            .load(
+                r#"
+                local bomb = ...
+                Hud.Radar:AddObjective({ sName = "1", nR = 255, nG = 0, nB = 0,
+                    nWidth = 3, nHeight = 3, uGuid = bomb, nSortOrder = 4 })
+                Event.Create(Event.ObjectDeath, { bomb }, function()
+                    Hud.Radar:RemoveObjective({ sName = "1" })
+                end, {})
+                "#,
+            )
+            .call::<()>(crate::events::guid_value(bomb))
+            .unwrap();
+        m.tick(0.1);
+        assert!(m.world.borrow().hud.radar.contains_key("1"), "blipped");
+        m.ordnance_burst(bomb, [0.0; 3]);
+        assert!(
+            !crate::events::World::is_alive(&*m.world.borrow(), bomb),
+            "it dies as it goes off"
+        );
+        m.tick(0.1);
+        assert!(
+            !m.world.borrow().hud.radar.contains_key("1"),
+            "its square comes off"
+        );
     }
 
     #[test]

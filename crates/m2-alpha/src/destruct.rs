@@ -364,6 +364,9 @@ pub type Shows = Vec<(u32, Vec3)>;
 /// The damage done to the island's placed objects, and those coming down.
 #[derive(Debug, Default)]
 pub struct Destruction {
+    /// Meetings of vehicles and prop bodies the crash rules took
+    /// ([`crash_body`](Self::crash_body)): how many, and how many broke.
+    pub bodies_met: (u32, u32),
     /// Damage taken so far, by placed object.
     taken: HashMap<usize, f32>,
     /// Destroyed, put up as props, waiting for their models to load to
@@ -400,6 +403,10 @@ pub struct Destruction {
     /// ([`crate::combat::Combat::set_off`]): where, its template, and
     /// what its model's `CollapseState` starts (effect name hash, where).
     pub set_off: Vec<(Vec3, u32, Shows)>,
+    /// The state layers' props worn through that blew up as their
+    /// template's blast and were taken away (a placed water mine: its
+    /// script hears of its death, [`crate::mines::report`]).
+    pub blew_up: HashSet<u32>,
     /// Part states the props destroyed went to, for the scripts'
     /// `OnStateChange` ([`take_state_changes`](Self::take_state_changes)):
     /// (entity, machine, state), in order.
@@ -676,6 +683,7 @@ impl Destruction {
             eprintln!("destruct: {key:?} blows up at {centre:.1}");
             props.hide(&mut world.physics, [e]);
             self.set_off.push((centre, template, shows));
+            self.blew_up.insert(e);
             return true;
         }
         match key {
@@ -755,6 +763,47 @@ impl Destruction {
             0.0,
         );
         self.wear_by(world, props, Some(install), key, hit, cause)
+    }
+
+    /// `vehicle` met prop `e`, a body of its own of `prop_mass` kg, closing
+    /// at `closing` m/s along the contact: the crash rules on that real
+    /// contact. Its size is [`m2_engine::durability::crash_size`] of both
+    /// masses (0x82163758, 0x82162BB8); a hundredth of it, nothing under
+    /// [`m2_engine::durability::CRASH_FLOOR`] (0x8228B5F0), wears the prop
+    /// by its row of the damage table for a vehicle's ram (0x82287CF8,
+    /// [`RAM_KIND`]). True if it broke.
+    #[allow(clippy::too_many_arguments)]
+    pub fn crash_body(
+        &mut self,
+        world: &mut World,
+        props: &mut Props,
+        install: &Install,
+        vehicle: &Crasher,
+        key: StaticKey,
+        closing: f32,
+        prop_mass: f32,
+    ) -> bool {
+        let size = m2_engine::durability::crash_size(vehicle.mass, prop_mass, closing);
+        let base = m2_engine::durability::crash_base(size);
+        self.bodies_met.0 += 1;
+        if base <= 0.0 {
+            return false;
+        }
+        let cause = Cause::Crash {
+            velocity: vehicle.velocity,
+            mass: vehicle.mass,
+            sound: vehicle.sound,
+        };
+        let hit = (base, m2_assets::name_hash(RAM_KIND), 0.0);
+        let broke = self.wear_by(world, props, Some(install), key, hit, cause);
+        eprintln!(
+            "destruct: a {:.0} kg vehicle met prop {key:?} ({prop_mass:.0} kg) closing at \
+             {closing:.1} m/s: size {size:.1}, {base:.2} before its cell{}",
+            vehicle.mass,
+            if broke { ", it breaks" } else { "" }
+        );
+        self.bodies_met.1 += u32::from(broke);
+        broke
     }
 
     /// Wears down what `blast` reaches ([`wear`](Self::wear)), the
@@ -1229,6 +1278,13 @@ impl Destruction {
         for shows in self.alight.drain(..) {
             combat.state_shows(shows);
         }
+        // The parts' states changed a step ago, applied: what of each
+        // shows, its collision, and the effects of those a message
+        // entered ([`Props::apply_states`]).
+        let shows = props.apply_states(&mut world.physics);
+        if !shows.is_empty() {
+            combat.state_shows(shows);
+        }
         // Their part machines' changes (from [`Props::destroy_parts`] on):
         // what each state starts (but the collapse's, which the bring-down
         // below shows), and for the scripts, the island's by their entity
@@ -1570,6 +1626,30 @@ mod tests {
         // A crate (no such property) is shoved; a rock stands.
         assert_eq!(car.does(key, None, true), Some(Crashed::Loose(key)));
         assert_eq!(car.does(key, None, false), None);
+    }
+
+    #[test]
+    fn a_placed_mine_goes_under_any_vehicle_that_meets_it() {
+        // `Mine (Vehicle)`'s record: flattened, taking 0 kg.
+        let mine = Some(Crash {
+            how: CrashHow::Flattened,
+            takes: 0.0,
+        });
+        let key = StaticKey::Entity(0x40);
+        let bike = Crasher {
+            mass: 150.0,
+            ..jeep(Vec3::ZERO)
+        };
+        assert_eq!(bike.does(key, mine, true), Some(Crashed::Down(key)));
+        assert_eq!(bike.does(key, mine, false), Some(Crashed::Down(key)));
+        // A 40 cm mine, 10 cm high: under the nose it is met; 1.5 m to
+        // the jeep's side, or under a helicopter 10 m up, it is not.
+        let disc = (Vec3::new(-0.2, 0.0, -0.2), Vec3::new(0.2, 0.1, 0.2));
+        let under = Mat4::from_translation(Vec3::new(0.0, 0.0, 2.0));
+        assert!(jeep(Vec3::ZERO).meets(under, disc));
+        let aside = Mat4::from_translation(Vec3::new(1.5, 0.0, 0.0));
+        assert!(!jeep(Vec3::ZERO).meets(aside, disc));
+        assert!(!jeep(Vec3::Y * 10.0).meets(under, disc));
     }
 
     #[test]

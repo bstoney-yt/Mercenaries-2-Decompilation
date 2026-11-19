@@ -154,14 +154,40 @@ pub struct Props {
     heard: HashSet<u32>,
     /// Knocked loose since [`take_knocked`](Self::take_knocked).
     fresh_knocks: Vec<u32>,
+    /// Props that come loose whole are bodies of their own from the start
+    /// (gap P7, [`as_bodies`](Self::as_bodies)), as the 360's props are;
+    /// this keeps them fixed until knocked instead (the port's old way,
+    /// for comparing).
+    pub bodies_off: bool,
+    /// Those that are: put up as sleeping bodies, not knocked by anything.
+    as_body: HashSet<u32>,
     /// The material animations playing on them
     /// ([`play_material_animation`](Self::play_material_animation)).
     material_anims: HashMap<u32, m2_engine::material_anim::Playing>,
     /// The part machines of those destroyed, running on
     /// ([`destroy_parts`](Self::destroy_parts)).
     part_runners: HashMap<u32, m2_engine::part_runner::Runner>,
+    /// Props whose parts take messages one at a time (a building's node
+    /// destroyed by the scripts): their runners are kept for the parts'
+    /// states, settled or not ([`send_part`](Self::send_part)).
+    kept_runners: HashSet<u32>,
     /// Their changes since last asked: (entity, change).
     part_changes: Vec<(u32, m2_engine::part_runner::Change)>,
+    /// The step [`apply_states`](Self::apply_states) is on (one a call,
+    /// a game step).
+    steps: u32,
+    /// Kept runners whose parts' states changed, to be applied the step
+    /// after: (entity, the step it changed on). The 360 queues an
+    /// object's change of state (0x83232DB0) and applies it a step on
+    /// (0x8222D2F0): its shown nodes rebuilt from its parts' states
+    /// (0x821C7648), its physics rebuilt for the parts shown
+    /// (0x82182CE8), the state's commands run (0x82231520).
+    due_states: Vec<(u32, u32)>,
+    /// The states a message put parts in ([`send_part`](Self::send_part)),
+    /// whose effects start as they are applied: (entity, state, step).
+    due_fx: Vec<(u32, u32, u32)>,
+    /// Applied since [`take_applied`](Self::take_applied).
+    applied: Vec<Applied>,
     /// Node matrices of those that move on their own, by entity
     /// ([`crate::moving`]).
     poses: HashMap<u32, Vec<Mat4>>,
@@ -201,7 +227,54 @@ pub struct Props {
     /// Wrecked since [`take_fallen`](Self::take_fallen): what falls with
     /// them is brought down too (`DestructionLink`).
     fallen: Vec<u32>,
+    /// What blasts threw, kept in check: past the 360's 40 the lightest
+    /// is taken away ([`m2_engine::disposer`]).
+    disposer: m2_engine::disposer::Disposer,
+    /// Seconds played ([`advance`](Self::advance)), and the eye's last
+    /// place ([`update`](Self::update)): what the disposer weighs by.
+    clock: f32,
+    eye: Vec3,
+    /// Taken away by the disposer since last asked.
+    disposed: Vec<u32>,
+    /// How many props blasts have thrown.
+    thrown: usize,
+    /// Vehicles (by index) and prop bodies in contact the step before
+    /// ([`met_bodies`](Self::met_bodies)).
+    bumping: HashSet<(usize, DebrisId)>,
+    /// The island's placed objects blasts threw, held by the disposer
+    /// too (keys with the top bit set: [`ISLAND`]): each one's first body
+    /// and half its box, for how big it looks.
+    island_thrown: HashMap<u32, (DebrisId, f32)>,
+    /// The island's placed objects the disposer took away, for the world
+    /// to remove ([`take_disposed_island`](Self::take_disposed_island)).
+    disposed_island: Vec<usize>,
 }
+
+/// A prop's parts' states applied ([`Props::apply_states`]): which nodes
+/// that showed and hid, by name hash, and the steps.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Applied {
+    pub entity: u32,
+    /// The step the states changed on (the message's), and the step they
+    /// were applied on.
+    pub sent: u32,
+    pub landed: u32,
+    /// Nodes shown that were hidden, and hidden that were shown.
+    pub shown: Vec<u32>,
+    pub hidden: Vec<u32>,
+    /// How many of its parts are down now.
+    pub down: usize,
+}
+
+/// A prop that is a body of its own near a blast ([`Props::bodies_near`]):
+/// its entity, its template, its bodies and its box as it now stands.
+pub type BodyNear = (u32, u32, Vec<DebrisId>, (Vec3, Vec3));
+
+/// The disposer's keys for the island's placed objects: the object's index
+/// with this bit set. A prop's entity may have it too (`0xA000D60D`): which
+/// a key is goes by [`Props`]'s island entries, not by the bit (q744e: a
+/// thrown prop was taken for an island object and dropped as gone).
+pub const ISLAND: u32 = 0x8000_0000;
 
 /// Which parts of a prop are broken ([`m2_engine::ModelParts`]), and the
 /// nodes hidden for it.
@@ -328,6 +401,12 @@ impl Props {
     /// has them ([`m2_engine::ModelParts`]) and it stands.
     pub fn model_parts(&self, entity: u32) -> Option<&Arc<m2_engine::ModelParts>> {
         let p = self.shown.get(&entity).filter(|p| !p.wrecked)?;
+        self.models.get(&p.model)?.as_ref()?.gpu.parts.as_ref()
+    }
+
+    /// `entity`'s model parts, wrecked or not.
+    fn any_model_parts(&self, entity: u32) -> Option<&Arc<m2_engine::ModelParts>> {
+        let p = self.shown.get(&entity)?;
         self.models.get(&p.model)?.as_ref()?.gpu.parts.as_ref()
     }
 
@@ -558,6 +637,7 @@ impl Props {
     /// too).
     pub fn hide(&mut self, physics: &mut Physics, entities: impl IntoIterator<Item = u32>) {
         for e in entities {
+            self.as_body.remove(&e);
             if self.shown.remove(&e).is_some() {
                 physics.remove_static(StaticKey::Entity(e));
                 self.changed();
@@ -646,6 +726,11 @@ impl Props {
         (index, id): (usize, m2_engine::VehicleId),
         bed: Option<&CollisionShape>,
     ) -> bool {
+        // A body of its own from the start (the goods came in before the
+        // vehicle): its bodies give way to its ride.
+        if self.as_body.contains(&entity) {
+            self.drop_bodies(physics, entity);
+        }
         let Some(p) = self.shown.get(&entity) else {
             return false;
         };
@@ -778,8 +863,8 @@ impl Props {
     /// Whether `entity` was knocked loose (`None` if not): broken into
     /// its pieces, its model's [`Loose::breaks`], or gone as one.
     pub fn knocked_loose(&self, entity: u32) -> Option<bool> {
-        self.knocked
-            .contains_key(&entity)
+        // A body of its own from the start was knocked by nothing.
+        (!self.as_body.contains(&entity) && self.knocked.contains_key(&entity))
             .then(|| self.loose(entity).is_some_and(|l| l.breaks))
     }
 
@@ -935,6 +1020,156 @@ impl Props {
     }
 
     fn wreck_by(&mut self, physics: &mut Physics, entity: u32, hit: Hit) -> bool {
+        let broke = self.wreck_hit(physics, entity, hit);
+        if broke && matches!(hit, Hit::Blast(..)) {
+            self.blast_thrown(physics, entity);
+        }
+        broke
+    }
+
+    /// A blast threw `entity` (broke it apart, or knocked it loose): it
+    /// goes to the disposer as the 360's blast puts every object it
+    /// pushes there (0x82289F40 -> 0x82246A08, [`m2_engine::disposer`]).
+    /// One the disposer takes away to make room is hidden, its pieces
+    /// gone.
+    pub fn blast_thrown(&mut self, physics: &mut Physics, entity: u32) {
+        self.thrown += 1;
+        let seen = self.seen(physics, entity).unwrap_or(0.0);
+        self.dispose_for(physics, entity, seen);
+    }
+
+    /// A blast threw the island's placed object `i` (a body of its own):
+    /// the disposer holds it as it holds props (`first` its first body,
+    /// `half` half its box's diagonal).
+    pub fn island_thrown(&mut self, physics: &mut Physics, i: usize, first: DebrisId, half: f32) {
+        self.thrown += 1;
+        let key = i as u32 | ISLAND;
+        self.island_thrown.insert(key, (first, half));
+        let seen = self.seen(physics, key).unwrap_or(0.0);
+        self.dispose_for(physics, key, seen);
+    }
+
+    fn dispose_for(&mut self, physics: &mut Physics, key: u32, seen: f32) {
+        if let m2_engine::disposer::Admit::Disposing(old) =
+            self.disposer.admit(key, self.clock, seen)
+        {
+            eprintln!(
+                "props: the disposer takes {old:#x} away for {key:#x} ({} held)",
+                self.disposer.len()
+            );
+            if self.island_thrown.contains_key(&old) {
+                self.island_thrown.remove(&old);
+                self.disposed_island.push((old & !ISLAND) as usize);
+            } else {
+                self.hide(physics, [old]);
+            }
+            self.disposed.push(old);
+        }
+    }
+
+    /// The island's placed objects the disposer took away since last
+    /// asked: the world removes them.
+    pub fn take_disposed_island(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.disposed_island)
+    }
+
+    /// How big `entity` looks from the eye ([`m2_engine::disposer::seen_size`]):
+    /// its first loose piece's place (where it was, if none) and half its
+    /// model's box. `None` once it is gone.
+    fn seen(&self, physics: &Physics, entity: u32) -> Option<f32> {
+        if let Some(&(first, half)) = self.island_thrown.get(&entity) {
+            let at = physics.debris_place(first)?.w_axis.truncate();
+            return Some(m2_engine::disposer::seen_size(half, at.distance(self.eye)));
+        }
+        let p = self.shown.get(&entity)?;
+        let m = self.models.get(&p.model)?.as_ref()?;
+        let (lo, hi) = m.gpu.bounds;
+        let first = self
+            .knocked
+            .get(&entity)
+            .or_else(|| self.broken.get(&entity))
+            .and_then(|v| v.first().copied());
+        let at = first
+            .and_then(|d| physics.debris_place(d))
+            .map_or(p.position, |m| m.w_axis.truncate());
+        Some(m2_engine::disposer::seen_size(
+            (hi - lo).length() * 0.5,
+            at.distance(self.eye),
+        ))
+    }
+
+    /// Those the disposer took away since last asked.
+    pub fn take_disposed(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.disposed)
+    }
+
+    /// How many the disposer holds.
+    pub fn disposer_held(&self) -> usize {
+        self.disposer.len()
+    }
+
+    /// How many props blasts have thrown ([`blast_thrown`](Self::blast_thrown)).
+    pub fn blast_thrown_count(&self) -> usize {
+        self.thrown
+    }
+
+    /// The prop whose body from the start `d` is ([`make_body`](Self::make_body)).
+    pub fn body_entity(&self, d: DebrisId) -> Option<u32> {
+        self.as_body
+            .iter()
+            .find(|e| self.knocked.get(e).is_some_and(|v| v.contains(&d)))
+            .copied()
+    }
+
+    /// The vehicles (by index) and prop bodies in contact this step:
+    /// those that weren't the step before, a meeting each (the 360 sends
+    /// one collision event for each new contact).
+    pub fn met_bodies(&mut self, now: &[(usize, DebrisId)]) -> Vec<(usize, DebrisId)> {
+        let fresh: Vec<(usize, DebrisId)> = now
+            .iter()
+            .copied()
+            .filter(|p| !self.bumping.contains(p))
+            .collect();
+        self.bumping = now.iter().copied().collect();
+        fresh
+    }
+
+    /// The props that are bodies of their own from the start within
+    /// `reach` of `at` (their first body's place): each entity, its
+    /// template, its bodies and its box as it now stands.
+    pub fn bodies_near(&self, physics: &Physics, at: Vec3, reach: f32) -> Vec<BodyNear> {
+        self.as_body
+            .iter()
+            .filter_map(|&e| {
+                let ids = self.knocked.get(&e)?;
+                let place = physics.debris_place(*ids.first()?)?;
+                let p = self.shown.get(&e)?;
+                let m = self.models.get(&p.model)?.as_ref()?;
+                let (lo, hi) = m.gpu.bounds;
+                let centre = place.w_axis.truncate();
+                let half = (hi - lo) * 0.5;
+                (centre.distance(at) - half.length() <= reach)
+                    .then(|| (e, p.template, ids.clone(), (centre - half, centre + half)))
+            })
+            .collect()
+    }
+
+    /// Every piece lying knocked loose (not a body from the start).
+    pub fn knocked_pieces(&self) -> Vec<DebrisId> {
+        self.knocked
+            .iter()
+            .filter(|(e, _)| !self.as_body.contains(e))
+            .flat_map(|(_, v)| v.iter().copied())
+            .collect()
+    }
+
+    fn wreck_hit(&mut self, physics: &mut Physics, entity: u32, hit: Hit) -> bool {
+        // A body of its own from the start: already loose. With a wreck to
+        // show, its bodies go and the wreck comes where it now stands;
+        // without, it stays as its bodies (nothing more to break).
+        if self.as_body.contains(&entity) && !self.unbody(physics, entity) {
+            return false;
+        }
         // Its box in the world, for a blast's push on it whole.
         let whole = self
             .placed_bounds(entity)
@@ -1038,6 +1273,126 @@ impl Props {
         self.knocked.insert(entity, pieces);
         self.fresh_knocks.push(entity);
         true
+    }
+
+    /// `entity`, which comes loose whole, put up as sleeping bodies of its
+    /// own where it stands (its model's `PHY2` bodies that move, their
+    /// shapes and mass: [`m2_engine::physics::Loose`]), not as fixed
+    /// collision. From the 360 code: a prop's physics object is made with
+    /// its bodies (0x821831B0, each by 0x8216A290 from the rigid-body
+    /// defaults 0x82621820, its mass the record's +0x34), at rest until
+    /// something touches it, and sleeps by the world's rule
+    /// ([`Physics::add_prop_body`]). One that breaks apart keeps its fixed
+    /// intact body until it breaks (its pieces' bodies are made for the
+    /// parts its broken state shows: 0x82182CE8 -> 0x82152780).
+    fn make_body(&mut self, physics: &mut Physics, entity: u32) {
+        let (Some(p), Some(loose)) = (self.shown.get(&entity), self.loose(entity)) else {
+            return;
+        };
+        let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+        let pieces = loose
+            .pieces
+            .iter()
+            .zip(loose.starts(placed))
+            .map(|(piece, at)| physics.add_prop_body(piece, at, true))
+            .collect::<Vec<_>>();
+        physics.group_debris(&pieces, placed);
+        self.knocked.insert(entity, pieces);
+        self.as_body.insert(entity);
+    }
+
+    /// `entity`, a body of its own from the start, is to be wrecked: if
+    /// its model has a wreck to show, its bodies go and the prop is put
+    /// where they had taken it (its first body's place, as it started
+    /// against the prop's), true; else false and it stays as it is.
+    fn unbody(&mut self, physics: &mut Physics, entity: u32) -> bool {
+        let has_wreck = self
+            .shown
+            .get(&entity)
+            .and_then(|p| self.models.get(&p.model)?.as_ref())
+            .is_some_and(|m| m.gpu.has_wreck());
+        if !has_wreck {
+            return false;
+        }
+        self.drop_bodies(physics, entity);
+        true
+    }
+
+    /// `entity`, a body of its own from the start, gives up its bodies:
+    /// the prop is put where they had taken it (its first body's place,
+    /// as it started against the prop's).
+    fn drop_bodies(&mut self, physics: &mut Physics, entity: u32) {
+        let ids = self.knocked.remove(&entity).unwrap_or_default();
+        let moved = (|| {
+            let p = self.shown.get(&entity)?;
+            let loose = self.loose(entity)?;
+            let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+            let start = *loose.starts(placed).first()?;
+            let now = physics.debris_place(*ids.first()?)?;
+            Some(now * start.inverse() * placed)
+        })();
+        for d in ids {
+            physics.remove_debris(d);
+        }
+        self.as_body.remove(&entity);
+        if let (Some(m), Some(p)) = (moved, self.shown.get_mut(&entity)) {
+            let (_, rotation, position) = m.to_scale_rotation_translation();
+            p.rotation = rotation.normalize();
+            p.position = position;
+        }
+        self.changed();
+    }
+
+    /// The props that are bodies of their own from the start whose first
+    /// body lies within `reach` of `at`: goods a vehicle's layers put on
+    /// its load bed come in as such before the vehicle is placed.
+    pub fn bodies_standing_near(&self, physics: &Physics, at: Vec3, reach: f32) -> Vec<u32> {
+        self.as_body
+            .iter()
+            .filter(|e| {
+                self.knocked
+                    .get(e)
+                    .and_then(|v| physics.debris_place(*v.first()?))
+                    .is_some_and(|m| m.w_axis.truncate().distance(at) <= reach)
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Where the body of `entity` (a body of its own from the start) has
+    /// taken it, put on the prop ([`drop_bodies`](Self::drop_bodies)
+    /// keeps the bodies): for what asks where the prop is.
+    pub fn follow_body(&mut self, physics: &Physics, entity: u32) {
+        let moved = (|| {
+            let ids = self.knocked.get(&entity)?;
+            let p = self.shown.get(&entity)?;
+            let loose = self.loose(entity)?;
+            let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+            let start = *loose.starts(placed).first()?;
+            let now = physics.debris_place(*ids.first()?)?;
+            Some((now * start.inverse() * placed, now, start))
+        })();
+        let Some((m, now, start)) = moved else {
+            return;
+        };
+        if now.w_axis.distance(start.w_axis) < 0.01 {
+            return;
+        }
+        // Its bodies' starts move with it: they are taken as from here on.
+        let (_, rotation, position) = m.to_scale_rotation_translation();
+        if let Some(p) = self.shown.get_mut(&entity) {
+            p.rotation = rotation.normalize();
+            p.position = position;
+        }
+    }
+
+    /// The props that are bodies of their own from the start
+    /// (unless [`bodies_off`](Self::bodies_off)): each entity and its
+    /// bodies.
+    pub fn as_bodies(&self) -> impl Iterator<Item = (u32, &[DebrisId])> + '_ {
+        self.as_body
+            .iter()
+            .filter_map(|e| Some((*e, self.knocked.get(e)?.as_slice())))
     }
 
     /// Whether `entity` broke apart (its pieces thrown).
@@ -1509,6 +1864,26 @@ impl Props {
         reach: f32,
     ) -> anyhow::Result<()> {
         self.reach = reach;
+        // The disposer weighs what it holds again.
+        self.eye = focus;
+        let seen: HashMap<u32, f32> = self
+            .disposer
+            .keys()
+            .filter_map(|e| Some((e, self.seen(physics, e)?)))
+            .collect();
+        for e in self.disposer.keys().filter(|e| !seen.contains_key(e)) {
+            eprintln!(
+                "props: the disposer drops {e:#x}: gone ({})",
+                if self.island_thrown.contains_key(&e) {
+                    "its body is gone"
+                } else if self.shown.contains_key(&e) {
+                    "its model is not in"
+                } else {
+                    "no longer shown"
+                }
+            );
+        }
+        self.disposer.update(self.clock, |e| seen.get(&e).copied());
         // Gates swung open: their collision with their leaves open; one
         // whose model came in without a hinge stops swinging.
         let mut unhinged = Vec::new();
@@ -1555,6 +1930,21 @@ impl Props {
                 Some(s) => s.as_ref(),
                 None => shape,
             };
+            let whole = self
+                .loose(e)
+                .is_some_and(|l| !l.breaks && !l.pieces.is_empty());
+            if !self.bodies_off
+                && whole
+                && !self.sturdy.contains(&e)
+                && stands(e)
+                && !p.wrecked
+                && !self.knocked.contains_key(&e)
+                && !self.swings.contains_key(&e)
+                && !self.cargo.contains_key(&e)
+            {
+                self.make_body(physics, e);
+                continue;
+            }
             if let Some(shape) = shape
                 && stands(e)
                 && !p.wrecked
@@ -1803,15 +2193,22 @@ impl Props {
 
     /// Moves on `dt` seconds: what breaks apart sinks.
     pub fn advance(&mut self, dt: f32) {
+        self.clock += dt;
         for a in self.material_anims.values_mut() {
             a.advance(dt);
         }
         for (e, r) in self.part_runners.iter_mut() {
             r.advance(dt);
+            let changes = r.take_changes();
+            if !changes.is_empty() && self.kept_runners.contains(e) {
+                self.due_states.push((*e, self.steps));
+            }
             self.part_changes
-                .extend(r.take_changes().into_iter().map(|c| (*e, c)));
+                .extend(changes.into_iter().map(|c| (*e, c)));
         }
-        self.part_runners.retain(|_, r| !r.settled());
+        let kept = &self.kept_runners;
+        self.part_runners
+            .retain(|e, r| !r.settled() || kept.contains(e));
         // Gates swing on; a shut one stands in the way again
         // ([`update`](Self::update) puts its collision back).
         // Each at its widest leaf's pace, a quarter turn where its model
@@ -1871,6 +2268,142 @@ impl Props {
         if !runner.settled() {
             self.part_runners.insert(entity, runner);
         }
+    }
+
+    /// Part `machine` (its node's name hash) of `entity` takes `message`
+    /// (a node's `DestroyMsg` from the scripts) from the state it is in
+    /// now: the part machines are run as the 360 runs them on the object
+    /// (0x82289020 -> the part's state machine, [`m2_engine::part_runner`]),
+    /// each part keeping its state between messages. Returns the changes
+    /// it makes at once (later ones come with
+    /// [`take_part_changes`](Self::take_part_changes)); none for a model
+    /// with no part states or no such part.
+    pub fn send_part(
+        &mut self,
+        entity: u32,
+        machine: u32,
+        message: u32,
+    ) -> Vec<m2_engine::part_runner::Change> {
+        if !self.part_runners.contains_key(&entity) {
+            let Some(states) = self
+                .shown
+                .get(&entity)
+                .and_then(|p| self.models.get(&p.model)?.as_ref())
+                .and_then(|m| m.gpu.part_states.clone())
+            else {
+                return Vec::new();
+            };
+            let (machines, names) = &*states;
+            let name = |n: u16| names.get(usize::from(n)).copied().unwrap_or(0);
+            self.part_runners.insert(
+                entity,
+                m2_engine::part_runner::Runner::new(machines, name, entity),
+            );
+        }
+        self.kept_runners.insert(entity);
+        let Some(r) = self.part_runners.get_mut(&entity) else {
+            return Vec::new();
+        };
+        r.deliver_named(machine, message);
+        let changes = r.take_changes();
+        if !changes.is_empty() {
+            self.due_states.push((entity, self.steps));
+            self.due_fx
+                .extend(changes.iter().map(|c| (entity, c.state, self.steps)));
+        }
+        changes
+    }
+
+    /// Whether `entity`'s parts take messages one at a time
+    /// ([`send_part`](Self::send_part)): their states, not a part's wreck,
+    /// say what of it shows.
+    pub fn parts_by_state(&self, entity: u32) -> bool {
+        self.kept_runners.contains(&entity)
+    }
+
+    /// The parts' states changed before this step, applied: what of each
+    /// prop shows is rebuilt from the states its parts are in (each
+    /// state's own nodes shown and hidden, [`m2_engine::ModelParts::hidden_in_states`]),
+    /// the parts with nothing of their own left shown are down, and its
+    /// collision is rebuilt once for the rest. Returns the effects the
+    /// states a message entered start (as [`state_effects`](Self::state_effects));
+    /// those of states due later come with
+    /// [`take_part_changes`](Self::take_part_changes).
+    pub fn apply_states(&mut self, physics: &mut Physics) -> Vec<(u32, Vec3)> {
+        self.steps += 1;
+        let now = self.steps;
+        let (ready, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut self.due_states)
+            .into_iter()
+            .partition(|&(_, step)| step < now);
+        self.due_states = wait;
+        let (fx, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut self.due_fx)
+            .into_iter()
+            .partition(|&(_, _, step)| step < now);
+        self.due_fx = wait;
+        let mut done = HashSet::new();
+        for (e, sent) in ready {
+            if !done.insert(e) {
+                continue;
+            }
+            // Applied even once the object is wrecked: its death sends
+            // its nodes' messages in the same step (0x82289F40), and the
+            // 360 applies the queued states all the same.
+            let Some(parts) = self.any_model_parts(e).cloned() else {
+                continue;
+            };
+            let Some(states) = self.part_runners.get(&e).map(|r| r.states()) else {
+                continue;
+            };
+            let m2_engine::model::StatesApplied {
+                hidden,
+                wrecked,
+                shown,
+                gone,
+            } = parts.apply_states(
+                |k| states.get(k).copied().flatten(),
+                self.parts_down.get(&e).map(|d| d.hidden.as_slice()),
+            );
+            let collision_changed = self
+                .parts_down
+                .get(&e)
+                .map_or(wrecked.contains(&true), |d| d.wrecked != wrecked);
+            let down = wrecked.iter().filter(|&&w| w).count();
+            self.parts_down.insert(
+                e,
+                PartsDown {
+                    wrecked: wrecked.clone(),
+                    hidden,
+                },
+            );
+            self.changed();
+            // Its physics for the parts shown, once.
+            if collision_changed
+                && !parts.meshes.is_empty()
+                && let Some(p) = self.shown.get(&e)
+            {
+                physics.remove_static(StaticKey::Entity(e));
+                if let Some(shape) = parts.collision(&wrecked) {
+                    physics.add_static(StaticKey::Entity(e), &shape, p.position, p.rotation);
+                }
+            }
+            self.applied.push(Applied {
+                entity: e,
+                sent,
+                landed: now,
+                shown,
+                hidden: gone,
+                down,
+            });
+        }
+        fx.into_iter()
+            .flat_map(|(e, state, _)| self.state_effects(e, state))
+            .collect()
+    }
+
+    /// The parts' states applied since last asked
+    /// ([`apply_states`](Self::apply_states)).
+    pub fn take_applied(&mut self) -> Vec<Applied> {
+        std::mem::take(&mut self.applied)
     }
 
     /// The part machines' changes since last asked ([`destroy_parts`]).

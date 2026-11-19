@@ -43,8 +43,10 @@ pub const JENNIFER: HumanMotion = HumanMotion {
 };
 /// Seconds after take-off before touching the ground counts as landing.
 const MIN_AIR: f32 = 0.15;
-/// Seconds before a landing clip's end that the gait takes over again
-/// (and a bash's).
+/// Seconds before a bash's clip ends that the gait takes over again
+/// (invented). A landing plays to its clip's end: the state table's
+/// `Complete` on the clip's end takes `JumpLandStationary` to `Idle`
+/// (Xenia: 0.49 s, the clip's length).
 const LAND_FADE: f32 = 0.1;
 /// Speeds (m/s) above which she takes off and lands on the run.
 const RUNNING_JUMP: f32 = 1.0;
@@ -371,6 +373,10 @@ pub struct Player {
     /// The floor under her was taken down ([`floor_went`](Self::floor_went)):
     /// she waits for the layers' models even with ground far below.
     floor_gone: bool,
+    /// She was put down out of a vehicle she was just in
+    /// ([`step_out_at`](Self::step_out_at)): the ground there is in, so
+    /// she lands without waiting on the world's streaming.
+    ground_known: bool,
     /// Set as she lands after her floor went (taken by the log of what
     /// stands there).
     pub floor_landed: bool,
@@ -440,6 +446,10 @@ pub struct Player {
     /// ([`m2_engine::human_state`]), and whether the air's loop plays.
     human: m2_engine::human_state::HumanState,
     air_looped: bool,
+    /// Seconds she has touched the ground while in the air's `Leap`: the
+    /// landing starts once she has for one 360 step
+    /// ([`m2_engine::physics::HOLD_STEP`]).
+    touchdown: f32,
     /// A stagger picked for her, to start on her rig this step (its clip
     /// and action), and the seconds since her last began
     /// ([`m2_engine::stagger`]).
@@ -667,6 +677,7 @@ impl Player {
             settled: 0,
             waited: 0,
             floor_gone: false,
+            ground_known: false,
             floor_landed: false,
             models_coming: false,
             model,
@@ -698,6 +709,7 @@ impl Player {
             jump_queued: false,
             human: m2_engine::human_state::HumanState::default(),
             air_looped: false,
+            touchdown: 0.0,
             stagger_pending: None,
             since_stagger: None,
             carrying: false,
@@ -956,6 +968,21 @@ impl Player {
     /// to land on what is under it once the world there has loaded: the
     /// floor or ground nearest under the spot, not the top of whatever
     /// stands over it.
+    /// Where her landing stands, for a check that waits on it.
+    pub fn landing_state(&self) -> String {
+        format!(
+            "landed {}, settled {}, waited {}, streaming {}, models coming {}, ground known {}, put at {:?}, at {:.2?}",
+            self.landed,
+            self.settled,
+            self.waited,
+            self.streaming,
+            self.models_coming,
+            self.ground_known,
+            self.land_from.map(|v| v.to_array()),
+            self.character.position.to_array()
+        )
+    }
+
     pub fn drop_at(&mut self, at: Vec3) {
         self.character.position = at;
         self.character.velocity = Vec3::ZERO;
@@ -965,6 +992,41 @@ impl Player {
         self.land_from = Some(at);
         self.waited = 0;
         self.floor_gone = false;
+        self.ground_known = false;
+    }
+
+    /// Put down at `at` out of a vehicle she was just in (its door, where
+    /// her exit's clip ends): as [`drop_at`](Self::drop_at), but she lands
+    /// at once, not when the world has stopped streaming. The ground she
+    /// was riding over is in; waiting on streaming anywhere (`pending`
+    /// counts the whole world's) left her hanging where she got out for
+    /// as long as anything streamed (q728d, q673j: 6 s and more).
+    pub fn step_out_at(&mut self, at: Vec3) {
+        self.drop_at(at);
+        self.ground_known = true;
+    }
+
+    /// Out of a vehicle into the air (a ditch or toss, 0x822A1B70): at
+    /// `at` (0.5 m over her exit's place, [`m2_engine::seats::DITCH_RISE`])
+    /// going at `velocity` ([`m2_engine::seats::ditch_velocity`]), off the
+    /// ground in her `Jump` (`InAir`), to land as from a jump
+    /// (`JumpLandStationary` or `JumpLandMoving`). Unlike
+    /// [`drop_at`](Self::drop_at) she is not put down on what is under her
+    /// first: the world is already in under her.
+    pub fn launch(&mut self, at: Vec3, velocity: Vec3) {
+        self.character.position = at;
+        self.character.velocity = velocity;
+        self.character.grounded = false;
+        // Set outright: held one step as it is (0x82179ED0's +0x250).
+        self.character.hold = m2_engine::physics::HOLD_STEP;
+        self.ground = Vec2::ZERO;
+        self.run_stop = RunStop::default();
+        self.leap = Leap::Air(0.0);
+        self.air_looped = true;
+        if let (Some((_, rig)), Some(air)) = (&mut self.model, self.clips.jump) {
+            rig.animator
+                .play_action(air, false, m2_engine::blend::action::JUMP);
+        }
     }
 
     /// The floor she stands on was taken down (a state layer went): she
@@ -1112,7 +1174,7 @@ impl Player {
             let floor_coming = self.models_coming
                 && self.waited < LAND_WAIT
                 && (self.floor_gone || self.land_from.and_then(near).is_none());
-            self.settled = if self.streaming || floor_coming {
+            self.settled = if !self.ground_known && (self.streaming || floor_coming) {
                 0
             } else {
                 self.settled.saturating_add(1)
@@ -1142,6 +1204,7 @@ impl Player {
                 self.character.position.y = y + 0.05;
                 self.landed = true;
                 self.land_from = None;
+                self.ground_known = false;
                 self.settled = 0;
                 self.waited = 0;
                 self.floor_gone = false;
@@ -1482,9 +1545,19 @@ impl Player {
             } else {
                 let states = self.moves.states.clone();
                 let was_landing = matches!(self.leap, Leap::Land(..));
+                // The 360 lands her the step after the one she touches
+                // down on (Xenia: touching down at 0.40 s, `Jump` gives way
+                // at 0.44 s; inferred, the proxy's state reaches the
+                // animation driver a step later).
+                self.touchdown = if self.character.grounded {
+                    self.touchdown + dt
+                } else {
+                    0.0
+                };
+                let touched = self.touchdown >= m2_engine::physics::HOLD_STEP - 1e-4;
                 self.leap = match self.leap {
                     Leap::Windup(..) => self.leap,
-                    Leap::Air(t) if t > MIN_AIR && self.character.grounded => {
+                    Leap::Air(t) if t > MIN_AIR && self.character.grounded && touched => {
                         // The physics' message on touching down picks the
                         // landing by the state table; without it, by her
                         // speed as before.
@@ -1544,7 +1617,7 @@ impl Player {
                     }
                     // A standing landing gives way when she sets off.
                     Leap::Land(t, clip)
-                        if t + LAND_FADE < rig.clips[clip].info.duration
+                        if t < rig.clips[clip].info.duration
                             && !(Some(clip) == clips.land_still && moved > RUNNING_JUMP) =>
                     {
                         Leap::Land(t + dt, clip)
@@ -1922,7 +1995,19 @@ impl Player {
         }
     }
 
-    pub fn stagger(&mut self, event: &m2_engine::stagger::Event) -> bool {
+    /// `immune`: the scripts made her invincible (`Object.SetInvincible`,
+    /// any reason, survival mode's `Survival` too): the 360's picker gives
+    /// her none while `Object.GetInvincible` holds (0x8228CB80, from
+    /// 0x824220B0). Aimed in she is `Crouched` (0xC8886020), when it gives
+    /// her none but for a melee bash.
+    /// Forgets her last stagger, so the next is not held back by the
+    /// cooldown (`--stagger-check` runs its cases back to back).
+    pub fn forget_stagger(&mut self) {
+        self.since_stagger = None;
+        self.stagger_pending = None;
+    }
+
+    pub fn stagger(&mut self, event: &m2_engine::stagger::Event, immune: bool) -> bool {
         use m2_engine::stagger::{self, Person};
         if self.down || self.driving.is_some() || self.seated || !self.character.grounded {
             return false;
@@ -1935,8 +2020,8 @@ impl Player {
             &Person {
                 facing: self.facing,
                 player: true,
-                immune: false,
-                crouched: false,
+                immune,
+                crouched: self.aiming,
                 moving: v.x.hypot(v.z) > STAGGER_MOVING,
                 since: self.since_stagger,
                 cooldown: stagger::COOLDOWN,
@@ -2287,6 +2372,32 @@ mod tests {
     }
     use m2_engine::{CollisionShape, StaticKey};
     use m2_math::glam::Quat;
+
+    // Out of a vehicle she lands at once though the world still streams;
+    // put down elsewhere (a spawn, a teleport) she waits for it.
+    #[test]
+    fn stepping_out_lands_without_waiting_on_streaming() {
+        let physics = ground();
+        let run = |out: bool| {
+            let mut p = Player::new(0.0, 0.0, 0.0, None);
+            p.streaming = true;
+            p.models_coming = true;
+            let at = Vec3::new(2.0, 1.0, 3.0);
+            if out {
+                p.step_out_at(at);
+            } else {
+                p.drop_at(at);
+            }
+            for _ in 0..30 {
+                p.streaming = true;
+                p.models_coming = true;
+                p.update(&physics, Intent::default(), 1.0 / 60.0);
+            }
+            p.landed
+        };
+        assert!(run(true), "out of a vehicle she lands");
+        assert!(!run(false), "put down while streaming she waits");
+    }
 
     fn ground() -> Physics {
         let mut p = Physics::new();
@@ -2791,12 +2902,15 @@ mod tests {
             held: vec![held],
             ..Moves::default()
         };
-        assert!(p.stagger(&m2_engine::stagger::Event {
-            direction: Vec3::NEG_Z,
-            direct: true,
-            melee: true,
-            key: None,
-        }));
+        assert!(p.stagger(
+            &m2_engine::stagger::Event {
+                direction: Vec3::NEG_Z,
+                direct: true,
+                melee: true,
+                key: None,
+            },
+            false
+        ));
         assert!(p.face.plays(ANGRY));
     }
 
@@ -2854,9 +2968,9 @@ mod tests {
             key,
         };
         // Facing +z: a bullet does nothing, a bash from ahead staggers.
-        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, false, None)));
+        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, false, None), false));
         p.facing = 0.3;
-        assert!(p.stagger(&hit(Vec3::NEG_Z, true, true, None)));
+        assert!(p.stagger(&hit(Vec3::NEG_Z, true, true, None), false));
         assert_eq!(
             p.stagger_pending,
             Some((11, m2_engine::blend::action::STAGGER_IN_PLACE))
@@ -2866,16 +2980,27 @@ mod tests {
         assert!(p.facing.abs() < 1e-5, "{}", p.facing);
         // Not again within a quarter of a second.
         p.since_stagger = Some(0.1);
-        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None)));
+        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None), false));
         // A blast behind her: the long one. Without its clip, nothing.
         p.since_stagger = Some(2.0);
-        assert!(p.stagger(&hit(Vec3::Z, false, false, Some(EXPLOSION))));
+        assert!(p.stagger(&hit(Vec3::Z, false, false, Some(EXPLOSION)), false));
         assert_eq!(p.stagger_pending.map(|s| s.0), Some(12));
         p.since_stagger = Some(2.0);
-        assert!(!p.stagger(&hit(Vec3::X, false, false, Some(EXPLOSION))));
+        assert!(!p.stagger(&hit(Vec3::X, false, false, Some(EXPLOSION)), false));
+        // Invincible (`Object.GetInvincible`, 0x8228CB80): none, even
+        // to a bash.
+        p.since_stagger = Some(2.0);
+        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None), true));
+        assert!(!p.stagger(&hit(Vec3::Z, false, false, Some(EXPLOSION)), true));
+        // Aimed in (`Crouched`): a blast gives her none, a bash still does.
+        p.aiming = true;
+        assert!(!p.stagger(&hit(Vec3::Z, false, false, Some(EXPLOSION)), false));
+        assert!(p.stagger(&hit(Vec3::NEG_Z, true, true, None), false));
+        p.aiming = false;
         // In the air, never.
+        p.since_stagger = Some(2.0);
         p.character.grounded = false;
-        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None)));
+        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None), false));
     }
 
     #[test]
