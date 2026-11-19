@@ -704,10 +704,29 @@ local pda = setmetatable({ OpenTransitInterface = transit }, {
         end
     end,
 })
+-- The scripts' own PDA, once `MrxGuiManager.CreateGui` has made one in
+-- their state: its `UpdateSupport` (the munitions laptop's and crates'
+-- support page) is passed on to the HUD's PDA as the stand-in's calls are,
+-- then runs as it would (q736i: the laptop's `PickupMunitions` ran, its
+-- call went to the scripts' own PDA, and the HUD never heard it).
+local __m2_pda_passed = setmetatable({}, { __mode = "k" })
+local function pass_on(w)
+    if type(w) ~= "table" or __m2_pda_passed[w] then return w end
+    __m2_pda_passed[w] = true
+    local own = w.UpdateSupport
+    if type(own) == "function" then
+        w.UpdateSupport = function(self, ...)
+            pda.UpdateSupport(self, ...)
+            return own(self, ...)
+        end
+    end
+    return w
+end
 local function lookup(original)
     local f = function(name, ...)
         local w = original(name, ...)
         if w == nil and name == "PDA" then return pda end
+        if name == "PDA" then return pass_on(w) end
         return w
     end
     __m2_dialog_wrapped[f] = true
@@ -10346,6 +10365,42 @@ mod tests {
         assert!(args.contains(&(Plain::Number(1.0), Plain::Text("artillery".into()))));
         assert!(args.contains(&(Plain::Number(3.0), Plain::Number(3.0))));
         assert!(args.contains(&(Plain::Text("n".into()), Plain::Number(3.0))));
+    }
+
+    // The scripts' own PDA (made by `MrxGuiManager.CreateGui` in their
+    // state): its `UpdateSupport` is passed on to the HUD's too, and still
+    // runs on their PDA (q736i: the laptop's call went to it alone).
+    #[test]
+    fn a_call_on_the_scripts_own_pda_goes_to_the_huds_too() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            Hud = {}
+            own_pda = { got = nil }
+            function own_pda:UpdateSupport(item, x, n) self.got = { item, n } end
+            MrxGui = { GetWidgetByNameAndOwner = function(name) if name == "PDA" then return own_pda end end }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        lua.load(DIALOG_BOXES).exec().unwrap();
+        let (item, n): (String, f64) = lua
+            .load(
+                r#"local pda = MrxGui.GetWidgetByNameAndOwner("PDA", 1)
+                   pda:UpdateSupport("carpetbomb", nil, 1)
+                   -- Found again, it is passed on once, not twice.
+                   MrxGui.GetWidgetByNameAndOwner("PDA", 1)
+                   return own_pda.got[1], own_pda.got[2]"#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!((item.as_str(), n), ("carpetbomb", 1.0));
+        let calls: Vec<_> = hud_calls(&lua)
+            .into_iter()
+            .filter(|c| c.group == "PdaWidget" && c.method == "UpdateSupport")
+            .collect();
+        assert_eq!(calls.len(), 1);
     }
 
     // A starter on a prop is gone to only once she is seated in play;
