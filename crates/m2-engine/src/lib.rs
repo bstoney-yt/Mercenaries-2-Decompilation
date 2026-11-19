@@ -39,6 +39,7 @@ pub mod collision_layers;
 pub mod crush;
 pub mod death;
 pub mod destroy_route;
+pub mod disposer;
 pub mod durability;
 pub mod face_expression;
 pub mod face_graph;
