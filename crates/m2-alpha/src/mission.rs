@@ -8320,6 +8320,16 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             });
             return false;
         }
+        // `Camera.SetPitch` on her camera, as the camera she has takes it
+        // (the 360's `0xDD8FBBCF` handlers: 0x824C2480, 0x824C0DF0,
+        // 0x824C5E18).
+        Command::CameraPitch(radians) => {
+            if let Some(p) = game.scene.player.as_mut() {
+                p.set_camera_pitch(*radians);
+                eprintln!("mission: her camera's pitch set by {radians:.3} rad");
+            }
+            return false;
+        }
         Command::AimMode(on) => {
             if game.aim_off == *on {
                 game.aim_off = !on;

@@ -11146,7 +11146,9 @@ impl Running {
         // Her pitch, and the held item's camera row (its template's
         // `HumanCameraModifier`; none known: row 0).
         if let Some(p) = self.game.scene.player.as_ref() {
-            self.pad.pitch = p.pitch;
+            // Without a helicopter's nose lift: its stick pitch is the
+            // camera's own ([`m2_engine::pad_camera::HeliFollow`]).
+            self.pad.pitch = p.pitch - p.heli_lift;
         }
         let held = match self.game.combat.weapon {
             combat::Weapon::Rifle => self.game.combat.rifle.name.clone(),

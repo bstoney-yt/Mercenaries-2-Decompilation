@@ -784,6 +784,15 @@ pub struct HeliLookTuning {
     pub pitch: (f32, f32),
     pub cushion: f32,
     pub keep: [f32; 3],
+    /// How the view follows the helicopter ([`HeliFollow`]): `YawLag`
+    /// (+0x20 to the yaw block +0x608's three keeps), `RollAmp` and
+    /// `RollLag` (+0x28/+0x2C to +0x64C/+0x650), `PitchAmp` and
+    /// `PitchLag` (+0x30/+0x34 to +0x674/+0x678).
+    pub yaw_lag: f32,
+    pub roll_amp: f32,
+    pub roll_lag: f32,
+    pub pitch_amp: f32,
+    pub pitch_lag: f32,
 }
 
 impl HeliLookTuning {
@@ -832,9 +841,158 @@ impl HeliLook {
     }
 }
 
+/// `x` moved toward the angle `target` the short way round for `dt`
+/// seconds, keeping `keep` of the gap each sixtieth (0x824B9CE0's
+/// wrapping path), wrapped.
+pub fn approach_angle(x: f32, target: f32, keep: f32, dt: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    let wrap = |a: f32| (a + PI).rem_euclid(TAU) - PI;
+    let near = x + wrap(target - x);
+    wrap(approach(x, near, keep, dt))
+}
+
+/// How a helicopter pilot's camera follows the helicopter (0x824C1EB0).
+///
+/// From the 360 code:
+/// - **Yaw**: the helicopter's heading, eased through the input inertia
+///   with `YawLag` as all three keeps, the short way round (the block
+///   +0x608, its value +0x618).
+/// - **Pitch**: the view's pitch (positive down) is its own (+0x604, the
+///   stick's, [`HeliLook`]) less `PitchAmp` times the helicopter's nose
+///   pitch eased once an update keeping `PitchLag` (+0x67C).
+/// - **Roll**: `RollAmp` times the helicopter's roll, eased keeping
+///   `RollLag` (0x825AF718's turn).
+/// - **Re-centring** (0x824C23A0, [`HeliFollow::recentre`]): a reset
+///   (the handler's `0xAA535A9F` and `0x5D4C76BF`) gives a quarter of a
+///   second (+0x6A0) in which the yaw eases toward the heading and the
+///   pitch toward `DefaultPitch` keeping 0.85 (0x820D2F64); a pitch input
+///   over 0.1 squared ends it.
+///
+/// **Inferred**: the per-update eases taken a sixtieth of a second at a
+/// time; the signs of the helicopter's pitch and roll (nose up and
+/// right wing down positive) and of the view's roll. **Not ported**: the
+/// flight-mode offsets (the record at store 0x83652020 blended by the
+/// helicopter's mode: focus height, distance, yaw and pitch shifts).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HeliFollow {
+    pub yaw: f32,
+    pub nose: f32,
+    pub roll: f32,
+    primed: bool,
+    recentre: f32,
+}
+
+impl HeliFollow {
+    /// A step of `dt` seconds: the helicopter heading `heading`, its
+    /// nose pitched `nose` (up positive) and rolled `roll`. Returns the
+    /// view's yaw, the pitch it adds to the view's own (radians up) and
+    /// its roll.
+    pub fn step(
+        &mut self,
+        t: &HeliLookTuning,
+        heading: f32,
+        nose: f32,
+        roll: f32,
+        dt: f32,
+    ) -> (f32, f32, f32) {
+        if !self.primed {
+            *self = Self {
+                yaw: heading,
+                nose,
+                roll: t.roll_amp * roll,
+                primed: true,
+                recentre: 0.0,
+            };
+        }
+        self.yaw = approach_angle(self.yaw, heading, t.yaw_lag, dt);
+        self.nose = approach(self.nose, nose, t.pitch_lag, dt);
+        self.roll = approach(self.roll, t.roll_amp * roll, t.roll_lag, dt);
+        (self.yaw, t.pitch_amp * self.nose, self.roll)
+    }
+
+    /// A reset of the view (0x824C23A0): for a quarter of a second it
+    /// eases back.
+    pub fn recentre(&mut self) {
+        self.recentre = 0.25;
+    }
+
+    /// While re-centring: the view's pitch (radians up) eased toward the
+    /// default one, `default_down` (`DefaultPitch`, positive down), and
+    /// the yaw toward `heading`; ends early on a pitch input over 0.1
+    /// squared (`eased` the stick's eased pitch).
+    pub fn recentring(
+        &mut self,
+        pitch: f32,
+        default_down: f32,
+        heading: f32,
+        eased: f32,
+        dt: f32,
+    ) -> f32 {
+        self.recentre = (self.recentre - dt).max(0.0);
+        let out = if self.recentre > 0.0 {
+            self.yaw = approach_angle(self.yaw, heading, 0.85, dt);
+            approach(pitch, -default_down, 0.85, dt)
+        } else {
+            pitch
+        };
+        if eased * eased > 0.1 {
+            self.recentre = 0.0;
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_helicopter_camera_lags_its_yaw_and_leans_with_it() {
+        // An MD-500's: YawLag 0.9, RollAmp 0.65 lag 0.95, PitchAmp 0.75 lag
+        // 0.95.
+        let md = HeliLookTuning {
+            pitch_speed: 2.8,
+            pitch: (-0.5, 1.0),
+            cushion: 1.7,
+            keep: [0.7, 0.7, 0.5],
+            yaw_lag: 0.9,
+            roll_amp: 0.65,
+            roll_lag: 0.95,
+            pitch_amp: 0.75,
+            pitch_lag: 0.95,
+        };
+        let dt = 1.0 / 60.0;
+        let mut f = HeliFollow::default();
+        f.step(&md, 0.0, 0.0, 0.0, dt);
+        // Turned to 1 rad: a tenth of the gap a sixtieth, so 0.65 after
+        // ten.
+        let mut yaw = 0.0;
+        for _ in 0..10 {
+            yaw = f.step(&md, 1.0, 0.0, 0.0, dt).0;
+        }
+        assert!((yaw - (1.0 - 0.9f32.powi(10))).abs() < 1e-3, "{yaw}");
+        // The short way round, across the back.
+        let mut g = HeliFollow::default();
+        g.step(&md, 3.0, 0.0, 0.0, dt);
+        let y = g.step(&md, -3.0, 0.0, 0.0, dt).0;
+        assert!(!(-3.0..=3.0).contains(&y), "{y}");
+        // Nose up 0.2 held: the view lifts 0.75 of it in time; rolled
+        // 0.4, the view rolls 0.65 of it.
+        let (mut lift, mut roll) = (0.0, 0.0);
+        for _ in 0..600 {
+            let (_, l, r) = f.step(&md, 1.0, 0.2, 0.4, dt);
+            lift = l;
+            roll = r;
+        }
+        assert!((lift - 0.15).abs() < 1e-3 && (roll - 0.26).abs() < 1e-3);
+        // A reset eases the pitch back to its default for a quarter second.
+        f.recentre();
+        let mut p = 0.5;
+        for _ in 0..30 {
+            p = f.recentring(p, 0.25, 1.0, 0.0, dt);
+        }
+        assert!(p < 0.5 && p > -0.25, "{p}");
+    }
 
     #[test]
     fn a_helicopter_camera_pitches_only_slowing_into_its_limits() {
@@ -845,6 +1003,11 @@ mod tests {
             pitch: (-0.5, 1.0),
             cushion: 1.7,
             keep: [0.7, 0.7, 0.5],
+            yaw_lag: 0.9,
+            roll_amp: 0.65,
+            roll_lag: 0.95,
+            pitch_amp: 0.75,
+            pitch_lag: 0.95,
         };
         let dt = 1.0 / 60.0;
         assert_eq!(md.pitch_up(), (-1.0, 0.5));

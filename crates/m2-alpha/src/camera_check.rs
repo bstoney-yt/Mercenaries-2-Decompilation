@@ -10,7 +10,10 @@
 //!
 //! Kinds: `tank` (the tank camera, [`m2_engine::pad_camera::TankLook`]),
 //! `turret` (an emplaced gun's, [`m2_engine::pad_camera::TurretLook`]),
-//! `heli` (a helicopter pilot's, [`m2_engine::pad_camera::HeliLook`]).
+//! `heli` (a helicopter pilot's, [`m2_engine::pad_camera::HeliLook`]),
+//! `heli-follow` (that camera following the helicopter's turn, nose and
+//! bank, [`m2_engine::pad_camera::HeliFollow`], with the helicopter's
+//! motion scripted).
 
 use std::collections::HashMap;
 
@@ -170,7 +173,10 @@ pub fn run(install: &Install, kind: &str) -> anyhow::Result<bool> {
         "tank" => tank(&records, &mut t),
         "turret" => turret(&records, &mut t),
         "heli" => heli(&records, &mut t),
-        other => anyhow::bail!("--camera-check: no kind {other:?} (tank, turret, heli)"),
+        "heli-follow" => heli_follow(&records, &mut t),
+        other => {
+            anyhow::bail!("--camera-check: no kind {other:?} (tank, turret, heli, heli-follow)")
+        }
     }
     Ok(t.finish())
 }
@@ -313,5 +319,47 @@ fn heli(records: &Records, t: &mut Tally) {
         rate,
         0.0,
         0.0,
+    );
+}
+
+/// #711's recipe: an MD-500's view trails its turn, closing 10% of the
+/// gap a sixtieth (`YawLag` 0.9); a nose 10 deg up lifts the view 7.5 deg
+/// (`PitchAmp` 0.75); a 20 deg bank rolls it about 13 deg (`RollAmp`).
+fn heli_follow(records: &Records, t: &mut Tally) {
+    use m2_engine::pad_camera::HeliFollow;
+    let Some((name, tuning)) = records.find("md-500", |v| v.heli_camera) else {
+        t.missing("heli md-500");
+        return;
+    };
+    let dt = DT as f32;
+    let mut f = HeliFollow::default();
+    f.step(&tuning, 0.0, 0.0, 0.0, dt);
+    let (yaw, _, _) = f.step(&tuning, 1.0, 0.0, 0.0, dt);
+    t.near(
+        &format!("heli-follow {name}: share of a 1 rad turn closed in a sixtieth"),
+        f64::from(yaw),
+        0.10,
+        0.02,
+    );
+    let mut f = HeliFollow::default();
+    f.step(&tuning, 0.0, 0.0, 0.0, dt);
+    let mut lift = 0.0;
+    let mut roll = 0.0;
+    for _ in 0..240 {
+        let (_, l, r) = f.step(&tuning, 0.0, 10f32.to_radians(), 20f32.to_radians(), dt);
+        lift = l;
+        roll = r;
+    }
+    t.near(
+        &format!("heli-follow {name}: view lift for a 10 deg nose up, deg"),
+        f64::from(lift.to_degrees()),
+        7.5,
+        0.03,
+    );
+    t.near(
+        &format!("heli-follow {name}: view roll for a 20 deg bank, deg"),
+        f64::from(roll.to_degrees()),
+        13.0,
+        0.05,
     );
 }

@@ -2361,6 +2361,11 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         pitch: (f("MinPitch")?, f("MaxPitch")?),
                         cushion: f("PitchLimitCushion")?,
                         keep: [input, input, f("PitchNoInputInertia")?],
+                        yaw_lag: f("YawLag")?,
+                        roll_amp: f("RollAmp")?,
+                        roll_lag: f("RollLag")?,
+                        pitch_amp: f("PitchAmp")?,
+                        pitch_lag: f("PitchLag")?,
                     })
                 })(),
                 car_camera: (|| {
