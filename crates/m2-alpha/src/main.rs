@@ -12947,13 +12947,41 @@ fn prop_limits_check(
     );
     let (mut most, mut disposed) = (0, 0);
     let every = (0.5 / tick).round().max(1.0) as u32;
+    // Where the blasts go: at the bodies of their own nearest her (the
+    // island's placed objects that came loose whole), so each throws
+    // some (q744e: blasts on rings 15 to 60 m out threw 16 in all, short
+    // of the pool's 40); the rings where there are too few.
+    let targets: Vec<Vec3> = game.scene.world.as_ref().map_or(Vec::new(), |w| {
+        let mut at: Vec<Vec3> = w
+            .as_bodies()
+            .filter_map(|(_, ids)| Some(w.physics.debris_place(*ids.first()?)?.w_axis.truncate()))
+            .filter(|p| p.distance(centre) < 120.0)
+            .collect();
+        at.sort_by(|a, b| a.distance(centre).total_cmp(&b.distance(centre)));
+        // One blast for each spread of bodies: none closer than 6 m to the
+        // last chosen.
+        let mut picked: Vec<Vec3> = Vec::new();
+        for p in at {
+            if picked.iter().all(|q| q.distance(p) > 6.0) {
+                picked.push(p);
+            }
+        }
+        picked
+    });
+    eprintln!(
+        "prop-limits-check: {} blast points at bodies near her",
+        targets.len()
+    );
     for i in 0..(20.0 / tick) as u32 {
         if i % every == 0 {
             // Rings 15, 30, 45 and 60 m out, 8 m between blasts.
             let n = i / every;
             let ring = 15.0 * (1 + n % 4) as f32;
             let turn = n as f32 * 8.0 / ring;
-            let at = centre + Vec3::new(turn.cos(), 0.0, turn.sin()) * ring;
+            let at = targets
+                .get(n as usize)
+                .copied()
+                .unwrap_or(centre + Vec3::new(turn.cos(), 0.0, turn.sin()) * ring);
             let ground = game.scene.world.as_ref().and_then(|w| {
                 let top = at + Vec3::Y * 200.0;
                 w.physics
@@ -13036,7 +13064,17 @@ fn prop_limits_check(
             let gap = physics
                 .cast_ray(from, (to - from).normalize_or(way), 14.0)
                 .map_or(f32::MAX, |(d, _)| d);
-            (gap >= 10.5).then_some((id, at, way, Vec3::new(start.x, floor, start.z)))
+            // And the lane free of every placed object and building (a
+            // ray from inside a wall doesn't see it: #740's q740d).
+            let lane = (0..=10).all(|k| {
+                let c = Vec3::new(start.x, floor, start.z) + way * (k as f32);
+                physics.box_clear(
+                    c + Vec3::new(-1.3, 0.4, -1.3),
+                    c + Vec3::new(1.3, 1.8, 1.3),
+                    |key| !matches!(key, m2_engine::StaticKey::Cell(_)),
+                )
+            });
+            (gap >= 10.5 && lane).then_some((id, at, way, Vec3::new(start.x, floor, start.z)))
         })
     });
     let Some((id, at, way, start)) = run else {

@@ -262,7 +262,9 @@ pub struct Applied {
 }
 
 /// The disposer's keys for the island's placed objects: the object's index
-/// with this bit set (a prop's entity never has it).
+/// with this bit set. A prop's entity may have it too (`0xA000D60D`): which
+/// a key is goes by [`Props`]'s island entries, not by the bit (q744e: a
+/// thrown prop was taken for an island object and dropped as gone).
 pub const ISLAND: u32 = 0x8000_0000;
 
 /// Which parts of a prop are broken ([`m2_engine::ModelParts`]), and the
@@ -1041,7 +1043,7 @@ impl Props {
                 "props: the disposer takes {old:#x} away for {key:#x} ({} held)",
                 self.disposer.len()
             );
-            if old & ISLAND != 0 {
+            if self.island_thrown.contains_key(&old) {
                 self.island_thrown.remove(&old);
                 self.disposed_island.push((old & !ISLAND) as usize);
             } else {
@@ -1061,8 +1063,7 @@ impl Props {
     /// its first loose piece's place (where it was, if none) and half its
     /// model's box. `None` once it is gone.
     fn seen(&self, physics: &Physics, entity: u32) -> Option<f32> {
-        if entity & ISLAND != 0 {
-            let &(first, half) = self.island_thrown.get(&entity)?;
+        if let Some(&(first, half)) = self.island_thrown.get(&entity) {
             let at = physics.debris_place(first)?.w_axis.truncate();
             return Some(m2_engine::disposer::seen_size(half, at.distance(self.eye)));
         }
@@ -1726,7 +1727,7 @@ impl Props {
         for e in self.disposer.keys().filter(|e| !seen.contains_key(e)) {
             eprintln!(
                 "props: the disposer drops {e:#x}: gone ({})",
-                if e & ISLAND != 0 {
+                if self.island_thrown.contains_key(&e) {
                     "its body is gone"
                 } else if self.shown.contains_key(&e) {
                     "its model is not in"
