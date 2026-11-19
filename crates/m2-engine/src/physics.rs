@@ -2256,6 +2256,13 @@ pub struct Character {
     /// for that one step, then clears it. Seconds of it left: the 360's
     /// step is its frame, 1/30 s ([`HOLD_STEP`]).
     pub hold: f32,
+    /// Flying free (thrown): its flat velocity is kept from step to step,
+    /// less only what walls met on that step take, rather than rebuilt
+    /// from how far it moved, and no earlier wall is remembered. Invented
+    /// (port): a step the controller couldn't move it across, at the
+    /// seat it was put out of, otherwise zeroes its flight for good (q673l:
+    /// moving 6.6 and 11.4 m/s across, then 0 for the rest of it).
+    pub flying: bool,
 }
 
 impl Character {
@@ -2270,6 +2277,7 @@ impl Character {
             gravity: GRAVITY,
             wall: None,
             hold: 0.0,
+            flying: false,
         }
     }
 
@@ -7623,11 +7631,15 @@ impl Physics {
         let short = Vec3::new(moved.x, 0.0, moved.z).length() < flat.length() * dt * SHORT;
         match (walls.last(), character.wall) {
             (Some(&n), _) => character.wall = Some(n),
-            (None, Some(n)) if short && flat.dot(n) < 0.0 => walls.push(n),
+            (None, Some(n)) if short && flat.dot(n) < 0.0 && !character.flying => walls.push(n),
             _ => character.wall = None,
         }
         let climbed = movement.grounded && moved.y > CLIMBED;
-        let along = if climbed || walls.is_empty() {
+        let along = if character.flying && !movement.grounded {
+            // Flying free: its own flat velocity, less what this step's
+            // walls take.
+            solved_walk(flat, &walls)
+        } else if climbed || walls.is_empty() {
             Vec3::new(moved.x / dt, 0.0, moved.z / dt)
         } else {
             solved_walk(flat, &walls)
@@ -7801,6 +7813,43 @@ mod tests {
             assert!((-0.5..=-0.25).contains(&l), "{l}");
         }
         assert_eq!(ai_wobble(3.0, 0.6), [0.0; 3]);
+    }
+
+    // Flying free (thrown) beside a wall it pushes into: the wall takes
+    // the part of its flight into it, the rest flies on as it was, not
+    // rebuilt from a step the controller could hardly move it on (q673l:
+    // 0 across for the rest of the flight). Up and down go as before.
+    #[test]
+    fn a_thrown_character_keeps_its_flight_but_what_a_wall_takes() {
+        let mut p = Physics::new();
+        let wall = CollisionShape::cuboid(Vec3::new(0.1, 20.0, 20.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &wall,
+            Vec3::new(-0.5, 5.0, 0.0),
+            Quat::IDENTITY,
+        );
+        p.step(DT);
+        let mut c = Character::new(Vec3::new(0.0, 5.0, 0.0));
+        c.velocity = Vec3::new(-6.0, 6.0, 4.0);
+        c.flying = true;
+        c.wall = Some(Vec3::X);
+        for _ in 0..10 {
+            let walk = Vec3::new(c.velocity.x, 0.0, c.velocity.z);
+            p.move_character(&mut c, walk, None, DT);
+        }
+        assert!((c.velocity.z - 4.0).abs() < 1e-3, "{:?}", c.velocity);
+        assert!(c.velocity.x.abs() < 1e-3, "{:?}", c.velocity);
+        assert!(c.velocity.y > 0.0 && c.velocity.y < 6.0, "{:?}", c.velocity);
+        // Away from the wall, nothing takes any of it.
+        let mut c = Character::new(Vec3::new(5.0, 5.0, 0.0));
+        c.velocity = Vec3::new(6.0, 6.0, 4.0);
+        c.flying = true;
+        for _ in 0..10 {
+            let walk = Vec3::new(c.velocity.x, 0.0, c.velocity.z);
+            p.move_character(&mut c, walk, None, DT);
+        }
+        assert!((c.velocity.x - 6.0).abs() < 1e-3 && (c.velocity.z - 4.0).abs() < 1e-3);
     }
 
     // 0x82153B30: a building, the ground or debris lets a road vehicle

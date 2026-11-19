@@ -9916,12 +9916,15 @@ fn wreck_rider_check(game: &mut Game, tick: f32) {
             {
                 let c = &p.character;
                 eprintln!(
-                    "wreck-rider-check: {:.1} s: she is at {:.2}, moving {:.2} m/s, grounded {}, thrown {}, landed {}",
+                    "wreck-rider-check: {:.1} s: she is at {:.2}, moving {:.2} m/s, grounded {}, thrown {}, flying {}, placed {}",
                     k as f32 * tick,
                     c.position,
                     c.velocity,
                     c.grounded,
                     p.thrown,
+                    c.flying,
+                    // `Player::landed`: put in the world on ground that
+                    // loaded (true from her spawn on), not touched down.
                     p.landed
                 );
             }

@@ -753,15 +753,26 @@ impl Player {
     }
 
     /// Throws her at `velocity` (m/s): off the ground, not steering, and
-    /// falling under the world's gravity ([`m2_engine::physics::GRAVITY`])
-    /// rather than her template's, as a body thrown limp does, until she
-    /// lands. Inferred: the footage's arc (Xenia, a wrecked car's rider:
-    /// 1.6 to 2.9 m up, down 1.3 to 1.7 s later) fits the world's 9.81,
-    /// not her 16.5.
+    /// falling under the physics world's gravity, as a body thrown limp
+    /// does, until she lands; her flat velocity flies on as it is (less
+    /// only walls met on a step) and no wall from before is remembered
+    /// ([`m2_engine::Character::flying`]).
+    ///
+    /// The gravity: from the 360 code, a blast moves a person only as a
+    /// ragdoll (0x8215CA38 -> her impulse handler 0x824282F8, applied to a
+    /// live ragdoll's body by 0x82428910), and a ragdoll's bodies are
+    /// rigid bodies of the physics world, which pulls at 9.0
+    /// ([`m2_engine::physics::WORLD_GRAVITY`], 0x820F9710). That she flies
+    /// as a ragdoll is inferred (whether her ragdoll goes live as the car
+    /// dies is not traced); before, 9.81 ([`m2_engine::physics::GRAVITY`]),
+    /// not her template's 16.5. The footage's arc (Xenia: 1.6 to 2.9 m up,
+    /// down 1.3 to 1.7 s later) fits either.
     pub fn throw(&mut self, velocity: Vec3) {
         self.character.velocity = velocity;
         self.character.grounded = false;
-        self.character.gravity = m2_engine::physics::GRAVITY;
+        self.character.gravity = m2_engine::physics::WORLD_GRAVITY;
+        self.character.wall = None;
+        self.character.flying = true;
         self.thrown = true;
     }
 
@@ -1367,6 +1378,7 @@ impl Player {
         physics.move_character(&mut self.character, wanted, jump, dt);
         if self.thrown && self.character.grounded {
             self.thrown = false;
+            self.character.flying = false;
             self.character.gravity = self.motion.gravity;
         }
         // A fall that hurts: the 360 measures it from where she left the
