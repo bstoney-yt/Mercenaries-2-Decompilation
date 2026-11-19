@@ -4250,6 +4250,25 @@ impl Physics {
             .count()
     }
 
+    /// The loose pieces awake ([`debris_awake`](Self::debris_awake)): each
+    /// one's id, where it is and how fast it moves.
+    pub fn debris_awake_list(&self) -> Vec<(DebrisId, Vec3, f32)> {
+        self.debris
+            .iter()
+            .enumerate()
+            .filter_map(|(i, h)| {
+                let b = self.world.bodies.get((*h)?)?;
+                (b.is_dynamic() && !b.is_sleeping()).then(|| {
+                    (
+                        DebrisId(i),
+                        vec3(b.translation()),
+                        vec3(b.linvel()).length(),
+                    )
+                })
+            })
+            .collect()
+    }
+
     pub fn remove_debris(&mut self, id: DebrisId) {
         if let Some(h) = self.debris.get(id.0).copied().flatten() {
             self.debris_groups.remove(&h);

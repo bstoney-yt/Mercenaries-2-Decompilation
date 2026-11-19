@@ -12725,6 +12725,18 @@ fn prop_bodies_check(
         bodies.len() - props_bodies
     );
     let awake = physics.debris_awake();
+    // Which (q753d: 4 awake at rest): whose, where, how fast, how far from
+    // her.
+    for (id, at, speed) in physics.debris_awake_list().into_iter().take(10) {
+        let whose = bodies
+            .iter()
+            .find(|(_, ids)| ids.contains(&id))
+            .map_or("none of the bodies".to_owned(), |(e, _)| format!("{e:#x}"));
+        eprintln!(
+            "prop-bodies-check: awake at rest: piece {id:?} of {whose} at {at:.1}, {speed:.2} m/s, {:.1} m from her",
+            at.distance(game.focus())
+        );
+    }
     let (median, worst) = (
         ms.get(ms.len() / 2).copied().unwrap_or(0.0),
         ms.last().copied().unwrap_or(0.0),
