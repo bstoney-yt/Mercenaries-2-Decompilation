@@ -3278,7 +3278,7 @@ fn seat_crew(
 ///
 /// `mine` and `proximitymine` are the placed mines' and her planted
 /// mine's ([`Mission::placed_mines`]).
-pub const OBJECT_SCRIPTS: [(&str, u32); 27] = [
+pub const OBJECT_SCRIPTS: [(&str, u32); 28] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3305,6 +3305,7 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 27] = [
     ("tree_396840f6", TREE_SCRIPTS[2]),
     ("tree_6d5311e5", TREE_SCRIPTS[3]),
     ("tree_bb6fc961", TREE_SCRIPTS[4]),
+    ("Laptop", LAPTOP),
     ("islandfortress", ISLAND_FORTRESS),
 ];
 
@@ -3329,6 +3330,12 @@ pub const TREE_SCRIPTS: [u32; 5] = [
 /// (Autogunship)`, the gunship AllCon003 flies over her
 /// (`Airstrike.Flyby`). Its name is from the hash (`autogunship`).
 pub const AUTOGUNSHIP: u32 = 0x9ae4_b2ec;
+/// `Laptop`'s module hash: the munitions laptops (`Munitions (Laptop)`).
+/// From samples (its Lua): awake, a blip on the map and a wait for the
+/// hero to pick it up (`Event.WeaponEvent { "hero", "pickup", "Laptop" }`);
+/// then a `MunitionsPickup` post, a support item's stock up by one, the
+/// PDA's `UpdateSupport` and Fiona's line.
+pub const LAPTOP: u32 = 0x4068_2f05;
 
 /// `islandfortress`'s module hash: the script of the island fortress
 /// (`_island_bld_fortress01`'s `ObjectScript`). Its `OnStateChange` hears

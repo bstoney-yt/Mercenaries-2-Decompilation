@@ -124,6 +124,16 @@ pub struct Game {
     pub combat: Combat,
     /// The island's placed objects worn down and brought down by blasts.
     pub destruction: Destruction,
+    /// The placed pickups she took since the scripts last heard (their
+    /// entities): each a `WeaponEvent` "pickup" for her
+    /// ([`crate::mission`]).
+    pub picked_up: Vec<u32>,
+    /// What she took that has no object of its own here (a crate's
+    /// contents, a dropped gun, cash): its template and where it lay. The
+    /// scripts get a `WeaponEvent` "pickup" for each, on an object made
+    /// for it ([`crate::mission`]), as the 360 raises the event for any
+    /// pickup (0x82281CD0).
+    pub picked_up_loose: Vec<(u32, Vec3)>,
     /// Each vehicle model's load bed, its `HP_Truckbed` node in its own
     /// space, by model (`None`: it has none), as looked up.
     beds: HashMap<u32, Option<Vec3>>,
@@ -553,6 +563,8 @@ impl Game {
             restore: Vec::new(),
             combat,
             destruction: Destruction::default(),
+            picked_up: Vec::new(),
+            picked_up_loose: Vec::new(),
             beds: HashMap::new(),
             bed_shapes: HashMap::new(),
             beds_told: HashSet::new(),
@@ -2597,7 +2609,7 @@ impl Game {
             let chosen_key = chosen.map(crate::flights::Pickup::key);
             let near = chosen.map(|p| {
                 let refill = crate::mission::refill(templates, &self.combat, &p.what);
-                let usable = p.what.is_money() || self.combat.can_use(refill, p.what.health);
+                let usable = usable_pickup(templates, &p.what, refill);
                 let offer = crate::mission::offer(templates, &self.combat, &p.what);
                 // Each pickup she stands at and leaves lying, once, with
                 // why: what each record would go to and its room.
@@ -2669,6 +2681,9 @@ impl Game {
                 if self.placed.is_pickup(from) {
                     self.placed
                         .taken(from, &mut scene.props, &mut world.physics);
+                    self.picked_up.push(from);
+                } else {
+                    self.picked_up_loose.push((p.what.template, p.at));
                 }
             }
             // Off an emplaced gun once she is down, in a vehicle, or it
@@ -4863,6 +4878,7 @@ fn knock_loose(
     install: Option<&Install>,
 ) -> Vec<(m2_engine::VehicleId, String, f32)> {
     let mut knocked = Vec::new();
+    let mut met = Vec::new();
     for (index, (v, bed)) in vehicles
         .iter()
         .zip(beds.iter().chain(std::iter::repeat(&None)))
@@ -4900,6 +4916,16 @@ fn knock_loose(
                 place.transform_point3((lo + hi) * 0.5),
                 (hi - lo).length() * 0.5,
             ));
+            // And goods that are bodies of their own (they came in before
+            // the vehicle was placed): where their bodies lie.
+            for e in props.bodies_standing_near(
+                &world.physics,
+                place.transform_point3((lo + hi) * 0.5),
+                (hi - lo).length() * 0.5,
+            ) {
+                props.follow_body(&world.physics, e);
+                near.push(e);
+            }
             near.sort_unstable();
             near.dedup();
             // Once the props round it have loaded: what stands round the
@@ -4929,6 +4955,40 @@ fn knock_loose(
             }
         }
         let before = world.physics.vehicle_velocity_before(id);
+        // Props that are bodies of their own it met in the step: the
+        // crash rules on the real contact (its closing speed and both
+        // masses), each meeting once ([`Destruction::crash_body`]).
+        if let Some(place) = world.physics.vehicle_transform(id) {
+            let db = &world.index.template_db;
+            let sound = vehicle_sound_key(db, &v.spec.label, v.spec.model).unwrap_or(0);
+            for (d, _, closing, prop_mass) in world.physics.vehicle_prop_hits(id) {
+                // A state layer's prop, or one of the island's placed
+                // objects that is a body of its own (q753e: the check's
+                // was one of these, and no meeting was ever taken).
+                let key = props.body_entity(d).map(StaticKey::Entity).or_else(|| {
+                    world
+                        .as_bodies()
+                        .find(|(_, ids)| ids.contains(&d))
+                        .map(|(i, _)| StaticKey::Object(i))
+                });
+                if let Some(key) = key {
+                    met.push((
+                        index,
+                        d,
+                        key,
+                        closing,
+                        prop_mass,
+                        Crasher {
+                            place,
+                            bounds: v.model.bounds,
+                            velocity: before,
+                            mass: v.spec.mass,
+                            sound,
+                        },
+                    ));
+                }
+            }
+        }
         let mut speed = before.length();
         if world.physics.vehicle_pulling(id) {
             speed = speed.max(PUSH_SPEED);
@@ -4968,6 +5028,15 @@ fn knock_loose(
             world.physics.set_vehicle_velocity(id, before * keep);
             world.physics.set_vehicle_spin(id, spin * keep);
             knocked.push((id, v.spec.label.clone(), before.y));
+        }
+    }
+    let pairs: Vec<(usize, m2_engine::DebrisId)> = met.iter().map(|m| (m.0, m.1)).collect();
+    let fresh = props.met_bodies(&pairs);
+    if let Some(install) = install {
+        for (index, d, e, closing, prop_mass, crasher) in met {
+            if fresh.contains(&(index, d)) {
+                destruction.crash_body(world, props, install, &crasher, e, closing, prop_mass);
+            }
         }
     }
     knocked
@@ -5079,7 +5148,10 @@ fn run_into(
         let (fling, topple) = flung(vehicle.velocity, mass, m);
         let knocked = match key {
             StaticKey::Object(i) => world.knock(i, fling, topple),
-            StaticKey::Entity(e) => props.knock(&mut world.physics, e, fling, topple, false),
+            // A prop that comes loose is a body of its own: the vehicle
+            // meets it in the physics, and the crash rules take the real
+            // contact ([`Destruction::crash_body`]).
+            StaticKey::Entity(_) => false,
             _ => false,
         };
         if knocked {
@@ -5371,7 +5443,58 @@ fn blast_loose(world: &mut World, props: &mut Props, pushes: &[BlastPush], strik
                 .placed_bounds(e)
                 .map_or((p, p), |(at, bounds)| crate::props::box_around(at, bounds));
             let (velocity, spin) = push.throw(lo, hi, fudge(db, template));
-            props.knock(&mut world.physics, e, velocity, spin, strike);
+            if props.knock(&mut world.physics, e, velocity, spin, strike) {
+                props.blast_thrown(&mut world.physics, e);
+            }
+        }
+        // The island's placed objects that are bodies of their own:
+        // pushed where they lie, as a blast pushes any moving body it
+        // reaches (0x8215C560 -> 0x8215CBC8), and handed to the disposer
+        // as every object a blast pushes is (0x82289F40 -> 0x82246A08).
+        let island: Vec<(usize, Vec<m2_engine::DebrisId>)> = world
+            .as_bodies()
+            .map(|(i, ids)| (i, ids.to_vec()))
+            .collect();
+        for (i, ids) in island {
+            let Some(&first) = ids.first() else { continue };
+            let Some(at) = world.physics.debris_place(first) else {
+                continue;
+            };
+            let centre = at.w_axis.truncate();
+            let o = world.index.objects[i];
+            let half = world
+                .object_model(i)
+                .map_or(Vec3::splat(0.5), |m| (m.bounds.1 - m.bounds.0) * 0.5);
+            if centre.distance(push.at) - half.length() > push.radius {
+                continue;
+            }
+            let db = &world.index.template_db;
+            if !strike && !blown_loose(db, o.template) {
+                continue;
+            }
+            let (velocity, _) = push.throw(centre - half, centre + half, fudge(db, o.template));
+            for d in ids {
+                world.physics.push_debris(d, velocity);
+            }
+            props.island_thrown(&mut world.physics, i, first, half.length());
+        }
+        for i in props.take_disposed_island() {
+            world.dispose(i);
+        }
+        // Props that are bodies of their own: pushed where they now lie,
+        // as a blast pushes any moving body it reaches (0x8215C560 ->
+        // 0x8215CBC8), each body by the push on the prop's box.
+        for (e, template, ids, (lo, hi)) in props.bodies_near(&world.physics, push.at, push.radius)
+        {
+            let db = &world.index.template_db;
+            if !strike && !blown_loose(db, template) {
+                continue;
+            }
+            let (velocity, _) = push.throw(lo, hi, fudge(db, template));
+            for d in ids {
+                world.physics.push_debris(d, velocity);
+            }
+            props.blast_thrown(&mut world.physics, e);
         }
     }
 }
@@ -6403,9 +6526,34 @@ fn would_leave(
     p: &crate::flights::Pickup,
 ) -> u8 {
     let refill = crate::mission::refill(templates, combat, &p.what);
-    let usable = p.what.is_money() || combat.can_use(refill, p.what.health);
+    let usable = usable_pickup(templates, &p.what, refill);
     let offer = crate::mission::offer(templates, combat, &p.what);
     u8::from(!usable && offer != crate::mission::Offer::Equip)
+}
+
+/// Whether what lies there (`what`, giving `refill`) is hers to take.
+/// From the 360 code (0x8228F5E8, the pickup's records by `Type`): one
+/// with no ammunition record (`Type` 1) is always taken (health, as much
+/// as there is room for; a munitions laptop, `Type` 0, whose script is
+/// then told); money always; one with ammunition records whenever a
+/// weapon of hers takes one of them, full or not (each record to the
+/// first of her weapons that takes it, 0x82285C98, topping it up as far as
+/// it goes).
+fn usable_pickup(
+    templates: &m2_engine::Templates,
+    what: &crate::flights::Leaves,
+    refill: crate::combat::Refill,
+) -> bool {
+    let no_ammo = templates
+        .leavings
+        .pickups
+        .get(&what.template)
+        .is_some_and(|t| t.walked.is_empty() && t.kind != m2_engine::pickup::EQUIPMENT);
+    let matches = refill.rifle > 0 || refill.launcher > 0 || refill.grenades > 0;
+    let health_only = no_ammo && what.weapon.is_none();
+    // A pickup with ammunition records is taken only so, its health
+    // records or not (0x8228F5E8 counts a `Type` 1 match alone).
+    what.is_money() || health_only || matches
 }
 
 /// What a press of the weapon switch picks.
@@ -6568,6 +6716,51 @@ mod tests {
     use m2_engine::TemplateInfo;
 
     use super::*;
+
+    // The 360's pickup rule by `Type` (0x8228F5E8): a pickup with no
+    // ammunition record (a munitions laptop, `Type` 0 with 1 health) is
+    // taken though she is whole and none of her weapons fires what it
+    // names; one with ammunition records she has no weapon for is not.
+    #[test]
+    fn a_pickup_with_no_ammunition_record_is_always_taken() {
+        use m2_engine::pickup::{AMMUNITION, HEALTH, PickupInfo};
+        let mut templates = m2_engine::Templates::default();
+        let info = |kind, walked: Vec<(u32, u32)>| PickupInfo {
+            kind,
+            radius: 1.0,
+            ammo: Some(0x8000_844c),
+            rounds: 1,
+            gives: vec![(0x8000_844c, 1)],
+            walked,
+            heals: 1,
+            icon: None,
+            effect: None,
+        };
+        templates.leavings.pickups.insert(1, info(HEALTH, vec![]));
+        templates
+            .leavings
+            .pickups
+            .insert(2, info(AMMUNITION, vec![(0x8000_844c, 1)]));
+        let laptop = crate::flights::Leaves {
+            template: 1,
+            health: 1.0,
+            ..Default::default()
+        };
+        let coilgun_ammo = crate::flights::Leaves {
+            template: 2,
+            ..Default::default()
+        };
+        let none = crate::combat::Refill::default();
+        assert!(usable_pickup(&templates, &laptop, none));
+        assert!(!usable_pickup(&templates, &coilgun_ammo, none));
+        // Ammunition a weapon of hers takes is taken whether or not she has
+        // room for it (0x8228F5E8 -> 0x82285C98: no room test).
+        let full = crate::combat::Refill {
+            rifle: 30,
+            ..Default::default()
+        };
+        assert!(usable_pickup(&templates, &coilgun_ammo, full));
+    }
 
     #[test]
     fn the_sink_check_finds_water_deeper_than_a_car() {
