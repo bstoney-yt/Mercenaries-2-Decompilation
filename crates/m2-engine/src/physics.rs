@@ -2806,16 +2806,19 @@ fn hold_bike(
 /// How fast a wheeled vehicle's driven wheels turn, rpm, as its engine
 /// feels them (from the 360 code, 0x8219E678): each wheel's ground speed
 /// along it (the chassis' velocity at its contact, the front's turned as
-/// they steer) over its radius, weighted by its share of the drive: the
-/// back's `split` x 2 over their number, the front's the rest (0x821A0390;
-/// the shares add up to 2).
+/// they steer) over its template radius
+/// ([`EngineTuning::wheel_radius`], the wheel's +0x108, not the model's
+/// wheel), weighted by its share of the drive: the back's `split` x 2
+/// over their number, the front the rest (0x821A0390; the shares add up
+/// to 2, so a four-wheeler's engine feels twice its wheels' rpm).
 fn driven_rpm(
     body: &r::RigidBody,
     wheels: &[rapier3d::control::Wheel],
     steers: &[bool],
     steering: f32,
-    split: f32,
+    e: &EngineTuning,
 ) -> f32 {
+    let split = e.split;
     let turn = Quat::from_array(body.position().rotation.to_array());
     let (ahead, up) = (turn * Vec3::Z, turn * Vec3::Y);
     let count = |front: bool| steers.iter().filter(|&&s| s == front).count().max(1) as f32;
@@ -2837,7 +2840,7 @@ fn driven_rpm(
             };
             let at = w.raycast_info().contact_point_ws;
             let speed = vec3(body.velocity_at_point(at)).dot(along);
-            share(front) * speed / w.radius.max(0.05) * 60.0 / std::f32::consts::TAU
+            share(front) * speed / e.wheel_radius(front) * 60.0 / std::f32::consts::TAU
         })
         .sum()
 }
@@ -3203,7 +3206,8 @@ fn push_axles(v: &VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
 /// Drives a wheeled vehicle as its engine turns its wheels ([`Physics::drive`]
 /// sets the torque; from the 360 code, 0x8219CAE8 to 0x8219CDEC): each
 /// wheel on the ground pushes with its share of the torque over its
-/// radius, along the way it points; each axle sums its wheels' pushes and
+/// template radius ([`EngineTuning::wheel_radius`]; 0x8219CAE8 divides
+/// by the wheel's +0x108), along the way it points; each axle sums its wheels' pushes and
 /// pushes along their mean way at their contacts' mean, by how well it
 /// stands ([`Tyres::footing`]).
 fn drive_axles(v: &VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
@@ -3240,7 +3244,7 @@ fn drive_axles(v: &VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
         }
         let pull: f32 = grounded
             .iter()
-            .map(|w| share * v.drive / w.radius.max(0.05))
+            .map(|_| share * v.drive / e.wheel_radius(front))
             .sum();
         let at = grounded
             .iter()
@@ -5001,7 +5005,7 @@ impl Physics {
                     .world
                     .bodies
                     .get(v.controller.chassis)
-                    .map_or(0.0, |b| driven_rpm(b, all, &v.steers, v.steering, e.split));
+                    .map_or(0.0, |b| driven_rpm(b, all, &v.steers, v.steering, &e));
                 let torque = e.step(gb, dt, open, wheels, reverse);
                 let top = if gb.gear == 0 { e.reverse_speed } else { v.top };
                 let ease = ((top - speed.abs()) / (0.05 * top).max(1e-3)).clamp(0.0, 1.0);
@@ -5977,6 +5981,23 @@ impl Physics {
             .vehicle_velocity(id)
             .dot(at.z_axis.truncate().normalize_or_zero());
         if along.abs() < ROLL_REST { 0.0 } else { along }
+    }
+
+    /// A wheeled vehicle's engine's drive at its wheels this step, N
+    /// (the gear's torque over a wheel's radius, twice: the shares of its
+    /// wheels sum to 2), its footing, and how many wheels are down: for
+    /// the coast log.
+    pub fn vehicle_drive_force(&self, id: VehicleId) -> (f32, f32, usize) {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return (0.0, 0.0, 0);
+        };
+        let wheels = v.controller.wheels();
+        let r = v.engine.map_or(1.0, |e| e.wheel_radius(false));
+        let down = wheels
+            .iter()
+            .filter(|w| w.raycast_info().is_in_contact)
+            .count();
+        (2.0 * v.drive / r, v.footing, down)
     }
 
     /// The gear a wheeled vehicle's engine drives in (0 reverse, 1 first)
@@ -9194,6 +9215,7 @@ mod tests {
         gears: [2.0, 1.35, 0.9, 0.6, 0.4],
         reverse: 1.0,
         radius: 0.32,
+        front_radius: 0.32,
         torque_at: (1.0, 1.0),
         reverse_speed: 50.0 / 3.6,
         slip: 0.0,
@@ -10243,6 +10265,7 @@ mod tests {
             gears: [4.0, 3.1, 2.4, 2.0, 1.5],
             reverse: 3.7,
             radius: 0.39,
+            front_radius: 0.39,
             torque_at: (0.8, 1.0),
             reverse_speed: 55.0 / 3.6,
             slip: 1000.0,
@@ -10291,6 +10314,53 @@ mod tests {
         assert!(fastest < engine.reverse_speed * 1.03, "{fastest}");
     }
 
+    // Its engine turns at its wheels' rpm over the template's radius,
+    // not the model's wheels' (0x8219E678 divides by the wheel's +0x108,
+    // set from `FrontWheelRadius` / `RearWheelRadius` at 0x8219EF90),
+    // twice over (the drive's shares sum to 2): the test car's wheels are
+    // 0.35 m, its template's 0.39.
+    #[test]
+    fn its_engine_turns_by_the_template_wheel_radius() {
+        let engine = crate::tuning::EngineTuning {
+            radius: 0.39,
+            front_radius: 0.39,
+            ..crate::tuning::EngineTuning::DEFAULT
+        };
+        let spec = VehicleSpec {
+            mass: 1000.0,
+            tuning: crate::VehicleTuning {
+                max_speed: Some(85.0 / 3.6),
+                engine: Some(engine),
+                ..Default::default()
+            },
+            ..car()
+        };
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 600.0);
+        p.step(DT);
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, -500.0), 0.0);
+        for _ in 0..(4.0 / DT) as usize {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        p.drive(id, VehicleControls::default());
+        p.step(DT);
+        let speed = p.vehicle_speed(id);
+        let (gear, rpm) = p.vehicle_gear(id).expect("an engine");
+        let want = 2.0 * speed / 0.39 * 60.0 / std::f32::consts::TAU * engine.ratio(gear).abs();
+        assert!(speed > 5.0, "{speed}");
+        assert!(
+            (rpm / want - 1.0).abs() < 0.04,
+            "{rpm} rpm, want {want} at {speed} m/s in {gear}"
+        );
+    }
+
     // With its template's clutch delay, its gearbox changes up one gear at
     // a time as it speeds up, no sooner than that long after the last
     // change, its engine driving nothing meanwhile (0x821A0528).
@@ -10306,6 +10376,7 @@ mod tests {
             gears: [4.0, 3.1, 2.4, 2.0, 1.5],
             reverse: 3.7,
             radius: 0.39,
+            front_radius: 0.39,
             torque_at: (0.8, 1.0),
             reverse_speed: 55.0 / 3.6,
             slip: 1000.0,

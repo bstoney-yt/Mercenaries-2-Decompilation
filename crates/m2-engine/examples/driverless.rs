@@ -12,7 +12,12 @@
 //! then applies no brake and no handbrake: it coasts, slowed by what its
 //! physics does with no throttle (its tyres' rolling friction,
 //! [`m2_engine::tuning::Tyres::slowing`], and the alpha's engine and
-//! gearbox model). The helicopter (an MD-500): lifted to 50 m,
+//! gearbox model), checked against the 360 code's coast worked out as a
+//! point mass (`expected_coast`): from 1 s to 2 s it slows within 0.03
+//! m/s of it, after 10 s it is within 0.2 m/s of it, and it stays in 5th
+//! (its engine turning at twice its wheels' rpm over the template's wheel
+//! radius). A `coast t ...` line every half second logs its gear, rpm,
+//! slowing, engine drive, footing and wheels down. The helicopter (an MD-500): lifted to 50 m,
 //! then every input 0 and its lift 0 for 10 s, its height logged.
 //!
 //! Prints `driverless: PASS ...` or `FAIL ...` lines, `driverless: INFO
@@ -100,8 +105,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .tyres
                 .unwrap_or(m2_engine::tuning::Tyres::DEFAULT);
             let rolling = (tyres.rolling.0 + tyres.rolling.1) / 2.0;
-            let cleared = coast(&spec, VehicleControls::default());
-            let parked = coast(
+            let (cleared, gears) = coast(&spec, VehicleControls::default());
+            let (parked, _) = coast(
                 &spec,
                 VehicleControls {
                     parked: true,
@@ -126,8 +131,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cleared[0]
                 ),
             );
+            // The 360's coast, worked out as a point mass from the code
+            // (0x821A0528's drag at throttle 0 through 0x8219CAE8, the
+            // engine's speed by 0x8219E678 over the template radius,
+            // each axle's rolling push 0x8219FB08): `expected_coast`.
+            let want = expected_coast(&spec);
             eprintln!(
-                "driverless: INFO {name}: its tyres' rolling friction alone is {rolling:.2} m/s²; the rest of the {first:.2} is the alpha physics' own no-throttle drag (not traced here)"
+                "driverless: INFO {name}: the 360 code's coast as a point mass: {} (its tyres' rolling coefficient {rolling:.2} each axle)",
+                list(&want)
+            );
+            let slowing = |v: &[f32]| v[1] - v[2];
+            line(
+                (slowing(&cleared) - slowing(&want)).abs() < 0.03,
+                format!(
+                    "{name}: from 1 s to 2 s it slows {:.3} m/s, the 360's {:.3} (within 0.03)",
+                    slowing(&cleared),
+                    slowing(&want)
+                ),
+            );
+            line(
+                (cleared[10] - want[10]).abs() < 0.2,
+                format!(
+                    "{name}: after 10 s it is at {:.2} m/s, the 360's {:.2} (within 0.2)",
+                    cleared[10], want[10]
+                ),
+            );
+            line(
+                gears.iter().all(|&g| g == 5),
+                format!(
+                    "{name}: it coasts in 5th throughout, as the 360's engine speed (twice its wheels' rpm) holds it: {gears:?}"
+                ),
             );
             line(
                 cleared[1] > parked[1] + 1.0,
@@ -204,8 +237,8 @@ fn start(spec: &VehicleSpec, lift: f32) -> (Physics, VehicleId) {
 }
 
 /// Driven flat out to [`LET_GO`] m/s, then `after` for 10 s: its speed at
-/// the let-go and each second after.
-fn coast(spec: &VehicleSpec, after: VehicleControls) -> Vec<f32> {
+/// the let-go and each second after, and its gear each second.
+fn coast(spec: &VehicleSpec, after: VehicleControls) -> (Vec<f32>, Vec<usize>) {
     let (mut p, id) = start(spec, 0.0);
     let mut t = 0.0;
     while p.vehicle_speed(id) < LET_GO && t < 30.0 {
@@ -220,12 +253,69 @@ fn coast(spec: &VehicleSpec, after: VehicleControls) -> Vec<f32> {
         t += DT;
     }
     let mut out = vec![p.vehicle_speed(id)];
-    for _ in 0..10 {
-        for _ in 0..60 {
+    let mut gears = Vec::new();
+    for sec in 0..10 {
+        for k in 0..60 {
             p.drive(id, after);
+            let before = p.vehicle_speed(id);
             p.step(DT);
+            // The coast's working, each half second: gear, engine rpm, the
+            // slowing this tick and what the engine's drive force is.
+            if k % 30 == 0 {
+                let (gear, rpm) = p.vehicle_gear(id).unwrap_or((9, 0.0));
+                let (drive, footing, down) = p.vehicle_drive_force(id);
+                eprintln!(
+                    "coast t {:.1}: {:.2} m/s, gear {gear}, {rpm:.0} rpm, slowing {:.3} m/s2, engine drive {drive:.0} N, footing {footing:.2}, {down} wheels down",
+                    sec as f32 + k as f32 / 60.0,
+                    p.vehicle_speed(id),
+                    (before - p.vehicle_speed(id)) / DT,
+                );
+            }
         }
         out.push(p.vehicle_speed(id));
+        gears.push(p.vehicle_gear(id).map_or(9, |(g, _)| g));
+    }
+    (out, gears)
+}
+
+/// The 360 code's coast from [`LET_GO`] m/s on the flat with every input
+/// 0, as a point mass of the template's `Mass`: the engine's drag at
+/// throttle 0 (0x821A0528, [`m2_engine::tuning::EngineTuning::step`]) in
+/// its gear, through the drive (0x8219CAE8: twice the drive over the
+/// rear radius, the shares summing to 2), the engine turning at twice
+/// its wheels' rpm (0x8219E678, shares summing to 2, over the template
+/// radius), with each axle's rolling push, mass x coefficient x speed
+/// up to 1 m/s, 3x at a standstill easing to 1x at `LowSpeedLimit`
+/// ([`m2_engine::tuning::Tyres::slowing`]). Its speed each second.
+fn expected_coast(spec: &VehicleSpec) -> Vec<f32> {
+    let e = spec
+        .tuning
+        .engine
+        .unwrap_or(m2_engine::tuning::EngineTuning::DEFAULT);
+    let tyres = spec
+        .tuning
+        .tyres
+        .unwrap_or(m2_engine::tuning::Tyres::DEFAULT);
+    let mass = spec.mass;
+    let mut gb = m2_engine::tuning::Gearbox {
+        gear: 5,
+        ..Default::default()
+    };
+    let (mut v, dt) = (LET_GO, 1.0 / 600.0);
+    let mut out = vec![v];
+    for i in 1..=6000 {
+        let rpm = 2.0 * v / e.radius * 60.0 / std::f32::consts::TAU;
+        let torque = e.step(&mut gb, dt, 0.0, rpm, false);
+        let drive = e.ratio(gb.gear).abs() * torque;
+        let engine = 2.0 * drive / e.radius;
+        let rolling: f32 = [true, false]
+            .into_iter()
+            .map(|front| tyres.slowing(front, v, 0.0, 0.0, 0.0, 0.0) * mass * v.min(1.0))
+            .sum();
+        v -= (rolling - engine) / mass * dt;
+        if i % 600 == 0 {
+            out.push(v);
+        }
     }
     out
 }
