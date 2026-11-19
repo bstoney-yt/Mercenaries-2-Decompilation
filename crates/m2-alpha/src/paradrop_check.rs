@@ -62,6 +62,9 @@ pub struct Check {
     fell: HashSet<u32>,
     /// Jumpers that came down in water.
     wet: HashSet<u32>,
+    /// Jumpers seen down on dry ground (each logged once, with what the
+    /// landing left him).
+    down: HashSet<u32>,
     /// Seconds she has stood on dry ground.
     ashore_for: f32,
     /// Seconds to the next ask to put her ashore (each costs many rays).
@@ -204,6 +207,16 @@ impl Check {
                 eprintln!(
                     "paradrop-check: jumper {e:#x} in play, falling at {:.2} m/s2 from {:.0}",
                     n.character.gravity, n.character.position
+                );
+            }
+            if n.landed
+                && self.fell.contains(&e)
+                && !water(n.character.position)
+                && self.down.insert(e)
+            {
+                eprintln!(
+                    "paradrop-check: jumper {e:#x} down at {:.0} with {:.0} health",
+                    n.character.position, n.hp
                 );
             }
             if n.landed && water(n.character.position) && self.wet.insert(e) {

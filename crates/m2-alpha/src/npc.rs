@@ -6197,8 +6197,13 @@ impl People {
         // A mission's targets, and those the scripts sent somewhere (the
         // villa's waves, `Ai.Goal` `PathMove`), come first.
         let (targets, routes, following) = (&self.mission_soldiers, &self.routes, &self.following);
-        let wanted =
-            |e: &u32| targets.contains(e) || routes.contains_key(e) || following.contains_key(e);
+        let drops = &self.drops;
+        let wanted = |e: &u32| {
+            targets.contains(e)
+                || routes.contains_key(e)
+                || following.contains_key(e)
+                || drops.contains_key(e)
+        };
         near.sort_by(|a, b| {
             (!wanted(&a.1.entity))
                 .cmp(&!wanted(&b.1.entity))
@@ -6210,9 +6215,12 @@ impl People {
         let mut walker_room = self.walker_cap.min(MAX_WALKERS).saturating_sub(walkers);
         for (_, s, at) in near {
             let target = self.mission_soldiers.contains(&s.entity);
-            // Sent somewhere, or following her (a VIP released).
-            let sent =
-                self.routes.contains_key(&s.entity) || self.following.contains_key(&s.entity);
+            // Sent somewhere, or following her (a VIP released), or made
+            // in the air by the scripts (a paratrooper: the 360's script
+            // objects are in the world from creation, 0x823FE2A0).
+            let sent = self.routes.contains_key(&s.entity)
+                || self.following.contains_key(&s.entity)
+                || self.drops.contains_key(&s.entity);
             let room = if is_walker(s.entity) {
                 &mut walker_room
             } else {
