@@ -1257,6 +1257,11 @@ const HURT_AT: f32 = 8.0;
 /// (both taken by walking onto them).
 const PICKUP_CHECK_ITEMS: [&str; 2] = ["Cash (Small)", "Fuel Pickup (Large)"];
 
+/// The least a `--pickup-event-check` run plays, seconds: its 10 s, the
+/// items 4 s apart and 20 s to take them, with time to spare for her to
+/// come down on foot.
+const PICKUP_CHECK_SECONDS: f32 = 90.0;
+
 /// `--pickup-event-check`: from 10 s in, once she is on foot and down,
 /// each of [`PICKUP_CHECK_ITEMS`] is laid at her feet as a crate's
 /// contents lie (no object of its own here, `flights::Pickup` from a
@@ -1264,7 +1269,9 @@ const PICKUP_CHECK_ITEMS: [&str; 2] = ["Cash (Small)", "Fuel Pickup (Large)"];
 /// she would. Each taken logs `mission: she picks up <name> (<guid>,
 /// loose: WeaponEvent pickup)` (the mission's). Ends `pickup-event-check:
 /// PASS N of N taken` once all are gone from the ground, else `FAIL`
-/// after 20 s.
+/// after 20 s; a run that ends before then says `FAIL` and the step it
+/// was on ([`finish`](Self::finish)). The run plays at least
+/// [`PICKUP_CHECK_SECONDS`].
 #[derive(Debug, Default)]
 struct PickupEventCheck {
     t: f32,
@@ -1278,6 +1285,40 @@ struct PickupEventCheck {
 const PICKUP_CHECK_CRATE: u32 = 0xc4ec_0001;
 
 impl PickupEventCheck {
+    /// The run ended: `FAIL` and where the check stood, unless it is done.
+    fn finish(&self, game: &Game) {
+        if self.done {
+            return;
+        }
+        let p = game.scene.player.as_ref();
+        let step = if self.t < 10.0 {
+            format!("waiting for 10 s in (the run ended at {:.1} s)", self.t)
+        } else if self.laid == 0 {
+            format!(
+                "waiting for her on foot and down (landed {}, driving {})",
+                p.is_some_and(|p| p.landed),
+                p.is_some_and(|p| p.driving.is_some())
+            )
+        } else {
+            let lying = game
+                .scene
+                .flights
+                .pickups()
+                .iter()
+                .filter(|p| p.from == PICKUP_CHECK_CRATE)
+                .count();
+            format!(
+                "{} of {} laid, {lying} still lying",
+                self.laid,
+                PICKUP_CHECK_ITEMS.len()
+            )
+        };
+        eprintln!(
+            "pickup-event-check: FAIL the run ended {:.1} s in: {step}",
+            self.t
+        );
+    }
+
     fn tick(&mut self, game: &mut Game, dt: f32) {
         if self.done {
             return;
@@ -4618,6 +4659,13 @@ fn mission_for_screenshot(
     } else {
         10.0
     };
+    // `--pickup-event-check` needs its 10 s, two items 4 s apart and
+    // 20 s to take them: a run long enough for all of it.
+    let seconds = if options.pickup_event_check {
+        seconds.max(PICKUP_CHECK_SECONDS)
+    } else {
+        seconds
+    };
     let mut auto = options.autoplay.then(autoplay::Autoplay::default);
     // How long the scripts' transit map has been up.
     let mut transit_up = 0.0f32;
@@ -6169,6 +6217,9 @@ fn mission_for_screenshot(
         if play_done.is_some_and(|d| i >= d + (options.after_contract / tick).round() as u32) {
             break;
         }
+    }
+    if let Some(c) = &pickup_check {
+        c.finish(game);
     }
     if let Some(sc) = &shop_check {
         for line in sc.summary() {
