@@ -1850,6 +1850,13 @@ pub struct Thrown {
 /// object's next update (0x82292778).
 #[derive(Clone, Debug)]
 pub struct SightRays {
+    /// What the rays are cast at.
+    pub target: SightTarget,
+    /// The round's own `DamageKey` (a rocket's), for a vehicle's weak
+    /// point.
+    pub key: Option<u32>,
+    /// A soldier's blast: what it does isn't to her account.
+    pub army: bool,
     /// Its heart, where the rays start.
     pub at: Vec3,
     /// Where they end: her bones as it went off
@@ -1860,17 +1867,35 @@ pub struct SightRays {
     pub hers: f32,
 }
 
-/// Where her bones `bones` (name hashes) are, posed, in the world: on
-/// her model as it is drawn, seated or not
-/// ([`Player::model_matrix`]); a bone her rig lacks, or no model, her
-/// chest's height over where she stands.
-fn her_bones(player: &Player, bones: &[u32]) -> Vec<Vec3> {
-    let chest = player.character.position + Vec3::Y * 1.3;
-    let Some((_, rig)) = &player.model else {
-        return vec![chest; bones.len()];
-    };
+/// What a blast's rays are cast at (0x82291B88's second loop): her, a
+/// person (by index), a vehicle (by index) or one of the island's
+/// explosive objects (by index): type 1, the vehicles' types, a prop's 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SightTarget {
+    Her,
+    Person(usize),
+    Vehicle(usize),
+    Explosive(usize),
+}
+
+/// Where a body's box's rays end (0x82291B88, for a target not a
+/// person): its middle (through its matrix) for a lone ray; for a pair,
+/// a quarter of its height under and over it (0x820DABDC, 0.25).
+fn box_points(middle: Vec3, height: f32, n: usize) -> Vec<Vec3> {
+    match n {
+        0 => Vec::new(),
+        1 => vec![middle],
+        _ => vec![
+            middle - Vec3::Y * 0.25 * height,
+            middle + Vec3::Y * 0.25 * height,
+        ],
+    }
+}
+
+/// Where bones `bones` (name hashes) of a rig posed under `body` are in
+/// the world; a bone it lacks, `fallback`.
+fn rig_bones(rig: &Rig, body: Mat4, bones: &[u32], fallback: Vec3) -> Vec<Vec3> {
     let (nodes, _) = rig.posed();
-    let body = player.model_matrix();
     bones
         .iter()
         .map(|&h| {
@@ -1879,9 +1904,21 @@ fn her_bones(player: &Player, bones: &[u32]) -> Vec<Vec3> {
                 .iter()
                 .position(|&n| n == h)
                 .and_then(|i| nodes.get(i))
-                .map_or(chest, |m| (body * *m).w_axis.truncate())
+                .map_or(fallback, |m| (body * *m).w_axis.truncate())
         })
         .collect()
+}
+
+/// Where her bones `bones` (name hashes) are, posed, in the world: on
+/// her model as it is drawn, seated or not
+/// ([`Player::model_matrix`]); a bone her rig lacks, or no model, her
+/// chest's height over where she stands.
+fn her_bones(player: &Player, bones: &[u32]) -> Vec<Vec3> {
+    let chest = player.character.position + Vec3::Y * 1.3;
+    match &player.model {
+        Some((_, rig)) => rig_bones(rig, player.model_matrix(), bones, chest),
+        None => vec![chest; bones.len()],
+    }
 }
 
 /// The fight's state.
@@ -3517,7 +3554,7 @@ impl Combat {
             );
         }
         for rays in std::mem::take(&mut self.pending_sight) {
-            self.sight_hurts_her(f, &rays);
+            self.sight_lands(f, &rays);
         }
         // A fall that hurt her ([`m2_engine::on_foot::fall_impact`]).
         if let Some(fell) = f.player.fell.take() {
@@ -4560,45 +4597,154 @@ impl Combat {
     /// ([`m2_engine::stagger`]: the long stagger, for the explosion keys
     /// only). The way it travelled is taken as from the blast to her
     /// (inferred).
-    /// A blast's rays to her, a step after it went off (0x82292778): each
-    /// clear when nothing the blast's rays see
-    /// ([`m2_engine::blast_sight::MASK`]; the alpha's solid things) stands
-    /// between its heart and her bone. With any clear she takes its
-    /// damage where she is now, times the clear share
+    /// A blast's rays, a step after it went off (0x82292778): each clear
+    /// when nothing the blast's rays see ([`m2_engine::blast_sight::MASK`];
+    /// the alpha's solid things) stands between its heart and its end, or
+    /// what it meets first is the target itself (a vehicle's hull, an
+    /// explosive's own shape). With any clear the target takes the blast's
+    /// damage where it is now, times the clear share
     /// ([`m2_engine::blast_sight::clear_share`]).
-    fn sight_hurts_her(&mut self, f: &mut Field<'_>, rays: &SightRays) {
+    fn sight_lands(&mut self, f: &mut Field<'_>, rays: &SightRays) {
         // The second of a pair starts half a metre over its heart
         // ([`m2_engine::blast_sight::ray_starts`]).
         let starts = m2_engine::blast_sight::ray_starts(rays.at, rays.to.len());
+        let target_vehicle = match rays.target {
+            SightTarget::Vehicle(i) => f.vehicles.get(i).and_then(|v| v.id),
+            _ => None,
+        };
+        let target_object = match rays.target {
+            SightTarget::Explosive(i) => f.explosives.get(i).map(|e| e.object),
+            _ => None,
+        };
         let clear: Vec<bool> = starts
             .iter()
             .zip(&rays.to)
-            .map(|(&from, &to)| f.physics.line_clear(from, to, None))
+            .map(|(&from, &to)| {
+                let way = to - from;
+                let len = way.length();
+                if len < 1e-4 {
+                    return true;
+                }
+                if let Some(id) = target_vehicle {
+                    return match f.physics.cast_ray_vehicle(from, way / len, len, None) {
+                        None => true,
+                        Some((_, hit)) => hit == Some(id),
+                    };
+                }
+                if let Some(o) = target_object {
+                    return match f.physics.cast_ray_keyed(from, way / len, len) {
+                        None => true,
+                        Some((_, _, k)) => k == Some(StaticKey::Object(o)),
+                    };
+                }
+                f.physics.line_clear(from, to, None)
+            })
             .collect();
         let share = m2_engine::blast_sight::clear_share(&clear);
         let b = rays.blast;
-        let d = (f.player.character.position + Vec3::Y).distance(rays.at);
-        if share <= 0.0 {
-            eprintln!(
-                "blast: {:08x} rays to her blocked {clear:?}: spares her",
-                b.template
-            );
-            self.sight_results.push((clear, 0.0, 0.0, 0.0));
+        match rays.target {
+            SightTarget::Her => {
+                let d = (f.player.character.position + Vec3::Y).distance(rays.at);
+                if share <= 0.0 {
+                    eprintln!(
+                        "blast: {:08x} rays to her blocked {clear:?}: spares her",
+                        b.template
+                    );
+                    self.sight_results.push((clear, 0.0, 0.0, 0.0));
+                    return;
+                }
+                let before = self.hp;
+                let due = b.damage_at(d) * rays.hers * share;
+                let lost = self.hurt_player(f, due, Some(rays.at));
+                self.sight_results.push((clear.clone(), share, due, lost));
+                eprintln!("hurt: her health {before:.1} -> {:.1}", self.hp);
+                eprintln!(
+                    "blast: {:08x} reaches her {d:.1} m off, rays {clear:?}: {:.1} x {} x {share} = {lost:.1} lost",
+                    b.template,
+                    b.damage_at(d),
+                    rays.hers
+                );
+                self.tally.taken_blasts += lost;
+                self.blast_staggers_her(f, rays.at, b.key);
+            }
+            SightTarget::Person(j) => {
+                if share <= 0.0 || j >= f.people.npcs.len() {
+                    return;
+                }
+                let scale = match b.key {
+                    Some(_) => self.on_person(&f.people.npcs[j], b.key),
+                    None => 1.0,
+                };
+                let hers = (f.people.npcs[j].hurt_by_her, f.people.npcs[j].killed_by_her);
+                let n = &mut f.people.npcs[j];
+                let d = n.chest().distance(rays.at);
+                let killed =
+                    n.hurt_by_blast(b.damage_at(d) * scale * share, Vec3::ZERO, b.key, rays.at)
+                        && n.soldier;
+                if rays.army {
+                    (n.hurt_by_her, n.killed_by_her) = hers;
+                } else if killed {
+                    self.remarks.push(Remark::Kill);
+                }
+            }
+            SightTarget::Vehicle(i) => {
+                if share > 0.0 && i < f.vehicles.len() {
+                    self.blast_hurts_vehicle(f, i, rays.at, &b, rays.key, share);
+                }
+            }
+            SightTarget::Explosive(i) => {
+                if share > 0.0
+                    && let Some(mut e) = f.explosives.get(i).copied()
+                    && !e.gone
+                {
+                    let d = (e.at.distance(rays.at) - e.size).max(0.0);
+                    let hit = b.damage_at(d) * self.on_explosive(&e, b.key) * share;
+                    self.wear_explosive(&mut e, hit);
+                    f.explosives[i] = e;
+                }
+            }
+        }
+        if !matches!(rays.target, SightTarget::Her) {
+            self.sight_results.push((clear, share, 0.0, 0.0));
+        }
+    }
+
+    /// Blast `b` at `at` hurts vehicle `i` by its damage at its box's side,
+    /// the damage table's cell for its row (and a weak point's, for round
+    /// key `key`), times `share` (the rays' clear share, 1 with none).
+    fn blast_hurts_vehicle(
+        &mut self,
+        f: &mut Field<'_>,
+        i: usize,
+        at: Vec3,
+        b: &Blast,
+        key: Option<u32>,
+        share: f32,
+    ) {
+        let Some(id) = f.vehicles[i].id else { return };
+        let Some(body) = f.physics.vehicle_transform(id) else {
+            return;
+        };
+        let v = &f.vehicles[i];
+        if v.wrecked {
             return;
         }
-        let before = self.hp;
-        let due = b.damage_at(d) * rays.hers * share;
-        let lost = self.hurt_player(f, due, Some(rays.at));
-        self.sight_results.push((clear.clone(), share, due, lost));
-        eprintln!("hurt: her health {before:.1} -> {:.1}", self.hp);
-        eprintln!(
-            "blast: {:08x} reaches her {d:.1} m off, rays {clear:?}: {:.1} x {} x {share} = {lost:.1} lost",
-            b.template,
-            b.damage_at(d),
-            rays.hers
-        );
-        self.tally.taken_blasts += lost;
-        self.blast_staggers_her(f, rays.at, b.key);
+        let (lo, hi) = v.spec.bounds;
+        let centre = body.transform_point3((lo + hi) * 0.5);
+        let d = (centre.distance(at) - (hi - lo).max_element() * 0.25).max(0.0);
+        let reach = b.radius.max(0.5);
+        if d >= reach {
+            return;
+        }
+        let weak = self.weak_point(v, body, at, key);
+        if weak != 1.0 {
+            eprintln!("weak point: {} takes {weak:.1}x of the blast", v.spec.label);
+        }
+        let cell = blast_cell(self.damage_table.as_ref(), v, b.key) * weak * share;
+        let damage = b.damage_at(d) * cell;
+        let v = &mut f.vehicles[i];
+        v.blast_parts(body, at, reach, |p| b.damage_at(p) * cell);
+        self.hurt_vehicle(f.physics, v, i, damage);
     }
 
     fn blast_staggers_her(&self, f: &mut Field<'_>, at: Vec3, key: Option<u32>) {
@@ -6869,8 +7015,12 @@ impl Combat {
                 .iter()
                 .map(|n| (n.hurt_by_her, n.killed_by_her))
                 .collect();
+            let queued = self.pending_sight.len();
             self.explode_keyed(f, at, blast, key);
             if army {
+                for r in &mut self.pending_sight[queued..] {
+                    r.army = true;
+                }
                 for (n, (hurt, killed)) in f.people.npcs.iter_mut().zip(hers) {
                     (n.hurt_by_her, n.killed_by_her) = (hurt, killed);
                 }
@@ -7235,6 +7385,59 @@ impl Combat {
         };
         let reach = b.radius.max(0.5);
         let mut killed = false;
+        // By the blast's `Detail` ([`m2_engine::blast_sight`]): `Low` hurts
+        // what it reaches at once; else what it reaches of a person's,
+        // vehicle's or prop's type waits for rays, cast at the next step
+        // ([`Self::sight_lands`]), fewer each with more than 8 waiting.
+        let detail = self
+            .blast_details
+            .get(&b.template)
+            .copied()
+            .unwrap_or(m2_engine::blast_sight::Detail::High);
+        let vehicle_d = |f: &Field<'_>, v: &ParkedVehicle| {
+            let body = f.physics.vehicle_transform(v.id?)?;
+            let (lo, hi) = v.spec.bounds;
+            let centre = body.transform_point3((lo + hi) * 0.5);
+            Some((centre.distance(at) - (hi - lo).max_element() * 0.25).max(0.0))
+        };
+        let her_d = (f.player.character.position + Vec3::Y).distance(at);
+        let detail = if detail.casts() {
+            let people = f
+                .people
+                .npcs
+                .iter()
+                .filter(|n| n.chest().distance(at) < reach)
+                .count();
+            let vehicles = f
+                .vehicles
+                .iter()
+                .filter(|v| !v.wrecked && vehicle_d(f, v).is_some_and(|d| d < reach))
+                .count();
+            let explosives = f
+                .explosives
+                .iter()
+                .filter(|e| !e.gone && (e.at.distance(at) - e.size).max(0.0) < reach)
+                .count();
+            let waiting = people + vehicles + explosives + usize::from(her_d < reach);
+            let d = detail.for_count(waiting);
+            eprintln!(
+                "blast: {:08x} casts rays ({d:?}) at {waiting} waiting: {people} people, {vehicles} vehicles, {explosives} explosives{}",
+                b.template,
+                if her_d < reach { ", her" } else { "" }
+            );
+            d
+        } else {
+            detail
+        };
+        let rays = |target: SightTarget, to: Vec<Vec3>| SightRays {
+            target,
+            key,
+            army: false,
+            at,
+            to,
+            blast: b,
+            hers,
+        };
         for j in 0..f.people.npcs.len() {
             // Their own row of the damage table for its `DamageKey`; all
             // of it without a key.
@@ -7245,50 +7448,45 @@ impl Combat {
             let n = &mut f.people.npcs[j];
             let d = n.chest().distance(at);
             if d < reach {
+                if detail.casts() {
+                    let to = rig_bones(&n.rig, n.model_matrix(), detail.person_bones(), n.chest());
+                    self.pending_sight.push(rays(SightTarget::Person(j), to));
+                } else {
+                    killed |=
+                        n.hurt_by_blast(b.damage_at(d) * scale, Vec3::ZERO, b.key, at) && n.soldier;
+                }
                 // No push of its own (0x8215C560 pushes only a ragdoll
-                // that runs): the launch throws them once limp.
-                killed |=
-                    n.hurt_by_blast(b.damage_at(d) * scale, Vec3::ZERO, b.key, at) && n.soldier;
+                // that runs): the launch throws them once limp. The push
+                // is the explosion action's, not the area damage's: it
+                // waits for no rays.
                 self.launch_person(&mut f.people.npcs, j, at, (b.radius, b.max_force));
                 f.people.npcs[j].panic(at);
             } else if d < reach * 3.0 {
                 n.panic(at);
             }
         }
-        self.blast_explosives(f.explosives, at, reach, |d| b.damage_at(d), b.key);
+        if detail.casts() {
+            // The island's explosive objects (a prop's type, 0): rays to
+            // their box ([`box_points`]: their middle, their size as the
+            // half of it).
+            for (i, e) in f.explosives.iter().enumerate() {
+                if !e.gone && (e.at.distance(at) - e.size).max(0.0) < reach {
+                    let n = detail.person_bones().len();
+                    let to = box_points(e.at, e.size * 2.0, n);
+                    self.pending_sight.push(rays(SightTarget::Explosive(i), to));
+                }
+            }
+        } else {
+            self.blast_explosives(f.explosives, at, reach, |d| b.damage_at(d), b.key);
+        }
         // Her, seated or not (a rider's body is in the world and among
-        // its targets: type 1, 0x822A2F80). By the blast's `Detail`
-        // ([`m2_engine::blast_sight`]): `Low` hurts her at once; else rays
-        // to her bones, cast at the next step ([`Self::sight_hurts_her`]).
-        let d = (f.player.character.position + Vec3::Y).distance(at);
+        // its targets: type 1, 0x822A2F80).
+        let d = her_d;
         if d < reach {
-            let detail = self
-                .blast_details
-                .get(&b.template)
-                .copied()
-                .unwrap_or(m2_engine::blast_sight::Detail::High);
             if detail.casts() {
-                // Those waiting for rays with her: the people and vehicles
-                // in its reach (props are not counted).
-                let people = f
-                    .people
-                    .npcs
-                    .iter()
-                    .filter(|n| n.chest().distance(at) < reach)
-                    .count();
-                let vehicles = f
-                    .vehicles
-                    .iter()
-                    .filter(|v| {
-                        v.id.and_then(|id| f.physics.vehicle_transform(id))
-                            .is_some_and(|m| m.w_axis.truncate().distance(at) < reach)
-                    })
-                    .count();
-                let waiting = 1 + people + vehicles;
-                let detail = detail.for_count(waiting);
                 let to = her_bones(f.player, detail.person_bones());
                 eprintln!(
-                    "blast: {:08x} {d:.1} m off casts {} ray(s) at her ({detail:?}, {waiting} waiting){}",
+                    "blast: {:08x} {d:.1} m off casts {} ray(s) at her ({detail:?}){}",
                     b.template,
                     to.len(),
                     if f.player.driving.is_some() {
@@ -7297,12 +7495,7 @@ impl Combat {
                         ""
                     }
                 );
-                self.pending_sight.push(SightRays {
-                    at,
-                    to,
-                    blast: b,
-                    hers,
-                });
+                self.pending_sight.push(rays(SightTarget::Her, to));
             } else {
                 let before = self.hp;
                 let lost = self.hurt_player(f, b.damage_at(d) * hers, Some(at));
@@ -7321,24 +7514,26 @@ impl Combat {
                 b.template
             );
         }
-        for (i, v) in f.vehicles.iter_mut().enumerate() {
+        for i in 0..f.vehicles.len() {
+            let v = &f.vehicles[i];
             let Some(id) = v.id else { continue };
             let Some(body) = f.physics.vehicle_transform(id) else {
                 continue;
             };
             let (lo, hi) = v.spec.bounds;
-            let centre = body.transform_point3((lo + hi) * 0.5);
-            let d = (centre.distance(at) - (hi - lo).max_element() * 0.25).max(0.0);
+            let middle = body.transform_point3((lo + hi) * 0.5);
+            let d = vehicle_d(f, v).unwrap_or(f32::MAX);
             if d < reach && !v.wrecked {
-                let weak = self.weak_point(v, body, at, key);
-                if weak != 1.0 {
-                    eprintln!("weak point: {} takes {weak:.1}x of the blast", v.spec.label);
+                if detail.casts() {
+                    // Rays to its box (0x82291B88: the middle of its box
+                    // through its matrix, a pair a quarter of its height
+                    // under and over).
+                    let n = detail.person_bones().len();
+                    let to = box_points(middle, hi.y - lo.y, n);
+                    self.pending_sight.push(rays(SightTarget::Vehicle(i), to));
+                } else {
+                    self.blast_hurts_vehicle(f, i, at, &b, key, 1.0);
                 }
-                let damage =
-                    b.damage_at(d) * blast_cell(self.damage_table.as_ref(), v, b.key) * weak;
-                let cell = blast_cell(self.damage_table.as_ref(), v, b.key) * weak;
-                v.blast_parts(body, at, reach, |p| b.damage_at(p) * cell);
-                self.hurt_vehicle(f.physics, v, i, damage);
             }
             // Every vehicle in its reach is pushed, whole or wrecked (the
             // wreck whose blast it is too), as the 360 pushes each moving
@@ -7349,6 +7544,7 @@ impl Combat {
                     radius: reach,
                     force: b.max_force,
                 };
+                let v = &mut f.vehicles[i];
                 blast_push_vehicle(f.physics, v, id, body, push);
             }
         }
@@ -9223,6 +9419,93 @@ mod tests {
         assert_eq!(vehicles[0].rounds(), None);
     }
 
+    /// A `High` blast's damage to soldiers waits a step for their rays:
+    /// one in the open is hurt, one behind a wall is not (0x82291B88's
+    /// second loop, 0x82292778); both are launched at once either way.
+    #[test]
+    fn a_wall_shields_a_soldier_from_a_blast() {
+        let mut physics = ground();
+        // A wall 4 m tall at x 1.4..1.6 across z -2..2 (the blast at x 3).
+        let v: Vec<Vec3> = (0..8)
+            .map(|k| {
+                Vec3::new(
+                    if k & 1 == 0 { 1.4 } else { 1.6 },
+                    if k & 2 == 0 { 0.0 } else { 4.0 },
+                    if k & 4 == 0 { -2.0 } else { 2.0 },
+                )
+            })
+            .collect();
+        let t = [
+            [0, 2, 1],
+            [1, 2, 3],
+            [4, 5, 6],
+            [5, 7, 6],
+            [0, 1, 4],
+            [1, 5, 4],
+            [2, 6, 3],
+            [3, 6, 7],
+            [0, 4, 2],
+            [2, 4, 6],
+            [1, 3, 5],
+            [3, 7, 5],
+        ];
+        let shape = m2_engine::CollisionShape::mesh(&v, &t).expect("wall");
+        physics.add_static(
+            m2_engine::StaticKey::Cell(99),
+            &shape,
+            Vec3::ZERO,
+            m2_math::glam::Quat::IDENTITY,
+        );
+        physics.step(1.0 / 60.0);
+        let dt = 1.0 / 60.0;
+        let mut player = Player::new(0.0, 0.0, 40.0, None);
+        let mut people = People::default();
+        // Behind the wall (x 0), and in the open beside the blast (x 5).
+        for x in [0.0, 5.0] {
+            people.npcs.push(Npc::new(
+                0,
+                &rig(),
+                Vec3::new(x, 1.0, 0.0),
+                0.0,
+                Brain::Post { facing: 0.0 },
+                Some(1),
+            ));
+        }
+        for _ in 0..3 {
+            people.update(&mut physics, &[], Vec3::ZERO, None, dt);
+        }
+        let arsenal = Arsenal::default();
+        let mut vehicles = Vec::new();
+        let mut explosives = [];
+        let mut combat = Combat::default();
+        let before: Vec<f32> = people.npcs.iter().map(|n| n.hp).collect();
+        let mut field = Field {
+            physics: &mut physics,
+            player: &mut player,
+            people: &mut people,
+            vehicles: &mut vehicles,
+            arsenal: &arsenal,
+            explosives: &mut explosives,
+        };
+        let blast = Blast {
+            template: 7,
+            radius: 6.0,
+            damage: 40.0,
+            min_damage: 10.0,
+            max_force: 0.0,
+            key: None,
+        };
+        combat.explode_keyed(&mut field, Vec3::new(3.0, 1.0, 0.0), Some(blast), None);
+        assert_eq!(field.people.npcs[0].hp, before[0]);
+        assert_eq!(
+            field.people.npcs[1].hp, before[1],
+            "not before the rays are read"
+        );
+        combat.step(&mut field, Trigger::default(), dt);
+        assert_eq!(field.people.npcs[0].hp, before[0], "behind the wall");
+        assert!(field.people.npcs[1].hp < before[1], "in the open");
+    }
+
     /// A `High` blast's damage to her waits a step for its two rays
     /// (0x82292778), comes whole with both clear, and none behind a wall;
     /// a `Low` one hurts her at once.
@@ -9565,7 +9848,10 @@ mod tests {
         assert!(field.explosives[0].gone);
         assert_eq!(field.explosives[1].hp, 500.0);
         // The first's own blast goes off at once: 3.5 m from the second's
-        // side it does 400 x (1 - 3.5 / 8) = 225, which sets it burning.
+        // side it does 400 x (1 - 3.5 / 8) = 225, which sets it burning:
+        // a step later, once its rays are read (0x82292778; nothing stands
+        // between here).
+        combat.step(&mut field, Trigger::default(), dt);
         combat.step(&mut field, Trigger::default(), dt);
         let second = field.explosives[1];
         assert!((second.hp - 275.0).abs() < 1e-3, "{}", second.hp);

@@ -9683,17 +9683,107 @@ fn blast_sight_check(game: &mut Game, tick: f32) {
     if let Some(w) = game.scene.world.as_mut() {
         w.physics.remove_static(wall);
     }
-    match (open_ok, wall_ok) {
-        (Ok(()), Ok(())) => eprintln!(
-            "blast-sight-check: PASS in the open she lost {:.1} at the clear share; behind the wall nothing",
+    let soldier_ok = soldier_sight(game, tick, blast, wall);
+    match (open_ok, wall_ok, soldier_ok) {
+        (Ok(()), Ok(()), Ok(())) => eprintln!(
+            "blast-sight-check: PASS in the open she lost {:.1} at the clear share; behind the wall nothing; a soldier behind a wall unhurt, in the open hurt",
             open.iter().copied().fold(0.0f32, f32::max)
         ),
-        (a, b) => {
-            for why in [a.err(), b.err()].into_iter().flatten() {
+        (a, b, c) => {
+            for why in [a.err(), b.err(), c.err()].into_iter().flatten() {
                 eprintln!("blast-sight-check: FAIL {why}");
             }
         }
     }
+}
+
+/// `--blast-sight-check`'s soldier: [`SIGHT_BLAST`] 3 m from the
+/// soldier nearest her (within 60 m), first with a wall 4 m wide and 4 m
+/// high halfway between (he must lose nothing), then without (he must
+/// lose some). `Err` with why.
+fn soldier_sight(
+    game: &mut Game,
+    tick: f32,
+    blast: m2_engine::weapons::Blast,
+    wall: m2_engine::StaticKey,
+) -> Result<(), String> {
+    use m2_math::glam::{Quat, Vec3};
+    let her = game.focus();
+    let people = &game.scene.people.npcs;
+    let j = (0..people.len())
+        .filter(|&j| people[j].alive && people[j].chest().distance(her) < 60.0)
+        .min_by(|&a, &b| {
+            people[a]
+                .chest()
+                .distance(her)
+                .total_cmp(&people[b].chest().distance(her))
+        })
+        .ok_or("no soldier within 60 m of her")?;
+    let chest = people[j].chest();
+    // The blast on the side away from her, 3 m off, at his chest's height.
+    let away = (chest - her).with_y(0.0).normalize_or(Vec3::X);
+    let at = chest + away * 3.0;
+    let go = |game: &mut Game| -> f32 {
+        let hp = game.scene.people.npcs[j].hp;
+        game.combat.set_off(at, Some(blast));
+        for _ in 0..4 {
+            game.step(Intent::default(), tick);
+        }
+        hp - game.scene.people.npcs.get(j).map_or(hp, |n| n.hp)
+    };
+    if let Some(w) = game.scene.world.as_mut()
+        && let Some(shape) = sight_wall()
+    {
+        let turn = Quat::from_rotation_arc(Vec3::X, away);
+        w.physics.add_static(wall, &shape, chest + away * 1.5, turn);
+    }
+    let walled = go(game);
+    if let Some(w) = game.scene.world.as_mut() {
+        w.physics.remove_static(wall);
+    }
+    let open = go(game);
+    eprintln!(
+        "blast-sight-check: soldier {j} {:.1} m from her: behind the wall lost {walled:.1}, in the open {open:.1}",
+        chest.distance(her)
+    );
+    if walled > 0.01 {
+        Err(format!("the soldier lost {walled:.1} behind the wall"))
+    } else if open <= 0.0 {
+        Err("the soldier lost nothing in the open".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+/// The checks' wall: 4 m wide, 4 m high, 0.3 m thick, about its middle,
+/// thin along x.
+fn sight_wall() -> Option<m2_engine::CollisionShape> {
+    use m2_math::glam::Vec3;
+    let (hw, hh, ht) = (2.0, 2.0, 0.15);
+    let v: Vec<Vec3> = (0..8)
+        .map(|k| {
+            Vec3::new(
+                if k & 1 == 0 { -ht } else { ht },
+                if k & 2 == 0 { -hh } else { hh },
+                if k & 4 == 0 { -hw } else { hw },
+            )
+        })
+        .collect();
+    let t = [
+        [0, 2, 1],
+        [1, 2, 3],
+        [4, 5, 6],
+        [5, 7, 6],
+        [0, 1, 4],
+        [1, 5, 4],
+        [2, 6, 3],
+        [3, 6, 7],
+        [0, 4, 2],
+        [2, 4, 6],
+        [1, 3, 5],
+        [3, 7, 5],
+    ];
+    m2_engine::CollisionShape::mesh(&v, &t)
 }
 
 /// Wrecks the vehicle she drives, as it goes, and logs how it comes to
