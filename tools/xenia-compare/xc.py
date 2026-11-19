@@ -1365,6 +1365,19 @@ def run(args) -> int:
                             last_say = now
                             say(f"fight3: {tk:#x} at {d:.0f} m, yaw err {err:+.0f}, pitch err {perr:+.0f}, {'advance' if ly else ('FIRE' if fire else 'aim')}; {len(tgts)} left, {len(killed)} down")
                     bb = 0
+                    # stalled while advancing (drops6 stood 10 min at 20 m): jump (A) and sidestep for 0.6 s
+                    if ly > 0:
+                        st3 = getattr(hh, "_f3", None)
+                        if st3 is None or now - st3[0] > 2.0:
+                            if st3 is not None and math.dist(st3[1], hp) < 0.5:
+                                hh._f3_jump = now
+                            hh._f3 = (now, hp)
+                        if now - getattr(hh, "_f3_jump", 0.0) < 0.6:
+                            bb |= BTN["a"]
+                            lx_side = 1.0 if int(now) % 2 else -1.0
+                            apply(bb, 0, 0, lx_side, ly, rx, ry)
+                            time.sleep(0.04)
+                            continue
                     if gren and yv is not None and d <= gren and abs(err) < 8 and now - last_gren > 5.0:
                         last_gren, n_gren = now, n_gren + 1
                         say(f"fight3: grenade {n_gren} at {tk:#x}, {d:.0f} m")
@@ -1618,6 +1631,25 @@ def run(args) -> int:
                         remembered_veh = k_
                         break
                 say(f"rememberveh: {remembered_veh and hex(remembered_veh)}")
+            elif op == "pitchto":
+                # pitchto <deg> [<timeout>]: bring the camera's pitch to <deg> with stepped right-stick y (dead zone ~0.5)
+                import xmem
+
+                cam = xmem.Camera(xmem.Guest(p.pid))
+                want = float(w[1])
+                end = time.time() + (float(w[2]) if len(w) > 2 else 8.0)
+                while time.time() < end:
+                    pv = cam.pitch()
+                    if pv is None:
+                        break
+                    err = want - pv
+                    if abs(err) < 1.0:
+                        break
+                    apply(0, 0, 0, 0.0, 0.0, 0.0, (1.0 if err > 0 else -1.0) * (1.0 if abs(err) > 8 else 0.62))
+                    time.sleep(0.01)
+                apply()
+                time.sleep(0.3)
+                say(f"pitchto: camera pitch {cam.pitch():.2f} (wanted {want:.1f})")
             elif op == "poke":
                 # poke <guest hex address> <byte>: set one guest data byte, a
                 # runtime flag (never code, the XEX or files). E.g. 0x83134382 =
