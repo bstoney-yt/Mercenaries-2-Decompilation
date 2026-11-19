@@ -9579,8 +9579,25 @@ fn wreck_rider_check(game: &mut Game, tick: f32) {
         }
         eprintln!("wreck-rider-check: the {label} wrecked under her at {hp:.1} health");
         let mut landed = None;
-        for _ in 0..(6.0 / tick) as u32 {
+        let every = ((0.1 / tick).round() as u32).max(1);
+        for k in 0..(6.0 / tick) as u32 {
             game.step(Intent::default(), tick);
+            // Her flight each tenth of a second (q673k: up 2.8 s but only
+            // 0.7 m across: what stops her across?).
+            if k % every == 0
+                && let Some(p) = game.scene.player.as_ref()
+            {
+                let c = &p.character;
+                eprintln!(
+                    "wreck-rider-check: {:.1} s: she is at {:.2}, moving {:.2} m/s, grounded {}, thrown {}, landed {}",
+                    k as f32 * tick,
+                    c.position,
+                    c.velocity,
+                    c.grounded,
+                    p.thrown,
+                    p.landed
+                );
+            }
             if let Some(l) = game.combat.wreck_landing.take() {
                 landed = Some(l);
                 break;
