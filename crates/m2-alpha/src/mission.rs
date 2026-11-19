@@ -679,14 +679,54 @@ local function transit(pda, zones, callback, data)
     __m2_transit_box = box.__m2_dialog
 end
 -- The PDA as the scripts find it (`MrxGui.GetWidgetByNameAndOwner("PDA",
--- player)`): the HUD's, in its own Lua state, so a stand-in that opens the
--- transit map and does nothing else.
-local pda = setmetatable({ OpenTransitInterface = transit },
-    { __index = function() return function() end end })
+-- player)`): the HUD's, in its own Lua state (on the 360 one state holds
+-- both, and the scripts call the PDA widget itself: `MrxGuiManager`'s
+-- `PdaLoaded` makes it). So a stand-in that opens the transit map, and
+-- passes any other call on to the HUD's PDA as it was made (group
+-- `PdaWidget`): the munitions laptop's and crates' `UpdateSupport`.
+-- A call's arguments as they go across: plain values and guids.
+local function plain(v, depth)
+    if type(v) == "function" then return nil end
+    if type(v) ~= "table" then return v end
+    if depth > 3 then return nil end
+    local out = {}
+    for k, x in pairs(v) do out[k] = plain(x, depth + 1) end
+    return out
+end
+local pda = setmetatable({ OpenTransitInterface = transit }, {
+    __index = function(_, method)
+        return function(_, ...)
+            __m2_hud_call_count = __m2_hud_call_count + 1
+            local args = { n = select("#", ...) }
+            for i = 1, args.n do args[i] = plain((select(i, ...)), 0) end
+            __m2_keep_hud_call({ seq = __m2_hud_call_count, group = "PdaWidget",
+                method = method, data = args })
+        end
+    end,
+})
+-- The scripts' own PDA, once `MrxGuiManager.CreateGui` has made one in
+-- their state: its `UpdateSupport` (the munitions laptop's and crates'
+-- support page) is passed on to the HUD's PDA as the stand-in's calls are,
+-- then runs as it would (q736i: the laptop's `PickupMunitions` ran, its
+-- call went to the scripts' own PDA, and the HUD never heard it).
+local __m2_pda_passed = setmetatable({}, { __mode = "k" })
+local function pass_on(w)
+    if type(w) ~= "table" or __m2_pda_passed[w] then return w end
+    __m2_pda_passed[w] = true
+    local own = w.UpdateSupport
+    if type(own) == "function" then
+        w.UpdateSupport = function(self, ...)
+            pda.UpdateSupport(self, ...)
+            return own(self, ...)
+        end
+    end
+    return w
+end
 local function lookup(original)
     local f = function(name, ...)
         local w = original(name, ...)
         if w == nil and name == "PDA" then return pda end
+        if name == "PDA" then return pass_on(w) end
         return w
     end
     __m2_dialog_wrapped[f] = true
@@ -1014,6 +1054,8 @@ pub struct MissionLink {
     pub check_building_damage: Option<f32>,
     /// `--part-destroy-check` ([`PartDestroyCheck`]).
     pub part_destroy_check: Option<PartDestroyCheck>,
+    /// `--sat-blip-check` ([`SatBlipCheck`]).
+    pub sat_blip_check: Option<SatBlipCheck>,
     /// The face rigs and sets read, and the sets the scripts mounted
     /// ([`m2_engine::lip_sync`]).
     faces: m2_engine::lip_sync::Library,
@@ -1095,6 +1137,8 @@ pub struct MissionLink {
     /// The factions' pursuit lists of units ([`crate::gunships::Lists`]).
     pursuit_lists: Option<crate::gunships::Lists>,
     reinforcements: crate::reinforce::Reinforcements,
+    /// `--paradrop-check` ([`crate::paradrop_check`]).
+    paradrop_check: Option<crate::paradrop_check::Check>,
     /// The scripts' drop zone tests being searched ([`crate::drop_zones`]).
     drop_zones: crate::drop_zones::DropZones,
     /// Seconds since the scripts said the contract was completed.
@@ -1117,6 +1161,12 @@ pub struct MissionLink {
     /// Interface sounds the scripts cued (`ui_HUD_Objective_New`), and
     /// whether each is to stop instead.
     sounds: Vec<(String, bool)>,
+    /// Objects made for loose pickups she took, to take away again once
+    /// their `WeaponEvent` has been heard.
+    loose_items: Vec<u32>,
+    /// Loose items made last step whose `pickup` is told this step: by
+    /// then their own scripts are waiting for it ([`Self::loose_items`]).
+    loose_pickups: Vec<u32>,
     /// `--mine-check` ([`crate::mines::MineCheck`]).
     mine_check: Option<crate::mines::MineCheck>,
     /// Sounds the scripts cued on an object (`Sound.CueSound(object,
@@ -1272,6 +1322,7 @@ impl MissionLink {
             check_node_damage: None,
             check_building_damage: None,
             part_destroy_check: None,
+            sat_blip_check: None,
             prop_nodes: HashMap::new(),
             faces: Default::default(),
             movies: false,
@@ -1307,6 +1358,7 @@ impl MissionLink {
             pursuit_counts: None,
             pursuit_lists: None,
             reinforcements: crate::reinforce::Reinforcements::default(),
+            paradrop_check: None,
             drop_zones: crate::drop_zones::DropZones::default(),
             completed: None,
             contracts: 0,
@@ -1316,6 +1368,8 @@ impl MissionLink {
             lines: Vec::new(),
             hushed: Vec::new(),
             voice_banks: Vec::new(),
+            loose_items: Vec::new(),
+            loose_pickups: Vec::new(),
             sounds: Vec::new(),
             mine_check: None,
             object_sounds: Vec::new(),
@@ -1629,6 +1683,15 @@ impl MissionLink {
             job.near = near;
         }
         self
+    }
+
+    /// With `--paradrop-check`: the paradrop plane put over her and its
+    /// drop followed ([`crate::paradrop_check`]).
+    pub fn with_paradrop_check(self, on: bool) -> Self {
+        Self {
+            paradrop_check: on.then(Default::default),
+            ..self
+        }
     }
 
     /// Stocks and calls in these support items once the scripts run.
@@ -2627,7 +2690,7 @@ impl MissionLink {
         if self.ashore > 0 && game.scene.player.as_ref().is_some_and(|p| p.landed) {
             self.ashore -= 1;
             // Thousands of rays a look: twice a second is plenty.
-            if self.ashore.is_multiple_of(30) && go_ashore(game) {
+            if self.ashore.is_multiple_of(30) && go_ashore(game, &[]).is_some() {
                 self.ashore = 0;
             }
         }
@@ -2858,6 +2921,9 @@ impl MissionLink {
         // vehicle she rides, as the scripts have it; the faction's
         // soldiers take her for one of theirs while it holds, and the
         // scripts and the HUD's gauge hear how it stands.
+        for g in game.take_sunk() {
+            mission.vehicle_sinking(g);
+        }
         let honks = game.take_honks();
         if honks > 0 {
             mission.honk();
@@ -3167,7 +3233,21 @@ impl MissionLink {
                 }
             }
         }
+        if let Some(check) = &mut self.paradrop_check
+            && check.tick(game, mission, dt) == crate::paradrop_check::Ask::Ashore
+            && game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.landed || p.swimming())
+        {
+            let to = go_ashore(game, check.failed());
+            check.put_ashore(to);
+        }
         if let Some(check) = &mut self.object_sound_check {
+            check.tick(game, mission, dt);
+        }
+        if let Some(check) = &mut self.sat_blip_check {
             check.tick(game, mission, dt);
         }
         // A pursuit run out: the scripts read level 0 again.
@@ -3522,6 +3602,45 @@ impl MissionLink {
             }
             // What rides on a vehicle is where it rides, for the scripts
             // that count it there (`Pg.GetObjectsInArea`).
+            // She took a placed pickup (the munitions laptop): as the
+            // 360's hero hears its `pickup` message (0x82281CD0, from her
+            // weapon messages 0x82282530), a `WeaponEvent` "pickup" for
+            // her and the item.
+            for item in std::mem::take(&mut game.picked_up) {
+                eprintln!("mission: she picks up {item:#x} (WeaponEvent pickup)");
+                mission.weapon_event(PLAYER, "pickup", item);
+            }
+            // Last step's loose items are taken away again: the event has
+            // been heard.
+            for g in std::mem::take(&mut self.loose_items) {
+                mission.ammo_gone(g);
+            }
+            // Last step's loose items: their `pickup` now, a step after
+            // they were made, so their own scripts are already waiting
+            // for it (a munitions laptop's `Laptop` waits for
+            // `WeaponEvent { "hero", "pickup", <itself> }`, and a wait
+            // hears only events after it was made: told in the step that
+            // made it, its `PickupMunitions` never ran, q736h).
+            for g in std::mem::take(&mut self.loose_pickups) {
+                mission.weapon_event(PLAYER, "pickup", g);
+                self.loose_items.push(g);
+            }
+            // Something with no object of its own here (a crate's
+            // contents, a dropped gun, cash): an object of its template is
+            // made where it lay for the event to name, then taken away.
+            for (template, at) in std::mem::take(&mut game.picked_up_loose) {
+                let name = game
+                    .scene
+                    .world
+                    .as_ref()
+                    .and_then(|w| w.index.template_db.names.get(&template).cloned());
+                let Some(name) = name else {
+                    continue;
+                };
+                let g = mission.ammo_spawned(&name, at.to_array());
+                eprintln!("mission: she picks up {name} ({g:#x}, loose: WeaponEvent pickup)");
+                self.loose_pickups.push(g);
+            }
             for (g, at, yaw, (lo, hi)) in game.scene.props.cargo_places() {
                 mission.place(g, at.to_array(), yaw);
                 mission.set_bounds(g, lo.to_array(), hi.to_array());
@@ -3561,6 +3680,11 @@ impl MissionLink {
             // counts them.
             let hero = mission.world().borrow().player;
             let hers = game.scene.people.her_kills();
+            // Their health as it changes (a fall, a round), for the scripts
+            // watching it: the paratrooper's chute comes off below 100.
+            for (guid, hp) in game.scene.people.take_health_changes() {
+                mission.set_health(guid, hp);
+            }
             for guid in game.scene.people.all_killed() {
                 match hero.filter(|_| hers.contains(&guid)) {
                     Some(h) => mission.kill_by(guid, h),
@@ -6558,38 +6682,176 @@ impl ObjectSoundCheck {
     }
 }
 
-fn go_ashore(game: &mut Game) -> bool {
+/// `--sat-blip-check`: the satellite bomb's square on the radar, put on
+/// and taken off by the game's own scripts. Two seconds into play a
+/// `Smart Bomb Projectile` is spawned 60 m over her and blipped as the
+/// satellite bomb's script blips it (`MrxSupport.BlipAircraft(bomb,
+/// {255, 0, 0})`, which takes the square off on the bomb's
+/// `ObjectDeath` or `ObjectHibernation`); a second later it goes off
+/// ([`m2_game::mission::Mission::ordnance_burst`]), and two seconds after
+/// that the radar is looked at. Prints `sat-blip-check: PASS` when the
+/// square was on and is gone, else `sat-blip-check: FAIL <why>`; a run
+/// that ends first fails ([`SatBlipCheck::finish`]).
+#[derive(Debug, Default)]
+pub struct SatBlipCheck {
+    t: f32,
+    bomb: Option<(u32, Vec3)>,
+    burst: bool,
+    done: bool,
+}
+
+impl SatBlipCheck {
+    /// Whether the scripts' radar has a blip on `guid`.
+    fn blipped(mission: &m2_game::mission::Mission, guid: u32) -> bool {
+        let w = mission.world().borrow();
+        w.hud.radar.values().any(|b| b.target == Some(guid))
+    }
+
+    fn fail(&mut self, why: &str) {
+        self.done = true;
+        eprintln!("sat-blip-check: FAIL {why}");
+    }
+
+    fn tick(&mut self, game: &Game, mission: &mut m2_game::mission::Mission, dt: f32) {
+        if self.done {
+            return;
+        }
+        self.t += dt;
+        if self.bomb.is_none() && self.t > 2.0 {
+            let at = game.focus() + Vec3::Y * 60.0;
+            let g = mission.ammo_spawned("Smart Bomb Projectile", at.to_array());
+            let blip = mission
+                .lua()
+                .load(
+                    "local bomb = ...                      if type(MrxSupport) ~= 'table' or type(MrxSupport.BlipAircraft) ~= 'function' then                        return false end                      MrxSupport.BlipAircraft(bomb, { 255, 0, 0 }) return true",
+                )
+                .set_name("=sat-blip-check")
+                .call::<bool>(m2_game::events::guid_value(g));
+            eprintln!("sat-blip-check: bomb {g:#x} at {at:.1}, blipped by the scripts: {blip:?}");
+            self.bomb = Some((g, at));
+            match blip {
+                Ok(true) if Self::blipped(mission, g) => {}
+                Ok(true) => return self.fail("BlipAircraft put no blip on the radar"),
+                Ok(false) => return self.fail("the scripts have no MrxSupport.BlipAircraft"),
+                Err(e) => return self.fail(&format!("BlipAircraft: {e}")),
+            }
+        }
+        let Some((g, at)) = self.bomb else { return };
+        if !self.burst && self.t > 3.0 {
+            self.burst = true;
+            eprintln!("sat-blip-check: bomb {g:#x} goes off");
+            mission.ordnance_burst(g, at.to_array());
+        }
+        if self.burst && self.t > 5.0 {
+            self.done = true;
+            if Self::blipped(mission, g) {
+                eprintln!(
+                    "sat-blip-check: FAIL its square is still on the radar 2 s after it went off"
+                );
+            } else {
+                eprintln!("sat-blip-check: PASS its square came off the radar as it went off");
+            }
+        }
+    }
+
+    /// The run ended: one with no verdict fails.
+    pub fn finish(&mut self) {
+        if !self.done {
+            self.fail(&format!(
+                "the run ended at {:.1} s of play, before a verdict",
+                self.t
+            ));
+        }
+    }
+}
+
+fn go_ashore(game: &mut Game, avoid: &[Vec3]) -> Option<Vec3> {
     let (Some(world), Some(player)) = (&game.scene.world, &mut game.scene.player) else {
-        return true;
+        return None;
     };
     // Boats and docks the layers place float at -36 m: dry ground is
     // above that, whatever height the sea is drawn at.
     let sea = world.settings.sea_level.max(WATERLINE);
-    let from = player.character.position;
-    if from.y > sea {
-        return true;
-    }
+    // The island's own ground only (its terrain's cells), not a dock or
+    // a boat's deck over the water, and not where a put failed.
     let ground = |x: f32, z: f32| {
+        if avoid
+            .iter()
+            .any(|a| a.with_y(0.0).distance(Vec3::new(x, 0.0, z)) < AVOID)
+        {
+            return None;
+        }
         let top = 600.0;
-        let (t, normal) = world
-            .physics
-            .cast_ray(Vec3::new(x, top, z), Vec3::NEG_Y, 1200.0)?;
-        let y = top - t;
-        (y > sea + 0.5 && normal.y > 0.7).then_some(Vec3::new(x, y + 1.0, z))
+        let (t, normal, key, _) =
+            world
+                .physics
+                .cast_ray_surface(Vec3::new(x, top, z), Vec3::NEG_Y, 1200.0)?;
+        matches!(key, Some(m2_engine::StaticKey::Cell(_))).then_some((top - t, normal.y))
     };
+    let to = dry_spot(
+        player.character.position,
+        ground,
+        |x, z| world.physics.water_at(x, z),
+        sea,
+    )?;
+    // Already standing on it: left as she is.
+    let from = player.character.position;
+    if player.landed && (to - from).with_y(0.0).length() < 1e-3 {
+        return Some(to);
+    }
+    // Out of any seat first: seated (VzaCon001 starts her at the wheel
+    // of its speed boat) she stays where the seat is, and the put came to
+    // nothing (the #618 game check: put ashore three times, each time
+    // back in the boat at the start).
+    let seated = player.driving.take().is_some();
+    if seated {
+        player.seated = false;
+        player.chase_target = None;
+        eprintln!("ashore: she leaves the vehicle she sits in to be put ashore");
+    }
+    // As a teleport puts her down (her swim and landing state too).
+    player.drop_at(to);
+    if seated {
+        game.ride = None;
+        game.on_foot = true;
+    }
+    Some(to)
+}
+
+/// How far from a spot she was put ashore on and wasn't dry after the
+/// next try must be, metres.
+const AVOID: f32 = 25.0;
+
+/// The nearest dry ground to `from` (its own spot first, then rings out
+/// every 25 m to 1.5 km): where the ground (`ground`: its height and the
+/// up part of its normal at x, z) is level enough (normal over 0.7) and
+/// more than 0.5 m over the water there (`water`, else `sea`, and never
+/// under `sea`), as the paradrop check's own dry test has it. A metre
+/// over that ground, to drop onto it; `None` where there is none.
+pub(crate) fn dry_spot(
+    from: Vec3,
+    ground: impl Fn(f32, f32) -> Option<(f32, f32)>,
+    water: impl Fn(f32, f32) -> Option<f32>,
+    sea: f32,
+) -> Option<Vec3> {
+    let dry = |x: f32, z: f32| {
+        let (y, up) = ground(x, z)?;
+        let surface = water(x, z).unwrap_or(sea).max(sea);
+        (y > surface + 0.5 && up > 0.7).then_some(Vec3::new(x, y + 1.0, z))
+    };
+    if let Some(here) = dry(from.x, from.z) {
+        return Some(here);
+    }
     for r in (1..=60).map(|i| i as f32 * 25.0) {
         let n = ((r / 10.0) as usize).max(8);
         for k in 0..n {
             let a = k as f32 / n as f32 * std::f32::consts::TAU;
-            if let Some(to) = ground(from.x + r * a.cos(), from.z + r * a.sin()) {
-                player.character.position = to;
-                player.character.velocity = Vec3::ZERO;
-                player.landed = false;
-                return true;
+            if let Some(to) = dry(from.x + r * a.cos(), from.z + r * a.sin()) {
+                return Some(to);
             }
         }
     }
-    false
+    None
 }
 
 /// Whether `guid` is a layer entity that places a person.
@@ -8099,12 +8361,18 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             position,
             yaw,
         } => {
-            if let Some(s) = game.scene.world.as_ref().and_then(|w| {
-                w.index
-                    .template_db
-                    .scripted_spawn(*guid, what, Vec3::from(*position), *yaw)
+            // One whose template scales gravity (a paratrooper) falls from
+            // where it was made.
+            if let Some((s, scale)) = game.scene.world.as_ref().and_then(|w| {
+                let db = &w.index.template_db;
+                let s = db.scripted_spawn(*guid, what, Vec3::from(*position), *yaw)?;
+                let scale = db
+                    .ids(what)
+                    .first()
+                    .and_then(|id| db.gravity_scales.get(id).copied());
+                Some((s, scale))
             }) {
-                game.scene.people.scripted_spawn(s);
+                game.scene.people.scripted_spawn(s, scale);
             }
             // A prop of theirs (PirCon004's organ boxes) stands as a
             // layer's would.
@@ -8129,7 +8397,9 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
         }
         Command::Remove(guid) => {
             game.scene.people.priority.remove(guid);
-            game.scene.people.scripted_gone(*guid);
+            game.scene
+                .people
+                .scripted_gone(game.scene.world.as_mut().map(|w| &mut w.physics), *guid);
             if let Some(w) = game.scene.world.as_mut() {
                 game.scene.props.hide(&mut w.physics, [*guid]);
             }
@@ -10245,6 +10515,77 @@ mod tests {
         );
     }
 
+    // The PDA the scripts find (the munitions laptop's): the HUD's, in its
+    // own state, so a call on it is kept for the HUD with its arguments.
+    #[test]
+    fn a_call_on_the_pda_goes_to_the_huds() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            Hud = {}
+            MrxGui = { GetWidgetByNameAndOwner = function() return nil end }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        lua.load(DIALOG_BOXES).exec().unwrap();
+        lua.load(
+            r#"local pda = MrxGui.GetWidgetByNameAndOwner("PDA", 1)
+               pda:UpdateSupport("artillery", nil, 3)"#,
+        )
+        .exec()
+        .unwrap();
+        let calls = hud_calls(&lua);
+        let call = calls
+            .iter()
+            .find(|c| c.group == "PdaWidget")
+            .expect("a PDA call");
+        assert_eq!(call.method, "UpdateSupport");
+        let Plain::Table(args) = &call.data else {
+            panic!("{:?}", call.data);
+        };
+        assert!(args.contains(&(Plain::Number(1.0), Plain::Text("artillery".into()))));
+        assert!(args.contains(&(Plain::Number(3.0), Plain::Number(3.0))));
+        assert!(args.contains(&(Plain::Text("n".into()), Plain::Number(3.0))));
+    }
+
+    // The scripts' own PDA (made by `MrxGuiManager.CreateGui` in their
+    // state): its `UpdateSupport` is passed on to the HUD's too, and still
+    // runs on their PDA (q736i: the laptop's call went to it alone).
+    #[test]
+    fn a_call_on_the_scripts_own_pda_goes_to_the_huds_too() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            Hud = {}
+            own_pda = { got = nil }
+            function own_pda:UpdateSupport(item, x, n) self.got = { item, n } end
+            MrxGui = { GetWidgetByNameAndOwner = function(name) if name == "PDA" then return own_pda end end }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        lua.load(DIALOG_BOXES).exec().unwrap();
+        let (item, n): (String, f64) = lua
+            .load(
+                r#"local pda = MrxGui.GetWidgetByNameAndOwner("PDA", 1)
+                   pda:UpdateSupport("carpetbomb", nil, 1)
+                   -- Found again, it is passed on once, not twice.
+                   MrxGui.GetWidgetByNameAndOwner("PDA", 1)
+                   return own_pda.got[1], own_pda.got[2]"#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!((item.as_str(), n), ("carpetbomb", 1.0));
+        let calls: Vec<_> = hud_calls(&lua)
+            .into_iter()
+            .filter(|c| c.group == "PdaWidget" && c.method == "UpdateSupport")
+            .collect();
+        assert_eq!(calls.len(), 1);
+    }
+
     // A starter on a prop is gone to only once she is seated in play;
     // one on foot at once.
     #[test]
@@ -10336,6 +10677,40 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn she_is_put_on_dry_ground_not_on_the_sea() {
+        // The sea at -36 everywhere; an island whose shore is 100 m east
+        // of her (ground at -34 from x 100 on, the sea floor -50 before),
+        // and a lagoon over it at -33.8 from x 100 to 120.
+        let sea = -36.0;
+        let ground = |x: f32, _z: f32| {
+            Some(if x >= 100.0 {
+                (-34.0, 1.0)
+            } else {
+                (-50.0, 1.0)
+            })
+        };
+        let water = |x: f32, _z: f32| {
+            Some(if (100.0..120.0).contains(&x) {
+                -33.8
+            } else {
+                -36.0
+            })
+        };
+        let at = dry_spot(Vec3::new(0.0, -36.0, 0.0), ground, water, sea).unwrap();
+        // Out of the lagoon, on the ground past it, a metre over it.
+        assert!(at.x >= 120.0, "{at}");
+        assert!((at.y - -33.0).abs() < 1e-3, "{at}");
+        // Already on dry ground: where she is.
+        let here = dry_spot(Vec3::new(130.0, -34.0, 0.0), ground, water, sea).unwrap();
+        assert_eq!(here, Vec3::new(130.0, -33.0, 0.0));
+        // A slope too steep, or all sea: nowhere.
+        assert!(dry_spot(Vec3::ZERO, |_, _| Some((-34.0, 0.5)), |_, _| None, sea).is_none());
+        assert!(dry_spot(Vec3::ZERO, |_, _| Some((-50.0, 1.0)), |_, _| None, sea).is_none());
+        // Ground under the waterline where no water is reported: still sea.
+        assert!(dry_spot(Vec3::ZERO, |_, _| Some((-35.8, 1.0)), |_, _| None, sea).is_none());
+    }
 
     #[test]
     fn the_object_sound_check_counts_its_charges_cue_only() {
@@ -11213,6 +11588,13 @@ mod tests {
 
     // A part-destroy check the run ends on without a verdict fails,
     // naming its step; its steps are logged once each.
+    #[test]
+    fn a_sat_blip_check_without_a_verdict_fails_at_the_end() {
+        let mut check = SatBlipCheck::default();
+        check.finish();
+        assert!(check.done, "a run with no verdict ends failed");
+    }
+
     #[test]
     fn a_part_destroy_check_without_a_verdict_fails_at_the_end() {
         let mut c = super::PartDestroyCheck::default();

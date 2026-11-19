@@ -1836,6 +1836,13 @@ impl Mission {
             .map_or(&[], |e| e.path.as_slice())
     }
 
+    /// Vehicle `guid` sank: its `VehicleSinking` physics event holds
+    /// (the scripts' `ObjectPhysicsEvent`; the 360 sends it once,
+    /// [`m2_engine::durability::Buoyancy`]).
+    pub fn vehicle_sinking(&mut self, guid: u32) {
+        self.world.borrow_mut().sunk.insert(guid);
+    }
+
     /// She honked: the friendly faction gates hear it for
     /// [`api::HONK_HEARD`] seconds.
     pub fn honk(&mut self) {
@@ -2129,9 +2136,19 @@ impl Mission {
         self.strike_callbacks(guid, at, true, "flyby arrived");
     }
 
-    /// Ordnance `guid` (an [`Command::Ordnance`]) went off at `at`.
+    /// Ordnance `guid` (an [`Command::Ordnance`]) went off at `at`: its
+    /// script's callbacks run, then it dies.
+    ///
+    /// From the scripts: `MrxSupport.BlipAircraft` (the satellite guided
+    /// bomb's red square on the radar) takes its blip off only on the
+    /// bomb's `ObjectDeath` or `ObjectHibernation` (its
+    /// `_RemoveBlipCallback`), so a bomb that went off and lived on kept
+    /// its square for good (playtest of e8749a2a). Inferred: that the
+    /// engine kills a projectile as it goes off (no other event takes
+    /// the blip away, and the 360 game's square goes).
     pub fn ordnance_burst(&mut self, guid: u32, at: [f32; 3]) {
         self.strike_callbacks(guid, at, false, "ordnance burst");
+        self.kill(guid);
     }
 
     fn strike_callbacks(&mut self, guid: u32, at: [f32; 3], arrival: bool, what: &str) {
@@ -3255,13 +3272,27 @@ fn seat_crew(
 /// (0xcd561a19): awake, its lights are on (`Vehicle.SetParts` of
 /// `LightFront`), and they go out when it dies.
 ///
+/// The paradrop chain: `paradroplocation` (the 20 placed `Paradrop
+/// Location (AL/CH)`, 0xc1349ba1), awake, flies its faction's paradrop
+/// plane 100 m over it from 50 m west and 300 m north at 40 m/s
+/// (`Airstrike.Flyby`) and removes itself; the plane's `paradrop`
+/// (0x6dea6fe8) shows a blip coloured by its faction's relation to the
+/// PMC and drops 16 men, one each 0.75 s from 6 s on, within 10 m of it
+/// (`Pg.Spawn` of the faction's `Paratrooper`); the man's `paratrooper`
+/// (0xee1b0a30), awake, waits for his health to drop below 100 (his
+/// landing's fall damage, or a round) and puts the faction's `Airborne`
+/// soldier in his place. The locations name their plane
+/// `"Support Vehicle (paradop_al)"` (sic), a template the data lacks, so
+/// the flyby is the program's fallback ([`crate::airstrike`]) and no men
+/// drop from it.
+///
 /// `C4` and `beacon` are the scripts of her stuck C4 and of the Beacon
 /// Designator's beacon light: they blink and, a second on, beep until
 /// they go ([`Mission::ammo_spawned`]).
 ///
 /// `mine` and `proximitymine` are the placed mines' and her planted
 /// mine's ([`Mission::placed_mines`]).
-pub const OBJECT_SCRIPTS: [(&str, u32); 27] = [
+pub const OBJECT_SCRIPTS: [(&str, u32); 31] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3276,6 +3307,9 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 27] = [
     ("pmcgate", PMC_GATE),
     ("repairpad", REPAIR_PAD),
     ("pursuitcopter", PURSUIT_COPTER),
+    ("paradroplocation", PARADROP_LOCATION),
+    ("paradrop", PARADROP),
+    ("paratrooper", PARATROOPER),
     ("AntiAir", homing::ANTI_AIR),
     ("HomingMissile", homing::HOMING_MISSILE),
     ("C4", ammo::C4),
@@ -3288,6 +3322,7 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 27] = [
     ("tree_396840f6", TREE_SCRIPTS[2]),
     ("tree_6d5311e5", TREE_SCRIPTS[3]),
     ("tree_bb6fc961", TREE_SCRIPTS[4]),
+    ("Laptop", LAPTOP),
     ("islandfortress", ISLAND_FORTRESS),
 ];
 
@@ -3308,10 +3343,22 @@ pub const TREE_SCRIPTS: [u32; 5] = [
     0xbb6f_c961,
 ];
 
+/// `paradroplocation`'s module hash.
+pub const PARADROP_LOCATION: u32 = 0xc134_9ba1;
+/// `paradrop`'s module hash (the paradrop plane's script).
+pub const PARADROP: u32 = 0x6dea_6fe8;
+/// `paratrooper`'s module hash.
+pub const PARATROOPER: u32 = 0xee1b_0a30;
 /// `autogunship`'s module hash: the script of `Support Vehicle
 /// (Autogunship)`, the gunship AllCon003 flies over her
 /// (`Airstrike.Flyby`). Its name is from the hash (`autogunship`).
 pub const AUTOGUNSHIP: u32 = 0x9ae4_b2ec;
+/// `Laptop`'s module hash: the munitions laptops (`Munitions (Laptop)`).
+/// From samples (its Lua): awake, a blip on the map and a wait for the
+/// hero to pick it up (`Event.WeaponEvent { "hero", "pickup", "Laptop" }`);
+/// then a `MunitionsPickup` post, a support item's stock up by one, the
+/// PDA's `UpdateSupport` and Fiona's line.
+pub const LAPTOP: u32 = 0x4068_2f05;
 
 /// `islandfortress`'s module hash: the script of the island fortress
 /// (`_island_bld_fortress01`'s `ObjectScript`). Its `OnStateChange` hears
@@ -4097,6 +4144,66 @@ mod tests {
         assert_eq!(part, 0);
     }
 
+    // The paratrooper's own watch, its figure a string: the 360 reads it
+    // through Lua's conversion, so it holds below 100.
+    #[test]
+    fn a_health_watch_reads_a_figure_given_as_text() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        let man = m.spawn("Allied Paratrooper", [0.0, 100.0, 0.0]).unwrap();
+        m.run(
+            &format!(
+                r#"
+                shed = 0
+                Event.Create(Event.ObjectHealth, {{ Sys.StringToGuid('{man:#x}'), "<", "100" }},
+                    function() shed = shed + 1 end)
+                "#
+            ),
+            "test",
+        )
+        .unwrap();
+        m.tick(0.1);
+        m.set_health(man, 120.0);
+        m.tick(0.1);
+        assert_eq!(m.lua().globals().raw_get::<i64>("shed").unwrap(), 0);
+        m.set_health(man, 90.0);
+        m.tick(0.1);
+        m.tick(0.1);
+        assert_eq!(m.lua().globals().raw_get::<i64>("shed").unwrap(), 1);
+    }
+
+    // The paradrop locations name a plane the data lacks ("paradop"): the
+    // flyby is of the program's fallback, `b52_ghost`; a plane it has
+    // flies as named.
+    #[test]
+    fn a_flyby_of_a_template_the_data_lacks_is_of_the_fallback() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.world.borrow_mut().template_names.extend([
+            "b52_ghost".to_owned(),
+            "support vehicle (paradrop_al)".to_owned(),
+        ]);
+        m.take_commands();
+        m.run(
+            r#"
+            Airstrike.Flyby("Support Vehicle (paradop_al)", -50, 300, 0, 0, 100, 40)
+            Airstrike.Flyby("Support Vehicle (Paradrop_AL)", -50, 300, 0, 0, 100, 40)
+            "#,
+            "test",
+        )
+        .unwrap();
+        let flown: Vec<String> = m
+            .take_commands()
+            .into_iter()
+            .filter_map(|c| match c {
+                Command::Flyby { what, .. } => Some(what),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(flown, ["b52_ghost", "Support Vehicle (Paradrop_AL)"]);
+        assert!(OBJECT_SCRIPTS.contains(&("paradroplocation", PARADROP_LOCATION)));
+        assert!(OBJECT_SCRIPTS.contains(&("paradrop", PARADROP)));
+        assert!(OBJECT_SCRIPTS.contains(&("paratrooper", PARATROOPER)));
+    }
+
     #[test]
     fn health_watches_fire_as_she_is_hurt() {
         let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
@@ -4415,6 +4522,43 @@ mod tests {
         // An object with no script of its own: nothing is called.
         m.object_state_changed(0x999, 1, 2);
         assert_eq!(g.get::<u32>("states").unwrap(), 1);
+    }
+
+    // The satellite bomb's square (`MrxSupport.BlipAircraft`): put on the
+    // bomb with a death event to take it off. The bomb going off kills
+    // it, and the square goes (playtest of e8749a2a: it stayed for good).
+    #[test]
+    fn a_bomb_that_goes_off_dies_and_its_radar_square_goes() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        let bomb =
+            m.world
+                .borrow_mut()
+                .spawn("Smart Bomb Projectile".into(), [0.0, 80.0, 0.0], 0.0);
+        m.lua()
+            .load(
+                r#"
+                local bomb = ...
+                Hud.Radar:AddObjective({ sName = "1", nR = 255, nG = 0, nB = 0,
+                    nWidth = 3, nHeight = 3, uGuid = bomb, nSortOrder = 4 })
+                Event.Create(Event.ObjectDeath, { bomb }, function()
+                    Hud.Radar:RemoveObjective({ sName = "1" })
+                end, {})
+                "#,
+            )
+            .call::<()>(crate::events::guid_value(bomb))
+            .unwrap();
+        m.tick(0.1);
+        assert!(m.world.borrow().hud.radar.contains_key("1"), "blipped");
+        m.ordnance_burst(bomb, [0.0; 3]);
+        assert!(
+            !crate::events::World::is_alive(&*m.world.borrow(), bomb),
+            "it dies as it goes off"
+        );
+        m.tick(0.1);
+        assert!(
+            !m.world.borrow().hud.radar.contains_key("1"),
+            "its square comes off"
+        );
     }
 
     #[test]
