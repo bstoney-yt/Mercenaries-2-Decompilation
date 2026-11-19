@@ -50,8 +50,8 @@ with open(sys.argv[1], "w") as fh:
             if f[3] != last_c:
                 last_c = f[3]
                 hv = struct.unpack(">f", g.read(ca + 4, 4))[0] if ca else float("nan")
-                wb = " ".join("".join(str((g.read(wp + 0x120, 1) or b"\xff")[0]) for wp in ws) for _, ws in ctl[:4])
-                w(f"t {time.time()-t0:.4f} car counter {f[3]} pos ({f[0]:.4f},{f[1]:.4f},{f[2]:.4f}) quat ({f[4]:.5f},{f[5]:.5f},{f[6]:.5f},{f[7]:.5f}) health {hv:.2f} wheels+0x120 [{wb}]")
+                wb = wheel_state(wls)
+                w(f"t {time.time()-t0:.4f} car counter {f[3]} pos ({f[0]:.4f},{f[1]:.4f},{f[2]:.4f}) quat ({f[4]:.5f},{f[5]:.5f},{f[6]:.5f},{f[7]:.5f}) health {hv:.2f} wheels [{wb}]")
                 for k, a in xmem.map_entries(g, 0x8365650C).items():
                     if k in seen: continue
                     seen.add(k); ad_keys.add(k)

@@ -17,6 +17,16 @@ for k, a in hm.items():
         p = struct.unpack(">3f", g.read(sa, 12))
         if math.hypot(p[0] - cx, p[2] - cz) < 1.0 and struct.unpack(">f", g.read(a, 4))[0] == 100.0:
             car, ca = k, a; break
+def ptrs(P):
+    """The first 16 heap pointers in P[0..0x200] (offset, target, target[0..0x100]): one of them should be the rigid body."""
+    b = g.read(P, 0x200) if P else None; out = []
+    for o in range(0, len(b or b"") - 3, 4):
+        q = struct.unpack_from(">I", b, o)[0]
+        if 0x40000000 <= q < 0xC0000000 and q & 3 == 0:
+            d = g.read(q, 0x100)
+            if d: out.append((o, q, d))
+        if len(out) >= 16: break
+    return out
 entry = H.state_addr(car) if car else None
 t0 = time.time(); last = None; ring = []; dead_c = None
 with open(sys.argv[1], "w") as fh:
@@ -32,16 +42,16 @@ with open(sys.argv[1], "w") as fh:
         C = struct.unpack(">I", g.read(P + 0x158, 4) or bytes(4))[0] if P else 0
         dtb = g.read(0x82B7C730, 4); hv = struct.unpack(">f", g.read(ca + 4, 4))[0] if ca else float("nan")
         row = (c, dtb and struct.unpack(">f", dtb)[0], (x, y, z), (qx, qy, qz, qw), P, C, hv,
-               g.read(P, 0x200) if P else b"", g.read(C, 0x100) if C else b"")
+               g.read(P, 0x200) if P else b"", (g.read(C, 0x100) if C else b"") or b"", ptrs(P))
         ring = (ring + [row])[-4:]
         if hv <= 0 and dead_c is None:
             dead_c = c
             for r in ring[:-1]:  # the 3 counters before the death
                 w(f"counter {r[0]} dt {r[1]:.5f} pos {tuple(round(v,4) for v in r[2])} quat {tuple(round(v,5) for v in r[3])} P {r[4]:#x} C {r[5]:#x} health {r[6]:.2f}")
-                w("  P " + r[7].hex()); w("  C " + r[8].hex())
+                w("  P " + r[7].hex()); w("  C " + r[8].hex()); [w(f"  *{o:#x} {q:#x} " + d.hex()) for o, q, d in r[9]]
         if dead_c is not None and c <= dead_c + 12:
             w(f"counter {c} dt {row[1]:.5f} pos {tuple(round(v,4) for v in row[2])} quat {tuple(round(v,5) for v in row[3])} P {P:#x} C {C:#x} health {hv:.2f}")
-            w("  P " + row[7].hex()); w("  C " + row[8].hex())
+            w("  P " + row[7].hex()); w("  C " + row[8].hex()); [w(f"  *{o:#x} {q:#x} " + d.hex()) for o, q, d in row[9]]
         elif dead_c is not None and c > dead_c + 12:
             break
         fh.flush()
