@@ -212,6 +212,10 @@ pub struct Props {
     /// The templates whose objects are physics props (`_PropPhysics`), by
     /// id: those whose model has no body that moves come loose as one.
     pub physics_props: HashMap<u32, m2_engine::durability::PropPhysics>,
+    /// Each template's `PhysicsPropertyGravityScaler`, by id: its bodies
+    /// are pulled that many times the world's gravity
+    /// ([`Physics::set_debris_gravity`]).
+    pub gravity_scales: HashMap<u32, f32>,
     /// Shown since their model came in, their collision not yet up.
     unwalled: HashSet<u32>,
     /// Put up by the scripts from a template with no physics component
@@ -799,9 +803,13 @@ impl Props {
                 at = place * Mat4::from_translation(Vec3::Y * lift) * local;
             }
         }
+        let template = p.template;
         let velocity = physics.vehicle_velocity(id);
         physics.remove_static(StaticKey::Entity(entity));
         let piece = physics.add_cargo(&piece, at, velocity);
+        if let Some(&g) = self.gravity_scales.get(&template) {
+            physics.set_debris_gravity(piece, g);
+        }
         self.cargo.insert(
             entity,
             Riding {
@@ -1297,6 +1305,11 @@ impl Props {
             .zip(loose.starts(placed))
             .map(|(piece, at)| physics.add_debris(piece, at, velocity, spin))
             .collect::<Vec<_>>();
+        if let Some(&g) = self.gravity_scales.get(&p.template) {
+            for &d in &pieces {
+                physics.set_debris_gravity(d, g);
+            }
+        }
         physics.group_debris(&pieces, placed);
         self.knocked.insert(entity, pieces);
         self.fresh_knocks.push(entity);
@@ -1324,6 +1337,11 @@ impl Props {
             .zip(loose.starts(placed))
             .map(|(piece, at)| physics.add_prop_body(piece, at, true))
             .collect::<Vec<_>>();
+        if let Some(&g) = self.gravity_scales.get(&p.template) {
+            for &d in &pieces {
+                physics.set_debris_gravity(d, g);
+            }
+        }
         physics.group_debris(&pieces, placed);
         self.knocked.insert(entity, pieces);
         self.as_body.insert(entity);
