@@ -1,0 +1,38 @@
+# AllCon003 by the game's Mission skip, then get into the Phoenix (Racing) 19 m away.
+wait 25
+pokestr 83133F98 AllCon003
+poke 82B7C953 0
+tap_until start Continue_without 90
+wait 2
+press up 0.3
+wait 1
+press a 0.3
+until NOTICE 30 2
+press a 0.3
+until new_game 60 2
+press a 0.3
+until Mattias 30 2
+press down 0.3
+wait 2
+ocr charsel
+press a 0.3
+wait 3
+ocr card
+press a 0.3
+tap_until a Objective 150
+trackhero
+mark AllCon003 start
+ocr start
+poslog start hit3 60
+camlog start hit3cam
+healthlog start hit3hp
+airlog start 236 155 hit3air
+walkcam 236 158 1.5 40
+walkcam 235 155 1.0 20
+wait 240
+ocr after
+airlog stop
+healthlog stop
+poslog stop
+camlog stop
+mark done
