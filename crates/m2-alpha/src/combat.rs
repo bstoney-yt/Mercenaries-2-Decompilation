@@ -1960,11 +1960,14 @@ pub struct Combat {
     /// the stream at `0x82B5E588`, from its start-up seed.
     knock_rng: m2_game::script_math::EngineRng,
     pub blasts: u32,
-    /// The effects that are explosions, by name hash, as blasts: a
-    /// vehicle's wreck sets one off ([`Combat::wreck`]).
-    pub wreck_blasts: std::collections::HashMap<u32, Blast>,
-    /// Wreck blasts to go off at the next step, where.
-    wreck_due: Vec<(Vec3, Blast)>,
+    /// The effect templates that go off as blasts, by name hash: their own
+    /// `Explosive` and their `PhysicalLink`s' (each with the link's
+    /// offset). A vehicle part's state that starts one sets them all off
+    /// ([`Combat::part_blasts`]).
+    pub wreck_blasts: std::collections::HashMap<u32, Vec<(Vec3, Blast)>>,
+    /// The templates of the blasts part states have set off, in order
+    /// (`--wreck-blast-check`'s).
+    pub part_blasts_fired: Vec<u32>,
     /// Where the last one went off, and what it pushes what it breaks
     /// with, where known.
     pub last_blast: Option<Vec3>,
@@ -2402,7 +2405,7 @@ impl Default for Combat {
             knock_rng: m2_game::script_math::EngineRng::default(),
             blasts: 0,
             wreck_blasts: std::collections::HashMap::new(),
-            wreck_due: Vec::new(),
+            part_blasts_fired: Vec::new(),
             last_blast: None,
             last_push: None,
             went_off: Vec::new(),
@@ -3468,12 +3471,7 @@ impl Combat {
         }
         self.went_off.clear();
         self.struck.clear();
-        // The blasts of the vehicles wrecked since: each goes off as any
-        // other (its damage, its wear, its push on every vehicle it
-        // reaches, the wreck's own too).
-        for (at, blast) in std::mem::take(&mut self.wreck_due) {
-            self.explode_keyed(f, at, Some(blast), blast.key);
-        }
+        self.part_blasts(f);
         // Up again (revived, respawned, or put on her feet by a script):
         // her limp body goes. The state table's `Resurrect` leads from
         // `Die` and `Dead` straight to `Upright` `Idle`.
@@ -5802,13 +5800,6 @@ impl Combat {
         }
         self.wrecks.push((i, 0.0));
         self.remarks.push(Remark::Wreck);
-        if let Some((at, blast)) = self.wreck_blast(physics, v) {
-            eprintln!(
-                "wreck: the {} sets off its blast at {at:.1} ({:.0} m, {:.0} damage, push {:.0})",
-                v.spec.label, blast.radius, blast.damage, blast.max_force
-            );
-            self.wreck_due.push((at, blast));
-        }
     }
 
     /// Wrecks vehicle `i`, `v`, as damage would (its blast to go off at
@@ -5817,37 +5808,59 @@ impl Combat {
         self.wreck(physics, v, i);
     }
 
-    /// Vehicle `v`'s wreck's blast and where it goes off: the first effect
-    /// its model's part states start that is an explosion's
-    /// (`fx_Explosion_Large` on the cars: 7 m, 160 to 150, push 300), at
-    /// its node, else at the vehicle's middle.
+    /// The blasts vehicles' part states set off: each effect a state
+    /// started since the last step ([`m2_engine::vehicle_damage::PartDamage::take_started`])
+    /// that is an explosion goes off where its node is, with its
+    /// `PhysicalLink`s' blasts at the same place (plus each link's
+    /// offset), all in the same step: its damage, wear and push on every
+    /// vehicle it reaches, the one whose blast it is too.
     ///
-    /// From the 360 code: vehicle templates leave no `Explosive` on dying
-    /// (no `SpawnOnDeath` blast); the blast is the explosion object the
-    /// wreck state's `CreateObject` effect makes, whose `Explosive` then
-    /// does area damage (0x82291440 -> 0x82291B88 -> 0x82291640) and
-    /// pushes (0x8215C560 -> 0x8215CBC8). From footage (Xenia, a Phoenix
-    /// shot dead): she took 74.6 at 5.9 m. That matches
-    /// `fx_Explosion_Large`'s 150 floor times her `Hero` row's
-    /// `Explosion` cell (0.5), which the area damage gives.
-    ///
-    /// Inferred: which state's effect. The first explosion any state
-    /// starts is taken, as #673 does.
-    fn wreck_blast(&self, physics: &Physics, v: &ParkedVehicle) -> Option<(Vec3, Blast)> {
-        let body = v.id.and_then(|id| physics.vehicle_transform(id))?;
-        let (lo, hi) = v.spec.bounds;
-        let middle = body.transform_point3((lo + hi) * 0.5);
-        let dm = v.spec.damage.as_deref()?;
-        dm.states
-            .machines
-            .iter()
-            .flat_map(|m| &m.acts)
-            .flat_map(|a| &a.emitters)
-            .find_map(|&(fx, node)| {
-                let b = *self.wreck_blasts.get(&fx)?;
-                let at = node.map_or(middle, |n| body.transform_point3(dm.node_at(n)));
-                Some((at, b))
-            })
+    /// From the 360 code: a state's `StartEmitter` (0x8222FA30) resolves
+    /// its effect's template, takes the world transform of the node it
+    /// names on the object (0x8241E720) and spawns the template there
+    /// (0x82409B38); the object's `PhysicalLink`s spawn with it at its
+    /// transform and the link's own (0x82408C30 -> 0x82409AA8); each
+    /// `Explosive` among them builds an area-damage entity (0x82291440)
+    /// that hurts and pushes. On a car's death its body takes `DestroyMsg`
+    /// ([`m2_engine::vehicle_damage::PartDamage::body_destroyed`]), whose
+    /// state starts `fx_Explosion_Large` (7 m, 160 to 150, `Explosion`),
+    /// linking `Explosion (RPG Frag)` (15 m, 300 to 40, `Bullet`): the two
+    /// area-damage objects Xenia saw on the death frame.
+    fn part_blasts(&mut self, f: &mut Field<'_>) {
+        let mut due = Vec::new();
+        for v in f.vehicles.iter_mut() {
+            let (Some(p), Some(dm)) = (v.parts.as_mut(), v.spec.damage.as_deref()) else {
+                continue;
+            };
+            let started = p.take_started();
+            let Some(body) = v.id.and_then(|id| f.physics.vehicle_transform(id)) else {
+                continue;
+            };
+            for (_, fx, n) in started {
+                let Some(blasts) = self.wreck_blasts.get(&fx) else {
+                    continue;
+                };
+                let at = body.transform_point3(dm.node_at(n));
+                for &(offset, b) in blasts {
+                    let here = at + body.transform_vector3(offset);
+                    eprintln!(
+                        "wreck: the {} sets off {:08x} at {here:.1} ({:.0} m, {:.0} to {:.0}, push {:.0}, key {:08x})",
+                        v.spec.label,
+                        b.template,
+                        b.radius,
+                        b.damage,
+                        b.min_damage,
+                        b.max_force,
+                        b.key.unwrap_or(0)
+                    );
+                    due.push((here, b));
+                    self.part_blasts_fired.push(b.template);
+                }
+            }
+        }
+        for (at, b) in due {
+            self.explode_keyed(f, at, Some(b), b.key);
+        }
     }
 
     /// Vehicles running into each other, body to body: as a pair meets,
@@ -7115,10 +7128,15 @@ impl Combat {
             hold: None,
             turn: None,
         });
-        let hers = if b.key == Some(m2_assets::name_hash("ExplosionLarge")) {
-            self.hero_damage.explosion_large
-        } else {
-            self.hero_damage.explosion
+        // Her cell: the damage table's `Hero` row for the blast's own key,
+        // a key the table lacks finding its first column (0x82291640 ->
+        // 0x823987D0); without a table, the cells as read.
+        let hers = match (self.damage_table.as_ref(), b.key) {
+            (Some(t), Some(k)) => t.cell(m2_assets::name_hash("Hero"), k),
+            _ if b.key == Some(m2_assets::name_hash("ExplosionLarge")) => {
+                self.hero_damage.explosion_large
+            }
+            _ => self.hero_damage.explosion,
         };
         let reach = b.radius.max(0.5);
         let mut killed = false;
@@ -7905,6 +7923,30 @@ mod tests {
         let (lo, hi) = world_box(at, (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.5, 2.0)));
         assert!((lo - Vec3::new(8.0, 1.0, -1.0)).length() < 1e-4);
         assert!((hi - Vec3::new(12.0, 2.5, 1.0)).length() < 1e-4);
+    }
+
+    // A car's wreck on her: `fx_Explosion_Large` (7 m, 160 to 150, her
+    // `Explosion` cell 0.2) and its `Explosion (RPG Frag)` (15 m, 300 to
+    // 40, her `Bullet` cell 0.25), each `max(least, damage x falloff)`
+    // (0x82291640), come within 6% of every loss Xenia measured.
+    #[test]
+    fn a_wrecks_two_blasts_hurt_her_as_xenia_measured() {
+        use m2_engine::durability::blast_damage;
+        for (d, seen) in [
+            (2.9, 88.7),
+            (3.21, 85.1),
+            (3.8, 86.4),
+            (5.8, 73.2),
+            (5.9, 74.6),
+            (6.42, 69.2),
+        ] {
+            let hit = blast_damage(160.0, 150.0, 7.0, d) * 0.2
+                + blast_damage(300.0, 40.0, 15.0, d) * 0.25;
+            assert!(
+                (hit - seen).abs() <= seen * 0.06,
+                "{d} m: {hit} against {seen}"
+            );
+        }
     }
 
     #[test]

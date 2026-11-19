@@ -1441,6 +1441,18 @@ impl DamageTable {
         self.cells.get(r * self.columns.len() + c).copied()
     }
 
+    /// As [`scale`](Self::scale), as the 360's area damage looks it up
+    /// (0x823987D0): a key the table lacks finds its first row or column
+    /// (0 for an empty table).
+    pub fn cell(&self, target: u32, damage: u32) -> f32 {
+        let r = self.rows.iter().position(|&k| k == target).unwrap_or(0);
+        let c = self.columns.iter().position(|&k| k == damage).unwrap_or(0);
+        self.cells
+            .get(r * self.columns.len() + c)
+            .copied()
+            .unwrap_or(0.0)
+    }
+
     /// Its targets' keys (rows) and its damage kinds' keys (columns).
     pub fn keys(&self) -> (&[u32], &[u32]) {
         (&self.rows, &self.columns)
@@ -2436,6 +2448,21 @@ mod tests {
     }
 
     use super::*;
+
+    // The area damage's lookup (0x823987D0): a key the table lacks finds
+    // the first row or column.
+    #[test]
+    fn a_missing_key_finds_the_first_row_or_column() {
+        let t = DamageTable {
+            rows: vec![1, 2],
+            columns: vec![10, 20],
+            cells: vec![0.0, 0.5, 0.7, 0.25],
+        };
+        assert_eq!(t.cell(2, 20), 0.25);
+        assert_eq!(t.cell(2, 99), 0.7);
+        assert_eq!(t.cell(99, 20), 0.5);
+        assert_eq!(t.scale(2, 99), None);
+    }
 
     /// A sound table of rows and columns keys 1 and 2: 1 x 2 has both
     /// words (0xa, 0xb), 2 x 1 has only a second (0, 0xc), 2 x 2 only a
