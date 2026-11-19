@@ -231,10 +231,11 @@ const EASE_NEAR: f32 = 2.0;
 const SLOWEST: f32 = 0.1;
 /// A person's search height on foot, metres (0x822C1520: 0x820BB6AC).
 const SEARCH_HEIGHT: f32 = 1.5;
-/// Searches run a tick, at most (invented: the 360's search manager,
-/// 0x822E7CE0, steps its searches over several frames; how many was not
-/// read).
-const SEARCHES_A_TICK: usize = 4;
+/// The search manager's budget (0x822E7CE0, as the path search's notes
+/// have it): the searches under way are stepped at most `PATH_STEPS`
+/// nodes a frame between them, within `PATH_TIME`.
+const PATH_STEPS: u32 = 8;
+const PATH_TIME: std::time::Duration = std::time::Duration::from_micros(1500);
 /// Between steps about in a fight: seconds (at least, plus up to), how
 /// far a step goes, metres, and how close he pushes in to her (inferred).
 const STEP_GAP: (f32, f32) = (2.0, 3.0);
@@ -2754,6 +2755,7 @@ impl Npc {
                     goal: Some(goal),
                     way: None,
                     asked: true,
+                    pending: None,
                 };
             }
         }
@@ -3768,11 +3770,29 @@ pub fn threat_reaction_seconds(
 /// way found (none yet, or none to be had: he goes straight at the goal,
 /// and a blocked straight line ends in the 8-swing give-up, as in the
 /// 360), and whether a search is wanted.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct Route {
     goal: Option<Vec3>,
     way: Option<m2_engine::path_search::Way>,
     asked: bool,
+    /// The search under way, stepped by the manager
+    /// ([`People::serve_paths`]); meanwhile he heads straight at the goal.
+    pending: Option<Box<m2_engine::path_search::Pending>>,
+}
+
+/// The search manager's tally since it was last logged: searches begun,
+/// ended with a way, ended with none; nodes stepped; time taken; the most
+/// nodes and time in one tick; the ticks.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PathStats {
+    begun: u32,
+    found: u32,
+    none: u32,
+    steps: u32,
+    time: std::time::Duration,
+    most_steps: u32,
+    most_time: std::time::Duration,
+    ticks: u32,
 }
 
 /// A path search's world for a person on foot: the physics, his hints.
@@ -3808,6 +3828,9 @@ impl m2_engine::path_search::PathWorld for OnFoot<'_> {
 pub struct People {
     /// The cover spots claimed ([`m2_engine::ai_cover::Claims`]).
     pub cover_claims: m2_engine::ai_cover::Claims,
+    /// Whose search the manager steps first next tick, and its tally.
+    path_next: usize,
+    path_stats: PathStats,
     pub kinds: Vec<PersonKind>,
     pub npcs: Vec<Npc>,
     /// How long the `ThreatReaction` action lasts, seconds: its clip's
@@ -4368,6 +4391,7 @@ impl People {
     /// ([`m2_engine::path_search`], manager 0x822E7CE0). None found, he
     /// goes straight at the goal. Inferred: his width is his capsule's
     /// (the 360 reads his own box's x extent, +0x2AC - +0x2A0).
+    #[cfg(test)]
     fn find_way(physics: &Physics, hints: crate::pursuers::Hints<'_>, npc: &mut Npc) {
         npc.route.asked = false;
         let Some(goal) = npc.route.goal else { return };
@@ -4378,6 +4402,72 @@ impl People {
         let mut world = OnFoot { physics, hints };
         npc.route.way =
             m2_engine::path_search::find(&mut world, size, npc.character.position, goal);
+    }
+
+    /// The search manager's tick (0x822E7CE0): the searches asked for
+    /// begin, then those under way are stepped in turn, at most
+    /// [`PATH_STEPS`] nodes between them within [`PATH_TIME`], the next
+    /// tick going on from where this one stopped. A search that ends
+    /// gives its person his way (or none: he goes straight at the goal).
+    /// Inferred: that the budget is the manager's for all its searches,
+    /// not each search's; that its turn goes round the people in order.
+    fn serve_paths(&mut self, physics: &Physics, hints: crate::pursuers::Hints<'_>) {
+        let t0 = std::time::Instant::now();
+        for npc in &mut self.npcs {
+            if !std::mem::take(&mut npc.route.asked) {
+                continue;
+            }
+            let Some(goal) = npc.route.goal else { continue };
+            let size = m2_engine::path_search::Size {
+                width: 2.0 * npc.character.radius,
+                height: SEARCH_HEIGHT,
+            };
+            let mut world = OnFoot { physics, hints };
+            npc.route.pending = Some(Box::new(m2_engine::path_search::Pending::begin(
+                &mut world,
+                size,
+                npc.character.position,
+                goal,
+            )));
+            self.path_stats.begun += 1;
+        }
+        let n = self.npcs.len();
+        let mut budget = PATH_STEPS;
+        let mut stepped = 0;
+        for k in 0..n {
+            let i = (self.path_next + k) % n;
+            if budget == 0 || t0.elapsed() > PATH_TIME {
+                self.path_next = i;
+                break;
+            }
+            let npc = &mut self.npcs[i];
+            let Some(p) = npc.route.pending.as_mut() else {
+                continue;
+            };
+            let mut world = OnFoot { physics, hints };
+            let (over, used) = p.step(&mut world, budget);
+            budget -= used;
+            stepped += used;
+            if let Some(way) = over {
+                if way.is_some() {
+                    self.path_stats.found += 1;
+                } else {
+                    self.path_stats.none += 1;
+                }
+                npc.route.way = way;
+                npc.route.pending = None;
+                self.path_next = (i + 1) % n;
+            } else {
+                self.path_next = i;
+            }
+        }
+        let took = t0.elapsed();
+        let st = &mut self.path_stats;
+        st.steps += stepped;
+        st.time += took;
+        st.most_steps = st.most_steps.max(stepped);
+        st.most_time = st.most_time.max(took);
+        st.ticks += 1;
     }
 
     /// While he heads for a cover spot, his claim on it is made again each
@@ -5434,7 +5524,6 @@ impl People {
         hints: crate::pursuers::Hints<'_>,
         dt: f32,
     ) {
-        let mut searches = 0;
         let mut lap = crate::spans::Lap::new();
         self.pursue(dt);
         lap.mark("people: pursuit");
@@ -5443,6 +5532,27 @@ impl People {
         self.war_log -= dt;
         if self.war_log <= 0.0 {
             self.war_log = 30.0;
+            // The search manager's tally over the last 30 s.
+            let st = std::mem::take(&mut self.path_stats);
+            let pending = self
+                .npcs
+                .iter()
+                .filter(|n| n.route.pending.is_some())
+                .count();
+            eprintln!(
+                "paths: {} searches begun, {} found a way, {} none, {pending} under way; \
+                 {} nodes over {} ticks ({:.2} a tick, most {}), {:.1} ms ({:.3} ms a tick, most {:.3})",
+                st.begun,
+                st.found,
+                st.none,
+                st.steps,
+                st.ticks,
+                f64::from(st.steps) / f64::from(st.ticks.max(1)),
+                st.most_steps,
+                st.time.as_secs_f64() * 1e3,
+                st.time.as_secs_f64() * 1e3 / f64::from(st.ticks.max(1)),
+                st.most_time.as_secs_f64() * 1e3
+            );
             let fighting = self.npcs.iter().filter(|n| n.foe_at.is_some()).count();
             let mut sides: Vec<(&str, usize)> = Vec::new();
             for n in self.npcs.iter().filter(|n| n.alive) {
@@ -5572,10 +5682,7 @@ impl People {
                 npc.update(physics, &mut self.rng, threat, dt)
             });
             Self::renew_cover_claim(&mut self.cover_claims, i as u32, npc, dt);
-            if npc.route.asked && searches < SEARCHES_A_TICK {
-                searches += 1;
-                Self::find_way(physics, hints, npc);
-            }
+
             let p = npc.character.position;
             crate::spans::time("people: checks", || {
                 self.checks
@@ -5663,6 +5770,7 @@ impl People {
                 physics.launch_ragdoll(id, l.velocity, l.point);
             }
         }
+        crate::spans::time("people: path searches", || self.serve_paths(physics, hints));
         // Smarter: those near a soldier who spots her are told where she is.
         if let Some(t) = threat {
             let range = self.smarter.callout_range;
@@ -9004,6 +9112,41 @@ pub(crate) mod tests {
         // speed takes to build and their way to swing round.
         let p = n.character.position;
         assert!(p.x < 1.0 && p.z.abs() > 4.5, "{p}");
+    }
+
+    /// The search manager steps at most 8 nodes a tick between all the
+    /// searches under way, going on next tick from where it stopped, and
+    /// each search ends with its person's way.
+    #[test]
+    fn path_searches_share_eight_nodes_a_tick() {
+        let mut physics = ground();
+        let shape = CollisionShape::cuboid(Vec3::new(5.0, 2.5, 0.25));
+        physics.add_static(
+            StaticKey::Object(9),
+            &shape,
+            Vec3::new(0.0, 1.5, 6.0),
+            Quat::IDENTITY,
+        );
+        physics.step(1.0 / 60.0);
+        let mut people = People::default();
+        for x in [-1.0, 1.0] {
+            let post = Brain::Post { facing: 0.0 };
+            let mut n = Npc::new(0, &rig(), Vec3::new(x, 0.0, 0.0), 0.0, post, Some(1));
+            n.steer_to(Vec3::new(x, 0.0, 14.0), 3.0, 1.0 / 60.0);
+            assert!(n.route.asked);
+            people.npcs.push(n);
+        }
+        let mut ticks = 0;
+        while people.npcs.iter().any(|n| n.route.asked || n.route.pending.is_some()) {
+            people.serve_paths(&physics, &|_| Vec::new());
+            ticks += 1;
+            assert!(people.path_stats.most_steps <= PATH_STEPS);
+            assert!(ticks < 200, "the searches end");
+        }
+        assert!(ticks > 1, "spread over ticks");
+        assert_eq!(people.path_stats.begun, 2);
+        assert_eq!(people.path_stats.found, 2);
+        assert!(people.npcs.iter().all(|n| n.route.way.is_some()));
     }
 
     // Hit by her from behind a wall, a soldier chasing her goes round it
