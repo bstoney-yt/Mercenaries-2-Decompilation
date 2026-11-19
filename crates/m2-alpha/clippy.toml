@@ -1,0 +1,5 @@
+# The log is piped through a thread when standard error is a file
+# (src/errlog.rs): ending the process must write it out first.
+disallowed-methods = [
+    { path = "std::process::exit", reason = "use errlog::exit, which writes the log out first" },
+]

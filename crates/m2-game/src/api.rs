@@ -261,8 +261,11 @@ pub enum Command {
     Kill(u32),
     /// `ObjectState.SendDamage` dealt `damage` to `guid`'s node `node`
     /// (0: the whole object), leaving it `health` (`None` for the whole
-    /// object); the node takes `message`, if any, and the object itself
-    /// `pass_through` of the damage ([`crate::node_damage`]).
+    /// object); the node takes `message`, if any, and the object's
+    /// `Health` took `pass_through` of the damage, leaving it
+    /// `object_health` ([`crate::node_damage`]). A node destroyed by its
+    /// object's death comes as one with no damage. The death itself
+    /// follows as [`Command::Kill`].
     NodeDamage {
         guid: u32,
         node: u32,
@@ -270,6 +273,7 @@ pub enum Command {
         health: Option<u16>,
         message: Option<u32>,
         pass_through: f32,
+        object_health: f32,
     },
     /// `Object.Revive(object, fraction)`: back in play, at that share of
     /// its most health.
@@ -597,6 +601,14 @@ pub enum Command {
     /// The player can't be killed while on (`Player.SetHealthClamp`): her
     /// health stops short of nothing, for the survival system to step in.
     HealthClamp(bool),
+    /// Her survival mode on or off (`Player.SetSurvivalMode`): while on, the
+    /// 360 cuts the damage others do her (0x822889F8). `beat`: the call's
+    /// third argument (true unless given false; 0x8233D030), whether the
+    /// screen beats in it (the player's +0x188, 0x8243AED8).
+    SurvivalMode {
+        on: bool,
+        beat: bool,
+    },
     /// A voice bank the scripts load (`true`) or let go (`false`) by its
     /// localised name (`vo_job_pmc.english`): `MrxSoundBanks.LoadTempBank`
     /// and `LoadSoundBank` for an HQ's briefings and a contract's lines,
@@ -1110,10 +1122,18 @@ pub struct ScriptWorld {
     pub script_removals: Vec<(u32, u32)>,
     /// Templates' cash values by name in lower case ([`crate::cash`]).
     pub template_cash: HashMap<String, i32>,
+    /// Templates carrying `Crusher` ([`crate::crusher`]), by name in
+    /// lower case.
+    pub template_crushers: HashMap<String, f32>,
     /// Templates' `NodeHealth` records by name in lower case, and the
     /// node tables built from them, by object ([`crate::node_damage`]).
-    pub template_nodes: HashMap<String, Vec<m2_engine::node_health::NodeRecord>>,
+    pub template_nodes: HashMap<String, crate::node_damage::TemplateNodes>,
     pub node_tables: HashMap<u32, m2_engine::node_health::NodeTable>,
+    /// The nodes of objects' models the game has hidden (a building's
+    /// broken part and what hangs under it), by object, as name hashes: a
+    /// node there no longer keeps its object alive
+    /// ([`crate::node_damage`]).
+    pub hidden_nodes: HashMap<u32, std::collections::HashSet<u32>>,
     /// Every template the template database names, in lower case: the
     /// names `Pg.GetGuidByName` answers with a template's guid
     /// ([`ScriptWorld::is_template`]).
@@ -1736,11 +1756,19 @@ impl ScriptWorld {
         };
         let (at, riding) = (Vec3::from(her.position), her.vehicle);
         for (g, o) in &mut self.objects {
-            let wake = o.hibernation_distance();
             if o.vehicle.is_some() {
                 self.riders.push(*g);
             }
-            if Some(*g) == self.player
+            // Whether it would sleep or wake, first: few do in a tick, and
+            // only those need the checks of who keeps theirs (look-ups in
+            // the carried weapons and the fresh spawns, which cost a 1440p
+            // story tick more than all the rest of the pass).
+            let wake = o.hibernation_distance();
+            let d = Vec3::from(o.position).distance(at);
+            let sleeps = o.awake && d > wake + HIBERNATION_MARGIN;
+            let wakes = !o.awake && d <= wake;
+            if !(sleeps || wakes)
+                || Some(*g) == self.player
                 || Some(*g) == riding
                 || (FIRST_TEMPLATE..FIRST_SPAWNED).contains(g)
                 || self.inventory.carried.contains_key(g)
@@ -1748,12 +1776,7 @@ impl ScriptWorld {
             {
                 continue;
             }
-            let d = Vec3::from(o.position).distance(at);
-            if o.awake && d > wake + HIBERNATION_MARGIN {
-                o.awake = false;
-            } else if !o.awake && d <= wake {
-                o.awake = true;
-            }
+            o.awake = wakes;
         }
     }
 }
@@ -3934,7 +3957,13 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([Value::Boolean(true)])
     })?;
     add(&player, "SetSurvivalMode", |w, _, a| {
-        w.survival_mode = matches!(a.get(1), Some(Value::Boolean(true)));
+        let on = matches!(a.get(1), Some(Value::Boolean(true)));
+        let beat = !matches!(a.get(2), Some(Value::Boolean(false)));
+        w.survival_mode = on;
+        // Every call goes to the game: the engine also turns survival
+        // mode on by itself (a hit the clamp caught), so "off" from the
+        // scripts must reach it even when they never turned it on.
+        w.commands.push(Command::SurvivalMode { on, beat });
         // From the 360 code (0x8233d030): true.
         values([Value::Boolean(true)])
     })?;
@@ -6078,6 +6107,89 @@ mod tests {
         w.objects.get_mut(&1).unwrap().position = [far - 10.0, 0.0, 0.0];
         w.update_hibernation();
         assert!(w.is_awake(50));
+    }
+
+    /// The hibernation pass as it was before it tested the distance
+    /// first, over a copy of the objects, kept to check the new one
+    /// against.
+    fn hibernation_as_before(
+        w: &ScriptWorld,
+        objects: &mut HashMap<u32, Object>,
+        fresh: &[u32],
+    ) -> Vec<u32> {
+        let mut riders = Vec::new();
+        let her = w.player.and_then(|p| objects.get(&p)).unwrap();
+        let (at, riding) = (Vec3::from(her.position), her.vehicle);
+        for (g, o) in objects.iter_mut() {
+            let wake = o.hibernation_distance();
+            if o.vehicle.is_some() {
+                riders.push(*g);
+            }
+            if Some(*g) == w.player
+                || Some(*g) == riding
+                || (FIRST_TEMPLATE..FIRST_SPAWNED).contains(g)
+                || w.inventory.carried.contains_key(g)
+                || fresh.contains(g)
+            {
+                continue;
+            }
+            let d = Vec3::from(o.position).distance(at);
+            if o.awake && d > wake + HIBERNATION_MARGIN {
+                o.awake = false;
+            } else if !o.awake && d <= wake {
+                o.awake = true;
+            }
+        }
+        riders
+    }
+
+    #[test]
+    fn hibernation_wakes_and_sleeps_the_same_objects_as_before() {
+        let (_host, world) = setup();
+        let mut w = world.borrow_mut();
+        // Objects at every distance, awake or not, some riding, some
+        // templates, some just spawned, and her in a vehicle.
+        let mut seed = 12345u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            seed >> 8
+        };
+        for i in 0..3000u32 {
+            let g = match i % 7 {
+                0 => FIRST_TEMPLATE + i,
+                _ => 1000 + i,
+            };
+            let r = next() as f32 / (1 << 24) as f32;
+            let mut o = Object::new(
+                "thing",
+                [r * 600.0 - 300.0, 0.0, (next() % 600) as f32 - 300.0],
+            );
+            o.awake = next() % 2 == 0;
+            if next() % 11 == 0 {
+                o.vehicle = Some(50);
+            }
+            if next() % 13 == 0 {
+                o.hibernation_distance = Some((next() % 400) as u16);
+            }
+            w.objects.insert(g, o);
+        }
+        w.objects.get_mut(&1).unwrap().vehicle = Some(50);
+        for step in 0..5 {
+            w.fresh = (0..40).map(|i| 1000 + i * 37 + step).collect();
+            let mut before = w.objects.clone();
+            let fresh = w.fresh.clone();
+            let riders = hibernation_as_before(&w, &mut before, &fresh);
+            w.update_hibernation();
+            assert_eq!(riders, w.riders, "step {step}");
+            let changed = w
+                .objects
+                .iter()
+                .filter(|(g, o)| o.awake != before[*g].awake)
+                .count();
+            assert_eq!(changed, 0, "step {step}");
+            // Move her for the next round.
+            w.objects.get_mut(&1).unwrap().position[0] += 90.0;
+        }
     }
 
     #[test]
@@ -9142,6 +9254,40 @@ mod tests {
             Value::Boolean(false)
         );
         assert!(ask("return Pg.SetPursuit(nil, 2)").is_nil());
+    }
+
+    /// Every `Player.SetSurvivalMode` reaches the game, off too: the
+    /// engine turns it on by itself when the clamp catches a hit.
+    #[test]
+    fn survival_mode_calls_reach_the_game() {
+        let (host, world) = setup();
+        let lua = host.lua();
+        lua.load("Player.SetSurvivalMode(1, false) Player.SetSurvivalMode(1, true) Player.SetSurvivalMode(1, true, false)")
+            .exec()
+            .unwrap();
+        let got: Vec<_> = world
+            .borrow_mut()
+            .commands
+            .drain(..)
+            .filter(|c| matches!(c, Command::SurvivalMode { .. }))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                Command::SurvivalMode {
+                    on: false,
+                    beat: true
+                },
+                Command::SurvivalMode {
+                    on: true,
+                    beat: true
+                },
+                Command::SurvivalMode {
+                    on: true,
+                    beat: false
+                }
+            ]
+        );
     }
 
     #[test]

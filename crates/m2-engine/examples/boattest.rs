@@ -136,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Where the 360 code's springs (0x82199EA8) hold it level and still:
         // its four push its weight up, each its strength x mass x how far
         // the water stands over the bottom of its spring.
-        let want_rest = start_at.min(end_at) + m2_engine::physics::GRAVITY / (4.0 * strength);
+        let want_rest = start_at.min(end_at) + m2_engine::physics::WORLD_GRAVITY / (4.0 * strength);
         let (rest, bob) = resting(&spec);
         let trim = trimmed(&spec);
         let (top, reverse) = (top / 3.6, reverse / 3.6);
