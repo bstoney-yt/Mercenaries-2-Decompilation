@@ -1325,12 +1325,13 @@ fn keep_crash_reports() {
 const HURT_AT: f32 = 8.0;
 
 /// The pickups `--pickup-event-check` lays at her feet, one after the
-/// other, as a crate's contents would lie: cash, then fuel
-/// (both taken by walking onto them).
-const PICKUP_CHECK_ITEMS: [&str; 2] = ["Cash (Small)", "Fuel Pickup (Large)"];
+/// other, as a crate's contents would lie: cash, then fuel (both taken
+/// by walking onto them), then a munitions laptop (#660: its script's
+/// `PickupMunitions` calls the HUD's PDA, `UpdateSupport`).
+const PICKUP_CHECK_ITEMS: [&str; 3] = ["Cash (Small)", "Fuel Pickup (Large)", "Munitions (Laptop)"];
 
 /// The least a `--pickup-event-check` run plays, seconds: its 10 s, the
-/// items 4 s apart and 20 s to take them, with time to spare for her to
+/// three items 4 s apart and 20 s to take them, with time to spare for her to
 /// come down on foot.
 const PICKUP_CHECK_SECONDS: f32 = 90.0;
 
