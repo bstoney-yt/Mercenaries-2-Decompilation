@@ -670,27 +670,27 @@ const UNTEMPLATED_FORCE: f32 = 300.0;
 const SHOT_PUSH: f32 = 2.0;
 pub(crate) const REACH: f32 = 9.0;
 
-/// How the blast of a vehicle's wreck throws her, put out at `at` (her
-/// feet), her capsule `radius` and `height` (m): the blast's push
-/// ([`m2_engine::durability::BlastPush::throw`], the 360's 0x8215CBC8) on
-/// her body's box, from where it went off (`blast`), its `Radius` and
-/// `MaxForce`. `fx_Explosion_Large` (7 m, 300) 1.5 to 2 m from her
-/// gives 7.1 to 6.4 m/s out and as much up.
-pub(crate) fn wreck_throw(
-    blast: Vec3,
-    (radius, force): (f32, f32),
-    at: Vec3,
-    (r, height): (f32, f32),
-) -> Vec3 {
-    let push = m2_engine::durability::BlastPush {
-        at: blast,
-        radius,
-        force,
-    };
-    let lo = at - Vec3::new(r, 0.0, r);
-    let hi = at + Vec3::new(r, height, r);
-    push.throw(lo, hi, 1.0).0
+/// Her way out of a vehicle that died under her, and how it went, for
+/// the log and `--wreck-rider-check`: seconds since, the vehicle's origin
+/// and where she was put out, the launch her ragdoll took, her health
+/// then, when her ragdoll went live, the highest her limp body's root rose
+/// over where she was put out, how far out it came to lie, and when she
+/// was up.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DeathExit {
+    pub t: f32,
+    pub vehicle: Vec3,
+    pub out: Vec3,
+    pub launch: Vec3,
+    pub hp: f32,
+    pub hp_up: f32,
+    pub live_at: Option<f32>,
+    pub peak: f32,
+    pub peak_at: f32,
+    pub lay: f32,
+    pub up_at: Option<f32>,
 }
+
 /// The satellite-guided bomb's blasts, from the template database's
 /// laser-guided bomb ("Explosion (Airstike Bomb)" 80008e3f, its frag
 /// "Explosion (Airstrike Frag)" 8000a3df, and its final strike 8000af7d
@@ -2006,13 +2006,11 @@ pub struct Combat {
     /// The effects that are explosions, by name hash: their `Radius` and
     /// `MaxForce` (a wreck's blast, [`Combat::her_vehicle_wrecked`]).
     pub blast_effects: std::collections::HashMap<u32, (f32, f32)>,
-    /// Thrown from a wreck: its blast's place, where she was put out, her
-    /// health then, and seconds since (for the landing's log line).
-    thrown_from: Option<(Vec3, Vec3, f32, f32)>,
-    /// Her last landing thrown from a wreck: seconds flown, metres from
-    /// the blast and from where she was put out, health before and after
-    /// (`--wreck-rider-check`).
-    pub wreck_landing: Option<(f32, f32, f32, f32, f32)>,
+    /// Put out of a vehicle that died under her, watched until she is up
+    /// ([`DeathExit`]).
+    death_exit: Option<DeathExit>,
+    /// The last such, once she is up again (`--wreck-rider-check`).
+    pub death_exit_done: Option<DeathExit>,
     /// The effect templates that go off as blasts, by name hash: their own
     /// `Explosive` and their `PhysicalLink`s' (each with the link's
     /// offset). A vehicle part's state that starts one sets them all off
@@ -2465,8 +2463,8 @@ impl Default for Combat {
             knock_rng: m2_game::script_math::EngineRng::default(),
             blasts: 0,
             blast_effects: std::collections::HashMap::new(),
-            thrown_from: None,
-            wreck_landing: None,
+            death_exit: None,
+            death_exit_done: None,
             wreck_blasts: std::collections::HashMap::new(),
             part_blasts_fired: Vec::new(),
             rider_of: None,
@@ -3521,7 +3519,7 @@ impl Combat {
             trigger
         };
         self.her_vehicle_wrecked(f);
-        self.her_landing(f, dt);
+        self.her_death_exit(f, dt);
         for damage in std::mem::take(&mut self.pending_hurt) {
             let before = self.hp;
             let lost = self.hurt_player(f, damage, None);
@@ -4613,6 +4611,9 @@ impl Combat {
     /// body lies; up when [`KnockedHer::stands`], where the body lay,
     /// facing along it.
     fn knocked_step(&mut self, f: &mut Field<'_>, dt: f32) {
+        if let Some(seconds) = f.player.knock_for.take() {
+            self.knock_her_down(f, seconds);
+        }
         if f.player.tossed {
             f.player.tossed = false;
             let r = self.knock_rng.unit();
@@ -4681,40 +4682,27 @@ impl Combat {
         }
     }
 
-    /// The vehicle she is in was wrecked: she is put out of it at its
-    /// door, and its wreck's blast throws her clear ([`wreck_throw`]);
-    /// she is hurt only by her landing (her fall's own damage).
+    /// The vehicle she is in was wrecked: the 360's death exit. She is put
+    /// out at her seat (else at a clear point), not hurt by it, and her
+    /// ragdoll goes live with a level launch away from the vehicle; she is
+    /// down [`crate::game::DEATH_EXIT_DOWN`] s, then gets up as from any
+    /// knockdown ([`Combat::knock_her_down`]).
     ///
-    /// From the 360 code: the rider system hears the vehicle's death
-    /// (queue 0x831B21C0, 0x82299918 -> 0x822A5D98) and puts a seated
-    /// rider out (0x822A1280 -> 0x822A2648 -> 0x822A13D0, which places
-    /// her by the seat's exit and posts an empty action to her action
-    /// component 0x83656C20: no launch there). It then posts the
-    /// player's character a 100.0 damage message (0x820D9F18, queue
-    /// 0x8318C480, direction up); footage shows no loss (Xenia round 3),
-    /// so it is taken as blocked while she is still the vehicle's rider
-    /// (0x822889F8 passes nothing to a rider whose seat isn't
-    /// `bIsPlayerVulnerable`; inferred, the order not traced) and not
-    /// dealt. The car's body's wreck state starts `fx_Explosion_Large`
-    /// (an `Explosive`: 7 m, `MaxForce` 300); a blast pushes what it
-    /// reaches by the Havok explosion action the explosion record makes
-    /// (0x82291B88 -> vtable 0x820C79B0 slot 5, 0x82154F60 ->
-    /// 0x8215C110, run by 0x8215C560). A person (body kind 1) is pushed
-    /// through her own physics object (component 0x8365726C): where she
-    /// has an impulse handler (component 0x8365849C) by 0x8215CA38, an
-    /// impulse of `MaxForce` x her `ExplosionFudge` x
-    /// `max(1 - d / Radius, MinForceFalloff)` x 150 (0x820EBF4C) along
-    /// her way from the blast across the ground plus as much up,
-    /// normalised, at a random point of her body (0.5 m either way across,
-    /// up to 1.75 m up: 0x824281C8), handed to that handler (vfunc 0x3C,
-    /// a ragdoll launch: 0x824282F8, 0x82428910, see the ragdoll thread's
-    /// notes); else by the rigid bodies' push (0x8215CBC8). Inferred, an
-    /// interim to be replaced by that ragdoll launch: the velocity it gives
-    /// her, taken as the rigid bodies' push on her capsule's box
-    /// ([`wreck_throw`]: the same 45 degrees up), which
-    /// gives the footage's arc under the world's gravity
-    /// ([`crate::player::Player::throw`]); from the wreck state's own
-    /// effect, where its node is.
+    /// From the 360 code: the vehicle's death (0x82205BE0) posts each
+    /// rider the seat message kind 4 (queue 0x831C2498), mode 3 (2 if the
+    /// vehicle's flags have 0x10000000; then its ordinary exit choice, not
+    /// ported). The rider system (0x82299918 -> 0x822A55D0 -> 0x822A0F58)
+    /// takes exit 4 for mode 3 (0x822A2B60), 0x822A2178: a state change
+    /// 0xBFFCEEA0 to her, her time down 0x82423848(3.0), and, when her way
+    /// out is clear (0x8229AC90 false), her placed at the seat's own
+    /// transform (0x823F8370 -> 0x823F8178), else put out at a clear point
+    /// (0x822A13D0); no velocity. The ragdoll controller takes the same
+    /// message with byte +0x21 = 3 and launches her 10 m/s level away from
+    /// what the seat is attached to (0x82428EA0; that lookup 0x82156978 on
+    /// 0x83653DF8 gives the vehicle is inferred). Her limbs meet the wreck
+    /// as it is thrown up under her (the ragdoll's collision layer against
+    /// vehicles is not read: inferred). No damage reaches her (Xenia: 100
+    /// -> 100).
     fn her_vehicle_wrecked(&mut self, f: &mut Field<'_>) {
         let Some(i) = f.player.driving else {
             return;
@@ -4722,81 +4710,71 @@ impl Combat {
         let Some(v) = f.vehicles.get(i).filter(|v| v.wrecked) else {
             return;
         };
-        let Some(body) = v.id.and_then(|id| f.physics.vehicle_transform(id)) else {
+        let label = v.spec.label.clone();
+        let Some(vehicle) = crate::game::death_exit(f.physics, v, f.player) else {
             return;
         };
-        let (lo, hi) = v.spec.bounds;
-        let middle = body.transform_point3((lo + hi) * 0.5);
-        crate::game::get_out(f.physics, v, None, f.player);
-        if f.player.driving.is_some() {
-            // Nowhere to put her: as before.
-            return;
-        }
         self.seat = 0;
         self.rider_of = Some(i);
-        let label = v.spec.label.clone();
-        // Its wreck's blast: an effect its model's states start that is an
-        // explosion's, where its node is (else the vehicle's middle).
-        let blast = v.spec.damage.as_deref().and_then(|dm| {
-            dm.states
-                .machines
-                .iter()
-                .flat_map(|m| &m.acts)
-                .flat_map(|a| &a.emitters)
-                .find_map(|&(fx, node)| {
-                    let b = self.blast_effects.get(&fx)?;
-                    let at = node.map_or(middle, |n| body.transform_point3(dm.node_at(n)));
-                    Some((at, *b))
-                })
+        let out = f.player.character.position;
+        let launch = crate::game::death_launch(vehicle, out);
+        f.player.launch = Some(launch);
+        f.player.knock_for = Some(crate::game::DEATH_EXIT_DOWN);
+        self.death_exit = Some(DeathExit {
+            vehicle,
+            out,
+            launch,
+            hp: self.hp,
+            hp_up: self.hp,
+            ..DeathExit::default()
         });
-        let Some((at, push)) = blast else {
-            eprintln!("wreck: the {label} she is in is wrecked: she is put out (no wreck blast)");
-            return;
-        };
-        let c = &f.player.character;
-        let velocity = wreck_throw(at, push, c.position, (c.radius, c.height));
-        f.player.throw(velocity);
-        self.thrown_from = Some((at, f.player.character.position, self.hp, 0.0));
         eprintln!(
-            "wreck: the {label} she is in is wrecked: she is put out and thrown by its blast ({:.0} m, push {:.0}) {:.1} m off: {:.1} m/s out, {:.1} m/s up; health {:.1}",
-            push.0,
-            push.1,
-            f.player.character.position.distance(at),
-            velocity.with_y(0.0).length(),
-            velocity.y,
+            "wreck: death exit out of the {label} at {out:.2}, launch {launch:.2} ({:.2} m/s level); health {:.1}",
+            launch.with_y(0.0).length(),
             self.hp
         );
     }
 
-    /// Thrown from a wreck, she landed: logs where (how far from the
-    /// blast and from where she was put out, across the ground), how long
-    /// she flew, and her health against what it was when thrown (Xenia:
-    /// 7.5 to 11 m out, no damage).
-    fn her_landing(&mut self, f: &Field<'_>, dt: f32) {
-        let Some((blast, out, hp, t)) = &mut self.thrown_from else {
+    /// Watches her death exit ([`DeathExit`]) until she is up: when her
+    /// ragdoll went live, how high and how far its root went, when she
+    /// stood; 10 s at most.
+    fn her_death_exit(&mut self, f: &Field<'_>, dt: f32) {
+        let Some(d) = &mut self.death_exit else {
             return;
         };
-        *t += dt;
-        if f.player.thrown && *t < 10.0 {
+        d.t += dt;
+        if let Some(id) = f.player.ragdoll {
+            d.live_at.get_or_insert(d.t);
+            if let Some(root) = crate::npc::limp_root(f.physics, id) {
+                let rise = root.y - d.out.y;
+                if rise > d.peak {
+                    d.peak = rise;
+                    d.peak_at = d.t;
+                }
+                d.lay = root.with_y(0.0).distance(d.vehicle.with_y(0.0));
+            }
+        }
+        let up = d.live_at.is_some() && !f.player.down;
+        if !up && d.t < 10.0 {
             return;
         }
-        let at = f.player.character.position;
+        if up {
+            d.up_at = Some(d.t);
+        }
+        d.hp_up = self.hp;
         eprintln!(
-            "wreck: she lands {:.1} s on, {:.1} m from the blast and {:.1} m from where she was put out; health {:.1} -> {:.1}",
-            t,
-            at.with_y(0.0).distance(blast.with_y(0.0)),
-            at.with_y(0.0).distance(out.with_y(0.0)),
-            hp,
-            self.hp
+            "wreck: death exit: ragdoll live {}, peak +{:.2} m at {:.2} s, {:.2} m out, up {}; health {:.1} -> {:.1}",
+            d.live_at
+                .map_or("never".to_owned(), |t| format!("at {t:.3} s")),
+            d.peak,
+            d.peak_at,
+            d.lay,
+            d.up_at
+                .map_or("not in 10 s".to_owned(), |t| format!("at {t:.2} s")),
+            d.hp,
+            d.hp_up
         );
-        self.wreck_landing = Some((
-            *t,
-            at.with_y(0.0).distance(blast.with_y(0.0)),
-            at.with_y(0.0).distance(out.with_y(0.0)),
-            *hp,
-            self.hp,
-        ));
-        self.thrown_from = None;
+        self.death_exit_done = self.death_exit.take();
         self.rider_of = None;
     }
 
@@ -9451,24 +9429,6 @@ mod tests {
     }
 
     #[test]
-    fn a_wreck_blast_throws_her_as_the_footage_has_it() {
-        // fx_Explosion_Large (7 m, push 300) 1.5 and 2 m from her feet,
-        // level: out and up alike, 7.07 and 6.43 m/s.
-        let blast = (7.0, 300.0);
-        let near = wreck_throw(Vec3::ZERO, blast, Vec3::X * 1.5, (0.3, 1.8));
-        let far = wreck_throw(Vec3::ZERO, blast, Vec3::X * 2.0, (0.3, 1.8));
-        assert!(
-            (near.y - 7.5 * 300.0 * 0.004 * (1.0 - 1.2 / 7.0)).abs() < 0.01,
-            "{near}"
-        );
-        assert!(
-            (near.x - near.y).abs() < 1e-4 && near.z.abs() < 1e-4,
-            "{near}"
-        );
-        assert!(far.y < near.y && far.y > 6.0, "{far}");
-    }
-
-    #[test]
     fn her_wrecked_vehicle_throws_her_clear_unhurt() {
         use m2_engine::tuning::VehicleTuning;
         let mut physics = ground();
@@ -9520,11 +9480,17 @@ mod tests {
         combat.step(&mut field, Trigger::default(), dt);
         assert_eq!(field.player.driving, Some(0));
         assert_eq!(combat.hp, full);
-        // Wrecked: out of it, thrown clear, not hurt by the wreck.
+        // Wrecked: the death exit, out at her seat, not hurt by it, her
+        // ragdoll to start 10 m/s level away from the vehicle (no rig
+        // here, so none is made: the launch stays as given).
         field.vehicles[0].wrecked = true;
         combat.step(&mut field, Trigger::default(), dt);
         assert_eq!(field.player.driving, None);
         assert_eq!(combat.hp, full, "no health lost at the wreck");
+        let d = combat.death_exit.expect("a death exit");
+        assert!((d.launch.with_y(0.0).length() - 10.0).abs() < 1e-4);
+        assert_eq!(d.launch.y, 0.0);
+        assert!(d.launch.dot((d.out - d.vehicle).with_y(0.0)) >= 0.0);
         let middle = field
             .physics
             .vehicle_transform(id)

@@ -380,10 +380,6 @@ pub struct Player {
     /// Set as she lands after her floor went (taken by the log of what
     /// stands there).
     pub floor_landed: bool,
-    /// Thrown clear of a wrecked vehicle ([`crate::combat::wreck_throw`]):
-    /// she keeps the throw's speed, not steering, falling under the
-    /// world's gravity rather than her own, until she lands ([`Player::throw`]).
-    pub thrown: bool,
     pub model: Option<(GpuModel, Rig)>,
     /// On a ladder: where the climb holds her and what she plays
     /// ([`crate::ladders`]).
@@ -477,6 +473,10 @@ pub struct Player {
     pub down: bool,
     /// Thrown off a vehicle (exit 3, 0x822A1B70): to be knocked down.
     pub tossed: bool,
+    /// Put out of a vehicle that died under her (exit 4, 0x822A2178): to
+    /// be knocked down for that many seconds, her ragdoll starting with
+    /// [`launch`](Self::launch).
+    pub knock_for: Option<f32>,
     /// The launch her ragdoll starts with, from the exit message
     /// ([`m2_engine::ragdoll_launch::exit_launch`]).
     pub launch: Option<Vec3>,
@@ -689,7 +689,6 @@ impl Player {
             floor_gone: false,
             ground_known: false,
             floor_landed: false,
-            thrown: false,
             models_coming: false,
             model,
             ladder: None,
@@ -730,6 +729,7 @@ impl Player {
             launcher: false,
             down: false,
             tossed: false,
+            knock_for: None,
             launch: None,
             last_toss: None,
             fall: on_foot::FallWatch::default(),
@@ -761,30 +761,6 @@ impl Player {
             swim: None,
             holstered: false,
         }
-    }
-
-    /// Throws her at `velocity` (m/s): off the ground, not steering, and
-    /// falling under the physics world's gravity, as a body thrown limp
-    /// does, until she lands; her flat velocity flies on as it is (less
-    /// only walls met on a step) and no wall from before is remembered
-    /// ([`m2_engine::Character::flying`]).
-    ///
-    /// The gravity: from the 360 code, a blast moves a person only as a
-    /// ragdoll (0x8215CA38 -> her impulse handler 0x824282F8, applied to a
-    /// live ragdoll's body by 0x82428910), and a ragdoll's bodies are
-    /// rigid bodies of the physics world, which pulls at 9.0
-    /// ([`m2_engine::physics::WORLD_GRAVITY`], 0x820F9710). That she flies
-    /// as a ragdoll is inferred (whether her ragdoll goes live as the car
-    /// dies is not traced); before, 9.81 ([`m2_engine::physics::GRAVITY`]),
-    /// not her template's 16.5. The footage's arc (Xenia: 1.6 to 2.9 m up,
-    /// down 1.3 to 1.7 s later) fits either.
-    pub fn throw(&mut self, velocity: Vec3) {
-        self.character.velocity = velocity;
-        self.character.grounded = false;
-        self.character.gravity = m2_engine::physics::WORLD_GRAVITY;
-        self.character.wall = None;
-        self.character.flying = true;
-        self.thrown = true;
     }
 
     /// Takes her template's `_HumanPhysics` tuning: her jump, the gravity
@@ -1363,9 +1339,7 @@ impl Player {
             self.unsupported + dt
         };
         let have = Vec2::new(self.character.velocity.x, self.character.velocity.z);
-        let ground = if self.thrown {
-            have
-        } else if self.character.grounded {
+        let ground = if self.character.grounded {
             on_foot::ground_step(have, ground, on_foot::GROUND_MAX_ACCEL * dt)
         } else if self.unsupported < on_foot::LEDGE_GRACE && !matches!(self.leap, Leap::Air(_)) {
             on_foot::ground_step(have, ground, on_foot::LEDGE_MAX_CHANGE)
@@ -1387,11 +1361,6 @@ impl Player {
             self.jump_step(intent.jump, bashing, walking.length_squared(), dt);
         let jump = launch.then(|| self.motion.jump_speed());
         physics.move_character(&mut self.character, wanted, jump, dt);
-        if self.thrown && self.character.grounded {
-            self.thrown = false;
-            self.character.flying = false;
-            self.character.gravity = self.motion.gravity;
-        }
         // A fall that hurts: the 360 measures it from where she left the
         // ground, and by her template's limits it costs her health and
         // posts `FallImpactLight` or `FallImpactHeavy`.
@@ -2468,44 +2437,6 @@ mod tests {
         );
         p.step(1.0 / 60.0);
         p
-    }
-
-    #[test]
-    fn thrown_clear_she_keeps_the_throw_until_she_lands() {
-        let physics = ground();
-        let mut p = Player::new(0.0, 0.0, 0.0, None);
-        let dt = 1.0 / 60.0;
-        for _ in 0..usize::from(SETTLED) {
-            p.update(&physics, Intent::default(), dt);
-        }
-        assert!(p.landed);
-        let from = p.character.position;
-        // A wrecked car's blast at its body's middle, 2 m from her feet
-        // put out at its door, as Combat::her_vehicle_wrecked gives it.
-        let v = crate::combat::wreck_throw(
-            from - Vec3::X * 2.0,
-            (7.0, 300.0),
-            from,
-            (p.character.radius, p.character.height),
-        );
-        p.throw(v);
-        let mut top = 0.0f32;
-        let mut t = 0.0;
-        loop {
-            p.update(&physics, Intent::default(), dt);
-            t += dt;
-            top = top.max(p.character.position.y - from.y);
-            if p.character.grounded || t > 3.0 {
-                break;
-            }
-        }
-        let across = p.character.position.x - from.x;
-        // Footage: 7.5 to 11 m out, 1.6 to 2.9 m up, 1.3 to 1.7 s.
-        assert!((7.5..=11.0).contains(&across), "{across} m out");
-        assert!((1.6..=2.9).contains(&top), "{top} m up");
-        assert!((1.3..=1.7).contains(&t), "{t} s");
-        assert!(!p.thrown);
-        assert_eq!(p.character.gravity, JENNIFER.gravity);
     }
 
     #[test]

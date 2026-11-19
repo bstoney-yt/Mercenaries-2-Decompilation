@@ -6380,19 +6380,7 @@ fn exit_plan(
     let index = seating.and_then(|s| her_seat.and_then(|n| s.seat(n)).or_else(|| s.driver()));
     let seat = seating.zip(index).map(|(s, i)| &s.seats[i]);
     let exit = seating.zip(index).and_then(|(s, i)| s.exit_of(i));
-    let local = exit
-        .and_then(|e| v.spec.entrance_at(e.name))
-        .map(|p| Vec3::new(p.x, 0.0, p.z));
-    let (lo, hi) = v.spec.bounds;
-    let local = local.filter(|p| !(lo.x..=hi.x).contains(&p.x) || !(lo.z..=hi.z).contains(&p.z));
-    let place = local.map(|p| at.transform_point3(p));
-    // The 360 sweeps her capsule (0.4 m, 0.6 to 1.8 m up) from her seat to
-    // the hardpoint (0x8229AC90); here one ray at 1.2 m.
-    let blocked = place.zip(v.id).is_some_and(|(to, id)| {
-        let from = at.transform_point3(v.spec.seat.unwrap_or(Vec3::ZERO)) + Vec3::Y * 1.2;
-        let way = to + Vec3::Y * 1.2 - from;
-        physics.cast_ray_past(from, way, way.length(), id).is_some()
-    });
+    let (place, blocked) = exit_way(physics, v, her_seat, at);
     let up_y = at.transform_vector3(Vec3::Y).normalize_or_zero().y;
     // A helicopter's landed share is not modelled: it counts as landed
     // (Invented; 0x822A2B60 ditches from one in the air).
@@ -6411,6 +6399,89 @@ fn exit_plan(
         (_, Some(p)) => p,
     };
     (kind, place)
+}
+
+/// Her way out of `v` (standing at `at`) from `her_seat` (else the
+/// driver's): the exit point by its entrance, if it lies outside the hull,
+/// and whether the way there is blocked. The 360 sweeps her capsule (0.4
+/// m, 0.6 to 1.8 m up) from her seat to the hardpoint (0x8229AC90); here
+/// one ray at 1.2 m.
+fn exit_way(
+    physics: &Physics,
+    v: &ParkedVehicle,
+    her_seat: Option<u32>,
+    at: Mat4,
+) -> (Option<Vec3>, bool) {
+    let seating = v.spec.seating.as_deref();
+    let index = seating.and_then(|s| her_seat.and_then(|n| s.seat(n)).or_else(|| s.driver()));
+    let exit = seating.zip(index).and_then(|(s, i)| s.exit_of(i));
+    let local = exit
+        .and_then(|e| v.spec.entrance_at(e.name))
+        .map(|p| Vec3::new(p.x, 0.0, p.z));
+    let (lo, hi) = v.spec.bounds;
+    let local = local.filter(|p| !(lo.x..=hi.x).contains(&p.x) || !(lo.z..=hi.z).contains(&p.z));
+    let place = local.map(|p| at.transform_point3(p));
+    let blocked = place.zip(v.id).is_some_and(|(to, id)| {
+        let from = at.transform_point3(v.spec.seat.unwrap_or(Vec3::ZERO)) + Vec3::Y * 1.2;
+        let way = to + Vec3::Y * 1.2 - from;
+        physics.cast_ray_past(from, way, way.length(), id).is_some()
+    });
+    (place, blocked)
+}
+
+/// The launch her ragdoll takes out of a vehicle that died under her, m/s,
+/// level, away from it (0x82428EA0: 0x82DE889C 10.0 for the player, at
+/// the angle 0x82DE88A0, 0.0).
+pub const DEATH_EXIT_LAUNCH: f32 = 10.0;
+/// How long she is held down after that exit, seconds (0x822A2178 sets
+/// her record's +0x38 from 0x82423848(3.0, …); that it is her time down
+/// is inferred).
+pub const DEATH_EXIT_DOWN: f32 = 3.0;
+
+/// Out of `v`, which died under her: the 360's death exit (exit 4,
+/// 0x822A2178, chosen by 0x822A2B60 for the death message's mode 3,
+/// posted by 0x82205BE0). She is put at her seat's own place when her way
+/// out is clear, else out at a clear point (0x8229AC90 blocked:
+/// 0x822A13D0); no velocity. Her ragdoll is to start with
+/// [`death_launch`]. Returns the vehicle's origin, or `None` if it isn't
+/// placed.
+pub(crate) fn death_exit(
+    physics: &Physics,
+    v: &ParkedVehicle,
+    player: &mut Player,
+) -> Option<Vec3> {
+    let id = v.id?;
+    let at = physics.vehicle_transform(id).filter(|m| m.is_finite())?;
+    let (_, blocked) = exit_way(physics, v, None, at);
+    let place = if blocked {
+        door_out(at, &v.spec)
+    } else {
+        at.transform_point3(v.spec.seat.unwrap_or(Vec3::ZERO))
+    };
+    player.step_out_at(place);
+    player.character.velocity = Vec3::ZERO;
+    player.driving = None;
+    player.chase_target = None;
+    player.seated = false;
+    player.seat_frame = None;
+    eprintln!(
+        "exit: {} death exit at {place:.2} ({})",
+        v.spec.label,
+        if blocked {
+            "way blocked: put out clear"
+        } else {
+            "at her seat"
+        }
+    );
+    Some(at.transform_point3(Vec3::ZERO))
+}
+
+/// Her ragdoll's launch out of a vehicle that died with its origin at
+/// `vehicle`, she at `her`: [`DEATH_EXIT_LAUNCH`] level, from it to her
+/// (0x82428EA0); straight along +Z if she is right over it.
+pub fn death_launch(vehicle: Vec3, her: Vec3) -> Vec3 {
+    let away = Vec3::new(her.x - vehicle.x, 0.0, her.z - vehicle.z).normalize_or(Vec3::Z);
+    away * DEATH_EXIT_LAUNCH
 }
 
 /// Whether `v`, standing at `at`, is a boat afloat: its origin (its
@@ -6645,6 +6716,15 @@ fn switch_weapon(
 
 #[cfg(test)]
 mod tests {
+
+    // Out of a vehicle that died under her: 10 m/s level, from its origin
+    // to her (0x82428EA0); straight along +Z right over it.
+    #[test]
+    fn a_death_exit_launches_her_level_away_from_the_vehicle() {
+        let v = death_launch(Vec3::new(1.0, 5.0, 1.0), Vec3::new(4.0, 7.0, 5.0));
+        assert!((v - Vec3::new(6.0, 0.0, 8.0)).length() < 1e-4, "{v}");
+        assert_eq!(death_launch(Vec3::ZERO, Vec3::Y * 2.0), Vec3::Z * 10.0);
+    }
     use std::collections::HashMap;
 
     #[test]

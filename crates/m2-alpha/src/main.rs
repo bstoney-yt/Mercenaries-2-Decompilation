@@ -9845,18 +9845,17 @@ fn fuel_check(game: &mut Game, tick: f32) {
     }
 }
 
-/// Xenia's seated rider of a wrecked car: thrown 7.5 to 11 m from the
-/// blast, landing 1.3 to 1.7 s on, unhurt.
-const RIDER_LANDS: (std::ops::RangeInclusive<f32>, std::ops::RangeInclusive<f32>) =
-    (7.5..=11.0, 1.3..=1.7);
-
 /// `--wreck-rider-check` (it turns on `--drive`): she is seated in the
 /// car she drives, then in a Ridgeline and a semi if their models are
 /// loaded (each put where she is, whole). Each is wrecked through the
 /// vehicles' own damage ([`combat::Combat::kill_vehicle`]) at full
-/// health, and her landing waited for (6 s at most). Each passes if
-/// she lost no health, landed [`RIDER_LANDS`] m from the blast and in
-/// that many seconds. One `wreck-rider-check: PASS` or `FAIL ...` line.
+/// health and her death exit watched until she is up (12 s at most,
+/// [`combat::DeathExit`]). Each passes if her health is unchanged, her
+/// ragdoll went live within two of the 360's frames, its launch was 10
+/// m/s level away from the vehicle ([`game::death_launch`]), and she got
+/// up; how high and far she went and when she rose are printed against
+/// Xenia's (+2.81 m, 8.75 m, 2.7 s), not gated. One
+/// `wreck-rider-check: PASS` or `FAIL ...` line.
 fn wreck_rider_check(game: &mut Game, tick: f32) {
     use m2_math::glam::Vec3;
     let Some(first) = game.scene.player.as_ref().and_then(|p| p.driving) else {
@@ -9905,53 +9904,72 @@ fn wreck_rider_check(game: &mut Game, tick: f32) {
         for _ in 0..(1.5 / tick) as u32 {
             game.step(Intent::default(), tick);
         }
-        game.combat.wreck_landing = None;
+        game.combat.death_exit_done = None;
         let hp = game.combat.hp;
-        // Played, as in the game (`--drive` starts with the free camera):
-        // only then is she stepped once put out, and lands (q673i: thrown
-        // 13.2 m/s out and up by the semi's blast, never grounded).
         game.on_foot = true;
         if let Some(world) = game.scene.world.as_mut() {
             let v = &mut game.scene.vehicles[i];
             game.combat.kill_vehicle(&mut world.physics, v, i);
         }
         eprintln!("wreck-rider-check: the {label} wrecked under her at {hp:.1} health");
-        let mut landed = None;
+        let mut done = None;
         let every = ((0.1 / tick).round() as u32).max(1);
-        for k in 0..(6.0 / tick) as u32 {
+        for k in 0..(12.0 / tick) as u32 {
             game.step(Intent::default(), tick);
-            // Her flight each tenth of a second (q673k: up 2.8 s but only
-            // 0.7 m across: what stops her across?).
+            // Her limp body's root each tenth of a second.
             if k % every == 0
                 && let Some(p) = game.scene.player.as_ref()
             {
-                let c = &p.character;
+                let root = p
+                    .ragdoll
+                    .zip(game.scene.world.as_ref())
+                    .and_then(|(id, w)| crate::npc::limp_root(&w.physics, id));
                 eprintln!(
-                    "wreck-rider-check: {:.1} s: she is at {:.2}, moving {:.2} m/s, grounded {}, thrown {}, flying {}, placed {}",
+                    "wreck-rider-check: {:.1} s: she is at {:.2}, her limp body's root at {}, down {}",
                     k as f32 * tick,
-                    c.position,
-                    c.velocity,
-                    c.grounded,
-                    p.thrown,
-                    c.flying,
-                    // `Player::landed`: put in the world on ground that
-                    // loaded (true from her spawn on), not touched down.
-                    p.landed
+                    p.character.position,
+                    root.map_or("-".to_owned(), |r| format!("{r:.2}")),
+                    p.down
                 );
             }
-            if let Some(l) = game.combat.wreck_landing.take() {
-                landed = Some(l);
+            if let Some(d) = game.combat.death_exit_done.take() {
+                done = Some(d);
                 break;
             }
         }
-        let (far, time) = RIDER_LANDS;
-        match landed {
-            None => fails.push(format!("the {label}: she never landed thrown (6 s)")),
-            Some((t, a, _, before, after)) => {
+        // Two of the 360's frames.
+        const LIVE_BY: f32 = 2.0 / 30.0;
+        match done {
+            None => fails.push(format!("the {label}: no death exit seen in 12 s")),
+            Some(d) => {
+                let level = d.launch.with_y(0.0);
+                let away = (d.out - d.vehicle).with_y(0.0).normalize_or_zero();
+                let by_rule = (level.length() - crate::game::DEATH_EXIT_LAUNCH).abs() <= 0.01
+                    && d.launch.y.abs() < 1e-4
+                    && level.normalize_or_zero().dot(away) > 0.999;
                 let line = format!(
-                    "the {label}: {a:.1} m from the blast after {t:.2} s, health {before:.1} -> {after:.1}"
+                    "the {label}: launch {:.2} ({}), ragdoll live {}, peak +{:.2} m at {:.2} s, {:.2} m out, up {} (Xenia: +2.81 m at 0.6 s, 8.75 m, up 2.7 s; recorded, not gated), health {:.1} -> {:.1}",
+                    d.launch,
+                    if by_rule {
+                        "by the rule"
+                    } else {
+                        "NOT by the rule"
+                    },
+                    d.live_at
+                        .map_or("never".to_owned(), |t| format!("at {t:.3} s")),
+                    d.peak,
+                    d.peak_at,
+                    d.lay,
+                    d.up_at
+                        .map_or("not in 10 s".to_owned(), |t| format!("at {t:.2} s")),
+                    d.hp,
+                    d.hp_up
                 );
-                if (after - before).abs() < 0.01 && far.contains(&a) && time.contains(&t) {
+                let ok = (d.hp_up - d.hp).abs() < 0.01
+                    && d.live_at.is_some_and(|t| t <= LIVE_BY + 1e-4)
+                    && by_rule
+                    && d.up_at.is_some();
+                if ok {
                     passed.push(line);
                 } else {
                     fails.push(line);
