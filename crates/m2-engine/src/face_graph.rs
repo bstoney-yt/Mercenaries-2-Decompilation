@@ -44,6 +44,9 @@ pub struct BonePose {
     pub position: Vec3,
     pub rotation: Quat,
     pub scale: Vec3,
+    /// The bone's rest in the rig (position, rotation, scale), which
+    /// `position`, `rotation` and `scale` moved from.
+    pub rest: (Vec3, Quat, Vec3),
 }
 
 fn parts(t: &Transform) -> (Vec3, Quat, Vec3) {
@@ -209,6 +212,7 @@ impl FaceGraph {
                 position,
                 rotation,
                 scale,
+                rest: (position, rotation, scale),
             })
             .collect();
         for (node, &value) in self.nodes.iter().zip(&v) {
