@@ -251,6 +251,9 @@ struct Options {
     /// `--exit-land-check`: she gets out of the car she drives and must
     /// land at once, whatever streams ([`exit_land_check`]).
     exit_land_check: bool,
+    /// `--no-blast-check`: a chain cannon's round (no blast) fired at a
+    /// soldier ([`no_blast_check`]).
+    no_blast_check: bool,
     /// With `--drive` and `--wreck` or `--shoot-up`: get out of the wreck,
     /// walk to the fuel can it left and take it (testing).
     fuel_check: bool,
@@ -848,6 +851,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--wreck" => o.wreck = true,
             "--exit-land-check" => {
                 o.exit_land_check = true;
+                o.drive = true;
+            }
+            "--no-blast-check" => {
+                o.no_blast_check = true;
                 o.drive = true;
             }
             "--fuel-check" => o.fuel_check = true,
@@ -8358,6 +8365,10 @@ fn drive_for_screenshot(
         exit_land_check(game, tick);
         return Ok(());
     }
+    if options.no_blast_check {
+        no_blast_check(game, tick);
+        return Ok(());
+    }
     if options.wreck {
         wreck_at_speed(game, tick);
     }
@@ -9748,6 +9759,105 @@ fn exit_land_check(game: &mut Game, tick: f32) {
                 .as_ref()
                 .map_or("no player".to_owned(), |p| p.landing_state())
         ),
+    }
+}
+
+/// `--no-blast-check` (it turns on `--drive`): the `Mounted Chain
+/// Cannon`'s round (`Minigun Bullet`: no `Explosive` reached from it, so
+/// no area damage on the 360) is fired from 10 m at the soldier nearest
+/// her, and 1 s is watched. `PASS` when the soldier struck lost health,
+/// every other person within 6 m of him lost none and was not pushed
+/// (speed changed by under 0.5 m/s), and she lost none; else `FAIL` with
+/// why. Logs each bystander's distance, health and speed before and
+/// after.
+fn no_blast_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::Vec3;
+    let ammo = game
+        .scene
+        .arms()
+        .and_then(|a| a.named("Mounted Chain Cannon"))
+        .map(|w| w.ammo);
+    let Some(ammo) = ammo else {
+        eprintln!("no-blast-check: FAIL no Mounted Chain Cannon template");
+        return;
+    };
+    if ammo.burst().is_some() {
+        eprintln!(
+            "no-blast-check: FAIL its round has a blast ({:?})",
+            ammo.burst()
+        );
+        return;
+    }
+    let her = game.focus();
+    let people = &game.scene.people.npcs;
+    let Some(t) = (0..people.len())
+        .filter(|&j| people[j].alive)
+        .min_by(|&a, &b| {
+            people[a]
+                .chest()
+                .distance(her)
+                .total_cmp(&people[b].chest().distance(her))
+        })
+    else {
+        eprintln!("no-blast-check: FAIL no one about");
+        return;
+    };
+    let chest = people[t].chest();
+    let near: Vec<usize> = (0..people.len())
+        .filter(|&j| j != t && people[j].alive && people[j].chest().distance(chest) < 6.0)
+        .collect();
+    let before: Vec<(f32, f32)> = near
+        .iter()
+        .map(|&j| (people[j].hp, people[j].character.velocity.length()))
+        .collect();
+    let (target_hp, her_hp) = (people[t].hp, game.combat.hp);
+    // From 10 m off, level, from the side away from her.
+    let away = (chest - her).with_y(0.0).normalize_or(Vec3::X);
+    let from = chest + away * 10.0;
+    eprintln!(
+        "no-blast-check: Mounted Chain Cannon ({:.0} damage, key {:08x}) fired at a soldier {:.1} m from her, {} within 6 m of him",
+        ammo.damage,
+        ammo.key.unwrap_or(0),
+        chest.distance(her),
+        near.len()
+    );
+    game.combat.fire_round(from, chest, &ammo);
+    let mut most_push = 0.0f32;
+    for _ in 0..(1.0 / tick) as u32 {
+        game.step(Intent::default(), tick);
+        let people = &game.scene.people.npcs;
+        for (k, &j) in near.iter().enumerate() {
+            if let Some(n) = people.get(j) {
+                most_push = most_push.max((n.character.velocity.length() - before[k].1).abs());
+            }
+        }
+    }
+    let people = &game.scene.people.npcs;
+    let struck = people.get(t).map_or(0.0, |n| target_hp - n.hp);
+    let mut hurt = Vec::new();
+    for (k, &j) in near.iter().enumerate() {
+        let Some(n) = people.get(j) else { continue };
+        eprintln!(
+            "no-blast-check: bystander {j} {:.1} m off: health {:.1} -> {:.1}",
+            n.chest().distance(chest),
+            before[k].0,
+            n.hp
+        );
+        if n.hp < before[k].0 {
+            hurt.push(j);
+        }
+    }
+    let her_lost = her_hp - game.combat.hp;
+    eprintln!(
+        "no-blast-check: the soldier struck lost {struck:.1}; bystanders hurt {hurt:?}, most speed change {most_push:.2} m/s; she lost {her_lost:.1}"
+    );
+    if struck > 0.0 && hurt.is_empty() && most_push < 0.5 && her_lost <= 0.0 {
+        eprintln!("no-blast-check: PASS");
+    } else {
+        eprintln!(
+            "no-blast-check: FAIL struck {struck:.1}, bystanders hurt {}, pushed {most_push:.2} m/s, she lost {her_lost:.1}",
+            hurt.len()
+        );
     }
 }
 
