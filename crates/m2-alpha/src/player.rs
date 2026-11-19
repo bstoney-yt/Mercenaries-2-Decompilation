@@ -373,6 +373,10 @@ pub struct Player {
     /// The floor under her was taken down ([`floor_went`](Self::floor_went)):
     /// she waits for the layers' models even with ground far below.
     floor_gone: bool,
+    /// She was put down out of a vehicle she was just in
+    /// ([`step_out_at`](Self::step_out_at)): the ground there is in, so
+    /// she lands without waiting on the world's streaming.
+    ground_known: bool,
     /// Set as she lands after her floor went (taken by the log of what
     /// stands there).
     pub floor_landed: bool,
@@ -671,6 +675,7 @@ impl Player {
             settled: 0,
             waited: 0,
             floor_gone: false,
+            ground_known: false,
             floor_landed: false,
             models_coming: false,
             model,
@@ -960,6 +965,21 @@ impl Player {
     /// to land on what is under it once the world there has loaded: the
     /// floor or ground nearest under the spot, not the top of whatever
     /// stands over it.
+    /// Where her landing stands, for a check that waits on it.
+    pub fn landing_state(&self) -> String {
+        format!(
+            "landed {}, settled {}, waited {}, streaming {}, models coming {}, ground known {}, put at {:?}, at {:.2?}",
+            self.landed,
+            self.settled,
+            self.waited,
+            self.streaming,
+            self.models_coming,
+            self.ground_known,
+            self.land_from.map(|v| v.to_array()),
+            self.character.position.to_array()
+        )
+    }
+
     pub fn drop_at(&mut self, at: Vec3) {
         self.character.position = at;
         self.character.velocity = Vec3::ZERO;
@@ -969,6 +989,18 @@ impl Player {
         self.land_from = Some(at);
         self.waited = 0;
         self.floor_gone = false;
+        self.ground_known = false;
+    }
+
+    /// Put down at `at` out of a vehicle she was just in (its door, where
+    /// her exit's clip ends): as [`drop_at`](Self::drop_at), but she lands
+    /// at once, not when the world has stopped streaming. The ground she
+    /// was riding over is in; waiting on streaming anywhere (`pending`
+    /// counts the whole world's) left her hanging where she got out for
+    /// as long as anything streamed (q728d, q673j: 6 s and more).
+    pub fn step_out_at(&mut self, at: Vec3) {
+        self.drop_at(at);
+        self.ground_known = true;
     }
 
     /// Out of a vehicle into the air (a ditch or toss, 0x822A1B70): at
@@ -1139,7 +1171,7 @@ impl Player {
             let floor_coming = self.models_coming
                 && self.waited < LAND_WAIT
                 && (self.floor_gone || self.land_from.and_then(near).is_none());
-            self.settled = if self.streaming || floor_coming {
+            self.settled = if !self.ground_known && (self.streaming || floor_coming) {
                 0
             } else {
                 self.settled.saturating_add(1)
@@ -1169,6 +1201,7 @@ impl Player {
                 self.character.position.y = y + 0.05;
                 self.landed = true;
                 self.land_from = None;
+                self.ground_known = false;
                 self.settled = 0;
                 self.waited = 0;
                 self.floor_gone = false;
@@ -2336,6 +2369,32 @@ mod tests {
     }
     use m2_engine::{CollisionShape, StaticKey};
     use m2_math::glam::Quat;
+
+    // Out of a vehicle she lands at once though the world still streams;
+    // put down elsewhere (a spawn, a teleport) she waits for it.
+    #[test]
+    fn stepping_out_lands_without_waiting_on_streaming() {
+        let physics = ground();
+        let run = |out: bool| {
+            let mut p = Player::new(0.0, 0.0, 0.0, None);
+            p.streaming = true;
+            p.models_coming = true;
+            let at = Vec3::new(2.0, 1.0, 3.0);
+            if out {
+                p.step_out_at(at);
+            } else {
+                p.drop_at(at);
+            }
+            for _ in 0..30 {
+                p.streaming = true;
+                p.models_coming = true;
+                p.update(&physics, Intent::default(), 1.0 / 60.0);
+            }
+            p.landed
+        };
+        assert!(run(true), "out of a vehicle she lands");
+        assert!(!run(false), "put down while streaming she waits");
+    }
 
     fn ground() -> Physics {
         let mut p = Physics::new();

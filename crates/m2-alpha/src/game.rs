@@ -6278,7 +6278,7 @@ pub(crate) fn get_out_at(
     facing: f32,
 ) {
     get_out(physics, v, seat, player);
-    player.drop_at(place);
+    player.step_out_at(place);
     player.facing = facing;
     eprintln!(
         "boarding: out of the {} where her clip ends, at {:.2?}",
@@ -6313,8 +6313,8 @@ pub(crate) fn get_out(
             );
         } else {
             // At the hull's height: onto the ground by the door, not onto
-            // a boulder or roof over it.
-            player.drop_at(place);
+            // a boulder or roof over it; at once (the ground is in).
+            player.step_out_at(place);
         }
         let f = at.transform_vector3(Vec3::Z);
         player.facing = f.x.atan2(f.z);
