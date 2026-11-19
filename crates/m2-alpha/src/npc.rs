@@ -2965,10 +2965,26 @@ impl Npc {
         };
         let gave_up = self.dither.step(way, dt);
         if gave_up {
+            // What he was doing, for finding which pick keeps coming back.
+            let doing = if hiding {
+                "hiding"
+            } else if covered {
+                "to cover"
+            } else if self.step.is_some() {
+                "stepping"
+            } else if self.detour.is_some() {
+                "going round"
+            } else if seen && distance < reach {
+                "close in"
+            } else {
+                "chasing"
+            };
             eprintln!(
-                "people: {:08x} dithers at {:.1}: gives the move up",
+                "people: {:08x} dithers at {:.1}: gives the move up ({doing}, cover spot {:.1?}, \
+                 her {distance:.1} m off, seen {seen})",
                 self.spawn.unwrap_or(u32::MAX),
-                self.character.position
+                self.character.position,
+                self.cover_spot
             );
             self.dither.mark(self.character.position);
             self.give_up_move();
