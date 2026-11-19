@@ -231,6 +231,20 @@ return true
 /// `MrxGuiDialogBox` (its widgets, fonts and pad handling), or taken down.
 /// The option picked goes into `__m2_hud_choices` with the call's number,
 /// for the mission's callback ([`GameHud::take_choices`]).
+/// A call the mission's scripts made on the PDA widget (their stand-in
+/// for it, group `PdaWidget`), made on the HUD's own: the munitions
+/// laptop's `UpdateSupport`. False when the HUD has no PDA or no such
+/// method.
+const PDA_CALL: &str = r##"
+local method, args = ...
+local g = rawget(_G, "MrxGui")
+if type(g) ~= "table" or type(g.GetWidgetByNameAndOwner) ~= "function" then return false end
+local w = g.GetWidgetByNameAndOwner("PDA", Sys.StringToGuid("0x1"))
+if w == nil or type(w[method]) ~= "function" then return false end
+w[method](w, unpack(args, 1, args.n or #args))
+return true
+"##;
+
 const DIALOG_CALL: &str = r##"
 local method, data, seq = ...
 __m2_dialog_boxes = __m2_dialog_boxes or {}
@@ -617,6 +631,19 @@ if not m then return end
 m.CustomData.nTime = time
 m.CustomData.nCost = cost
 m.CustomData.nCashPerSecond = 0
+"#;
+/// As the satellite's view closes: its overlay takes no more presses
+/// (`CustomData.bExiting`), as the timing wheel's own end leaves it
+/// (`MrxGuiSatellite._CompleteMinigame` sets it; `_OpenMinigame` clears
+/// it as the view next opens). The overlay's `_HandleInput` starts the
+/// wheel (`BeginMinigame`: its pop-up sound, then a beep each time the
+/// marker enters a wedge) on any confirm press it gets while the flag is
+/// clear. The play runs the wheel itself and never ended the overlay's,
+/// so a later confirm (the HQ's Accept box) started it again and it
+/// beeped on through Fiona's briefing (playtest of e8749a2a).
+const SATELLITE_DONE: &str = r#"
+local w = MrxGui.GetWidgetByNameAndOwner("Satellite overlay", Sys.StringToGuid("0x1"))
+if w and type(w.CustomData) == "table" then w.CustomData.bExiting = true end
 "#;
 /// The HUD's tutorial box (`MrxGuiTutorial`: the line typed out under its
 /// header, right of the middle) says this, or is put away (nil).
@@ -3799,6 +3826,18 @@ impl Thread {
                 Err(e) => format!("gui call {name}: {e}"),
             });
         }
+        for c in s.hud_calls.iter().filter(|c| c.group == "PdaWidget") {
+            let done = c.data.to_lua(lua).and_then(|args| {
+                lua.load(PDA_CALL)
+                    .set_name("=m2-pda call")
+                    .call::<bool>((c.method.as_str(), args))
+            });
+            log.push(match done {
+                Ok(true) => format!("pda call {}: {:?}", c.method, c.data),
+                Ok(false) => format!("pda call {}: the HUD's PDA has no such method", c.method),
+                Err(e) => format!("pda call {}: {e}", c.method),
+            });
+        }
         for c in s.hud_calls.iter().filter(|c| c.group == "DialogBox") {
             let done = c.data.to_lua(lua).and_then(|data| {
                 lua.load(DIALOG_CALL)
@@ -4532,6 +4571,11 @@ impl Thread {
         }
         if open != self.told.satellite {
             self.told.satellite = open;
+            if !open {
+                lua.load(SATELLITE_DONE)
+                    .set_name("=m2-hud satellite done")
+                    .exec()?;
+            }
             // As `MrxGuiManager.ToggleSatellite(player, open, "pmc")`
             // sends it: the minigame on, not the advanced view.
             let t = table(
@@ -6488,6 +6532,36 @@ fn text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mission's call on the PDA is made on the HUD's own PDA, as the
+    /// scripts made it.
+    #[test]
+    fn a_pda_call_is_made_on_the_huds_pda() {
+        let lua = Lua::new();
+        lua.load(
+            r#"
+            Sys = { StringToGuid = function() return 1 end }
+            local pda = { UpdateSupport = function(self, item, x, n) got = { item, x, n } end }
+            MrxGui = { GetWidgetByNameAndOwner = function(name) if name == "PDA" then return pda end end }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let args = Plain::Table(vec![
+            (Plain::Number(1.0), Plain::Text("artillery".into())),
+            (Plain::Number(3.0), Plain::Number(3.0)),
+            (Plain::Text("n".into()), Plain::Number(3.0)),
+        ]);
+        let call = |method: &str| {
+            lua.load(PDA_CALL)
+                .call::<bool>((method, args.to_lua(&lua).unwrap()))
+                .unwrap()
+        };
+        assert!(call("UpdateSupport"));
+        let (item, n): (String, f64) = lua.load("return got[1], got[3]").eval().unwrap();
+        assert_eq!((item.as_str(), n), ("artillery", 3.0));
+        assert!(!call("NoSuchMethod"));
+    }
     use crate::combat::RIFLE_CLIP;
 
     #[test]
@@ -7041,6 +7115,95 @@ mod tests {
         assert_eq!(stinger_place([1.0, -1.0], 4.0 / 3.0), [640.0, 480.0]);
         let [x, y] = stinger_place([1.0, -1.0], 16.0 / 9.0);
         assert!((x - 746.67).abs() < 0.01 && y == 480.0, "{x} {y}");
+    }
+
+    /// With `M2_INSTALL` set: the game's own HUD scripts, the satellite's
+    /// view opened and closed as the play drives it, then a dialog box's
+    /// accept press (`BUTTON_PAD2_D`, as the HQ's Accept box gets it):
+    /// the overlay's timing wheel must not pop up or beep after the view
+    /// closed (playtest of e8749a2a: it beeped through Fiona's briefing).
+    /// CPU only (`cargo test -p m2-alpha satellite_overlay -- --ignored
+    /// --nocapture`).
+    #[test]
+    #[ignore = "needs the player's install"]
+    fn the_satellite_overlay_stays_quiet_once_closed() {
+        use std::time::Duration;
+        let root = std::env::var_os("M2_INSTALL").expect("M2_INSTALL");
+        let install = Install::find(std::path::Path::new(&root)).unwrap();
+        let mut hud = GameHud::start(&install, crate::hero::Hero::Chris, 100.0);
+        let ctx = egui::Context::default();
+        let base = HudState {
+            size: [1280.0, 720.0],
+            dt: 1.0 / 30.0,
+            hp: 100.0,
+            ..HudState::default()
+        };
+        let mut heard: Vec<(u32, String)> = Vec::new();
+        let frame =
+            |hud: &mut GameHud, heard: &mut Vec<(u32, String)>, n: u32, state: &HudState| {
+                hud.update_and_wait(&ctx, state.clone(), Duration::from_secs(5));
+                let news = hud.take_pause_news();
+                heard.extend(news.sounds.into_iter().map(|s| (n, s)));
+            };
+        for n in 0..300 {
+            if hud.ready() || hud.failed() {
+                break;
+            }
+            frame(&mut hud, &mut heard, n, &base);
+        }
+        assert!(hud.ready() && !hud.failed(), "the HUD's scripts ran");
+        let mut open = base.clone();
+        open.support.satellite = Some((Vec3::new(0.0, 0.0, 0.0), 1.0, 0.0));
+        for n in 0..60 {
+            frame(&mut hud, &mut heard, 1000 + n, &open);
+        }
+        for n in 0..30 {
+            frame(&mut hud, &mut heard, 2000 + n, &base);
+        }
+        let closed = heard.len();
+        let mut press = base.clone();
+        press.dialog_keys.push("BUTTON_PAD2_D");
+        frame(&mut hud, &mut heard, 3000, &press);
+        for n in 1..120 {
+            frame(&mut hud, &mut heard, 3000 + n, &base);
+        }
+        for (n, s) in &heard {
+            eprintln!("frame {n}: {s}");
+        }
+        let wheel: Vec<_> = heard[closed..]
+            .iter()
+            .filter(|(_, s)| s.starts_with("ui_SatDes_Circular"))
+            .collect();
+        assert!(wheel.is_empty(), "the closed overlay's wheel: {wheel:?}");
+    }
+
+    /// The satellite's view closed: its overlay is left exiting, so the
+    /// guard of its own `_HandleInput` (`bMinigameOn and not bExiting`)
+    /// turns a later confirm press away and the wheel doesn't start again.
+    #[test]
+    fn a_closed_satellite_view_takes_no_more_presses() {
+        let lua = Lua::new();
+        lua.load(
+            r#"
+            overlay = { CustomData = { bMinigameOn = true, bExiting = false } }
+            Sys = { StringToGuid = function(s) return s end }
+            MrxGui = { GetWidgetByNameAndOwner = function(name, owner)
+                if name == "Satellite overlay" and owner == "0x1" then return overlay end
+            end }
+            function begins(w) return w.CustomData.bMinigameOn and not w.CustomData.bExiting end
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let begins = |lua: &Lua| lua.load("return begins(overlay)").eval::<bool>().unwrap();
+        assert!(begins(&lua), "open, a press starts the wheel");
+        lua.load(SATELLITE_DONE).exec().unwrap();
+        assert!(!begins(&lua), "closed, a press is turned away");
+        // No overlay (the HUD's layout not up): nothing to do, no error.
+        lua.load("MrxGui.GetWidgetByNameAndOwner = function() end")
+            .exec()
+            .unwrap();
+        lua.load(SATELLITE_DONE).exec().unwrap();
     }
 
     /// A request to show every counter fires the event once, with no

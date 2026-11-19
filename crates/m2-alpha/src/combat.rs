@@ -565,6 +565,8 @@ const BODY_RADIUS: f32 = 0.3;
 /// How far ahead of his shoulder a soldier's rocket starts, m: past his
 /// body's radius (invented: the 360's projectile skips its owner).
 const LAUNCH_CLEAR: f32 = BODY_RADIUS + 0.2;
+/// What she loses put out of a vehicle sunk under her ([`Combat::sank_out`]).
+pub const SANK_OUT: f32 = 100.0;
 /// Health comes back after this many quiet seconds, at this rate a second.
 const REGEN_AFTER: f32 = 4.0;
 const REGEN_RATE: f32 = 25.0;
@@ -659,8 +661,6 @@ const BASH_GAP: f32 = 0.8;
 /// Heights of a blow over her feet, high and low, metres.
 const BASH_HIGH: f32 = 1.2;
 const BASH_LOW: f32 = 0.45;
-/// Blasts kill within `KILL` metres and hurt to `REACH`.
-const KILL: f32 = 4.0;
 /// The `MaxForce` the blasts without a template (the alpha's own and the
 /// scripted bombs) throw people with: that of most of the game's
 /// explosions (`fx_Explosion_Large`, `Explosion (Small)`, ...: 300).
@@ -729,10 +729,6 @@ enum Round {
     Bullet,
     BulletLarge,
 }
-/// A blast's damage to vehicles (the "Explosion (Tank Shell)" and RPG's:
-/// 200 at its heart down to 50 at 5 m, nothing beyond), times the
-/// damage table's cell for the vehicle's row and `Explosion`.
-const BLAST_ON_VEHICLE: (f32, f32, f32) = (200.0, 50.0, 5.0);
 /// Below its `TickDamage` health a vehicle burns down this fast, health a
 /// second (the template's 1 every 0.5 s, read as seconds).
 const BURN_DOWN: f32 = 2.0;
@@ -1577,6 +1573,22 @@ pub struct Strike {
     pub kind: u32,
 }
 
+/// A round with no blast striking something ([`Combat::round_strikes`]):
+/// where it flew from, its way, how far it went, the person it hit if one,
+/// its own `Damage` and `DamageKey`, the vehicle that fired it, and
+/// whether a soldier's.
+#[derive(Clone, Copy, Debug)]
+struct DirectHit {
+    from: Vec3,
+    dir: Vec3,
+    d: f32,
+    who: Option<usize>,
+    damage: f32,
+    key: Option<u32>,
+    owner: Option<VehicleId>,
+    army: bool,
+}
+
 /// A round's `DamageKey`: its ammunition's, a plain `Bullet` for none.
 pub fn round_kind(key: Option<u32>) -> u32 {
     key.filter(|&k| k != 0)
@@ -1658,6 +1670,10 @@ enum Projectile {
         /// A homing missile fired on a lock on her vehicle: its number
         /// for the scripts ([`crate::homing::ScriptSide`]).
         round: Option<u32>,
+        /// Its round's own `Damage`, dealt to what it strikes when it
+        /// has no blast (a chain cannon's or deck cannon's round: no
+        /// `Explosive` reached from it, so the 360 makes no area damage).
+        direct: f32,
     },
     Grenade {
         at: Vec3,
@@ -1907,7 +1923,7 @@ pub struct Combat {
     feels: std::collections::HashMap<u32, Feel>,
     /// Every gun's round's blast and `DamageKey`, by template (a tank
     /// gun's shell, [`arm`](Self::arm)).
-    shells: std::collections::HashMap<u32, (Option<Blast>, Option<u32>)>,
+    shells: std::collections::HashMap<u32, (Option<Blast>, Option<u32>, f32)>,
     /// Sounds made since the last call to [`take_sounds`](Self::take_sounds).
     sounds: Vec<Sound>,
     /// Wrecks smoke: (vehicle index, seconds to the next puff).
@@ -2745,7 +2761,7 @@ impl Combat {
         self.shells = arms
             .weapons
             .iter()
-            .map(|(&id, w)| (id, (w.ammo.burst(), w.ammo.key)))
+            .map(|(&id, w)| (id, (w.ammo.burst(), w.ammo.key, w.ammo.damage)))
             .collect();
         if let Some(c) = arms.named("Carbine") {
             self.carbine = Rifle::from_spec(c);
@@ -3840,6 +3856,7 @@ impl Combat {
                     shell: false,
                     owner: None,
                     blast: ammo.burst(),
+                    direct: ammo.damage,
                     homing: None,
                     key: ammo.key,
                     army: false,
@@ -4199,6 +4216,7 @@ impl Combat {
             shell: false,
             owner: None,
             blast: l.ammo.burst(),
+            direct: l.ammo.damage,
             homing,
             key: l.ammo.key,
             army: true,
@@ -4723,6 +4741,7 @@ impl Combat {
             shell: false,
             owner: None,
             blast: self.launcher.blast(),
+            direct: self.launcher.ammo.map_or(0.0, |a| a.damage),
             homing,
             key: self.launcher.ammo.and_then(|a| a.key),
             army: false,
@@ -5029,6 +5048,7 @@ impl Combat {
                     shell: false,
                     owner: Some(id),
                     blast: ammo.burst(),
+                    direct: ammo.damage,
                     homing,
                     key: ammo.key,
                     army: self.crew_firing,
@@ -5593,9 +5613,9 @@ impl Combat {
             let burn = gun.and_then(|g| g.flash).unwrap_or(CANNON_FLASH_TIME);
             // Its gun template's round's blast and kind (a tank shell's
             // explosion); without one, the alpha's own blast.
-            let (blast, key) = gun
+            let (blast, key, direct) = gun
                 .and_then(|g| self.shells.get(&g.weapon).copied())
-                .unwrap_or((None, None));
+                .unwrap_or((None, None, 0.0));
             // A main gun that is a TOW (the M2A3's) flies on its wire.
             let homing = tow_of(v, self.seat)
                 .and_then(|(_, h)| h)
@@ -5610,6 +5630,7 @@ impl Combat {
                 shell: homing.is_none(),
                 owner: Some(id),
                 blast,
+                direct,
                 homing,
                 key,
                 army: self.crew_firing,
@@ -5740,8 +5761,33 @@ impl Combat {
         }
     }
 
-    /// Wrecks vehicle `i`, `v`, if it isn't already: it burns and can't be
-    /// driven.
+    /// She is put out of a vehicle that sank under her: 100 of her health
+    /// (from footage: Xenia, 120 -> 19.6 as the seat lets her go, three
+    /// runs 100.1-100.5; what posts it in the 360 code is not traced),
+    /// stopped by the scripts' health clamp as any hit is (Xenia, Jennifer
+    /// at 100 of 100: 100 -> 3.00 in one sample, then she swam: the
+    /// clamp's floor, [`CLAMP_FLOOR`], 0x822889F8). With no clamp set,
+    /// never below 1 here (invented: she swam away in every run). The
+    /// vehicle itself is not wrecked: it stays whole at the bottom.
+    ///
+    /// A hit like any other: her quiet time, after which her health comes
+    /// back ([`REGEN_AFTER`]), starts again from it. Before, it didn't:
+    /// sat still in the sinking car for over 4 s, she healed 25 x 1/60 =
+    /// 0.42 on the very next step (q760: 3.42 against Xenia's 3.00).
+    pub fn sank_out(&mut self) {
+        if self.hurts.len() >= MAX_HURTS {
+            self.hurts.remove(0);
+        }
+        self.hurts.push((SANK_OUT, None));
+        self.quiet = 0.0;
+        let floor = if self.health_clamp {
+            self.clamp_floor()
+        } else {
+            1.0
+        };
+        self.hp = (self.hp - SANK_OUT).max(floor.min(self.hp));
+    }
+
     fn wreck(&mut self, physics: &mut Physics, v: &mut ParkedVehicle, i: usize) {
         if v.wrecked {
             return;
@@ -6018,6 +6064,89 @@ impl Combat {
         }
     }
 
+    /// Fires template round `ammo` from `from` at `to`, as a vehicle's gun
+    /// fires one (flying at its `Velocity`; its blast, if any, where it
+    /// lands): `--no-blast-check`'s.
+    pub fn fire_round(&mut self, from: Vec3, to: Vec3, ammo: &m2_engine::weapons::Ammo) {
+        let aim = (to - from).normalize_or(Vec3::Z);
+        self.projectiles.push(Projectile::Rocket {
+            at: from,
+            velocity: aim * ammo.velocity.max(1.0),
+            flown: 0.0,
+            shell: true,
+            owner: None,
+            blast: ammo.burst(),
+            direct: ammo.damage,
+            homing: None,
+            key: ammo.key,
+            army: false,
+            round: None,
+        });
+    }
+
+    /// A round with no blast strikes what it hit with its own `Damage`, as
+    /// a gun's round does: a person by their row of the damage table for
+    /// its key, a vehicle by its rounds' scale, the world's props and
+    /// explosives as her rifle's rounds do. Nothing else is touched: no
+    /// `Explosive` is reached from it, so the 360 makes no area damage
+    /// (0x82291440 is made only for an `Explosive`).
+    fn round_strikes(&mut self, f: &mut Field<'_>, hit: DirectHit) {
+        let DirectHit {
+            from,
+            dir,
+            d,
+            who,
+            damage,
+            key,
+            owner,
+            army,
+        } = hit;
+        let at = from + dir * d;
+        match who {
+            Some(i) => {
+                let hers: Vec<_> = f
+                    .people
+                    .npcs
+                    .iter()
+                    .map(|n| (n.hurt_by_her, n.killed_by_her))
+                    .collect();
+                let killed = self.round_on_person(
+                    f.people,
+                    i,
+                    (damage, 1.0),
+                    key,
+                    dir * SHOT_PUSH,
+                    Some(at),
+                );
+                if army {
+                    for (n, (hurt, killed)) in f.people.npcs.iter_mut().zip(hers) {
+                        (n.hurt_by_her, n.killed_by_her) = (hurt, killed);
+                    }
+                } else if killed {
+                    self.remarks.push(Remark::Kill);
+                }
+            }
+            None => {
+                let round = if key == Some(m2_assets::name_hash("BulletLarge")) {
+                    Round::BulletLarge
+                } else {
+                    Round::Bullet
+                };
+                self.round_on_vehicle(f, (from, dir, d), (damage, round), owner);
+                let on_props = RIFLE_DAMAGE * damage / CARBINE_ROUND;
+                self.hit_explosives_in(f.explosives, at, on_props);
+                let struck = self.strike_world(f.physics, from, dir, d);
+                self.struck.push(Strike {
+                    at,
+                    damage: on_props,
+                    key: struck,
+                    round: damage,
+                    kind: round_kind(key),
+                });
+            }
+        }
+    }
+
     /// A round landing at `at` hurts the explosive it hits, as its row of
     /// the damage table takes a `Bullet` ([`Explosive::take`]).
     fn hit_explosives_in(&mut self, explosives: &mut [Explosive], at: Vec3, damage: f32) {
@@ -6287,15 +6416,9 @@ impl Combat {
             });
             return;
         }
+        // Nothing of the kind to throw: nothing is thrown (the 360 throws
+        // only a throwable's template).
         let Some(t) = self.throwables.get(self.explosive).cloned().flatten() else {
-            let velocity = (dir + Vec3::Y * 0.35).normalize_or(Vec3::Y) * THROW;
-            self.projectiles.push(Projectile::Grenade {
-                at: from,
-                velocity,
-                fuse: FUSE,
-                blast: None,
-                army: false,
-            });
             return;
         };
         // Its template's throw: faster the higher she aims (the grenade's
@@ -6399,6 +6522,9 @@ impl Combat {
 
     fn fly(&mut self, f: &mut Field<'_>, dt: f32) {
         let mut blasts: Vec<(Vec3, Option<Blast>, Option<u32>)> = Vec::new();
+        // Rounds with no blast that struck something: what they struck
+        // takes their own `Damage` ([`Combat::round_strikes`]).
+        let mut strikes: Vec<DirectHit> = Vec::new();
         // Explosives alight burn on; one burnt out goes off.
         for i in 0..f.explosives.len() {
             if f.explosives[i].burn_on(dt) {
@@ -6481,6 +6607,7 @@ impl Combat {
                 key,
                 army,
                 round: _,
+                direct,
             } => {
                 // Turning after the vehicle it locked on, no faster than its
                 // turn rate; one gone, or too far off its nose, is lost and
@@ -6522,10 +6649,22 @@ impl Combat {
                 let step = *velocity * dt;
                 let len = step.length();
                 let hit = cast_shot(f.physics, f.people, *at, step, len, None, *owner);
-                if let Some((d, _)) = hit {
+                if let Some((d, who)) = hit {
                     let burst = *at + step.normalize_or_zero() * d;
                     if *army {
                         armies.push(burst);
+                    }
+                    if blast.is_none() && *direct > 0.0 {
+                        strikes.push(DirectHit {
+                            from: *at,
+                            dir: step.normalize_or_zero(),
+                            d,
+                            who,
+                            damage: *direct,
+                            key: *key,
+                            owner: *owner,
+                            army: *army,
+                        });
                     }
                     blasts.push((burst, *blast, *key));
                     return false;
@@ -6656,6 +6795,9 @@ impl Combat {
         for (from, to) in streaks {
             self.effect(Effect::Tracer { from, to }, dt * 1.5);
         }
+        for hit in strikes {
+            self.round_strikes(f, hit);
+        }
         for (at, blast, key) in blasts {
             // A soldier's blast isn't to her account.
             let army = armies.contains(&at);
@@ -6698,95 +6840,6 @@ impl Combat {
             [self.random(), self.random(), self.random()],
         );
         npcs[j].launch = Some(m2_engine::ragdoll_launch::Launch::new(&impulse, Vec3::Y));
-    }
-
-    pub fn explode(&mut self, f: &mut Field<'_>, at: Vec3) {
-        self.burst(at, 1.0, None);
-        self.show_fx(fx::GRENADE, at);
-        let mut killed = false;
-        let key = Some(m2_assets::name_hash("Explosion"));
-        for j in 0..f.people.npcs.len() {
-            let n = &f.people.npcs[j];
-            let d = n.chest().distance(at);
-            let near = (1.0 - d / REACH).max(0.0);
-            // Each by their own row of the table (`Human` 1 of an
-            // `Explosion`, `HumanArmor` 0.5).
-            let own = self.on_person(n, key);
-            if d < REACH {
-                self.launch_person(&mut f.people.npcs, j, at, (REACH, UNTEMPLATED_FORCE));
-            }
-            let n = &mut f.people.npcs[j];
-            // No push of its own: the launch throws them once limp.
-            if d < KILL {
-                killed |= n.hurt_by_blast(1000.0 * own, Vec3::ZERO, key, at) && n.soldier;
-            } else if d < REACH {
-                killed |= n.hurt_by_blast(100.0 * near * own, Vec3::ZERO, key, at) && n.soldier;
-                n.panic(at);
-            } else if d < REACH * 3.0 {
-                n.panic(at);
-            }
-        }
-        // Fuel tanks and the like near it are worn down as people are.
-        self.blast_explosives(
-            f.explosives,
-            at,
-            REACH,
-            |d| 100.0 * (1.0 - d / REACH).max(0.0),
-            key,
-        );
-        if f.player.driving.is_none() && f.player.landed {
-            let d = (f.player.character.position + Vec3::Y).distance(at);
-            if d < REACH {
-                let damage = 100.0 * (1.0 - d / REACH).max(0.0);
-                self.tally.taken_blasts +=
-                    self.hurt_player(f, damage * self.hero_damage.explosion, Some(at));
-                self.blast_staggers_her(f, at, key);
-            }
-        }
-        for (i, v) in f.vehicles.iter_mut().enumerate() {
-            let Some(id) = v.id else { continue };
-            let Some(body) = f.physics.vehicle_transform(id) else {
-                continue;
-            };
-            let (lo, hi) = v.spec.bounds;
-            let centre = body.transform_point3((lo + hi) * 0.5);
-            // Nearest its hull's side, roughly.
-            let d = (centre.distance(at) - (hi - lo).max_element() * 0.25).max(0.0);
-            let (heart, edge, radius) = BLAST_ON_VEHICLE;
-            if d < radius && !v.wrecked {
-                let damage = heart + (edge - heart) * d / radius;
-                let cell = blast_cell(
-                    self.damage_table.as_ref(),
-                    v,
-                    Some(m2_assets::name_hash("Explosion")),
-                );
-                v.blast_parts(body, at, radius, |p| {
-                    (heart + (edge - heart) * p / radius) * cell
-                });
-                self.hurt_vehicle(
-                    f.physics,
-                    v,
-                    i,
-                    damage
-                        * blast_cell(
-                            self.damage_table.as_ref(),
-                            v,
-                            Some(m2_assets::name_hash("Explosion")),
-                        ),
-                );
-                // What it wrecks, it throws: off-centre, so it tumbles.
-                if v.wrecked {
-                    let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
-                    let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass * fudge(v);
-                    f.physics
-                        .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
-                }
-            }
-        }
-        if killed {
-            self.remarks.push(Remark::Kill);
-        }
-        alarm_within(f.people, at, BLAST_AUDIBILITY);
     }
 
     /// A blast's fire, smoke and sound, `size` times a grenade's.
@@ -7004,7 +7057,11 @@ impl Combat {
         key: Option<u32>,
     ) {
         let Some(b) = blast else {
-            self.explode(f, at);
+            // No `Explosive` behind it: the 360 makes no area damage and
+            // no push (0x82291440 is made only for one), so nothing is
+            // hurt or thrown; its burst and flash show.
+            self.burst(at, 1.0, None);
+            self.show_fx(fx::GRENADE, at);
             return;
         };
         // Fire and smoke the size of a grenade's at its 5 m reach.
@@ -7749,6 +7806,19 @@ pub fn survival_check() -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A template's blast for the tests: 9 m, 100 at its heart falling
+    /// to nothing at its edge, `Explosion`, a push of 300.
+    fn test_blast() -> Blast {
+        Blast {
+            template: 1,
+            radius: REACH,
+            damage: 100.0,
+            min_damage: 0.0,
+            max_force: 300.0,
+            key: Some(m2_assets::name_hash("Explosion")),
+        }
+    }
+
     /// A knockdown's length is spread by the engine's own random draws
     /// from its start-up seed, not by how many blows have landed: from a
     /// fresh start the first two fell for about 6.66 and 6.21 seconds
@@ -7792,6 +7862,50 @@ mod tests {
     }
 
     use super::*;
+
+    // Put out of a car sunk under her (Xenia: 120 -> 19.6): 100 of her
+    // health, never below 1, heard as a hurt with no direction.
+    #[test]
+    fn sinking_puts_her_out_100_down() {
+        let mut c = Combat {
+            hp: 120.0,
+            ..Combat::default()
+        };
+        c.sank_out();
+        assert_eq!(c.hp, 20.0);
+        assert_eq!(c.take_hurts(), vec![(SANK_OUT, None)]);
+        c.hp = 30.0;
+        c.sank_out();
+        assert_eq!(c.hp, 1.0);
+        // The scripts' clamp on (as they set it): Jennifer, 100 of 100,
+        // stops at its floor, 3, as Xenia's run did.
+        let mut c = Combat {
+            hp: 100.0,
+            max_hp: 100.0,
+            health_clamp: true,
+            ..Combat::default()
+        };
+        c.sank_out();
+        assert_eq!(c.hp, CLAMP_FLOOR);
+        assert_eq!(CLAMP_FLOOR, 3.0);
+    }
+
+    // Put out after sitting quiet past the regen delay, she does not heal
+    // on the next step: the sinking is a hit, and her quiet time starts
+    // again from it (q760 read 3.42, Xenia 3.00).
+    #[test]
+    fn sinking_starts_her_quiet_time_again() {
+        let mut c = Combat {
+            hp: 100.0,
+            max_hp: 100.0,
+            health_clamp: true,
+            quiet: REGEN_AFTER + 1.0,
+            ..Combat::default()
+        };
+        c.sank_out();
+        assert_eq!(c.quiet, 0.0);
+        assert_eq!(c.hp, CLAMP_FLOOR);
+    }
 
     #[test]
     fn three_hits_a_frame_are_heard_those_that_damage_most() {
@@ -8827,7 +8941,12 @@ mod tests {
         let side = (Vec3::new(5.0, 1.0, 0.0), Vec3::NEG_X, 4.0);
         combat.round_on_vehicle(&mut field, side, (6.0, Round::Bullet), None);
         assert_eq!(field.vehicles[0].damage, 0.0);
-        combat.explode(&mut field, Vec3::new(2.0, 1.0, 0.0));
+        combat.explode_keyed(
+            &mut field,
+            Vec3::new(2.0, 1.0, 0.0),
+            Some(test_blast()),
+            test_blast().key,
+        );
         let hit = field.vehicles[0].health();
         assert!((60.0..90.0).contains(&hit), "{hit}");
         assert!(!field.vehicles[0].wrecked);
@@ -8851,6 +8970,78 @@ mod tests {
         vehicles[0].spec.kind = "car".into();
         vehicles[0].spec.tuning.gun = None;
         assert_eq!(vehicles[0].rounds(), None);
+    }
+
+    /// A round with no blast (a chain cannon's: no `Explosive` reached
+    /// from it) hurts the one it strikes by its own `Damage`, and nobody
+    /// else: a bystander 2 m off and she, 2 m off, are not hurt or pushed.
+    #[test]
+    fn a_round_with_no_blast_hurts_only_what_it_strikes() {
+        let mut physics = ground();
+        let dt = 1.0 / 60.0;
+        let mut player = Player::new(2.0, 0.0, 12.0, None);
+        let mut people = People::default();
+        for (x, z) in [(0.0, 12.0), (-2.0, 12.0)] {
+            people.npcs.push(Npc::new(
+                0,
+                &rig(),
+                Vec3::new(x, 1.0, z),
+                std::f32::consts::PI,
+                Brain::Post { facing: 0.0 },
+                Some(1),
+            ));
+        }
+        for _ in 0..3 {
+            people.update(&mut physics, &[], Vec3::ZERO, None, dt);
+            player.update(&physics, Default::default(), dt);
+        }
+        let arsenal = Arsenal::default();
+        let mut vehicles = Vec::new();
+        let mut combat = Combat::default();
+        let ammo = m2_engine::weapons::Ammo {
+            template: 1,
+            velocity: 300.0,
+            max_velocity: 0.0,
+            human_boost: 1.0,
+            gravity: 0.0,
+            damage: 30.0,
+            damage_min: 0.0,
+            falloff: (0.0, 0.0),
+            dropoff: 1.0,
+            hero: 1.0,
+            key: Some(m2_assets::name_hash("BulletLarge")),
+            blast: None,
+            timer: None,
+            timer_blast: None,
+            homing: None,
+            model: None,
+            sticky: false,
+        };
+        assert!(ammo.burst().is_none());
+        let before: Vec<(f32, Vec3)> = people
+            .npcs
+            .iter()
+            .map(|n| (n.hp, n.character.velocity))
+            .collect();
+        let (hp, her_v) = (combat.hp, player.character.velocity);
+        let chest = people.npcs[0].chest();
+        combat.fire_round(chest - Vec3::Z * 10.0, chest, &ammo);
+        for _ in 0..10 {
+            let mut field = Field {
+                physics: &mut physics,
+                player: &mut player,
+                people: &mut people,
+                vehicles: &mut vehicles,
+                arsenal: &arsenal,
+                explosives: &mut [],
+            };
+            combat.step(&mut field, Trigger::default(), dt);
+        }
+        assert!(people.npcs[0].hp < before[0].0, "the one struck is hurt");
+        assert_eq!(people.npcs[1].hp, before[1].0, "the bystander is not hurt");
+        assert_eq!(people.npcs[1].character.velocity, before[1].1, "nor pushed");
+        assert_eq!(combat.hp, hp, "she is not hurt");
+        assert_eq!(player.character.velocity, her_v, "nor pushed");
     }
 
     /// Her limp body lasts while she is down and goes when she is up
@@ -9104,7 +9295,12 @@ mod tests {
             explosives: &mut explosives,
         };
         // A blast 6 m off the first, out of reach of the second.
-        combat.explode(&mut field, Vec3::new(-6.0, 1.0, 40.0));
+        combat.explode_keyed(
+            &mut field,
+            Vec3::new(-6.0, 1.0, 40.0),
+            Some(test_blast()),
+            test_blast().key,
+        );
         assert!(field.explosives[0].gone);
         assert_eq!(field.explosives[1].hp, 500.0);
         // The first's own blast goes off at once: 3.5 m from the second's
@@ -9247,13 +9443,13 @@ mod tests {
             explosives: &mut [],
         };
         let before = combat.hp;
-        combat.explode(&mut field, at);
+        combat.explode_keyed(&mut field, at, Some(test_blast()), test_blast().key);
         let lost = before - combat.hp;
         let blast = 100.0 * (1.0 - 1.0 / REACH);
         assert!((lost - blast * 0.2).abs() < 0.01, "{lost}");
         assert!(combat.down == 0.0 && !field.player.down);
         for _ in 0..4 {
-            combat.explode(&mut field, at);
+            combat.explode_keyed(&mut field, at, Some(test_blast()), test_blast().key);
         }
         assert!(combat.down > 0.0 && player.down);
         assert_eq!(combat.target(&player, true), None);
