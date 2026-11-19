@@ -479,6 +479,7 @@ impl Game {
         }
         if let Some(w) = &scene.world {
             let db = &w.index.template_db;
+            combat.blast_details = db.blast_details.clone();
             // Each effect template by name hash: its own `Explosive`, and
             // each `PhysicalLink`'d template's (fx_Explosion_Large's
             // `Explosion (RPG Frag)`), with the link's offset. From the

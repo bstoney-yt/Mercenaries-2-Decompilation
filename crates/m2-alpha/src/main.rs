@@ -255,6 +255,9 @@ struct Options {
     /// 5.9 m off, and its flight and her health are logged against the
     /// 360's (`wreck-blast-check:` lines, [`wreck_blast_check`]).
     wreck_blast_check: bool,
+    /// `--blast-sight-check`: blasts beside the car she sits in, in the
+    /// open and behind a wall ([`blast_sight_check`]).
+    blast_sight_check: bool,
     /// `--wreck-blast-at <m>`: how far from the car's middle
     /// `--wreck-blast-check` stands her.
     wreck_blast_at: Option<f32>,
@@ -834,6 +837,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--fuel-check" => o.fuel_check = true,
             "--wreck-blast-check" => {
                 o.wreck_blast_check = true;
+                o.drive = true;
+            }
+            "--blast-sight-check" => {
+                o.blast_sight_check = true;
                 o.drive = true;
             }
             "--wreck-blast-at" => {
@@ -8110,6 +8117,10 @@ fn drive_for_screenshot(
         wreck_blast_check(game, tick, options.wreck_blast_at);
         return Ok(());
     }
+    if options.blast_sight_check {
+        blast_sight_check(game, tick);
+        return Ok(());
+    }
     if options.wreck {
         wreck_at_speed(game, tick);
     }
@@ -9506,6 +9517,172 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
             "wreck-blast-check: FAIL she lost {lost:.1} at {away} m, Xenia {h} (within {:.0}% asked)",
             WRECK_HIT_SLACK * 100.0
         ),
+    }
+}
+
+/// The blast `--blast-sight-check` sets off: `fx_Explosion_Large`'s
+/// own (7 m, `Detail` `High`: two rays to a person), a car's death blast.
+const SIGHT_BLAST: u32 = 0x8000_5695;
+
+/// `--blast-sight-check` (it turns on `--drive`): she sits in the car she
+/// drives, held still, and [`SIGHT_BLAST`] goes off 3.5 m from its middle
+/// to her side, at its middle's height, twice: in the open, then with a
+/// wall 4 m wide and 4 m high between (1.8 m from its middle). Her health
+/// is filled before each. `PASS` when:
+/// - in the open, her loss comes a step after the blast, not with it
+///   (0x82292778 reads the rays at the next update), at least one of its
+///   two rays is clear, and she loses what the clear share asks
+///   (its damage there x her `Hero` cell x 0.5 a clear ray), within 1%;
+/// - behind the wall, both rays are blocked and she loses nothing.
+///
+/// Else `FAIL` with why.
+fn blast_sight_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::{Quat, Vec3};
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("blast-sight-check: FAIL she drives nothing");
+        return;
+    };
+    let Some(id) = game.scene.vehicles[i].id else {
+        eprintln!("blast-sight-check: FAIL her vehicle has no body");
+        return;
+    };
+    let Some(blast) = game
+        .combat
+        .wreck_blasts
+        .values()
+        .flatten()
+        .map(|&(_, b)| b)
+        .find(|b| b.template == SIGHT_BLAST)
+    else {
+        eprintln!("blast-sight-check: FAIL no blast {SIGHT_BLAST:08x}");
+        return;
+    };
+    let still = |game: &mut Game| {
+        if let Some(w) = game.scene.world.as_mut() {
+            w.physics.set_vehicle_velocity(id, Vec3::ZERO);
+            w.physics.set_vehicle_spin(id, Vec3::ZERO);
+        }
+    };
+    for _ in 0..(1.0 / tick) as u32 {
+        still(game);
+        game.step(Intent::default(), tick);
+    }
+    let Some((centre, side)) = game.scene.world.as_ref().and_then(|w| {
+        let (lo, hi) = game.scene.vehicles[i].spec.bounds;
+        let m = w.physics.vehicle_transform(id)?;
+        Some((
+            m.transform_point3((lo + hi) * 0.5),
+            m.x_axis.truncate().normalize_or(Vec3::X),
+        ))
+    }) else {
+        eprintln!("blast-sight-check: FAIL her vehicle has no place");
+        return;
+    };
+    let at = centre + side * 3.5;
+    eprintln!(
+        "blast-sight-check: the {} at {centre:.1}, the blast at {at:.1}",
+        game.scene.vehicles[i].spec.label
+    );
+    // One blast: her loss with it and in the steps after, and the casts.
+    let go = |game: &mut Game| {
+        game.combat.max_hp = 120.0;
+        game.combat.hp = 120.0;
+        game.combat.sight_results.clear();
+        game.combat.set_off(at, Some(blast));
+        let mut losses = Vec::new();
+        for _ in 0..4 {
+            still(game);
+            game.step(Intent::default(), tick);
+            losses.push(120.0 - game.combat.hp);
+        }
+        (losses, game.combat.sight_results.clone())
+    };
+    let (open, casts) = go(game);
+    let wrecked = game.scene.vehicles[i].wrecked;
+    let open_ok = match casts.first() {
+        _ if wrecked => Err("the blast wrecked her car".to_owned()),
+        None => Err(format!("no rays were cast at her (losses {open:.1?})")),
+        Some((clear, share, due, lost)) => {
+            eprintln!(
+                "blast-sight-check: open: rays {clear:?}, share {share}, due {due:.1}, lost {lost:.1}, losses by step {open:.1?}"
+            );
+            if open.first().is_some_and(|&l| l > 0.01) {
+                Err(format!("she lost {:.1} with the blast's own step", open[0]))
+            } else if *share <= 0.0 {
+                Err(format!("both rays blocked in the open {clear:?}"))
+            } else if (lost - due).abs() > due * 0.01 {
+                Err(format!("she lost {lost:.1}, the share asks {due:.1}"))
+            } else {
+                Ok(())
+            }
+        }
+    };
+    // The wall: between the blast and her car, standing on the ground.
+    let wall = m2_engine::StaticKey::Cell(0xffff_fff0);
+    if let Some(w) = game.scene.world.as_mut() {
+        let (hw, hh, ht) = (2.0, 2.0, 0.15);
+        let v: Vec<Vec3> = (0..8)
+            .map(|k| {
+                Vec3::new(
+                    if k & 1 == 0 { -ht } else { ht },
+                    if k & 2 == 0 { -hh } else { hh },
+                    if k & 4 == 0 { -hw } else { hw },
+                )
+            })
+            .collect();
+        let t = [
+            [0, 2, 1],
+            [1, 2, 3],
+            [4, 5, 6],
+            [5, 7, 6],
+            [0, 1, 4],
+            [1, 5, 4],
+            [2, 6, 3],
+            [3, 6, 7],
+            [0, 4, 2],
+            [2, 4, 6],
+            [1, 3, 5],
+            [3, 7, 5],
+        ];
+        let turn = Quat::from_rotation_arc(Vec3::X, side.with_y(0.0).normalize_or(Vec3::X));
+        if let Some(shape) = m2_engine::CollisionShape::mesh(&v, &t) {
+            w.physics
+                .add_static(wall, &shape, centre + side * 1.8, turn);
+        }
+    }
+    still(game);
+    game.step(Intent::default(), tick);
+    let (walled, casts) = go(game);
+    let wall_ok = match casts.first() {
+        _ if game.scene.vehicles[i].wrecked => Err("the blast wrecked her car".to_owned()),
+        None => Err(format!("no rays were cast at her (losses {walled:.1?})")),
+        Some((clear, share, _, lost)) => {
+            eprintln!(
+                "blast-sight-check: walled: rays {clear:?}, share {share}, lost {lost:.1}, losses by step {walled:.1?}"
+            );
+            let most = walled.iter().copied().fold(0.0f32, f32::max);
+            if *share > 0.0 || most > 0.01 {
+                Err(format!(
+                    "behind the wall she lost {most:.1} (rays {clear:?})"
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    };
+    if let Some(w) = game.scene.world.as_mut() {
+        w.physics.remove_static(wall);
+    }
+    match (open_ok, wall_ok) {
+        (Ok(()), Ok(())) => eprintln!(
+            "blast-sight-check: PASS in the open she lost {:.1} at the clear share; behind the wall nothing",
+            open.iter().copied().fold(0.0f32, f32::max)
+        ),
+        (a, b) => {
+            for why in [a.err(), b.err()].into_iter().flatten() {
+                eprintln!("blast-sight-check: FAIL {why}");
+            }
+        }
     }
 }
 

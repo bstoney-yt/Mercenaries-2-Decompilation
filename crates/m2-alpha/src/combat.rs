@@ -1844,6 +1844,46 @@ pub struct Thrown {
     pub settled: bool,
 }
 
+/// A blast's rays to her, queued as it goes off and cast, and its
+/// damage dealt, at the next step: the 360 queues them in the physics
+/// world's ray batch (0x8215A0F8) and reads them at the area-damage
+/// object's next update (0x82292778).
+#[derive(Clone, Debug)]
+pub struct SightRays {
+    /// Its heart, where the rays start.
+    pub at: Vec3,
+    /// Where they end: her bones as it went off
+    /// ([`m2_engine::blast_sight::Detail::person_bones`]).
+    pub to: Vec<Vec3>,
+    pub blast: Blast,
+    /// Her `Hero` row's cell for its key.
+    pub hers: f32,
+}
+
+/// Where her bones `bones` (name hashes) are, posed, in the world: on
+/// her model as it is drawn, seated or not
+/// ([`Player::model_matrix`]); a bone her rig lacks, or no model, her
+/// chest's height over where she stands.
+fn her_bones(player: &Player, bones: &[u32]) -> Vec<Vec3> {
+    let chest = player.character.position + Vec3::Y * 1.3;
+    let Some((_, rig)) = &player.model else {
+        return vec![chest; bones.len()];
+    };
+    let (nodes, _) = rig.posed();
+    let body = player.model_matrix();
+    bones
+        .iter()
+        .map(|&h| {
+            rig.skeleton
+                .name_hashes
+                .iter()
+                .position(|&n| n == h)
+                .and_then(|i| nodes.get(i))
+                .map_or(chest, |m| (body * *m).w_axis.truncate())
+        })
+        .collect()
+}
+
 /// The fight's state.
 #[derive(Debug)]
 pub struct Combat {
@@ -1898,6 +1938,14 @@ pub struct Combat {
     /// (`--hurt`, `--death-check`): her floor, the scripts' clamp and her
     /// death apply as to any hit's.
     pub pending_hurt: Vec<f32>,
+    /// Each template's blast's `Detail` ([`m2_engine::blast_sight`]):
+    /// whether its damage to her waits for rays, and how many.
+    pub blast_details: std::collections::HashMap<u32, m2_engine::blast_sight::Detail>,
+    /// A blast's rays to her, cast at the next step ([`SightRays`]).
+    pub pending_sight: Vec<SightRays>,
+    /// Each cast's outcome, in order (`--blast-sight-check`'s): which rays
+    /// were clear, the share, what she should have lost and what she did.
+    pub sight_results: Vec<(Vec<bool>, f32, f32, f32)>,
     /// Who stood her up after her last death: `Some(true)` the scripts'
     /// revive, `Some(false)` the alpha's own fallback ([`crate::death`]).
     pub revived_by_scripts: Option<bool>,
@@ -2377,6 +2425,9 @@ impl Default for Combat {
             died: false,
             revive_hp: None,
             pending_hurt: Vec::new(),
+            blast_details: std::collections::HashMap::new(),
+            pending_sight: Vec::new(),
+            sight_results: Vec::new(),
             revived_by_scripts: None,
             unkillable_her: false,
             unkillable: std::collections::HashSet::new(),
@@ -3465,6 +3516,9 @@ impl Combat {
                 self.hp < crate::death::DEATH_BELOW
             );
         }
+        for rays in std::mem::take(&mut self.pending_sight) {
+            self.sight_hurts_her(f, &rays);
+        }
         // A fall that hurt her ([`m2_engine::on_foot::fall_impact`]).
         if let Some(fell) = f.player.fell.take() {
             self.hurt_player(f, fell.damage, None);
@@ -4506,6 +4560,44 @@ impl Combat {
     /// ([`m2_engine::stagger`]: the long stagger, for the explosion keys
     /// only). The way it travelled is taken as from the blast to her
     /// (inferred).
+    /// A blast's rays to her, a step after it went off (0x82292778): each
+    /// clear when nothing the blast's rays see
+    /// ([`m2_engine::blast_sight::MASK`]; the alpha's solid things) stands
+    /// between its heart and her bone. With any clear she takes its
+    /// damage where she is now, times the clear share
+    /// ([`m2_engine::blast_sight::clear_share`]).
+    fn sight_hurts_her(&mut self, f: &mut Field<'_>, rays: &SightRays) {
+        let clear: Vec<bool> = rays
+            .to
+            .iter()
+            .map(|&p| f.physics.line_clear(rays.at, p, None))
+            .collect();
+        let share = m2_engine::blast_sight::clear_share(&clear);
+        let b = rays.blast;
+        let d = (f.player.character.position + Vec3::Y).distance(rays.at);
+        if share <= 0.0 {
+            eprintln!(
+                "blast: {:08x} rays to her blocked {clear:?}: spares her",
+                b.template
+            );
+            self.sight_results.push((clear, 0.0, 0.0, 0.0));
+            return;
+        }
+        let before = self.hp;
+        let due = b.damage_at(d) * rays.hers * share;
+        let lost = self.hurt_player(f, due, Some(rays.at));
+        self.sight_results.push((clear.clone(), share, due, lost));
+        eprintln!("hurt: her health {before:.1} -> {:.1}", self.hp);
+        eprintln!(
+            "blast: {:08x} reaches her {d:.1} m off, rays {clear:?}: {:.1} x {} x {share} = {lost:.1} lost",
+            b.template,
+            b.damage_at(d),
+            rays.hers
+        );
+        self.tally.taken_blasts += lost;
+        self.blast_staggers_her(f, rays.at, b.key);
+    }
+
     fn blast_staggers_her(&self, f: &mut Field<'_>, at: Vec3, key: Option<u32>) {
         let direction = (f.player.character.position - at).with_y(0.0);
         f.player.stagger(
@@ -7161,24 +7253,54 @@ impl Combat {
             }
         }
         self.blast_explosives(f.explosives, at, reach, |d| b.damage_at(d), b.key);
+        // Her, seated or not (a rider's body is in the world and among
+        // its targets: type 1, 0x822A2F80). By the blast's `Detail`
+        // ([`m2_engine::blast_sight`]): `Low` hurts her at once; else rays
+        // to her bones, cast at the next step ([`Self::sight_hurts_her`]).
         let d = (f.player.character.position + Vec3::Y).distance(at);
-        if d < reach * 2.0 && !(f.player.driving.is_none() && d < reach) {
-            eprintln!(
-                "blast: {:08x} {d:.1} m off spares her: {}",
-                b.template,
-                if f.player.driving.is_some() {
-                    "she is in a vehicle"
-                } else {
-                    "past its reach"
-                }
-            );
-        }
-        // Whoever is in its reach, on the ground or not: the 360's area
-        // damage has no grounded test (0x82291B88's target filter is the
-        // body's type, an angle and a player's group). Not traced: whether
-        // a seated rider's body is among its targets (kept out here).
-        if f.player.driving.is_none() && d < reach {
-            {
+        if d < reach {
+            let detail = self
+                .blast_details
+                .get(&b.template)
+                .copied()
+                .unwrap_or(m2_engine::blast_sight::Detail::High);
+            if detail.casts() {
+                // Those waiting for rays with her: the people and vehicles
+                // in its reach (props are not counted).
+                let people = f
+                    .people
+                    .npcs
+                    .iter()
+                    .filter(|n| n.chest().distance(at) < reach)
+                    .count();
+                let vehicles = f
+                    .vehicles
+                    .iter()
+                    .filter(|v| {
+                        v.id.and_then(|id| f.physics.vehicle_transform(id))
+                            .is_some_and(|m| m.w_axis.truncate().distance(at) < reach)
+                    })
+                    .count();
+                let waiting = 1 + people + vehicles;
+                let detail = detail.for_count(waiting);
+                let to = her_bones(f.player, detail.person_bones());
+                eprintln!(
+                    "blast: {:08x} {d:.1} m off casts {} ray(s) at her ({detail:?}, {waiting} waiting){}",
+                    b.template,
+                    to.len(),
+                    if f.player.driving.is_some() {
+                        ", seated"
+                    } else {
+                        ""
+                    }
+                );
+                self.pending_sight.push(SightRays {
+                    at,
+                    to,
+                    blast: b,
+                    hers,
+                });
+            } else {
                 let before = self.hp;
                 let lost = self.hurt_player(f, b.damage_at(d) * hers, Some(at));
                 eprintln!("hurt: her health {before:.1} -> {:.1}", self.hp);
@@ -7190,6 +7312,11 @@ impl Combat {
                 self.tally.taken_blasts += lost;
                 self.blast_staggers_her(f, at, b.key);
             }
+        } else if d < reach * 2.0 {
+            eprintln!(
+                "blast: {:08x} {d:.1} m off spares her: past its reach",
+                b.template
+            );
         }
         for (i, v) in f.vehicles.iter_mut().enumerate() {
             let Some(id) = v.id else { continue };
@@ -8000,6 +8127,10 @@ mod tests {
             let at = field.player.character.position + Vec3::new(d, 1.0, 0.0);
             combat.explode_keyed(&mut field, at, Some(a), a.key);
             combat.explode_keyed(&mut field, at, Some(b), b.key);
+            // Both `High`: their rays to her are read at the next step
+            // (0x82292778), all clear in the open.
+            assert_eq!(combat.hp, 120.0);
+            combat.step(&mut field, Trigger::default(), 1.0 / 60.0);
             let lost = 120.0 - combat.hp;
             eprintln!("{d} m: lost {lost}");
             assert!(
@@ -9087,6 +9218,93 @@ mod tests {
         vehicles[0].spec.kind = "car".into();
         vehicles[0].spec.tuning.gun = None;
         assert_eq!(vehicles[0].rounds(), None);
+    }
+
+    /// A `High` blast's damage to her waits a step for its two rays
+    /// (0x82292778), comes whole with both clear, and none behind a wall;
+    /// a `Low` one hurts her at once.
+    #[test]
+    fn a_blast_hurts_her_a_step_later_by_its_clear_rays() {
+        use m2_engine::blast_sight::Detail;
+        let blast = Blast {
+            template: 7,
+            radius: 7.0,
+            damage: 160.0,
+            min_damage: 150.0,
+            max_force: 0.0,
+            key: None,
+        };
+        let run = |detail: Detail, wall: bool| {
+            let mut physics = ground();
+            if wall {
+                let v: Vec<Vec3> = (0..8)
+                    .map(|k| {
+                        Vec3::new(
+                            if k & 1 == 0 { 1.4 } else { 1.6 },
+                            if k & 2 == 0 { 0.0 } else { 4.0 },
+                            if k & 4 == 0 { -2.0 } else { 2.0 },
+                        )
+                    })
+                    .collect();
+                let t = [
+                    [0, 2, 1],
+                    [1, 2, 3],
+                    [4, 5, 6],
+                    [5, 7, 6],
+                    [0, 1, 4],
+                    [1, 5, 4],
+                    [2, 6, 3],
+                    [3, 6, 7],
+                    [0, 4, 2],
+                    [2, 4, 6],
+                    [1, 3, 5],
+                    [3, 7, 5],
+                ];
+                let shape = m2_engine::CollisionShape::mesh(&v, &t).expect("wall");
+                physics.add_static(
+                    m2_engine::StaticKey::Cell(99),
+                    &shape,
+                    Vec3::ZERO,
+                    m2_math::glam::Quat::IDENTITY,
+                );
+                physics.step(1.0 / 60.0);
+            }
+            let mut player = Player::new(0.0, 0.0, 0.0, None);
+            let mut people = People::default();
+            let arsenal = Arsenal::default();
+            let mut vehicles = Vec::new();
+            let mut explosives = [];
+            let mut combat = Combat::default();
+            combat.blast_details.insert(7, detail);
+            let mut field = Field {
+                physics: &mut physics,
+                player: &mut player,
+                people: &mut people,
+                vehicles: &mut vehicles,
+                arsenal: &arsenal,
+                explosives: &mut explosives,
+            };
+            let full = combat.hp;
+            combat.set_off(Vec3::new(3.0, 1.0, 0.0), Some(blast));
+            let mut lost = Vec::new();
+            for _ in 0..3 {
+                combat.step(&mut field, Trigger::default(), 1.0 / 60.0);
+                lost.push(full - combat.hp);
+            }
+            (lost, combat.sight_results.clone())
+        };
+        let (open, casts) = run(Detail::High, false);
+        assert_eq!(open[0], 0.0, "{open:?}");
+        assert!(open[1] > 0.0, "{open:?}");
+        assert_eq!(casts.len(), 1);
+        assert_eq!(casts[0].0, vec![true, true]);
+        assert_eq!(casts[0].1, 1.0);
+        let (walled, casts) = run(Detail::High, true);
+        assert_eq!(walled, vec![0.0; 3], "{walled:?}");
+        assert_eq!(casts[0].0, vec![false, false]);
+        let (low, casts) = run(Detail::Low, true);
+        assert!(low[0] > 0.0, "{low:?}");
+        assert!(casts.is_empty());
     }
 
     /// Her limp body lasts while she is down and goes when she is up

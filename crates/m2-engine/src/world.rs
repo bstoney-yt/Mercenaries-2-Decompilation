@@ -302,6 +302,9 @@ pub struct Templates {
     pub durability: HashMap<u32, crate::durability::Durability>,
     /// The blasts of those with `Explosive`, by id.
     pub explosions: HashMap<u32, crate::durability::Explosion>,
+    /// Their `Explosive` record's `Detail`, by id: whether and how its
+    /// damage waits for rays ([`crate::blast_sight`]).
+    pub blast_details: HashMap<u32, crate::blast_sight::Detail>,
     /// The compiled script (`ObjectScript`) of every template that runs
     /// one, by id, as the archive holds it. Six of them set the light when
     /// their object comes into being (`m2_game::atmosphere_script`): blasts
@@ -1153,6 +1156,7 @@ impl Templates {
             audibilities: crate::ai::audibilities(&db),
             durability: crate::durability::read(&db),
             explosions: crate::durability::explosions(&db),
+            blast_details: crate::blast_sight::details(&db),
             hijack: crate::hijack::read(&db),
             music_sources: crate::music_source::read(&db),
             spawn_sounds: crate::spawn_sound::read(&db),
