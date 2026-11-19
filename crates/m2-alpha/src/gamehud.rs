@@ -1171,9 +1171,9 @@ impl HudState {
             saving: game.save_icon > 0.0,
             hero: Some((game.scene.hero, game.combat.max_hp)),
             binoculars: game.walking().and_then(|p| {
-                let scope = p.scope.map(|z| (z.round().clamp(1.0, 255.0) as u8, true));
+                let scope = p.scope.map(|z| (z, true));
                 p.binoculars
-                    .map(|b| (b.zoom, false))
+                    .map(|b| (b.zoom(), false))
                     .or(scope)
                     .map(|(zoom, sniper)| binoculars::View {
                         focus: game.binocular_focus(),
@@ -4455,8 +4455,8 @@ impl Thread {
                 name.map_or_else(String::new, |k| format!("[{k:#010x}]")),
             )?;
             let n = gui_runtime::fire(lua, "BinocularsUpdate", t)?;
-            if self.told.binoculars_logged != Some((v.zoom, n)) {
-                self.told.binoculars_logged = Some((v.zoom, n));
+            if self.told.binoculars_logged != Some((v.zoom.round() as u8, n)) {
+                self.told.binoculars_logged = Some((v.zoom.round() as u8, n));
                 // Where the handlers put the meters' pointers: the
                 // pointer's middle from its meter's, a share of the
                 // meter's length, against the share their sums give.
@@ -4468,7 +4468,7 @@ impl Thread {
                         let (across, want) = match name.as_str() {
                             "top pointer" => (true, binoculars::heading_meter(v.heading)),
                             "left pointer" => (false, binoculars::pitch_meter(v.pitch)),
-                            "right pointer" => (false, binoculars::zoom_meter(f32::from(v.zoom))),
+                            "right pointer" => (false, binoculars::zoom_meter(v.zoom)),
                             _ => continue,
                         };
                         let Some(bar) = screen.widget(*id).and_then(|w| w.parent) else {
