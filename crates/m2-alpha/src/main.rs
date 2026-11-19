@@ -542,6 +542,9 @@ struct Options {
     /// `--prop-bodies-check`: props that come loose whole as bodies of
     /// their own from the start (gap P7, [`prop_bodies_check`]).
     prop_bodies_check: bool,
+    /// `--prop-limits-check`: what blasts throw, kept in check by the
+    /// disposer, and hulls meeting loose pieces ([`prop_limits_check`]).
+    prop_limits_check: bool,
     /// `--sink-check`: a parked car is put in deep water with her in it,
     /// then a helicopter set down on the sea, each held past its
     /// `Buoyancy` delay; PASS when each sinks and she is put out.
@@ -958,6 +961,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--swim-check" => o.swim_check = true,
             "--prop-bodies-check" => {
                 o.prop_bodies_check = true;
+                o.drive = true;
+            }
+            "--prop-limits-check" => {
+                o.prop_limits_check = true;
                 o.drive = true;
             }
             "--sink-check" => {
@@ -7646,8 +7653,8 @@ fn drive_for_screenshot(
     install: Option<&Install>,
 ) -> anyhow::Result<()> {
     game.combat.homing_check = options.homing_check;
-    game.scene.props.bodies_on = options.prop_bodies_check;
-    if options.prop_bodies_check
+    game.scene.props.bodies_on = options.prop_bodies_check || options.prop_limits_check;
+    if (options.prop_bodies_check || options.prop_limits_check)
         && let Some(w) = game.scene.world.as_mut()
     {
         // The island's placed objects that come loose whole (the café
@@ -7786,6 +7793,9 @@ fn drive_for_screenshot(
     }
     if options.prop_bodies_check {
         return prop_bodies_check(backend, game, fov, aspect, tick);
+    }
+    if options.prop_limits_check {
+        return prop_limits_check(backend, game, fov, aspect, tick);
     }
     if options.swim_check {
         swim_check(game, tick);
@@ -13246,4 +13256,308 @@ mod disguise_check_tests {
     fn the_disguise_check_passes() {
         assert!(super::disguise_check());
     }
+}
+
+/// `--prop-limits-check` (it turns on `--drive`; a town: `--spawn`): 5 s
+/// at rest, then a blast every half second for 20 s, each 8 m from the
+/// last round her in rings 15 to 60 m out, throwing what loose props are
+/// there (the disposer takes each, [`m2_engine::disposer`]). Logs how many
+/// the blasts threw, the most the disposer held at once and how many it
+/// took away, and the physics step's median and worst milliseconds. Then
+/// the car she drives is put 12 m short of the nearest piece still lying
+/// knocked loose, facing it, and driven at it for 4 s (hulls meet loose
+/// pieces now): how far the piece moved. `prop-limits-check: PASS` when
+/// over 40 were thrown, the disposer never held over 40, it took away at
+/// least one, and the car moved the piece over half a metre; else `FAIL`.
+fn prop_limits_check(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    tick: f32,
+) -> anyhow::Result<()> {
+    use m2_math::glam::{Vec2, Vec3};
+    let mut ms = Vec::new();
+    let mut step = |game: &mut Game, intent: Intent, ms: &mut Vec<f32>| -> anyhow::Result<()> {
+        game.step(intent, tick);
+        render(backend, game, fov, aspect, None)?;
+        if let Some(w) = game.scene.world.as_ref() {
+            ms.push(w.physics.last_step_ms);
+        }
+        Ok(())
+    };
+    for _ in 0..(5.0 / tick) as u32 {
+        step(game, Intent::default(), &mut ms)?;
+    }
+    ms.clear();
+    // At no wheel (the check runs before `--drive` seats her): she takes
+    // the nearest land vehicle standing, for the drive at the end.
+    if game
+        .scene
+        .player
+        .as_ref()
+        .is_some_and(|p| p.driving.is_none())
+    {
+        let here = game.focus();
+        let pick = game.scene.world.as_ref().and_then(|world| {
+            (game.scene.vehicles.iter().enumerate())
+                .filter(|(_, v)| !v.wrecked && !v.spec.is_boat())
+                .filter_map(|(i, v)| {
+                    let at = world.physics.vehicle_transform(v.id?)?.w_axis.truncate();
+                    Some((i, at.distance(here)))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        });
+        if let (Some(i), Some(p)) = (pick, game.scene.player.as_mut()) {
+            p.driving = Some(i);
+            p.landed = true;
+            game.take_from_driver(i);
+            eprintln!(
+                "prop-limits-check: she takes the {} (not at a wheel)",
+                game.scene.vehicles[i].spec.label
+            );
+        }
+    }
+    let centre = game.focus();
+    // `fx_Explosion_Large`'s blast and its `PhysicalLink`'d frag
+    // (`Explosion (RPG Frag)`), 7 m and 15 m, as the template database
+    // has them, both at the blast's point.
+    let blasts: Vec<(Vec3, m2_engine::weapons::Blast)> = game
+        .scene
+        .world
+        .as_ref()
+        .map(|w| {
+            let db = &w.index.template_db;
+            [0x8000_5695u32, 0x8000_a27b]
+                .into_iter()
+                .filter_map(|t| {
+                    let e = db.explosions.get(&t)?;
+                    Some((
+                        Vec3::ZERO,
+                        m2_engine::weapons::Blast {
+                            template: t,
+                            radius: e.radius,
+                            damage: e.damage,
+                            min_damage: e.least,
+                            max_force: e.force,
+                            key: (e.kind != 0).then_some(e.kind),
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    eprintln!(
+        "prop-limits-check: each blast is {:08x?}",
+        blasts.iter().map(|(_, b)| b.template).collect::<Vec<_>>()
+    );
+    let (mut most, mut disposed) = (0, 0);
+    let every = (0.5 / tick).round().max(1.0) as u32;
+    // Where the blasts go: at the bodies of their own nearest her (the
+    // island's placed objects that came loose whole), so each throws
+    // some (q744e: blasts on rings 15 to 60 m out threw 16 in all, short
+    // of the pool's 40); the rings where there are too few.
+    let targets: Vec<Vec3> = game.scene.world.as_ref().map_or(Vec::new(), |w| {
+        let mut at: Vec<Vec3> = w
+            .as_bodies()
+            .filter_map(|(_, ids)| Some(w.physics.debris_place(*ids.first()?)?.w_axis.truncate()))
+            .collect();
+        at.sort_by(|a, b| a.distance(centre).total_cmp(&b.distance(centre)));
+        // One blast for each spread of bodies: none closer than 6 m to the
+        // last chosen.
+        let mut picked: Vec<Vec3> = Vec::new();
+        // The nearest, whatever the distance (q744f: none within 120 m of
+        // her), at most the 40 blasts' worth.
+        for p in at {
+            if picked.len() < 40 && picked.iter().all(|q| q.distance(p) > 6.0) {
+                picked.push(p);
+            }
+        }
+        picked
+    });
+    eprintln!(
+        "prop-limits-check: {} blast points at bodies near her",
+        targets.len()
+    );
+    for i in 0..(20.0 / tick) as u32 {
+        if i % every == 0 {
+            // Rings 15, 30, 45 and 60 m out, 8 m between blasts.
+            let n = i / every;
+            let ring = 15.0 * (1 + n % 4) as f32;
+            let turn = n as f32 * 8.0 / ring;
+            let at = targets
+                .get(n as usize)
+                .copied()
+                .unwrap_or(centre + Vec3::new(turn.cos(), 0.0, turn.sin()) * ring);
+            let ground = game.scene.world.as_ref().and_then(|w| {
+                let top = at + Vec3::Y * 200.0;
+                w.physics
+                    .cast_ray(top, Vec3::NEG_Y, 400.0)
+                    .map(|(t, _)| top - Vec3::Y * t)
+            });
+            // A car's death blasts, as the game has them (q744d: the
+            // alpha's old blast, `None`, pushes nothing, so what it
+            // knocked loose lay where it stood and the disposer dropped
+            // it unseen, and it never reached the island's bodies).
+            let at = ground.unwrap_or(at);
+            if blasts.is_empty() {
+                game.combat.set_off(at, None);
+            }
+            for &(offset, b) in &blasts {
+                game.combat.set_off(at + offset, Some(b));
+            }
+        }
+        step(game, Intent::default(), &mut ms)?;
+        most = most.max(game.scene.props.disposer_held());
+        disposed += game.scene.props.take_disposed().len();
+    }
+    ms.sort_by(f32::total_cmp);
+    let thrown = game.scene.props.blast_thrown_count();
+    let (median, worst) = (
+        ms.get(ms.len() / 2).copied().unwrap_or(0.0),
+        ms.last().copied().unwrap_or(0.0),
+    );
+    eprintln!(
+        "prop-limits-check: 40 blasts threw {thrown} props; the disposer held at most {most}, \
+         took {disposed} away; physics step median {median:.2} ms, worst {worst:.2} ms"
+    );
+    // The car at the nearest piece lying loose.
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("prop-limits-check: FAIL she drives nothing");
+        return Ok(());
+    };
+    let Some(world) = game.scene.world.as_ref() else {
+        eprintln!("prop-limits-check: FAIL no island");
+        return Ok(());
+    };
+    let here = game.scene.vehicles[i]
+        .id
+        .and_then(|c| world.physics.vehicle_transform(c))
+        .map_or(centre, |m| m.w_axis.truncate());
+    // A piece lying loose (a prop's, or an island object's body), the
+    // nearest with 12 m of level, open ground before it from any of eight
+    // sides: the car is put on the ground there (the q744c run's car,
+    // put among walls, never moved).
+    let mut near: Vec<(m2_engine::DebrisId, Vec3)> = game
+        .scene
+        .props
+        .knocked_pieces()
+        .into_iter()
+        .chain(
+            world
+                .as_bodies()
+                .filter_map(|(_, ids)| ids.first().copied()),
+        )
+        .filter_map(|id| Some((id, world.physics.debris_place(id)?.w_axis.truncate())))
+        .collect();
+    near.sort_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)));
+    let physics = &world.physics;
+    let ground = |x: f32, z: f32, from: f32| {
+        physics
+            .cast_ray(Vec3::new(x, from + 20.0, z), Vec3::NEG_Y, 60.0)
+            .map(|(d, _)| from + 20.0 - d)
+    };
+    let run = near.iter().take(60).find_map(|&(id, at)| {
+        (0..8).find_map(|k| {
+            let a = k as f32 * std::f32::consts::FRAC_PI_4;
+            let way = Vec3::new(a.sin(), 0.0, a.cos());
+            let start = at - way * 12.0;
+            let floor = ground(start.x, start.z, at.y)?;
+            if (floor - at.y).abs() > 1.5 {
+                return None;
+            }
+            let from = Vec3::new(start.x, floor + 0.8, start.z);
+            let to = Vec3::new(at.x, floor + 0.8, at.z);
+            let gap = physics
+                .cast_ray(from, (to - from).normalize_or(way), 14.0)
+                .map_or(f32::MAX, |(d, _)| d);
+            // And the lane free of every placed object and building (a
+            // ray from inside a wall doesn't see it: #740's q740d).
+            let lane = (0..=10).all(|k| {
+                let c = Vec3::new(start.x, floor, start.z) + way * (k as f32);
+                physics.box_clear(
+                    c + Vec3::new(-1.3, 0.4, -1.3),
+                    c + Vec3::new(1.3, 1.8, 1.3),
+                    |key| !matches!(key, m2_engine::StaticKey::Cell(_)),
+                )
+            });
+            (gap >= 10.5 && lane).then_some((id, at, way, Vec3::new(start.x, floor, start.z)))
+        })
+    });
+    let Some((id, at, way, start)) = run else {
+        eprintln!(
+            "prop-limits-check: FAIL no piece lying loose has 12 m of open ground before it ({} looked at)",
+            near.len().min(60)
+        );
+        return Ok(());
+    };
+    eprintln!("prop-limits-check: the car is put at {start:.1}, 12 m short of a piece at {at:.1}");
+    let yaw = way.x.atan2(way.z);
+    if let Some(world) = game.scene.world.as_mut() {
+        let v = &mut game.scene.vehicles[i];
+        if let Some(old) = v.id.take() {
+            world.physics.remove_vehicle(old);
+        }
+        v.id = Some(
+            world
+                .physics
+                .add_vehicle(&v.spec, start + Vec3::Y * 0.5, yaw),
+        );
+    }
+    let Some(car) = game.scene.vehicles[i].id else {
+        return Ok(());
+    };
+    for _ in 0..(4.0 / tick) as u32 {
+        let speed = game
+            .scene
+            .world
+            .as_ref()
+            .map_or(0.0, |w| w.physics.vehicle_speed(car));
+        let intent = Intent {
+            movement: Vec2::new(0.0, if speed < 12.0 { 1.0 } else { 0.0 }),
+            ..Intent::default()
+        };
+        // Where the car is, how fast, and what its body touches (q744f:
+        // the piece moved 0.0 m).
+        if let Some(w) = game.scene.world.as_ref() {
+            let t = ms.len();
+            if t % 15 == 0 {
+                let at = w
+                    .physics
+                    .vehicle_transform(car)
+                    .map_or(Vec3::ZERO, |m| m.w_axis.truncate());
+                let touching: Vec<String> = w
+                    .physics
+                    .vehicle_touching(car)
+                    .into_iter()
+                    .map(|(key, point, _)| format!("{key:?} at {point:.2}"))
+                    .collect();
+                eprintln!(
+                    "prop-limits-check: the car at {at:.2}, {speed:.1} m/s, touching [{}]",
+                    touching.join("; ")
+                );
+            }
+        }
+        step(game, intent, &mut ms)?;
+    }
+    let moved = game
+        .scene
+        .world
+        .as_ref()
+        .and_then(|w| w.physics.debris_place(id))
+        .map_or(0.0, |m| m.w_axis.truncate().distance(at));
+    eprintln!(
+        "prop-limits-check: the {} driven at a piece lying loose: it moved {moved:.1} m",
+        game.scene.vehicles[i].spec.label
+    );
+    if thrown > 40 && most <= 40 && disposed > 0 && moved > 0.5 {
+        eprintln!("prop-limits-check: PASS");
+    } else {
+        eprintln!(
+            "prop-limits-check: FAIL thrown {thrown}, held at most {most}, took away {disposed}, \
+             the piece moved {moved:.1} m"
+        );
+    }
+    Ok(())
 }

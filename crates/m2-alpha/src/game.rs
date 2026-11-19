@@ -5334,7 +5334,43 @@ fn blast_loose(world: &mut World, props: &mut Props, pushes: &[BlastPush], strik
                 .placed_bounds(e)
                 .map_or((p, p), |(at, bounds)| crate::props::box_around(at, bounds));
             let (velocity, spin) = push.throw(lo, hi, fudge(db, template));
-            props.knock(&mut world.physics, e, velocity, spin, strike);
+            if props.knock(&mut world.physics, e, velocity, spin, strike) {
+                props.blast_thrown(&mut world.physics, e);
+            }
+        }
+        // The island's placed objects that are bodies of their own:
+        // pushed where they lie, as a blast pushes any moving body it
+        // reaches (0x8215C560 -> 0x8215CBC8), and handed to the disposer
+        // as every object a blast pushes is (0x82289F40 -> 0x82246A08).
+        let island: Vec<(usize, Vec<m2_engine::DebrisId>)> = world
+            .as_bodies()
+            .map(|(i, ids)| (i, ids.to_vec()))
+            .collect();
+        for (i, ids) in island {
+            let Some(&first) = ids.first() else { continue };
+            let Some(at) = world.physics.debris_place(first) else {
+                continue;
+            };
+            let centre = at.w_axis.truncate();
+            let o = world.index.objects[i];
+            let half = world
+                .object_model(i)
+                .map_or(Vec3::splat(0.5), |m| (m.bounds.1 - m.bounds.0) * 0.5);
+            if centre.distance(push.at) - half.length() > push.radius {
+                continue;
+            }
+            let db = &world.index.template_db;
+            if !strike && !blown_loose(db, o.template) {
+                continue;
+            }
+            let (velocity, _) = push.throw(centre - half, centre + half, fudge(db, o.template));
+            for d in ids {
+                world.physics.push_debris(d, velocity);
+            }
+            props.island_thrown(&mut world.physics, i, first, half.length());
+        }
+        for i in props.take_disposed_island() {
+            world.dispose(i);
         }
     }
 }
