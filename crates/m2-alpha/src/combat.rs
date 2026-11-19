@@ -4440,6 +4440,7 @@ impl Combat {
             if !crate::npc::in_ram(local, (lo, hi)) {
                 continue;
             }
+            let inside = local.cmpge(lo).all() && local.cmple(hi).all();
             let point = at.transform_point3(local.clamp(lo, hi));
             let normal = (her - point).with_y(0.0);
             let normal = if normal.length_squared() > 1e-6 {
@@ -4462,10 +4463,12 @@ impl Combat {
             let Some(event) = touch.event() else { continue };
             let damage = m2_engine::run_over::person_damage(&event, velocity.length(), cell);
             eprintln!(
-                "run over: contact: closing {:.2} m/s, size {:.1}, vehicle {:.2} m/s, damage {damage:.2}",
+                "run over: contact: closing {:.2} m/s, size {:.1}, vehicle {:.2} m/s, damage {damage:.2}, her middle {} the hull, {:.2} m along it",
                 event.closing,
                 event.size,
-                velocity.length()
+                velocity.length(),
+                if inside { "inside" } else { "outside" },
+                local.z
             );
             if damage > 0.0 {
                 hits.push((damage, point));
