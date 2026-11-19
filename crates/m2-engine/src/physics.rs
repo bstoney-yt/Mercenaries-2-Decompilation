@@ -2417,8 +2417,9 @@ impl Tracks {
 struct Rest {
     /// Where its centre of mass was at the last check (world).
     from: Option<Vec3>,
-    /// Seconds since the last check.
-    clock: f32,
+    /// The world's check its last check was ([`REST_PERIOD`]s of the
+    /// physics' time): every body is checked on the same step.
+    check: Option<i64>,
     /// Checks in a row it has kept within the distance.
     still: u8,
     /// Its body was put to sleep (or found asleep).
@@ -2431,19 +2432,36 @@ const REST_DISTANCE: f32 = 0.02;
 const REST_CHECKS: u8 = 6;
 
 impl Rest {
-    /// One step of `dt` s at `centre`: whether it may sleep now. Once its
-    /// checks have found it still it may, between checks too, until a
-    /// check finds it moved: two bodies touching, their checks falling on
-    /// different steps, were never both allowed on one step, and their
-    /// island never slept (q753e: two pairs of placed objects standing in
-    /// each other, awake after 10 s at 0.09 and 0.00 m/s).
-    fn step(&mut self, centre: Vec3, dt: f32) -> bool {
-        let from = *self.from.get_or_insert(centre);
-        self.clock += dt;
-        if self.clock + 1e-6 < REST_PERIOD {
-            return self.still >= REST_CHECKS;
+    /// One step, the physics' time `now`, at `centre`: whether it may
+    /// sleep at this step.
+    ///
+    /// From the 360 code: the island check 0x824CE9C8 reads each body's
+    /// two 7-bit still counts (its motion's +0xDC and +0xDA, each tagged in
+    /// its top bits with the world's check index, +0x2C6 and +0x2C5) and
+    /// keeps the island awake while any body's larger count is under 6.
+    /// The check index is the world's: every body is checked on the same
+    /// step, and an island may sleep only then. Here the check index is
+    /// the physics' time in [`REST_PERIOD`]s, the same for every body.
+    /// Inferred, not traced: that a body's count goes up by one a check
+    /// it kept within [`REST_DISTANCE`] and back to 0 otherwise (the
+    /// integrator's update of +0xDC/+0xDA is not read).
+    ///
+    /// Before, each body had its own clock from when it was made: two
+    /// touching, their checks on different steps, were never both allowed
+    /// on one step and their island never slept (q753e: two pairs of
+    /// placed objects standing in each other, awake after 10 s).
+    fn step(&mut self, centre: Vec3, now: f32) -> bool {
+        let k = (now / REST_PERIOD).floor() as i64;
+        let Some(last) = self.check else {
+            self.check = Some(k);
+            self.from = Some(centre);
+            return false;
+        };
+        if k == last {
+            return false;
         }
-        self.clock -= REST_PERIOD;
+        self.check = Some(k);
+        let from = self.from.unwrap_or(centre);
         self.still = if (centre - from).length() < REST_DISTANCE {
             self.still.saturating_add(1)
         } else {
@@ -3642,6 +3660,8 @@ impl Physics {
     /// asleep with its island stays so until woken; woken, it counts
     /// again; still for long enough, its island may sleep this step.
     fn rest_props(&mut self, dt: f32) {
+        // This step's time ([`step_inner`](Self::step_inner) adds `dt`).
+        let now = self.time + dt;
         let w = &mut self.world;
         self.prop_before.clear();
         for h in self.prop_rest.keys() {
@@ -3669,7 +3689,7 @@ impl Physics {
             if rest.asleep {
                 rest.wake();
             }
-            let still = rest.step(vec3(b.center_of_mass()), dt);
+            let still = rest.step(vec3(b.center_of_mass()), now);
             rest_hand_off(b, still);
             true
         });
@@ -3678,6 +3698,7 @@ impl Physics {
     fn step_inner(&mut self, dt: f32) {
         self.world.integration_parameters.dt = dt;
         self.time += dt;
+        let now = self.time;
         let w = &mut self.world;
         for v in self.vehicles.iter_mut().flatten() {
             v.before = w
@@ -3714,7 +3735,7 @@ impl Physics {
                 // is never put to sleep alone: rapier would go on moving
                 // it (gravity) while its tracks no longer hold it up
                 // (PmcCon001: the villa tank fell through the HQ's floor).
-                let still = !v.wrecked && tank.rest.step(vec3(b.center_of_mass()), dt);
+                let still = !v.wrecked && tank.rest.step(vec3(b.center_of_mass()), now);
                 rest_hand_off(b, still);
             }
             let filter = ground().exclude_rigid_body(v.controller.chassis);
@@ -10672,7 +10693,7 @@ mod tests {
         let dt = 1.0 / 60.0;
         let mut still = Rest::default();
         let steps = |r: &mut Rest, speed: f32| {
-            (1..=120).find(|&i| r.step(Vec3::Z * speed * i as f32 * dt, dt))
+            (1..=120).find(|&i| r.step(Vec3::Z * speed * i as f32 * dt, i as f32 * dt))
         };
         // Still: the first check sets where it stands, then six in a row
         // within 0.02 m (each 0.2 s): asleep at 1.2 s.
@@ -10683,18 +10704,29 @@ mod tests {
         // At 0.05 m/s (0.01 m a check) it still sleeps.
         let mut slow = Rest::default();
         assert_eq!(steps(&mut slow, 0.05), Some(72));
-        // Once still it may sleep on every step after, not only on a
-        // check's: two bodies whose checks fall on different steps.
+        // Two bodies made at different times are checked on the same
+        // steps (the world's check index), so both may sleep on one step;
+        // never between checks.
         let mut a = Rest::default();
-        let mut b = Rest {
-            clock: 0.1,
-            ..Rest::default()
-        };
-        let both = (1..=120).find(|&_i| {
-            let x = a.step(Vec3::ZERO, dt);
-            let y = b.step(Vec3::ZERO, dt);
-            x && y
-        });
+        let mut b = Rest::default();
+        let mut both = None;
+        for i in 1..=200 {
+            let now = i as f32 * dt;
+            let x = a.step(Vec3::ZERO, now);
+            let y = if i > 7 {
+                b.step(Vec3::ZERO, now)
+            } else {
+                false
+            };
+            assert_eq!(
+                x || y,
+                (x || y) && i % 12 == 0,
+                "allowed off a check, step {i}"
+            );
+            if x && y {
+                both.get_or_insert(i);
+            }
+        }
         assert!(both.is_some(), "never both on one step");
     }
 
