@@ -2703,6 +2703,26 @@ impl Npc {
         physics.cast_ray(eye, to / distance, distance).is_none()
     }
 
+    /// Whether he passes over destination `at`: within 2 m of a spot he
+    /// gave a move up at in the last minute ([`m2_engine::ai_dither`]).
+    /// Inferred: the 360's reader of that list was not found; every
+    /// destination chooser asks here, so it is one place to correct.
+    pub fn avoids(&self, at: Vec3) -> bool {
+        self.dither.bad(at)
+    }
+
+    /// The step's caller after a move given up with no path held
+    /// (0x822B34A8): he stops dead, and his destination goes so that the
+    /// behaviour picks again.
+    fn give_up_move(&mut self) {
+        self.character.velocity.x = 0.0;
+        self.character.velocity.z = 0.0;
+        self.ground = Vec2::ZERO;
+        self.step = None;
+        self.detour = None;
+        self.cover_spot = None;
+    }
+
     /// A soldier's tick in a fight with the player at `threat`. While he
     /// sees her within his gun's `FireRange` he turns to her, aims and
     /// fires in its bursts (no nearer than its `MinFireRange`), and
@@ -2884,8 +2904,8 @@ impl Npc {
                         target = at + flat.normalize() * length;
                     }
                 }
-                // Not to a spot he dithered at lately ([`m2_engine::ai_dither`]).
-                if !self.dither.bad(target) {
+                // Not to a spot he dithered at lately.
+                if !self.avoids(target) {
                     self.step = Some((target, length / (self.push(self.ai.combat_speed))));
                 }
             }
@@ -2938,21 +2958,32 @@ impl Npc {
             wanted = Vec3::ZERO;
         }
         self.move_dry(physics, wanted, dt);
-        // Swinging back and forth in the fight: past 8 swings he gives the
-        // move up and marks the spot bad for a minute, as the 360's
-        // `HumanCombat` path step does (0x822B3130, 0x822BF4D8).
-        if self.dither.step(Vec2::new(wanted.x, wanted.z), dt) {
+        let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
+        // Swinging back and forth in the fight: as the 360's `HumanCombat`
+        // path step does (0x822B3130), only a step to a destination that
+        // made no progress counts its swings (0x822CB340, 0x822BF4D8);
+        // past 8 he gives the move up, marks where he stands bad for a
+        // minute, stops, and picks again ([`m2_engine::ai_dither`]).
+        // Inferred: "no progress" is the stall below (pushing and not
+        // moving), and his step, way round and cover spot are the
+        // destination given up.
+        let stuck = self.pushed > 0.3 && moved < 0.2;
+        let way = if stuck {
+            Vec2::new(wanted.x, wanted.z)
+        } else {
+            Vec2::ZERO
+        };
+        let gave_up = self.dither.step(way, dt);
+        if gave_up {
             eprintln!(
                 "people: {:08x} dithers at {:.1}: gives the move up",
                 self.spawn.unwrap_or(u32::MAX),
                 self.character.position
             );
             self.dither.mark(self.character.position);
-            self.step = None;
-            self.detour = None;
+            self.give_up_move();
         }
-        let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
-        if self.pushed > 0.3 && moved < 0.2 && self.stalled >= STALLED {
+        if !gave_up && self.pushed > 0.3 && moved < 0.2 && self.stalled >= STALLED {
             // Walked into something: stop stepping; a chase goes round it
             // (along it the clearer way, or back if it is a corner) for a
             // while, then on.

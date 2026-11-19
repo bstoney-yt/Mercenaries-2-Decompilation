@@ -6807,6 +6807,8 @@ fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
         let found = ai_cover::choose(&req, &cands, ground, blocked);
         let n = &mut people.npcs[i];
         n.cover_ask = None;
+        // Not to a spot he gave a move up at lately.
+        let found = found.filter(|&at| !n.avoids(at));
         n.cover_spot = found;
         if let Some(at) = found {
             eprintln!(
