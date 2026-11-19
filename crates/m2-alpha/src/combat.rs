@@ -7336,9 +7336,7 @@ impl Combat {
         }
         self.blast_explosives(f.explosives, at, reach, |d| b.damage_at(d), b.key);
         let d = (f.player.character.position + Vec3::Y).distance(at);
-        if d < reach * 2.0
-            && !(f.player.driving.is_none() && f.player.landed && d < reach && !self.spare_her)
-        {
+        if d < reach * 2.0 && !(f.player.driving.is_none() && d < reach && !self.spare_her) {
             eprintln!(
                 "blast: {:08x} {d:.1} m off spares her: {}",
                 b.template,
@@ -7346,14 +7344,16 @@ impl Combat {
                     "the wreck she rode spares her"
                 } else if f.player.driving.is_some() {
                     "she is in a vehicle"
-                } else if !f.player.landed {
-                    "she is not down on the ground"
                 } else {
                     "past its reach"
                 }
             );
         }
-        if f.player.driving.is_none() && f.player.landed && d < reach && !self.spare_her {
+        // Whoever is in its reach, on the ground or not: the 360's area
+        // damage has no grounded test (0x82291B88's target filter is the
+        // body's type, an angle and a player's group). Not traced: whether
+        // a seated rider's body is among its targets (kept out here).
+        if f.player.driving.is_none() && d < reach && !self.spare_her {
             {
                 let before = self.hp;
                 let lost = self.hurt_player(f, b.damage_at(d) * hers, Some(at));
