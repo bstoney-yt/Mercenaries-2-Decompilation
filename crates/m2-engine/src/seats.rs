@@ -602,6 +602,15 @@ pub fn transfer_to(seats: &[Seat], from: usize, taken: impl Fn(usize) -> bool) -
         .find(|&i| i != from && !taken(i))
 }
 
+impl Seat {
+    /// Whether a change of `jolt` m/s in the vehicle's velocity over one
+    /// 360 update throws its rider (0x822A2B60's toss; 0x8218A138's crash
+    /// ejection): over its `TossSpeedChange`, where it has one above 0.
+    pub fn tosses_at(&self, jolt: f32) -> bool {
+        self.toss_speed > 0.0 && jolt > 0.0 && self.toss_speed * self.toss_speed < jolt * jolt
+    }
+}
+
 /// How she leaves a seat (0x822A2B60's result).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitKind {
@@ -618,22 +627,31 @@ pub enum ExitKind {
 }
 
 /// How she gets out of `seat` through `exit`, the vehicle moving at
-/// `speed` m/s with its up axis `up_y` high; `airborne` for a helicopter
-/// whose landed share is 0.5 or less; `blocked` when the sweep from her to
-/// the exit hits something (0x822A2B60).
+/// `speed` m/s, its velocity having changed by `jolt` m/s over the last
+/// 360 update ([`crate::Physics::vehicle_jolt`]), with its up axis `up_y`
+/// high; `airborne` for a helicopter whose landed share is 0.5 or less;
+/// `blocked` when the sweep from her to the exit hits something
+/// (0x822A2B60).
+///
+/// From the 360 code: a toss is not a fast exit. 0x822A2B60 compares the
+/// seat's `TossSpeedChange` squared with the vehicle's vfunc +0x68, which
+/// for a car or bike (0x82188A78) is the squared change of its velocity
+/// over one update (+0x14C, kept by 0x8218A138): a crash. Only the ditch
+/// compares the speed itself (vfunc +0x4C) with `MinDitchSpeed`. Xenia
+/// (knockdown-time.md): a Chopper (`TossSpeedChange` 15) left at 17.5 m/s
+/// ditches; the same bike stopping from 19.4 m/s in two frames throws her.
 pub fn exit_kind(
     seat: Option<&Seat>,
     exit: Option<&EntranceParams>,
     speed: f32,
+    jolt: f32,
     airborne: bool,
     up_y: f32,
     blocked: bool,
 ) -> ExitKind {
     if !exit.is_some_and(EntranceParams::keeps_speed) {
         if let Some(s) = seat
-            && speed > 0.0
-            && s.toss_speed > 0.0
-            && s.toss_speed < speed
+            && s.tosses_at(jolt)
         {
             return ExitKind::Toss;
         }
@@ -1263,13 +1281,27 @@ mod tests {
         bike.toss_speed = 15.0;
         let plain = EntranceParams::default();
         let k = |s: &Seat, speed, airborne, up, blocked| {
-            exit_kind(Some(s), Some(&plain), speed, airborne, up, blocked)
+            exit_kind(Some(s), Some(&plain), speed, 0.0, airborne, up, blocked)
         };
         assert_eq!(k(&car, 0.0, false, 1.0, false), ExitKind::Animated);
         assert_eq!(k(&car, 5.0, false, 1.0, false), ExitKind::Animated);
         assert_eq!(k(&car, 5.01, false, 1.0, false), ExitKind::Ditch);
-        assert_eq!(k(&bike, 15.0, false, 1.0, false), ExitKind::Ditch);
-        assert_eq!(k(&bike, 15.01, false, 1.0, false), ExitKind::Toss);
+        // A bike at speed ditches like a car: its toss is a crash's.
+        assert_eq!(k(&bike, 15.01, false, 1.0, false), ExitKind::Ditch);
+        assert_eq!(k(&bike, 17.5, false, 1.0, false), ExitKind::Ditch);
+        let j = |jolt| exit_kind(Some(&bike), Some(&plain), 17.5, jolt, false, 1.0, false);
+        assert_eq!(j(15.0), ExitKind::Ditch);
+        assert_eq!(j(15.01), ExitKind::Toss);
+        assert!(!car.tosses_at(100.0), "no TossSpeedChange, no toss");
+        // Xenia (knockdown-time.md): the Chopper (15) crashing threw her at
+        // |dv| 18.34 and 21.08 m/s in an update; a Phoenix (no
+        // TossSpeedChange) going 23.1 -> 5.5 m/s (|dv| 28.58) kept her in.
+        assert!(bike.tosses_at(18.34) && bike.tosses_at(21.08));
+        assert!(!car.tosses_at(28.58));
+        assert_eq!(
+            exit_kind(Some(&car), Some(&plain), 5.5, 28.58, false, 1.0, false),
+            ExitKind::Ditch
+        );
         assert_eq!(k(&car, 0.0, true, 1.0, false), ExitKind::Ditch);
         assert_eq!(k(&car, 0.0, false, 0.49, false), ExitKind::Crawl);
         assert_eq!(k(&car, 0.0, false, 0.49, true), ExitKind::Crawl);
@@ -1280,12 +1312,12 @@ mod tests {
             ..plain
         };
         assert_eq!(
-            exit_kind(Some(&car), Some(&deck), 20.0, false, 1.0, false),
+            exit_kind(Some(&car), Some(&deck), 20.0, 40.0, false, 1.0, false),
             ExitKind::Animated
         );
         // No seat data: the 5 m/s default.
         assert_eq!(
-            exit_kind(None, None, 6.0, false, 1.0, false),
+            exit_kind(None, None, 6.0, 0.0, false, 1.0, false),
             ExitKind::Ditch
         );
     }

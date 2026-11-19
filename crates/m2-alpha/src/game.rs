@@ -2140,6 +2140,25 @@ impl Game {
                     v.spec.label
                 );
             }
+            // A crash throws her off the seat she rides, no exit pressed
+            // (0x8218A138's rider loop: its velocity changed by more than
+            // her seat's `TossSpeedChange` in one update; Xenia: a Chopper
+            // stopping from 19.4 m/s, |dv| 18.34 then 21.08 m/s).
+            if let Some(player) = &mut self.scene.player
+                && let Some(i) = player.driving
+                && let Some(v) = self.scene.vehicles.get(i)
+            {
+                let seat = self.ride.filter(|r| r.0 == i).map(|r| r.1);
+                let jolt = v.id.map_or(0.0, |id| world.physics.vehicle_jolt(id));
+                if her_seat_of(v, seat).is_some_and(|s| s.tosses_at(jolt)) {
+                    eprintln!(
+                        "toss: the {} lurches {jolt:.1} m/s in an update: she is thrown off",
+                        v.spec.label
+                    );
+                    get_out(&world.physics, v, seat, player);
+                    self.ride = None;
+                }
+            }
             // Vehicles running into each other hurt each other and the
             // parts where they met.
             for (struck, other, closing, damage) in self
@@ -5800,6 +5819,16 @@ const WADE: f32 = 1.4;
 /// the hull by the door when the way there is blocked (Invented stand-in
 /// for 0x822A13D0's clear point) or the hardpoint lies within the hull (a
 /// boat's driver gets out at the seat itself).
+/// Her seat in `v` (its `SeatLink` name `her_seat`; `None`, the
+/// driver's), as [`exit_plan`] finds it.
+fn her_seat_of(v: &ParkedVehicle, her_seat: Option<u32>) -> Option<&m2_engine::seats::Seat> {
+    let seating = v.spec.seating.as_deref()?;
+    let index = her_seat
+        .and_then(|n| seating.seat(n))
+        .or_else(|| seating.driver())?;
+    seating.seats.get(index)
+}
+
 fn exit_plan(
     physics: &Physics,
     v: &ParkedVehicle,
@@ -5829,10 +5858,12 @@ fn exit_plan(
     let up_y = at.transform_vector3(Vec3::Y).normalize_or_zero().y;
     // A helicopter's landed share is not modelled: it counts as landed
     // (Invented; 0x822A2B60 ditches from one in the air).
+    let jolt = v.id.map_or(0.0, |id| physics.vehicle_jolt(id));
     let kind = seats::exit_kind(
         seat,
         exit.map(|e| &e.params),
         velocity.length(),
+        jolt,
         false,
         up_y,
         blocked,

@@ -1749,6 +1749,11 @@ struct VehicleBody {
     before: Vec3,
     /// Its spin before the last step, radians a second about each axis.
     spin_before: Vec3,
+    /// Its velocities as the last two steps began, newest first
+    /// (`None` before its first step), and how much its velocity changed
+    /// over that one 360 update ([`Physics::vehicle_jolt`]).
+    history: Option<[Vec3; 2]>,
+    jolt: f32,
     /// A boat's: it floats instead of rolling on wheels.
     hull: Option<Hull>,
     /// A helicopter's: it flies.
@@ -3601,6 +3606,11 @@ impl Physics {
                 .bodies
                 .get(v.controller.chassis)
                 .map_or(Vec3::ZERO, |b| vec3(b.angvel()));
+            // Its velocity's change over one 360 update (1/30 s: two of
+            // these steps).
+            let h = v.history.get_or_insert([v.before; 2]);
+            v.jolt = (v.before - h[1]).length();
+            *h = [v.before, h[0]];
             if v.held {
                 continue;
             }
@@ -4806,6 +4816,8 @@ impl Physics {
             held: false,
             before: Vec3::ZERO,
             spin_before: Vec3::ZERO,
+            history: None,
+            jolt: 0.0,
             hull,
             rotor,
         }));
@@ -6077,6 +6089,19 @@ impl Physics {
 
     /// A vehicle's velocity before the last step, m/s: what it hit things
     /// with (a crash stops it within the step).
+    /// How much vehicle `id`'s velocity changed over the last 360 update
+    /// (1/30 s, two of these steps), m/s: what its seats'
+    /// `TossSpeedChange` is measured against. From the 360 code: the car
+    /// physics' update (0x8218A138) keeps `|v - v_last|²` at +0x14C (v
+    /// from vfunc +0x4C, v_last at +0x140), which its vfunc +0x68
+    /// (0x82188A78) answers and the exit kind (0x822A2B60) tests.
+    pub fn vehicle_jolt(&self, id: VehicleId) -> f32 {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map_or(0.0, |v| v.jolt)
+    }
+
     pub fn vehicle_velocity_before(&self, id: VehicleId) -> Vec3 {
         self.vehicles
             .get(id.0)
