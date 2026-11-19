@@ -7738,8 +7738,7 @@ fn drive_for_screenshot(
         return board_for_check(game, options, tick);
     }
     if options.prop_bodies_check {
-        prop_bodies_check(game, tick);
-        return Ok(());
+        return prop_bodies_check(backend, game, fov, aspect, tick);
     }
     if options.swim_check {
         swim_check(game, tick);
@@ -12630,20 +12629,57 @@ mod gravity_check_tests {
 /// awake after the rest, the physics step's median and worst
 /// milliseconds, and how far the prop moved and how fast the car went
 /// on. `prop-bodies-check: PASS` when there are some, none is awake at
-/// rest and the car moved the prop, else `FAIL`.
-fn prop_bodies_check(game: &mut Game, tick: f32) {
+/// rest and the car moved the prop, else `FAIL`. The world is drawn as
+/// it goes (props stream in only so), and if she is at no wheel (the
+/// check runs before `--drive` seats her) she takes the nearest land
+/// vehicle standing, logged.
+fn prop_bodies_check(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    tick: f32,
+) -> anyhow::Result<()> {
     use m2_math::glam::{Vec2, Vec3};
     let mut ms = Vec::new();
     for _ in 0..(10.0 / tick) as u32 {
         game.step(Intent::default(), tick);
+        render(backend, game, fov, aspect, None)?;
         if let Some(w) = game.scene.world.as_ref() {
             ms.push(w.physics.last_step_ms);
+        }
+    }
+    if game
+        .scene
+        .player
+        .as_ref()
+        .is_some_and(|p| p.driving.is_none())
+    {
+        let here = game.focus();
+        let pick = game.scene.world.as_ref().and_then(|world| {
+            (game.scene.vehicles.iter().enumerate())
+                .filter(|(_, v)| !v.wrecked && !v.spec.is_boat())
+                .filter_map(|(i, v)| {
+                    let at = world.physics.vehicle_transform(v.id?)?.w_axis.truncate();
+                    Some((i, at.distance(here)))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        });
+        if let (Some(i), Some(p)) = (pick, game.scene.player.as_mut()) {
+            p.driving = Some(i);
+            p.landed = true;
+            game.take_from_driver(i);
+            eprintln!(
+                "prop-bodies-check: she takes the {} (not at a wheel)",
+                game.scene.vehicles[i].spec.label
+            );
         }
     }
     ms.sort_by(f32::total_cmp);
     let Some(world) = game.scene.world.as_ref() else {
         eprintln!("prop-bodies-check: FAIL no island");
-        return;
+        return Ok(());
     };
     let physics = &world.physics;
     let bodies: Vec<(u32, Vec<m2_engine::DebrisId>)> = game
@@ -12666,11 +12702,11 @@ fn prop_bodies_check(game: &mut Game, tick: f32) {
     // The car at the nearest one.
     let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
         eprintln!("prop-bodies-check: FAIL she drives nothing");
-        return;
+        return Ok(());
     };
     let Some(car) = game.scene.vehicles[i].id else {
         eprintln!("prop-bodies-check: FAIL her vehicle has no body");
-        return;
+        return Ok(());
     };
     let here = physics
         .vehicle_transform(car)
@@ -12682,7 +12718,7 @@ fn prop_bodies_check(game: &mut Game, tick: f32) {
         .min_by(|a, b| a.2.distance(here).total_cmp(&b.2.distance(here)));
     let Some((e, id, at)) = target else {
         eprintln!("prop-bodies-check: FAIL no prop is a body here (try a town: --spawn)");
-        return;
+        return Ok(());
     };
     let way = (at - here).with_y(0.0).normalize_or(Vec3::Z);
     let start = at - way * 12.0;
@@ -12699,7 +12735,7 @@ fn prop_bodies_check(game: &mut Game, tick: f32) {
         );
     }
     let Some(car) = game.scene.vehicles[i].id else {
-        return;
+        return Ok(());
     };
     for _ in 0..(4.0 / tick) as u32 {
         let speed = game
@@ -12712,9 +12748,10 @@ fn prop_bodies_check(game: &mut Game, tick: f32) {
             ..Intent::default()
         };
         game.step(intent, tick);
+        render(backend, game, fov, aspect, None)?;
     }
     let Some(world) = game.scene.world.as_ref() else {
-        return;
+        return Ok(());
     };
     let moved = world
         .physics
@@ -12735,6 +12772,7 @@ fn prop_bodies_check(game: &mut Game, tick: f32) {
             bodies.len()
         );
     }
+    Ok(())
 }
 
 #[cfg(test)]
