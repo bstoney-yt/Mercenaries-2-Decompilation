@@ -1836,6 +1836,13 @@ impl Mission {
             .map_or(&[], |e| e.path.as_slice())
     }
 
+    /// Vehicle `guid` sank: its `VehicleSinking` physics event holds
+    /// (the scripts' `ObjectPhysicsEvent`; the 360 sends it once,
+    /// [`m2_engine::durability::Buoyancy`]).
+    pub fn vehicle_sinking(&mut self, guid: u32) {
+        self.world.borrow_mut().sunk.insert(guid);
+    }
+
     /// She honked: the friendly faction gates hear it for
     /// [`api::HONK_HEARD`] seconds.
     pub fn honk(&mut self) {
@@ -2129,9 +2136,19 @@ impl Mission {
         self.strike_callbacks(guid, at, true, "flyby arrived");
     }
 
-    /// Ordnance `guid` (an [`Command::Ordnance`]) went off at `at`.
+    /// Ordnance `guid` (an [`Command::Ordnance`]) went off at `at`: its
+    /// script's callbacks run, then it dies.
+    ///
+    /// From the scripts: `MrxSupport.BlipAircraft` (the satellite guided
+    /// bomb's red square on the radar) takes its blip off only on the
+    /// bomb's `ObjectDeath` or `ObjectHibernation` (its
+    /// `_RemoveBlipCallback`), so a bomb that went off and lived on kept
+    /// its square for good (playtest of e8749a2a). Inferred: that the
+    /// engine kills a projectile as it goes off (no other event takes
+    /// the blip away, and the 360 game's square goes).
     pub fn ordnance_burst(&mut self, guid: u32, at: [f32; 3]) {
         self.strike_callbacks(guid, at, false, "ordnance burst");
+        self.kill(guid);
     }
 
     fn strike_callbacks(&mut self, guid: u32, at: [f32; 3], arrival: bool, what: &str) {
@@ -4415,6 +4432,43 @@ mod tests {
         // An object with no script of its own: nothing is called.
         m.object_state_changed(0x999, 1, 2);
         assert_eq!(g.get::<u32>("states").unwrap(), 1);
+    }
+
+    // The satellite bomb's square (`MrxSupport.BlipAircraft`): put on the
+    // bomb with a death event to take it off. The bomb going off kills
+    // it, and the square goes (playtest of e8749a2a: it stayed for good).
+    #[test]
+    fn a_bomb_that_goes_off_dies_and_its_radar_square_goes() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        let bomb =
+            m.world
+                .borrow_mut()
+                .spawn("Smart Bomb Projectile".into(), [0.0, 80.0, 0.0], 0.0);
+        m.lua()
+            .load(
+                r#"
+                local bomb = ...
+                Hud.Radar:AddObjective({ sName = "1", nR = 255, nG = 0, nB = 0,
+                    nWidth = 3, nHeight = 3, uGuid = bomb, nSortOrder = 4 })
+                Event.Create(Event.ObjectDeath, { bomb }, function()
+                    Hud.Radar:RemoveObjective({ sName = "1" })
+                end, {})
+                "#,
+            )
+            .call::<()>(crate::events::guid_value(bomb))
+            .unwrap();
+        m.tick(0.1);
+        assert!(m.world.borrow().hud.radar.contains_key("1"), "blipped");
+        m.ordnance_burst(bomb, [0.0; 3]);
+        assert!(
+            !crate::events::World::is_alive(&*m.world.borrow(), bomb),
+            "it dies as it goes off"
+        );
+        m.tick(0.1);
+        assert!(
+            !m.world.borrow().hud.radar.contains_key("1"),
+            "its square comes off"
+        );
     }
 
     #[test]
