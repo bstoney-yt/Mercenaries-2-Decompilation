@@ -12972,6 +12972,19 @@ fn prop_bodies_check(
             );
         }
     }
+    // The slowest steps of the watch, and when (q740e: one of 149 ms
+    // against a median of 3).
+    let mut slowest: Vec<(usize, f32)> = ms.iter().copied().enumerate().collect();
+    slowest.sort_by(|a, b| b.1.total_cmp(&a.1));
+    eprintln!(
+        "prop-bodies-check: slowest physics steps of the watch: {}",
+        slowest
+            .iter()
+            .take(3)
+            .map(|&(k, t)| format!("{t:.1} ms at step {k} ({:.2} s in)", k as f32 * tick))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     ms.sort_by(f32::total_cmp);
     let Some(world) = game.scene.world.as_ref() else {
         eprintln!("prop-bodies-check: FAIL no island");
