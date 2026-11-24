@@ -3589,6 +3589,7 @@ impl Npc {
             match threat {
                 Some(_) if fights => return,
                 _ => {
+                    fight_time::walked(usize::from(threat.is_some()) ^ 1, self.soldier);
                     self.slot.clear();
                     self.foe_at = None;
                     self.foe_reach = None;
@@ -3598,6 +3599,21 @@ impl Npc {
                 }
             }
         }
+        let walk_t0 = std::time::Instant::now();
+        let reason = if self.alarm.is_some() {
+            2
+        } else if self.flee.is_some() {
+            3
+        } else {
+            match self.brain {
+                Brain::Post { .. } => 4,
+                Brain::Patrol { .. } => 5,
+                Brain::Wander { .. } => 6,
+                Brain::Route { .. } => 7,
+                Brain::Follow { .. } => 8,
+            }
+        };
+        fight_time::walked(reason, self.soldier);
         let at = self.character.position;
         let mut wanted = Vec3::ZERO;
         let mut face = None;
@@ -3770,7 +3786,7 @@ impl Npc {
             // Got on this step.
             return;
         }
-        match glide {
+        fight_time::time(fight_time::WALK_MOVE, || match glide {
             Some(point) => {
                 let to = point - self.character.position;
                 let d = to.length();
@@ -3779,8 +3795,10 @@ impl Npc {
                 self.character.velocity = step / dt;
             }
             None => self.move_dry(physics, wanted, dt),
-        }
+        });
+        fight_time::add(fight_time::WALK, walk_t0.elapsed());
         lap.mark("person: walk");
+        let stall_t0 = std::time::Instant::now();
         // Walked into something: give up on that point (strolls) or wait
         // and try again (routes).
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
@@ -3812,6 +3830,7 @@ impl Npc {
                 (None, Brain::Post { .. } | Brain::Route { .. } | Brain::Follow { .. }) => {}
             }
         }
+        fight_time::add(fight_time::WALK_STALL, stall_t0.elapsed());
         if wanted.length_squared() > 0.01 {
             face = Some(wanted.x.atan2(wanted.z));
         }
@@ -3878,7 +3897,7 @@ pub mod fight_time {
     use std::time::{Duration, Instant};
 
     /// The parts timed.
-    pub const PARTS: [&str; 7] = [
+    pub const PARTS: [&str; 10] = [
         "fight (whole)",
         "steer",
         "move",
@@ -3886,6 +3905,9 @@ pub mod fight_time {
         "cover claims",
         "cover service",
         "path searches",
+        "walk (whole)",
+        "walk move",
+        "walk stall",
     ];
     pub const FIGHT: usize = 0;
     pub const STEER: usize = 1;
@@ -3894,10 +3916,28 @@ pub mod fight_time {
     pub const CLAIMS: usize = 4;
     pub const COVER: usize = 5;
     pub const PATHS: usize = 6;
+    pub const WALK: usize = 7;
+    pub const WALK_MOVE: usize = 8;
+    pub const WALK_STALL: usize = 9;
+
+    /// Why a person walked this tick rather than fight: kinds counted.
+    pub const REASONS: [&str; 9] = [
+        "lost the fight (fight false)",
+        "alerted, no threat",
+        "raising an alarm",
+        "fleeing",
+        "post",
+        "patrol",
+        "wander",
+        "route",
+        "follow",
+    ];
 
     thread_local! {
-        static SPENT: RefCell<([Duration; 7], [u64; 7])> =
-            const { RefCell::new(([Duration::ZERO; 7], [0; 7])) };
+        static SPENT: RefCell<([Duration; 10], [u64; 10])> =
+            const { RefCell::new(([Duration::ZERO; 10], [0; 10])) };
+        /// Walk ticks by [`REASONS`], and those of soldiers.
+        static WALKED: RefCell<([u64; 9], u64)> = const { RefCell::new(([0; 9], 0)) };
         /// Fight ticks, and those in which he pushed to move.
         static MOVING: RefCell<(u64, u64)> = const { RefCell::new((0, 0)) };
     }
@@ -3913,6 +3953,24 @@ pub mod fight_time {
             s.1[i] += 1;
         });
         out
+    }
+
+    /// Adds `took` to part `i` (for parts timed by hand).
+    pub fn add(i: usize, took: Duration) {
+        SPENT.with(|s| {
+            let mut s = s.borrow_mut();
+            s.0[i] += took;
+            s.1[i] += 1;
+        });
+    }
+
+    /// A walk tick for reason `r` ([`REASONS`]), by a soldier or not.
+    pub fn walked(r: usize, soldier: bool) {
+        WALKED.with(|w| {
+            let mut w = w.borrow_mut();
+            w.0[r] += 1;
+            w.1 += u64::from(soldier);
+        });
     }
 
     /// A fight tick, and whether he pushed to move in it.
@@ -3940,6 +3998,17 @@ pub mod fight_time {
             })
             .collect();
         parts.push(format!("{moving} of {ticks} fight ticks moving"));
+        let (why, soldiers) = WALKED.with(|w| std::mem::take(&mut *w.borrow_mut()));
+        let why: Vec<String> = REASONS
+            .iter()
+            .zip(why)
+            .filter(|(_, n)| *n > 0)
+            .map(|(r, n)| format!("{r} {n}"))
+            .collect();
+        parts.push(format!(
+            "walk ticks: {} ({soldiers} by soldiers)",
+            why.join(", ")
+        ));
         parts.join(", ")
     }
 }
