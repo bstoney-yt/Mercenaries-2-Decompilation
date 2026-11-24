@@ -9620,37 +9620,45 @@ fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, lab
 }
 
 /// `--cargo-check`'s verdict on its phases' ends (phase, median and most
-/// shift of those aboard, how many off, how many in all), against Xenia's
-/// run eg2 (`elgrande-crates.md`: still 0.00 / 0.01 m; straight 0.33 /
-/// 0.52 m, none off; 3 of 19 off in the hard turn; 0.68 / 2.68 m at the
-/// end): they keep still standing (most shift at most 0.05 m, none off),
-/// none comes off driving straight, they do slide (some shift past 0.1 m
-/// by the end), and not more than half come off. The thresholds are the
-/// check's own, around Xenia's numbers.
+/// shift of those aboard, how many off so far, how many in all), against
+/// Xenia's crate runs (eg2, and block 2, `crates-hold.md`: 19 crates on
+/// the El Grande, each a plain dynamic body under its gravity scaler, no
+/// attach link). There they shift as physics starts and slide in the bed
+/// from the first pull-away, so how far they move is **not** gated. What
+/// is gated: none comes off standing, on a gentle straight or in a hard
+/// brake; a hard turn may shed a few (Xenia: 4 of 19), but most stay (no
+/// more than half off by the end).
 fn cargo_verdict(ends: &[(&str, f32, f32, usize, usize)]) -> Result<(), String> {
     let at = |name: &str| ends.iter().find(|e| e.0 == name).copied();
-    let (Some(still), Some(straight), Some(last)) =
-        (at("standing"), at("straight"), at("standing after"))
-    else {
+    let (Some(still), Some(straight), Some(turn), Some(brake), Some(last)) = (
+        at("standing"),
+        at("straight"),
+        at("hard turn"),
+        at("braking"),
+        at("standing after"),
+    ) else {
         return Err("the drive ended before all its phases".into());
     };
     if still.4 == 0 {
         return Err("no crates aboard".into());
     }
-    if still.2 > 0.05 || still.3 > 0 {
+    if still.3 > 0 {
+        return Err(format!("{} came off standing", still.3));
+    }
+    if straight.3 > still.3 {
         return Err(format!(
-            "standing they moved: max {:.2} m, {} off",
-            still.2, still.3
+            "{} came off driving straight",
+            straight.3 - still.3
         ));
     }
-    if straight.3 > 0 {
-        return Err(format!("{} came off driving straight", straight.3));
-    }
-    if last.2 <= 0.1 {
-        return Err(format!("they never slid (max {:.2} m)", last.2));
+    if brake.3 > turn.3 {
+        return Err(format!("{} came off braking", brake.3 - turn.3));
     }
     if last.3 * 2 > last.4 {
-        return Err(format!("{} of {} came off", last.3, last.4));
+        return Err(format!(
+            "{} of {} came off: most should stay",
+            last.3, last.4
+        ));
     }
     Ok(())
 }
@@ -14168,12 +14176,26 @@ mod cargo_verdict_tests {
             ("standing after", 0.68, 2.68, 3, 19),
         ];
         assert_eq!(cargo_verdict(&xenia), Ok(()));
-        let mut frozen = xenia;
-        frozen[4] = ("standing after", 0.0, 0.0, 0, 19);
-        assert!(cargo_verdict(&frozen).is_err());
+        // Block 2: they settle as physics starts (up to 0.47 m in the
+        // truck's frame) and slide from the first pull-away, 4 of 19 off
+        // in the hard turn: passes, however far they slid.
+        let block2 = [
+            ("standing", 0.3, 0.47, 0, 19),
+            ("straight", 0.4, 0.9, 0, 19),
+            ("hard turn", 0.6, 2.0, 4, 19),
+            ("braking", 0.7, 2.2, 4, 19),
+            ("standing after", 0.7, 2.2, 4, 19),
+        ];
+        assert_eq!(cargo_verdict(&block2), Ok(()));
         let mut spilled = xenia;
         spilled[1] = ("straight", 0.3, 0.5, 2, 19);
         assert!(cargo_verdict(&spilled).is_err());
+        let mut braked = block2;
+        braked[3] = ("braking", 0.7, 2.2, 6, 19);
+        assert!(cargo_verdict(&braked).is_err());
+        let mut emptied = block2;
+        emptied[4] = ("standing after", 0.7, 2.2, 12, 19);
+        assert!(cargo_verdict(&emptied).is_err());
     }
 }
 
