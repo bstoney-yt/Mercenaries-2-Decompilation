@@ -13433,6 +13433,24 @@ fn prop_bodies_check(
                 w.loads_pending(),
             );
             loading.push(last != Some(now) || now.5 > 0);
+            // What the gate sees, each half second of the first 3 s and at
+            // any change after (the evidence for where it settled).
+            let k = ms.len();
+            if (k as f32 * tick <= 3.0 && k % ((0.5 / tick).round().max(1.0) as usize) == 0)
+                || (last.is_some() && last != Some(now))
+            {
+                eprintln!(
+                    "prop-bodies-check: world at {:.2} s: tiles {}, cells {}, models {}, bodies {} + {}, loads pending {}; step {:.2} ms",
+                    k as f32 * tick,
+                    now.0,
+                    now.1,
+                    now.2,
+                    now.3,
+                    now.4,
+                    now.5,
+                    w.physics.last_step_ms
+                );
+            }
             last = Some(now);
         }
     }

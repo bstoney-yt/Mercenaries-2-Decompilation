@@ -604,7 +604,17 @@ pub struct World {
     /// Placed objects whose models came in this update that are to be put
     /// up as bodies of their own, made at the update's end in object
     /// order ([`raise_bodies`](Self::raise_bodies)).
-    to_raise: std::collections::BTreeSet<usize>,
+    to_raise: Vec<usize>,
+    /// Each model asked for, by the order it was asked in, and the next
+    /// one to be taken in: models are taken in the order they were asked
+    /// for, not the order the loader threads finish them, so what is made
+    /// of them (bodies, and their physics handles) comes in the same order
+    /// every run (q764: the body order differed run to run).
+    model_asked: HashMap<u32, u64>,
+    models_asked: u64,
+    next_model: u64,
+    /// Models in from the loader before an earlier-asked one.
+    held_models: Vec<Loaded>,
     pub index: Arc<WorldIndex>,
     pub settings: WorldSettings,
     loader: Loader,
@@ -825,7 +835,11 @@ impl World {
             knocked: FastMap::default(),
             bodies_on: true,
             as_body: std::collections::BTreeSet::new(),
-            to_raise: std::collections::BTreeSet::new(),
+            to_raise: Vec::new(),
+            model_asked: HashMap::new(),
+            models_asked: 0,
+            next_model: 0,
+            held_models: Vec::new(),
             taken: FastSet::default(),
             felled: HashSet::new(),
             member_of: HashMap::new(),
@@ -1257,7 +1271,11 @@ impl World {
             if self.in_flight.insert(r) {
                 match r {
                     Request::Cell(h) => drop(self.cells.insert(h, Slot::Loading)),
-                    Request::Model(h) => drop(self.models.insert(h, Slot::Loading)),
+                    Request::Model(h) => {
+                        self.models.insert(h, Slot::Loading);
+                        self.model_asked.insert(h, self.models_asked);
+                        self.models_asked += 1;
+                    }
                     Request::Tile(h) => drop(self.tiles.insert(h, Slot::Loading)),
                     Request::Scatter(h) => drop(self.scatter.insert(h, Slot::Loading)),
                 }
@@ -1314,8 +1332,41 @@ impl World {
         materials: &mut MaterialCache,
     ) -> Result<(), BackendError> {
         while let Some(l) = self.loader.try_recv() {
-            self.pending.push(l);
+            match l {
+                Loaded::Model(..) => self.held_models.push(l),
+                l => self.pending.push(l),
+            }
         }
+        // Models in the order they were asked for: each waits for those
+        // asked before it.
+        let mut held: Vec<(u64, Loaded)> = std::mem::take(&mut self.held_models)
+            .into_iter()
+            .map(|l| {
+                let n = match &l {
+                    Loaded::Model(h, _) => self.model_asked.get(h).copied().unwrap_or(u64::MAX),
+                    _ => u64::MAX,
+                };
+                (n, l)
+            })
+            .collect();
+        held.sort_by_key(|(n, _)| *n);
+        let mut next = self.next_model;
+        for (n, l) in held {
+            // One asked for that was never numbered (none should be) is
+            // taken as it comes.
+            if n == next || n == u64::MAX {
+                if n == next {
+                    next += 1;
+                }
+                if let Loaded::Model(h, _) = &l {
+                    self.model_asked.remove(h);
+                }
+                self.pending.push(l);
+            } else {
+                self.held_models.push(l);
+            }
+        }
+        self.next_model = next;
         let mut spent = 0;
         let mut taken = 0;
         for l in &self.pending {
@@ -1435,7 +1486,7 @@ impl World {
                                 {
                                     // Made at the update's end, in object
                                     // order ([`raise_bodies`](Self::raise_bodies)).
-                                    self.to_raise.insert(i);
+                                    self.to_raise.push(i);
                                     continue;
                                 }
                                 // A prop placed by name with no collision
