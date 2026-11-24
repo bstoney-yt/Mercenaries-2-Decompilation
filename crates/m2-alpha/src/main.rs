@@ -9846,6 +9846,23 @@ fn fuel_check(game: &mut Game, tick: f32) {
 /// 74.6 and slid 1.7 m.
 const XENIA_WRECK: (f32, f32, f32, f32) = (5.3, 16.5, 17.5, 74.6);
 
+/// Xenia's car death launch (phys3-6, Phoenix): the rebuilt body's speed
+/// on the death step, all of it and its up part, after one gravity step.
+const XENIA_DEATH_SPEED: (f32, f32) = (9.8, 10.05);
+const XENIA_DEATH_UP: (f32, f32) = (9.0, 9.2);
+/// The fall it flies under after (0.30 m/s a 1/30 s step, phys6).
+const XENIA_WRECK_G: f32 = 9.0;
+/// How near that a fitted fall must be.
+const WRECK_G_SLACK: f32 = 0.5;
+/// Its highest rise and where it lands, metres (phys3-6).
+const XENIA_WRECK_PEAK: (f32, f32) = (4.9, 5.3);
+const XENIA_WRECK_LANDS: (f32, f32) = (11.0, 15.6);
+/// The step after: its blasts' change, level only (up topped away, as
+/// 0x8215BF38 tops it): its up change within this of gravity's alone,
+/// its level change at least the least.
+const WRECK_NEXT_UP_SLACK: f32 = 0.15;
+const WRECK_NEXT_LEAST_LEVEL: f32 = 1.0;
+
 /// Her health lost to a car's wreck in Xenia, by her distance from its
 /// middle (metres, health; full health, GodMode off): runs carblast24,
 /// dmg3b, dmg6b, carblast3n, carblast6m and the 2.9 m read.
@@ -9875,11 +9892,11 @@ const WRECK_BLASTS: [u32; 2] = [0x8000_5695, 0x8000_a27b];
 /// lost and how far she moved, each beside Xenia's
 /// ([`XENIA_WRECK`]). `--wreck-blast-at <m>` stands her that far from
 /// its middle instead (2.9, 3.21, 3.8, 5.8, 5.9 or 6.42: Xenia's,
-/// [`XENIA_WRECK_HITS`]). Ends `wreck-blast-check: PASS` when the wreck
-/// set off both of [`WRECK_BLASTS`] and her loss is within
-/// [`WRECK_HIT_SLACK`] of Xenia's at that distance, else `FAIL` with
-/// why. Its rise, landing and speed are logged beside Xenia's, not
-/// judged.
+/// [`XENIA_WRECK_HITS`]). Ends `wreck-blast-check: PASS` when it flew
+/// as Xenia's ([`wreck_flight_verdict`]: its death step, the level-only
+/// step after, its fall, rise and landing), the wreck set off both of
+/// [`WRECK_BLASTS`] and her loss is within [`WRECK_HIT_SLACK`] of Xenia's
+/// at that distance, else `FAIL` with why.
 fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
     use m2_math::glam::Vec3;
     let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
@@ -9991,10 +10008,10 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
         );
         return;
     }
-    if let Some(world) = game.scene.world.as_mut() {
-        let v = &mut game.scene.vehicles[i];
-        game.combat.wreck_now(&mut world.physics, v, i);
-    }
+    game.combat.wreck_now(i);
+    // Its speed each step from the one it is wrecked in (the death step),
+    // and the time then.
+    let mut flight: Vec<(f32, Vec3)> = Vec::new();
     let (mut top, mut top_at, mut fastest, mut landed) = (0.0f32, 0.0, 0.0f32, None);
     let mut falling = false;
     // Her least health in the watch: the blasts' loss, before her health
@@ -10007,6 +10024,9 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
         let Some((at, v)) = place(game) else {
             break;
         };
+        if game.scene.vehicles[i].wrecked && landed.is_none() {
+            flight.push((t, v));
+        }
         let rise = at.y - start.y;
         if rise > top {
             (top, top_at) = (rise, t);
@@ -10033,6 +10053,10 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
             .zip(her_from)
             .map_or(0.0, |(a, b)| a.with_y(0.0).distance(b.with_y(0.0)))
     );
+    let flew = wreck_flight_verdict(&flight, tick, top, landed);
+    for line in &flew.lines {
+        eprintln!("wreck-blast-check: {line}");
+    }
     let away = at.unwrap_or(5.9);
     let lost = hp - least;
     let fired = &game.combat.part_blasts_fired;
@@ -10046,6 +10070,10 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
         .find(|(d, _)| (d - away).abs() < 0.01)
         .map(|&(_, h)| h);
     match want {
+        _ if !flew.fails.is_empty() => eprintln!(
+            "wreck-blast-check: FAIL its flight: {}",
+            flew.fails.join("; ")
+        ),
         _ if !missing.is_empty() => eprintln!(
             "wreck-blast-check: FAIL the {} set off {fired:08x?}, not {}",
             game.scene.vehicles[i].spec.label,
@@ -10055,13 +10083,112 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
             "wreck-blast-check: FAIL {away} m is none of Xenia's distances (2.9, 3.21, 3.8, 5.8, 5.9, 6.42)"
         ),
         Some(h) if (lost - h).abs() <= h * WRECK_HIT_SLACK => {
-            eprintln!("wreck-blast-check: PASS she lost {lost:.1} at {away} m (Xenia {h})")
+            eprintln!(
+                "wreck-blast-check: PASS it flew as Xenia's and she lost {lost:.1} at {away} m (Xenia {h})"
+            )
         }
         Some(h) => eprintln!(
             "wreck-blast-check: FAIL she lost {lost:.1} at {away} m, Xenia {h} (within {:.0}% asked)",
             WRECK_HIT_SLACK * 100.0
         ),
     }
+}
+
+/// What `--wreck-blast-check` makes of a wreck's flight: its lines and
+/// why it fails, if it does.
+struct FlightVerdict {
+    lines: Vec<String>,
+    fails: Vec<String>,
+}
+
+/// Judges a wreck's flight against Xenia's (phys3-6): `flight` is its
+/// speed each step from the death step on, `(time, velocity)`; `top` its
+/// highest rise and `landed` how far off it came down. The death step's
+/// speed, with that step's gravity undone, within [`XENIA_DEATH_SPEED`]
+/// and its up part within [`XENIA_DEATH_UP`]; the next step's change level only (its up change
+/// gravity's alone, within [`WRECK_NEXT_UP_SLACK`], its level change at
+/// least [`WRECK_NEXT_LEAST_LEVEL`]); after that a fall fitted within
+/// [`WRECK_G_SLACK`] of [`XENIA_WRECK_G`] while it rises; its rise within
+/// [`XENIA_WRECK_PEAK`] and its landing within [`XENIA_WRECK_LANDS`].
+fn wreck_flight_verdict(
+    flight: &[(f32, m2_math::glam::Vec3)],
+    tick: f32,
+    top: f32,
+    landed: Option<f32>,
+) -> FlightVerdict {
+    use m2_math::glam::Vec3;
+    let mut lines = Vec::new();
+    let mut fails = Vec::new();
+    let within = |x: f32, (lo, hi): (f32, f32)| (lo..=hi).contains(&x);
+    let Some(&(_, death)) = flight.first() else {
+        fails.push("it never was wrecked".to_owned());
+        return FlightVerdict { lines, fails };
+    };
+    // Its launch: the death step's speed with that step's gravity undone
+    // (phys6: (2.12, 9.18, 1.30) is |9.80| launched).
+    let launched = (death + Vec3::Y * XENIA_WRECK_G * tick).length();
+    lines.push(format!(
+        "death step {death:.3}, launched |{launched:.2}| (360 |{:?}|, up {:?})",
+        XENIA_DEATH_SPEED, XENIA_DEATH_UP
+    ));
+    if !within(launched, XENIA_DEATH_SPEED) || !within(death.y, XENIA_DEATH_UP) {
+        fails.push(format!(
+            "death step launched |{:.2}| up {:.2}, not {:?} up {:?}",
+            launched, death.y, XENIA_DEATH_SPEED, XENIA_DEATH_UP
+        ));
+    }
+    match flight.get(1) {
+        Some(&(_, next)) => {
+            let change = next - death;
+            let level = change.with_y(0.0).length();
+            let up = change.y + XENIA_WRECK_G * tick;
+            lines.push(format!(
+                "next step {next:.3}: change {change:.3}, level {level:.2}, up past gravity {up:.2}"
+            ));
+            if up.abs() > WRECK_NEXT_UP_SLACK || level < WRECK_NEXT_LEAST_LEVEL {
+                fails.push(format!(
+                    "next step's change not level only (level {level:.2}, up past gravity {up:.2})"
+                ));
+            }
+        }
+        None => fails.push("no step after the death step".to_owned()),
+    }
+    // The fall while it rises, from the step after next.
+    let rising: Vec<(f32, f32)> = flight
+        .iter()
+        .skip(2)
+        .take_while(|(_, v)| v.y > 0.0)
+        .map(|&(t, v)| (t, v.y))
+        .collect();
+    match (rising.first(), rising.last()) {
+        (Some(&(t0, a)), Some(&(t1, b))) if t1 > t0 => {
+            let g = (a - b) / (t1 - t0);
+            lines.push(format!(
+                "falls at {g:.2} m/s/s while rising (360 {XENIA_WRECK_G})"
+            ));
+            if (g - XENIA_WRECK_G).abs() > WRECK_G_SLACK {
+                fails.push(format!("falls at {g:.2}, not {XENIA_WRECK_G}"));
+            }
+        }
+        _ => fails.push("no rise to fit its fall to".to_owned()),
+    }
+    lines.push(format!(
+        "rose {top:.2} m (360 {:?}), landed {} m off (360 {:?})",
+        XENIA_WRECK_PEAK,
+        landed.map_or("never".to_owned(), |d| format!("{d:.1}")),
+        XENIA_WRECK_LANDS
+    ));
+    if !within(top, XENIA_WRECK_PEAK) {
+        fails.push(format!("rose {top:.2}, not {:?}", XENIA_WRECK_PEAK));
+    }
+    if !landed.is_some_and(|d| within(d, XENIA_WRECK_LANDS)) {
+        fails.push(format!(
+            "landed {} off, not {:?}",
+            landed.map_or("never".to_owned(), |d| format!("{d:.1}")),
+            XENIA_WRECK_LANDS
+        ));
+    }
+    FlightVerdict { lines, fails }
 }
 
 /// Wrecks the vehicle she drives, as it goes, and logs how it comes to
@@ -13200,6 +13327,31 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Xenia's phys6 flight passes: 9.18 up after one gravity step, the
+    // next step level only, then 9 m/s/s; a 10.2 launch with no gravity
+    // fails its death step.
+    #[test]
+    fn a_wreck_flight_like_xenias_passes_and_an_unfallen_one_fails() {
+        use m2_math::glam::Vec3;
+        let dt = 1.0 / 30.0;
+        let mut flight = vec![(dt, Vec3::new(2.12, 9.18, 1.30))];
+        let mut v = Vec3::new(-4.87, 9.18 - 0.30, -5.42);
+        for k in 2..20 {
+            flight.push((k as f32 * dt, v));
+            v.y -= 9.0 * dt;
+        }
+        let ok = wreck_flight_verdict(&flight, dt, 5.1, Some(13.0));
+        assert!(ok.fails.is_empty(), "{:?}", ok.fails);
+        flight[0].1 = Vec3::new(2.0, 9.9, 1.0);
+        let bad = wreck_flight_verdict(&flight, dt, 5.1, Some(13.0));
+        assert!(
+            bad.fails.iter().any(|f| f.starts_with("death step")),
+            "{:?}",
+            bad.fails
+        );
+        assert!(!wreck_flight_verdict(&[], dt, 0.0, None).fails.is_empty());
+    }
 
     #[test]
     fn autoplay_retries_a_failed_contract_only_with_a_retry_save_and_not_forever() {

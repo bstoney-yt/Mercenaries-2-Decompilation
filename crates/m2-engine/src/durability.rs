@@ -102,6 +102,34 @@ const PUSH_BY_SIZE: [(f32, f32); 12] = [
 /// schema's default, 0x823EF9F0).
 pub const LEAST_PUSH: f32 = 0.3;
 
+/// A wrecked vehicle's launch, its speed along its random mostly-up way
+/// (m/s, 0x820BAEEC; the 360 adds `rand x [0x8380EB38]`, 0 in every
+/// Xenia read).
+pub const DEATH_LAUNCH: f32 = 10.0;
+/// The launch way's height before it is made a unit (its level part is
+/// random, each axis in [-1, 1): 0x820B7B6C).
+pub const DEATH_LAUNCH_UP: f32 = 4.0;
+/// A wrecked vehicle's sideways kick, level and square to the launch
+/// (m/s, 0x820C77A4; plus `rand x [0x8380EB3C]`, read 0).
+pub const DEATH_KICK: f32 = 2.0;
+
+/// The speed a vehicle's death adds to each of its bodies, as the 360's
+/// one-step death action gives it (0x8215D978, made by PgHavokManager's
+/// slot +0x18, 0x82155040, from the car death handler 0x82205BE0): along
+/// `(rx, 4, rz)` made a unit, [`DEATH_LAUNCH`]; and along that way crossed
+/// with up, made a unit (level, square to it), [`DEATH_KICK`]; both times
+/// `scale` (1 for a car, 0.5 for its other kind). `rx` and `rz` are its
+/// random level part, each in [-1, 1) (0x8215E160: `(u - 1.5) x 2`).
+/// Each is a linear impulse of that times the body's mass, no turn
+/// (0x8216DCC8), so a speed change of exactly this.
+pub fn death_launch(rx: f32, rz: f32, scale: f32) -> Vec3 {
+    let way = Vec3::new(rx, DEATH_LAUNCH_UP, rz).normalize();
+    // cross(way, up) = (-way.z, 0, way.x) as 0x8215D978 lays it out with
+    // up (0, 1, 0) (0x82B5E578): (up.y way.z, 0, -up.y way.x).
+    let side = Vec3::new(way.z, 0.0, -way.x).normalize_or_zero();
+    (way * DEATH_LAUNCH + side * DEATH_KICK) * scale
+}
+
 /// What a blast pushes broken pieces with: where it went off, its reach
 /// (`Radius`, metres) and its push (`MaxForce`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -905,6 +933,24 @@ pub fn explosions(db: &Layer<'_>) -> HashMap<u32, Explosion> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A car's death launch: 10 m/s along (rx, 4, rz) made a unit, 2 m/s
+    // level and square to it; with no level part, straight up and no kick.
+    #[test]
+    fn a_wreck_is_launched_ten_up_its_way_and_kicked_two_aside() {
+        let v = death_launch(0.6, -0.8, 1.0);
+        let way = Vec3::new(0.6, 4.0, -0.8).normalize();
+        let along = v.dot(way);
+        assert!((along - 10.0).abs() < 1e-4, "{along}");
+        let side = v - way * along;
+        assert!((side.length() - 2.0).abs() < 1e-4, "{side}");
+        assert!(side.y.abs() < 1e-5);
+        assert!((v.length() - 104f32.sqrt()).abs() < 1e-4);
+        let up = death_launch(0.0, 0.0, 1.0);
+        assert!((up - Vec3::Y * 10.0).length() < 1e-5, "{up}");
+        let half = death_launch(0.6, -0.8, 0.5);
+        assert!((half - v * 0.5).length() < 1e-5);
+    }
 
     // The rigid push: five impulses bottom to top, 1 to 2 times as hard,
     // adding up to the broken piece's throw; a 10 m³ car at the heart of
