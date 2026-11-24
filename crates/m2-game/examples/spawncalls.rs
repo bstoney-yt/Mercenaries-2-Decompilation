@@ -6,8 +6,11 @@
 //! other library call whose name has `Spawn` in it too.
 //!
 //! ```text
-//! cargo run --release -p m2-game --example spawncalls -- "<install dir>"
+//! cargo run --release -p m2-game --example spawncalls -- "<install dir>" [script hash]
 //! ```
+//!
+//! With a script hash, its listing is printed instead (to read where a
+//! site's function is called from).
 //!
 //! Prints counts, template names and script hashes only. A computed
 //! position (a local, a parameter, another call's result) can only be
@@ -72,6 +75,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!("{} scripts", scripts.len());
+    if let Some(h) = std::env::args().nth(2) {
+        let h = u32::from_str_radix(&h, 16)?;
+        for (hash, chunk) in &scripts {
+            if *hash == h {
+                println!("{}", chunk.main.listing());
+            }
+        }
+        return Ok(());
+    }
 
     let mut others: BTreeMap<String, usize> = BTreeMap::new();
     // (template kind, position constant?) -> count

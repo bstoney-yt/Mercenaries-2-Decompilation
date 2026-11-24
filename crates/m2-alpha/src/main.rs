@@ -556,6 +556,10 @@ struct Options {
     /// `--parked-settle-check`: the layers' parked vehicles, placed as
     /// authored, keep to their authored pose ([`parked_settle_check`]).
     parked_settle_check: bool,
+    /// With `--parked-settle-check`: at least this many of the scripts'
+    /// vehicles placed where they said must be judged, or it fails
+    /// (`--settle-given <n>`).
+    settle_given: usize,
     /// `--prop-limits-check`: what blasts throw, kept in check by the
     /// disposer, and hulls meeting loose pieces ([`prop_limits_check`]).
     prop_limits_check: bool,
@@ -990,6 +994,9 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--parked-settle-check" => {
                 o.parked_settle_check = true;
                 o.drive = true;
+            }
+            "--settle-given" => {
+                o.settle_given = value()?.parse().context("--settle-given expects a count")?;
             }
             "--prop-limits-check" => {
                 o.prop_limits_check = true;
@@ -8070,7 +8077,7 @@ fn drive_for_screenshot(
         return prop_bodies_check(backend, game, fov, aspect, tick);
     }
     if options.parked_settle_check {
-        return parked_settle_check(backend, game, fov, aspect, tick);
+        return parked_settle_check(backend, game, fov, aspect, tick, options.settle_given);
     }
     if options.prop_limits_check {
         return prop_limits_check(backend, game, fov, aspect, tick);
@@ -13569,6 +13576,7 @@ fn parked_settle_check(
     fov: f32,
     aspect: f32,
     tick: f32,
+    given_least: usize,
 ) -> anyhow::Result<()> {
     use m2_math::glam::{Quat, Vec3};
     use std::collections::HashMap;
@@ -13576,6 +13584,8 @@ fn parked_settle_check(
     let mut watched: HashMap<u32, (Vec3, Quat, f32, String)> = HashMap::new();
     let (mut passed, mut failed) = (0usize, Vec::new());
     let mut judged = std::collections::HashSet::new();
+    // The scripts' vehicles placed where they said, judged.
+    let mut given_judged = 0usize;
     let mut t = 0.0f32;
     while t < SETTLE_WATCH {
         game.step(Intent::default(), tick);
@@ -13605,7 +13615,14 @@ fn parked_settle_check(
             if judged.contains(&key) || watched.contains_key(&key) {
                 continue;
             }
-            watched.insert(key, (at, turn, 0.0, v.spec.label.clone()));
+            let given =
+                v.spot.is_none() && v.guid.is_some_and(|g| game.given_guids.contains_key(&g));
+            let label = if given {
+                format!("{} (where the scripts said)", v.spec.label)
+            } else {
+                v.spec.label.clone()
+            };
+            watched.insert(key, (at, turn, 0.0, label));
         }
         let mut done = Vec::new();
         for (&entity, (at, turn, since, label)) in &mut watched {
@@ -13614,6 +13631,9 @@ fn parked_settle_check(
                 continue;
             }
             done.push(entity);
+            if label.ends_with("(where the scripts said)") {
+                given_judged += 1;
+            }
             let Some(id) = game
                 .scene
                 .vehicles
@@ -13660,8 +13680,15 @@ fn parked_settle_check(
         judged.len(),
         watched.len()
     );
+    eprintln!(
+        "parked-settle-check: {given_judged} of them the scripts' placed where they said (at least {given_least} asked)"
+    );
     if judged.is_empty() {
         eprintln!("parked-settle-check: FAIL no parked vehicle placed as authored here");
+    } else if given_judged < given_least {
+        eprintln!(
+            "parked-settle-check: FAIL {given_judged} of the scripts' vehicles placed where they said were judged, not at least {given_least}"
+        );
     } else if failed.is_empty() {
         eprintln!("parked-settle-check: PASS {passed} parked vehicles kept their authored pose");
     } else {
