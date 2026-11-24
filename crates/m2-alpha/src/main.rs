@@ -9520,19 +9520,22 @@ fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, lab
         .with_y(0.0)
         .normalize_or(Vec3::Z);
     let physics = &world.physics;
-    let ground = |x: f32, z: f32| {
+    let ground = |x: f32, z: f32, near: f32| {
         physics
-            .cast_ray(Vec3::new(x, here.y + 20.0, z), Vec3::NEG_Y, 60.0)
-            .map(|(d, _)| here.y + 20.0 - d)
+            .cast_ray(Vec3::new(x, near + 20.0, z), Vec3::NEG_Y, 60.0)
+            .map(|(d, _)| near + 20.0 - d)
     };
-    let Some(floor) = ground(here.x, here.z) else {
+    let Some(floor) = ground(here.x, here.z, here.y) else {
         eprintln!("cargo-check: FAIL no clear straight (no ground under the {label})");
         return false;
     };
-    let clear = |way: Vec3| {
+    // A clear, level straight from `from` (on the ground at `base`) along
+    // `way`: the ground loaded and within 1.5 m of `base` every 4 m, and a
+    // 3.2 m wide box over each free of placed objects and buildings.
+    let clear = |from: Vec3, base: f32, way: Vec3| {
         (0..=((CARGO_STRAIGHT / 4.0) as i32)).all(|k| {
-            let c = here + way * (5.0 + 4.0 * k as f32);
-            let Some(y) = ground(c.x, c.z).filter(|y| (y - floor).abs() <= 1.5) else {
+            let c = from + way * (5.0 + 4.0 * k as f32);
+            let Some(y) = ground(c.x, c.z, base).filter(|y| (y - base).abs() <= 1.5) else {
                 return false;
             };
             let c = Vec3::new(c.x, y, c.z);
@@ -9543,30 +9546,74 @@ fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, lab
             )
         })
     };
-    let Some(k) = (0..8)
-        .find(|&k| clear(Quat::from_rotation_y(k as f32 * std::f32::consts::FRAC_PI_4) * ahead))
-    else {
+    let turned = |k: i32| Quat::from_rotation_y(k as f32 * std::f32::consts::FRAC_PI_4) * ahead;
+    if let Some(k) = (0..8).find(|&k| clear(here, floor, turned(k))) {
+        if k == 0 {
+            eprintln!("cargo-check: the {label}'s own heading is clear for {CARGO_STRAIGHT} m");
+            return true;
+        }
+        // Turned about where it stands, its cargo with it.
+        let turn = Mat4::from_translation(here)
+            * Mat4::from_rotation_y(k as f32 * std::f32::consts::FRAC_PI_4)
+            * Mat4::from_translation(-here);
+        world.physics.place_vehicle(id, turn * m);
+        for d in game.scene.props.cargo_pieces(i) {
+            if let Some(at) = world.physics.debris_place(d) {
+                world.physics.move_debris(d, turn * at);
+            }
+        }
         eprintln!(
-            "cargo-check: FAIL no clear straight: none of eight headings from the {label} at {here:.0} has {CARGO_STRAIGHT} m of level, open ground"
+            "cargo-check: the {label} is turned {} degrees where it stands: its own heading is blocked, that one is clear for {CARGO_STRAIGHT} m",
+            k * 45
+        );
+        return true;
+    }
+    // None here (q680 at a6fcbef0: on the waterfront): the nearest clear,
+    // level straight on ground already loaded within 200 m, rings 20 m
+    // apart, 16 places a ring, eight headings each; the place itself must
+    // have ground under it and room for the truck. Truck and cargo are
+    // moved there by one rigid move, as high over the ground as here.
+    let mut found = None;
+    'rings: for r in (1..=10).map(|n| n as f32 * 20.0) {
+        for a in 0..16 {
+            let turn = Quat::from_rotation_y(a as f32 * std::f32::consts::TAU / 16.0);
+            let at = here + turn * Vec3::Z * r;
+            let Some(base) = ground(at.x, at.z, here.y) else {
+                continue;
+            };
+            let spot = Vec3::new(at.x, base, at.z);
+            if !physics.box_clear(
+                spot + Vec3::new(-2.0, 0.4, -2.0),
+                spot + Vec3::new(2.0, 3.0, 2.0),
+                |key| !matches!(key, m2_engine::StaticKey::Cell(_)),
+            ) {
+                continue;
+            }
+            if let Some(k) = (0..8).find(|&k| clear(spot, base, turned(k))) {
+                found = Some((spot, base, k));
+                break 'rings;
+            }
+        }
+    }
+    let Some((spot, base, k)) = found else {
+        eprintln!(
+            "cargo-check: FAIL no clear straight within 200 m: none of eight headings at the {label} ({here:.0}) or at any loaded place round it has {CARGO_STRAIGHT} m of level, open ground"
         );
         return false;
     };
-    if k == 0 {
-        eprintln!("cargo-check: the {label}'s own heading is clear for {CARGO_STRAIGHT} m");
-        return true;
-    }
-    // Turned about where it stands, its cargo with it.
-    let turn = Mat4::from_translation(here)
+    let to = Vec3::new(spot.x, base + (here.y - floor), spot.z);
+    let moved = Mat4::from_translation(to)
         * Mat4::from_rotation_y(k as f32 * std::f32::consts::FRAC_PI_4)
         * Mat4::from_translation(-here);
-    world.physics.place_vehicle(id, turn * m);
+    world.physics.place_vehicle(id, moved * m);
     for d in game.scene.props.cargo_pieces(i) {
         if let Some(at) = world.physics.debris_place(d) {
-            world.physics.move_debris(d, turn * at);
+            world.physics.move_debris(d, moved * at);
         }
     }
     eprintln!(
-        "cargo-check: the {label} is turned {} degrees where it stands: its own heading is blocked, that one is clear for {CARGO_STRAIGHT} m",
+        "cargo-check: the {label} and its cargo are moved {:.0} m to {to:.0}, heading {} degrees: a clear, level {CARGO_STRAIGHT} m straight",
+        to.with_y(0.0).distance(here.with_y(0.0)),
         k * 45
     );
     true
