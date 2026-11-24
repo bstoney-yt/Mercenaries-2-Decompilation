@@ -9932,8 +9932,38 @@ fn wreck_rider_check(game: &mut Game, tick: f32) {
         eprintln!("wreck-rider-check: the {label} wrecked under her at {hp:.1} health");
         let mut done = None;
         let every = ((0.1 / tick).round() as u32).max(1);
+        let half = ((0.5 / tick).round() as u32).max(1);
+        let mut last_root: Option<Vec3> = None;
         for k in 0..(12.0 / tick) as u32 {
             game.step(Intent::default(), tick);
+            // Each half second her limp body is down: where its root is,
+            // how far it moved in that half second, how far it lies from
+            // the wreck's hull, and what each limb touches (v vehicle, o
+            // her own limb, g ground, w other fixed collision, d a loose
+            // body: debris, prop body, goods or pickup, r another ragdoll).
+            if k % half == 0
+                && let (Some(p), Some(w)) = (game.scene.player.as_ref(), game.scene.world.as_ref())
+                && let Some(doll) = p.ragdoll
+                && let Some(root) = crate::npc::limp_root(&w.physics, doll)
+            {
+                let hull = game.scene.vehicles[i]
+                    .id
+                    .and_then(|id| w.physics.vehicle_body_box(id))
+                    .map_or(f32::NAN, |(lo, hi)| root.clamp(lo, hi).distance(root));
+                let moved = last_root.replace(root).map_or(0.0, |q| q.distance(root));
+                let limbs: Vec<String> = w
+                    .physics
+                    .ragdoll_limb_contacts(doll)
+                    .iter()
+                    .filter(|l| !l.2.is_empty() || l.1 >= 0.2)
+                    .map(|l| format!("{}:{:.2}{}", l.0, l.1, l.2))
+                    .collect();
+                eprintln!(
+                    "wreck-rider-check: {:.1} s: her limp root at {root:.2}, moved {moved:.2} m in 0.5 s, {hull:.2} m from the wreck's hull; limbs (index:speed m/s, touching) {}",
+                    k as f32 * tick,
+                    limbs.join(" ")
+                );
+            }
             // Her limp body's root each tenth of a second.
             if k % every == 0
                 && let Some(p) = game.scene.player.as_ref()
