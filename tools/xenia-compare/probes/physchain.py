@@ -30,9 +30,11 @@ def bodies(g, P):
     out = []
     if not ok_ptr(lst) or not 0 < n <= 64: return lst, n, ind, out
     for i in range(n):
-        w = u32(g, lst + 4 * i)   # list of wrapper pointers
-        if ind and ok_ptr(w) and not ok_ptr(u32(g, w + 0x38)):
-            w = u32(g, w)          # one more level when the list holds pointers to pointers
+        if ind:   # +0x54 != 0: the list holds pointers to wrappers
+            w = u32(g, lst + 4 * i)
+        else:     # +0x54 == 0: the wrapper is stored inline at the list address (phys1: u32(lst) was the wrapper's vtable)
+            if i: break  # inline stride for more than one body is unknown
+            w = lst
         B = u32(g, w + 0x38) if ok_ptr(w) else 0
         out.append((w, B))
     return lst, n, ind, out

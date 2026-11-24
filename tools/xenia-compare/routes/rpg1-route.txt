@@ -1,0 +1,32 @@
+# #719 RPG (Jennifer + GodMode): PmcCon004, find VZ Heavy (RPG) 0xB4E55 (-3270, 105, -2621), weaken and kill it, take the RPG; 50 m wall chosen live.
+wait 25
+pokestr 83133F98 PmcCon004
+poke 82B7C953 0
+poke 83134382 1
+tap_until start Continue_without 90
+wait 2
+press up 0.3
+wait 1
+press a 0.3
+until NOTICE 30 2
+press a 0.3
+until new_game 60 2
+press a 0.3
+until Mattias 30 2
+press down 0.3
+wait 2
+ocr charsel
+press a 0.3
+wait 3
+ocr card
+press a 0.3
+tap_until a Steal 150
+trackhero
+mark PmcCon004 start
+ocr start
+walkcam -3270 -2621 15 240 ls
+ocr nearrpg
+fight3 90 -3270 -2621 25 weak
+wait 3
+ocr after
+mark done

@@ -1,0 +1,84 @@
+# Traffic controlled cases (Jennifer): 1) stand still ON the lane line x 233.8 z 150 for 300 s; 2) walk back and forth across the lane.
+wait 25
+pokestr 83133F98 AllCon003
+poke 82B7C953 0
+tap_until start Continue_without 90
+wait 2
+press up 0.3
+wait 1
+press a 0.3
+until NOTICE 30 2
+press a 0.3
+until new_game 60 2
+press a 0.3
+until Mattias 30 2
+press down 0.3
+wait 2
+ocr charsel
+press a 0.3
+wait 3
+ocr card
+press a 0.3
+tap_until a Objective 150
+trackhero
+mark AllCon003 start
+healthlog start traffic1hp
+walkcam 236 158 1.5 40
+walkcam 233.8 150 0.6 20
+mark still
+wait 300
+mark walk
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+walkcam 230.5 150 0.8 8
+walkcam 237 150 0.8 8
+mark walkend
+ocr after
+healthlog stop
+mark done

@@ -1,0 +1,54 @@
+# Turret camera (M101A1 0x13C2E7 at (2753.5, -14.0, -742.0), 24 m from the PmcCon032 start) then GL #715 at the sandbags (2759, -751) (Jennifer).
+wait 25
+pokestr 83133F98 PmcCon032
+poke 82B7C953 0
+tap_until start Continue_without 90
+wait 2
+press up 0.3
+wait 1
+press a 0.3
+until NOTICE 30 2
+press a 0.3
+until new_game 60 2
+press a 0.3
+until Mattias 30 2
+press down 0.3
+wait 2
+ocr charsel
+press a 0.3
+wait 3
+ocr card
+press a 0.3
+tap_until a Steal 150
+trackhero
+mark PmcCon032 start
+ocr start
+camlog start turretcam
+walkcam 2755.5 -742 2.0 40
+enter 2753.5 -742 2.5 6
+ocr inturret
+mark turret
+stick r 1 0 2
+stick r -1 0 2
+stick r 0 1 1
+press rt 0.3
+wait 3
+press y 0.3
+wait 2
+camlog stop
+mark gl
+walkcam 2759 -751 1.5 40
+ocr sandbags
+mark glsnap1
+wait 3
+press rt 0.3
+wait 4
+mark glsnap2
+wait 3
+hold lt 1.0
+press rt 0.3
+wait 4
+mark glsnap3
+wait 3
+ocr after
+mark done

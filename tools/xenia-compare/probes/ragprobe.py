@@ -44,7 +44,7 @@ def actor_bodies(actor):
     """Body array of the ragdoll actor (0x82428768: actor = controller+0x18; array +0x4C, count +0x50, pointer list when +0x54 != 0)."""
     lst, n, ind = u32(actor + 0x4C), u32(actor + 0x50), u32(actor + 0x54)
     if not pc.ok_ptr(lst) or not 0 < n <= 32: return lst, n, ind, []
-    return lst, n, ind, [u32(lst + 4 * i) for i in range(n)]
+    return lst, n, ind, ([u32(lst + 4 * i) for i in range(n)] if ind else [lst])  # +0x54 == 0: inline (0x82428768 reads u32(actor+0x4C))
 def filters_block(w, hero, car, actor_ctl):
     actor, how, e = actor_from_pool(hero)
     w(f"FILTERS actor via pool 0x8365726C: {actor and hex(actor)} ({how}, entry {e and hex(e)}); via controller+0x18: {actor_ctl:#x}; "
@@ -112,6 +112,25 @@ with open(sys.argv[1], "w") as fh:
             hs_ = f"cd {cd:.4f} imp {tuple(round(v,3) for v in imp)} r {rp:#x} live {live:#x} bit {int(bool(live & 0x20))}"
         else: hs_ = "no handler"
         rel = "" if dead is None else f" df {c - dead}"
+        if dead is not None and c - dead <= 10:  # rag4: her ragdoll bodies per frame (pool 0x8365726C actor, inline-list fix)
+            act, how_, _ = actor_from_pool(hero)
+            if act:
+                lst, nb, ind_, gbs = actor_bodies(act)
+                vs = []
+                for i, gb in enumerate(gbs):
+                    B = u32(gb + 0x38) if pc.ok_ptr(gb) else 0
+                    v = struct.unpack(">3f", g.read(B + 0x1A0, 12) or bytes(12)) if pc.ok_ptr(B) else None
+                    vs.append(f"{i}:" + ("-" if v is None else ",".join(f"{q:.2f}" for q in v)))
+                w(f"  rag bodies v (actor {act:#x} n {nb}): " + " ".join(vs))
+                # pelvis candidates: body 0's Havok body, every float triple within 3 m of her origin (offsets kept for offline)
+                B0 = u32(gbs[0] + 0x38) if gbs and pc.ok_ptr(gbs[0]) else 0
+                raw = g.read(B0, 0x300) if pc.ok_ptr(B0) else None
+                if raw:
+                    hits = []
+                    for o in range(0, len(raw) - 11, 4):
+                        t3 = struct.unpack_from(">3f", raw, o)
+                        if all(math.isfinite(q) for q in t3) and math.dist(t3, (x, y, z)) < 3.0: hits.append(f"+{o:#x}=({t3[0]:.3f},{t3[1]:.3f},{t3[2]:.3f})")
+                    w(f"  body0 B {B0:#x} position candidates near her origin ({x:.3f},{y:.3f},{z:.3f}): " + " ".join(hits[:12]))
         if dead is not None and hd and not getattr(sys, "_filt_done", False):
             rp_ = u32(hd + 0x18)
             if rp_ and (g.read(rp_ + 0x324, 1) or bytes(1))[0] & 0x20:
