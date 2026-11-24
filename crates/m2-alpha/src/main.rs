@@ -2521,6 +2521,9 @@ fn traffic_for_screenshot(
     let mut next_log = 0.0;
     // What lives near her, every 2 s.
     game.census.get_or_insert((2.0, 0.0, 2.0));
+    // Each traffic car seen: where first seen and the farthest from there.
+    let mut seen: std::collections::HashMap<u32, (m2_math::glam::Vec3, f32)> =
+        std::collections::HashMap::new();
     while t <= seconds {
         if t >= next_log {
             next_log += 5.0;
@@ -2544,6 +2547,71 @@ fn traffic_for_screenshot(
         game.step(Intent::default(), tick);
         render(backend, game, fov, aspect, None)?;
         t += tick;
+        if let Some(world) = &game.scene.world {
+            for v in &game.scene.vehicles {
+                let (Some((e, _, _)), Some(id)) = (v.spot, v.id) else {
+                    continue;
+                };
+                if !game.traffic.is_traffic(e) {
+                    continue;
+                }
+                let Some(m) = world.physics.vehicle_transform(id) else {
+                    continue;
+                };
+                let at = m.w_axis.truncate();
+                let entry = seen.entry(e).or_insert((at, 0.0));
+                entry.1 = entry.1.max(at.distance(entry.0));
+            }
+        }
+    }
+    let upside_down: Vec<String> = game.scene.world.as_ref().map_or(Vec::new(), |world| {
+        game.scene
+            .vehicles
+            .iter()
+            .filter(|v| v.spot.is_some_and(|(e, _, _)| game.traffic.is_traffic(e)))
+            .filter_map(|v| {
+                let m = world.physics.vehicle_transform(v.id?)?;
+                (m.transform_vector3(m2_math::glam::Vec3::Y)
+                    .normalize_or_zero()
+                    .y
+                    < 0.0)
+                    .then(|| v.spec.label.clone())
+            })
+            .collect()
+    });
+    let moved = seen
+        .values()
+        .filter(|(_, far)| *far >= TRAFFIC_MOVED)
+        .count();
+    eprintln!(
+        "traffic: {} traffic cars seen in {seconds:.0} s, {moved} went at least {TRAFFIC_MOVED} m, {} upside down",
+        seen.len(),
+        upside_down.len()
+    );
+    match traffic_verdict(seen.len(), moved, &upside_down) {
+        Ok(()) => eprintln!("traffic: PASS"),
+        Err(why) => eprintln!("traffic: FAIL {why}"),
+    }
+    Ok(())
+}
+
+/// How far a traffic car must get from where it was first seen to count
+/// as going, metres (`--traffic`).
+const TRAFFIC_MOVED: f32 = 10.0;
+
+/// `--traffic`'s verdict: at least one traffic car seen, at least one
+/// going ([`TRAFFIC_MOVED`]), none upside down.
+fn traffic_verdict(seen: usize, moved: usize, upside_down: &[String]) -> Result<(), String> {
+    if seen == 0 {
+        return Err("no traffic car came out".to_owned());
+    }
+    if moved == 0 {
+        return Err(format!(
+            "none of {seen} traffic cars went {TRAFFIC_MOVED} m"
+        ));
+    }
+    if !upside_down.is_empty() {
+        return Err(format!("upside down: {}", upside_down.join(", ")));
     }
     Ok(())
 }
@@ -7914,6 +7982,37 @@ fn homing_check(game: &mut Game, tick: f32) {
     eprintln!("homing-check: FAIL {why} in {HOMING_CHECK_SECONDS} s");
 }
 
+/// How far `--drive`'s 4 s at full throttle must take her vehicle,
+/// metres (the "hardly moved" line's own 8 m).
+const DRIVE_MOVED: f32 = 8.0;
+
+/// `--drive`'s verdict: she still drives (`moved` is how far it went,
+/// `None` when she doesn't), it went [`DRIVE_MOVED`] or more, it stands
+/// upright (`up`, its up axis's height, over 0.5) and isn't wrecked.
+/// Ploughing (let go to settle) asks only that it is upright and whole.
+fn drive_verdict(
+    moved: Option<f32>,
+    up: Option<f32>,
+    wrecked: bool,
+    ploughing: bool,
+) -> Result<(), String> {
+    let Some(moved) = moved else {
+        return Err("she drives nothing at the end".to_owned());
+    };
+    if wrecked {
+        return Err("her vehicle is wrecked".to_owned());
+    }
+    match up {
+        Some(u) if u > 0.5 => {}
+        Some(u) => return Err(format!("not upright (up {u:.2})")),
+        None => return Err("her vehicle has no body".to_owned()),
+    }
+    if !ploughing && moved < DRIVE_MOVED {
+        return Err(format!("it went {moved:.1} m, not {DRIVE_MOVED}"));
+    }
+    Ok(())
+}
+
 fn drive_for_screenshot(
     backend: &mut WgpuBackend,
     game: &mut Game,
@@ -8273,6 +8372,31 @@ fn drive_for_screenshot(
                     break;
                 }
             }
+        }
+    }
+    {
+        let driven_now = game
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| p.driving)
+            .map(|i| &game.scene.vehicles[i]);
+        let up = driven_now
+            .and_then(|v| game.scene.world.as_ref()?.physics.vehicle_transform(v.id?))
+            .map(|m| {
+                m.transform_vector3(m2_math::glam::Vec3::Y)
+                    .normalize_or_zero()
+                    .y
+            });
+        let verdict = drive_verdict(
+            from.zip(game.driving()).map(|(a, (b, _))| (b - a).length()),
+            up,
+            driven_now.is_some_and(|v| v.wrecked),
+            ploughing,
+        );
+        match verdict {
+            Ok(()) => eprintln!("drive: PASS"),
+            Err(why) => eprintln!("drive: FAIL {why}"),
         }
     }
     if let (Some(from), Some((to, speed))) = (from, game.driving()) {
@@ -12954,6 +13078,28 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `--drive`: it went 8 m or more, upright and whole, with her in it;
+    // ploughing asks only upright and whole.
+    #[test]
+    fn drive_passes_only_driven_upright_whole_and_far_enough() {
+        assert!(drive_verdict(Some(20.0), Some(0.99), false, false).is_ok());
+        assert!(drive_verdict(Some(3.0), Some(0.99), false, false).is_err());
+        assert!(drive_verdict(Some(3.0), Some(0.99), false, true).is_ok());
+        assert!(drive_verdict(Some(20.0), Some(0.2), false, false).is_err());
+        assert!(drive_verdict(Some(20.0), Some(0.99), true, false).is_err());
+        assert!(drive_verdict(None, Some(0.99), false, false).is_err());
+        assert!(drive_verdict(Some(20.0), None, false, false).is_err());
+    }
+
+    // `--traffic`: some came out, some went, none upside down.
+    #[test]
+    fn traffic_passes_only_when_some_go_and_none_are_upside_down() {
+        assert!(traffic_verdict(4, 2, &[]).is_ok());
+        assert!(traffic_verdict(0, 0, &[]).is_err());
+        assert!(traffic_verdict(4, 0, &[]).is_err());
+        assert!(traffic_verdict(4, 2, &["Taxi".to_owned()]).is_err());
+    }
 
     #[test]
     fn autoplay_retries_a_failed_contract_only_with_a_retry_save_and_not_forever() {

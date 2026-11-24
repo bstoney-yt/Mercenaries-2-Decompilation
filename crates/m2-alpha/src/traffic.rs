@@ -425,6 +425,11 @@ fn look_ahead(route: &[Vec3], next: usize, closed: bool, here: Vec3, ahead: f32)
 }
 
 impl Traffic {
+    /// Whether layer entity `e` is one of the traffic spawners'.
+    pub fn is_traffic(&self, e: u32) -> bool {
+        self.points.contains_key(&e)
+    }
+
     /// A line per traffic vehicle out: what, where, how fast, which
     /// waypoint; and the spawners nearest `focus`, for checking.
     pub fn report(
