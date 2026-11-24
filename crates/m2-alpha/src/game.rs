@@ -6430,9 +6430,15 @@ fn exit_way(
 }
 
 /// The launch her ragdoll takes out of a vehicle that died under her, m/s,
-/// level, away from it (0x82428EA0: 0x82DE889C 10.0 for the player, at
-/// the angle 0x82DE88A0, 0.0).
+/// away from it and [`DEATH_EXIT_ANGLE`] up (0x82428EA0: the speed at
+/// 0x82DE889C for the player, 0x82DE8894 for anyone else).
 pub const DEATH_EXIT_LAUNCH: f32 = 10.0;
+/// How far up from level that launch goes, radians (0x82DE88A0 for the
+/// player, 0x82DE8898 for anyone else). From Xenia: the image holds 0.0,
+/// but both read 0.7854 (45 degrees) live at the title screen and at the
+/// death; something writes them before the title screen (the writer is
+/// not found: likely a tunables load).
+pub const DEATH_EXIT_ANGLE: f32 = std::f32::consts::FRAC_PI_4;
 /// How long she is held down after that exit, seconds (0x822A2178 sets
 /// her record's +0x38 from 0x82423848(3.0, …); that it is her time down
 /// is inferred).
@@ -6477,11 +6483,13 @@ pub(crate) fn death_exit(
 }
 
 /// Her ragdoll's launch out of a vehicle that died with its origin at
-/// `vehicle`, she at `her`: [`DEATH_EXIT_LAUNCH`] level, from it to her
-/// (0x82428EA0); straight along +Z if she is right over it.
+/// `vehicle`, she at `her`: [`DEATH_EXIT_LAUNCH`] at [`DEATH_EXIT_ANGLE`]
+/// up, from it to her across the ground (0x82428EA0); along +Z if she is
+/// right over it.
 pub fn death_launch(vehicle: Vec3, her: Vec3) -> Vec3 {
     let away = Vec3::new(her.x - vehicle.x, 0.0, her.z - vehicle.z).normalize_or(Vec3::Z);
-    away * DEATH_EXIT_LAUNCH
+    away * (DEATH_EXIT_LAUNCH * DEATH_EXIT_ANGLE.cos())
+        + Vec3::Y * (DEATH_EXIT_LAUNCH * DEATH_EXIT_ANGLE.sin())
 }
 
 /// Whether `v`, standing at `at`, is a boat afloat: its origin (its
@@ -6717,13 +6725,17 @@ fn switch_weapon(
 #[cfg(test)]
 mod tests {
 
-    // Out of a vehicle that died under her: 10 m/s level, from its origin
-    // to her (0x82428EA0); straight along +Z right over it.
+    // Out of a vehicle that died under her: 10 m/s at 45 degrees, 7.07
+    // out from its origin towards her and 7.07 up (0x82428EA0, the live
+    // values); along +Z right over it.
     #[test]
-    fn a_death_exit_launches_her_level_away_from_the_vehicle() {
+    fn a_death_exit_launches_her_away_from_the_vehicle_at_45_degrees() {
+        let h = 10.0 * std::f32::consts::FRAC_PI_4.cos();
         let v = death_launch(Vec3::new(1.0, 5.0, 1.0), Vec3::new(4.0, 7.0, 5.0));
-        assert!((v - Vec3::new(6.0, 0.0, 8.0)).length() < 1e-4, "{v}");
-        assert_eq!(death_launch(Vec3::ZERO, Vec3::Y * 2.0), Vec3::Z * 10.0);
+        assert!((v - Vec3::new(0.6 * h, h, 0.8 * h)).length() < 1e-4, "{v}");
+        assert!((v.with_y(0.0).length() - 7.071).abs() < 1e-3);
+        let over = death_launch(Vec3::ZERO, Vec3::Y * 2.0);
+        assert!((over - Vec3::new(0.0, h, h)).length() < 1e-4, "{over}");
     }
     use std::collections::HashMap;
 

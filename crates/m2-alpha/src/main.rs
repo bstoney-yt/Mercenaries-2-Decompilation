@@ -9962,8 +9962,12 @@ fn wreck_rider_check(game: &mut Game, tick: f32) {
             Some(d) => {
                 let level = d.launch.with_y(0.0);
                 let away = (d.out - d.vehicle).with_y(0.0).normalize_or_zero();
-                let by_rule = (level.length() - crate::game::DEATH_EXIT_LAUNCH).abs() <= 0.01
-                    && d.launch.y.abs() < 1e-4
+                let (out, up) = (
+                    crate::game::DEATH_EXIT_LAUNCH * crate::game::DEATH_EXIT_ANGLE.cos(),
+                    crate::game::DEATH_EXIT_LAUNCH * crate::game::DEATH_EXIT_ANGLE.sin(),
+                );
+                let by_rule = (level.length() - out).abs() <= 0.01
+                    && (d.launch.y - up).abs() <= 0.01
                     && level.normalize_or_zero().dot(away) > 0.999;
                 let line = format!(
                     "the {label}: launch {:.2} ({}), ragdoll live {}, peak +{:.2} m at {:.2} s, {:.2} m out, up {} (Xenia: +2.81 m at 0.6 s, 8.75 m, up 2.7 s; recorded, not gated), health {:.1} -> {:.1}",

@@ -9516,8 +9516,8 @@ mod tests {
         assert_eq!(field.player.driving, None);
         assert_eq!(combat.hp, full, "no health lost at the wreck");
         let d = combat.death_exit.expect("a death exit");
-        assert!((d.launch.with_y(0.0).length() - 10.0).abs() < 1e-4);
-        assert_eq!(d.launch.y, 0.0);
+        assert!((d.launch.with_y(0.0).length() - 7.071).abs() < 1e-3);
+        assert!((d.launch.y - 7.071).abs() < 1e-3);
         assert!(d.launch.dot((d.out - d.vehicle).with_y(0.0)) >= 0.0);
         let middle = field
             .physics
