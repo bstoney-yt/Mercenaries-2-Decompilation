@@ -152,6 +152,10 @@ pub struct Game {
     /// The layers' parked vehicles' whole authored turns, by entity:
     /// placed as authored ([`place`]).
     authored: HashMap<u32, Quat>,
+    /// The scripts' (mission) vehicles placed as authored (their layer
+    /// entity's `Transform`), by guid: where and turned how
+    /// (`--parked-settle-check`).
+    pub(crate) authored_guids: HashMap<u32, (Vec3, Quat)>,
     /// The island's traffic spawners and what they have out.
     pub traffic: crate::traffic::Traffic,
     /// A pursuit's gunships ([`crate::gunships`]).
@@ -539,6 +543,7 @@ impl Game {
             winches: Default::default(),
             fetched: HashSet::new(),
             authored: HashMap::new(),
+            authored_guids: HashMap::new(),
             traffic: crate::traffic::Traffic::default(),
             gunships: crate::gunships::Gunships::default(),
             pursuers: crate::pursuers::Pursuers::default(),

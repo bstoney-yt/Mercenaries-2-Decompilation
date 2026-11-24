@@ -13547,8 +13547,12 @@ const SETTLE_WATCH: f32 = 45.0;
 const SETTLE_AFTER: f32 = 5.0;
 /// What `--parked-settle-check` allows a vehicle placed as authored, 5 s
 /// on: metres from its authored place, degrees from its authored turn,
-/// and m/s.
-const SETTLE_MOST: (f32, f32, f32) = (0.25, 5.0, 0.05);
+/// and m/s. From Xenia: the 360's El Grande, placed at its layer
+/// transform, settled on its suspension 0.18 m up and 0.20 m sideways
+/// (0.27 m in all) with its roll 0.75 degrees off; 0.35 m is that with
+/// about a third more for other vehicles' suspension, and 5 degrees is
+/// well over its tilt.
+const SETTLE_MOST: (f32, f32, f32) = (0.35, 5.0, 0.05);
 
 /// `--parked-settle-check` (it turns on `--drive`; give a `--spawn`): for
 /// [`SETTLE_WATCH`] s the game runs as played, the layers' parked vehicles
@@ -13581,15 +13585,23 @@ fn parked_settle_check(
             continue;
         };
         for v in &game.scene.vehicles {
-            let (Some((entity, at, _)), Some(_)) = (v.spot, v.id) else {
+            if v.id.is_none() {
+                continue;
+            }
+            // A layer's parked vehicle (by entity) or a mission's (by its
+            // guid, its layer entity's `Transform`).
+            let authored = match (v.spot, v.guid) {
+                (Some((entity, at, _)), _) => game.authored_turn(entity).map(|t| (entity, at, t)),
+                (None, Some(g)) => game.authored_guids.get(&g).map(|&(at, t)| (g, at, t)),
+                _ => None,
+            };
+            let Some((key, at, turn)) = authored else {
                 continue;
             };
-            if judged.contains(&entity) || watched.contains_key(&entity) {
+            if judged.contains(&key) || watched.contains_key(&key) {
                 continue;
             }
-            if let Some(turn) = game.authored_turn(entity) {
-                watched.insert(entity, (at, turn, 0.0, v.spec.label.clone()));
-            }
+            watched.insert(key, (at, turn, 0.0, v.spec.label.clone()));
         }
         let mut done = Vec::new();
         for (&entity, (at, turn, since, label)) in &mut watched {
@@ -13602,7 +13614,7 @@ fn parked_settle_check(
                 .scene
                 .vehicles
                 .iter()
-                .find(|v| v.spot.is_some_and(|s| s.0 == entity))
+                .find(|v| v.spot.is_some_and(|s| s.0 == entity) || v.guid == Some(entity))
                 .and_then(|v| v.id)
             else {
                 continue;
