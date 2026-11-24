@@ -13592,7 +13592,11 @@ fn parked_settle_check(
             // guid, its layer entity's `Transform`).
             let authored = match (v.spot, v.guid) {
                 (Some((entity, at, _)), _) => game.authored_turn(entity).map(|t| (entity, at, t)),
-                (None, Some(g)) => game.authored_guids.get(&g).map(|&(at, t)| (g, at, t)),
+                (None, Some(g)) => game
+                    .authored_guids
+                    .get(&g)
+                    .or_else(|| game.given_guids.get(&g))
+                    .map(|&(at, t)| (g, at, t)),
                 _ => None,
             };
             let Some((key, at, turn)) = authored else {
