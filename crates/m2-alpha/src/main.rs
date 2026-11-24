@@ -322,6 +322,10 @@ struct Options {
     paradrop_check: bool,
     /// `--gravity-check`: measure the physics world's gravity ([`gravity_check`]).
     gravity_check: bool,
+    /// `--runover-check`: (turns on --drive) her vehicle driven into her
+    /// on foot at set speeds, against the 360's proxy contact damage
+    /// ([`runover_check`]).
+    runover_check: bool,
     /// `--ditch-check`: (turns on --drive) out of her car at 18 m/s and
     /// what she plays on foot after ([`ditch_check`]).
     ditch_check: bool,
@@ -1167,6 +1171,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--gravity-check" => {
                 o.gravity_check = true;
+                o.drive = true;
+            }
+            "--runover-check" => {
+                o.runover_check = true;
                 o.drive = true;
             }
             "--stagger-check" => o.stagger_check = true,
@@ -8112,6 +8120,10 @@ fn drive_for_screenshot(
         gravity_check(game);
         return Ok(());
     }
+    if options.runover_check {
+        let ok = runover_check(game, tick);
+        errlog::exit(if ok { 0 } else { 1 });
+    }
     if options.ditch_check {
         ditch_check(game, tick);
         return Ok(());
@@ -13223,6 +13235,123 @@ fn ditch_check(game: &mut Game, tick: f32) {
         verdict(ok2)
     );
     eprintln!("ditch-check: {}", verdict(ok && ok2));
+}
+
+/// `--runover-check`: she gets out of her vehicle, stands 7 m ahead of
+/// it, and it is driven straight at her for 3 s at 0, 4, 8 and 12 m/s,
+/// against the 360's proxy contact damage ([`m2_engine::run_over`]). The
+/// per-update `run over: contact:` lines (stderr) give the closing, the
+/// event size and the damage.
+///
+/// Pass: at 0 m/s she loses nothing (the 360: a driverless bike lying by
+/// her); at 8 m/s she loses health; at 12 m/s more than at 8. The 4 m/s
+/// push is printed, not gated: the 360's code gives nothing there for
+/// her standing still (closing under 6 m/s), while Xenia saw 2.1-2.6 a
+/// frame on slow pushes with her walking about the lane.
+fn runover_check(game: &mut Game, tick: f32) -> bool {
+    use m2_math::glam::Vec3;
+    let verdict = |ok: bool| if ok { "PASS" } else { "FAIL" };
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        println!("runover-check: FAIL not in a vehicle");
+        return false;
+    };
+    let label = game.scene.vehicles[i].spec.label.clone();
+    let mass = game.scene.vehicles[i].spec.mass;
+    let Some(id) = game.scene.vehicles[i].id else {
+        println!("runover-check: FAIL the {label} has no body");
+        return false;
+    };
+    let mut input = input::Input::default();
+    input.button(input::Action::Use, true);
+    game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+    let mut input = input::Input::default();
+    input.button(input::Action::Use, false);
+    game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+    let mut t = 0.0;
+    while t < 2.0 {
+        game.step(Intent::default(), tick);
+        t += tick;
+    }
+    if game
+        .scene
+        .player
+        .as_ref()
+        .is_none_or(|p| p.driving.is_some())
+    {
+        println!("runover-check: FAIL she did not get out of the {label}");
+        return false;
+    }
+    let Some(start) = game
+        .scene
+        .world
+        .as_ref()
+        .and_then(|w| w.physics.vehicle_transform(id))
+    else {
+        println!("runover-check: FAIL the {label} has no place");
+        return false;
+    };
+    let (_, facing, home) = start.to_scale_rotation_translation();
+    let ahead = start
+        .transform_vector3(Vec3::Z)
+        .with_y(0.0)
+        .normalize_or(Vec3::Z);
+    let mut lost = Vec::new();
+    for speed in [0.0f32, 4.0, 8.0, 12.0] {
+        // Each run from where she parked it, her 7 m ahead.
+        if let Some(w) = game.scene.world.as_mut() {
+            w.physics.place_vehicle(id, home + Vec3::Y * 0.2, facing);
+        }
+        let spot = home + ahead * 7.0;
+        let ground = game
+            .scene
+            .world
+            .as_ref()
+            .and_then(|w| w.physics.cast_ray(spot + Vec3::Y * 3.0, -Vec3::Y, 10.0))
+            .map_or(spot.y, |(d, _)| spot.y + 3.0 - d);
+        game.combat.hp = 100.0;
+        game.combat.down = 0.0;
+        let before = game.combat.run_overs;
+        if let Some(p) = game.scene.player.as_mut() {
+            p.character.position = Vec3::new(spot.x, ground, spot.z);
+            p.character.velocity = Vec3::ZERO;
+        }
+        let mut t = 0.0;
+        while t < 3.0 {
+            if let Some(w) = game.scene.world.as_mut() {
+                let v = w.physics.vehicle_velocity(id);
+                w.physics
+                    .set_vehicle_velocity(id, ahead * speed + Vec3::Y * v.y.min(0.0));
+            }
+            game.step(Intent::default(), tick);
+            // Kept alive (her health back to full each update) so every
+            // contact update is counted: a heavy vehicle would kill her
+            // and the dead take no more (each update's damage is logged).
+            game.combat.hp = game.combat.max_hp;
+            t += tick;
+        }
+        let hits = game.combat.run_overs.0 - before.0;
+        let health = game.combat.run_overs.1 - before.1; // kept alive: the damage done
+        println!(
+            "runover-check: the {label} ({mass:.0} kg) at {speed:.0} m/s into her standing:              {hits} damaging contact updates, {health:.1} health lost"
+        );
+        lost.push(health);
+    }
+    let still = lost[0] == 0.0;
+    let fast = lost[2] > 0.0;
+    let faster = lost[3] > lost[2];
+    println!("runover-check: at rest it does nothing: {}", verdict(still));
+    println!("runover-check: at 8 m/s it hurts her: {}", verdict(fast));
+    println!(
+        "runover-check: at 12 m/s more than at 8: {}",
+        verdict(faster)
+    );
+    println!(
+        "runover-check: slow push at 4 m/s: {:.1} lost (360 code: none for her standing;          Xenia: 2.1-2.6 a frame with her walking): not gated",
+        lost[1]
+    );
+    let ok = still && fast && faster;
+    println!("runover-check: {}", verdict(ok));
+    ok
 }
 
 fn gravity_check(game: &Game) {
