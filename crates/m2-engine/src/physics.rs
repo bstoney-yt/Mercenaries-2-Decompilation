@@ -84,9 +84,15 @@ fn insert_collider(
 /// Rapier's own rules have no such mean). A terrain at the rigid-body
 /// default 0.5 (0x82621820 +0x9C) under a wreck's 0.3 grips at 0.39, not
 /// the 0.3 the least of the two gave.
-struct HavokFriction;
+///
+/// It also drops a ragdoll limb's contacts with the triangles of a fixed
+/// model's shapes on layers the ragdoll's layer does not meet
+/// ([`collision_layers::meets_ragdolls`]; [`CollisionShape::off_ragdoll`]).
+struct HavokFriction<'a> {
+    off_ragdoll: &'a HashMap<r::ColliderHandle, Arc<[(u32, u32)]>>,
+}
 
-impl r::PhysicsHooks for HavokFriction {
+impl r::PhysicsHooks for HavokFriction<'_> {
     fn modify_solver_contacts(&self, context: &mut r::ContactModificationContext) {
         let (Some(a), Some(b)) = (
             context.colliders.get(context.collider1),
@@ -94,8 +100,22 @@ impl r::PhysicsHooks for HavokFriction {
         ) else {
             return;
         };
+        let limb = |c: &r::Collider| c.collision_groups().memberships.contains(RAGDOLL);
+        let passed = |handle, subshape: u32| {
+            self.off_ragdoll
+                .get(&handle)
+                .is_some_and(|runs| runs.iter().any(|&(s, e)| (s..e).contains(&subshape)))
+        };
+        let (limb_a, limb_b) = (limb(a), limb(b));
+        let (h1, h2) = (context.collider1, context.collider2);
         let mixed = (a.friction() * b.friction()).max(0.0).sqrt();
         if let Some(m) = context.rigid_mut() {
+            let through = (limb_a && passed(h2, m.manifold.subshape2))
+                || (limb_b && passed(h1, m.manifold.subshape1));
+            if through {
+                m.solver_contacts.clear();
+                return;
+            }
             *m.friction = mixed;
         }
     }
@@ -190,6 +210,10 @@ pub struct CollisionShape {
     pub path: PathSolid,
     /// Its shapes no vehicle meets ([`Ghost`]), if it has both kinds.
     pub ghost: Option<Ghost>,
+    /// Runs of its triangles (first, past the last) on layers a vehicle
+    /// meets but a ragdoll does not ([`collision_layers::meets_ragdolls`]:
+    /// foliage): a limp body passes through them.
+    pub off_ragdoll: Arc<[(u32, u32)]>,
     /// The box round all its `PHY2` shapes on parts it shows intact,
     /// leaves and shapes nothing meets included (model space), as a path
     /// search sizes it up. From the 360 code: an obstacle's box is its
@@ -314,6 +338,8 @@ struct Split {
     ghost: Vec<[u32; 3]>,
     ghost_path: Vec<[u32; 3]>,
     ghost_part: bool,
+    /// Runs of `solid` a ragdoll passes through.
+    off_ragdoll: Vec<(u32, u32)>,
 }
 
 /// Splits `runs` of `triangles` by `preset`'s layers: a shape on a layer
@@ -333,6 +359,10 @@ fn split_shapes(runs: &[ShapeRun], triangles: &[[u32; 3]], preset: Preset) -> Sp
             } else {
                 out.path_part = true;
             }
+            if !collision_layers::meets_ragdolls(layer) {
+                let from = out.solid.len() as u32;
+                out.off_ragdoll.push((from, from + tris.len() as u32));
+            }
             out.solid.extend_from_slice(tris);
         } else {
             if seen {
@@ -350,6 +380,32 @@ fn split_shapes(runs: &[ShapeRun], triangles: &[[u32; 3]], preset: Preset) -> Sp
         out.ghost_part = false;
     }
     out
+}
+
+/// `runs` of `triangles` (first, past the last) as they fall in the mesh
+/// [`CollisionShape::mesh_of`] keeps of them, which drops the degenerate
+/// ones and so renumbers the rest.
+fn kept_runs(vertices: &[Vec3], triangles: &[[u32; 3]], runs: &[(u32, u32)]) -> Arc<[(u32, u32)]> {
+    if runs.is_empty() {
+        return Arc::new([]);
+    }
+    let n = vertices.len() as u32;
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    let mut kept = 0u32;
+    for (k, t) in triangles.iter().enumerate() {
+        if !(t.iter().all(|&i| i < n) && t[0] != t[1] && t[1] != t[2] && t[0] != t[2]) {
+            continue;
+        }
+        let k = k as u32;
+        if runs.iter().any(|&(a, b)| (a..b).contains(&k)) {
+            match out.last_mut() {
+                Some(last) if last.1 == kept => last.1 = kept + 1,
+                _ => out.push((kept, kept + 1)),
+            }
+        }
+        kept += 1;
+    }
+    out.into()
 }
 
 /// Whether a path search meets `PHY2` shape `s` of a building's model.
@@ -991,6 +1047,7 @@ impl CollisionShape {
             surfaces: Arc::new([]),
             path: PathSolid::All,
             ghost: None,
+            off_ragdoll: Arc::new([]),
             entity_box: None,
             source: None,
             leaves: None,
@@ -1038,6 +1095,7 @@ impl CollisionShape {
             surfaces: runs.into(),
             path: PathSolid::All,
             ghost: None,
+            off_ragdoll: Arc::new([]),
             entity_box: None,
             source: None,
             leaves: None,
@@ -1080,6 +1138,7 @@ impl CollisionShape {
         let surface = self.surfaces.first().map_or(0, |r| r.1);
         let surfaces = vec![surface; split.solid.len()];
         let mut shape = Self::mesh_of(&src.vertices, &split.solid, &surfaces)?;
+        shape.off_ragdoll = kept_runs(&src.vertices, &split.solid, &split.off_ragdoll);
         if split.path_part {
             shape.path = PathSolid::of(&src.vertices, &split.path);
         }
@@ -1186,6 +1245,7 @@ impl CollisionShape {
         let mut ghost_triangles = Vec::new();
         let mut ghost_path = Vec::new();
         let mut ghost_part = false;
+        let mut off_ragdoll: Vec<(u32, u32)> = Vec::new();
         let mut entity_box: Option<(Vec3, Vec3)> = None;
         // Each standing shape's flags, kind and triangles, kept for the
         // other presets ([CollisionShape::as_preset]).
@@ -1264,6 +1324,7 @@ impl CollisionShape {
             ghost_triangles = split.ghost;
             ghost_path = split.ghost_path;
             ghost_part = split.ghost_part;
+            off_ragdoll = split.off_ragdoll;
         }
         let stand_in = !shaped && triangles.is_empty();
         if stand_in {
@@ -1338,6 +1399,7 @@ impl CollisionShape {
             surfaces = vec![drawn_surface(model, lod); triangles.len()];
         }
         let mut shape = Self::mesh_of(&vertices, &triangles, &surfaces)?;
+        shape.off_ragdoll = kept_runs(&vertices, &triangles, &off_ragdoll);
         if path_part {
             shape.path = PathSolid::of(&vertices, &path_triangles);
         }
@@ -3375,6 +3437,9 @@ pub struct Physics {
     surfaces: HashMap<r::ColliderHandle, CollisionShape>,
     /// What of a static a path search does not see in full ([`PathSolid`]).
     path_solid: HashMap<r::ColliderHandle, PathSolid>,
+    /// Fixed models' triangles a ragdoll passes through
+    /// ([`CollisionShape::off_ragdoll`]), by collider.
+    off_ragdoll: HashMap<r::ColliderHandle, Arc<[(u32, u32)]>>,
     /// Each static's shapes no vehicle meets ([Ghost]).
     ghosts: HashMap<StaticKey, r::ColliderHandle>,
     /// Each static's box as a path search sizes it up ([CollisionShape::entity_box]).
@@ -3469,6 +3534,7 @@ impl Physics {
             keys: HashMap::new(),
             surfaces: HashMap::new(),
             path_solid: HashMap::new(),
+            off_ragdoll: HashMap::new(),
             ghosts: HashMap::new(),
             boxes: HashMap::new(),
             debris_groups: HashMap::new(),
@@ -3543,6 +3609,9 @@ impl Physics {
         if !matches!(shape.path, PathSolid::All) {
             self.path_solid.insert(handle, shape.path.clone());
         }
+        if !shape.off_ragdoll.is_empty() {
+            self.off_ragdoll.insert(handle, shape.off_ragdoll.clone());
+        }
         if let Some(b) = shape.entity_box {
             self.boxes.insert(key, b);
         }
@@ -3615,6 +3684,7 @@ impl Physics {
                 self.keys.remove(&h);
                 self.surfaces.remove(&h);
                 self.path_solid.remove(&h);
+                self.off_ragdoll.remove(&h);
                 self.world.remove_collider(h);
             }
         }
@@ -3789,7 +3859,12 @@ impl Physics {
         self.fly_helicopters(dt);
         self.cap_debris_speeds();
         self.weigh_down_ragdolls(dt);
-        self.world.step_with_events(&HavokFriction, &());
+        self.world.step_with_events(
+            &HavokFriction {
+                off_ragdoll: &self.off_ragdoll,
+            },
+            &(),
+        );
         self.cap_ragdoll_speeds();
         self.hold_ragdolls_together();
         self.settle_debris();
@@ -8807,6 +8882,45 @@ mod tests {
     }
 
     #[test]
+    fn a_ragdoll_falls_through_foliage_and_lands_on_a_solid_shape() {
+        // A slab 1.0 to 1.4 m up under a ragdoll dropped from 2 m: solid
+        // (layer 3), it holds the body up; foliage (layer 19, which a
+        // ragdoll's layer 20 does not meet), the body falls to the ground.
+        let rest = |off: bool| {
+            let mut p = ready();
+            let mut slab = CollisionShape::cuboid(Vec3::new(3.0, 0.2, 3.0));
+            if off {
+                slab.off_ragdoll = Arc::new([(0, 1)]);
+            }
+            p.add_static(
+                StaticKey::Cell(7),
+                &slab,
+                Vec3::new(0.0, 1.2, 0.0),
+                Quat::IDENTITY,
+            );
+            let parents = [None, Some(0), Some(1), Some(2), Some(2)];
+            let ys = [2.0, 3.0, 3.45, 3.75, 3.4];
+            let nodes: Vec<Mat4> = ys
+                .iter()
+                .enumerate()
+                .map(|(i, &y)| Mat4::from_translation(Vec3::new(i as f32 * 0.01, y, 0.0)))
+                .collect();
+            let id = p.add_ragdoll(&parents, &nodes, Vec3::ZERO);
+            for _ in 0..240 {
+                p.step(DT);
+            }
+            p.ragdoll_nodes(id).unwrap()[1..]
+                .iter()
+                .map(|m| m.w_axis.y)
+                .fold(f32::MAX, f32::min)
+        };
+        let on_slab = rest(false);
+        let through = rest(true);
+        assert!(on_slab > 1.3, "held by a solid slab: {on_slab}");
+        assert!(through < 0.8, "through foliage to the ground: {through}");
+    }
+
+    #[test]
     fn ragdolls_fall_to_the_ground_and_rays_pass_them() {
         let mut p = ready();
         // Feet, hips, chest, head, and a hand on the chest.
@@ -12123,6 +12237,7 @@ mod tests {
             surfaces: Arc::new([]),
             path: PathSolid::All,
             ghost: None,
+            off_ragdoll: Arc::new([]),
             entity_box: None,
             source: None,
             leaves: None,
