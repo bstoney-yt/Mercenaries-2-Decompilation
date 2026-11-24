@@ -6479,6 +6479,30 @@ impl Physics {
         }
     }
 
+    /// A blast's push on a vehicle, as the 360's rigid push gives it
+    /// (0x8215CBC8): the impulses `pushes` (kg m/s, each at its world
+    /// point) are applied, then the change they made to its linear and
+    /// angular velocity is **topped up** per axis against what it had
+    /// before ([`top_up`], 0x8215BF38), and its velocities are set to the
+    /// old ones plus that (0x8262AA20, 0x8262AAC0). A push never adds to
+    /// speed already going its way, only brings it up to the push's.
+    pub fn push_vehicle_topped(&mut self, id: VehicleId, pushes: &[(Vec3, Vec3)]) {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return;
+        };
+        let Some(body) = self.world.bodies.get_mut(v.controller.chassis) else {
+            return;
+        };
+        let (linear, angular) = (vec3(body.linvel()), vec3(body.angvel()));
+        for &(impulse, at) in pushes {
+            body.apply_impulse_at_point(vector(impulse), vector(at), true);
+        }
+        let dv = vec3(body.linvel()) - linear;
+        let dw = vec3(body.angvel()) - angular;
+        body.set_linvel(vector(linear + top_up(dv, linear)), true);
+        body.set_angvel(vector(angular + top_up(dw, angular)), true);
+    }
+
     /// Shoves a vehicle: `impulse` (kg m/s) applied at world point `at`.
     pub fn push_vehicle(&mut self, id: VehicleId, impulse: Vec3, at: Vec3) {
         let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
@@ -7711,6 +7735,25 @@ impl Physics {
     }
 }
 
+/// A push's change `change` to a velocity `before`, per axis as the
+/// 360's rigid push takes it (0x8215BF38): along an axis where the push
+/// goes the way the body already moves, only what it exceeds that speed
+/// by (never less than nothing); against it, or from rest, all of it.
+pub fn top_up(change: Vec3, before: Vec3) -> Vec3 {
+    let axis = |d: f32, b: f32| {
+        if d * b > 0.0 {
+            d.signum() * (d.abs() - b.abs()).max(0.0)
+        } else {
+            d
+        }
+    };
+    Vec3::new(
+        axis(change.x, before.x),
+        axis(change.y, before.y),
+        axis(change.z, before.z),
+    )
+}
+
 /// Normals flatter than this (their up part, of 1) are walls a walk
 /// pushes against rather than ground under it.
 const WALL_NORMAL_Y: f32 = 0.7;
@@ -8662,6 +8705,29 @@ mod tests {
     }
 
     const DT: f32 = 1.0 / 60.0;
+
+    // The 360's rigid push tops speed up rather than adding to it (Xenia
+    // phys5, a Phoenix's death): rising at 9.094 m/s, the frag's push
+    // (7.5 m/s each way, away (-0.676, -0.737)) and then the fx's (4.5)
+    // give it (-6.43, 0, -5.53) between them, none upward: the measured
+    // (-6.43, gravity only, -5.55).
+    #[test]
+    fn a_blast_push_tops_speed_up_and_never_adds_to_it() {
+        let away = Vec3::new(-0.676, 0.0, -0.737);
+        let push = |p: f32| Vec3::new(away.x * p, p, away.z * p);
+        let start = Vec3::new(3.394, 9.094, 1.171);
+        let a = start + top_up(push(7.5), start);
+        let b = a + top_up(push(4.5), a);
+        let change = b - start;
+        assert!((change.x + 6.43).abs() < 0.01, "{change}");
+        assert!((change.z + 5.53).abs() < 0.01, "{change}");
+        assert_eq!(change.y, 0.0);
+        // From rest it is all of it; against the way it moves, all of it.
+        assert_eq!(top_up(push(4.5), Vec3::ZERO), push(4.5));
+        assert_eq!(top_up(Vec3::X * -2.0, Vec3::X * 3.0), Vec3::X * -2.0);
+        // The same way and slower than it already goes: nothing.
+        assert_eq!(top_up(Vec3::Y * 2.0, Vec3::Y * 3.0), Vec3::ZERO);
+    }
 
     /// A square of `half` metres at height `y`, centred on (x, z).
     fn floor(physics: &mut Physics, key: u32, x: f32, z: f32, y: f32, half: f32) {
