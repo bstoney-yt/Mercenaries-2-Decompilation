@@ -4598,6 +4598,10 @@ impl Physics {
                         .unwrap_or(BodyMaterial::COMMON)
                         .angular_damping,
                 )
+                // Its template's `PhysicsPropertyGravityScaler`
+                // ([`vehicle_gravity_scale`]): a tank falls at twice the
+                // world's gravity, in the air and on the ground.
+                .gravity_scale(vehicle_gravity_scale(spec.tuning.gravity_scale))
                 .can_sleep(false)
                 .ccd_enabled(true),
         );
@@ -7652,6 +7656,23 @@ impl Physics {
     }
 }
 
+/// A vehicle's `PhysicsPropertyGravityScaler` `scale` as the 360 applies
+/// it: as a prop's ([`prop_gravity_scale`]), none read as 1.
+///
+/// From the 360 code: a vehicle's bodies are built by the same set-up as
+/// a prop's (0x823FDB60 for a car, then 0x821831B0), which gives each
+/// moving body a gravity action (vtable 0x820C8284, scale at +0x28). Its
+/// step (0x82180778), every physics step whatever the body touches, gives
+/// the body `(scale - 1) x mass x dt` times the gravity of the world the
+/// body is in (the vector loaded from its world, body +8, at +0x10:
+/// [`WORLD_GRAVITY`]), through 0x821755C8. So a scaled body is pulled by
+/// `scale x` [`WORLD_GRAVITY`] in all: 18 m/s² for a tank's 2. The car
+/// code's own `GravityFactor` pull ([`GRAVITY_360`], with its wheels
+/// down) is a separate push on top, from the car's own step.
+pub fn vehicle_gravity_scale(scale: Option<f32>) -> f32 {
+    scale.map_or(1.0, prop_gravity_scale)
+}
+
 /// A template's `PhysicsPropertyGravityScaler` as the 360 applies it to a
 /// prop's bodies: clamped to [-10, 10] (0x821831B0 with 0x82DE8C30 and
 /// 0x820BAEEC); not a number reads 1.
@@ -8640,6 +8661,27 @@ mod tests {
         assert!((fall(plain) - WORLD_GRAVITY).abs() < 0.2, "{}", fall(plain));
         assert!((fall(carbine) - 13.5).abs() < 0.3, "{}", fall(carbine));
         assert!((fall(gunbox) - 31.5).abs() < 0.6, "{}", fall(gunbox));
+    }
+
+    // A tank's `PhysicsPropertyGravityScaler` of 2 pulls it at twice the
+    // world's gravity in the air, 18 m/s²; one with none at the world's
+    // 9; the scale is clamped as a prop's.
+    #[test]
+    fn a_scaled_tank_falls_at_twice_the_worlds_gravity() {
+        assert_eq!(vehicle_gravity_scale(None), 1.0);
+        assert_eq!(vehicle_gravity_scale(Some(2.0)), 2.0);
+        assert_eq!(vehicle_gravity_scale(Some(40.0)), 10.0);
+        let mut p = Physics::new();
+        let mut scaled = tank();
+        scaled.tuning.gravity_scale = Some(2.0);
+        let plain = p.add_vehicle_turned(&tank(), Vec3::new(0.0, 500.0, 0.0), Quat::IDENTITY);
+        let heavy = p.add_vehicle_turned(&scaled, Vec3::new(30.0, 500.0, 0.0), Quat::IDENTITY);
+        for _ in 0..30 {
+            p.step(DT);
+        }
+        let fall = |id| -p.vehicle_velocity(id).y / (30.0 * DT);
+        assert!((fall(plain) - WORLD_GRAVITY).abs() < 0.3, "{}", fall(plain));
+        assert!((fall(heavy) - 18.0).abs() < 0.5, "{}", fall(heavy));
     }
 
     /// A square of `half` metres at height `y`, centred on (x, z).

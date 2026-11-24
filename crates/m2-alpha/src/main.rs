@@ -322,6 +322,9 @@ struct Options {
     paradrop_check: bool,
     /// `--gravity-check`: measure the physics world's gravity ([`gravity_check`]).
     gravity_check: bool,
+    /// `--vehicle-gravity-check`: her vehicle's fall in the air by its
+    /// template's gravity scale ([`vehicle_gravity_check`]).
+    vehicle_gravity_check: bool,
     /// `--ditch-check`: (turns on --drive) out of her car at 18 m/s and
     /// what she plays on foot after ([`ditch_check`]).
     ditch_check: bool,
@@ -1167,6 +1170,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--gravity-check" => {
                 o.gravity_check = true;
+                o.drive = true;
+            }
+            "--vehicle-gravity-check" => {
+                o.vehicle_gravity_check = true;
                 o.drive = true;
             }
             "--stagger-check" => o.stagger_check = true,
@@ -8112,6 +8119,10 @@ fn drive_for_screenshot(
         gravity_check(game);
         return Ok(());
     }
+    if options.vehicle_gravity_check {
+        vehicle_gravity_check(game);
+        return Ok(());
+    }
     if options.ditch_check {
         ditch_check(game, tick);
         return Ok(());
@@ -13223,6 +13234,62 @@ fn ditch_check(game: &mut Game, tick: f32) {
         verdict(ok2)
     );
     eprintln!("ditch-check: {}", verdict(ok && ok2));
+}
+
+/// The airborne fall `--vehicle-gravity-check` asks of a scaled tank,
+/// m/s² (code-derived, not yet measured: 2 x the world's 9.0, from the
+/// gravity action 0x82180778; Xenia is to measure the M1A2's), and how
+/// near.
+const SCALED_TANK_FALL: (f32, f32) = (18.0, 0.5);
+
+/// `--vehicle-gravity-check` (it turns on `--drive`; give `--vehicle
+/// m1a2`): her vehicle's spec, alone in an empty physics world 500 m up,
+/// let fall 0.5 s; its fall (m/s², from its speed) logged beside the
+/// world's gravity times its template's `PhysicsPropertyGravityScaler`.
+/// `PASS` when it carries a scale of 2 and falls within
+/// [`SCALED_TANK_FALL`]; else `FAIL` with why.
+fn vehicle_gravity_check(game: &Game) {
+    use m2_engine::Physics;
+    use m2_engine::physics::{WORLD_GRAVITY, vehicle_gravity_scale};
+    use m2_math::glam::{Quat, Vec3};
+    const DT: f32 = 1.0 / 60.0;
+    let Some(spec) = game
+        .scene
+        .player
+        .as_ref()
+        .and_then(|pl| pl.driving)
+        .map(|i| &game.scene.vehicles[i].spec)
+    else {
+        eprintln!("vehicle-gravity-check: FAIL she drives nothing");
+        return;
+    };
+    let scale = spec.tuning.gravity_scale;
+    let mut p = Physics::new();
+    let id = p.add_vehicle_turned(spec, Vec3::new(0.0, 500.0, 0.0), Quat::IDENTITY);
+    let steps = 30;
+    for _ in 0..steps {
+        p.step(DT);
+    }
+    let fall = -p.vehicle_velocity(id).y / (steps as f32 * DT);
+    let (want, slack) = SCALED_TANK_FALL;
+    eprintln!(
+        "vehicle-gravity-check: the {} (scale {scale:?}) falls at {fall:.2} m/s/s in the air; the world's {WORLD_GRAVITY} x {} = {:.2}; a scaled tank's {want} (code-derived, not yet measured)",
+        spec.label,
+        vehicle_gravity_scale(scale),
+        WORLD_GRAVITY * vehicle_gravity_scale(scale)
+    );
+    match scale {
+        Some(2.0) if (fall - want).abs() <= slack => {
+            eprintln!("vehicle-gravity-check: PASS")
+        }
+        Some(2.0) => {
+            eprintln!("vehicle-gravity-check: FAIL it falls at {fall:.2}, not {want} +- {slack}")
+        }
+        _ => eprintln!(
+            "vehicle-gravity-check: FAIL the {} carries no gravity scale of 2 ({scale:?}): not a scaled tank",
+            spec.label
+        ),
+    }
 }
 
 fn gravity_check(game: &Game) {
