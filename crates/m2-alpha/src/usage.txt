@@ -240,6 +240,8 @@ m2-alpha [options]
                          and the use key pressed; what she plays on foot after,
                          against Xenia's Jump 0.41 s + JumpLandStationary 0.52 s;
                          PASS/FAIL
+  --runover-check        check: (turns on --drive) her vehicle driven at her on
+                         foot at 0/4/8/12 m/s; the 360 proxy contact damage; PASS/FAIL
   --gravity-check        check: (turns on --drive) the physics world's gravity
                          against the 360's 9.0 m/s^2: a block dropped 20 m,
                          the vehicle she gets in driven off a 10 m ledge,
