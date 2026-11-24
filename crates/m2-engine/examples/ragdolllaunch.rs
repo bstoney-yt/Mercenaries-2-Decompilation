@@ -4,12 +4,17 @@
 //! 360 (a wrecked car's rider lands 7.5 to 11 m out, 1.6 to 2.9 m up).
 //!
 //! ```text
-//! cargo run --release -p m2-engine --example ragdolllaunch -- <vz.wad> [max force] [seat height]
+//! cargo run --release -p m2-engine --example ragdolllaunch -- <vz.wad> [max force] [seat height] [throws]
 //! ```
 //!
 //! The body is the ragdoll asset's own skeleton as bound (standing),
 //! raised by the seat height (default 0.6 m, a car seat), the blast 1, 2
-//! and 3 m away across the ground at its feet. Prints numbers only.
+//! and 3 m away across the ground at its feet, the push's point at the
+//! middle of its jitter. With a number of throws, that many from 2 m
+//! away, each with the point jittered at random as the 360 does
+//! (0x824281C8: up to half a metre across, up to 1.75 m up), and where
+//! they first come down summed up (the 360's throws vary with the
+//! point: the struck bone is the one nearest it). Prints numbers only.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -27,6 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: ragdolllaunch <vz.wad> [max force] [seat]")?;
     let max_force: f32 = args.next().map_or(Ok(500.0), |a| a.parse())?;
     let seat: f32 = args.next().map_or(Ok(0.6), |a| a.parse())?;
+    let throws: u32 = args.next().map_or(Ok(0), |a| a.parse())?;
     let mut wad = WadArchive::open(BufReader::new(File::open(path)?))?;
     let block = wad
         .index()
@@ -71,7 +77,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         doll.mass(),
         nodes[hips].w_axis.y
     );
-    for away in [1.0f32, 2.0, 3.0] {
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut random = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 40) as f32 / (1u64 << 24) as f32
+    };
+    let runs: Vec<(f32, [f32; 3])> = if throws == 0 {
+        [1.0, 2.0, 3.0].map(|a| (a, [0.5; 3])).to_vec()
+    } else {
+        (0..throws)
+            .map(|_| (2.0, [random(), random(), random()]))
+            .collect()
+    };
+    let mut downs = Vec::new();
+    for (away, jitter) in runs {
         let mut p = Physics::new();
         let half = 200.0;
         let ground = CollisionShape::mesh(
@@ -90,9 +111,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("ragdoll not built")?;
         let feet = Vec3::new(0.0, seat, 0.0);
         let centre = Vec3::new(-away, 0.0, 0.0);
-        // The vehicle wreck's blast: reach 10 m, least falloff 0.3; the
-        // point at the middle of its jitter.
-        let i = blast_impulse(centre, feet, 10.0, max_force, 0.3, 1.0, [0.5, 0.5, 0.5]);
+        // The vehicle wreck's blast: reach 10 m, least falloff 0.3.
+        let i = blast_impulse(centre, feet, 10.0, max_force, 0.3, 1.0, jitter);
         let l = Launch::new(&i, Vec3::Y);
         let start = nodes[hips].w_axis.truncate();
         let dt = 1.0 / 60.0;
@@ -109,6 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 first_down = Some(((now - start).with_y(0.0).length(), k as f32 * dt));
             }
         }
+        downs.extend(first_down.map(|d| d.0));
         let end = p.ragdoll_nodes(id).ok_or("gone")?[hips].w_axis.truncate();
         println!(
             "blast {away} m away: launch {:.1} m/s, hips up to {:.2} m, first down {:.2?} (m, s), rests {:.2} m out",
@@ -116,6 +137,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             top,
             first_down,
             (end - start).with_y(0.0).length()
+        );
+    }
+    if throws > 0 && !downs.is_empty() {
+        downs.sort_by(f32::total_cmp);
+        let at = |q: f32| downs[((downs.len() - 1) as f32 * q).round() as usize];
+        println!(
+            "{} throws first down: least {:.2}, quarter {:.2}, median {:.2}, three quarters {:.2}, most {:.2} m",
+            downs.len(),
+            at(0.0),
+            at(0.25),
+            at(0.5),
+            at(0.75),
+            at(1.0)
         );
     }
     Ok(())
