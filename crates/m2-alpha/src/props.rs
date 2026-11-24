@@ -1811,6 +1811,11 @@ impl Props {
         Some((p, self.models.get(&p.model).is_some_and(Option::is_some)))
     }
 
+    /// Where `entity` was shown (put up), if it is.
+    pub fn place_of(&self, entity: u32) -> Option<Vec3> {
+        self.shown.get(&entity).map(|p| p.position)
+    }
+
     /// Those shown, by entity.
     pub fn shown(&self) -> impl Iterator<Item = (u32, &Prop)> {
         self.shown.iter().map(|(&e, p)| (e, p))
