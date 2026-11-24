@@ -1836,9 +1836,6 @@ pub struct Combat {
     /// The scripts made her invincible (while the screen fades, at the
     /// fanfare): nothing hurts her.
     pub invincible: bool,
-    /// Seconds before a vehicle can hurt her again by running into her
-    /// ([`crate::npc::RAM_GAP`]).
-    pub rammed: f32,
     /// Vehicles that ran into her, and the health they took.
     pub run_overs: (u32, f32),
     /// The scripts keep her from dying (`Player.SetHealthClamp`): her
@@ -2334,7 +2331,6 @@ impl Default for Combat {
             weapon: Weapon::Rifle,
             down: 0.0,
             invincible: false,
-            rammed: 0.0,
             run_overs: (0, 0.0),
             health_clamp: false,
             survival: false,
@@ -4420,50 +4416,82 @@ impl Combat {
         self.npc_shoot(&mut f, 0, target);
     }
 
-    /// Vehicles running into her on foot: one moving faster than
-    /// [`crate::npc::RUN_OVER`] whose hull (padded as a person's is,
-    /// [`crate::npc::People::traffic`]) holds her hurts her by its ram times
-    /// the damage table's cell for her row, `Hero`, and its ram's kind,
-    /// `Car` ([`m2_engine::durability::run_over`]: the `Hero` row takes a
-    /// fifth of a `Car`'s; from the data), at most once a
-    /// [`crate::npc::RAM_GAP`]. What she takes is the table's; when the
-    /// ram counts, its size and the gap are invented, as for people.
-    pub fn vehicles_hit_her(&mut self, f: &mut Field<'_>, dt: f32) {
-        self.rammed -= dt;
+    /// Vehicles running into her on foot, as the 360's proxy contacts do
+    /// ([`m2_engine::run_over`]): each update a vehicle's hull touches her,
+    /// the touch makes a collision event (0x82178AD8) and the crash step
+    /// (0x8228B5F0, 0x82287CF8) hurts her by a hundredth of its size times
+    /// her damage table cell (`Hero`'s for the vehicle's `Car`), only
+    /// when the vehicle moves at 1 m/s or more and closes on her at 6 m/s
+    /// or more, and only past 1.
+    ///
+    /// **Inferred**: her proxy's contact with the vehicle is her capsule
+    /// within its hull (padded as a person's is, [`crate::npc::in_ram`]);
+    /// the contact point is the nearest point of the hull's box to her
+    /// middle and the normal points from it to her, level; her mass (proxy
+    /// +0x70) is `_HumanPhysics` `Mass` ([`BODY_MASS`]). Each game step is
+    /// one contact update.
+    pub fn vehicles_hit_her(&mut self, f: &mut Field<'_>, _dt: f32) {
         // Only on foot: seated, her own vehicle's hull holds her (playtest
         // 5: driving hurt her once a second, 22 times in one drive).
-        if self.rammed > 0.0 || f.player.driving.is_some() {
+        if f.player.driving.is_some() {
             return;
         }
         let hero = m2_assets::name_hash("Hero");
         let kind = m2_assets::name_hash(m2_engine::durability::RAM_KIND);
+        let cell = self
+            .damage_table
+            .as_ref()
+            .and_then(|t| t.scale(hero, kind))
+            .unwrap_or(1.0);
         let her = f.player.character.position + Vec3::Y * 0.9;
-        let mut hit = None;
+        let her_velocity = f.player.character.velocity;
+        let mut hits = Vec::new();
         for v in f.vehicles.iter() {
             let Some(id) = v.id else { continue };
             let Some(at) = f.physics.vehicle_transform(id) else {
                 continue;
             };
-            let velocity = f.physics.vehicle_velocity(id);
-            let speed = velocity.length();
-            if speed < crate::npc::RUN_OVER {
+            let (lo, hi) = v.spec.hull;
+            let local = at.inverse().transform_point3(her);
+            if !crate::npc::in_ram(local, (lo, hi)) {
                 continue;
             }
-            let (lo, hi) = v.spec.hull;
-            if crate::npc::in_ram(at.inverse().transform_point3(her), (lo, hi)) {
-                let damage = self
-                    .damage_table
-                    .as_ref()
-                    .map_or(m2_engine::durability::ram(v.spec.mass, speed), |t| {
-                        m2_engine::durability::run_over(t, hero, kind, v.spec.mass, speed)
-                    });
-                hit = Some((damage, at.transform_point3((lo + hi) * 0.5)));
-                break;
+            let inside = local.cmpge(lo).all() && local.cmple(hi).all();
+            let point = at.transform_point3(local.clamp(lo, hi));
+            let normal = (her - point).with_y(0.0);
+            let normal = if normal.length_squared() > 1e-6 {
+                normal.normalize()
+            } else {
+                (her - at.transform_point3((lo + hi) * 0.5))
+                    .with_y(0.0)
+                    .normalize_or(Vec3::X)
+            };
+            let origin = at.transform_point3(Vec3::ZERO);
+            let velocity = f.physics.vehicle_velocity(id);
+            let spin = f.physics.vehicle_spin(id);
+            let touch = m2_engine::run_over::Touch {
+                person_mass: BODY_MASS,
+                person_velocity: her_velocity,
+                body_mass: v.spec.mass,
+                body_velocity: velocity + spin.cross(point - origin),
+                normal,
+            };
+            let Some(event) = touch.event() else { continue };
+            let damage = m2_engine::run_over::person_damage(&event, velocity.length(), cell);
+            eprintln!(
+                "run over: contact: closing {:.2} m/s, size {:.1}, vehicle {:.2} m/s, damage {damage:.2}, her middle {} the hull, {:.2} m along it",
+                event.closing,
+                event.size,
+                velocity.length(),
+                if inside { "inside" } else { "outside" },
+                local.z
+            );
+            if damage > 0.0 {
+                hits.push((damage, point));
             }
         }
-        if let Some((damage, from)) = hit {
+        for (damage, from) in hits {
             let lost = self.hurt_player(f, damage, Some(from));
-            self.rammed = crate::npc::RAM_GAP;
             self.run_overs.0 += 1;
             self.run_overs.1 += lost;
             eprintln!("run over: a vehicle ran into her for {damage:.1} ({lost:.1} health lost)");

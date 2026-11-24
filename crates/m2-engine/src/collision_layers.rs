@@ -128,6 +128,21 @@ pub fn meet(a: u32, b: u32) -> bool {
     FILTER[(a & 31) as usize] >> (b & 31) & 1 != 0
 }
 
+/// The layer of a person's ragdoll bodies. From the 360 code: the
+/// ragdoll's build (0x8218F980) hands 0x8216C570 the layer set
+/// `[-1, -1, 20, -1, -1, -1, -1, -1]`, and every one of its 12 shapes
+/// (`PHY2` flags 0x27, from samples) takes entry 2 of it (0x8216C308).
+pub const RAGDOLL_LAYER: u32 = 20;
+
+/// Whether a ragdoll's bodies meet a body on `layer`
+/// ([`RAGDOLL_LAYER`]'s row, 0x28C5BB6F): the world, buildings' and
+/// props' solid shapes, loose props and vehicles; not each other, nor a
+/// person's own proxy (21), foliage (19), or shapes without the solid
+/// flag (4, 7, 14, 17).
+pub fn meets_ragdolls(layer: u32) -> bool {
+    meet(RAGDOLL_LAYER, layer)
+}
+
 /// Which of the presets a fixed model's body takes (0x821697D0), by its
 /// template: a `_BuildingPhysics` one (and one with neither component)
 /// [`BUILDING`]; a `_PropPhysics` or `_DebrisPhysics` one [`PROP`]
@@ -292,5 +307,27 @@ mod tests {
         for shape in [4, 7, 14, 17] {
             assert!(!meet(8, shape));
         }
+    }
+
+    /// Layer 20 (a ragdoll) meets the world, vehicles' layers and solid
+    /// building and prop shapes, not foliage, itself, the proxy or a
+    /// non-solid shape; the table is symmetric.
+    #[test]
+    fn a_ragdoll_meets_what_its_row_says() {
+        for l in [
+            0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 13, 15, 16, 18, 22, 23, 27, 29,
+        ] {
+            assert!(meets_ragdolls(l), "{l}");
+        }
+        for l in [4, 7, 10, 14, 17, 19, 20, 21, 24, 25, 26, 28, 30, 31] {
+            assert!(!meets_ragdolls(l), "{l}");
+        }
+        for l in 0..32 {
+            assert_eq!(meet(RAGDOLL_LAYER, l), meet(l, RAGDOLL_LAYER), "{l}");
+        }
+        // What a vehicle meets that a ragdoll does not, among layers a
+        // fixed model's shapes take: foliage (the building and prop
+        // presets' entry 6).
+        assert!(meets_vehicles(19) && !meets_ragdolls(19));
     }
 }
