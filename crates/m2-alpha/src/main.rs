@@ -2528,6 +2528,40 @@ fn traffic_for_screenshot(
     let mut next_log = 0.0;
     // What lives near her, every 2 s.
     game.census.get_or_insert((2.0, 0.0, 2.0));
+    // Out of every road spawner's reach (q770, e763fcb9: "no traffic car
+    // came out" in 30 s at the start), she is stood by the nearest one
+    // that sends a car along a road: check set-up, not the game's.
+    for _ in 0..(2.0 / tick) as u32 {
+        game.step(Intent::default(), tick);
+    }
+    let focus = game.focus();
+    match game.traffic.nearest_road(focus) {
+        Some((e, name, at, forward, reach)) => {
+            let off = flat_distance(at, focus);
+            if off > reach * TRAFFIC_STAND {
+                let side = forward.cross(m2_math::glam::Vec3::Y).normalize_or_zero();
+                let stand = at + side * TRAFFIC_ASIDE;
+                if let Some(p) = game.scene.player.as_mut() {
+                    p.drop_at(stand);
+                }
+                eprintln!(
+                    "traffic: she is put {TRAFFIC_ASIDE} m beside spawner {e:#x} ({name}, reach {reach:.0} m), {off:.0} m from where she was"
+                );
+                let waited = Instant::now();
+                while !game.scene.player.as_ref().is_some_and(|p| p.landed)
+                    && waited.elapsed() < Duration::from_secs(60)
+                {
+                    game.step(Intent::default(), tick);
+                    render(backend, game, fov, aspect, None)?;
+                }
+            } else {
+                eprintln!(
+                    "traffic: spawner {e:#x} ({name}) is {off:.0} m off, within its reach {reach:.0} m"
+                );
+            }
+        }
+        None => eprintln!("traffic: no road spawner with its layer in to stand her by"),
+    }
     // Each traffic car seen: where first seen and the farthest from there.
     let mut seen: std::collections::HashMap<u32, (m2_math::glam::Vec3, f32)> =
         std::collections::HashMap::new();
@@ -2605,6 +2639,17 @@ fn traffic_for_screenshot(
 /// How far a traffic car must get from where it was first seen to count
 /// as going, metres (`--traffic`).
 const TRAFFIC_MOVED: f32 = 10.0;
+
+/// `--traffic` stands her by the nearest road spawner when she is farther
+/// from it than this share of its reach, this many metres to the side of
+/// where its car starts (check set-up; invented).
+const TRAFFIC_STAND: f32 = 0.5;
+const TRAFFIC_ASIDE: f32 = 15.0;
+
+/// Level distance between two points, metres.
+fn flat_distance(a: m2_math::glam::Vec3, b: m2_math::glam::Vec3) -> f32 {
+    a.with_y(0.0).distance(b.with_y(0.0))
+}
 
 /// `--traffic`'s verdict: at least one traffic car seen, at least one
 /// going ([`TRAFFIC_MOVED`]), none upside down.
