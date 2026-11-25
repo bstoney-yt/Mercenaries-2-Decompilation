@@ -5975,7 +5975,8 @@ struct Watched {
 /// (0x8218CAA8: 0x82185FE0 -> vfunc +0x128) with nothing reading the
 /// ground. The layers author them at rest (survey of 1397 state-layer
 /// and 35 static cars and tanks: 871 within 5 cm of the wheels' rest on
-/// the terrain). It waits until there is something under it within
+/// the terrain). It is added asleep ([`Physics::sleep_vehicle`]). It
+/// waits until there is something under it within
 /// [`AUTHORED_FLOOR`] (its deck or bridge loaded, not only the terrain far
 /// below): invented, the 360 makes it with its layer.
 ///
@@ -6018,7 +6019,13 @@ pub(crate) fn place(
         if !floor {
             return false;
         }
-        v.id = Some(physics.add_vehicle_turned(&v.spec, at, turn.normalize()));
+        let id = physics.add_vehicle_turned(&v.spec, at, turn.normalize());
+        // Added asleep, as the 360's layer loader adds it (its bodies added
+        // with activation 0, 0x82165958; Xenia settle7: a fresh parked
+        // Phoenix asleep from its first sample), until its driver, a push
+        // or something awake touching it wakes it.
+        physics.sleep_vehicle(id);
+        v.id = Some(id);
         return true;
     }
     // (Never where it came out NaN: round 88 lost the start boat, and her

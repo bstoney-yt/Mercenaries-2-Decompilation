@@ -1859,6 +1859,23 @@ struct VehicleBody {
     hinge: Option<TurretHinge>,
     /// Held where it is ([`Physics::hold_vehicle`]): its body fixed.
     held: bool,
+    /// How its body goes to sleep when it keeps still ([`Rest`]): a car's
+    /// or a tank's (`None` for a boat or a helicopter, which never sleep
+    /// here).
+    ///
+    /// From the 360 code: no car or tank set-up turns Havok's spatial
+    /// deactivation off. The only callers of the setter that does
+    /// (0x82629CF0 with 1) are 0x8218CAA8, the +0x120 set-up of one class
+    /// alone (vtable 0x820C8940, built by 0x823FE0C8; the jet's), and the
+    /// constraint pairing 0x82160FF8. The car's set-up (vtable 0x820C8560,
+    /// +0x120 0x82189448) builds its chassis and never calls it, and a
+    /// rebuild (0x821831B0) runs that same set-up again. Xenia settle7: a
+    /// fresh parked Phoenix asleep from its first sample, the El Grande and
+    /// its crates one island that sleeps again 0.7-2.8 s after each wake.
+    /// Invented: a boat or a helicopter never sleeps here (the 360 leaves
+    /// them the same deactivation; their float and rotor steps aren't
+    /// made to stop for it yet), and neither does a wreck.
+    rest: Option<Rest>,
     /// Its velocity before the last step, m/s: what it hit things with.
     before: Vec3,
     /// Its spin before the last step, radians a second about each axis.
@@ -2492,7 +2509,6 @@ struct Tracks {
     asked: (f32, f32),
     grip: Vec<(f32, f32)>,
     lengths: Vec<f32>,
-    rest: Rest,
 }
 
 impl Tracks {
@@ -2504,7 +2520,6 @@ impl Tracks {
             asked: (0.0, 0.0),
             grip: vec![tuning.friction; points],
             lengths: vec![tuning.spring_length(); points],
-            rest: Rest::default(),
         }
     }
 }
@@ -3812,13 +3827,16 @@ impl Physics {
             }
         }
         for h in std::mem::take(&mut self.cargo_sleep) {
-            if !self.paired_with_awake(h)
+            if !self.paired_with_awake(h, false)
                 && let Some(b) = self.world.bodies.get_mut(h)
             {
                 b.sleep();
             }
         }
-        // Goods asleep are woken once something awake reaches them.
+        // Goods asleep in contact with something awake are woken by
+        // Rapier's islands, as Havok's are. Only goods over a bed by less
+        // than their contact margin (2 cm: paired, no contact point yet)
+        // are woken here, once the bed under them is awake.
         self.cargo_bodies
             .retain(|h| self.world.bodies.get(*h).is_some());
         let wake: Vec<r::RigidBodyHandle> = self
@@ -3826,7 +3844,7 @@ impl Physics {
             .iter()
             .copied()
             .filter(|&h| self.world.bodies.get(h).is_some_and(|b| b.is_sleeping()))
-            .filter(|&h| self.paired_with_awake(h))
+            .filter(|&h| self.paired_with_awake(h, true))
             .collect();
         for h in wake {
             if let Some(b) = self.world.bodies.get_mut(h) {
@@ -3898,22 +3916,23 @@ impl Physics {
             if v.held {
                 continue;
             }
-            // A tank's body sleeps once it keeps still, and then nothing
-            // of it runs until it is woken: by its input ([`Physics::drive`])
-            // or by something touching it. Woken, it counts again
+            // A car's or a tank's body sleeps once it keeps still, and then
+            // nothing of it runs (its wheels, springs, tyres or tracks) until
+            // it is woken: by its input ([`Physics::drive`]), a push, a move,
+            // or something awake touching its island. Woken, it counts again
             // (0x8261EEB0 clears its counts).
-            if let Some(tank) = &mut v.tank
+            if let Some(rest) = &mut v.rest
                 && let Some(b) = w.bodies.get_mut(v.controller.chassis)
             {
                 if b.is_sleeping() {
                     // Asleep with its island: it stays so until something
                     // wakes the island (no sleep of rapier's own after).
-                    tank.rest.asleep = true;
+                    rest.asleep = true;
                     rest_hand_off(b, false);
                     continue;
                 }
-                if tank.rest.asleep {
-                    tank.rest.wake();
+                if rest.asleep {
+                    rest.wake();
                 }
                 // Still long enough: its island may sleep at the end of
                 // this step, if every body in it may (its turret and
@@ -3921,7 +3940,7 @@ impl Physics {
                 // is never put to sleep alone: rapier would go on moving
                 // it (gravity) while its tracks no longer hold it up
                 // (PmcCon001: the villa tank fell through the HQ's floor).
-                let still = !v.wrecked && tank.rest.step(vec3(b.center_of_mass()), now);
+                let still = !v.wrecked && rest.step(vec3(b.center_of_mass()), now);
                 rest_hand_off(b, still);
             }
             let filter = ground().exclude_rigid_body(v.controller.chassis);
@@ -4369,13 +4388,18 @@ impl Physics {
     }
 
     /// Whether body `h`'s collision is paired with an awake, moving body's
-    /// (their boxes meet: Rapier's narrow phase has the pair).
-    fn paired_with_awake(&self, h: r::RigidBodyHandle) -> bool {
+    /// (their boxes meet: Rapier's narrow phase has the pair); with
+    /// `gap_only`, only a pair with no contact point yet (one in contact
+    /// Rapier's islands wake by themselves).
+    fn paired_with_awake(&self, h: r::RigidBodyHandle, gap_only: bool) -> bool {
         let Some(b) = self.world.bodies.get(h) else {
             return false;
         };
         b.colliders().iter().any(|&c| {
             self.world.narrow_phase.contact_pairs_with(c).any(|pair| {
+                if gap_only && pair.has_any_active_contact() {
+                    return false;
+                }
                 let other = if pair.collider1 == c {
                     pair.collider2
                 } else {
@@ -4861,6 +4885,10 @@ impl Physics {
                 // ([`vehicle_gravity_scale`]): a tank falls at twice the
                 // world's gravity, in the air and on the ground.
                 .gravity_scale(vehicle_gravity_scale(spec.tuning.gravity_scale))
+                // Rapier's own sleep off: a car's or a tank's body sleeps by
+                // the 360's check instead ([`Rest`], which hands it to
+                // Rapier's island sleep when it may), a boat's or a
+                // helicopter's not at all.
                 .can_sleep(false)
                 .ccd_enabled(true),
         );
@@ -5304,6 +5332,7 @@ impl Physics {
             turret: (turret_colliders, spec.turret_mount()),
             hinge,
             held: false,
+            rest: (hull.is_none() && rotor.is_none()).then(Rest::default),
             before: Vec3::ZERO,
             spin_before: Vec3::ZERO,
             history: None,
@@ -5357,7 +5386,7 @@ impl Physics {
         }
         // A sleeping tank's tracks don't run; any input wakes it (see
         // [`Rest`]).
-        if let Some(tank) = &mut v.tank
+        if v.tank.is_some()
             && let Some(body) = self.world.bodies.get_mut(v.controller.chassis)
             && body.is_sleeping()
         {
@@ -5366,18 +5395,28 @@ impl Physics {
                 return;
             }
             body.wake_up(true);
-            tank.rest.wake();
+            if let Some(rest) = &mut v.rest {
+                rest.wake();
+            }
         }
         // A sleeping car wakes to any input: its input handler
         // wakes its body on each message of a value other than 0
         // (0x82189AC8 -> 0x8261EEB0).
         if v.tank.is_none()
-            && !controls.parked
-            && (controls.throttle != 0.0 || controls.steer != 0.0 || controls.brake)
             && let Some(body) = self.world.bodies.get_mut(v.controller.chassis)
             && body.is_sleeping()
         {
+            let input = !controls.parked
+                && (controls.throttle != 0.0 || controls.steer != 0.0 || controls.brake);
+            // Asleep and asked nothing: its wheels stay as they are (they
+            // don't run while it sleeps).
+            if !input {
+                return;
+            }
             body.wake_up(true);
+            if let Some(rest) = &mut v.rest {
+                rest.wake();
+            }
         }
         let speed = v.controller.current_vehicle_speed;
         let wheels = v.controller.wheels().len().max(1) as f32;
@@ -6066,7 +6105,8 @@ impl Physics {
             .unwrap_or_default()
     }
 
-    /// Whether a vehicle's body is asleep (a tank keeping still, [`Rest`]).
+    /// Whether a vehicle's body is asleep (a car or a tank keeping still,
+    /// [`Rest`], or put to sleep, [`sleep_vehicle`](Self::sleep_vehicle)).
     pub fn vehicle_asleep(&self, id: VehicleId) -> bool {
         self.vehicles
             .get(id.0)
@@ -6661,6 +6701,42 @@ impl Physics {
             body.set_body_type(kind, true);
             body.set_linvel(r::Vector::ZERO, true);
             body.set_angvel(r::Vector::ZERO, true);
+        }
+    }
+
+    /// Puts vehicle `id` to sleep where it is, at rest, with its turret
+    /// and gun: as a layer's vehicle is made, its bodies added to the world
+    /// without waking them (the physics manager's flush, 0x82165958, adds
+    /// with activation 0; Xenia settle7's fresh parked Phoenix asleep from
+    /// its first sample). It stays so until its input, a push, a move or
+    /// something awake touching it wakes it. Not for a boat or a
+    /// helicopter, which don't sleep here.
+    pub fn sleep_vehicle(&mut self, id: VehicleId) {
+        let Some(v) = self
+            .vehicles
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .filter(|v| !v.held && !v.wrecked)
+        else {
+            return;
+        };
+        let Some(rest) = &mut v.rest else {
+            return;
+        };
+        rest.asleep = true;
+        let hinged = v
+            .hinge
+            .iter()
+            .flat_map(|h| std::iter::once(h.body).chain(h.gun.as_ref().map(|g| g.body)));
+        for h in std::iter::once(v.controller.chassis).chain(hinged) {
+            if let Some(b) = self.world.bodies.get_mut(h) {
+                b.set_linvel(r::Vector::ZERO, false);
+                b.set_angvel(r::Vector::ZERO, false);
+                b.sleep();
+                // Rapier wakes a body just added at its next step: asleep
+                // again after it.
+                self.prop_sleep.push(h);
+            }
         }
     }
 
@@ -11850,6 +11926,118 @@ mod tests {
         assert!(dropped < 0.05, "dropped {dropped} m");
         assert!(slid < 0.1, "slid {slid} m");
         assert_eq!(touching, 6);
+    }
+
+    /// A car on flat ground, nobody in it, stepped `seconds`: its world
+    /// and id.
+    fn parked_car(asleep_at_once: bool, seconds: f32) -> (Physics, VehicleId) {
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        if asleep_at_once {
+            p.sleep_vehicle(id);
+        }
+        let parked = VehicleControls {
+            parked: true,
+            ..Default::default()
+        };
+        for _ in 0..(seconds / DT).round() as u32 {
+            p.drive(id, parked);
+            p.step(DT);
+        }
+        (p, id)
+    }
+
+    // A car keeps Havok's spatial deactivation as a tank does (no car
+    // set-up calls 0x82629CF0): parked and still, it sleeps with its
+    // island, and while it sleeps its wheels don't run and it stays put.
+    #[test]
+    fn a_parked_car_sleeps_and_stays_put() {
+        let (mut p, id) = parked_car(false, 4.0);
+        assert!(p.vehicle_asleep(id), "awake after 4 s");
+        let from = p.vehicle_transform(id).unwrap().w_axis;
+        let parked = VehicleControls {
+            parked: true,
+            ..Default::default()
+        };
+        for _ in 0..600 {
+            p.drive(id, parked);
+            p.step(DT);
+        }
+        assert!(p.vehicle_asleep(id), "woke with nothing asked of it");
+        let to = p.vehicle_transform(id).unwrap().w_axis;
+        assert!(
+            (to - from).length() < 1e-4,
+            "moved {}",
+            (to - from).length()
+        );
+    }
+
+    // A car added asleep (as a layer's is, activation 0) is asleep from
+    // its first step, where it was put; any input wakes it (0x82189AC8 ->
+    // 0x8261EEB0), and it drives off.
+    #[test]
+    fn a_car_added_asleep_sleeps_until_driven() {
+        let (mut p, id) = parked_car(true, 1.0 / 60.0);
+        assert!(p.vehicle_asleep(id), "awake after its first step");
+        let from = p.vehicle_transform(id).unwrap().w_axis;
+        for _ in 0..60 {
+            p.drive(id, VehicleControls::default());
+            p.step(DT);
+        }
+        assert!(p.vehicle_asleep(id), "no input woke it");
+        assert_eq!(p.vehicle_transform(id).unwrap().w_axis, from);
+        for _ in 0..90 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        assert!(!p.vehicle_asleep(id), "asleep with its throttle open");
+        let moved = (p.vehicle_transform(id).unwrap().w_axis - from).length();
+        assert!(moved > 0.5, "moved {moved} m");
+    }
+
+    // A push wakes a sleeping car (the 360's body setters wake, 0x8262AA20
+    // and its kin), and so does an awake car driven into it, through its
+    // island.
+    #[test]
+    fn a_sleeping_car_wakes_to_a_push_or_a_car_hitting_it() {
+        let (mut p, id) = parked_car(true, 0.5);
+        assert!(p.vehicle_asleep(id));
+        let at = p.vehicle_transform(id).unwrap().w_axis.truncate();
+        p.push_vehicle(id, Vec3::new(0.0, 0.0, 3000.0), at);
+        p.step(DT);
+        assert!(!p.vehicle_asleep(id), "a push left it asleep");
+
+        let (mut p, id) = parked_car(true, 0.5);
+        let other = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, -12.0), 0.0);
+        let mut woke = false;
+        for _ in 0..300 {
+            p.drive(
+                other,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+            if !p.vehicle_asleep(id) {
+                woke = true;
+                break;
+            }
+        }
+        assert!(woke, "hit by a moving car, it slept on");
     }
 
     #[test]
