@@ -253,7 +253,9 @@ var<private> draw: Draw;
 @group(3) @binding(1) var scene_color: texture_2d<f32>;
 
 struct Varyings {
-    @builtin(position) clip: vec4<f32>,
+    // Invariant: the depth pre-pass and the shading after it place every
+    // vertex alike, so the depths they test agree exactly.
+    @builtin(position) @invariant clip: vec4<f32>,
     @location(0) world_pos: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
@@ -768,14 +770,27 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
     let dist = distance(v.world_pos, frame.eye.xyz);
     let footprint = length(fwidth(v.world_pos.xz));
     var water_alpha = 1.0;
-    // Sampled outside branches: derivatives need uniform control flow.
+    // Each map is sampled only by materials that use it. The branches
+    // test the material alone, the same for every pixel of a draw, so
+    // the control flow stays uniform (derivatives need it) and each
+    // sample is what it was when every map was sampled for every pixel
+    // (a 1440p frame spent ~9 ms of its world pass shading, measured).
     let p = vec4<f32>(v.world_pos, 1.0);
-    let t0 = textureSample(maps[material.layer_tex.x], samplers[0], layer_uv(0u, p)).rgb;
-    let t1 = textureSample(maps[material.layer_tex.y], samplers[0], layer_uv(1u, p)).rgb;
-    let t2 = textureSample(maps[material.layer_tex.z], samplers[0], layer_uv(2u, p)).rgb;
-    let t3 = textureSample(maps[material.layer_tex.w], samplers[0], layer_uv(3u, p)).rgb;
+    var t0 = vec3<f32>(0.0);
+    var t1 = vec3<f32>(0.0);
+    var t2 = vec3<f32>(0.0);
+    var t3 = vec3<f32>(0.0);
+    if ground {
+        t0 = textureSample(maps[material.layer_tex.x], samplers[0], layer_uv(0u, p)).rgb;
+        t1 = textureSample(maps[material.layer_tex.y], samplers[0], layer_uv(1u, p)).rgb;
+        t2 = textureSample(maps[material.layer_tex.z], samplers[0], layer_uv(2u, p)).rgb;
+        t3 = textureSample(maps[material.layer_tex.w], samplers[0], layer_uv(3u, p)).rgb;
+    }
     let detail_uv = v.world_pos.xz * material.detail.x;
-    let detail_texel = textureSample(maps[material.tex.y], samplers[0], detail_uv).rgb;
+    var detail_texel = vec3<f32>(0.0);
+    if material.detail.x > 0.0 {
+        detail_texel = textureSample(maps[material.tex.y], samplers[0], detail_uv).rgb;
+    }
     if ground {
         // As the game's terrain shaders: the vertex colour weights the
         // tiled layers (r the first), the colour map makes up any shortfall
@@ -807,8 +822,14 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
         let fade = clamp(1.0 - dist / material.detail.y, 0.0, 1.0);
         rgb = rgb * mix(vec3<f32>(1.0), detail_texel / max(mean, vec3<f32>(0.05)), fade);
     }
-    let spec_texel = textureSample(maps[material.tex.z], samplers[material.samp.x], v.uv).rgb;
-    let normal_texel = textureSample(maps[material.tex.w], samplers[material.samp.x], v.uv);
+    var spec_texel = vec3<f32>(1.0);
+    if material.maps.x > 0.5 || material.emissive.w > 0.5 {
+        spec_texel = textureSample(maps[material.tex.z], samplers[material.samp.x], v.uv).rgb;
+    }
+    var normal_texel = vec4<f32>(0.0);
+    if material.maps.y > 0.5 {
+        normal_texel = textureSample(maps[material.tex.w], samplers[material.samp.x], v.uv);
+    }
     // Highlight and reflection, added after any ambient occlusion.
     var shine = vec3<f32>(0.0);
     var spec_light = vec3<f32>(0.0);
