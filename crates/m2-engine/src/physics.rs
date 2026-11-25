@@ -5865,6 +5865,22 @@ impl Physics {
             .unwrap_or_default()
     }
 
+    /// Each of a vehicle's wheels' drive force and brake as last set, in
+    /// spec order (what the controls put on it; for logs).
+    pub fn vehicle_wheel_forces(&self, id: VehicleId) -> Vec<(f32, f32)> {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map(|v| {
+                v.controller
+                    .wheels()
+                    .iter()
+                    .map(|w| (w.engine_force, w.brake))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// How far each of a vehicle's wheels sits above where its model has
     /// it, chassis space, metres, in spec order: up as its spring squeezes
     /// over a bump, down as it hangs off a ledge or in the air. Draw the
@@ -6673,6 +6689,27 @@ impl Physics {
     /// boat alike, vtable +0x60 0x82182418) sums its bodies' masses, each
     /// one over its inverse mass (0x8262C120), and answers 0 at the first
     /// body whose inverse mass is 0.
+    /// The world box round vehicle `id`'s chassis body's collision (what
+    /// a blast's rigid push sizes it by: the 360 takes the box of the
+    /// Havok body it pushes, 0x82170500 in 0x8215CBC8).
+    pub fn vehicle_body_box(&self, id: VehicleId) -> Option<(Vec3, Vec3)> {
+        let v = self.vehicles.get(id.0)?.as_ref()?;
+        let body = self.world.bodies.get(v.controller.chassis)?;
+        let mut out: Option<r::Aabb> = None;
+        for &h in body.colliders() {
+            let Some(c) = self.world.colliders.get(h) else {
+                continue;
+            };
+            let a = c.compute_aabb();
+            out = Some(match out {
+                Some(o) => rapier3d::geometry::BoundingVolume::merged(&o, &a),
+                None => a,
+            });
+        }
+        let a = out?;
+        Some((vec3(a.mins), vec3(a.maxs)))
+    }
+
     pub fn vehicle_mass(&self, id: VehicleId) -> Option<f32> {
         let v = self.vehicles.get(id.0)?.as_ref()?;
         let hinge = v.hinge.as_ref();
@@ -7125,6 +7162,66 @@ impl Physics {
                             Some(q) if chassis.contains(&q) => 'v',
                             Some(q) if own.contains(&q) => 's',
                             _ => 'g',
+                        };
+                        if !what.contains(tag) {
+                            what.push(tag);
+                        }
+                    }
+                }
+                Some((k, vec3(b.linvel()).length(), what))
+            })
+            .collect()
+    }
+
+    /// What each limb of ragdoll `id` touches, by kind, for tracing what
+    /// keeps a limp body moving: `v` a vehicle's body, `o` another limb of
+    /// its own, `g` the ground (a terrain cell), `w` other fixed collision
+    /// (a building, a fixed prop), `d` a loose body (debris, a prop body,
+    /// goods, a pickup lying loose), `r` another ragdoll, `?` anything
+    /// else. Each limb's index, speed (m/s) and tags.
+    pub fn ragdoll_limb_contacts(&self, id: RagdollId) -> Vec<(usize, f32, String)> {
+        let Some(doll) = self.ragdolls.get(id.0).and_then(Option::as_ref) else {
+            return Vec::new();
+        };
+        let chassis: Vec<_> = self
+            .vehicles
+            .iter()
+            .flatten()
+            .map(|v| v.controller.chassis)
+            .collect();
+        let own: Vec<_> = doll.bodies.iter().flatten().copied().collect();
+        let loose: Vec<_> = self.debris.iter().flatten().copied().collect();
+        let dolls: Vec<_> = self
+            .ragdolls
+            .iter()
+            .flatten()
+            .flat_map(|d| d.bodies.iter().flatten().copied())
+            .collect();
+        doll.bodies
+            .iter()
+            .enumerate()
+            .filter_map(|(k, h)| {
+                let b = self.world.bodies.get((*h)?)?;
+                let mut what = String::new();
+                for &c in b.colliders() {
+                    for p in self.world.narrow_phase.contact_pairs_with(c) {
+                        if !p.has_any_active_contact() {
+                            continue;
+                        }
+                        let other = if p.collider1 == c {
+                            p.collider2
+                        } else {
+                            p.collider1
+                        };
+                        let parent = self.world.colliders.get(other).and_then(|o| o.parent());
+                        let tag = match (parent, self.keys.get(&other)) {
+                            (Some(q), _) if chassis.contains(&q) => 'v',
+                            (Some(q), _) if own.contains(&q) => 'o',
+                            (Some(q), _) if loose.contains(&q) => 'd',
+                            (Some(q), _) if dolls.contains(&q) => 'r',
+                            (_, Some(StaticKey::Cell(_))) => 'g',
+                            (_, Some(_)) => 'w',
+                            _ => '?',
                         };
                         if !what.contains(tag) {
                             what.push(tag);
@@ -8122,8 +8219,6 @@ mod tests {
         assert_eq!(ai_wobble(3.0, 0.6), [0.0; 3]);
     }
 
-    // 0x82153B30: a building, the ground or debris lets a road vehicle
-    // come out in its box; a prop there doesn't.
     #[test]
     fn a_spawn_box_is_kept_by_props_not_by_buildings() {
         let mut p = Physics::new();

@@ -152,6 +152,10 @@ pub struct Game {
     /// The layers' parked vehicles' whole authored turns, by entity:
     /// placed as authored ([`place`]).
     authored: HashMap<u32, Quat>,
+    /// The island's vehicles placed and still watched: entity, body,
+    /// where it was put and how, and how many steps logged so far
+    /// ([`Game::log_first_steps`]).
+    just_placed: Vec<Watched>,
     /// The scripts' (mission) vehicles placed as authored (their layer
     /// entity's `Transform`), by guid: where and turned how
     /// (`--parked-settle-check`).
@@ -509,6 +513,43 @@ impl Game {
         if let Some(arms) = scene.arms() {
             combat.arm(arms, scene.damage_table());
         }
+        if let Some(w) = &scene.world {
+            let db = &w.index.template_db;
+            // Each effect template by name hash: its own `Explosive`, and
+            // each `PhysicalLink`'d template's (fx_Explosion_Large's
+            // `Explosion (RPG Frag)`), with the link's offset. From the
+            // 360 code: a template's object spawns its `PhysicalLink`s at
+            // its own transform with the link's (0x82408C30 -> 0x82409AA8).
+            let blast = |t: u32| {
+                db.explosions.get(&t).map(|e| m2_engine::weapons::Blast {
+                    template: t,
+                    radius: e.radius,
+                    damage: e.damage,
+                    min_damage: e.least,
+                    max_force: e.force,
+                    key: (e.kind != 0).then_some(e.kind),
+                })
+            };
+            combat.wreck_blasts = db
+                .names
+                .iter()
+                .filter_map(|(&t, name)| {
+                    let mut all: Vec<(Vec3, m2_engine::weapons::Blast)> =
+                        blast(t).map(|b| (Vec3::ZERO, b)).into_iter().collect();
+                    for l in db.links.get(&t).into_iter().flatten() {
+                        all.extend(blast(l.child).map(|b| (l.offset, b)));
+                    }
+                    (!all.is_empty()).then(|| (m2_assets::name_hash(name), all))
+                })
+                .collect();
+            combat.blast_effects = db
+                .explosions
+                .iter()
+                .filter_map(|(t, e)| {
+                    Some((m2_assets::name_hash(db.names.get(t)?), (e.radius, e.force)))
+                })
+                .collect();
+        }
         combat.particle_table = scene.particle_table();
         own_explosives(&mut combat, scene.hero_explosives());
         eprintln!(
@@ -549,6 +590,7 @@ impl Game {
             winches: Default::default(),
             fetched: HashSet::new(),
             authored: HashMap::new(),
+            just_placed: Vec::new(),
             authored_guids: HashMap::new(),
             given_guids: HashMap::new(),
             traffic: crate::traffic::Traffic::default(),
@@ -715,6 +757,12 @@ impl Game {
         })
     }
 
+    /// Whether the layers have asked for entity `entity`'s vehicle
+    /// (placed, or still loading).
+    pub(crate) fn layers_asked(&self, entity: u32) -> bool {
+        self.fetched.contains(&entity)
+    }
+
     /// Island vehicles asked for that have not been placed yet.
     pub fn island_vehicles_loading(&self) -> bool {
         if self.startup.as_ref().is_some_and(Startup::loading) {
@@ -791,6 +839,22 @@ impl Game {
                     "island vehicle {entity:#x}: {} parked at ({:.0}, {:.0}, {:.0})",
                     v.spec.label, at.x, at.y, at.z
                 );
+                if let Some(id) = v.id
+                    && let Some(m) = world.physics.vehicle_transform(id)
+                {
+                    let (_, turn, put) = m.to_scale_rotation_translation();
+                    self.just_placed.push(Watched {
+                        entity,
+                        id,
+                        put,
+                        turn,
+                        n: 0,
+                        crossed: 0,
+                        last: put,
+                        still: 0.0,
+                        moved: false,
+                    });
+                }
             }
         }
         self.vehicle_wait -= dt;
@@ -838,6 +902,8 @@ impl Game {
                 rotation: e.rotation,
             }))
             .filter(|t| !self.fetched.contains(&t.entity) && t.at.y > HIDDEN_BELOW)
+            // One the scripts have made is theirs, not built twice.
+            .filter(|t| crate::scene::layers_may_build(&scene.script_owned, t.entity))
             .filter_map(|t| {
                 let d = t.at.distance(near);
                 (d <= VEHICLE_REACH).then_some((d, t))
@@ -1865,6 +1931,7 @@ impl Game {
             }
         }
         split("game: player and physics");
+        self.log_first_steps(dt);
         // The vehicles' load beds, looked up once a model.
         if let Some(source) = self.scene.source.as_mut() {
             for v in &self.scene.vehicles {
@@ -5679,6 +5746,164 @@ fn spray(world: &World, vehicles: &[ParkedVehicle], combat: &mut Combat) {
 }
 
 impl Game {
+    /// Logs each island vehicle placed before this step, after its very
+    /// first physics step: how far it moved and turned, its speed and spin,
+    /// its wheels down and each spring's squeeze from its rest length, and
+    /// what its body touches. A spring launch (squeezed springs, a speed up)
+    /// tells apart from a shove (a touch, a speed level).
+    ///
+    /// The ones in [`FIRST_STEPS_WATCHED`] are then watched until they
+    /// rest (still [`WATCH_REST`] s after moving) or [`WATCH_LONGEST`] s
+    /// pass: an event line the first step each passes each of
+    /// [`WATCH_SPEEDS`] (what touches it, its driver and crew, each wheel's
+    /// drive and brake, where it is, the step and time, how far it jumped
+    /// that step, and every vehicle in the scene that is this entity, the
+    /// layers' or the scripts'), a line for any jump over 1 m in a step,
+    /// and a short line each second (where, speed, up). Log only.
+    fn log_first_steps(&mut self, dt: f32) {
+        if self.just_placed.is_empty() {
+            return;
+        }
+        let Some(world) = self.scene.world.as_ref() else {
+            return;
+        };
+        let physics = &world.physics;
+        let mut keep = Vec::new();
+        for mut w in std::mem::take(&mut self.just_placed) {
+            let id = w.id;
+            let Some(m) = physics.vehicle_transform(id) else {
+                eprintln!(
+                    "watch: island vehicle {:#x}: its body is gone at step {}",
+                    w.entity,
+                    w.n + 1
+                );
+                continue;
+            };
+            w.n += 1;
+            let n = w.n;
+            let t = n as f32 * dt;
+            let (_, now_turn, now) = m.to_scale_rotation_translation();
+            let v = physics.vehicle_velocity(id);
+            let vehicle = self.scene.vehicles.iter().find(|c| c.id == Some(id));
+            let label = vehicle.map_or("?", |c| c.spec.label.as_str());
+            let touching = || -> String {
+                physics
+                    .vehicle_touching(id)
+                    .iter()
+                    .map(|(k, at, _)| format!("{k:?} at {at:.2}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            if n == 1 {
+                let (down, wheels) = physics.vehicle_contacts(id);
+                let squeeze: Vec<String> = physics
+                    .vehicle_suspension(id)
+                    .iter()
+                    .map(|s| format!("{s:.3}"))
+                    .collect();
+                eprintln!(
+                    "first step: island vehicle {:#x} {label}: moved {:.3} (dy {:+.3}), turned {:.2} deg, v {v:.3} (up {:+.3}), spin {:.3}, wheels down {down} of {wheels}, springs squeezed [{}] m, touching [{}]",
+                    w.entity,
+                    now.distance(w.put),
+                    now.y - w.put.y,
+                    w.turn.angle_between(now_turn).to_degrees(),
+                    v.y,
+                    physics.vehicle_spin(id),
+                    squeeze.join(", "),
+                    touching()
+                );
+            }
+            if !FIRST_STEPS_WATCHED.contains(&w.entity) {
+                continue;
+            }
+            let speed = v.length();
+            let jump = now.distance(w.last);
+            for (k, &limit) in WATCH_SPEEDS.iter().enumerate() {
+                if speed <= limit || w.crossed & (1 << k) != 0 {
+                    continue;
+                }
+                w.crossed |= 1 << k;
+                let forces: Vec<String> = physics
+                    .vehicle_wheel_forces(id)
+                    .iter()
+                    .map(|(f, b)| format!("{f:.0}/{b:.0}"))
+                    .collect();
+                let index = self.scene.vehicles.iter().position(|c| c.id == Some(id));
+                let her = index.is_some_and(|i| {
+                    self.scene
+                        .player
+                        .as_ref()
+                        .is_some_and(|p| p.driving == Some(i))
+                });
+                let crew = vehicle.map_or(0, |c| c.crew.len());
+                let copies: Vec<String> = self
+                    .scene
+                    .vehicles
+                    .iter()
+                    .filter(|c| {
+                        c.spot.is_some_and(|(e, _, _)| e == w.entity) || c.guid == Some(w.entity)
+                    })
+                    .map(|c| {
+                        let at =
+                            c.id.and_then(|i| physics.vehicle_transform(i))
+                                .map_or("unplaced".to_owned(), |m| {
+                                    format!("{:.2}", m.w_axis.truncate())
+                                });
+                        let whose = if c.guid.is_some() {
+                            "the scripts'"
+                        } else {
+                            "the layers'"
+                        };
+                        format!("{whose} {:?} at {at}", c.id)
+                    })
+                    .collect();
+                eprintln!(
+                    "watch: island vehicle {:#x} {label} passed {limit} m/s at step {n} ({t:.2} s): at {now:.2}, v {v:.2}, moved {:.2} from where put, jumped {jump:.2} this step, up {:.3}; touching [{}]; driver her {her}, crew {crew}; wheel drive/brake [{}]; copies of this entity in the scene [{}]",
+                    w.entity,
+                    now.distance(w.put),
+                    m.y_axis.y,
+                    touching(),
+                    forces.join(", "),
+                    copies.join("; ")
+                );
+            }
+            if jump > 1.0 {
+                eprintln!(
+                    "watch: island vehicle {:#x} {label} jumped {jump:.2} m at step {n} ({t:.2} s), to {now:.2}",
+                    w.entity
+                );
+            }
+            if n % ((1.0 / dt).round().max(1.0) as u32) == 0 {
+                eprintln!(
+                    "watch: island vehicle {:#x} {label} at {t:.1} s: at {now:.2}, v {v:.2}, up {:.3}, {:.2} m from where put",
+                    w.entity,
+                    m.y_axis.y,
+                    now.distance(w.put)
+                );
+            }
+            w.last = now;
+            w.moved |= speed > WATCH_SPEEDS[0];
+            w.still = if speed < 0.05 { w.still + dt } else { 0.0 };
+            let rested = w.moved && w.still >= WATCH_REST;
+            if rested || t >= WATCH_LONGEST {
+                eprintln!(
+                    "watch: island vehicle {:#x} {label} {} at {t:.1} s: at {now:.2}, {:.2} m from where put, turned {:.1} deg",
+                    w.entity,
+                    if rested {
+                        "rests"
+                    } else {
+                        "watched long enough"
+                    },
+                    now.distance(w.put),
+                    w.turn.angle_between(now_turn).to_degrees()
+                );
+                continue;
+            }
+            keep.push(w);
+        }
+        self.just_placed = keep;
+    }
+
     /// The authored turn of the layers' parked vehicle `entity`, if one
     /// was placed as authored ([`place`]).
     pub fn authored_turn(&self, entity: u32) -> Option<Quat> {
@@ -5696,6 +5921,36 @@ pub(crate) enum Put {
     Given,
     /// On the ground under it, fitted to it and let go over it (invented).
     Rest,
+}
+
+/// The island vehicles [`Game::log_first_steps`] watches after they are
+/// placed (#766's B, C and E spots: the Phoenix, the Van (Green) and the
+/// M151 that left their authored places after their first second).
+const FIRST_STEPS_WATCHED: [u32; 3] = [0x10_d5d8, 0x12_b8fc, 0x13_3ba2];
+/// The speeds whose first passing is logged, m/s.
+const WATCH_SPEEDS: [f32; 2] = [0.5, 2.0];
+/// Still this long, s, after moving: rested, the watch ends.
+const WATCH_REST: f32 = 1.0;
+/// The longest a watch lasts, s.
+const WATCH_LONGEST: f32 = 60.0;
+
+/// One island vehicle [`Game::log_first_steps`] watches.
+#[derive(Debug)]
+struct Watched {
+    entity: u32,
+    id: m2_engine::VehicleId,
+    /// Where and how it was put.
+    put: Vec3,
+    turn: Quat,
+    /// Steps logged so far.
+    n: u32,
+    /// Which of [`WATCH_SPEEDS`] it has passed, a bit each.
+    crossed: u8,
+    /// Where it was last step.
+    last: Vec3,
+    /// How long it has been still, s, and whether it has moved.
+    still: f32,
+    moved: bool,
 }
 
 /// Puts a vehicle where it stands: false while what it stands on hasn't
@@ -6470,19 +6725,7 @@ fn exit_plan(
     let index = seating.and_then(|s| her_seat.and_then(|n| s.seat(n)).or_else(|| s.driver()));
     let seat = seating.zip(index).map(|(s, i)| &s.seats[i]);
     let exit = seating.zip(index).and_then(|(s, i)| s.exit_of(i));
-    let local = exit
-        .and_then(|e| v.spec.entrance_at(e.name))
-        .map(|p| Vec3::new(p.x, 0.0, p.z));
-    let (lo, hi) = v.spec.bounds;
-    let local = local.filter(|p| !(lo.x..=hi.x).contains(&p.x) || !(lo.z..=hi.z).contains(&p.z));
-    let place = local.map(|p| at.transform_point3(p));
-    // The 360 sweeps her capsule (0.4 m, 0.6 to 1.8 m up) from her seat to
-    // the hardpoint (0x8229AC90); here one ray at 1.2 m.
-    let blocked = place.zip(v.id).is_some_and(|(to, id)| {
-        let from = at.transform_point3(v.spec.seat.unwrap_or(Vec3::ZERO)) + Vec3::Y * 1.2;
-        let way = to + Vec3::Y * 1.2 - from;
-        physics.cast_ray_past(from, way, way.length(), id).is_some()
-    });
+    let (place, blocked) = exit_way(physics, v, her_seat, at);
     let up_y = at.transform_vector3(Vec3::Y).normalize_or_zero().y;
     // A helicopter's landed share is not modelled: it counts as landed
     // (Invented; 0x822A2B60 ditches from one in the air).
@@ -6501,6 +6744,124 @@ fn exit_plan(
         (_, Some(p)) => p,
     };
     (kind, place)
+}
+
+/// Her way out of `v` (standing at `at`) from `her_seat` (else the
+/// driver's): the exit point by its entrance, if it lies outside the hull,
+/// and whether the way there is blocked. The 360 sweeps her capsule (0.4
+/// m, 0.6 to 1.8 m up) from her seat to the hardpoint (0x8229AC90); here
+/// one ray at 1.2 m.
+fn exit_way(
+    physics: &Physics,
+    v: &ParkedVehicle,
+    her_seat: Option<u32>,
+    at: Mat4,
+) -> (Option<Vec3>, bool) {
+    let seating = v.spec.seating.as_deref();
+    let index = seating.and_then(|s| her_seat.and_then(|n| s.seat(n)).or_else(|| s.driver()));
+    let exit = seating.zip(index).and_then(|(s, i)| s.exit_of(i));
+    let local = exit
+        .and_then(|e| v.spec.entrance_at(e.name))
+        .map(|p| Vec3::new(p.x, 0.0, p.z));
+    let (lo, hi) = v.spec.bounds;
+    let local = local.filter(|p| !(lo.x..=hi.x).contains(&p.x) || !(lo.z..=hi.z).contains(&p.z));
+    let place = local.map(|p| at.transform_point3(p));
+    let blocked = place.zip(v.id).is_some_and(|(to, id)| {
+        let from = at.transform_point3(v.spec.seat.unwrap_or(Vec3::ZERO)) + Vec3::Y * 1.2;
+        let way = to + Vec3::Y * 1.2 - from;
+        physics.cast_ray_past(from, way, way.length(), id).is_some()
+    });
+    (place, blocked)
+}
+
+/// The launch her ragdoll takes out of a vehicle that died under her, m/s,
+/// away from it and [`DEATH_EXIT_ANGLE`] up (0x82428EA0: the speed at
+/// 0x82DE889C for the player, 0x82DE8894 for anyone else).
+pub const DEATH_EXIT_LAUNCH: f32 = 10.0;
+/// How far up from level that launch goes, radians (0x82DE88A0 for the
+/// player, 0x82DE8898 for anyone else). From Xenia: the image holds 0.0,
+/// but both read 0.7854 (45 degrees) live at the title screen and at the
+/// death; something writes them before the title screen (the writer is
+/// not found: likely a tunables load).
+pub const DEATH_EXIT_ANGLE: f32 = std::f32::consts::FRAC_PI_4;
+/// How long she is held down after that exit, seconds (0x822A2178 sets
+/// her record's +0x38 from 0x82423848(3.0, …); that it is her time down
+/// is inferred).
+pub const DEATH_EXIT_DOWN: f32 = 3.0;
+
+/// Out of `v`, which died under her: the 360's death exit (exit 4,
+/// 0x822A2178, chosen by 0x822A2B60 for the death message's mode 3,
+/// posted by 0x82205BE0). She is put at her seat's own place when her way
+/// out is clear, else out at a clear point (0x8229AC90 blocked:
+/// 0x822A13D0); no velocity. Her ragdoll is to start with
+/// [`death_launch`]. Returns the vehicle's origin, or `None` if it isn't
+/// placed.
+pub(crate) fn death_exit(
+    physics: &Physics,
+    v: &ParkedVehicle,
+    player: &mut Player,
+) -> Option<Vec3> {
+    let id = v.id?;
+    let at = physics.vehicle_transform(id).filter(|m| m.is_finite())?;
+    // Blocked as the 360 finds it (0x822A2178 -> 0x8229AC90): her
+    // character's capsule cast where she sits meets something (true:
+    // 0x82166660 returns its hits' count, non-zero), her own vehicle's hull
+    // counted (its query passes no body to skip), so a seat inside a cab
+    // always is; then she goes out by her exit path (0x822A13D0), else
+    // stays where she is. The way to her door as before besides.
+    let blocked = seat_in_hull(&v.spec) || exit_way(physics, v, None, at).1;
+    let place = if blocked {
+        door_out(at, &v.spec)
+    } else {
+        at.transform_point3(v.spec.seat.unwrap_or(Vec3::ZERO))
+    };
+    player.step_out_at(place);
+    player.character.velocity = Vec3::ZERO;
+    player.driving = None;
+    player.chase_target = None;
+    player.seated = false;
+    player.seat_frame = None;
+    eprintln!(
+        "exit: {} death exit at {place:.2} ({})",
+        v.spec.label,
+        if blocked {
+            "way blocked: put out clear"
+        } else {
+            "at her seat"
+        }
+    );
+    Some(at.transform_point3(Vec3::ZERO))
+}
+
+/// The character capsule the 360's death exit casts where a rider sits
+/// (0x8229AC90): radius 0.4 m (0x82B7C0F0), from 0.6 m (0x82B7C0E8) to
+/// 1.8 m (0x82B7C0EC) up from her feet.
+const EXIT_CAPSULE: (f32, f32, f32) = (0.4, 0.6, 1.8);
+
+/// Whether a rider's capsule at the vehicle's seat ([`EXIT_CAPSULE`],
+/// model space, her feet at the seat) meets its hull box: as the 360's
+/// cast meets the cab she sits in. Inferred: the hull box stands for the
+/// vehicle's collision shapes.
+pub(crate) fn seat_in_hull(spec: &VehicleSpec) -> bool {
+    let (r, low, high) = EXIT_CAPSULE;
+    let seat = spec.seat.unwrap_or(Vec3::ZERO);
+    let (lo, hi) = spec.hull;
+    // The capsule's axis, from (low + r) to (high - r) up, sampled.
+    (0..=8).any(|k| {
+        let y = low + r + (high - low - 2.0 * r) * k as f32 / 8.0;
+        let p = seat + Vec3::Y * y;
+        p.clamp(lo, hi).distance(p) <= r
+    })
+}
+
+/// Her ragdoll's launch out of a vehicle that died with its origin at
+/// `vehicle`, she at `her`: [`DEATH_EXIT_LAUNCH`] at [`DEATH_EXIT_ANGLE`]
+/// up, from it to her across the ground (0x82428EA0); along +Z if she is
+/// right over it.
+pub fn death_launch(vehicle: Vec3, her: Vec3) -> Vec3 {
+    let away = Vec3::new(her.x - vehicle.x, 0.0, her.z - vehicle.z).normalize_or(Vec3::Z);
+    away * (DEATH_EXIT_LAUNCH * DEATH_EXIT_ANGLE.cos())
+        + Vec3::Y * (DEATH_EXIT_LAUNCH * DEATH_EXIT_ANGLE.sin())
 }
 
 /// Whether `v`, standing at `at`, is a boat afloat: its origin (its
@@ -6735,6 +7096,19 @@ fn switch_weapon(
 
 #[cfg(test)]
 mod tests {
+
+    // Out of a vehicle that died under her: 10 m/s at 45 degrees, 7.07
+    // out from its origin towards her and 7.07 up (0x82428EA0, the live
+    // values); along +Z right over it.
+    #[test]
+    fn a_death_exit_launches_her_away_from_the_vehicle_at_45_degrees() {
+        let h = 10.0 * std::f32::consts::FRAC_PI_4.cos();
+        let v = death_launch(Vec3::new(1.0, 5.0, 1.0), Vec3::new(4.0, 7.0, 5.0));
+        assert!((v - Vec3::new(0.6 * h, h, 0.8 * h)).length() < 1e-4, "{v}");
+        assert!((v.with_y(0.0).length() - 7.071).abs() < 1e-3);
+        let over = death_launch(Vec3::ZERO, Vec3::Y * 2.0);
+        assert!((over - Vec3::new(0.0, h, h)).length() < 1e-4, "{over}");
+    }
     use std::collections::HashMap;
 
     // A layer's parked vehicle is put as authored: where and as turned as
@@ -6841,6 +7215,28 @@ mod tests {
             0.0,
             super::Put::Given
         ));
+    }
+
+    // A rider sat inside a cab is blocked as the 360's capsule cast finds
+    // her (0x8229AC90 meets the cab) and goes out at her door, outside the
+    // vehicle's box; one sat over an open bed's edge is not.
+    #[test]
+    fn a_rider_inside_a_cab_exits_at_her_door_outside_it() {
+        use m2_math::glam::{Mat4, Vec3};
+        let mut spec = crate::npc::tests::tank(m2_engine::tuning::VehicleTuning::default());
+        spec.hull = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 2.0, 2.0));
+        spec.bounds = spec.hull;
+        spec.seat = Some(Vec3::new(0.4, 0.3, 0.5));
+        spec.door = Some(Vec3::new(1.0, 0.0, 0.3));
+        assert!(super::seat_in_hull(&spec));
+        let out = super::door_out(Mat4::IDENTITY, &spec);
+        let (lo, hi) = spec.bounds;
+        let inside = (lo.x..=hi.x).contains(&out.x) && (lo.z..=hi.z).contains(&out.z);
+        assert!(!inside, "{out}");
+        assert!(out.x > hi.x + 0.5, "{out}");
+        // A seat well clear of the box (a bike's, out over its side).
+        spec.seat = Some(Vec3::new(2.0, 2.5, 0.0));
+        assert!(!super::seat_in_hull(&spec));
     }
 
     #[test]

@@ -192,7 +192,7 @@ impl ChaseRig {
 
 /// Ticks the world must have been quiet before she lands: a building's
 /// collision can arrive a few frames after the ground under it.
-const SETTLED: u8 = 3;
+pub(crate) const SETTLED: u8 = 3;
 /// Ticks she waits for the world to stop coming in before she lands
 /// anyway (ten seconds; invented: models that never load hold no one up).
 const LAND_WAIT: u16 = 600;
@@ -473,6 +473,10 @@ pub struct Player {
     pub down: bool,
     /// Thrown off a vehicle (exit 3, 0x822A1B70): to be knocked down.
     pub tossed: bool,
+    /// Put out of a vehicle that died under her (exit 4, 0x822A2178): to
+    /// be knocked down for that many seconds, her ragdoll starting with
+    /// [`launch`](Self::launch).
+    pub knock_for: Option<f32>,
     /// The launch her ragdoll starts with, from the exit message
     /// ([`m2_engine::ragdoll_launch::exit_launch`]).
     pub launch: Option<Vec3>,
@@ -725,6 +729,7 @@ impl Player {
             launcher: false,
             down: false,
             tossed: false,
+            knock_for: None,
             launch: None,
             last_toss: None,
             fall: on_foot::FallWatch::default(),
@@ -976,10 +981,13 @@ impl Player {
     /// to land on what is under it once the world there has loaded: the
     /// floor or ground nearest under the spot, not the top of whatever
     /// stands over it.
-    /// Where her landing stands, for a check that waits on it.
+    /// Where her landing stands, for a check that waits on it: landed,
+    /// settled ticks, ticks waited, the world still streaming, models
+    /// still coming, the spot she was put at, where she is, swimming, on a
+    /// ladder, down, driving.
     pub fn landing_state(&self) -> String {
         format!(
-            "landed {}, settled {}, waited {}, streaming {}, models coming {}, ground known {}, put at {:?}, at {:.2?}",
+            "landed {}, settled {}, waited {}, streaming {}, models coming {}, ground known {}, put at {:?}, at {:.2?}, swimming {}, ladder {}, down {}, driving {:?}",
             self.landed,
             self.settled,
             self.waited,
@@ -987,7 +995,11 @@ impl Player {
             self.models_coming,
             self.ground_known,
             self.land_from.map(|v| v.to_array()),
-            self.character.position.to_array()
+            self.character.position.to_array(),
+            self.swimming(),
+            self.ladder.is_some(),
+            self.down,
+            self.driving
         )
     }
 
