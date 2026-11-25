@@ -235,6 +235,21 @@ pub struct TemplateInfo {
     pub human: bool,
 }
 
+/// The template a layer entity named `stem` (its name without the id), an
+/// instance of template `parent`, is: the one its name names, else the one
+/// it is an instance of. As both a state layer's vehicles and its props
+/// resolve it.
+fn entity_template<'a>(
+    templates: &'a Templates,
+    stem: &'a str,
+    parent: u32,
+) -> Option<(&'a str, &'a TemplateInfo)> {
+    match templates.get(stem) {
+        Some(t) => Some((stem, t)),
+        None => templates.by_id(parent),
+    }
+}
+
 /// The bit every template id has (the database's `UNIQ` ids).
 const TEMPLATE_BIT: u32 = 0x8000_0000;
 
@@ -2676,6 +2691,19 @@ impl WorldIndex {
                 continue;
             }
             let stem = names.get(&entity).map_or("", |n| member_stem(n));
+            // One whose template drives is the state layer's vehicle
+            // (`add_state_vehicles`), not also a prop: the 360's layer loader
+            // makes each entity once, with its template's physics
+            // (0x823E6AB8 -> 0x82408C30 -> the template's physics creator,
+            // 0x823FDB60 for a car), so a vehicle gets its vehicle body and
+            // no static of its model. q769: Fuel Trailer 0x94b0f, named by its
+            // model (`_oc_veh_semi_fueltrailer`), stood as a prop's static
+            // and a vehicle's body at once and touched itself.
+            if entity_template(&assets.templates, stem, p.parent)
+                .is_some_and(|(_, t)| t.vehicle.is_some())
+            {
+                continue;
+            }
             // A prop's template: one with a model, that neither drives
             // nor walks.
             let prop = |t: &TemplateInfo| match t {
@@ -2731,10 +2759,7 @@ impl WorldIndex {
         let names = layer.names();
         for &(entity, ref p) in &in_entity_order(&layer.placements()) {
             let stem = names.get(&entity).map_or("", |n| member_stem(n));
-            let template = match assets.templates.get(stem) {
-                Some(t) => Some((stem, t)),
-                None => assets.templates.by_id(p.parent),
-            };
+            let template = entity_template(&assets.templates, stem, p.parent);
             let Some((
                 name,
                 &TemplateInfo {
@@ -3334,6 +3359,41 @@ pub fn low_res_tile<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
+    // An entity named by its model (q769's `_oc_veh_semi_fueltrailer
+    // 0x00094b0f`), an instance of a vehicle template, resolves to that
+    // template, so the props pass it by; one named by a template resolves to
+    // it; a prop's resolves to its non-vehicle template.
+    #[test]
+    fn an_entity_named_by_its_model_resolves_to_its_vehicle_template() {
+        let mut db = Templates::default();
+        let trailer = TemplateInfo {
+            model: Some(7),
+            vehicle: Some(VehicleKind::Car),
+            engine: None,
+            person: false,
+            human: false,
+        };
+        let crate_ = TemplateInfo {
+            vehicle: None,
+            ..trailer
+        };
+        db.names.insert(0x8000_0001, "Fuel Trailer".to_owned());
+        db.infos.insert(0x8000_0001, trailer);
+        db.by_name.insert("fuel trailer".to_owned(), trailer);
+        db.names.insert(0x8000_0002, "Crate".to_owned());
+        db.infos.insert(0x8000_0002, crate_);
+        db.by_name.insert("crate".to_owned(), crate_);
+        let (name, t) = entity_template(&db, "_oc_veh_semi_fueltrailer", 0x8000_0001).unwrap();
+        assert_eq!(name, "Fuel Trailer");
+        assert!(t.vehicle.is_some());
+        let (name, t) = entity_template(&db, "Fuel Trailer", 0).unwrap();
+        assert_eq!(name, "Fuel Trailer");
+        assert!(t.vehicle.is_some());
+        let (_, t) = entity_template(&db, "crate_on_dock", 0x8000_0002).unwrap();
+        assert!(t.vehicle.is_none());
+        assert!(entity_template(&db, "nothing", 0x8000_0099).is_none());
+    }
+
     use super::*;
 
     #[test]
