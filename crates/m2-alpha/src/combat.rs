@@ -740,7 +740,8 @@ fn blast_cell(table: Option<&DamageTable>, v: &ParkedVehicle, key: Option<u32>) 
 /// Pushes vehicle `v` (`id`, placed at `body`) by blast `push` as the
 /// 360 pushes a moving rigid body ([`BlastPush::rigid_pushes`],
 /// 0x8215CBC8): five impulses up its world box, each per kg times its
-/// mass, its `ExplosionFudge` scaling them.
+/// mass, its `ExplosionFudge` scaling them, their change topped up per
+/// axis ([`Physics::push_vehicle_topped`], 0x8215BF38).
 ///
 /// [`BlastPush::rigid_pushes`]: m2_engine::durability::BlastPush::rigid_pushes
 fn blast_push_vehicle(
@@ -755,9 +756,29 @@ fn blast_push_vehicle(
     let (lo, hi) = physics
         .vehicle_body_box(id)
         .unwrap_or_else(|| world_box(body, v.spec.bounds));
-    for (per_kg, point) in push.rigid_pushes(lo, hi, fudge(v)) {
-        physics.push_vehicle(id, per_kg * v.spec.mass, point);
-    }
+    // One blast's impulses together, their change topped up per axis
+    // against the speed before (0x8215BF38): each blast on its own, as
+    // each explosion action pushes in its own step call.
+    // Each impulse per kg times the body's own mass, as 0x8215CBC8 sizes it
+    // (0x8262C120 of the body it pushes), so its speed change is the per-kg
+    // push whatever the body weighs (q728 30d6b115: sized by the spec's
+    // mass, half the Phoenix body's, every push came out halved).
+    let mass = physics.vehicle_chassis_mass(id).unwrap_or(v.spec.mass);
+    let pushes: Vec<(Vec3, Vec3)> = push
+        .rigid_pushes(lo, hi, fudge(v))
+        .into_iter()
+        .map(|(per_kg, point)| (per_kg * mass, point))
+        .collect();
+    let before = physics.vehicle_velocity(id);
+    physics.push_vehicle_topped(id, &pushes);
+    // Log only: the push's linear change before and after the per-axis
+    // top-up (0x8215BF38), up part apart.
+    let raw: Vec3 = pushes.iter().map(|p| p.0).sum::<Vec3>() / mass.max(1.0);
+    let topped = physics.vehicle_velocity(id) - before;
+    eprintln!(
+        "blast push: the {} (body {mass:.0} kg, spec {:.0} kg) from {before:.3}: raw {raw:.3} (up {:.3}), topped {topped:.3} (up {:.3})",
+        v.spec.label, v.spec.mass, raw.y, topped.y
+    );
 }
 
 /// The world box round a model box `(lo, hi)` placed at `at`.
@@ -2016,6 +2037,12 @@ pub struct Combat {
     /// The templates of the blasts part states have set off, in order
     /// (`--wreck-blast-check`'s).
     pub part_blasts_fired: Vec<u32>,
+    /// A vehicle to wreck in the next step, after that step's part blasts
+    /// ([`Self::wreck_now`]): as damage wrecks it mid-step.
+    wreck_due: Option<usize>,
+    /// The last wreck's speed right after its death launch
+    /// (`--wreck-blast-check` judges its blasts' change from it).
+    pub launched: Option<Vec3>,
     /// The vehicle she was put out of as it was wrecked: its own blasts
     /// spare her ([`Combat::her_vehicle_wrecked`]).
     rider_of: Option<usize>,
@@ -2463,6 +2490,8 @@ impl Default for Combat {
             death_exit_done: None,
             wreck_blasts: std::collections::HashMap::new(),
             part_blasts_fired: Vec::new(),
+            wreck_due: None,
+            launched: None,
             rider_of: None,
             spare_her: false,
             last_blast: None,
@@ -3533,6 +3562,11 @@ impl Combat {
         self.went_off.clear();
         self.struck.clear();
         self.part_blasts(f);
+        if let Some(i) = self.wreck_due.take()
+            && let Some(v) = f.vehicles.get_mut(i)
+        {
+            self.wreck(f.physics, v, i);
+        }
         self.knocked_step(f, dt);
         // Up again (revived, respawned, or put on her feet by a script):
         // her limp body goes. The state table's `Resurrect` leads from
@@ -3786,6 +3820,12 @@ impl Combat {
         self.fly(f, dt);
         self.burn_vehicles(f, dt);
         self.smoke_wrecks(f, dt);
+        // What this step's wrecks started goes off at the start of the
+        // next step's actions (above), after that step's physics: Xenia
+        // phys8a-c, the explosions' level-only write lands a frame after
+        // the launch, deferred while the world is locked and flushed
+        // after its step (0x82644F18). q728p: fired here too, in the
+        // death step, they landed with the launch.
     }
 
     /// Where shots start and the way the crosshair points: along the
@@ -6141,15 +6181,42 @@ impl Combat {
         v.wrecked = true;
         if let Some(id) = v.id {
             physics.wreck_vehicle(id);
+            // Its death launch, on its rebuilt body, before this step's
+            // physics; its blasts push a step later ([`Self::part_blasts`]),
+            // as Xenia's runs show (phys3-6). From the 360 code: the car
+            // death handler (0x82205BE0) queues PgHavokManager's one-step
+            // action (0x82155040 -> 0x8215D978), run after the rebuild
+            // pass (0x82152780) in the manager's update. Inferred: every
+            // vehicle wrecked here is its kind 2 (scale 1).
+            let (rx, rz) = (self.random() * 2.0, self.random() * 2.0);
+            let launch = m2_engine::durability::death_launch(rx, rz, 1.0);
+            let before = physics.vehicle_velocity(id);
+            physics.set_vehicle_velocity(id, before + launch);
+            self.launched = Some(before + launch);
+            eprintln!(
+                "wreck: the {} is launched {launch:.2} (|{:.2}|) from {before:.2}",
+                v.spec.label,
+                launch.length()
+            );
         }
+        // Its body's destroyed state now: the explosions it starts push it
+        // a step later ([`Self::part_blasts`] runs before this in the next
+        // step, after its physics). Xenia phys8a (counter c69, then c70):
+        // the launch lands at once in the death frame (world +0x84 and
+        // +0x80 both 0), the explosions' level-only write in the next
+        // frame while the world is locked (+0x84 = 1), flushed after its
+        // step as deferred pushes (0x82644F18). The rebuilt body takes the
+        // old one's speed first; the port keeps one body, so it keeps it.
+        v.follow_health();
         self.wrecks.push((i, 0.0));
         self.remarks.push(Remark::Wreck);
     }
 
-    /// Wrecks vehicle `i`, `v`, as damage would (its blast to go off at
-    /// the next step): for `--wreck-blast-check`.
-    pub fn wreck_now(&mut self, physics: &mut Physics, v: &mut ParkedVehicle, i: usize) {
-        self.wreck(physics, v, i);
+    /// Wrecks vehicle `i` in the next step, after its part blasts, as
+    /// damage would mid-step (its launch at once, its blasts a step
+    /// later): for `--wreck-blast-check`.
+    pub fn wreck_now(&mut self, i: usize) {
+        self.wreck_due = Some(i);
     }
 
     /// The blasts vehicles' part states set off: each effect a state
