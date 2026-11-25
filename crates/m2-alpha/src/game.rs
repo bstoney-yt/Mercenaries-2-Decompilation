@@ -7197,6 +7197,8 @@ fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
             avoid,
         };
         let mut cands = Vec::new();
+        // Each candidate's cover object, for its claim.
+        let mut objects: Vec<u32> = Vec::new();
         for (o, _) in world.near(centre, ai_cover::SEARCH) {
             let p = &world.index.objects[o];
             let Some(hints) = world.index.template_db.cover_hints.get(&p.template) else {
@@ -7211,7 +7213,9 @@ fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
                 bounds: model.bounds,
             };
             for h in hints {
-                cands.extend(ai_cover::candidates(&req, &placed, h));
+                let c = ai_cover::candidates(&req, &placed, h);
+                objects.extend(std::iter::repeat_n(o as u32, c.len()));
+                cands.extend(c);
             }
         }
         let physics = &world.physics;
@@ -7226,9 +7230,27 @@ fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
                 .cast_ray(a, to, to.length())
                 .is_some_and(|(d, _)| d < to.length() - 0.05)
         };
-        let found = ai_cover::choose(&req, &cands, ground, blocked);
+        let picked = ai_cover::choose_index(&req, &cands, ground, blocked);
+        // As he starts for it, he claims it (0x822C7CF0 -> 0x822EDA60), and
+        // again each update for 2 s ([`crate::npc::People`]): refused, the
+        // spot goes into his list for 10 s and he has none.
+        let found = picked.and_then(|(at, k)| {
+            let object = objects[k];
+            if people.cover_claims.claim(i as u32, object, centre, at) {
+                Some((at, object))
+            } else {
+                eprintln!(
+                    "people: {:08x} cover at {at:.1} refused: claimed by another",
+                    people.npcs[i].spawn.unwrap_or(u32::MAX)
+                );
+                people.npcs[i].destination_refused(at);
+                None
+            }
+        });
         let n = &mut people.npcs[i];
         n.cover_ask = None;
+        n.cover_claim = found.map(|(_, object)| (object, 0.0));
+        let found = found.map(|(at, _)| at);
         n.cover_spot = found;
         if let Some(at) = found {
             eprintln!(
