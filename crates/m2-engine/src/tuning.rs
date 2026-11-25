@@ -48,6 +48,10 @@ pub struct VehicleTuning {
     /// Health below which it burns down by itself (`TickDamage`'s field
     /// 9a6663a4: the AMX-30's 30).
     pub burns_below: Option<f32>,
+    /// Its `PhysicsPropertyGravityScaler` `Scale`: how many times the
+    /// world's gravity pulls its bodies (2 on the tanks, the AMX30 AA's 1;
+    /// none on cars, boats or helicopters).
+    pub gravity_scale: Option<f32>,
     /// What rounds do to it, of their damage, by its `ModifierKey` in the
     /// game's damage table (an M151's `Car`: a rifle round a fortieth).
     pub rounds: Option<RoundScale>,
@@ -1441,6 +1445,28 @@ impl DamageTable {
         self.cells.get(r * self.columns.len() + c).copied()
     }
 
+    /// A table of `rows` (target keys) by `columns` (damage keys), its
+    /// `cells` row by row (for tests and tools).
+    pub fn from_cells(rows: Vec<u32>, columns: Vec<u32>, cells: Vec<f32>) -> Self {
+        Self {
+            rows,
+            columns,
+            cells,
+        }
+    }
+
+    /// As [`scale`](Self::scale), as the 360's area damage looks it up
+    /// (0x823987D0): a key the table lacks finds its first row or column
+    /// (0 for an empty table).
+    pub fn cell(&self, target: u32, damage: u32) -> f32 {
+        let r = self.rows.iter().position(|&k| k == target).unwrap_or(0);
+        let c = self.columns.iter().position(|&k| k == damage).unwrap_or(0);
+        self.cells
+            .get(r * self.columns.len() + c)
+            .copied()
+            .unwrap_or(0.0)
+    }
+
     /// Its targets' keys (rows) and its damage kinds' keys (columns).
     pub fn keys(&self) -> (&[u32], &[u32]) {
         (&self.rows, &self.columns)
@@ -1927,6 +1953,7 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
     let hint = Table::new(db, "ObjectHint");
     let stimulus = Table::new(db, "Stimulus");
     let fudge = Table::new(db, "ExplosionFudge");
+    let scaler = Table::new(db, "PhysicsPropertyGravityScaler");
     let tick = Table::new(db, "TickDamage");
     let modifier = Table::new(db, "ModifierKey");
     let heli = Table::new(db, "_HelicopterPhysics");
@@ -1980,6 +2007,11 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                 audibility: stimulus.get(id, "Audibility"),
                 blast_scale: fudge.number(id, BLAST_SCALE),
                 burns_below: tick.number(id, BURNS_BELOW),
+                gravity_scale: scaler
+                    .of_template(id)
+                    .first()
+                    .and_then(|r| scaler.float(r, name_hash("Scale")))
+                    .filter(|s| s.is_finite()),
                 // The whole vehicle's key: its record with no `Name` (the
                 // named ones are parts).
                 rounds: whole_key(&modifier, id).and_then(|key| damage?.rounds(key)),
@@ -2453,6 +2485,21 @@ mod tests {
     }
 
     use super::*;
+
+    // The area damage's lookup (0x823987D0): a key the table lacks finds
+    // the first row or column.
+    #[test]
+    fn a_missing_key_finds_the_first_row_or_column() {
+        let t = DamageTable {
+            rows: vec![1, 2],
+            columns: vec![10, 20],
+            cells: vec![0.0, 0.5, 0.7, 0.25],
+        };
+        assert_eq!(t.cell(2, 20), 0.25);
+        assert_eq!(t.cell(2, 99), 0.7);
+        assert_eq!(t.cell(99, 20), 0.5);
+        assert_eq!(t.scale(2, 99), None);
+    }
 
     /// A sound table of rows and columns keys 1 and 2: 1 x 2 has both
     /// words (0xa, 0xb), 2 x 1 has only a second (0, 0xc), 2 x 2 only a
