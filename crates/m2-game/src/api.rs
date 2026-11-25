@@ -99,6 +99,10 @@ pub struct Object {
     pub position: [f32; 3],
     /// Radians about the vertical axis.
     pub yaw: f32,
+    /// Its whole turn (x, y, z, w) as its layer authored it, while it
+    /// stands where it was authored: a parked vehicle is placed so, tilt
+    /// and all. `None` once moved, or for one not from a layer.
+    pub rotation: Option<[f32; 4]>,
     pub health: f32,
     pub max_health: f32,
     pub alive: bool,
@@ -1972,6 +1976,7 @@ pub fn arrived(world: &Shared, guid: u32, at: [f32; 3]) -> Vec<mlua::Error> {
         {
             if let Some(o) = w.objects.get_mut(&g) {
                 o.position = at;
+                o.rotation = None;
             }
         }
         for g in cargo {
@@ -3024,6 +3029,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             let position = [x, y, z];
             if let Some(o) = w.objects.get_mut(&guid) {
                 o.position = position;
+                o.rotation = None;
             }
             w.commands.push(Command::Move { guid, position });
         }
@@ -3085,6 +3091,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let (position, yaw) = (hardpoint.unwrap_or(to.0), to.1);
         if let Some(o) = w.objects.get_mut(&guid) {
             o.position = position;
+            o.rotation = None;
             o.yaw = yaw;
         }
         w.commands.push(Command::Move { guid, position });
@@ -4678,6 +4685,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 o.seated_instantly = false;
                 o.not_driving = false;
                 o.position = position;
+                o.rotation = None;
             }
             w.commands.push(Command::ExitVehicle(g));
             w.commands.push(Command::Move { guid: g, position });

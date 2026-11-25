@@ -567,9 +567,18 @@ struct Options {
     /// swim her forward walking, at her pace and sprinting, logging how
     /// fast she goes (`swim-check:` lines).
     swim_check: bool,
+    /// `--cargo-check`: Xenia's El Grande drive with its crates aboard
+    /// ([`cargo_check`]): each crate's shift, phase by phase.
+    cargo_check: bool,
     /// `--prop-bodies-check`: props that come loose whole as bodies of
     /// their own from the start (gap P7, [`prop_bodies_check`]).
     prop_bodies_check: bool,
+    /// `--parked-settle-check`: the layers' parked vehicles, placed as
+    /// authored, keep to their authored pose ([`parked_settle_check`]).
+    parked_settle_check: bool,
+    /// With `--parked-settle-check`: at least this many vehicles must be
+    /// judged here, or it fails (`--settle-least <n>`).
+    settle_least: usize,
     /// `--prop-limits-check`: what blasts throw, kept in check by the
     /// disposer, and hulls meeting loose pieces ([`prop_limits_check`]).
     prop_limits_check: bool,
@@ -1016,8 +1025,19 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.vehicle.get_or_insert_with(|| "m151".to_owned());
             }
             "--swim-check" => o.swim_check = true,
+            "--cargo-check" => {
+                o.cargo_check = true;
+                o.mission = true;
+            }
             "--prop-bodies-check" => {
                 o.prop_bodies_check = true;
+                o.drive = true;
+            }
+            "--settle-least" => {
+                o.settle_least = value()?.parse().context("--settle-least expects a count")?;
+            }
+            "--parked-settle-check" => {
+                o.parked_settle_check = true;
                 o.drive = true;
             }
             "--prop-limits-check" => {
@@ -5278,6 +5298,7 @@ fn mission_for_screenshot(
     let mut death_check = options.death_check.then(DeathCheck::default);
     // Seconds she has been where --props-check hits the props.
     let mut props_ready = 0.0;
+    let mut cargo_wait = options.cargo_check.then(CargoWait::default);
     let mut shop_check = options.shop_check.clone().map(shopcheck::ShopCheck::new);
     let mut cheat_check = options.cheat_check.then(cheats::Check::default);
     let mut context = ContextCheck::default();
@@ -5861,6 +5882,21 @@ fn mission_for_screenshot(
             && game.scene.player.as_ref().is_some_and(|p| p.landed)
         {
             placed::check(game, &mut placed_tried, tick);
+        }
+        // With --cargo-check, once the contract has put out a vehicle with
+        // cargo aboard (she is put by it so it streams in), it is driven
+        // ([`cargo_check`]); then the run ends.
+        if let Some(w) = &mut cargo_wait
+            && i % (1.0 / tick).round() as u32 == 0
+            && w.tick(
+                game,
+                link.place_named(CARGO_TRUCK),
+                &link.marked_places(),
+                1.0,
+            )
+        {
+            cargo_check(game, tick);
+            break;
         }
         // With --props-check, every placed prop is hit once she has been
         // ashore (and in --props-area, if given) a while, for the
@@ -8264,6 +8300,9 @@ fn drive_for_screenshot(
     if options.prop_bodies_check {
         return prop_bodies_check(backend, game, fov, aspect, tick);
     }
+    if options.parked_settle_check {
+        return parked_settle_check(backend, game, fov, aspect, tick, options.settle_least);
+    }
     if options.prop_limits_check {
         return prop_limits_check(backend, game, fov, aspect, tick);
     }
@@ -9447,6 +9486,753 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 /// `--swim-check`: she is put in the nearest water over 4 m deep (looked
 /// for in rings out to 600 m) and swims forward for 4 s walking, at her
 /// pace and sprinting, through the game's tick; logs her speed each time.
+/// `--cargo-check`: Xenia's El Grande profile (`elgrande-crates.md`) on
+/// the first vehicle with cargo aboard (OilCon020's El Grande and its
+/// crates), her at the wheel: standing 3 s, full throttle straight 6 s
+/// (held to 11 m/s), a hard left turn at speed 2 s, hard braking (reverse
+/// throttle) until it stops or 4 s, then standing 3 s. Each crate's shift
+/// in the truck's frame from where it started is logged 4 times a
+/// second, and at each phase's end the median and most shift of those
+/// still aboard and how many have come off, as `cargo-check: <phase>:
+/// median <m> m, max <m> m, <n> of <k> off`.
+/// How long `--cargo-check` waits for a vehicle with cargo aboard after
+/// she is put by one that might carry some, seconds.
+const CARGO_WAIT: f32 = 60.0;
+
+/// OilCon020's El Grande with the gun crates: its layer entity's name
+/// (`vz_state_oilcon020`, guid 0xFA056, at about [2756, -34, -423]).
+/// From samples. The q680g run went to the scripts' first marker instead,
+/// [2632, -14, -998], 590 m from the truck, and it never streamed in.
+const CARGO_TRUCK: &str = "GunPickup";
+
+/// `--cargo-check`'s wait in the mission for a vehicle with cargo aboard
+/// (the contract's layers put out OilCon020's El Grande and its crates):
+/// each second, once a vehicle carries cargo it is time; before that,
+/// she is put 8 m from an El Grande that is out, else from the contract's
+/// truck where its layer has it ([`CARGO_TRUCK`]), else from the place the
+/// scripts mark first, else from
+/// the first vehicle, so the truck and its crates stream in; [`CARGO_WAIT`] s after, a `FAIL` with what was there.
+#[derive(Debug, Default)]
+struct CargoWait {
+    t: f32,
+    put_at: Option<f32>,
+    done: bool,
+}
+
+impl CargoWait {
+    fn tick(
+        &mut self,
+        game: &mut Game,
+        truck: Option<m2_math::glam::Vec3>,
+        marks: &[m2_math::glam::Vec3],
+        dt: f32,
+    ) -> bool {
+        use m2_math::glam::Vec3;
+        if self.done {
+            return false;
+        }
+        self.t += dt;
+        let vehicles = &game.scene.vehicles;
+        if (0..vehicles.len()).any(|i| {
+            vehicles[i].id.is_some() && !vehicles[i].wrecked && game.scene.props.carrying(i)
+        }) {
+            self.done = true;
+            eprintln!(
+                "cargo-check: a vehicle has cargo aboard after {:.0} s",
+                self.t
+            );
+            return true;
+        }
+        // Not before the contract's layers have had a moment.
+        if self.put_at.is_none() && self.t >= 10.0 {
+            // The El Grande if it is out; else the contract's truck where
+            // its layer has it (so it and its crates stream in there);
+            // else the place the scripts mark first; else the first
+            // vehicle.
+            let grande = vehicles
+                .iter()
+                .position(|v| v.id.is_some() && !v.wrecked && v.spec.label.contains("El Grande"));
+            if grande.is_none()
+                && let Some(at) = truck
+            {
+                eprintln!(
+                    "cargo-check: she is put 8 m from the contract's truck {CARGO_TRUCK} at {at:.0}"
+                );
+                if let Some(p) = game.scene.player.as_mut() {
+                    p.driving = None;
+                    p.drop_at(at + Vec3::X * 8.0 + Vec3::Y * 2.0);
+                }
+                game.ride = None;
+                game.on_foot = true;
+                self.put_at = Some(self.t);
+                return false;
+            }
+            let to_mark = grande.is_none().then(|| marks.first().copied()).flatten();
+            if let Some(at) = to_mark {
+                eprintln!("cargo-check: she is put 8 m from the scripts' marker at {at:.0}");
+                if let Some(p) = game.scene.player.as_mut() {
+                    p.driving = None;
+                    p.drop_at(at + Vec3::X * 8.0 + Vec3::Y * 2.0);
+                }
+                game.ride = None;
+                game.on_foot = true;
+                self.put_at = Some(self.t);
+                return false;
+            }
+            let pick =
+                grande.or_else(|| vehicles.iter().position(|v| v.id.is_some() && !v.wrecked));
+            let at = pick.and_then(|i| {
+                let id = vehicles[i].id?;
+                let m = game.scene.world.as_ref()?.physics.vehicle_transform(id)?;
+                Some((i, m.w_axis.truncate(), m.x_axis.truncate()))
+            });
+            match at {
+                Some((i, at, side)) => {
+                    eprintln!(
+                        "cargo-check: she is put 8 m from the {} at {at:.0}",
+                        vehicles[i].spec.label
+                    );
+                    if let Some(p) = game.scene.player.as_mut() {
+                        p.driving = None;
+                        p.drop_at(at + side.normalize_or(Vec3::X) * 8.0 + Vec3::Y);
+                    }
+                    game.ride = None;
+                    game.on_foot = true;
+                }
+                None => eprintln!("cargo-check: no vehicle out yet at {:.0} s", self.t),
+            }
+            self.put_at = Some(self.t);
+        }
+        if self.put_at.is_some_and(|t| self.t - t > CARGO_WAIT) {
+            self.done = true;
+            let props = &game.scene.props;
+            eprintln!(
+                "cargo-check: FAIL no vehicle with cargo aboard {CARGO_WAIT} s after she was put by one ({} vehicles, {} props loaded on any, {} shown)",
+                game.scene.vehicles.len(),
+                props.cargo_places().len(),
+                props.shown().count()
+            );
+        }
+        false
+    }
+}
+
+fn cargo_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::{Vec2, Vec3};
+    let vehicles = &game.scene.vehicles;
+    let Some(i) = (0..vehicles.len()).find(|&i| {
+        vehicles[i].id.is_some() && !vehicles[i].wrecked && game.scene.props.carrying(i)
+    }) else {
+        eprintln!("cargo-check: FAIL no vehicle with cargo aboard");
+        return;
+    };
+    let Some(id) = game.scene.vehicles[i].id else {
+        return;
+    };
+    let label = game.scene.vehicles[i].spec.label.clone();
+    if let Some(p) = game.scene.player.as_mut() {
+        p.driving = Some(i);
+        p.landed = true;
+    }
+    // A clear, level straight to drive (q680h drove its parked heading
+    // into a tall rock 25 m on): its heading if that is clear, else the
+    // first of seven others, the truck and its cargo turned to it where
+    // it stands.
+    if !cargo_clear_straight(game, i, id, &label) {
+        return;
+    }
+    let local = |game: &Game| -> Vec<(u32, Vec3, bool)> {
+        let Some(world) = game.scene.world.as_ref() else {
+            return Vec::new();
+        };
+        let Some(at) = world.physics.vehicle_transform(id) else {
+            return Vec::new();
+        };
+        let inv = at.inverse();
+        // From the crates' bodies, not where they were last shown: the
+        // first reading is taken right after the rigid move, before the
+        // props follow (q680, 3d99c9b7: judged against the old place,
+        // standing measured 39.85 m).
+        game.scene
+            .props
+            .cargo_riding_now(&world.physics)
+            .into_iter()
+            .filter(|c| c.1 == i)
+            .map(|(e, _, centre, aboard)| (e, inv.transform_point3(centre), aboard))
+            .collect()
+    };
+    // Crates already off the truck when the check starts (q680 1555b736:
+    // 0x11d39d fell off 17 s before, as the El Grande, now placed as
+    // authored on its 10-degree slope, rose and settled where it was
+    // parked) are not the check's to judge: logged, and left out of every
+    // phase.
+    let (start, before) = cargo_split_start(local(game));
+    for e in &before {
+        eprintln!(
+            "cargo-check: {e:#x} was already off the {label} before the check began (while it stood where it was parked): not counted"
+        );
+    }
+    let local = |game: &Game| -> Vec<(u32, Vec3, bool)> {
+        local(game)
+            .into_iter()
+            .filter(|c| !before.contains(&c.0))
+            .collect()
+    };
+    eprintln!(
+        "cargo-check: the {label}, {} crates aboard ({} already off, not counted)",
+        start.len(),
+        before.len()
+    );
+    if !cargo_ground_slope(game, i, id, &label) {
+        return;
+    }
+    // Each phase's fastest speed, its most turn from where it began and
+    // its longest run with no wheel down (after the first second).
+    let mut sane: Vec<Result<(), String>> = Vec::new();
+    let yaw = |game: &Game| {
+        game.scene
+            .world
+            .as_ref()
+            .and_then(|w| w.physics.vehicle_transform(id))
+            .map_or(0.0, |m| {
+                let f = m.transform_vector3(Vec3::Z);
+                f.x.atan2(f.z).to_degrees()
+            })
+    };
+    let speed = |game: &Game| {
+        game.scene
+            .world
+            .as_ref()
+            .map_or(0.0, |w| w.physics.vehicle_speed(id))
+    };
+    let mut table = Vec::new();
+    // Each phase's median and most shift of those aboard, how many off,
+    // and how many in all: for the verdict.
+    let mut ends: Vec<(&str, f32, f32, usize, usize)> = Vec::new();
+    let every = ((0.25 / tick) as u32).max(1);
+    for (phase, seconds) in [
+        ("standing", 3.0f32),
+        ("straight", 6.0),
+        ("hard turn", 2.0),
+        ("braking", 4.0),
+        ("standing after", 3.0),
+    ] {
+        let ticks = (seconds / tick) as u32;
+        let yaw0 = yaw(game);
+        let (mut fastest, mut turned, mut air, mut longest) = (0.0f32, 0.0f32, 0u32, 0u32);
+        for t in 0..ticks {
+            let v = speed(game);
+            let movement = match phase {
+                "straight" => Vec2::new(0.0, if v < 11.0 { 1.0 } else { 0.0 }),
+                "hard turn" => Vec2::new(-1.0, if v < 11.0 { 1.0 } else { 0.0 }),
+                "braking" => Vec2::new(0.0, if v > 0.5 { -1.0 } else { 0.0 }),
+                _ => Vec2::ZERO,
+            };
+            game.step(
+                crate::player::Intent {
+                    movement,
+                    ..Default::default()
+                },
+                tick,
+            );
+            // Log only: the first steps after the move, each with its
+            // speed and what the truck's body and wheels touch (q680
+            // ee4254c5: it drifted at -2.0 m/s while standing).
+            if phase == "standing" && t < CARGO_FIRST_STEPS {
+                cargo_step_log(game, i, id, t + 1);
+            }
+            fastest = fastest.max(speed(game).abs());
+            turned = turned.max(((yaw(game) - yaw0 + 540.0).rem_euclid(360.0) - 180.0).abs());
+            let down = game
+                .scene
+                .world
+                .as_ref()
+                .map_or(0, |w| w.physics.vehicle_contacts(id).0);
+            let settling = phase == "standing" && (t as f32) * tick < 1.0;
+            air = if down == 0 && !settling { air + 1 } else { 0 };
+            longest = longest.max(air);
+            if t % every == 0 {
+                let now = local(game);
+                let shifts: Vec<String> = now
+                    .iter()
+                    .filter_map(|(e, p, aboard)| {
+                        let s = start.iter().find(|s| s.0 == *e)?;
+                        let d = *p - s.1;
+                        Some(format!(
+                            "{e:#x} {:+.2},{:+.2},{:+.2}{}",
+                            d.x,
+                            d.y,
+                            d.z,
+                            if *aboard { "" } else { " off" }
+                        ))
+                    })
+                    .collect();
+                eprintln!(
+                    "cargo-check: {phase} {:.2} s, {:.1} m/s, yaw {:.0}, truck at {:.2}: {}",
+                    t as f32 * tick,
+                    speed(game),
+                    yaw(game),
+                    game.scene
+                        .world
+                        .as_ref()
+                        .and_then(|w| w.physics.vehicle_transform(id))
+                        .map_or(Vec3::NAN, |m| m.transform_point3(Vec3::ZERO)),
+                    shifts.join("; ")
+                );
+            }
+            if phase == "braking" && speed(game) < 0.5 && t as f32 * tick > 0.5 {
+                break;
+            }
+        }
+        let now = local(game);
+        let mut aboard: Vec<f32> = now
+            .iter()
+            .filter(|c| c.2)
+            .filter_map(|(e, p, _)| Some((*p - start.iter().find(|s| s.0 == *e)?.1).length()))
+            .collect();
+        let off = now.iter().filter(|c| !c.2).count();
+        let (median, most) = median_and_most(&mut aboard);
+        let line = format!(
+            "{phase}: median {median:.2} m, max {most:.2} m, {off} of {} off (yaw {:.0} -> {:.0}, {:.1} m/s)",
+            now.len(),
+            yaw0,
+            yaw(game),
+            speed(game)
+        );
+        eprintln!("cargo-check: {line}");
+        table.push(line);
+        ends.push((phase, median, most, off, now.len()));
+        sane.push(cargo_sane(phase, fastest, turned, longest as f32 * tick));
+    }
+    eprintln!("cargo-check: TABLE (shift from start in the truck's frame, of those still aboard)");
+    for l in table {
+        eprintln!("cargo-check:   {l}");
+    }
+    let verdict = sane.into_iter().find(Result::is_err).map_or_else(
+        || cargo_verdict(&ends),
+        |e| e.map_err(|why| format!("not a drive on its wheels: {why}")),
+    );
+    match verdict {
+        Ok(()) => eprintln!(
+            "cargo-check: PASS the crates kept still standing, stayed aboard driving straight, and slid as they went"
+        ),
+        Err(why) => eprintln!("cargo-check: FAIL {why}"),
+    }
+}
+
+/// `--cargo-check`'s crates at its start split into those aboard (its
+/// judged set) and the ids of those already off (fallen before the check
+/// began, while the truck stood where it was parked).
+fn cargo_split_start(
+    crates: Vec<(u32, m2_math::glam::Vec3, bool)>,
+) -> (Vec<(u32, m2_math::glam::Vec3, bool)>, Vec<u32>) {
+    let (aboard, off): (Vec<_>, Vec<_>) = crates.into_iter().partition(|c| c.2);
+    (aboard, off.into_iter().map(|c| c.0).collect())
+}
+
+/// How many steps after the move `--cargo-check` logs one by one.
+const CARGO_FIRST_STEPS: u32 = 10;
+
+/// Logs `--cargo-check`'s truck `id` (vehicle `i`) after standing step
+/// `n`: its speed and spin, its wheels down, each spring's squeeze, what
+/// its body touches, and the speed of each crate still aboard. Log only.
+fn cargo_step_log(game: &Game, i: usize, id: m2_engine::VehicleId, n: u32) {
+    let Some(world) = game.scene.world.as_ref() else {
+        return;
+    };
+    let physics = &world.physics;
+    let (down, wheels) = physics.vehicle_contacts(id);
+    let squeeze: Vec<String> = physics
+        .vehicle_suspension(id)
+        .iter()
+        .map(|s| format!("{s:.3}"))
+        .collect();
+    let touching: Vec<String> = physics
+        .vehicle_touching(id)
+        .iter()
+        .map(|(k, at, _)| format!("{k:?} at {at:.2}"))
+        .collect();
+    let crates: Vec<String> = game
+        .scene
+        .props
+        .cargo_pieces(i)
+        .into_iter()
+        .filter_map(|d| Some(format!("{:.2}", physics.debris_velocity(d)?.0)))
+        .collect();
+    eprintln!(
+        "cargo-check: step {n}: v {:.3}, spin {:.3}, wheels down {down} of {wheels}, springs squeezed [{}] m, touching [{}], crates [{}]",
+        physics.vehicle_velocity(id),
+        physics.vehicle_spin(id),
+        squeeze.join(", "),
+        touching.join("; "),
+        crates.join("; ")
+    );
+}
+
+/// Logs the ground under `--cargo-check`'s truck `id` (vehicle `i`) where
+/// it now stands: the height under each corner of its hull's footprint,
+/// and the ground's slope along it and across it, degrees. Log only.
+fn cargo_ground_slope(game: &Game, i: usize, id: m2_engine::VehicleId, label: &str) -> bool {
+    use m2_math::glam::Vec3;
+    let Some(world) = game.scene.world.as_ref() else {
+        return false;
+    };
+    let physics = &world.physics;
+    let Some(m) = physics.vehicle_transform(id) else {
+        return false;
+    };
+    let (lo, hi) = game.scene.vehicles[i].spec.hull;
+    // Front left, front right, back left, back right (model +Z ahead).
+    let corners = [(lo.x, hi.z), (hi.x, hi.z), (lo.x, lo.z), (hi.x, lo.z)]
+        .map(|(x, z)| m.transform_point3(Vec3::new(x, lo.y, z)));
+    let ground = corners.map(|c| {
+        physics
+            .cast_ray_fixed(c + Vec3::Y * 20.0, Vec3::NEG_Y, 60.0)
+            .map(|(d, _)| c.y + 20.0 - d)
+    });
+    let [Some(fl), Some(fr), Some(bl), Some(br)] = ground else {
+        eprintln!(
+            "cargo-check: FAIL ground under the {label}'s corners: {ground:.2?} (one or more with none)"
+        );
+        return false;
+    };
+    let length = corners[0].with_y(0.0).distance(corners[2].with_y(0.0));
+    let width = corners[0].with_y(0.0).distance(corners[1].with_y(0.0));
+    let along = (((fl + fr) - (bl + br)) * 0.5).atan2(length).to_degrees();
+    let across = (((fr + br) - (fl + bl)) * 0.5).atan2(width).to_degrees();
+    eprintln!(
+        "cargo-check: ground under the {label}'s corners (front left, front right, back left, back right) {fl:.2}, {fr:.2}, {bl:.2}, {br:.2}: slope {along:+.1} deg along it (up ahead +), {across:+.1} deg across it (up to the right +); hull bottom corners at {:.2}, {:.2}, {:.2}, {:.2}",
+        corners[0].y, corners[1].y, corners[2].y, corners[3].y
+    );
+    let under: Vec<f32> = corners
+        .iter()
+        .zip([fl, fr, bl, br])
+        .map(|(c, g)| c.y - g)
+        .collect();
+    if let Err(why) = cargo_hull_over_ground(&under) {
+        eprintln!("cargo-check: FAIL the {label} {why}");
+        return false;
+    }
+    true
+}
+
+/// How far a hull's bottom corner may sit under the ground it reads,
+/// metres, before `--cargo-check` fails: its tyres' squeeze and a little
+/// more.
+const CARGO_HULL_UNDER: f32 = 0.3;
+
+/// Whether the hull's bottom corners, each so far over the ground under
+/// it (`over`, metres, under is negative), stand on it: none more than
+/// [`CARGO_HULL_UNDER`] under.
+fn cargo_hull_over_ground(over: &[f32]) -> Result<(), String> {
+    match over.iter().copied().reduce(f32::min) {
+        Some(least) if least < -CARGO_HULL_UNDER => Err(format!(
+            "stands in the ground: its hull's bottom corners {over:.2?} m over the ground under them"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The sane range of `--cargo-check`'s drive: never faster than this,
+/// m/s (its straight is held to 11), nor turned more than this on its
+/// straight or standing, degrees, nor without a wheel on the ground more
+/// than this many seconds running after the first second.
+const CARGO_SANE_SPEED: f32 = 14.0;
+const CARGO_SANE_YAW: f32 = 20.0;
+const CARGO_SANE_AIRBORNE: f32 = 0.5;
+
+/// Whether a phase of `--cargo-check`'s drive was a drive on its wheels:
+/// its fastest speed (either way), how far it turned from where it began
+/// (degrees; only a standing or straight phase is held to it), and its
+/// longest run with no wheel down, seconds (q680 6d991f6e: no wheel down
+/// any step, -24.6 and -84.4 m/s, turned 93 degrees on its straight).
+fn cargo_sane(phase: &str, fastest: f32, turned: f32, airborne: f32) -> Result<(), String> {
+    if fastest > CARGO_SANE_SPEED {
+        return Err(format!(
+            "{phase}: {fastest:.1} m/s, over {CARGO_SANE_SPEED}"
+        ));
+    }
+    if matches!(phase, "standing" | "straight" | "standing after") && turned > CARGO_SANE_YAW {
+        return Err(format!(
+            "{phase}: turned {turned:.0} degrees, over {CARGO_SANE_YAW}"
+        ));
+    }
+    if airborne > CARGO_SANE_AIRBORNE {
+        return Err(format!(
+            "{phase}: no wheel down for {airborne:.2} s running, over {CARGO_SANE_AIRBORNE}"
+        ));
+    }
+    Ok(())
+}
+
+/// Where `--cargo-check` puts its truck: at `at`'s level place, upright
+/// (no tilt or roll: what it stood on before doesn't come with it), its
+/// origin `ride` over the ground at `ground` (its wheels on it, its
+/// springs as its model has them: their rest, #766), heading `yaw`
+/// (radians, from +z towards +x) turned `k` eighths.
+fn cargo_upright(
+    at: m2_math::glam::Vec3,
+    ground: f32,
+    ride: f32,
+    yaw: f32,
+    k: i32,
+) -> m2_math::glam::Mat4 {
+    use m2_math::glam::{Mat4, Quat, Vec3};
+    Mat4::from_rotation_translation(
+        Quat::from_rotation_y(yaw + k as f32 * std::f32::consts::FRAC_PI_4),
+        Vec3::new(at.x, ground + ride, at.z),
+    )
+}
+
+/// How long `--cargo-check`'s straight must be, level and open, metres:
+/// its 6 s held to 11 m/s.
+const CARGO_STRAIGHT: f32 = 40.0;
+
+/// Finds `--cargo-check` a clear, level [`CARGO_STRAIGHT`] for vehicle
+/// `i` (`id`): its own heading if clear, else the first clear one of the
+/// seven others 45 degrees apart, to which the truck and what rides on it
+/// are turned where they stand. A heading is clear when the ground under
+/// a sample every 4 m stays within 1.5 m of the truck's and a 3.2 m wide,
+/// 2.1 m tall box over each is free of every placed object and building
+/// (as `--prop-limits-check`'s lane). False, with `cargo-check: FAIL no
+/// clear straight`, if none is.
+fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, label: &str) -> bool {
+    use m2_math::glam::{Quat, Vec3};
+    let Some(world) = game.scene.world.as_mut() else {
+        return false;
+    };
+    let Some(m) = world.physics.vehicle_transform(id) else {
+        return false;
+    };
+    let here = m.w_axis.truncate();
+    let ahead = m
+        .transform_vector3(Vec3::Z)
+        .with_y(0.0)
+        .normalize_or(Vec3::Z);
+    // Snapped to the nearest of eight world headings, so the search is the
+    // same from run to run (q680: eb5b8507 and the run before moved the
+    // truck to different places from headings a few degrees apart).
+    let step = std::f32::consts::FRAC_PI_4;
+    let snapped = (ahead.x.atan2(ahead.z) / step).round() * step;
+    let ahead = Vec3::new(snapped.sin(), 0.0, snapped.cos());
+    let physics = &world.physics;
+    // The truck's and its crates' footprint corners (model space of the
+    // truck): every one must have ground under it where it is moved to.
+    let (lo, hi) = game.scene.vehicles[i].spec.hull;
+    let ride = game.scene.vehicles[i].spec.ride_height();
+    let snapped_yaw = snapped;
+    let inv = m.inverse();
+    let mut corners: Vec<Vec3> = [(lo.x, lo.z), (hi.x, lo.z), (lo.x, hi.z), (hi.x, hi.z)]
+        .iter()
+        .map(|&(x, z)| Vec3::new(x, lo.y, z))
+        .collect();
+    for d in game.scene.props.cargo_pieces(i) {
+        if let Some(at) = physics.debris_place(d) {
+            corners.push(inv.transform_point3(at.w_axis.truncate()));
+        }
+    }
+    // What stands fixed only: from above, a plain ray met the truck's own
+    // bed and crates 2 m up, and the truck was moved 2 m into the ground
+    // (q680 6d991f6e: its hull 2.1-2.4 m under the ground it read).
+    let ground = |x: f32, z: f32, near: f32| {
+        physics
+            .cast_ray_fixed(Vec3::new(x, near + 20.0, z), Vec3::NEG_Y, 60.0)
+            .map(|(d, _)| near + 20.0 - d)
+    };
+    let Some(floor) = ground(here.x, here.z, here.y) else {
+        eprintln!("cargo-check: FAIL no clear straight (no ground under the {label})");
+        return false;
+    };
+    // A clear, level straight from `from` (on the ground at `base`) along
+    // `way`: the ground loaded and within 1.5 m of `base` every 4 m, and a
+    // 3.2 m wide box over each free of placed objects and buildings.
+    let clear = |from: Vec3, base: f32, way: Vec3| {
+        (0..=((CARGO_STRAIGHT / 4.0) as i32)).all(|k| {
+            let c = from + way * (5.0 + 4.0 * k as f32);
+            let Some(y) = ground(c.x, c.z, base).filter(|y| (y - base).abs() <= 1.5) else {
+                return false;
+            };
+            let c = Vec3::new(c.x, y, c.z);
+            physics.box_clear(
+                c + Vec3::new(-1.6, 0.4, -1.6),
+                c + Vec3::new(1.6, 2.5, 1.6),
+                |key| !matches!(key, m2_engine::StaticKey::Cell(_)),
+            )
+        })
+    };
+    let turned = |k: i32| Quat::from_rotation_y(k as f32 * std::f32::consts::FRAC_PI_4) * ahead;
+    if let Some(k) = (0..8).find(|&k| clear(here, floor, turned(k))) {
+        if k == 0 {
+            eprintln!("cargo-check: the {label}'s own heading is clear for {CARGO_STRAIGHT} m");
+            return true;
+        }
+        // Turned where it stands, upright on its wheels, its cargo with it.
+        let target = cargo_upright(here, floor, ride, snapped_yaw, k);
+        let turn = target * inv;
+        {
+            let (_, r, t) = target.to_scale_rotation_translation();
+            world.physics.place_vehicle(id, t, r);
+        }
+        for d in game.scene.props.cargo_pieces(i) {
+            if let Some(at) = world.physics.debris_place(d) {
+                world.physics.move_debris(d, turn * at);
+            }
+        }
+        eprintln!(
+            "cargo-check: the {label} is turned {} degrees where it stands: its own heading is blocked, that one is clear for {CARGO_STRAIGHT} m",
+            k * 45
+        );
+        return true;
+    }
+    // None here (q680 at a6fcbef0: on the waterfront): the nearest clear,
+    // level straight on ground already loaded within 200 m, rings 20 m
+    // apart, 16 places a ring, eight headings each; the place itself must
+    // have ground under it and room for the truck. Truck and cargo are
+    // moved there by one rigid move, as high over the ground as here.
+    let mut found = None;
+    // Places clear and level but with a truck or crate corner over no
+    // ground (or ground not loaded yet).
+    let mut ungrounded = 0;
+    'rings: for r in (1..=10).map(|n| n as f32 * 20.0) {
+        for a in 0..16 {
+            let turn = Quat::from_rotation_y(a as f32 * std::f32::consts::TAU / 16.0);
+            let at = here + turn * Vec3::Z * r;
+            let Some(base) = ground(at.x, at.z, here.y) else {
+                continue;
+            };
+            let spot = Vec3::new(at.x, base, at.z);
+            if !physics.box_clear(
+                spot + Vec3::new(-2.0, 0.4, -2.0),
+                spot + Vec3::new(2.0, 3.0, 2.0),
+                |key| !matches!(key, m2_engine::StaticKey::Cell(_)),
+            ) {
+                continue;
+            }
+            if let Some(k) = (0..8).find(|&k| clear(spot, base, turned(k))) {
+                // Ground under every truck and crate corner there.
+                let target = cargo_upright(spot, base, ride, snapped_yaw, k);
+                let bare = corners
+                    .iter()
+                    .map(|&c| target.transform_point3(c))
+                    .filter(|c| ground(c.x, c.z, c.y).is_none_or(|y| (y - c.y).abs() > 3.0))
+                    .count();
+                if bare > 0 {
+                    ungrounded += 1;
+                    continue;
+                }
+                found = Some((spot, base, k));
+                break 'rings;
+            }
+        }
+    }
+    let Some((spot, base, k)) = found else {
+        if ungrounded > 0 {
+            eprintln!(
+                "cargo-check: FAIL no ground under the move target: {ungrounded} clear, level places within 200 m had a truck or crate corner over no ground"
+            );
+            return false;
+        }
+        eprintln!(
+            "cargo-check: FAIL no clear straight within 200 m: none of eight headings at the {label} ({here:.0}) or at any loaded place round it has {CARGO_STRAIGHT} m of level, open ground"
+        );
+        return false;
+    };
+    // Upright on its wheels on the ground there, heading as cleared: not
+    // the tilt it stood with where it was (q680 5e4483a5: moved keeping it,
+    // its hull's bottom corners read -0.10, 0.36, -0.33 and 0.13 m over
+    // ground level within 0.03 m).
+    let target = cargo_upright(spot, base, ride, snapped_yaw, k);
+    let to = target.w_axis.truncate();
+    let moved = target * inv;
+    // Ground under every corner of the truck and under every crate where
+    // they are moved to (q680 eb5b8507: moved onto no ground, the truck
+    // fell 33 m in 2.75 s).
+    let missing: Vec<Vec3> = corners
+        .iter()
+        .map(|&c| target.transform_point3(c))
+        .filter(|c| ground(c.x, c.z, c.y).is_none_or(|y| (y - c.y).abs() > 3.0))
+        .collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "cargo-check: FAIL no ground under the move target {to:.0}: {} of {} truck and crate corners have none within 3 m ({:.0?})",
+            missing.len(),
+            corners.len(),
+            missing
+        );
+        return false;
+    }
+    {
+        let (_, r, t) = target.to_scale_rotation_translation();
+        world.physics.place_vehicle(id, t, r);
+    }
+    for d in game.scene.props.cargo_pieces(i) {
+        if let Some(at) = world.physics.debris_place(d) {
+            world.physics.move_debris(d, moved * at);
+        }
+    }
+    eprintln!(
+        "cargo-check: the {label} and its cargo are moved {:.0} m to {to:.0}, turned {} degrees from its own heading (now {:.0} degrees, from +z towards +x): a clear, level {CARGO_STRAIGHT} m straight",
+        to.with_y(0.0).distance(here.with_y(0.0)),
+        k * 45,
+        (snapped_yaw + k as f32 * std::f32::consts::FRAC_PI_4).to_degrees()
+    );
+    true
+}
+
+/// `--cargo-check`'s verdict on its phases' ends (phase, median and most
+/// shift of those aboard, how many off so far, how many in all), against
+/// Xenia's crate runs (eg2, and block 2, `crates-hold.md`: 19 crates on
+/// the El Grande, each a plain dynamic body under its gravity scaler, no
+/// attach link). There they shift as physics starts and slide in the bed
+/// from the first pull-away, so how far they move is **not** gated. What
+/// is gated: none comes off standing, on a gentle straight or in a hard
+/// brake; a hard turn may shed a few (Xenia: 4 of 19), but most stay (no
+/// more than half off by the end).
+fn cargo_verdict(ends: &[(&str, f32, f32, usize, usize)]) -> Result<(), String> {
+    let at = |name: &str| ends.iter().find(|e| e.0 == name).copied();
+    let (Some(still), Some(straight), Some(turn), Some(brake), Some(last)) = (
+        at("standing"),
+        at("straight"),
+        at("hard turn"),
+        at("braking"),
+        at("standing after"),
+    ) else {
+        return Err("the drive ended before all its phases".into());
+    };
+    if still.4 == 0 {
+        return Err("no crates aboard".into());
+    }
+    if still.3 > 0 {
+        return Err(format!("{} came off standing", still.3));
+    }
+    if straight.3 > still.3 {
+        return Err(format!(
+            "{} came off driving straight",
+            straight.3 - still.3
+        ));
+    }
+    if brake.3 > turn.3 {
+        return Err(format!("{} came off braking", brake.3 - turn.3));
+    }
+    if last.3 * 2 > last.4 {
+        return Err(format!(
+            "{} of {} came off: most should stay",
+            last.3, last.4
+        ));
+    }
+    Ok(())
+}
+
+/// The median and the most of `shifts` (0 for none), as the Xenia
+/// table gives them: the upper middle of an even count.
+fn median_and_most(shifts: &mut [f32]) -> (f32, f32) {
+    shifts.sort_by(f32::total_cmp);
+    (
+        shifts.get(shifts.len() / 2).copied().unwrap_or(0.0),
+        shifts.last().copied().unwrap_or(0.0),
+    )
+}
+
 /// `--sink-check`: the first car loaded (no boat, no helicopter; parked
 /// or, with nowhere to park by her, not) is put on water more than 6 m
 /// deep near her with her at the wheel, and held
@@ -14096,6 +14882,91 @@ mod tests {
         assert!(!wreck_flight_verdict(&[], 0.0, None, None).fails.is_empty());
     }
 
+    // Crates off before the check began are not judged: only those aboard
+    // at its start (q680 1555b736: 0x11d39d fell 17 s before, as the truck
+    // settled where it was parked, and was counted as off standing).
+    #[test]
+    fn crates_off_before_the_cargo_check_are_not_judged() {
+        use m2_math::glam::Vec3;
+        let crates = vec![
+            (0x11d39d, Vec3::new(-1.3, -0.4, 0.4), false),
+            (0x11d39e, Vec3::ZERO, true),
+            (0x11d397, Vec3::X, true),
+        ];
+        let (aboard, before) = cargo_split_start(crates);
+        assert_eq!(before, vec![0x11d39d]);
+        assert_eq!(aboard.len(), 2);
+        assert!(aboard.iter().all(|c| c.2));
+    }
+
+    // The truck is put upright where it is moved, whatever tilt it stood
+    // with: its hull's bottom corners level over level ground (q680
+    // 5e4483a5: kept, a 10-degree roll read -0.10..0.36 m), its origin its
+    // ride height over the ground, its heading the cleared one.
+    #[test]
+    fn a_moved_cargo_truck_stands_upright_on_its_wheels() {
+        use m2_math::glam::{Mat4, Quat, Vec3};
+        let tilted = Mat4::from_rotation_translation(
+            Quat::from_rotation_y(0.3) * Quat::from_rotation_z(0.18),
+            Vec3::new(5.0, 2.0, 5.0),
+        );
+        let target = cargo_upright(
+            Vec3::new(40.0, 9.0, -20.0),
+            -31.34,
+            0.47,
+            -std::f32::consts::FRAC_PI_4,
+            1,
+        );
+        assert!((target.y_axis.truncate() - Vec3::Y).length() < 1e-5);
+        assert!((target.w_axis.y - (-31.34 + 0.47)).abs() < 1e-5);
+        let f = target.transform_vector3(Vec3::Z);
+        assert!(f.x.atan2(f.z).abs() < 1e-5, "heading {}", f.x.atan2(f.z));
+        let (lo, hi) = (Vec3::new(-1.2, 0.1, -3.0), Vec3::new(1.2, 2.5, 3.0));
+        let ys: Vec<f32> = [(lo.x, lo.z), (hi.x, lo.z), (lo.x, hi.z), (hi.x, hi.z)]
+            .iter()
+            .map(|&(x, z)| target.transform_point3(Vec3::new(x, lo.y, z)).y)
+            .collect();
+        assert!(ys.iter().all(|y| (y - ys[0]).abs() < 1e-4), "{ys:?}");
+        // What the old move did: its tilt carried over.
+        let kept = (Mat4::from_translation(Vec3::new(40.0, 0.0, -20.0)) * tilted)
+            .transform_point3(Vec3::new(lo.x, lo.y, lo.z))
+            .y
+            - (Mat4::from_translation(Vec3::new(40.0, 0.0, -20.0)) * tilted)
+                .transform_point3(Vec3::new(hi.x, lo.y, lo.z))
+                .y;
+        assert!(kept.abs() > 0.3, "{kept}");
+    }
+
+    // q680 6d991f6e's drive fails as not on its wheels: no wheel down,
+    // -24.6 m/s standing, 93 degrees on its straight; its hull 2.1-2.4 m
+    // under the ground it read. A real drive's numbers pass.
+    #[test]
+    fn a_cargo_drive_off_its_wheels_or_in_the_ground_fails() {
+        assert!(cargo_sane("standing", 24.6, 3.0, 0.0).is_err());
+        assert!(cargo_sane("straight", 11.0, 93.0, 0.0).is_err());
+        assert!(cargo_sane("standing", 0.1, 3.0, 2.9).is_err());
+        assert!(cargo_sane("straight", 11.2, 4.0, 0.0).is_ok());
+        assert!(cargo_sane("hard turn", 9.0, 120.0, 0.1).is_ok());
+        assert!(cargo_hull_over_ground(&[-2.12, -1.66, -2.38, -1.91]).is_err());
+        assert!(cargo_hull_over_ground(&[0.35, 0.38, 0.31, 0.33]).is_ok());
+        assert!(cargo_hull_over_ground(&[-0.1, 0.2, 0.0, 0.1]).is_ok());
+    }
+
+    // A boat may drop and tilt as it settles (the 360's moored boats
+    // dropped up to 2.33 m, boat1) but not move level more than a few
+    // centimetres, nor capsize.
+    #[test]
+    fn a_boat_settles_where_it_was_authored_however_far_it_drops() {
+        use m2_math::glam::Vec3;
+        let authored = Vec3::new(10.0, -31.713, 5.0);
+        let dropped = Vec3::new(10.01, -34.045, 5.0);
+        assert!(boat_settled(dropped, authored, 0.99,).is_ok());
+        // Tilted 7 degrees: still fine.
+        assert!(boat_settled(dropped, authored, 7f32.to_radians().cos()).is_ok());
+        assert!(boat_settled(dropped, authored, 0.2).is_err());
+        assert!(boat_settled(Vec3::new(10.3, -34.0, 5.0), authored, 0.99).is_err());
+    }
+
     // A scaled tank's airborne fall by the code: 18 for all its bodies,
     // plus the tracks' 9 on its chassis shared over all its mass; 27 with
     // no turret, less with one.
@@ -14126,6 +14997,13 @@ mod tests {
         assert!(traffic_verdict(0, 0, &[]).is_err());
         assert!(traffic_verdict(4, 0, &[]).is_err());
         assert!(traffic_verdict(4, 2, &["Taxi".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn the_cargo_check_tables_the_median_and_most_shift() {
+        assert_eq!(median_and_most(&mut [0.5, 0.1, 2.0]), (0.5, 2.0));
+        assert_eq!(median_and_most(&mut [0.3, 0.1]), (0.3, 0.3));
+        assert_eq!(median_and_most(&mut []), (0.0, 0.0));
     }
 
     #[test]
@@ -15124,6 +16002,347 @@ mod gravity_check_tests {
 /// it goes (props stream in only so), and if she is at no wheel (the
 /// check runs before `--drive` seats her) she takes the nearest land
 /// vehicle standing, logged.
+/// How long `--parked-settle-check` watches, seconds, and how long after
+/// its placing each vehicle is judged.
+const SETTLE_WATCH: f32 = 45.0;
+const SETTLE_AFTER: f32 = 5.0;
+/// What `--parked-settle-check` allows a vehicle placed as authored, 5 s
+/// on: metres from its authored place, degrees from its authored turn,
+/// and m/s. From Xenia: the 360's El Grande, placed at its layer
+/// transform, settled on its suspension 0.18 m up and 0.20 m sideways
+/// (0.27 m in all) with its roll 0.75 degrees off; 0.35 m is that with
+/// about a third more for other vehicles' suspension, and 5 degrees is
+/// well over its tilt.
+const SETTLE_MOST: (f32, f32, f32) = (0.35, 5.0, 0.05);
+/// Over how long before it is judged `--parked-settle-check` measures how
+/// fast a vehicle is moving, seconds.
+const SETTLE_STILL_OVER: f32 = 0.5;
+
+/// How long `--parked-settle-check` notes what each vehicle touches after
+/// it is placed, seconds, and the one whose every touch is logged as it
+/// goes (q766 B's Phoenix, flipped 152 deg): log lines only.
+const SETTLE_TOUCH_WATCH: f32 = 1.0;
+const SETTLE_TOUCH_WATCHED: u32 = 0x0010_d5d8;
+
+/// What a vehicle touches, named for `--parked-settle-check`'s log: a
+/// terrain cell, a static layer's placed object (its entity guid and
+/// template's name), a state layer's entity, or a moving body.
+fn settle_touch_name(world: &m2_engine::World, key: Option<m2_engine::StaticKey>) -> String {
+    use m2_engine::StaticKey;
+    let object = |i: usize| {
+        world
+            .index
+            .objects
+            .get(i)
+            .map_or(format!("object #{i}"), |o| {
+                let name = world
+                    .index
+                    .template_db
+                    .by_id(o.template)
+                    .map_or(format!("model {:08x}", o.model), |(n, _)| n.to_owned());
+                format!("{:#x} {name} (a static layer's)", o.entity)
+            })
+    };
+    match key {
+        Some(StaticKey::Cell(h)) => format!("terrain cell {h:08x}"),
+        Some(StaticKey::Object(i)) => object(i),
+        Some(StaticKey::Member(i, k)) => format!("building {k} of {}", object(i)),
+        Some(StaticKey::Entity(g)) => format!("{g:#x} (a state layer's)"),
+        None => "a moving body (a vehicle, prop body or debris)".to_owned(),
+    }
+}
+
+/// What `--parked-settle-check` allows a boat: metres it may move level
+/// from its authored place, and the least up (its up axis's height: not
+/// capsized). From Xenia's boat1 (OilCon020, 2026-11-25): the 360's moored
+/// boats appear at their authored transforms and drop and settle within
+/// about 7 s, then stay put. GunningBoat 0xFA47B dropped 0.906 m and
+/// drifted 2.2 cm in its last 20 s; the fishing boats 0xD5FC6, 0xD5FC4 and
+/// 0xD5FC7 dropped 0.765, 2.332 and 0.673 m, tilted 6-7 degrees, and moved
+/// under 1 cm level. So any drop and any tilt short of capsizing are
+/// allowed; level movement must stay within a few centimetres.
+const BOAT_SETTLE: (f32, f32) = (0.05, 0.5);
+
+/// A boat judged by [`BOAT_SETTLE`]: at `now`, authored at `authored`,
+/// `up` its up axis's height. It may drop and tilt as it settles; it must
+/// stay where it was authored, level, and not capsize.
+fn boat_settled(
+    now: m2_math::glam::Vec3,
+    authored: m2_math::glam::Vec3,
+    up: f32,
+) -> Result<(), String> {
+    let (level, least_up) = BOAT_SETTLE;
+    let off = now.with_y(0.0).distance(authored.with_y(0.0));
+    let drop = authored.y - now.y;
+    if up < least_up {
+        return Err(format!(
+            "capsized (up {up:.2}); dropped {drop:+.2} m, {off:.3} m level"
+        ));
+    }
+    if off > level {
+        return Err(format!(
+            "{off:.3} m level from its authored place (dropped {drop:+.2} m)"
+        ));
+    }
+    Ok(())
+}
+
+/// `--parked-settle-check` (it turns on `--drive`; give a `--spawn`): for
+/// [`SETTLE_WATCH`] s the game runs as played, the layers' parked vehicles
+/// coming in as she stands there, each placed as authored ([`game::place`]).
+/// Each is judged [`SETTLE_AFTER`] s after it was placed against its
+/// authored pose, structures included: within [`SETTLE_MOST`] of its place
+/// and turn, not on its side or roof, and still. A failing one is named
+/// with how far, how turned, how fast, and what is under it now (the
+/// terrain, something else, or nothing within 3 m), as its likely cause.
+/// One `parked-settle-check: PASS` or `FAIL ...` line.
+fn parked_settle_check(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    tick: f32,
+    least: usize,
+) -> anyhow::Result<()> {
+    use m2_math::glam::{Quat, Vec3};
+    use std::collections::HashMap;
+    // Entity -> (authored place, authored turn, seconds since placed).
+    // Entity -> (authored place, authored turn, seconds since placed,
+    // label, what it touched in its first second).
+    #[allow(clippy::type_complexity)]
+    let mut watched: HashMap<
+        u32,
+        (
+            Vec3,
+            Quat,
+            f32,
+            String,
+            std::collections::BTreeSet<String>,
+            Option<Vec3>,
+        ),
+    > = HashMap::new();
+    let (mut passed, mut failed) = (0usize, Vec::new());
+    let mut judged = std::collections::HashSet::new();
+    let mut t = 0.0f32;
+    while t < SETTLE_WATCH {
+        game.step(Intent::default(), tick);
+        render(backend, game, fov, aspect, None)?;
+        t += tick;
+        let Some(world) = game.scene.world.as_ref() else {
+            continue;
+        };
+        for v in &game.scene.vehicles {
+            if v.id.is_none() {
+                continue;
+            }
+            // A layer's parked vehicle (by entity) or a mission's (by its
+            // guid, its layer entity's `Transform`).
+            let authored = match (v.spot, v.guid) {
+                (Some((entity, at, _)), _) => game.authored_turn(entity).map(|t| (entity, at, t)),
+                (None, Some(g)) => game.authored_guids.get(&g).map(|&(at, t)| (g, at, t)),
+                _ => None,
+            };
+            let Some((key, at, turn)) = authored else {
+                continue;
+            };
+            if judged.contains(&key) || watched.contains_key(&key) {
+                continue;
+            }
+            // As it is placed: how far each corner of its hull's bottom is
+            // over what is under it (past its own bodies; negative: in it),
+            // to tell a hull put into the ground (q766 B: the Phoenix
+            // 0x10d5d8 flipped 178 deg touching only the terrain). Log only.
+            if let Some(m) =
+                v.id.and_then(|id| world.physics.vehicle_transform(id).zip(Some(id)))
+            {
+                let (m, id) = m;
+                let (lo, hi) = v.spec.hull;
+                let gaps: Vec<String> = [(lo.x, lo.z), (hi.x, lo.z), (lo.x, hi.z), (hi.x, hi.z)]
+                    .iter()
+                    .map(|&(x, z)| {
+                        let corner = m.transform_point3(Vec3::new(x, lo.y, z));
+                        world
+                            .physics
+                            .cast_ray_past(corner + Vec3::Y * 2.0, Vec3::NEG_Y, 6.0, id)
+                            .map_or("none".to_owned(), |(d, _)| format!("{:+.2}", d - 2.0))
+                    })
+                    .collect();
+                eprintln!(
+                    "parked-settle-check: {key:#x} {} placed: its hull's bottom corners over the ground [{}] m",
+                    v.spec.label,
+                    gaps.join(", ")
+                );
+            }
+            watched.insert(
+                key,
+                (
+                    at,
+                    turn,
+                    0.0,
+                    v.spec.label.clone(),
+                    std::collections::BTreeSet::new(),
+                    None,
+                ),
+            );
+        }
+        let mut done = Vec::new();
+        for (&entity, (at, turn, since, label, touched, mark)) in &mut watched {
+            *since += tick;
+            // What it touches as it is placed and over its first second
+            // (log lines only; q766 B's Phoenix 0x10d5d8 flipped 152 deg
+            // from a pose authored on the terrain).
+            if *since <= SETTLE_TOUCH_WATCH + tick
+                && let Some(id) = game
+                    .scene
+                    .vehicles
+                    .iter()
+                    .find(|v| v.spot.is_some_and(|s| s.0 == entity) || v.guid == Some(entity))
+                    .and_then(|v| v.id)
+            {
+                let now: Vec<String> = world
+                    .physics
+                    .vehicle_touching(id)
+                    .into_iter()
+                    .map(|(key, _, _)| settle_touch_name(world, key))
+                    .collect();
+                if entity == SETTLE_TOUCH_WATCHED {
+                    eprintln!(
+                        "parked-settle-check: {entity:#x} {label} at {:.2} s touches [{}]",
+                        *since,
+                        now.join("; ")
+                    );
+                }
+                touched.extend(now);
+            }
+            // Where it is half a second before it is judged: it is still
+            // if it has moved under SETTLE_MOST.2 m/s since.
+            if mark.is_none()
+                && *since >= SETTLE_AFTER - SETTLE_STILL_OVER
+                && let Some(id) = game
+                    .scene
+                    .vehicles
+                    .iter()
+                    .find(|v| v.spot.is_some_and(|s| s.0 == entity) || v.guid == Some(entity))
+                    .and_then(|v| v.id)
+                && let Some(m) = world.physics.vehicle_transform(id)
+            {
+                *mark = Some(m.w_axis.truncate());
+            }
+            if *since < SETTLE_AFTER {
+                continue;
+            }
+            done.push(entity);
+            let Some(v) = game
+                .scene
+                .vehicles
+                .iter()
+                .find(|v| v.spot.is_some_and(|s| s.0 == entity) || v.guid == Some(entity))
+            else {
+                continue;
+            };
+            let Some(id) = v.id else {
+                continue;
+            };
+            let Some(m) = world.physics.vehicle_transform(id) else {
+                continue;
+            };
+            let (_, now_turn, now_at) = m.to_scale_rotation_translation();
+            let moved = now_at.distance(*at);
+            let turned = now_turn.angle_between(*turn).to_degrees();
+            let up = m.transform_vector3(Vec3::Y).normalize_or_zero().y;
+            // Its whole speed: `vehicle_speed` is the signed speed along
+            // its heading, so one rolling back at 0.6 m/s passed as still
+            // (q769: two Fuel Trailers judged at -0.68 and -0.58 m/s).
+            let speed = world.physics.vehicle_velocity(id).length();
+            // A boat floats where the water puts it (`game::place`: level,
+            // at its float depth), not at its authored height or tilt: it
+            // is judged by its own rule.
+            if v.spec.is_boat() {
+                // Its offset split, level and down (boat1: the 360's drops
+                // were 0.67-2.33 m, its level movement under 1 cm).
+                eprintln!(
+                    "parked-settle-check: {entity:#x} {label} (a boat): {:.3} m level, dropped {:+.3} m, up {up:.2}",
+                    now_at.with_y(0.0).distance(at.with_y(0.0)),
+                    at.y - now_at.y
+                );
+                match boat_settled(now_at, *at, up) {
+                    Ok(()) => passed += 1,
+                    Err(why) => {
+                        let line = format!(
+                            "{entity:#x} {label} (a boat): {why}; touched in its first second: [{}]",
+                            touched.iter().cloned().collect::<Vec<_>>().join("; ")
+                        );
+                        eprintln!("parked-settle-check: off: {line}");
+                        failed.push(line);
+                    }
+                }
+                continue;
+            }
+            // How fast it moved over the last half second (q766: one
+            // step's velocity read 0.06 m/s on every vehicle at rest).
+            let instant = speed;
+            let speed = mark.map_or(instant, |p| now_at.distance(p) / SETTLE_STILL_OVER);
+            let ok = moved <= SETTLE_MOST.0
+                && turned <= SETTLE_MOST.1
+                && up > 0.5
+                && speed < SETTLE_MOST.2;
+            if ok {
+                passed += 1;
+            } else {
+                // Past its own bodies (q766 A: four Guntrucks' probe met
+                // their own hulls, -2.00).
+                let from = *at + Vec3::Y * 2.0;
+                let under = world
+                    .physics
+                    .cast_ray_past(from, Vec3::NEG_Y, 5.0, id)
+                    .map_or(
+                        "nothing within 3 m under its authored place (past its own bodies)"
+                            .to_owned(),
+                        |(d, _)| {
+                            format!(
+                                "something {:+.2} m under its authored place (past its own bodies)",
+                                d - 2.0
+                            )
+                        },
+                    );
+                let line = format!(
+                    "{entity:#x} {label}: {moved:.2} m from its authored place, {turned:.1} deg turned, up {up:.2}, {speed:.3} m/s over the last {SETTLE_STILL_OVER} s ({instant:.2} m/s this step); {under}; touched in its first second: [{}]",
+                    touched.iter().cloned().collect::<Vec<_>>().join("; ")
+                );
+                eprintln!("parked-settle-check: off: {line}");
+                failed.push(line);
+            }
+        }
+        for e in done {
+            watched.remove(&e);
+            judged.insert(e);
+        }
+    }
+    eprintln!(
+        "parked-settle-check: {} judged ({passed} kept their authored pose), {} still settling at the end",
+        judged.len(),
+        watched.len()
+    );
+    if judged.is_empty() {
+        eprintln!("parked-settle-check: FAIL no parked vehicle placed as authored here");
+    } else if judged.len() < least {
+        eprintln!(
+            "parked-settle-check: FAIL {} judged here, not at least {least}",
+            judged.len()
+        );
+    } else if failed.is_empty() {
+        eprintln!("parked-settle-check: PASS {passed} parked vehicles kept their authored pose");
+    } else {
+        eprintln!(
+            "parked-settle-check: FAIL {} of {} left their authored pose: {}",
+            failed.len(),
+            judged.len(),
+            failed.join("; ")
+        );
+    }
+    Ok(())
+}
+
 fn prop_bodies_check(
     backend: &mut WgpuBackend,
     game: &mut Game,
@@ -15500,6 +16719,45 @@ mod disguise_check_tests {
     #[test]
     fn the_disguise_check_passes() {
         assert!(super::disguise_check());
+    }
+}
+
+#[cfg(test)]
+mod cargo_verdict_tests {
+    use super::cargo_verdict;
+
+    // Xenia's run eg2 passes; crates that never move, or fall off driving
+    // straight, fail.
+    #[test]
+    fn xenias_crates_pass_and_frozen_or_spilled_ones_fail() {
+        let xenia = [
+            ("standing", 0.0, 0.01, 0, 19),
+            ("straight", 0.33, 0.52, 0, 19),
+            ("hard turn", 0.54, 1.80, 3, 19),
+            ("braking", 0.70, 2.36, 3, 19),
+            ("standing after", 0.68, 2.68, 3, 19),
+        ];
+        assert_eq!(cargo_verdict(&xenia), Ok(()));
+        // Block 2: they settle as physics starts (up to 0.47 m in the
+        // truck's frame) and slide from the first pull-away, 4 of 19 off
+        // in the hard turn: passes, however far they slid.
+        let block2 = [
+            ("standing", 0.3, 0.47, 0, 19),
+            ("straight", 0.4, 0.9, 0, 19),
+            ("hard turn", 0.6, 2.0, 4, 19),
+            ("braking", 0.7, 2.2, 4, 19),
+            ("standing after", 0.7, 2.2, 4, 19),
+        ];
+        assert_eq!(cargo_verdict(&block2), Ok(()));
+        let mut spilled = xenia;
+        spilled[1] = ("straight", 0.3, 0.5, 2, 19);
+        assert!(cargo_verdict(&spilled).is_err());
+        let mut braked = block2;
+        braked[3] = ("braking", 0.7, 2.2, 6, 19);
+        assert!(cargo_verdict(&braked).is_err());
+        let mut emptied = block2;
+        emptied[4] = ("standing after", 0.7, 2.2, 12, 19);
+        assert!(cargo_verdict(&emptied).is_err());
     }
 }
 

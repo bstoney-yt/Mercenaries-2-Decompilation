@@ -2136,6 +2136,19 @@ impl MissionLink {
         ))
     }
 
+    /// Where the scripts' object named `name` stands (a layer entity's
+    /// own name, as `GunPickup`), if one is in their world.
+    pub fn place_named(&self, name: &str) -> Option<Vec3> {
+        let State::Running(m) = &self.state else {
+            return None;
+        };
+        let w = m.world().borrow();
+        w.objects
+            .values()
+            .find(|o| o.name.eq_ignore_ascii_case(name))
+            .map(|o| Vec3::from(o.position))
+    }
+
     /// Where the scripts' markers stand: on their targets.
     pub fn marked_places(&self) -> Vec<Vec3> {
         let State::Running(m) = &self.state else {
@@ -6008,20 +6021,33 @@ impl Fleet {
             self.riding = riding;
         }
         let mut seated = false;
+        let mut as_authored = Vec::new();
         {
             let w = mission.world().borrow();
             for (i, v) in game.scene.vehicles.iter_mut().enumerate() {
                 let Some(g) = v.guid else { continue };
                 // Placed once the scripts have let go of it (a winch) and
                 // the ground under it has loaded.
-                if v.id.is_none()
-                    && let Some(o) = w
-                        .objects
+                let placed = v.id.is_none()
+                    && w.objects
                         .get(&g)
                         .filter(|o| o.alive && o.position[1] > HIDDEN_BELOW)
-                    && !w.winch.get(&g).is_some_and(Option::is_some)
-                    && !game.scene.flights.carrying(g)
-                    && place(physics, v, Vec3::from(o.position), o.yaw)
+                        .is_some_and(|o| {
+                            let turn = o.rotation.map(m2_math::glam::Quat::from_array);
+                            let at = Vec3::from(o.position);
+                            if w.winch.get(&g).is_some_and(Option::is_some)
+                                || game.scene.flights.carrying(g)
+                                || !place(physics, v, at, o.yaw, turn)
+                            {
+                                return false;
+                            }
+                            // Placed as authored: for `--parked-settle-check`.
+                            if let Some(t) = turn.filter(|_| !v.spec.is_boat()) {
+                                as_authored.push((g, at, t));
+                            }
+                            true
+                        });
+                if placed
                     && self.reenter == Some(g)
                     && let Some(p) = game.scene.player.as_mut()
                 {
@@ -6041,6 +6067,9 @@ impl Fleet {
         }
         if seated {
             game.scripts_seated = true;
+        }
+        for (g, at, turn) in as_authored {
+            game.authored_guids.insert(g, (at, turn));
         }
         let now = mission.now();
         self.landing.retain(|_, until| *until > now);
@@ -6133,13 +6162,12 @@ impl Fleet {
             })
             .filter(|(_, g, models)| !ai_flown(&w, *g, models))
             // One of the layers' patrol boats the traffic already put out
-            // ([`crate::traffic`]) is that one.
+            // ([`crate::traffic`]), or road traffic, is that one: left to it.
             .filter(|(_, g, _)| {
-                !game
-                    .scene
-                    .vehicles
-                    .iter()
-                    .any(|v| v.spot.is_some_and(|(e, _, _)| e == *g))
+                !game.scene.vehicles.iter().any(|v| {
+                    v.spot.is_some_and(|(e, _, _)| e == *g)
+                        && (game.traffic.owns(*g) || game.roads.owns(v))
+                })
             })
             .collect();
         // Those the scripts still have in play near her count against the
@@ -6168,7 +6196,29 @@ impl Fleet {
             if !crew.is_empty() {
                 game.scene.mission_crews.insert(g, crew);
             }
-            game.scene.load_vehicle(g, models);
+            // One vehicle per entity: the layers' own, placed or loading,
+            // is the scripts' (q766: each of B, C and E's cars was loaded a
+            // second time by the scripts and the two shoved apart).
+            game.scene.script_owned.insert(g);
+            match crate::scene::scripts_find(&game.scene.vehicles, |e| game.layers_asked(e), g) {
+                crate::scene::ScriptsFind::Layers(i) => {
+                    let crew = game.scene.mission_crews.get(&g).cloned();
+                    let ruin = game.scene.ruins.contains(&g);
+                    let v = &mut game.scene.vehicles[i];
+                    v.take_for_scripts(g, crew.as_ref(), ruin);
+                    eprintln!(
+                        "mission vehicle {g:#x}: the layers' {}, taken over",
+                        v.spec.label
+                    );
+                }
+                crate::scene::ScriptsFind::LayersLoading => {
+                    game.scene.adopt_on_load.insert(g);
+                    eprintln!(
+                        "mission vehicle {g:#x}: the layers' still loading, theirs as it loads"
+                    );
+                }
+                crate::scene::ScriptsFind::Nothing => game.scene.load_vehicle(g, models),
+            }
         }
     }
 }

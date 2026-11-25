@@ -39,6 +39,8 @@ pub struct LayerEntity {
     pub name: String,
     pub position: Vec3,
     pub yaw: f32,
+    /// Its whole authored turn (its `Transform`'s).
+    pub rotation: m2_math::glam::Quat,
     /// The layer it is in (`vz_state_alljob002_02_staging`).
     pub layer: String,
 }
@@ -174,6 +176,7 @@ fn run(
             name: member_stem(&e.name).to_owned(),
             position: Vec3::from(e.at),
             yaw: e.yaw,
+            rotation: m2_math::glam::Quat::from_array(e.rotation),
             layer: name.clone(),
         }));
     }
