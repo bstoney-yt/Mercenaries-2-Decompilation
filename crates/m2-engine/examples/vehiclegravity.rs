@@ -34,9 +34,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let name = db
             .by_id(id)
             .map_or(format!("{id:#x}"), |(n, _)| n.to_owned());
+        // A tank's `_TankPhysics` `GravityFactor` (its off-ground pull,
+        // 0x821A4F10: (GravityFactor - 1) x 1.5 m/s² for each of its six
+        // track points off the ground).
+        let gf = db
+            .tuning
+            .get(&id)
+            .and_then(|t| t.tank)
+            .map_or(String::new(), |t| {
+                format!(" GravityFactor {}", t.gravity_factor)
+            });
         by.entry(format!("{s:.3}"))
             .or_default()
-            .push((format!("{kind:?}"), name));
+            .push((format!("{kind:?}"), format!("{name}{gf}")));
     }
     println!("{vehicles} vehicle templates, {scaled} with a gravity scale");
     for (s, mut list) in by {

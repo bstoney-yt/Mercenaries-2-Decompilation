@@ -13258,11 +13258,18 @@ fn ditch_check(game: &mut Game, tick: f32) {
     eprintln!("ditch-check: {}", verdict(ok && ok2));
 }
 
-/// The airborne fall `--vehicle-gravity-check` asks of a scaled tank,
-/// m/s² (code-derived, not yet measured: 2 x the world's 9.0, from the
-/// gravity action 0x82180778; Xenia is to measure the M1A2's), and how
-/// near.
-const SCALED_TANK_FALL: (f32, f32) = (18.0, 0.5);
+/// The airborne fall `--vehicle-gravity-check` asks of a scaled tank, of
+/// gravity scale 2 and `GravityFactor` 2 (the M1A2's, the DLC M1A1's and
+/// every other scaled tank's), m/s², and how near. Code-derived, not yet
+/// measured (Xenia is to measure the M1A2's): the gravity action
+/// (0x82180778) pulls it at 2 x the world's 9.0 = 18; and every step,
+/// with no gate on being airborne, `_TankPhysics`' step (0x821A49E8)
+/// calls 0x821A4F10, which counts its six track points in contact
+/// (bytes +0x80 .. +0x300 of the tracks, stride 0x80), and pulls it
+/// down by (GravityFactor - 1) x (6 - those) x mass x 1.5 (0x820D2F6C,
+/// -1.5) through its motion (vfunc +0x58, with the step's dt): in the
+/// air, (2 - 1) x 6 x 1.5 = 9 more. 27 in all.
+const SCALED_TANK_FALL: (f32, f32) = (27.0, 0.5);
 
 /// `--vehicle-gravity-check` (it turns on `--drive`): a tank whose
 /// template carries a `PhysicsPropertyGravityScaler` of 2 (one whose label
@@ -13373,7 +13380,7 @@ fn vehicle_gravity_check(
     );
     let (want_fall, slack) = SCALED_TANK_FALL;
     eprintln!(
-        "vehicle-gravity-check: the {} (scale {scale:?}) falls at {fall:.2} m/s/s in the air; the world's {WORLD_GRAVITY} x {} = {:.2}; a scaled tank's {want_fall} (code-derived, not yet measured)",
+        "vehicle-gravity-check: the {} (scale {scale:?}) falls at {fall:.2} m/s/s in the air; the world's {WORLD_GRAVITY} x {} = {:.2}; a scaled tank's {want_fall} with its six track points' pull (code-derived, not yet measured)",
         spec.label,
         vehicle_gravity_scale(scale),
         WORLD_GRAVITY * vehicle_gravity_scale(scale)
