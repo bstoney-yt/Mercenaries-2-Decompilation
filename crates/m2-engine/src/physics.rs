@@ -210,6 +210,15 @@ const HINGE_LEAST: f32 = 1.0e-4;
 const HINGE_INERTIA_SHARE: f32 = 0.1;
 const HINGE_MASS_SHARE: f32 = 0.01;
 
+/// How many steps goods just loaded (and the asleep vehicle under them)
+/// are put back to sleep after, while Rapier finds their contacts: it
+/// wakes a body the step after it is added and again when each new
+/// contact begins, where the 360 adds them inactive into one island that
+/// stays asleep (activation 0, 0x82165A18; Xenia settle8). The count is
+/// invented: enough for every contact of goods added in one tick to have
+/// begun.
+const CARGO_SETTLE_STEPS: u8 = 4;
+
 /// A static collision shape, shared between every place it is used.
 #[derive(Clone)]
 pub struct CollisionShape {
@@ -3570,7 +3579,7 @@ pub struct Physics {
     /// Goods just loaded, put to sleep again after the step they were
     /// added in unless something awake outside them touches them
     /// ([`Physics::add_cargo`]).
-    cargo_sleep: Vec<r::RigidBodyHandle>,
+    cargo_sleep: Vec<(r::RigidBodyHandle, u8)>,
     /// Every loaded piece of goods: one asleep is woken once an awake
     /// dynamic body's collision pairs with it (Havok wakes an inactive
     /// island an active body reaches; inferred from Havok's islands).
@@ -3835,8 +3844,12 @@ impl Physics {
         // passer-by. Rapier woke every one of them at this step (each was
         // just added), so a pair within the batch says nothing.
         let batch = std::mem::take(&mut self.cargo_sleep);
-        for &h in &batch {
-            if !self.paired_with_awake_except(h, false, &batch)
+        let handles: Vec<r::RigidBodyHandle> = batch.iter().map(|e| e.0).collect();
+        for &(h, left) in &batch {
+            if left > 1 {
+                self.cargo_sleep.push((h, left - 1));
+            }
+            if !self.paired_with_awake_except(h, false, &handles)
                 && let Some(b) = self.world.bodies.get_mut(h)
             {
                 // Not put back where it was loaded: moving a body wakes its
@@ -4395,7 +4408,24 @@ impl Physics {
             // next step: asleep again after it, unless something awake
             // touches it by then (a moving truck's bed wakes it, as Havok's
             // islands would).
-            self.cargo_sleep.push(h);
+            self.cargo_sleep.push((h, CARGO_SETTLE_STEPS));
+            // The asleep vehicles it may be loaded on stay so with it: their
+            // bed meets it at these steps too, and a new contact wakes both
+            // in Rapier.
+            let beds: Vec<r::RigidBodyHandle> = self
+                .vehicles
+                .iter()
+                .flatten()
+                .filter(|v| v.bed && v.rest.is_some_and(|r| r.asleep))
+                .map(|v| v.controller.chassis)
+                .filter(|c| self.world.bodies.get(*c).is_some_and(|b| b.is_sleeping()))
+                .collect();
+            for c in beds {
+                match self.cargo_sleep.iter_mut().find(|e| e.0 == c) {
+                    Some(e) => e.1 = CARGO_SETTLE_STEPS,
+                    None => self.cargo_sleep.push((c, CARGO_SETTLE_STEPS)),
+                }
+            }
             self.cargo_bodies.push(h);
         }
         id
@@ -4443,14 +4473,31 @@ impl Physics {
 
     /// Wakes loose piece `id`.
     pub fn wake_debris(&mut self, id: DebrisId) {
-        if let Some(b) = self
-            .debris
-            .get(id.0)
-            .copied()
-            .flatten()
-            .and_then(|h| self.world.bodies.get_mut(h))
-        {
+        let Some(h) = self.debris.get(id.0).copied().flatten() else {
+            return;
+        };
+        self.let_go(h);
+        if let Some(b) = self.world.bodies.get_mut(h) {
             b.wake_up(true);
+        }
+    }
+
+    /// Body `h` is woken by the game (a push, a velocity set, a move or its
+    /// driver), not by Rapier finding its contacts: it is no longer put
+    /// back to sleep with the goods just loaded ([`CARGO_SETTLE_STEPS`]).
+    fn let_go(&mut self, h: r::RigidBodyHandle) {
+        self.cargo_sleep.retain(|e| e.0 != h);
+    }
+
+    /// [`let_go`](Self::let_go) for vehicle `id`'s chassis.
+    fn let_go_vehicle(&mut self, id: VehicleId) {
+        if let Some(c) = self
+            .vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map(|v| v.controller.chassis)
+        {
+            self.let_go(c);
         }
     }
 
@@ -4488,6 +4535,20 @@ impl Physics {
                 ));
             let chassis = v.controller.chassis;
             insert_collider(&mut self.world, collider, Some(chassis));
+            // The bed is the 360 truck's own collision from the start, so
+            // adding it here wakes nothing: Rapier wakes a body at the step
+            // after a collider is added to it, and an asleep truck goes back
+            // to sleep after those steps with what is loaded on it
+            // ([`CARGO_SETTLE_STEPS`]), unless the game wakes it first.
+            if v.rest.is_some_and(|r| r.asleep)
+                || self
+                    .world
+                    .bodies
+                    .get(chassis)
+                    .is_some_and(|b| b.is_sleeping())
+            {
+                self.cargo_sleep.push((chassis, CARGO_SETTLE_STEPS));
+            }
         }
         true
     }
@@ -4603,6 +4664,7 @@ impl Physics {
         let Some(h) = self.debris.get(id.0).copied().flatten() else {
             return;
         };
+        self.let_go(h);
         if let Some(b) = self.world.bodies.get_mut(h) {
             let v = vec3(b.linvel()) + velocity;
             b.set_linvel(vector(v), true);
@@ -5390,6 +5452,10 @@ impl Physics {
     /// (-1 left to 1 right) and handbrake. Throttle against the way the
     /// vehicle rolls brakes it; with no throttle it rolls to a stop.
     pub fn drive(&mut self, id: VehicleId, controls: VehicleControls) {
+        if !controls.parked && (controls.throttle != 0.0 || controls.steer != 0.0 || controls.brake)
+        {
+            self.let_go_vehicle(id);
+        }
         let dt = self.world.integration_parameters.dt.max(1e-3);
         let Some(v) = self
             .vehicles
@@ -6818,6 +6884,7 @@ impl Physics {
 
     /// Sets a vehicle's spin, radians a second about each axis.
     pub fn set_vehicle_spin(&mut self, id: VehicleId, spin: Vec3) {
+        self.let_go_vehicle(id);
         let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
             return;
         };
@@ -6829,6 +6896,7 @@ impl Physics {
     /// Sets a vehicle's velocity, m/s (as it was before something it hit
     /// gave way).
     pub fn set_vehicle_velocity(&mut self, id: VehicleId, velocity: Vec3) {
+        self.let_go_vehicle(id);
         let Some(v) = self.vehicles.get_mut(id.0).and_then(Option::as_mut) else {
             return;
         };
@@ -6855,6 +6923,7 @@ impl Physics {
     /// Puts a vehicle at `position` facing `rotation`, at rest (for the
     /// offscreen checks).
     pub fn place_vehicle(&mut self, id: VehicleId, position: Vec3, rotation: Quat) {
+        self.let_go_vehicle(id);
         let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
             return;
         };
@@ -6892,6 +6961,7 @@ impl Physics {
     /// old ones plus that (0x8262AA20, 0x8262AAC0). A push never adds to
     /// speed already going its way, only brings it up to the push's.
     pub fn push_vehicle_topped(&mut self, id: VehicleId, pushes: &[(Vec3, Vec3)]) {
+        self.let_go_vehicle(id);
         let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
             return;
         };
@@ -6921,6 +6991,7 @@ impl Physics {
 
     /// Shoves a vehicle: `impulse` (kg m/s) applied at world point `at`.
     pub fn push_vehicle(&mut self, id: VehicleId, impulse: Vec3, at: Vec3) {
+        self.let_go_vehicle(id);
         let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
             return;
         };
@@ -10005,6 +10076,80 @@ mod tests {
             },
             stop,
         )
+    }
+
+    /// A parked truck added asleep with a bed, and overlapping goods (as
+    /// the El Grande's 39b/39d) loaded on it in the same tick; `wake` wakes
+    /// the truck after 1 s (its island). The most any good moved in the
+    /// truck's frame over 20 s, metres.
+    fn overlapping_load(wake: bool) -> f32 {
+        let mut p = ready();
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        for _ in 0..120 {
+            p.step(DT);
+        }
+        p.sleep_vehicle(id);
+        let tray = [
+            Vec3::new(-1.0, 1.0, -2.2),
+            Vec3::new(1.0, 1.0, -2.2),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(-1.0, 1.0, 0.0),
+        ];
+        let bed = CollisionShape::mesh(&tray, &[[0, 2, 1], [0, 3, 2]]).unwrap();
+        assert!(p.add_bed(id, &bed));
+        let place = p.vehicle_transform(id).unwrap();
+        let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::new(0.5, 0.15, 0.2), 30.0);
+        let spots = [
+            Vec3::new(0.0, 1.17, -1.0),
+            Vec3::new(0.32, 1.27, -0.9),
+            Vec3::new(-0.3, 1.17, -1.2),
+        ];
+        let goods: Vec<(DebrisId, Mat4)> = spots
+            .iter()
+            .map(|&s| {
+                let at = place * Mat4::from_translation(s);
+                (p.add_cargo(&piece, at), Mat4::from_translation(s))
+            })
+            .collect();
+        let mut most = 0.0f32;
+        for k in 0..1200 {
+            if wake && k == 60 {
+                let at = p.vehicle_transform(id).unwrap().w_axis.truncate();
+                p.push_vehicle(id, Vec3::new(0.0, 1.0, 0.0), at);
+            }
+            p.step(DT);
+            let place = p.vehicle_transform(id).unwrap();
+            for (g, from) in &goods {
+                let on = place.inverse() * p.debris_place(*g).unwrap();
+                most = most.max((on.w_axis - from.w_axis).length());
+            }
+        }
+        most
+    }
+
+    // The El Grande's overlapping 39b/39d: goods loaded in one tick on a
+    // parked truck added asleep, their records overlapping, stay asleep
+    // with it and don't move (Xenia settle8: one island asleep
+    // throughout, velocity 0). Before, the contacts Rapier found the steps
+    // after they were added woke the truck and them, and they pushed apart
+    // (2.4 m here; 0.57 and 0.76 m in the merge queue's run).
+    #[test]
+    fn overlapping_goods_on_a_parked_truck_stay_asleep_and_put() {
+        let most = overlapping_load(false);
+        assert!(most < 5e-3, "moved {most} m");
+    }
+
+    // Woken (a push on the truck), the same goods are pushed apart by
+    // Rapier's contact recovery from their 0.1-0.3 m overlaps. The 360
+    // recovers penetration through Havok's solver (tau 0.9, damping 1.1,
+    // four substeps; tolerance 0.1, read from the world dump), which is
+    // not yet matched here; Xenia settle3 had woken crates move 0.24-0.50 m
+    // and none come off.
+    #[test]
+    #[ignore = "open: Havok's penetration recovery for woken overlapping goods is not yet matched"]
+    fn overlapping_goods_on_a_woken_truck_stay_on_their_bed() {
+        let most = overlapping_load(true);
+        assert!(most < 0.5, "moved {most} m");
     }
 
     fn crate_on_bed_as(m: BodyMaterial, stop: bool) -> f32 {
