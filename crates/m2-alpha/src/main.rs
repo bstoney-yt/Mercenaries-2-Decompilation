@@ -9651,8 +9651,28 @@ fn cargo_check(game: &mut Game, tick: f32) {
             .map(|(e, _, centre, aboard)| (e, inv.transform_point3(centre), aboard))
             .collect()
     };
-    let start = local(game);
-    eprintln!("cargo-check: the {label}, {} crates aboard", start.len());
+    // Crates already off the truck when the check starts (q680 1555b736:
+    // 0x11d39d fell off 17 s before, as the El Grande, now placed as
+    // authored on its 10-degree slope, rose and settled where it was
+    // parked) are not the check's to judge: logged, and left out of every
+    // phase.
+    let (start, before) = cargo_split_start(local(game));
+    for e in &before {
+        eprintln!(
+            "cargo-check: {e:#x} was already off the {label} before the check began (while it stood where it was parked): not counted"
+        );
+    }
+    let local = |game: &Game| -> Vec<(u32, Vec3, bool)> {
+        local(game)
+            .into_iter()
+            .filter(|c| !before.contains(&c.0))
+            .collect()
+    };
+    eprintln!(
+        "cargo-check: the {label}, {} crates aboard ({} already off, not counted)",
+        start.len(),
+        before.len()
+    );
     if !cargo_ground_slope(game, i, id, &label) {
         return;
     }
@@ -9788,6 +9808,16 @@ fn cargo_check(game: &mut Game, tick: f32) {
         ),
         Err(why) => eprintln!("cargo-check: FAIL {why}"),
     }
+}
+
+/// `--cargo-check`'s crates at its start split into those aboard (its
+/// judged set) and the ids of those already off (fallen before the check
+/// began, while the truck stood where it was parked).
+fn cargo_split_start(
+    crates: Vec<(u32, m2_math::glam::Vec3, bool)>,
+) -> (Vec<(u32, m2_math::glam::Vec3, bool)>, Vec<u32>) {
+    let (aboard, off): (Vec<_>, Vec<_>) = crates.into_iter().partition(|c| c.2);
+    (aboard, off.into_iter().map(|c| c.0).collect())
 }
 
 /// How many steps after the move `--cargo-check` logs one by one.
@@ -10131,9 +10161,10 @@ fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, lab
         }
     }
     eprintln!(
-        "cargo-check: the {label} and its cargo are moved {:.0} m to {to:.0}, heading {} degrees: a clear, level {CARGO_STRAIGHT} m straight",
+        "cargo-check: the {label} and its cargo are moved {:.0} m to {to:.0}, turned {} degrees from its own heading (now {:.0} degrees, from +z towards +x): a clear, level {CARGO_STRAIGHT} m straight",
         to.with_y(0.0).distance(here.with_y(0.0)),
-        k * 45
+        k * 45,
+        (snapped_yaw + k as f32 * std::f32::consts::FRAC_PI_4).to_degrees()
     );
     true
 }
@@ -14346,6 +14377,23 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Crates off before the check began are not judged: only those aboard
+    // at its start (q680 1555b736: 0x11d39d fell 17 s before, as the truck
+    // settled where it was parked, and was counted as off standing).
+    #[test]
+    fn crates_off_before_the_cargo_check_are_not_judged() {
+        use m2_math::glam::Vec3;
+        let crates = vec![
+            (0x11d39d, Vec3::new(-1.3, -0.4, 0.4), false),
+            (0x11d39e, Vec3::ZERO, true),
+            (0x11d397, Vec3::X, true),
+        ];
+        let (aboard, before) = cargo_split_start(crates);
+        assert_eq!(before, vec![0x11d39d]);
+        assert_eq!(aboard.len(), 2);
+        assert!(aboard.iter().all(|c| c.2));
+    }
 
     // The truck is put upright where it is moved, whatever tilt it stood
     // with: its hull's bottom corners level over level ground (q680
