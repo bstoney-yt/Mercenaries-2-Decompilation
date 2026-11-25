@@ -8,4 +8,5 @@ one m151 m151 "$PY tankfall.py Z:/mercs2/scratch/xenia-compare/m151/m151.txt 133
 one rpg1 rpg1 "$PY hpfast.py Z:/mercs2/scratch/xenia-compare/rpg1/hp.csv -3270 -2621 600 > $D/rpg1-hp.out 2>&1 &" || exit 1
 one phys7b death2 "$PY massprobe.py Z:/mercs2/scratch/xenia-compare/phys7b/mass.txt 2653.8 -996.7 150 > $D/phys7b-mass.out 2>&1 &" || exit 1
 one phys7c death2 "$PY massprobe.py Z:/mercs2/scratch/xenia-compare/phys7c/mass.txt 2653.8 -996.7 150 > $D/phys7c-mass.out 2>&1 &" || exit 1
-one phys7d death2 "$PY massprobe.py Z:/mercs2/scratch/xenia-compare/phys7d/mass.txt 2653.8 -996.7 150 > $D/phys7d-mass.out 2>&1 &"
+one phys7d death2 "$PY massprobe.py Z:/mercs2/scratch/xenia-compare/phys7d/mass.txt 2653.8 -996.7 150 > $D/phys7d-mass.out 2>&1 &" || exit 1
+one boat1 boat1 "$PY boatprobe.py Z:/mercs2/scratch/xenia-compare/boat1/boat.txt 900 FA47B D5FC4 D5FC7 D5FC6 > $D/boat1-probe.out 2>&1 &"
