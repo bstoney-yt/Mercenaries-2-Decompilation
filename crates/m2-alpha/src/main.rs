@@ -8335,6 +8335,12 @@ fn drive_for_screenshot(
         ditch_check(game, tick);
         return Ok(());
     }
+    // No drive: the car is put at Xenia's wreck spot as it stands
+    // (q728m, q728n: the drive left it upside down on the coast).
+    if options.wreck_blast_check {
+        wreck_blast_check(game, tick, options.wreck_blast_at);
+        return Ok(());
+    }
     let label = game
         .scene
         .player
@@ -8670,10 +8676,6 @@ fn drive_for_screenshot(
     );
     if options.wreck_rider_check {
         wreck_rider_check(game, tick);
-        return Ok(());
-    }
-    if options.wreck_blast_check {
-        wreck_blast_check(game, tick, options.wreck_blast_at);
         return Ok(());
     }
     if options.exit_land_check {
@@ -10271,123 +10273,122 @@ fn wreck_blast_model(game: &Game, options: &Options) -> Option<u32> {
         .model
 }
 
-/// How far round the car `--wreck-blast-check` wants open ground, metres:
-/// nothing placed within it to stop its flight (q728k: wrecked 1 m from
-/// Object 25647, it hit that on its third step). Xenia's wrecks land
-/// 11-15.6 m out ([`XENIA_WRECK_LANDS`]).
-const WRECK_OPEN_RADIUS: f32 = 16.0;
-/// How far the ground within that may rise or fall from the car's,
-/// metres: about 7 degrees at its edge.
-const WRECK_OPEN_LEVEL: f32 = 2.0;
-/// Placed objects smaller than this (their box's half diagonal, metres)
-/// don't count: plants and small props, which the flight passes over or
-/// knocks loose (q728m: on the coast none of 200 m was free of every
-/// object).
-const WRECK_OPEN_SMALL: f32 = 1.0;
-/// How far out the search goes, metres: rings 20 m apart, 24 places a
-/// ring.
-const WRECK_OPEN_SEARCH: f32 = 400.0;
+/// Where `--wreck-blast-check` wrecks its car, level (x, z): where
+/// Xenia's phys3-8 wrecked theirs, the Phoenix parked at the OilCon020
+/// start (phys8a: body at (2653.789, -13.786, -996.733) as it stood).
+/// Run with `--spawn 2654,-997` so the world round it is loaded.
+const WRECK_SPOT: (f32, f32) = (2653.8, -996.7);
 
-/// Moves vehicle `id` (which she drives) where `--wreck-blast-check`
-/// wrecks it to open ground: where it stands if open, else the nearest
-/// open place on rings 20 m apart out to [`WRECK_OPEN_SEARCH`], 24 places
-/// a ring. A place is open when the ground is loaded under it and every
-/// 4 m within [`WRECK_OPEN_RADIUS`], within [`WRECK_OPEN_LEVEL`] of its
-/// own, and no placed object or building at least [`WRECK_OPEN_SMALL`]
-/// in size reaches within that radius from 0.3 to 4 m over it. The car is
-/// put there upright, on its wheels (its heading kept), still. Logs how
-/// many places were turned down for which reason. Whether it was moved
-/// (its own place not open); `None`, with `wreck-blast-check: FAIL no
-/// open ground`, if none is.
-fn wreck_open_ground(game: &mut Game, id: m2_engine::VehicleId, label: &str) -> Option<bool> {
+/// How far out `--wreck-blast-check` logs the ground and what stands
+/// round its spot, metres: Xenia's wrecks land 11-15.6 m out.
+const WRECK_PATH: f32 = 16.0;
+
+/// Puts vehicle `id` (which she drives) at [`WRECK_SPOT`] for
+/// `--wreck-blast-check`: upright on its wheels on the ground there, its
+/// heading kept, still; then holds it still until the world has no loads
+/// pending (at least 1 s, at most 10 s). Logs, along eight headings, the
+/// ground 4, 8, 12 and 16 m out against the car's, and each placed object
+/// or building of 1 m or more within [`WRECK_PATH`] (log only: the flight
+/// is judged by its own numbers). False, with `wreck-blast-check: FAIL`,
+/// when there is no ground at the spot.
+fn wreck_at_spot(game: &mut Game, id: m2_engine::VehicleId, label: &str, tick: f32) -> bool {
     use m2_math::glam::{Quat, Vec3};
-    let i = game.scene.vehicles.iter().position(|v| v.id == Some(id))?;
+    let Some(i) = game.scene.vehicles.iter().position(|v| v.id == Some(id)) else {
+        return false;
+    };
     let ride = game.scene.vehicles[i].spec.ride_height();
-    let world = game.scene.world.as_mut()?;
-    let m = world.physics.vehicle_transform(id)?;
-    let here = m.w_axis.truncate();
+    let (x, z) = WRECK_SPOT;
+    let ground_at = |game: &Game, x: f32, z: f32| {
+        let physics = &game.scene.world.as_ref()?.physics;
+        physics
+            .cast_ray(Vec3::new(x, 400.0, z), Vec3::NEG_Y, 800.0)
+            .map(|(d, _)| 400.0 - d)
+    };
+    let Some(base) = ground_at(game, x, z) else {
+        eprintln!(
+            "wreck-blast-check: FAIL no ground at the wreck spot ({x}, {z}): run with --spawn 2654,-997"
+        );
+        return false;
+    };
+    let Some(world) = game.scene.world.as_mut() else {
+        return false;
+    };
+    let Some(m) = world.physics.vehicle_transform(id) else {
+        return false;
+    };
     let ahead = m
         .transform_vector3(Vec3::Z)
         .with_y(0.0)
         .normalize_or(Vec3::Z);
-    let physics = &world.physics;
-    let ground = |x: f32, z: f32, near: f32| {
-        physics
-            .cast_ray(Vec3::new(x, near + 30.0, z), Vec3::NEG_Y, 80.0)
-            .map(|(d, _)| near + 30.0 - d)
-    };
-    let r = WRECK_OPEN_RADIUS;
-    // Why places were turned down: no ground loaded, not level, blocked.
-    let (mut unloaded, mut uneven, mut blocked) = (0, 0, 0);
-    let mut open = |at: Vec3| -> Option<f32> {
-        let Some(base) = ground(at.x, at.z, at.y) else {
-            unloaded += 1;
-            return None;
-        };
-        let steps = (r / 4.0) as i32;
-        for a in -steps..=steps {
-            for b in -steps..=steps {
-                let (x, z) = (a as f32 * 4.0, b as f32 * 4.0);
-                if x * x + z * z > r * r {
-                    continue;
-                }
-                match ground(at.x + x, at.z + z, base) {
-                    None => {
-                        unloaded += 1;
-                        return None;
-                    }
-                    Some(y) if (y - base).abs() > WRECK_OPEN_LEVEL => {
-                        uneven += 1;
-                        return None;
-                    }
-                    Some(_) => {}
-                }
-            }
+    let to = Vec3::new(x, base + ride + 0.05, z);
+    world
+        .physics
+        .place_vehicle(id, to, Quat::from_rotation_y(ahead.x.atan2(ahead.z)));
+    eprintln!(
+        "wreck-blast-check: the {label} put upright at Xenia's wreck spot {to:.2} (ground {base:.2})"
+    );
+    let waited = Instant::now();
+    let mut k = 0u32;
+    loop {
+        if let Some(w) = game.scene.world.as_mut() {
+            w.physics.set_vehicle_velocity(id, Vec3::ZERO);
+            w.physics.set_vehicle_spin(id, Vec3::ZERO);
         }
-        let near = physics.fixed_near(
-            Vec3::new(at.x - r, base + 0.3, at.z - r),
-            Vec3::new(at.x + r, base + 4.0, at.z + r),
-        );
-        if near.iter().any(|&(c, size)| {
-            size >= WRECK_OPEN_SMALL && c.with_y(0.0).distance(at.with_y(0.0)) - size < r
-        }) {
-            blocked += 1;
-            return None;
-        }
-        Some(base)
-    };
-    let mut found = open(here).map(|base| (here, base));
-    if found.is_none() {
-        'rings: for n in 1..=(WRECK_OPEN_SEARCH / 20.0) as i32 {
-            for a in 0..24 {
-                let at = here
-                    + Quat::from_rotation_y(a as f32 * std::f32::consts::TAU / 24.0)
-                        * Vec3::Z
-                        * (n as f32 * 20.0);
-                if let Some(base) = open(at) {
-                    found = Some((at, base));
-                    break 'rings;
-                }
-            }
+        game.step(Intent::default(), tick);
+        k += 1;
+        let pending = game.scene.world.as_ref().map_or(0, |w| w.stats().pending);
+        if (k as f32 * tick >= 1.0 && pending == 0) || waited.elapsed() > Duration::from_secs(10) {
+            eprintln!(
+                "wreck-blast-check: waited {:.1} s at the spot, {pending} loads pending",
+                k as f32 * tick
+            );
+            break;
         }
     }
-    let moved = found.is_some_and(|(at, _)| at != here);
-    let Some((at, base)) = found else {
-        eprintln!(
-            "wreck-blast-check: FAIL no open ground within {WRECK_OPEN_SEARCH} m of the {label} ({here:.0}): no loaded place has {r} m round it level within {WRECK_OPEN_LEVEL} m and free of placed objects {WRECK_OPEN_SMALL} m or more ({unloaded} not loaded, {uneven} uneven, {blocked} blocked)"
-        );
-        return None;
+    let Some(base) = ground_at(game, x, z) else {
+        eprintln!("wreck-blast-check: FAIL the ground at the wreck spot went away");
+        return false;
     };
-    let to = Vec3::new(at.x, base + ride + 0.05, at.z);
-    let rotation = Quat::from_rotation_y(ahead.x.atan2(ahead.z));
-    world.physics.place_vehicle(id, to, rotation);
-    world.physics.set_vehicle_velocity(id, Vec3::ZERO);
-    world.physics.set_vehicle_spin(id, Vec3::ZERO);
-    eprintln!(
-        "wreck-blast-check: the {label} put upright on open ground at {to:.1}, {:.0} m from where it stopped ({here:.1}); {r} m round it level within {WRECK_OPEN_LEVEL} m and clear ({unloaded} places not loaded, {uneven} uneven, {blocked} blocked before it)",
-        here.with_y(0.0).distance(to.with_y(0.0))
-    );
-    Some(moved)
+    for h in 0..8 {
+        let way = Quat::from_rotation_y(h as f32 * std::f32::consts::FRAC_PI_4) * Vec3::Z;
+        let heights: Vec<String> = [4.0, 8.0, 12.0, 16.0]
+            .iter()
+            .map(|&d| {
+                let c = Vec3::new(x, 0.0, z) + way * d;
+                ground_at(game, c.x, c.z).map_or("none".to_owned(), |y| format!("{:+.2}", y - base))
+            })
+            .collect();
+        eprintln!(
+            "wreck-blast-check: path {:>3} deg (from +z towards +x): ground 4/8/12/16 m out {}",
+            h * 45,
+            heights.join(" ")
+        );
+    }
+    if let Some(world) = game.scene.world.as_ref() {
+        let r = WRECK_PATH;
+        let mut near: Vec<(f32, f32, Vec3)> = world
+            .physics
+            .fixed_near(
+                Vec3::new(x - r, base + 0.3, z - r),
+                Vec3::new(x + r, base + 4.0, z + r),
+            )
+            .into_iter()
+            .filter(|&(_, size)| size >= 1.0)
+            .map(|(c, size)| (c.with_y(0.0).distance(Vec3::new(x, 0.0, z)) - size, size, c))
+            .filter(|&(gap, _, _)| gap < r)
+            .collect();
+        near.sort_by(|a, b| a.0.total_cmp(&b.0));
+        eprintln!(
+            "wreck-blast-check: {} placed objects of 1 m or more within {r} m (0.3-4 m up): {}",
+            near.len(),
+            near.iter()
+                .take(8)
+                .map(|(gap, size, c)| format!("{gap:.1} m off (size {size:.1}, at {c:.1})"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    true
 }
 
 /// Xenia's car death launch (phys8a, Phoenix 0x40005ED5, counter c69):
@@ -10496,42 +10497,7 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
             .as_ref()
             .and_then(|w| w.physics.vehicle_chassis_mass(id))
     );
-    // Open where it is put once what streams in round it has loaded: up
-    // to three moves, each waiting up to 10 s for the world's pending
-    // loads, held still, and looking again.
-    let mut settled = false;
-    for _ in 0..3 {
-        match wreck_open_ground(game, id, &label) {
-            None => return,
-            Some(false) => {
-                settled = true;
-                break;
-            }
-            Some(true) => {}
-        }
-        let waited = Instant::now();
-        for k in 0.. {
-            if let Some(w) = game.scene.world.as_mut() {
-                w.physics.set_vehicle_velocity(id, Vec3::ZERO);
-                w.physics.set_vehicle_spin(id, Vec3::ZERO);
-            }
-            game.step(Intent::default(), tick);
-            let pending = game.scene.world.as_ref().map_or(0, |w| w.stats().pending);
-            if (k as f32 * tick >= 1.0 && pending == 0)
-                || waited.elapsed() > Duration::from_secs(10)
-            {
-                eprintln!(
-                    "wreck-blast-check: waited {:.1} s at the new place, {pending} loads pending",
-                    k as f32 * tick
-                );
-                break;
-            }
-        }
-    }
-    if !settled {
-        eprintln!(
-            "wreck-blast-check: FAIL no open ground that stayed open once loaded (three moves)"
-        );
+    if !wreck_at_spot(game, id, &label, tick) {
         return;
     }
     // Stopped, a while, then her out and 5.9 m off its middle. The car
