@@ -879,6 +879,9 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--wreck-blast-check" => {
                 o.wreck_blast_check = true;
                 o.drive = true;
+                // Xenia's phys3-6 bands are a Phoenix's (q728 ran a Semi
+                // and was judged against them); `--vehicle` still picks.
+                o.vehicle.get_or_insert_with(|| WRECK_BLAST_VEHICLE.to_owned());
             }
             "--wreck-blast-at" => {
                 o.wreck_blast_at = Some(
@@ -9846,6 +9849,11 @@ fn fuel_check(game: &mut Game, tick: f32) {
 /// 74.6 and slid 1.7 m.
 const XENIA_WRECK: (f32, f32, f32, f32) = (5.3, 16.5, 17.5, 74.6);
 
+/// The vehicle `--wreck-blast-check` wrecks unless `--vehicle` names
+/// another: Xenia's phys3-6 runs, whose bands it is judged by, wrecked a
+/// Phoenix.
+const WRECK_BLAST_VEHICLE: &str = "phoenix";
+
 /// Xenia's car death launch (phys3-6, Phoenix): the rebuilt body's speed
 /// on the death step, all of it and its up part, after one gravity step.
 const XENIA_DEATH_SPEED: (f32, f32) = (9.8, 10.05);
@@ -9907,6 +9915,14 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
         eprintln!("wreck-blast-check: FAIL her vehicle has no body");
         return;
     };
+    // Judged by a Phoenix's bands: another vehicle can't pass.
+    let label = game.scene.vehicles[i].spec.label.clone();
+    if !label.to_ascii_lowercase().contains(WRECK_BLAST_VEHICLE) {
+        eprintln!(
+            "wreck-blast-check: FAIL she drives the {label}, not a {WRECK_BLAST_VEHICLE} (Xenia's bands are a Phoenix's)"
+        );
+        return;
+    }
     // Stopped, a while, then her out and 5.9 m off its middle. The car
     // is held still all the while (driverless it would roll on, and her
     // distance from it with it: the q728 runs' blasts went off 1 to 5 m
