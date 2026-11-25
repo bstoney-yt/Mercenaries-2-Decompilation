@@ -70,6 +70,9 @@ pub const PLACE_WAIT: f32 = 2.0;
 /// Seconds the ready cover waits for the scripts' intro movie
 /// (invented).
 pub const INTRO_WAIT: f32 = 5.0;
+/// Seconds the opened intro gets to present its first frame before it
+/// counts as not playing (invented).
+pub const FIRST_FRAME_WAIT: f32 = 10.0;
 /// Seconds of the fade from black into the intro movie (invented).
 pub const FADE: f32 = 0.5;
 /// Seconds after which the cover stops waiting for her and the pipelines
@@ -88,6 +91,40 @@ pub enum Phase {
     Settling,
     /// Ready: the scripts' intro movie may come (invented wait).
     Intro { waited: f32 },
+    /// The intro is open: black until its first frame is presented
+    /// (invented, up to [`FIRST_FRAME_WAIT`]).
+    Handover { waited: f32 },
+}
+
+/// Why the scripts' intro was handed out but not played.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Skip {
+    /// No movie decoder (ffmpeg) was found.
+    NoDecoder,
+    /// The decoder or the movie would not open (a decoder that cannot be
+    /// run, such as one on a network share; a missing file).
+    OpenError,
+    /// Opened, but no frame came within [`FIRST_FRAME_WAIT`] (or the
+    /// stream ended first).
+    NoFrame,
+}
+
+impl Skip {
+    pub fn name(self) -> &'static str {
+        match self {
+            Skip::NoDecoder => "no movie decoder",
+            Skip::OpenError => "the movie would not open",
+            Skip::NoFrame => "no frame was presented",
+        }
+    }
+}
+
+/// How the scripts' intro went, for the check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Intro {
+    /// Its first frame was presented.
+    Presented,
+    Skipped(Skip),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -129,6 +166,8 @@ pub struct Cover {
     /// The scripts' intro was handed out (played, or skipped when it
     /// could not be opened).
     pub intro_taken: bool,
+    /// Why it was skipped, if it was.
+    pub skip: Option<Skip>,
 }
 
 impl Default for Cover {
@@ -147,6 +186,7 @@ impl Cover {
             placements: None,
             placed: false,
             intro_taken: false,
+            skip: None,
         }
     }
 
@@ -178,40 +218,77 @@ impl Cover {
             && matches!(self.state, State::Covered(p) if !matches!(p, Phase::Intro { .. }))
     }
 
-    /// The scripts' movie (the intro) started: the cover fades into it.
+    /// The scripts' movie (the intro) is open: the cover stays black
+    /// until its first frame is presented
+    /// ([`movie_presented`](Self::movie_presented)).
     pub fn movie_started(&mut self) -> Option<String> {
         if !self.covered() {
             return None;
         }
         self.intro_taken = true;
+        self.state = State::Covered(Phase::Handover { waited: 0.0 });
+        Some(format!(
+            "cover: the intro is open at {:.1} s: black until its first frame",
+            self.age
+        ))
+    }
+
+    /// Whether the cover waits for the open intro's first frame.
+    pub fn in_handover(&self) -> bool {
+        matches!(self.state, State::Covered(Phase::Handover { .. }))
+    }
+
+    /// The intro's first frame is being presented: the cover fades into
+    /// it from this frame on.
+    pub fn movie_presented(&mut self) -> Option<String> {
+        if !self.in_handover() {
+            return None;
+        }
         self.state = State::FadingOut { left: FADE };
-        Some(format!("cover: fading into the intro at {:.1} s", self.age))
+        Some(format!(
+            "cover: the intro's first frame is up at {:.1} s: fading into it",
+            self.age
+        ))
+    }
+
+    /// The open intro has had [`FIRST_FRAME_WAIT`] without a frame.
+    pub fn handover_expired(&self) -> bool {
+        matches!(
+            self.state,
+            State::Covered(Phase::Handover { waited }) if waited >= FIRST_FRAME_WAIT
+        )
     }
 
     /// The scripts' movie (the intro) was handed out but could not be
     /// played (no decoder): the scripts go straight on (they seat her in
     /// the start's boat), so the cover stays and counts Loading again,
     /// dropping (with the loading screen's wipe back) once that settles.
-    pub fn movie_skipped(&mut self) -> Option<String> {
+    pub fn movie_skipped(&mut self, why: Skip) -> Option<String> {
         if !self.covered() {
             return None;
         }
         self.intro_taken = true;
+        self.skip = Some(why);
         self.state = State::Covered(Phase::Loading { quiet: 0 });
         Some(format!(
-            "cover: the intro could not play at {:.1} s: Loading again until she settles",
-            self.age
+            "cover: the intro could not play at {:.1} s ({}): Loading again until she settles",
+            self.age,
+            why.name()
         ))
     }
 
     /// Moves the fade on by a frame's `dt` (the movie plays; the game
     /// waits).
     pub fn frame(&mut self, dt: f32) {
-        if let State::FadingOut { left } = &mut self.state {
-            *left -= dt;
-            if *left <= 0.0 {
-                self.state = State::Clear;
+        match &mut self.state {
+            State::FadingOut { left } => {
+                *left -= dt;
+                if *left <= 0.0 {
+                    self.state = State::Clear;
+                }
             }
+            State::Covered(Phase::Handover { waited }) => *waited += dt,
+            _ => {}
         }
     }
 
@@ -266,6 +343,8 @@ impl Cover {
             Phase::Intro { waited } => Phase::Intro {
                 waited: waited + dt,
             },
+            // The movie's frames move it on ([`Cover::frame`]).
+            Phase::Handover { waited } => Phase::Handover { waited },
         };
         if matches!(next, Phase::Intro { .. }) && self.intro_taken {
             self.state = State::Clear;
@@ -293,6 +372,7 @@ impl Cover {
                     Phase::Streaming { .. } => "WaitForStreaming",
                     Phase::Settling => "InGame: waiting for her to stand and the pipelines",
                     Phase::Intro { .. } => "ready: the intro may play",
+                    Phase::Handover { .. } => "waiting for the intro's first frame",
                 },
                 self.age,
                 if capped { " (capped)" } else { "" }
@@ -307,6 +387,7 @@ impl Cover {
             State::Covered(Phase::Streaming { .. }) => "Covered/WaitForStreaming",
             State::Covered(Phase::Settling) => "Covered/Settling",
             State::Covered(Phase::Intro { .. }) => "Covered/Intro",
+            State::Covered(Phase::Handover { .. }) => "Covered/Handover",
             State::FadingOut { .. } => "FadingOut",
             State::Clear => "Clear",
         }
@@ -326,8 +407,11 @@ pub struct Check {
     pub dropped: Option<(u64, bool)>,
     /// The frame the intro movie started on (or was skipped on).
     pub intro: Option<u64>,
-    /// The intro could not be played (no decoder): it was skipped.
-    pub skipped: bool,
+    /// How it went.
+    pub how: Option<Intro>,
+    /// A movie decoder was found at the start (then a skipped intro
+    /// fails).
+    pub decoder: bool,
 }
 
 impl Check {
@@ -360,10 +444,10 @@ impl Check {
 
     /// The intro movie started on this frame (`skipped`: handed out but
     /// not playable).
-    pub fn intro(&mut self, skipped: bool) {
+    pub fn intro(&mut self, how: Intro) {
         if self.intro.is_none() {
             self.intro = Some(self.frames);
-            self.skipped = skipped;
+            self.how = Some(how);
         }
     }
 
@@ -382,8 +466,27 @@ impl Check {
                 format!("FAIL frame {n} showed the world uncovered before the intro"),
             );
         }
+        if let Some(Intro::Skipped(why)) = self.how
+            && (self.decoder || why != Skip::NoDecoder)
+        {
+            return (
+                false,
+                format!(
+                    "FAIL the intro was skipped ({}){}",
+                    why.name(),
+                    if self.decoder {
+                        " with a decoder present"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+        }
         match (self.intro, self.dropped) {
-            (None, _) => (false, format!("FAIL no intro after {} frames", self.frames)),
+            (None, _) => (
+                false,
+                format!("FAIL timeout: no intro after {} frames", self.frames),
+            ),
             (Some(_), Some((d, false))) => (
                 false,
                 format!("FAIL the cover dropped at frame {d} before she was placed and standing"),
@@ -392,10 +495,9 @@ impl Check {
                 true,
                 format!(
                     "PASS no world frame before the intro (frame {i}{}); cover dropped at frame {d} with her placed and standing",
-                    if self.skipped {
-                        ", skipped: no movie decoder"
-                    } else {
-                        ""
+                    match self.how {
+                        Some(Intro::Skipped(why)) => format!(", skipped: {}", why.name()),
+                        _ => ", its first frame presented".to_owned(),
                     }
                 ),
             ),
@@ -604,6 +706,10 @@ mod tests {
             ..Cover::raise()
         };
         assert!(c.movie_started().is_some());
+        // Black until the intro's first frame is presented.
+        c.frame(1.0);
+        assert!(c.in_handover() && c.covered());
+        assert!(c.movie_presented().is_some());
         assert_eq!(c.black(), 1.0);
         c.frame(FADE / 2.0);
         assert!((c.black() - 0.5).abs() < 1e-3);
@@ -630,8 +736,8 @@ mod tests {
         };
         c.tick(ready(), DT);
         let mut k = Check::default();
-        assert!(c.movie_skipped().is_some());
-        k.intro(true);
+        assert!(c.movie_skipped(Skip::NoDecoder).is_some());
+        k.intro(Intro::Skipped(Skip::NoDecoder));
         assert!(c.covered() && !c.holds_movies());
         // Past the old wait: still covered while the scripts seat her.
         run(
@@ -678,6 +784,58 @@ mod tests {
         assert!(!ok && line.contains("frame 0"), "{line}");
     }
 
+    /// The merge queue's run of #777 with M2_FFMPEG on the NAS: the
+    /// decoder was found but could not be run (os error 5), so the intro
+    /// was skipped; that run passed. With a decoder present a skipped
+    /// intro must fail, and say why.
+    #[test]
+    fn a_skipped_intro_fails_when_a_decoder_is_present() {
+        for why in [Skip::OpenError, Skip::NoFrame, Skip::NoDecoder] {
+            let mut k = Check {
+                decoder: true,
+                ..Check::default()
+            };
+            let up = Cover::raise();
+            k.frame(&up, false, false, true, true);
+            k.intro(Intro::Skipped(why));
+            k.frame(&Cover::clear(), true, true, true, true);
+            let (ok, line) = k.verdict();
+            assert!(!ok && line.contains(why.name()), "{line}");
+        }
+        // No decoder at all: an open error still fails; no decoder passes
+        // (noted).
+        let mut k = Check::default();
+        k.frame(&Cover::raise(), false, false, true, true);
+        k.intro(Intro::Skipped(Skip::OpenError));
+        k.frame(&Cover::clear(), true, true, true, true);
+        assert!(!k.verdict().0);
+        let mut k = Check::default();
+        k.frame(&Cover::raise(), false, false, true, true);
+        k.intro(Intro::Skipped(Skip::NoDecoder));
+        k.frame(&Cover::clear(), true, true, true, true);
+        let (ok, line) = k.verdict();
+        assert!(ok && line.contains("no movie decoder"), "{line}");
+    }
+
+    #[test]
+    fn an_open_intro_with_no_frame_runs_out() {
+        let mut c = Cover {
+            state: State::Covered(Phase::Intro { waited: 0.0 }),
+            ..Cover::raise()
+        };
+        c.movie_started();
+        c.frame(FIRST_FRAME_WAIT - 0.1);
+        assert!(!c.handover_expired());
+        // The game's updates do not move the handover on.
+        c.tick(ready(), 100.0);
+        assert!(c.in_handover());
+        c.frame(0.2);
+        assert!(c.handover_expired());
+        assert!(c.movie_skipped(Skip::NoFrame).is_some());
+        assert_eq!(c.skip, Some(Skip::NoFrame));
+        assert!(c.covered() && !c.holds_movies());
+    }
+
     #[test]
     fn the_check_fails_on_a_world_frame_before_the_intro() {
         let mut k = Check::default();
@@ -686,7 +844,7 @@ mod tests {
         k.frame(&up, true, false, true, true);
         let mut clear = Cover::clear();
         k.frame(&clear, true, true, true, true);
-        k.intro(false);
+        k.intro(Intro::Presented);
         let (ok, line) = k.verdict();
         assert!(!ok && line.contains("frame 2"), "{line}");
 
@@ -694,7 +852,7 @@ mod tests {
         k.frame(&up, false, false, false, false);
         k.frame(&up, true, false, true, true);
         clear.state = State::FadingOut { left: FADE };
-        k.intro(false);
+        k.intro(Intro::Presented);
         k.frame(&clear, true, false, true, true);
         let (ok, line) = k.verdict();
         assert!(ok, "{line}");

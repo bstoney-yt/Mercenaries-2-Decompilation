@@ -13400,8 +13400,20 @@ impl App {
                 eprintln!(
                     "newgame-cover-check: New Game once the front end is up; PASS needs no world                      frame before the intro and her placed and standing when the cover drops"
                 );
+                let decoder = movie::ffmpeg();
+                eprintln!(
+                    "newgame-cover-check: movie decoder {}",
+                    decoder
+                        .as_ref()
+                        .map_or("none (a skipped intro passes, noted)".to_owned(), |p| {
+                            format!("{} (the intro must present a frame)", p.display())
+                        })
+                );
                 (
-                    cover::Check::default(),
+                    cover::Check {
+                        decoder: decoder.is_some(),
+                        ..cover::Check::default()
+                    },
                     Instant::now() + COVER_CHECK_LIMIT,
                 )
             }),
@@ -14405,10 +14417,10 @@ impl Running {
                     flow.start_new_game(&mut mixer);
                 }
             }
-            if let Some(skipped) = flow.take_intro_started()
+            if let Some(how) = flow.take_intro_started()
                 && let Some((check, _)) = &mut self.cover_check
             {
-                check.intro(skipped);
+                check.intro(how);
             }
             if flow.cover.covered() {
                 // The cover stands in for the arrival screen of the
