@@ -95,8 +95,9 @@ pub struct Flow {
     /// The cover over a new game's start ([`crate::cover`]): up from New
     /// Game (or a save) until play may show.
     pub cover: crate::cover::Cover,
-    /// The scripts' movie that ended the cover started this tick, once.
-    intro_started: bool,
+    /// The scripts' movie that ended the cover was handed out this tick,
+    /// once: whether it was skipped (could not be played).
+    intro_started: Option<bool>,
 }
 
 impl Flow {
@@ -141,7 +142,7 @@ impl Flow {
             attract: false,
             wake: false,
             cover: crate::cover::Cover::clear(),
-            intro_started: false,
+            intro_started: None,
         }
     }
 
@@ -166,9 +167,10 @@ impl Flow {
         eprintln!("flow: new game as {} (the check)", self.hero);
     }
 
-    /// The scripts' movie that took the cover down started (once).
-    pub fn take_intro_started(&mut self) -> bool {
-        std::mem::take(&mut self.intro_started)
+    /// The scripts' movie that took the cover down was handed out (once):
+    /// whether it was skipped.
+    pub fn take_intro_started(&mut self) -> Option<bool> {
+        self.intro_started.take()
     }
 
     /// Whether the stage is the front end with its menus up (or the
@@ -460,12 +462,18 @@ impl Flow {
                         self.scripted = true;
                         if !self.open(&name, mixer) {
                             self.scripted = false;
+                            // Handed out all the same: the cover's intro
+                            // is over, unplayed.
+                            if let Some(line) = self.cover.movie_skipped() {
+                                eprintln!("{line} ({name})");
+                                self.intro_started = Some(true);
+                            }
                             mission.movie_done();
                             return;
                         }
                         if let Some(line) = self.cover.movie_started() {
                             eprintln!("{line} ({name})");
-                            self.intro_started = true;
+                            self.intro_started = Some(false);
                         }
                         if let Some(lines) = lines {
                             if self.captions.is_none() {

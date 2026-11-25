@@ -13509,8 +13509,25 @@ impl Running {
             self.lag -= TICK;
             spans::time("ticks", || self.tick(config, event_loop));
         }
+        // The new game's cover is updated once a frame, as the 360's
+        // Loading and WaitForStreaming count their updates ([`cover`]).
+        if let Some(flow) = self.flow.as_mut().filter(|f| f.cover.covered()) {
+            let inputs = cover::Inputs {
+                busy: self.game.streaming_busy(),
+                scripts: self
+                    .mission
+                    .as_ref()
+                    .is_some_and(mission::MissionLink::running),
+                standing: self.game.standing(),
+                placements: self.game.placements,
+                pipelines_left: warmup::pending(),
+            };
+            if let Some(line) = flow.cover.tick(inputs, dt as f32) {
+                eprintln!("{line}");
+            }
+        }
         if let Some((check, limit)) = &self.cover_check
-            && (check.intro.is_some() || now >= *limit)
+            && (check.done() || now >= *limit)
         {
             let (ok, line) = check.verdict();
             eprintln!("newgame-cover-check: {line}");
@@ -14388,28 +14405,15 @@ impl Running {
                     flow.start_new_game(&mut mixer);
                 }
             }
-            if flow.take_intro_started()
+            if let Some(skipped) = flow.take_intro_started()
                 && let Some((check, _)) = &mut self.cover_check
             {
-                check.intro();
+                check.intro(skipped);
             }
             if flow.cover.covered() {
                 // The cover stands in for the arrival screen of the
                 // scripts' first move of her.
                 self.game.arrival = None;
-                let inputs = cover::Inputs {
-                    busy: self.game.streaming_busy(),
-                    scripts: self
-                        .mission
-                        .as_ref()
-                        .is_some_and(mission::MissionLink::running),
-                    standing: self.game.standing(),
-                    placements: self.game.placements,
-                    pipelines_left: warmup::pending(),
-                };
-                if let Some(line) = flow.cover.tick(inputs, TICK.as_secs_f32()) {
-                    eprintln!("{line}");
-                }
             }
             let news = flow.take_news();
             // The hero picked in the front end, before the scripts start;

@@ -9,8 +9,10 @@
 //! through for another 2 s.
 //!
 //! [`Cover`] is the state machine ([`State`]: covered, fading out, clear),
-//! owned by the flow ([`crate::flow::Flow::cover`]) and ticked with the
-//! game's ticks; while it covers, the frame draws black and the loading
+//! owned by the flow ([`crate::flow::Flow::cover`]) and updated once a
+//! frame (the 360's state updates run once a frame; counting the game's
+//! 60 Hz ticks let a slow frame's catch-up run all of WaitForStreaming
+//! inside one frame); while it covers, the frame draws black and the loading
 //! screen, never the world.
 //!
 //! # Provenance
@@ -47,7 +49,9 @@
 //!   [`PLACE_WAIT`] for the scripts to put her at her start (then she is
 //!   taken as placed where she stands); holding the scripts' movies while
 //!   covered, and waiting up to [`INTRO_WAIT`] for theirs once ready
-//!   (none: the loading screen wipes back to play); the [`FADE`] from
+//!   (none: the loading screen wipes back to play); an intro handed out
+//!   but not playable (no movie decoder) keeps the cover up through the
+//!   scripts' moves after it, then drops it; the [`FADE`] from
 //!   black into the intro movie; the [`CAP`] past which the cover gives
 //!   up waiting for her or the pipelines.
 
@@ -62,7 +66,7 @@ pub const STREAM_TICKS: u32 = 10;
 pub const STREAM_CAP: f32 = 30.0;
 /// Seconds after the scripts start that she counts as placed where she
 /// stands if they never move her (invented).
-pub const PLACE_WAIT: f32 = 10.0;
+pub const PLACE_WAIT: f32 = 2.0;
 /// Seconds the ready cover waits for the scripts' intro movie
 /// (invented).
 pub const INTRO_WAIT: f32 = 5.0;
@@ -122,6 +126,9 @@ pub struct Cover {
     placements: Option<(u32, u32)>,
     /// She was placed since it went up (or taken as placed).
     pub placed: bool,
+    /// The scripts' intro was handed out (played, or skipped when it
+    /// could not be opened).
+    pub intro_taken: bool,
 }
 
 impl Default for Cover {
@@ -139,6 +146,7 @@ impl Cover {
             scripts_for: 0.0,
             placements: None,
             placed: false,
+            intro_taken: false,
         }
     }
 
@@ -166,7 +174,8 @@ impl Cover {
 
     /// Whether the scripts' movies wait: while covered and not yet ready.
     pub fn holds_movies(&self) -> bool {
-        matches!(self.state, State::Covered(p) if !matches!(p, Phase::Intro { .. }))
+        !self.intro_taken
+            && matches!(self.state, State::Covered(p) if !matches!(p, Phase::Intro { .. }))
     }
 
     /// The scripts' movie (the intro) started: the cover fades into it.
@@ -174,8 +183,25 @@ impl Cover {
         if !self.covered() {
             return None;
         }
+        self.intro_taken = true;
         self.state = State::FadingOut { left: FADE };
         Some(format!("cover: fading into the intro at {:.1} s", self.age))
+    }
+
+    /// The scripts' movie (the intro) was handed out but could not be
+    /// played (no decoder): the scripts go straight on (they seat her in
+    /// the start's boat), so the cover stays and counts Loading again,
+    /// dropping (with the loading screen's wipe back) once that settles.
+    pub fn movie_skipped(&mut self) -> Option<String> {
+        if !self.covered() {
+            return None;
+        }
+        self.intro_taken = true;
+        self.state = State::Covered(Phase::Loading { quiet: 0 });
+        Some(format!(
+            "cover: the intro could not play at {:.1} s: Loading again until she settles",
+            self.age
+        ))
     }
 
     /// Moves the fade on by a frame's `dt` (the movie plays; the game
@@ -189,7 +215,9 @@ impl Cover {
         }
     }
 
-    /// One game tick of `dt` seconds: a log line when the state changes.
+    /// One update of `dt` seconds, once a frame as the 360's state update
+    /// runs (its clock adds a fixed step per update): a log line when the
+    /// state changes.
     pub fn tick(&mut self, i: Inputs, dt: f32) -> Option<String> {
         let State::Covered(phase) = self.state else {
             return None;
@@ -239,6 +267,13 @@ impl Cover {
                 waited: waited + dt,
             },
         };
+        if matches!(next, Phase::Intro { .. }) && self.intro_taken {
+            self.state = State::Clear;
+            return Some(format!(
+                "cover: down after the skipped intro at {:.1} s (the loading screen wipes back)",
+                self.age
+            ));
+        }
         if let Phase::Intro { waited } = next
             && waited >= INTRO_WAIT
         {
@@ -289,8 +324,10 @@ pub struct Check {
     /// When the cover first stopped covering: whether she had been
     /// placed and stood.
     pub dropped: Option<(u64, bool)>,
-    /// The frame the intro movie started on.
+    /// The frame the intro movie started on (or was skipped on).
     pub intro: Option<u64>,
+    /// The intro could not be played (no decoder): it was skipped.
+    pub skipped: bool,
 }
 
 impl Check {
@@ -321,9 +358,19 @@ impl Check {
         )
     }
 
-    /// The intro movie started on this frame.
-    pub fn intro(&mut self) {
-        self.intro.get_or_insert(self.frames);
+    /// The intro movie started on this frame (`skipped`: handed out but
+    /// not playable).
+    pub fn intro(&mut self, skipped: bool) {
+        if self.intro.is_none() {
+            self.intro = Some(self.frames);
+            self.skipped = skipped;
+        }
+    }
+
+    /// Whether the run has what the verdict needs: the intro, and the
+    /// cover down.
+    pub fn done(&self) -> bool {
+        self.intro.is_some() && self.dropped.is_some()
     }
 
     /// PASS only if no frame before the intro showed the world and she
@@ -344,7 +391,12 @@ impl Check {
             (Some(i), Some((d, true))) => (
                 true,
                 format!(
-                    "PASS no world frame before the intro (frame {i}); cover dropped at frame {d} with her placed and standing"
+                    "PASS no world frame before the intro (frame {i}{}); cover dropped at frame {d} with her placed and standing",
+                    if self.skipped {
+                        ", skipped: no movie decoder"
+                    } else {
+                        ""
+                    }
                 ),
             ),
             (Some(i), None) => (
@@ -566,6 +618,66 @@ mod tests {
         assert_eq!(c.state, State::Clear);
     }
 
+    /// The merge queue's run of c981aba5: no ffmpeg, so `01_AOA_J` could
+    /// not be opened; the cover waited [`INTRO_WAIT`] for an intro that
+    /// had been handed out already and dropped onto the world (frame 252).
+    #[test]
+    fn an_intro_that_cannot_play_keeps_the_cover_until_she_settles() {
+        let mut c = Cover {
+            state: State::Covered(Phase::Intro { waited: 0.0 }),
+            placed: true,
+            ..Cover::raise()
+        };
+        c.tick(ready(), DT);
+        let mut k = Check::default();
+        assert!(c.movie_skipped().is_some());
+        k.intro(true);
+        assert!(c.covered() && !c.holds_movies());
+        // Past the old wait: still covered while the scripts seat her.
+        run(
+            &mut c,
+            Inputs {
+                placements: 2,
+                standing: false,
+                ..ready()
+            },
+            (INTRO_WAIT / DT) as u32 + 10,
+        );
+        assert!(c.covered(), "{:?}", c.state);
+        assert!(k.frame(&c, true, false, true, false).contains("Covered"));
+        // She stands in the boat: Loading, WaitForStreaming, then down.
+        for _ in 0..(QUIET_TICKS + STREAM_TICKS + 3) {
+            c.tick(
+                Inputs {
+                    placements: 2,
+                    ..ready()
+                },
+                DT,
+            );
+        }
+        assert_eq!(c.state, State::Clear);
+        k.frame(&c, true, true, true, true);
+        let (ok, line) = k.verdict();
+        assert!(ok && line.contains("skipped"), "{line}");
+    }
+
+    /// The same run as the check saw it: no intro taken, the cover down
+    /// by its wait, the world shown: FAIL at that frame.
+    #[test]
+    fn the_old_drop_without_an_intro_fails() {
+        let mut c = Cover {
+            state: State::Covered(Phase::Intro { waited: 0.0 }),
+            placed: true,
+            ..Cover::raise()
+        };
+        let mut k = Check::default();
+        run(&mut c, ready(), (INTRO_WAIT / DT) as u32 + 1);
+        assert_eq!(c.state, State::Clear);
+        k.frame(&c, true, true, true, true);
+        let (ok, line) = k.verdict();
+        assert!(!ok && line.contains("frame 0"), "{line}");
+    }
+
     #[test]
     fn the_check_fails_on_a_world_frame_before_the_intro() {
         let mut k = Check::default();
@@ -574,7 +686,7 @@ mod tests {
         k.frame(&up, true, false, true, true);
         let mut clear = Cover::clear();
         k.frame(&clear, true, true, true, true);
-        k.intro();
+        k.intro(false);
         let (ok, line) = k.verdict();
         assert!(!ok && line.contains("frame 2"), "{line}");
 
@@ -582,7 +694,7 @@ mod tests {
         k.frame(&up, false, false, false, false);
         k.frame(&up, true, false, true, true);
         clear.state = State::FadingOut { left: FADE };
-        k.intro();
+        k.intro(false);
         k.frame(&clear, true, false, true, true);
         let (ok, line) = k.verdict();
         assert!(ok, "{line}");
