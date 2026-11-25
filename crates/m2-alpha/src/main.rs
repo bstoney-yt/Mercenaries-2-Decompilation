@@ -9961,11 +9961,10 @@ fn cargo_split_start(
 /// Xenia settle3's window (20 s from the truck's first record).
 const CARGO_SETTLE_WATCH: f32 = 20.0;
 /// The most a crate may have moved on the bed from where it was loaded,
-/// in the truck's frame, metres: Xenia settle3's 21 crates moved 0.24 to
-/// 0.50 m (load-time depenetration, 0x11D3A0 the most), so 0.50 plus a
-/// tenth for the port's measure (its box middle, the 360's record
-/// position). The tenth is invented.
-const CARGO_SETTLE_MOST: f32 = 0.55;
+/// in the truck's frame, metres, judged by its place (its origin, as
+/// Xenia settle3 read each crate's record position): settle3's 21 crates
+/// moved 0.24 to 0.50 m (load-time depenetration, 0x11D3A0 the most).
+const CARGO_SETTLE_MOST: f32 = 0.50;
 
 /// `--cargo-settle-check` (it turns on `--mission`; start it with
 /// `--skip-to OilCon020`): once the contract's truck has its cargo aboard
@@ -15139,11 +15138,12 @@ mod tests {
     }
 
     // The parked truck's crates pass when all stay aboard, none fell
-    // before, and none moved past Xenia's 0.50 m (plus a tenth).
+    // before, and none moved past Xenia's 0.50 m.
     #[test]
     fn the_parked_cargo_check_passes_only_when_all_stay_near_where_loaded() {
         let end = [(1, 0.3, true), (2, 0.5, true)];
         let most = [(1, 0.31), (2, 0.5)];
+        assert!(cargo_settle_verdict(&end, &[(1, 0.31), (2, 0.52)], 0).is_err());
         assert!(cargo_settle_verdict(&end, &most, 0).is_ok());
         assert!(cargo_settle_verdict(&end, &most, 1).is_err());
         assert!(cargo_settle_verdict(&[(1, 1.4, false)], &[(1, 1.4)], 0).is_err());

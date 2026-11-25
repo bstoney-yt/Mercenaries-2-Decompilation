@@ -885,8 +885,9 @@ impl Props {
     }
 
     /// Each prop loaded on vehicle `index` (placed as `id`): how far its
-    /// middle now is from where it was loaded, in the vehicle's frame
-    /// (metres), and whether it is still aboard.
+    /// place (its origin, what the 360's object record holds: Xenia
+    /// settle3 measured that) now is from where it was loaded, in the
+    /// vehicle's frame (metres), and whether it is still aboard.
     pub fn cargo_from_loaded(
         &self,
         physics: &Physics,
@@ -903,10 +904,8 @@ impl Props {
             .filter(|(_, r)| r.vehicle == index)
             .filter_map(|(&e, r)| {
                 let at = physics.debris_place(r.piece)?;
-                let (lo, hi) = r.bounds;
-                let mid = (lo + hi) * 0.5;
-                let now = (inv * at).transform_point3(mid);
-                let then = r.loaded?.transform_point3(mid);
+                let now = (inv * at).w_axis.truncate();
+                let then = r.loaded?.w_axis.truncate();
                 Some((e, now.distance(then), r.aboard))
             })
             .collect();
