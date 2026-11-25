@@ -50,48 +50,9 @@ struct Riding {
     bounds: (Vec3, Vec3),
     /// Still on the bed, as last seen ([`Props::carry`]).
     aboard: bool,
-    /// Held where it was loaded on the bed, in the vehicle's frame, until
-    /// the vehicle has settled after it was placed
-    /// ([`Props::hold_until_settled`]); `None` once let go.
-    held: Option<Mat4>,
     /// Where it was loaded, in the vehicle's frame (for
     /// [`Props::cargo_from_loaded`]).
     loaded: Option<Mat4>,
-}
-
-/// How long a loaded vehicle must have stood still before what it carries
-/// is let go, seconds, and how still: m/s and radians a second
-/// ([`Props::hold_until_settled`]). Invented, from Xenia: on the 360 the
-/// OilCon020 El Grande's crates stayed put until the truck had settled
-/// (crates2: the truck rose 0.18 m while the crates' records were
-/// unchanged; then they all moved at once, on its bed).
-const CARGO_SETTLED: (f32, f32, f32) = (0.5, 0.05, 0.05);
-/// The longest what a vehicle carries is held after it is placed, seconds
-/// (invented; a vehicle that never comes to rest).
-const CARGO_HELD_LONGEST: f32 = 5.0;
-
-/// One loaded vehicle's settling after it was placed: how long since, and
-/// how long it has stood still.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct Settling {
-    pub since: f32,
-    pub still: f32,
-}
-
-impl Settling {
-    /// After a step of `dt` at speed `v` (m/s) turning at `w` (rad/s):
-    /// whether what it carries is let go now ([`CARGO_SETTLED`],
-    /// [`CARGO_HELD_LONGEST`]).
-    pub fn step(&mut self, dt: f32, v: f32, w: f32) -> bool {
-        let (long, speed, turn) = CARGO_SETTLED;
-        self.since += dt;
-        self.still = if v < speed && w < turn {
-            self.still + dt
-        } else {
-            0.0
-        };
-        self.still >= long || self.since >= CARGO_HELD_LONGEST
-    }
 }
 
 /// One shown.
@@ -183,9 +144,6 @@ pub struct Props {
     /// Those riding loose on a vehicle's load bed (PirCon002's rum jugs on
     /// its truck, OilCon020's guns on the El Grande): [`Props::load`].
     cargo: HashMap<u32, Riding>,
-    /// Each loaded vehicle's settling while what it carries is held
-    /// ([`Props::hold_until_settled`]), by its index.
-    settling: HashMap<usize, Settling>,
     /// Those broken apart: their pieces, in their [`Breakup`]'s order.
     broken: HashMap<u32, Vec<DebrisId>>,
     /// Those wrecked by a blast: their intact parts going down into the
@@ -861,13 +819,14 @@ impl Props {
             );
         }
         let template = p.template;
-        let velocity = physics.vehicle_velocity(id);
         physics.remove_static(StaticKey::Entity(entity));
-        let piece = physics.add_cargo(&piece, at, velocity);
+        // Asleep, at rest, until something awake touches it
+        // ([`Physics::add_cargo`]).
+        let piece = physics.add_cargo(&piece, at);
         if let Some(&g) = self.gravity_scales.get(&template) {
             physics.set_debris_gravity(piece, g);
         }
-        let held = physics
+        let loaded = physics
             .vehicle_transform(id)
             .map(|place| place.inverse() * at);
         self.cargo.insert(
@@ -877,8 +836,7 @@ impl Props {
                 piece,
                 bounds,
                 aboard: true,
-                held,
-                loaded: held,
+                loaded,
             },
         );
         true
@@ -911,62 +869,6 @@ impl Props {
             .collect();
         out.sort_by_key(|c| c.0);
         out
-    }
-
-    /// Holds what was loaded on each vehicle where it was loaded (in the
-    /// vehicle's frame, moved with it, still) until the vehicle has
-    /// settled after it was placed, then lets it go at the vehicle's
-    /// speed: a loaded truck put down as authored rises and settles on its
-    /// springs (Xenia hold1: the El Grande +0.35 m) and would throw its
-    /// goods off (q680 1555b736: crate 0x11d39d slid off the parked El
-    /// Grande). On the 360 its crates stayed put meanwhile and moved only
-    /// once it had settled (crates2, settle3: none off). `vehicle(index)`
-    /// gives a vehicle's body and name. Returns the vehicles let go, with
-    /// how long after they were loaded.
-    pub fn hold_until_settled(
-        &mut self,
-        physics: &mut Physics,
-        vehicle: impl Fn(usize) -> Option<m2_engine::VehicleId>,
-        dt: f32,
-    ) -> Vec<(usize, f32, usize)> {
-        let held: std::collections::BTreeSet<usize> = self
-            .cargo
-            .values()
-            .filter(|r| r.held.is_some())
-            .map(|r| r.vehicle)
-            .collect();
-        self.settling.retain(|i, _| held.contains(i));
-        let mut let_go = Vec::new();
-        for index in held {
-            let Some(id) = vehicle(index) else {
-                continue;
-            };
-            let (Some(place), v, w) = (
-                physics.vehicle_transform(id),
-                physics.vehicle_velocity(id),
-                physics.vehicle_spin(id),
-            ) else {
-                continue;
-            };
-            let settling = self.settling.entry(index).or_default();
-            let go = settling.step(dt, v.length(), w.length());
-            let since = settling.since;
-            let mut n = 0;
-            for r in self.cargo.values_mut().filter(|r| r.vehicle == index) {
-                let Some(rel) = r.held else { continue };
-                physics.move_debris(r.piece, place * rel);
-                if go {
-                    physics.push_debris(r.piece, v);
-                    r.held = None;
-                    n += 1;
-                }
-            }
-            if go {
-                self.settling.remove(&index);
-                let_go.push((index, since, n));
-            }
-        }
-        let_go
     }
 
     /// Moves what is aboard vehicle `index` with it as it is put down
@@ -3148,80 +3050,49 @@ mod tests {
     use super::*;
     use m2_engine::{CollisionShape, LoosePiece};
 
-    // A loaded vehicle's goods stay where they were loaded on it, in its
-    // frame, while it settles where it was placed, and are let go once it
-    // has stood still (q680 1555b736: a crate thrown off the El Grande as
-    // it rose on its springs; the 360's stayed, crates2 and settle3).
+    // Goods are added asleep and at rest (the 360's add, activation 0,
+    // 0x82165958), and wake once something awake touches them: a moving
+    // truck's bed, here a body dropped onto them.
     #[test]
-    fn goods_are_held_on_a_settling_vehicle_and_let_go_once_it_rests() {
+    fn loaded_goods_start_asleep_and_wake_when_touched() {
         let mut physics = crate::npc::tests::ground();
-        let spec = crate::npc::tests::tank(m2_engine::tuning::VehicleTuning::default());
-        // Dropped 0.4 m onto the ground: it falls and bounces first.
-        let id = physics.add_vehicle(&spec, Vec3::new(0.0, 1.5, 0.0), 0.0);
-        let mut props = Props::default();
         let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.3), 50.0);
-        let place = physics.vehicle_transform(id).unwrap();
-        let rel = Mat4::from_translation(Vec3::new(0.5, 3.0, -1.0));
-        let body = physics.add_cargo(&piece, place * rel, Vec3::ZERO);
-        props.cargo.insert(
-            9,
-            Riding {
-                vehicle: 0,
-                piece: body,
-                bounds: (Vec3::splat(-0.3), Vec3::splat(0.3)),
-                aboard: true,
-                held: Some(rel),
-                loaded: Some(rel),
-            },
+        let at = Mat4::from_translation(Vec3::new(0.0, 0.31, 0.0));
+        let crate_ = physics.add_cargo(&piece, at);
+        assert_eq!(physics.debris_asleep(crate_), Some(true));
+        assert_eq!(
+            physics.debris_velocity(crate_).map(|v| v.0),
+            Some(Vec3::ZERO)
         );
-        let dt = 1.0 / 60.0;
-        let mut let_go = None;
-        for k in 1..=(6.0 / dt) as usize {
-            physics.step(dt);
-            let out = props.hold_until_settled(&mut physics, |_| Some(id), dt);
-            if let Some(&(_, since, n)) = out.first() {
-                assert_eq!(n, 1);
-                let_go = Some((k, since));
-                break;
-            }
-            // Held: exactly where it was loaded, in the vehicle's frame.
-            let place = physics.vehicle_transform(id).unwrap();
-            let at = physics.debris_place(body).unwrap();
-            let off = (place.inverse() * at).w_axis.truncate() - rel.w_axis.truncate();
-            assert!(off.length() < 1e-3, "step {k}: {off}");
+        for _ in 0..30 {
+            physics.step(1.0 / 60.0);
         }
-        let (k, since) = let_go.expect("let go");
-        assert!(since <= CARGO_HELD_LONGEST + 1e-3, "{since}");
-        assert!(k > 1, "not at once: the vehicle was still falling");
-        assert!(props.cargo[&9].held.is_none());
-        // Then it rides free: no longer moved by the hold.
-        assert!(
-            props
-                .hold_until_settled(&mut physics, |_| Some(id), dt)
-                .is_empty()
+        assert_eq!(
+            physics.debris_asleep(crate_),
+            Some(true),
+            "nothing touched it"
         );
-    }
-
-    // The settling rule: still for CARGO_SETTLED's time at its speeds, or
-    // CARGO_HELD_LONGEST at the most.
-    #[test]
-    fn a_vehicle_settles_once_still_long_enough_or_at_the_longest() {
-        let dt = 0.1;
-        let mut s = Settling::default();
-        assert!(!s.step(dt, 0.3, 0.0));
-        for _ in 0..4 {
-            assert!(!s.step(dt, 0.01, 0.01));
-        }
-        assert!(s.step(dt, 0.01, 0.01), "0.5 s still");
-        let mut moving = Settling::default();
-        let mut went = false;
-        for _ in 0..60 {
-            went = moving.step(dt, 1.0, 0.0);
-            if went {
+        let place = physics.debris_place(crate_).unwrap().w_axis.truncate();
+        // Rapier steps a body whose collider was just added once before it
+        // sleeps again ([`Physics::add_cargo`]): a few millimetres at most.
+        assert!((place - at.w_axis.truncate()).length() < 0.01, "{place}");
+        // An awake body dropped on it wakes it.
+        let ball = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.2), 20.0);
+        let falling = physics.add_prop_body(
+            &ball,
+            Mat4::from_translation(Vec3::new(0.0, 1.5, 0.0)),
+            false,
+        );
+        let mut woke = false;
+        for _ in 0..120 {
+            physics.step(1.0 / 60.0);
+            if physics.debris_asleep(crate_) == Some(false) {
+                woke = true;
                 break;
             }
         }
-        assert!(went && moving.since >= CARGO_HELD_LONGEST - 1e-3);
+        assert!(woke, "touched by an awake body, it wakes");
+        let _ = falling;
     }
 
     // What rides a truck is read from its body as it is now: moved 40 m
@@ -3235,7 +3106,7 @@ mod tests {
         let mut props = Props::default();
         let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.5), 50.0);
         let at = Mat4::from_translation(Vec3::new(0.0, 100.0, 0.0));
-        let body = physics.add_cargo(&piece, at, Vec3::ZERO);
+        let body = physics.add_cargo(&piece, at);
         props.shown.insert(
             9,
             Prop {
@@ -3256,7 +3127,6 @@ mod tests {
                 piece: body,
                 bounds,
                 aboard: true,
-                held: None,
                 loaded: None,
             },
         );

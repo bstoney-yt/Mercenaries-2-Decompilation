@@ -3552,6 +3552,13 @@ pub struct Physics {
     /// Props placed asleep, put to sleep once their first step has made
     /// their contacts (a new contact wakes a body in rapier).
     prop_sleep: Vec<r::RigidBodyHandle>,
+    /// Goods just loaded, put to sleep again after the step they were
+    /// added in unless something awake touches them ([`Physics::add_cargo`]).
+    cargo_sleep: Vec<r::RigidBodyHandle>,
+    /// Every loaded piece of goods: one asleep is woken once an awake
+    /// dynamic body's collision pairs with it (Havok wakes an inactive
+    /// island an active body reaches; inferred from Havok's islands).
+    cargo_bodies: Vec<r::RigidBodyHandle>,
     /// How long the last [`step`](Self::step) took, milliseconds.
     pub last_step_ms: f32,
     /// The water's surface boats float on, if there is any.
@@ -3628,6 +3635,8 @@ impl Physics {
             prop_rest: HashMap::new(),
             prop_before: HashMap::new(),
             prop_sleep: Vec::new(),
+            cargo_sleep: Vec::new(),
+            cargo_bodies: Vec::new(),
             last_step_ms: 0.0,
             water: None,
             inland: None,
@@ -3800,6 +3809,28 @@ impl Physics {
             }
             if let Some(rest) = self.prop_rest.get_mut(&h) {
                 rest.asleep = true;
+            }
+        }
+        for h in std::mem::take(&mut self.cargo_sleep) {
+            if !self.paired_with_awake(h)
+                && let Some(b) = self.world.bodies.get_mut(h)
+            {
+                b.sleep();
+            }
+        }
+        // Goods asleep are woken once something awake reaches them.
+        self.cargo_bodies
+            .retain(|h| self.world.bodies.get(*h).is_some());
+        let wake: Vec<r::RigidBodyHandle> = self
+            .cargo_bodies
+            .iter()
+            .copied()
+            .filter(|&h| self.world.bodies.get(h).is_some_and(|b| b.is_sleeping()))
+            .filter(|&h| self.paired_with_awake(h))
+            .collect();
+        for h in wake {
+            if let Some(b) = self.world.bodies.get_mut(h) {
+                b.wake_up(true);
             }
         }
         self.last_step_ms = started.elapsed().as_secs_f32() * 1000.0;
@@ -4302,18 +4333,83 @@ impl Physics {
     /// ([`add_bed`](Self::add_bed)) and slides, tips and falls off as the
     /// vehicle turns, brakes and hits, held there by friction alone (its
     /// [`LoosePiece::material`] and the bed's).
-    pub fn add_cargo(&mut self, piece: &LoosePiece, at: Mat4, velocity: Vec3) -> DebrisId {
-        self.add_piece(
+    pub fn add_cargo(&mut self, piece: &LoosePiece, at: Mat4) -> DebrisId {
+        let id = self.add_piece(
             piece,
             at,
-            velocity,
+            Vec3::ZERO,
             Vec3::ZERO,
             r::InteractionGroups::new(
                 CARGO,
                 r::Group::ALL.difference(VEHICLE).difference(RUBBLE),
                 r::InteractionTestMode::And,
             ),
-        )
+        );
+        // Added asleep, at rest, as the 360 adds every body it builds: the
+        // physics manager's flush of its pending additions (0x82165958)
+        // hands each to the world's add (0x82622068, or 0x82627C68 for
+        // seven or more) with its activation argument 0 (`li r6,0x0` at
+        // 0x82165A18). Inferred from Havok's add-entity API: 0 is "do not
+        // activate". It wakes when something awake touches it (Rapier's
+        // islands, as Havok's), not before.
+        if let Some(h) = self.debris[id.0]
+            && let Some(b) = self.world.bodies.get_mut(h)
+        {
+            b.set_linvel(vector(Vec3::ZERO), false);
+            b.set_angvel(vector(Vec3::ZERO), false);
+            b.sleep();
+            // Rapier wakes a body whose colliders were just added at the
+            // next step: asleep again after it, unless something awake
+            // touches it by then (a moving truck's bed wakes it, as Havok's
+            // islands would).
+            self.cargo_sleep.push(h);
+            self.cargo_bodies.push(h);
+        }
+        id
+    }
+
+    /// Whether body `h`'s collision is paired with an awake, moving body's
+    /// (their boxes meet: Rapier's narrow phase has the pair).
+    fn paired_with_awake(&self, h: r::RigidBodyHandle) -> bool {
+        let Some(b) = self.world.bodies.get(h) else {
+            return false;
+        };
+        b.colliders().iter().any(|&c| {
+            self.world.narrow_phase.contact_pairs_with(c).any(|pair| {
+                let other = if pair.collider1 == c {
+                    pair.collider2
+                } else {
+                    pair.collider1
+                };
+                self.world
+                    .colliders
+                    .get(other)
+                    .and_then(|o| o.parent())
+                    .filter(|&ob| ob != h)
+                    .and_then(|ob| self.world.bodies.get(ob))
+                    .is_some_and(|ob| ob.is_dynamic() && !ob.is_sleeping())
+            })
+        })
+    }
+
+    /// Wakes loose piece `id`.
+    pub fn wake_debris(&mut self, id: DebrisId) {
+        if let Some(b) = self
+            .debris
+            .get(id.0)
+            .copied()
+            .flatten()
+            .and_then(|h| self.world.bodies.get_mut(h))
+        {
+            b.wake_up(true);
+        }
+    }
+
+    /// Whether loose piece `id` is asleep (not simulated until something
+    /// awake touches it).
+    pub fn debris_asleep(&self, id: DebrisId) -> Option<bool> {
+        let h = (*self.debris.get(id.0)?)?;
+        Some(self.world.bodies.get(h)?.is_sleeping())
     }
 
     /// Puts vehicle `id`'s own collision, `shape` (its `PHY2`, model
@@ -9142,16 +9238,23 @@ mod tests {
         let at = |x: f32| Mat4::from_translation(Vec3::new(x, 500.0, 0.0));
         let plain = p.add_debris(&piece, at(0.0), Vec3::ZERO, Vec3::ZERO);
         let carbine = p.add_debris(&piece, at(10.0), Vec3::ZERO, Vec3::ZERO);
-        let gunbox = p.add_cargo(&piece, at(20.0), Vec3::ZERO);
+        let gunbox = p.add_cargo(&piece, at(20.0));
         p.set_debris_gravity(carbine, 1.5);
         p.set_debris_gravity(gunbox, 3.5);
-        for _ in 0..30 {
+        // Goods are added asleep ([`Physics::add_cargo`]): this one woken,
+        // and measured from rest.
+        p.step(DT);
+        p.wake_debris(gunbox);
+        let start = p.debris_velocity(gunbox).unwrap().0.y;
+        assert_eq!(start, 0.0);
+        for _ in 0..29 {
             p.step(DT);
         }
         let fall = |id| -p.debris_velocity(id).unwrap().0.y / (30.0 * DT);
         assert!((fall(plain) - WORLD_GRAVITY).abs() < 0.2, "{}", fall(plain));
         assert!((fall(carbine) - 13.5).abs() < 0.3, "{}", fall(carbine));
-        assert!((fall(gunbox) - 31.5).abs() < 0.6, "{}", fall(gunbox));
+        let gunbox_fall = -p.debris_velocity(gunbox).unwrap().0.y / (29.0 * DT);
+        assert!((gunbox_fall - 31.5).abs() < 0.6, "{gunbox_fall}");
     }
 
     // Two blasts' pushes on a Phoenix rising from its launch, each topped
@@ -9825,7 +9928,10 @@ mod tests {
         let speed = Vec3::new(0.0, 0.0, 12.0);
         let up = p.vehicle_velocity(id).y;
         p.set_vehicle_velocity(id, speed.with_y(up));
-        let c = p.add_cargo(&piece, at, speed);
+        // Added asleep and at rest (as the 360 adds it), then going with
+        // the truck: a crate already riding it.
+        let c = p.add_cargo(&piece, at);
+        p.push_debris(c, speed);
         for _ in 0..30 {
             p.step(DT);
         }
@@ -9918,7 +10024,7 @@ mod tests {
                 0.0
             };
             let at = place * Mat4::from_translation(centre + Vec3::Y * lifted);
-            p.add_cargo(&piece, at, Vec3::ZERO);
+            p.add_cargo(&piece, at);
         }
         for _ in 0..240 {
             p.drive(
