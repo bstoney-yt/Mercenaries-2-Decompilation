@@ -13348,6 +13348,29 @@ fn vehicle_gravity_check(
         p.step(DT);
     }
     let fall = -p.vehicle_velocity(id).y / (steps as f32 * DT);
+    // Each term that pulls a chassis down in the air, as the port has
+    // them (log only): the world's gravity times its scale (the gravity
+    // action, 0x82180778); a tracked vehicle's pull on each track point
+    // off the ground, (GravityFactor - 1) x 1.5 m/s² a point
+    // (`drive_tracks`, 0x821A4F10); a car's GravityFactor pull
+    // (x GRAVITY_360) applies only with most wheels down, so none here.
+    let points = spec.wheels.len();
+    let track = spec.tuning.tank.map(|t| {
+        (
+            t.gravity_factor,
+            (t.gravity_factor - 1.0) * points as f32 * 1.5,
+        )
+    });
+    let car = spec.tuning.springs.map(|s| s.gravity_factor);
+    eprintln!(
+        "vehicle-gravity-check: terms: world {WORLD_GRAVITY} x scale {} = {:.2}; tracks {} ({points} points off the ground, GravityFactor {:?}) = {:.2}; car GravityFactor {car:?} (wheels down only: 0 in the air); sum {:.2}, measured {fall:.2}",
+        vehicle_gravity_scale(scale),
+        WORLD_GRAVITY * vehicle_gravity_scale(scale),
+        if track.is_some() { "pull" } else { "none" },
+        track.map(|t| t.0),
+        track.map_or(0.0, |t| t.1),
+        WORLD_GRAVITY * vehicle_gravity_scale(scale) + track.map_or(0.0, |t| t.1),
+    );
     let (want_fall, slack) = SCALED_TANK_FALL;
     eprintln!(
         "vehicle-gravity-check: the {} (scale {scale:?}) falls at {fall:.2} m/s/s in the air; the world's {WORLD_GRAVITY} x {} = {:.2}; a scaled tank's {want_fall} (code-derived, not yet measured)",
