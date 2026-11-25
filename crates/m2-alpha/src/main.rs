@@ -2535,7 +2535,13 @@ fn traffic_for_screenshot(
         game.step(Intent::default(), tick);
     }
     let focus = game.focus();
-    match game.traffic.nearest_road(focus) {
+    let people = &game.scene.people;
+    let (road, rejects) = game.traffic.nearest_road(focus, |l| people.layer_in(l));
+    eprintln!(
+        "traffic: road spawners turned away: {} standing (no route), {} with nothing listed, {} with their layer not in",
+        rejects.standing, rejects.nothing_listed, rejects.layer_out
+    );
+    match road {
         Some((e, name, at, forward, reach)) => {
             let off = flat_distance(at, focus);
             if off > reach * TRAFFIC_STAND {
@@ -2560,7 +2566,9 @@ fn traffic_for_screenshot(
                 );
             }
         }
-        None => eprintln!("traffic: no road spawner with its layer in to stand her by"),
+        None => eprintln!(
+            "traffic: no road spawner with its layer in to stand her by (see the counts above)"
+        ),
     }
     // Each traffic car seen: where first seen and the farthest from there.
     let mut seen: std::collections::HashMap<u32, (m2_math::glam::Vec3, f32)> =
