@@ -67,13 +67,15 @@ jobs:
       - run: cargo test -p m2-game --target i686-pc-windows-msvc
       # The release exe is built only for main: PRs already get the debug
       # i686 build above, and this step takes several minutes.
-      - name: Build the alpha exe
+      - name: Build the alpha and launcher exes
         if: github.event_name == 'push'
-        run: cargo build --release -p m2-alpha --target i686-pc-windows-msvc
+        run: cargo build --release -p m2-alpha -p m2-launcher --target i686-pc-windows-msvc
       # Our code only: the exe reads the game from the player's own install.
       - uses: actions/upload-artifact@v4
         if: github.event_name == 'push'
         with:
           name: m2-alpha-windows-i686
-          path: target/i686-pc-windows-msvc/release/m2-alpha.exe
+          path: |
+            target/i686-pc-windows-msvc/release/m2-alpha.exe
+            target/i686-pc-windows-msvc/release/m2-launcher.exe
           retention-days: 7
