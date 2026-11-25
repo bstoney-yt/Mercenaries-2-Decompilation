@@ -63,6 +63,7 @@ mod cheats;
 mod combat;
 mod config;
 mod coop;
+mod cover;
 mod death;
 mod destruct;
 mod disguise;
@@ -160,6 +161,8 @@ use scene::Scene;
 
 /// Simulation rate; rendering runs as fast as presentation allows.
 const TICK: Duration = Duration::from_nanos(1_000_000_000 / 60);
+/// How long `--newgame-cover-check` waits for the intro (invented).
+const COVER_CHECK_LIMIT: Duration = Duration::from_secs(240);
 /// Longest real time a single frame may advance the simulation by, so a
 /// stall (dragging the window, a breakpoint) doesn't fast-forward the game.
 const MAX_FRAME: Duration = Duration::from_millis(250);
@@ -528,6 +531,10 @@ struct Options {
     /// Escape would, this many seconds after play begins. For testing what
     /// pausing asks of the sound (the pause music).
     pause_at: Option<f32>,
+    /// `--newgame-cover-check`: in the window, New Game is started as
+    /// soon as the front end is up; each frame logs the cover's state, and
+    /// the run ends at the intro movie with PASS or FAIL ([`cover::Check`]).
+    newgame_cover_check: bool,
     /// With `--screenshot` on foot and `--gait`: put the nearest soldier
     /// this many metres ahead of her at the start, at the water's height
     /// there, and log each second whether he swims (`npc-swim:` lines).
@@ -1341,6 +1348,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.face_test = Some(value()?.parse().context("--face-test expects seconds")?)
             }
             "--pause-at" => o.pause_at = Some(value()?.parse()?),
+            "--newgame-cover-check" => {
+                o.newgame_cover_check = true;
+                o.alpha = true;
+            }
             "--contracts" => {
                 o.contracts = value()?.parse().context("--contracts expects a count")?
             }
@@ -2004,6 +2015,7 @@ fn run(
         load: options.load.clone(),
         load_at: options.load_at,
         pause_at: options.pause_at,
+        newgame_cover_check: options.newgame_cover_check,
         successor: None,
         state: None,
         error: None,
@@ -2523,6 +2535,20 @@ fn render(
     aspect: f32,
     hud: Option<&mut ui::Hud>,
 ) -> anyhow::Result<()> {
+    render_frame(backend, game, fov, aspect, hud, true)
+}
+
+/// As [`render`]; `world` false streams but draws no world (the new
+/// game's cover, [`cover`], before she is placed): the frame is the HUD's
+/// alone.
+fn render_frame(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    hud: Option<&mut ui::Hud>,
+    world: bool,
+) -> anyhow::Result<()> {
     game.lens = (fov, aspect);
     let mut view = game.view(fov, aspect);
     if game.scene.world.is_some() {
@@ -2535,7 +2561,9 @@ fn render(
     let mut queue = DrawQueue::new();
     spans::time("draw", || -> anyhow::Result<()> {
         backend.begin_frame(&view)?;
-        game.scene.draw(backend, &mut queue, &view, &game.combat)?;
+        if world {
+            game.scene.draw(backend, &mut queue, &view, &game.combat)?;
+        }
         spans::drawn(queue.flush(&view, backend)?.draws);
         Ok(())
     })?;
@@ -13277,6 +13305,10 @@ struct Running {
     /// When to open the pause menu as Escape does (`--pause-at`): a test of
     /// pausing in play (the pause music).
     pause_at: Option<Instant>,
+    /// `--newgame-cover-check`'s frames, and when it gives up.
+    cover_check: Option<(cover::Check, Instant)>,
+    /// The new game was started for the check.
+    cover_check_started: bool,
 }
 
 struct App {
@@ -13328,6 +13360,8 @@ struct App {
     /// Seconds into play to load the player's own save (`--load-at`).
     load_at: Option<f32>,
     pause_at: Option<f32>,
+    /// `--newgame-cover-check`.
+    newgame_cover_check: bool,
     /// The alpha started again (the pause menu's Quit, loading a save),
     /// which this one waits for once its window is closed.
     successor: Option<std::process::Child>,
@@ -13501,6 +13535,28 @@ impl App {
             pause_at: self
                 .pause_at
                 .map(|s| Instant::now() + Duration::from_secs_f32(s)),
+            cover_check: self.newgame_cover_check.then(|| {
+                eprintln!(
+                    "newgame-cover-check: New Game once the front end is up; PASS needs no world                      frame before the intro and her placed and standing when the cover drops"
+                );
+                let decoder = movie::ffmpeg();
+                eprintln!(
+                    "newgame-cover-check: movie decoder {}",
+                    decoder
+                        .as_ref()
+                        .map_or("none (a skipped intro passes, noted)".to_owned(), |p| {
+                            format!("{} (the intro must present a frame)", p.display())
+                        })
+                );
+                (
+                    cover::Check {
+                        decoder: decoder.is_some(),
+                        ..cover::Check::default()
+                    },
+                    Instant::now() + COVER_CHECK_LIMIT,
+                )
+            }),
+            cover_check_started: false,
         };
         running.apply_options(&self.config);
         Ok(running)
@@ -13604,10 +13660,47 @@ impl Running {
             self.lag -= TICK;
             spans::time("ticks", || self.tick(config, event_loop));
         }
+        // The new game's cover is updated once a frame, as the 360's
+        // Loading and WaitForStreaming count their updates ([`cover`]).
+        if let Some(flow) = self.flow.as_mut().filter(|f| f.cover.covered()) {
+            let inputs = cover::Inputs {
+                busy: self.game.streaming_busy(),
+                scripts: self
+                    .mission
+                    .as_ref()
+                    .is_some_and(mission::MissionLink::running),
+                standing: self.game.standing(),
+                placements: self.game.placements,
+                pipelines_left: warmup::pending(),
+            };
+            if let Some(line) = flow.cover.tick(inputs, dt as f32) {
+                eprintln!("{line}");
+            }
+        }
+        if let Some((check, limit)) = &self.cover_check
+            && (check.done() || now >= *limit)
+        {
+            let (ok, line) = check.verdict();
+            eprintln!("newgame-cover-check: {line}");
+            errlog::exit(if ok { 0 } else { 1 });
+        }
         self.keep_mouse();
         let vsync = config.window.vsync;
         let input = self.egui.take_egui_input(&self.window);
+        let frame_dt = dt as f32;
         if let Some(flow) = self.flow.as_mut().filter(|f| f.covers()) {
+            flow.cover.frame(frame_dt);
+            if let (Some((check, _)), true) = (&mut self.cover_check, self.cover_check_started) {
+                // The flow's own screen (black, the movie) is opaque.
+                let line = check.frame(
+                    &flow.cover,
+                    true,
+                    false,
+                    flow.cover.placed,
+                    self.game.standing(),
+                );
+                eprintln!("{line}");
+            }
             let output = self.hud.build_screen(input, |ui| flow.paint(ui));
             self.platform_output(output);
             let (w, h) = self.backend.size();
@@ -13681,6 +13774,16 @@ impl Running {
         if self.pad.touch.used {
             info.touch = Some(self.pad.touch.picture());
         }
+        // The new game's cover: black and the loading screen, from the
+        // first frame after New Game ([`cover`]).
+        let (covered, placed) = self
+            .flow
+            .as_ref()
+            .map_or((false, false), |f| (f.cover.covered(), f.cover.placed));
+        if covered {
+            info.loading = true;
+        }
+        self.hud.blackout = covered;
         let (action, output) = spans::time("hud", || self.hud.build(input, &info, config));
         self.platform_output(output);
         if let Some(news) = self
@@ -13764,13 +13867,29 @@ impl Running {
             None => {}
         }
         let (w, h) = self.backend.size();
-        render(
+        // Under the cover the world is drawn only once she is placed (so
+        // its pipelines are built under the cover), never shown.
+        let world = !covered || placed;
+        render_frame(
             &mut self.backend,
             &mut self.game,
             config.camera.fov,
             view_aspect(&config.window, w, h),
             Some(&mut self.hud),
+            world,
         )?;
+        if let (Some((check, _)), true) = (&mut self.cover_check, self.cover_check_started)
+            && let Some(flow) = &self.flow
+        {
+            let line = check.frame(
+                &flow.cover,
+                world,
+                world && !covered,
+                flow.cover.placed,
+                self.game.standing(),
+            );
+            eprintln!("{line}");
+        }
         self.fps.1 += 1;
         let elapsed = now - self.fps.0;
         if elapsed >= Duration::from_secs(1) {
@@ -14428,6 +14547,24 @@ impl Running {
             flow.window(display::current(&self.window));
             if let Ok(mut mixer) = self.audio.out.mixer.lock() {
                 flow.tick(self.mission.as_mut(), &mut mixer);
+            }
+            // `--newgame-cover-check`: New Game as soon as the front end
+            // is up (past the boot movies).
+            if self.cover_check.is_some() && !self.cover_check_started && flow.at_front_end() {
+                self.cover_check_started = true;
+                if let Ok(mut mixer) = self.audio.out.mixer.lock() {
+                    flow.start_new_game(&mut mixer);
+                }
+            }
+            if let Some(how) = flow.take_intro_started()
+                && let Some((check, _)) = &mut self.cover_check
+            {
+                check.intro(how);
+            }
+            if flow.cover.covered() {
+                // The cover stands in for the arrival screen of the
+                // scripts' first move of her.
+                self.game.arrival = None;
             }
             let news = flow.take_news();
             // The hero picked in the front end, before the scripts start;
@@ -15236,6 +15373,17 @@ mod tests {
         assert!(boat_settled(Vec3::new(10.3, -34.0, 5.0), authored, 0.99).is_err());
     }
 
+    // The M1A2 with its turret and gun each a hundredth of its 32,000 kg
+    // chassis (0x82273E48): 18 + 9 x 32000/32640 = 26.82, Xenia tank3b's
+    // 26.83 (all three bodies, -0.4471 a 1/60 s step); with its records'
+    // 14,132 kg it was 24.25.
+    #[test]
+    fn an_m1a2_falls_as_xenia_measured_with_its_hinged_parts_sized() {
+        let fall = joined_tank_fall(2.0, 2.0, 32_000.0, 640.0);
+        assert!((fall - XENIA_M1A2_FALL).abs() < 0.05, "{fall}");
+        assert!((joined_tank_fall(2.0, 2.0, 32_000.0, 14_132.0) - 24.25).abs() < 0.05);
+    }
+
     // A scaled tank's airborne fall by the code: 18 for all its bodies,
     // plus the tracks' 9 on its chassis shared over all its mass; 27 with
     // no turret, less with one.
@@ -15600,8 +15748,13 @@ fn ditch_check(game: &mut Game, tick: f32) {
 /// to come to [`joined_tank_fall`]'s, m/s².
 const SCALED_TANK_SLACK: f32 = 0.5;
 
-/// A scaled tank's airborne fall, m/s², by the 360 code (not yet
-/// measured: Xenia's tank3): every one of its object's moving bodies,
+/// The M1A2's airborne fall in Xenia tank3b, m/s²: all three of its bodies
+/// (chassis, turret, gun) -0.4471 m/s a 1/60 s step.
+const XENIA_M1A2_FALL: f32 = 26.83;
+
+/// A scaled tank's airborne fall, m/s², by the 360 code (measured: Xenia
+/// tank3b's M1A2, [`XENIA_M1A2_FALL`], with its turret and gun sized as
+/// the code sizes them, `Physics`' `hinge_body`): every one of its object's moving bodies,
 /// chassis, turret and gun, is pulled at `scale` x the world's 9.0 by
 /// its gravity action (0x821831B0 gives each one, 0x82180778); and every
 /// step, with no gate on being airborne, `_TankPhysics`' step
@@ -15744,8 +15897,20 @@ fn vehicle_gravity_check(
         vehicle_gravity_scale(scale),
         WORLD_GRAVITY * vehicle_gravity_scale(scale)
     );
-    if (fall - want_fall).abs() <= slack {
+    // The M1A2 against Xenia's own measure too (tank3b).
+    let m1a2 = spec.label.starts_with("M1A2");
+    if m1a2 {
+        eprintln!(
+            "vehicle-gravity-check: Xenia tank3b's M1A2 fell at {XENIA_M1A2_FALL} (all three bodies); this one {fall:.2}"
+        );
+    }
+    let xenia_ok = !m1a2 || (fall - XENIA_M1A2_FALL).abs() <= slack;
+    if (fall - want_fall).abs() <= slack && xenia_ok {
         eprintln!("vehicle-gravity-check: PASS");
+    } else if !xenia_ok {
+        eprintln!(
+            "vehicle-gravity-check: FAIL it falls at {fall:.2}, not Xenia's {XENIA_M1A2_FALL} +- {slack}"
+        );
     } else {
         eprintln!("vehicle-gravity-check: FAIL it falls at {fall:.2}, not {want_fall} +- {slack}");
     }

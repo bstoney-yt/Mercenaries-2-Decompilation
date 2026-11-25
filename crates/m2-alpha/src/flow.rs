@@ -92,6 +92,12 @@ pub struct Flow {
     /// The attract video is over: the scripts are to go back to their
     /// menus ([`HudState::shell_wake`]), with the next frame.
     wake: bool,
+    /// The cover over a new game's start ([`crate::cover`]): up from New
+    /// Game (or a save) until play may show.
+    pub cover: crate::cover::Cover,
+    /// How the scripts' movie that ended the cover went (its first frame
+    /// presented, or skipped and why), once.
+    intro_started: Option<crate::cover::Intro>,
 }
 
 impl Flow {
@@ -135,7 +141,42 @@ impl Flow {
             news: crate::pause::News::default(),
             attract: false,
             wake: false,
+            cover: crate::cover::Cover::clear(),
+            intro_started: None,
         }
+    }
+
+    /// Leaves the front end for play: the cover goes up at once, so the
+    /// next frame draws the loading screen, not the world.
+    fn enter_game(&mut self, mixer: &mut Mixer) {
+        self.shell = None;
+        self.close(mixer);
+        self.stage = Stage::Game;
+        self.cover = crate::cover::Cover::raise();
+        eprintln!("cover: up (New Game accepted)");
+    }
+
+    /// Starts a new game as the hero up, as the menus' New Game does
+    /// (`--newgame-cover-check`).
+    pub fn start_new_game(&mut self, mixer: &mut Mixer) {
+        if self.stage == Stage::Game {
+            return;
+        }
+        self.enter_game(mixer);
+        self.picked = Some(self.hero);
+        eprintln!("flow: new game as {} (the check)", self.hero);
+    }
+
+    /// How the scripts' movie that took the cover down went (once): its
+    /// first frame presented, or skipped and why.
+    pub fn take_intro_started(&mut self) -> Option<crate::cover::Intro> {
+        self.intro_started.take()
+    }
+
+    /// Whether the stage is the front end with its menus up (or the
+    /// stand-in), past the boot movies.
+    pub fn at_front_end(&self) -> bool {
+        self.stage == Stage::FrontEnd
     }
 
     /// Whether the game waits (no play, no scripts): before play, or while
@@ -319,9 +360,7 @@ impl Flow {
                         // The scripts have left their menus for a save:
                         // play starts from it (the game's hero is the
                         // save's, set as it is taken).
-                        self.shell = None;
-                        self.close(mixer);
-                        self.stage = Stage::Game;
+                        self.enter_game(mixer);
                         eprintln!("flow: the shell loads a save");
                         return;
                     }
@@ -330,9 +369,7 @@ impl Flow {
                         // naming no hero (logged) starts as the stand-in's
                         // hero (the settings', unless changed there).
                         self.hero = crate::shell::hero(&who).unwrap_or(self.hero);
-                        self.shell = None;
-                        self.close(mixer);
-                        self.stage = Stage::Game;
+                        self.enter_game(mixer);
                         self.picked = Some(self.hero);
                         eprintln!("flow: the shell starts a new game as {} ({who})", self.hero);
                         return;
@@ -388,8 +425,7 @@ impl Flow {
                     return;
                 }
                 if pressed {
-                    self.close(mixer);
-                    self.stage = Stage::Game;
+                    self.enter_game(mixer);
                     self.picked = Some(self.hero);
                     eprintln!("flow: new game as {}", self.hero);
                     return;
@@ -416,13 +452,29 @@ impl Flow {
             Stage::Game => {
                 let Some(mission) = mission else { return };
                 if self.movie.is_none() {
+                    // Under the new game's cover the scripts' movies wait
+                    // until it is ready ([`crate::cover`]).
+                    if self.cover.holds_movies() {
+                        return;
+                    }
                     if let Some((name, lines)) = mission.take_movie() {
                         eprintln!("flow: the scripts play movie {name}");
                         self.scripted = true;
                         if !self.open(&name, mixer) {
                             self.scripted = false;
+                            // Handed out all the same: the cover's intro
+                            // is over, unplayed.
+                            let why = if self.ffmpeg.is_none() {
+                                crate::cover::Skip::NoDecoder
+                            } else {
+                                crate::cover::Skip::OpenError
+                            };
+                            self.skip_intro(why, &name);
                             mission.movie_done();
                             return;
+                        }
+                        if let Some(line) = self.cover.movie_started() {
+                            eprintln!("{line} ({name})");
                         }
                         if let Some(lines) = lines {
                             if self.captions.is_none() {
@@ -438,10 +490,17 @@ impl Flow {
                     }
                     return;
                 }
-                let over = self
+                let mut over = self
                     .movie
                     .as_mut()
                     .is_some_and(|m| pressed || m.update(|p| mixer.play(p)));
+                // The intro the cover hands over to must present a frame:
+                // one that ends or runs out of time first was not played.
+                if self.cover.in_handover() && (over || self.cover.handover_expired()) {
+                    let name = self.movie.as_ref().map(|m| m.name.clone());
+                    self.skip_intro(crate::cover::Skip::NoFrame, &name.unwrap_or_default());
+                    over = true;
+                }
                 if let (Some(s), Some(m)) = (&mut self.subtitles, &self.movie)
                     && let Some((frame, _)) = &m.frame
                 {
@@ -468,6 +527,14 @@ impl Flow {
                     }
                 }
             }
+        }
+    }
+
+    /// The cover's intro was handed out but not played, for `why`.
+    fn skip_intro(&mut self, why: crate::cover::Skip, name: &str) {
+        if let Some(line) = self.cover.movie_skipped(why) {
+            eprintln!("{line} ({name})");
+            self.intro_started = Some(crate::cover::Intro::Skipped(why));
         }
     }
 
@@ -571,6 +638,14 @@ impl Flow {
                     Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                     Color32::WHITE,
                 );
+                // The intro's first frame drawn: the cover fades into it
+                // from this frame.
+                if self.stage == Stage::Game
+                    && let Some(line) = self.cover.movie_presented()
+                {
+                    eprintln!("{line} ({})", m.name);
+                    self.intro_started = Some(crate::cover::Intro::Presented);
+                }
             }
         }
         if let (Some(s), Some(Some(c))) = (&self.subtitles, &mut self.captions) {
@@ -593,6 +668,16 @@ impl Flow {
                 "Left/Right to choose, Enter to start",
                 FontId::proportional(size),
                 Color32::from_gray(230),
+            );
+        }
+        // The new game's cover fading from black into the intro movie
+        // (invented, [`crate::cover::FADE`]).
+        let black = self.cover.black();
+        if black > 0.0 && self.stage == Stage::Game {
+            painter.rect_filled(
+                screen,
+                0.0,
+                Color32::from_black_alpha((black * 255.0).round() as u8),
             );
         }
     }
