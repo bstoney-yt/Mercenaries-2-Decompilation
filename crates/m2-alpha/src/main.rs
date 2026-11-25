@@ -168,6 +168,9 @@ const LAUNCH_CHECK_LIMIT: Duration = Duration::from_secs(240);
 /// Seconds of play before `--save-check` saves (invented: the island and
 /// the scripts' first steps are in by then).
 const SAVE_CHECK_AFTER: f32 = 20.0;
+/// How near the saved place `--save-check-no-world` wants her for the
+/// world file's place to be dropped, metres (invented).
+const WORLD_CHECK_METRES: f32 = 10.0;
 /// Longest real time a single frame may advance the simulation by, so a
 /// stall (dragging the window, a breakpoint) doesn't fast-forward the game.
 const MAX_FRAME: Duration = Duration::from_millis(250);
@@ -554,6 +557,12 @@ struct Options {
     /// that pause-menu slot in the 360's record layout, read back and its
     /// fields compared with what was saved; PASS or FAIL, and the run ends.
     save_check: Option<u32>,
+    /// `--save-check-no-world`: with `--load <save> --screenshot
+    /// --mission`, the save loads the 360's way (its record alone, the
+    /// invented world file left out); [`SAVE_CHECK_AFTER`] seconds in,
+    /// where she is, her health and weapons are logged against what the
+    /// world file had, PASS if within [`WORLD_CHECK_METRES`] of it.
+    save_check_no_world: bool,
     /// With `--screenshot` on foot and `--gait`: put the nearest soldier
     /// this many metres ahead of her at the start, at the water's height
     /// there, and log each second whether he swims (`npc-swim:` lines).
@@ -1362,6 +1371,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--pause-at" => o.pause_at = Some(value()?.parse()?),
             "--new-game" => o.start = Some(flow::Start::NewGame),
             "--launch-check" => o.launch_check = true,
+            "--save-check-no-world" => o.save_check_no_world = true,
             "--save-check" => {
                 let n: u32 = value()?
                     .parse()
@@ -2392,11 +2402,62 @@ fn write_save(game: &Game, mission: Option<&mission::MissionLink>, path: &std::p
     }
 }
 
+/// `--save-check-no-world`: where she is after a load of the record
+/// alone (the 360's path), against what the save's world file had: her
+/// place, health, weapons, rounds. PASS if she is within
+/// [`WORLD_CHECK_METRES`] of the saved place (what dropping the world
+/// file's place needs); the rest is logged for the decision.
+fn world_check(game: &Game, saved: Option<&save::WorldRef>) -> bool {
+    let Some(was) = saved.and_then(|w| w.player.as_ref()) else {
+        eprintln!("save-world-check: FAIL: the save had no world file to compare with");
+        return false;
+    };
+    let Some(now) = game.save().and_then(|s| s.player) else {
+        eprintln!("save-world-check: FAIL: she is not on the island");
+        return false;
+    };
+    use m2_math::glam::Vec3;
+    let gap = Vec3::from(now.position).distance(Vec3::from(was.position));
+    let flat = (Vec3::from(now.position) - Vec3::from(was.position))
+        .with_y(0.0)
+        .length();
+    let same = |a: &str, b: &str| if a == b { "same" } else { "differs" };
+    eprintln!(
+        "save-world-check: place: now {:?}, saved {:?}: {gap:.1} m apart ({flat:.1} m level)",
+        now.position, was.position
+    );
+    eprintln!(
+        "save-world-check: health: now {:.0}, saved {:.0} ({})",
+        now.hp,
+        was.hp,
+        if (now.hp - was.hp).abs() < 0.5 {
+            "same"
+        } else {
+            "differs"
+        }
+    );
+    let weapons = |p: &save::PlayerSave| {
+        format!(
+            "{} up, guns {:?}, rifle {:?}, launcher {:?}, grenades {}, explosives {:?}",
+            p.weapon, p.guns, p.rifle, p.launcher, p.grenades, p.explosives
+        )
+    };
+    let (wn, ww) = (weapons(&now), weapons(was));
+    eprintln!("save-world-check: weapons now: {wn}");
+    eprintln!("save-world-check: weapons saved: {ww} ({})", same(&wn, &ww));
+    let ok = gap <= WORLD_CHECK_METRES;
+    eprintln!(
+        "save-world-check: {} (she is {gap:.1} m from the saved place; {WORLD_CHECK_METRES} m or less passes)",
+        if ok { "PASS" } else { "FAIL" }
+    );
+    ok
+}
+
 /// `--save-check`: saves the game to pause-menu slot `slot`, reads the
 /// file back and compares it with what was saved: the 360's record
 /// length and header, the character, cash and fuel, the scripts' save
-/// text, and the time played, contract and percent the scripts' last
-/// `Sys.RequestAutosave` gave. Each line logged; whether all held.
+/// text, and the time played, contract and percent the pause screen
+/// stamped as it opened. Each line logged; whether all held.
 fn save_check(game: &Game, link: &mission::MissionLink, slot: u32) -> bool {
     let path = pause_save_path(slot);
     eprintln!("save-check: saving to slot {slot} ({})", path.display());
@@ -5456,8 +5517,26 @@ fn mission_for_screenshot(
     out: &std::path::Path,
 ) -> anyhow::Result<mission::MissionLink> {
     let tick = TICK.as_secs_f32();
+    // `--save-check-no-world`: the save loads the 360's way, its record
+    // alone; what its world file had is kept to compare with.
+    let mut load = options.load.clone();
+    let world_ref = match (&mut load, options.save_check_no_world) {
+        (Some(s), true) => Some(save::strip_world(s)),
+        _ => None,
+    };
+    if options.save_check_no_world {
+        match &world_ref {
+            Some(w) => eprintln!(
+                "save-world-check: loading the record alone; its world file had her at {:?}, {} vehicles, {} killed",
+                w.player.as_ref().map(|p| p.position),
+                w.vehicles,
+                w.killed
+            ),
+            None => eprintln!("save-world-check: FAIL needs --load <save>"),
+        }
+    }
     let mut link = mission::MissionLink::start(install, options.mission_drivers.clone())
-        .with_save(options.load.clone())
+        .with_save(load)
         .with_support(options.support.clone())
         .with_movies(options.movies)
         .with_skip_mode_off(options.skip_mode_off)
@@ -6195,7 +6274,17 @@ fn mission_for_screenshot(
         if let Some(slot) = options.save_check
             && i as f32 * tick >= SAVE_CHECK_AFTER
         {
+            // Saved from the pause menu, as the 360 saves: the pause
+            // screen opening stamps the progress first.
+            link.stamp_pause();
             errlog::exit(if save_check(game, &link, slot) { 0 } else { 1 });
+        }
+        if options.save_check_no_world && i as f32 * tick >= SAVE_CHECK_AFTER {
+            errlog::exit(if world_check(game, world_ref.as_ref()) {
+                0
+            } else {
+                1
+            });
         }
         // With --placed-check, what the layers have put out is tried
         // every few seconds ([`placed::check`]).
@@ -14227,6 +14316,12 @@ impl Running {
     }
 
     fn open_menu(&mut self) {
+        // As the 360's pause screen opens it hands the engine the time
+        // played, last contract and percent its saves are stamped with
+        // (`_GuiInternal.SetFlashPauseMenu`, 0x82322D50).
+        if let Some(m) = &mut self.mission {
+            m.stamp_pause();
+        }
         self.hud.menu = true;
         self.keep_mouse();
         self.input.clear();
