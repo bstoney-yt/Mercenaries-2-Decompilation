@@ -46,13 +46,24 @@ substep, on the bodies the rebuild pass has just made.
 - The queue is a plain list. Each call appends one 20-byte entry (type, body,
   vector), keeps a reference to the body and counts the entry. It is **not keyed per
   body**: two impulses on one body are two entries, applied in turn.
-- Havok's step **0x82644C38** locks the world (+0x84 += 1) and marks the
-  queue at its start. Its end, where the world is unlocked and the queue is
-  run, is vector code the decompiler can't follow. **Inferred**: queued
-  impulses are applied when the world next unlocks, inside a substep. That
-  fits Xenia's phys7c/d, where the explosion pushes showed as separate
-  level-only changes between substeps, and the world read locked between
-  frames.
+- Each substep: Havok's step **0x82644C38** locks the world (+0x84 += 1),
+  marks the queue and starts the simulation jobs. 0x82643FA8 runs their
+  results. Then the step's finish **0x82644F18** (through 0x82622A00)
+  clears the mark and unlocks the world. If the lock is back to 0, the world
+  is not in a critical section (+0x8C) and ops are pending (+0x80), it
+  **runs the queue** (0x82621DC8). So queued impulses are applied at the
+  end of a substep, after its solve (recovered code).
+- Xenia read the world locked between frames. If the lock is held during
+  the action pass, the launch and explosion impulses queue up and land in
+  order at the end of the frame's first substep, as phys7c/d's separate
+  writes show (inferred; where that outer lock is taken is not read).
+- **phys7b-d** (Xenia, sub-frame samples): three equal substeps of gravity
+  at frame dt 0.034-0.047 s. In each death frame the new body is seen first
+  with its launch. Then the explosions come as separate level-only changes,
+  then a small mixed change (contact), then gravity. The launch's
+  level/vertical ratio (0.40, 0.38, 0.32) exceeds what the launch can reach
+  without its 2 m/s square term (at most 0.354), so that term is applied.
+  Its size reads 2-7% under the code's 10.2 m/s, which is unexplained.
 
 ## The port's frame against the 360's (from the code of both)
 
