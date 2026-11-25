@@ -742,7 +742,16 @@ fn blast_push_vehicle(
         .into_iter()
         .map(|(per_kg, point)| (per_kg * v.spec.mass, point))
         .collect();
+    let before = physics.vehicle_velocity(id);
     physics.push_vehicle_topped(id, &pushes);
+    // Log only: the push's linear change before and after the per-axis
+    // top-up (0x8215BF38), up part apart.
+    let raw: Vec3 = pushes.iter().map(|p| p.0).sum::<Vec3>() / v.spec.mass.max(1.0);
+    let topped = physics.vehicle_velocity(id) - before;
+    eprintln!(
+        "blast push: the {} from {before:.3}: raw {raw:.3} (up {:.3}), topped {topped:.3} (up {:.3})",
+        v.spec.label, raw.y, topped.y
+    );
 }
 
 /// The world box round a model box `(lo, hi)` placed at `at`.

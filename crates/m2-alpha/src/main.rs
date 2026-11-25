@@ -9870,6 +9870,10 @@ const WRECK_BLAST_VEHICLE: &str = "phoenix";
 /// on the death step, all of it and its up part, after one gravity step.
 const XENIA_DEATH_SPEED: (f32, f32) = (9.8, 10.05);
 const XENIA_DEATH_UP: (f32, f32) = (9.0, 9.2);
+/// How many steps from the wreck on `--wreck-blast-check` logs, with
+/// their dt and speed.
+const WRECK_STEPS_LOGGED: usize = 8;
+
 /// The fall it flies under after (0.30 m/s a 1/30 s step, phys6).
 const XENIA_WRECK_G: f32 = 9.0;
 /// How near that a fitted fall must be.
@@ -10045,6 +10049,11 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
     // Her least health in the watch: the blasts' loss, before her health
     // comes back (4 s on, at 25 a second: by 6 s some 50 of it).
     let mut least = game.combat.hp;
+    // Log only: each step's dt and speed from the wreck on (the port
+    // steps at 1/60 s, Xenia's counters are 1/30 s), and where it first
+    // touches anything after it has left the ground, apart from where it
+    // comes to rest.
+    let (mut logged, mut airborne, mut first_touch) = (0, false, None);
     for k in 0..(6.0 / tick) as u32 {
         game.step(Intent::default(), tick);
         least = least.min(game.combat.hp);
@@ -10054,6 +10063,27 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
         };
         if game.scene.vehicles[i].wrecked && landed.is_none() {
             flight.push((t, v));
+            if logged < WRECK_STEPS_LOGGED {
+                logged += 1;
+                eprintln!(
+                    "wreck-blast-check: step {logged} at {t:.4} s, dt {tick:.4} s: v {v:.3}, |v| {:.2}",
+                    v.length()
+                );
+            }
+            let touching = game
+                .scene
+                .world
+                .as_ref()
+                .is_some_and(|w| !w.physics.vehicle_touching(id).is_empty());
+            if !touching {
+                airborne = true;
+            } else if airborne && first_touch.is_none() {
+                let d = at.with_y(0.0).distance(start.with_y(0.0));
+                eprintln!(
+                    "wreck-blast-check: first touch after leaving the ground at {t:.2} s, {d:.1} m off, v {v:.2}"
+                );
+                first_touch = Some(d);
+            }
         }
         let rise = at.y - start.y;
         if rise > top {
@@ -10073,6 +10103,12 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
         }
     }
     let (rise, off, speed, lost) = XENIA_WRECK;
+    eprintln!(
+        "wreck-blast-check: first touch {} m off, at rest {} m off (360 lands {:?})",
+        first_touch.map_or("never".to_owned(), |d| format!("{d:.1}")),
+        landed.map_or("never".to_owned(), |d| format!("{d:.1}")),
+        XENIA_WRECK_LANDS
+    );
     eprintln!(
         "wreck-blast-check: rose {top:.1} m at {top_at:.2} s (360 {rise}), landed {} m off (360 {off}), top speed {fastest:.1} m/s (360 {speed}); she lost {:.1} (360 {lost}) and moved {:.1} m",
         landed.map_or("never".to_owned(), |d| format!("{d:.1}")),
