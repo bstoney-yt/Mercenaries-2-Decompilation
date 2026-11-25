@@ -190,6 +190,9 @@ pub struct Game {
     ///
     /// [`teleported`]: Self::teleported
     pub arrival: Option<f32>,
+    /// How many times the scripts (or the start) have put her somewhere,
+    /// for the new game's cover ([`crate::cover`]).
+    pub placements: u32,
     /// The start-up's state layers have their models up.
     props_up: bool,
     /// The driver's throttle last tick, -1 (reverse) to 1.
@@ -603,6 +606,7 @@ impl Game {
             vehicle_wait: 0.0,
             startup: None,
             arrival: None,
+            placements: 0,
             props_up: false,
             throttle: 0.0,
             steer: 0.0,
@@ -1093,9 +1097,30 @@ impl Game {
     /// that is a load (the second contract's end takes her to PMC HQ), and
     /// the loading screen stays up while the place loads.
     pub fn teleported(&mut self, from: Vec3, to: Vec3) {
+        self.placements = self.placements.wrapping_add(1);
         if from.distance(to) > FAR_TELEPORT {
             self.arrival = Some(0.0);
         }
+    }
+
+    /// Whether anything near her is still loading: the island-wide tiles,
+    /// its vehicles, the props near her or the world's pieces (the new
+    /// game's cover waits for none, [`crate::cover`]).
+    pub fn streaming_busy(&self) -> bool {
+        let counts = self.scene.props.counts();
+        let world = self.scene.world.as_ref().is_some_and(|w| {
+            let s = w.stats();
+            s.tiles + s.failed < w.index.tiles.len() || s.pending > 0
+        });
+        world || self.scene.vehicles_loading() || counts.loading + counts.waiting_near > 0
+    }
+
+    /// She stands (landed, or seated in a vehicle), for the cover.
+    pub fn standing(&self) -> bool {
+        self.scene
+            .player
+            .as_ref()
+            .is_some_and(|p| p.landed || p.driving.is_some())
     }
 
     /// The arrival's load, `dt` seconds on: over once her surroundings are

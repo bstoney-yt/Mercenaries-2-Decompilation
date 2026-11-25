@@ -255,6 +255,12 @@ fn warm(backend: &mut WgpuBackend, budget: Option<Duration>, when: &str) {
     }
 }
 
+/// Pipelines of the list not yet built (the new game's cover waits for
+/// none, [`crate::cover`]).
+pub fn pending() -> usize {
+    STATE.with_borrow(|s| s.pending.len())
+}
+
 /// The loading screen is up (or not) this frame.
 pub fn screen(up: bool) {
     STATE.with_borrow_mut(|s| s.watch.screen(up));

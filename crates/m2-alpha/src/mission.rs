@@ -2673,6 +2673,7 @@ impl MissionLink {
                 self.spawn_tries = 0;
                 if p.character.position.distance(at) > SPAWN_NEAR {
                     p.drop_at(at);
+                    game.placements = game.placements.wrapping_add(1);
                     p.driving = None;
                     p.chase_target = None;
                     eprintln!("mission: she starts at the scripts' spawn point {name} ({at:.1})");
