@@ -49,7 +49,10 @@ pub struct Paths {
 
 impl Paths {
     pub fn new(dir: &Path) -> Self {
-        let here = PathBuf::from(GAME_SETTINGS_FILE);
+        // Absolute, so the folders read as paths in the Options tab.
+        let dir = &std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let here =
+            std::path::absolute(GAME_SETTINGS_FILE).unwrap_or_else(|_| GAME_SETTINGS_FILE.into());
         let game_settings = if here.is_file() {
             here
         } else {

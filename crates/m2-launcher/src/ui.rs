@@ -538,6 +538,21 @@ impl App {
         if count > 0 {
             let art = banners[self.banner % count];
             let tex = &self.art[&art.hash];
+            if art.hash == assets::BANNER[0].hash
+                && let Some(head) = self.art.get(&assets::BILL_HEAD.hash)
+            {
+                // Behind the bill, in its oval (invented placement: the
+                // bill's middle, 80% of its height).
+                let bill = cover_rect(tex, hero);
+                let side = bill.height() * 0.8;
+                p.rect_filled(hero, 0.0, Color32::from_rgb(0x12, 0x10, 0x0c));
+                p.image(
+                    head.id(),
+                    Rect::from_center_size(bill.center(), vec2(side, side)),
+                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
             cover(&p, tex, hero);
             // Darker toward the bar, for the text over it.
             gradient(
@@ -641,7 +656,7 @@ impl App {
             );
         }
         // The game's name over it.
-        let logo = pos2(hero.center().x, hero.top() + hero.height() * 0.30);
+        let logo = pos2(hero.center().x, hero.top() + hero.height() * 0.22);
         for (offset, colour) in [
             (vec2(3.0, 3.0), Color32::from_black_alpha(200)),
             (vec2(0.0, 0.0), TEXT),
@@ -1370,6 +1385,13 @@ impl eframe::App for App {
 // ---- shapes ----
 
 /// `tex` over `rect`, filling it and cut to its shape (centred).
+/// Where all of `tex` lands when [`cover`] draws it over `rect`.
+fn cover_rect(tex: &TextureHandle, rect: Rect) -> Rect {
+    let [w, h] = tex.size();
+    let scale = (rect.width() / w.max(1) as f32).max(rect.height() / h.max(1) as f32);
+    Rect::from_center_size(rect.center(), vec2(w as f32 * scale, h as f32 * scale))
+}
+
 fn cover(p: &Painter, tex: &TextureHandle, rect: Rect) {
     let [w, h] = tex.size();
     let image = w as f32 / h.max(1) as f32;

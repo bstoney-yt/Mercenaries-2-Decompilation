@@ -114,6 +114,14 @@ pub const CHARACTERS: Art = Art {
     caption: "New game",
 };
 
+/// Mattias's head, which the main menu shows in the dollar bill's oval
+/// (the bill's middle is see-through).
+pub const BILL_HEAD: Art = Art {
+    name: "shell_mainmenu_mattias_head",
+    hash: 0xb07a_1459,
+    caption: "",
+};
+
 /// The loading screen's skull, the sidebar's game icon.
 pub const SKULL: Art = Art {
     name: "global_loading_skull",
@@ -175,7 +183,7 @@ pub fn load(data: &Path) -> Loaded {
         }
     }
 
-    for art in BANNER.iter().chain([&CHARACTERS, &SKULL]) {
+    for art in BANNER.iter().chain([&CHARACTERS, &BILL_HEAD, &SKULL]) {
         match texture(&mut sources, art.hash) {
             Some(rgba) => {
                 out.log.push(format!(
@@ -231,7 +239,7 @@ mod tests {
 
     #[test]
     fn each_pictures_hash_is_its_names() {
-        for art in BANNER.iter().chain([&CHARACTERS, &SKULL]) {
+        for art in BANNER.iter().chain([&CHARACTERS, &BILL_HEAD, &SKULL]) {
             assert_eq!(name_hash(art.name), art.hash, "{}", art.name);
         }
     }
