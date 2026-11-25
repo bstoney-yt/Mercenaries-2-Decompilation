@@ -258,6 +258,9 @@ struct Options {
     /// With `--drive` and `--wreck` or `--shoot-up`: get out of the wreck,
     /// walk to the fuel can it left and take it (testing).
     fuel_check: bool,
+    /// `--binocular-check`: the binoculars driven by a scripted look and
+    /// zoom, offscreen, PASS/FAIL against the 360 ([`binoculars::check`]).
+    binocular_check: bool,
     /// `--survival-check`: her health clamp and survival mode on the
     /// game's own code, offscreen ([`combat::survival_check`]); then exit.
     survival_check: bool,
@@ -869,6 +872,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.drive = true;
             }
             "--fuel-check" => o.fuel_check = true,
+            "--binocular-check" => o.binocular_check = true,
             "--survival-check" => o.survival_check = true,
             "--log-check" => o.log_check = true,
             "--shoot-up" => {
@@ -1803,6 +1807,9 @@ fn run(
     if options.write_config {
         print!("{}", config.to_toml());
         return Ok(());
+    }
+    if options.binocular_check {
+        errlog::exit(if binoculars::check() { 0 } else { 1 });
     }
     let install = match &config.install {
         Some(dir) => Some(Install::find(dir)?),
@@ -3281,8 +3288,8 @@ fn screenshot(
     if let Some(zoom) = options.binoculars
         && let Some(p) = game.scene.player.as_mut()
     {
-        let mut b = binoculars::Binoculars::default();
-        b.step(i32::from(zoom) - i32::from(b.zoom));
+        let mut b = binoculars::Binoculars::up(p.yaw, p.pitch);
+        b.camera.zoom = f32::from(zoom).clamp(b.camera.params.min, b.camera.params.max);
         p.binoculars = Some(b);
     }
     if options.pda {
