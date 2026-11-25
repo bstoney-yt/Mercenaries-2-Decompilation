@@ -44,21 +44,32 @@ with open(sys.argv[1], "w") as fh:
         b = g.read(entry, 0x20)
         if not b or len(b) < 0x20: continue
         c = struct.unpack_from(">I", b, 0xC)[0]
-        if c == last: continue
+        if c == last:
+            # (b) between counters right after the death: log every change of the new body's v (sub-counter samples)
+            if dead is not None and c <= dead + 2:
+                cur_ = pc.bodies(g, P)[3] if P else []; B_ = cur_[0][1] if cur_ else 0
+                v_ = pc.f3(g, B_ + 0x1A0) if pc.ok_ptr(B_) else None
+                if v_ != getattr(sys, "_lastv", None):
+                    sys._lastv = v_; mgr_ = u32(0x831334C8)
+                    w(f"  sub t {time.time()-t0:.5f} c {c} B {B_:#x} v {fmt(v_)} steps {u32(mgr_ + 0x23D4)}")
+            continue
         last = c
         hv = struct.unpack(">f", g.read(ca + 4, 4) or bytes(4))[0] if ca else float("nan")
         e, eh = dmg_rec(); raw = g.read(e, 0x40) if e else None
         fl = struct.unpack(">16f", raw) if raw and len(raw) == 0x40 else None
         cur = pc.bodies(g, P)[3] if P else []; B = cur[0][1] if cur else 0
+        mgr = u32(0x831334C8)
+        tim = (f"  t {time.time()-t0:.5f} frame dt 0x82B7C730 {struct.unpack('>f', g.read(0x82B7C730, 4) or bytes(4))[0]:.5f} "
+               f"phys dt mgr+0x2390 {struct.unpack('>f', g.read(mgr + 0x2390, 4) or bytes(4))[0]:.5f} steps mgr+0x23D4 {u32(mgr + 0x23D4)}")
         row = [f"c {c} hp {hv:.2f} record pos {fmt(struct.unpack_from('>3f', b, 0))} quat {fmt(struct.unpack_from('>4f', b, 0x10))}",
                f"  dmg rec {e and hex(e)} via {eh}: dir {fmt(fl[0:3]) if fl else None} hit {fmt(fl[3:6]) if fl else None} kind {fl and fl[6]} (as u32 {hex(struct.unpack_from('>I', raw, 24)[0]) if raw and len(raw) >= 28 else None}) floats {fmt(fl) if fl else None} raw {raw and raw.hex()}",
                f"  world u32(B+8) {u32(B + 8) if B else 0:#x} world+0x84 {u32(u32(B + 8) + 0x84) if B and u32(B + 8) else 0:#x} (0x8262AB60 defers the impulse as op 0x1A when non-zero; sampled between frames only)",
                f"  P+0x3C {g.read(P + 0x3C, 4).hex() if P else None} P+0x50 {g.read(P + 0x50, 4).hex() if P else None} (gate for the last-damage kick)",
-               f"  OLD {body(oldB)}", f"  CUR {'NEW' if B != oldB else 'same'} {body(B)}",
+               tim, f"  OLD {body(oldB)}", f"  CUR {'NEW' if B != oldB else 'same'} {body(B)}",
                f"  rand scales 0x8380EB38/3C {fmt(struct.unpack('>2f', g.read(0x8380EB38, 8) or bytes(8)))} RNG 0x82B5E588 raw {(g.read(0x82B5E588, 0x20) or b'').hex()}"]
         ring = (ring + [row])[-4:]
         if dead is None and hv <= 0:
             dead = c; [w(l) for r in ring[:-1] for l in r]
         if dead is not None:
             [w(l) for l in row]
-            if c > dead + 4: break
+            if c > dead + 6: break
