@@ -387,6 +387,9 @@ pub struct Templates {
     /// Each person template's jump, gravity, turn and paces, by id
     /// ([`crate::tuning::human_motion`]).
     pub human_motion: HashMap<u32, crate::on_foot::HumanMotion>,
+    /// Each person template's `TossGetupSeconds`
+    /// ([`crate::tuning::toss_getup_seconds`]).
+    pub toss_getup: HashMap<u32, f32>,
     /// Each template's cover hints, by id ([`crate::tuning::cover_hints`]).
     pub cover_hints: HashMap<u32, Vec<crate::ai_cover::Hint>>,
     /// Each person template's `HumanAnimationSet` gender and character
@@ -677,6 +680,13 @@ impl Templates {
         self.ids(name)
             .iter()
             .find_map(|id| self.swim_speeds.get(id).copied())
+    }
+
+    /// Template `name`'s `TossGetupSeconds`, whatever its case.
+    pub fn toss_getup_seconds(&self, name: &str) -> Option<f32> {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.toss_getup.get(id).copied())
     }
 
     /// Template `name`'s jump, gravity, turn and paces, whatever its case.
@@ -1217,6 +1227,7 @@ impl Templates {
             speeds: crate::tuning::human_speeds(&db),
             swim_speeds: crate::tuning::human_swim_speeds(&db),
             human_motion: crate::tuning::human_motion(&db),
+            toss_getup: crate::tuning::toss_getup_seconds(&db),
             cover_hints: crate::tuning::cover_hints(&db),
             human_sets: crate::tuning::human_animation_sets(&db),
             face_actors: crate::tuning::face_actors(&db),
@@ -2293,7 +2304,7 @@ impl WorldIndex {
             .unwrap_or_default();
         let population = &templates.population;
         let names = layer.names();
-        for (&entity, p) in &layer.placements() {
+        for &(entity, ref p) in &in_entity_order(&layer.placements()) {
             let Some(&spawner) = own
                 .get(&entity)
                 .or_else(|| population.spawners.get(&p.parent))
@@ -2346,7 +2357,7 @@ impl WorldIndex {
             .component("HibernationControl")
             .map(crate::population::hibernation)
             .unwrap_or_default();
-        for (&entity, p) in &layer.placements() {
+        for &(entity, ref p) in &in_entity_order(&layer.placements()) {
             let Some(&haste) = own_haste.get(&entity) else {
                 continue;
             };
@@ -2470,8 +2481,15 @@ impl WorldIndex {
             self.add_state_objects(layer, assets);
             self.add_state_vehicles(layer, layer_hash, assets);
         } else {
+            // In entity order: the objects' indices (and what keys on
+            // them) are the same every run, not a hash map's order, whose
+            // seed is per process (q764: the same placed object had a
+            // different index each run).
             let models = layer.hashes("ModelName");
-            for (&entity, model) in &models {
+            let mut in_order: Vec<(u32, u32)> = models.iter().map(|(&e, &m)| (e, m)).collect();
+            in_order.sort_unstable();
+            for (entity, model) in &in_order {
+                let entity = *entity;
                 if let Some(p) = at(entity) {
                     self.objects.push(ObjectPlacement {
                         entity,
@@ -2491,7 +2509,9 @@ impl WorldIndex {
                 .map(|(entity, _)| entity)
                 .collect();
             let logging = std::env::var("M2_LOG_FOLIAGE").as_deref() == Ok("on");
-            for (entity, name) in layer.names() {
+            let mut named: Vec<(u32, &str)> = layer.names().into_iter().collect();
+            named.sort_unstable_by_key(|&(e, _)| e);
+            for (entity, name) in named {
                 let Some(p) = at(entity) else { continue };
                 let (position, rotation) = (Vec3::from(p.position), rotation(p.rotation));
                 let mut candidates: Vec<u32> = models.get(&entity).copied().into_iter().collect();
@@ -2648,7 +2668,10 @@ impl WorldIndex {
             .filter(|&(c, entity)| leaves_out(c, destructible.contains(&entity)))
             .map(|(_, entity)| entity)
             .collect();
-        for (&entity, p) in &placements {
+        // In entity order (see `add_layer`).
+        let mut placed: Vec<(&u32, &m2_assets::layer::Placement)> = placements.iter().collect();
+        placed.sort_unstable_by_key(|&(e, _)| *e);
+        for (&entity, p) in placed {
             if not_props.contains(&entity) || p.position[1] < HIDDEN_BELOW {
                 continue;
             }
@@ -2706,7 +2729,7 @@ impl WorldIndex {
     /// else by the one they are an instance of, has vehicle physics.
     fn add_state_vehicles(&mut self, layer: &Layer<'_>, layer_hash: u32, assets: &Assets) {
         let names = layer.names();
-        for (&entity, p) in &layer.placements() {
+        for &(entity, ref p) in &in_entity_order(&layer.placements()) {
             let stem = names.get(&entity).map_or("", |n| member_stem(n));
             let template = match assets.templates.get(stem) {
                 Some(t) => Some((stem, t)),
@@ -2765,6 +2788,18 @@ impl WorldIndex {
             .min_by(|a, b| square_distance(**a, x, z).total_cmp(&square_distance(**b, x, z)))
             .map_or(0.0, |c| c.y)
     }
+}
+
+/// A layer's placements in entity order, not a hash map's (whose seed is
+/// per process): what they are made into is made in the same order, with
+/// the same indices, every run.
+fn in_entity_order(
+    placements: &HashMap<u32, m2_assets::layer::Placement>,
+) -> Vec<(u32, m2_assets::layer::Placement)> {
+    let mut out: Vec<(u32, m2_assets::layer::Placement)> =
+        placements.iter().map(|(&e, p)| (e, *p)).collect();
+    out.sort_unstable_by_key(|&(e, _)| e);
+    out
 }
 
 /// Distance from `(x, z)` to the 400 m square centred on `centre`.

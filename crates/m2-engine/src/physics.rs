@@ -1811,6 +1811,11 @@ struct VehicleBody {
     before: Vec3,
     /// Its spin before the last step, radians a second about each axis.
     spin_before: Vec3,
+    /// Its velocities as the last two steps began, newest first
+    /// (`None` before its first step), and how much its velocity changed
+    /// over that one 360 update ([`Physics::vehicle_jolt`]).
+    history: Option<[Vec3; 2]>,
+    jolt: f32,
     /// A boat's: it floats instead of rolling on wheels.
     hull: Option<Hull>,
     /// A helicopter's: it flies.
@@ -3779,6 +3784,11 @@ impl Physics {
                 .bodies
                 .get(v.controller.chassis)
                 .map_or(Vec3::ZERO, |b| vec3(b.angvel()));
+            // Its velocity's change over one 360 update (1/30 s: two of
+            // these steps).
+            let h = v.history.get_or_insert([v.before; 2]);
+            v.jolt = (v.before - h[1]).length();
+            *h = [v.before, h[0]];
             if v.held {
                 continue;
             }
@@ -4120,6 +4130,35 @@ impl Physics {
             b.set_gravity_scale(gravity, true);
         }
         id
+    }
+
+    /// Gives a prop's body (a loose piece, a prop body, cargo) its
+    /// template's `PhysicsPropertyGravityScaler` `scale`: pulled by
+    /// [`prop_gravity_scale`]`(scale)` times the world's gravity.
+    ///
+    /// From the 360 code: building a prop's bodies (0x821831B0), each body
+    /// that is neither fixed nor keyframed (motion byte +0xD8 not 6 or 7)
+    /// is given a gravity action (vtable 0x820C8284) holding the scale,
+    /// clamped to [-10, 10] (0x82DE8C30, 0x820BAEEC), whose step
+    /// (0x82180778) gives it `(scale - 1) x mass x dt` of the world's
+    /// gravity: in all, `scale` times the world's pull, which is what a
+    /// rapier body's gravity scale is.
+    pub fn set_debris_gravity(&mut self, id: DebrisId, scale: f32) {
+        let scale = prop_gravity_scale(scale);
+        if scale == 1.0 {
+            return;
+        }
+        if let Some(b) = self
+            .debris
+            .get(id.0)
+            .copied()
+            .flatten()
+            .and_then(|h| self.world.bodies.get_mut(h))
+            && !b.is_fixed()
+            && !b.is_kinematic()
+        {
+            b.set_gravity_scale(scale, true);
+        }
     }
 
     /// As [`add_debris`](Self::add_debris), a piece a building broke
@@ -5069,6 +5108,8 @@ impl Physics {
             held: false,
             before: Vec3::ZERO,
             spin_before: Vec3::ZERO,
+            history: None,
+            jolt: 0.0,
             hull,
             rotor,
         }));
@@ -6410,6 +6451,31 @@ impl Physics {
 
     /// A vehicle's velocity before the last step, m/s: what it hit things
     /// with (a crash stops it within the step).
+    /// How much vehicle `id`'s velocity changed over the last 360 update
+    /// (1/30 s, two of these steps), m/s: what its seats'
+    /// `TossSpeedChange` is measured against. From the 360 code: the car
+    /// physics' update (0x8218A138) keeps `|v - v_last|²` at +0x14C (v
+    /// from vfunc +0x4C, v_last at +0x140), which its vfunc +0x68
+    /// (0x82188A78) answers and the exit kind (0x822A2B60) tests.
+    pub fn vehicle_jolt(&self, id: VehicleId) -> f32 {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map_or(0.0, |v| v.jolt)
+    }
+
+    /// Vehicle `id`'s velocity one 360 update ago (the older of its
+    /// history's two, before any jolt [`vehicle_jolt`](Self::vehicle_jolt)
+    /// measures): the +0x140 the car physics keeps (0x8218A138), which its
+    /// crash ejection hands its riders.
+    pub fn vehicle_velocity_pre_jolt(&self, id: VehicleId) -> Vec3 {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .and_then(|v| v.history.map(|h| h[1]))
+            .unwrap_or(Vec3::ZERO)
+    }
+
     pub fn vehicle_velocity_before(&self, id: VehicleId) -> Vec3 {
         self.vehicles
             .get(id.0)
@@ -6439,6 +6505,21 @@ impl Physics {
     /// Sets a vehicle's velocity, m/s (as it was before something it hit
     /// gave way).
     pub fn set_vehicle_velocity(&mut self, id: VehicleId, velocity: Vec3) {
+        let Some(v) = self.vehicles.get_mut(id.0).and_then(Option::as_mut) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
+            body.set_linvel(vector(velocity), true);
+        }
+        // Set, not driven into: no jolt ([`Physics::vehicle_jolt`]).
+        v.history = None;
+        v.jolt = 0.0;
+    }
+
+    /// Holds a vehicle at `velocity`, m/s, keeping its velocity history:
+    /// a run-up for the offscreen checks, so a crash after it still counts
+    /// as a jolt ([`vehicle_jolt`](Self::vehicle_jolt)).
+    pub fn hold_vehicle_velocity(&mut self, id: VehicleId, velocity: Vec3) {
         let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
             return;
         };
@@ -6974,6 +7055,53 @@ impl Physics {
                 .map(|b| vec3(b.linvel()).length())
                 .fold(0.0, f32::max),
         )
+    }
+
+    /// Each limb's speed, m/s, and whether it touches anything (for
+    /// tracing what keeps a limp body from lying still).
+    /// What each touches: `v` a vehicle, `s` another limb of the same
+    /// body, `g` anything else (the ground, a wall), empty nothing.
+    pub fn ragdoll_limb_speeds(&self, id: RagdollId) -> Vec<(usize, f32, String)> {
+        let Some(doll) = self.ragdolls.get(id.0).and_then(Option::as_ref) else {
+            return Vec::new();
+        };
+        let chassis: Vec<_> = self
+            .vehicles
+            .iter()
+            .flatten()
+            .map(|v| v.controller.chassis)
+            .collect();
+        let own: Vec<_> = doll.bodies.iter().flatten().copied().collect();
+        doll.bodies
+            .iter()
+            .enumerate()
+            .filter_map(|(k, h)| {
+                let b = self.world.bodies.get((*h)?)?;
+                let mut what = String::new();
+                for &c in b.colliders() {
+                    for p in self.world.narrow_phase.contact_pairs_with(c) {
+                        if !p.has_any_active_contact() {
+                            continue;
+                        }
+                        let other = if p.collider1 == c {
+                            p.collider2
+                        } else {
+                            p.collider1
+                        };
+                        let parent = self.world.colliders.get(other).and_then(|o| o.parent());
+                        let tag = match parent {
+                            Some(q) if chassis.contains(&q) => 'v',
+                            Some(q) if own.contains(&q) => 's',
+                            _ => 'g',
+                        };
+                        if !what.contains(tag) {
+                            what.push(tag);
+                        }
+                    }
+                }
+                Some((k, vec3(b.linvel()).length(), what))
+            })
+            .collect()
     }
 
     /// Shoves every limb of a ragdoll by `velocity` (m/s).
@@ -7753,6 +7881,17 @@ impl Physics {
         if !movement.grounded && vertical > 0.0 && moved.y < desired.y * 0.5 {
             character.velocity.y = 0.0;
         }
+    }
+}
+
+/// A template's `PhysicsPropertyGravityScaler` as the 360 applies it to a
+/// prop's bodies: clamped to [-10, 10] (0x821831B0 with 0x82DE8C30 and
+/// 0x820BAEEC); not a number reads 1.
+pub fn prop_gravity_scale(scale: f32) -> f32 {
+    if scale.is_finite() {
+        scale.clamp(-10.0, 10.0)
+    } else {
+        1.0
     }
 }
 
@@ -8726,6 +8865,33 @@ mod tests {
     }
 
     const DT: f32 = 1.0 / 60.0;
+
+    // A prop's body falls at its template's gravity scale times the
+    // world's 9.0 (OilCon020's gun box, 3.5: 31.5 m/s^2; its carbine,
+    // 1.5: 13.5), clamped to +-10 as the 360 clamps it; one with none
+    // falls at the world's.
+    #[test]
+    fn a_prop_body_falls_by_its_templates_gravity_scale() {
+        assert_eq!(prop_gravity_scale(3.5), 3.5);
+        assert_eq!(prop_gravity_scale(25.0), 10.0);
+        assert_eq!(prop_gravity_scale(-25.0), -10.0);
+        assert_eq!(prop_gravity_scale(f32::NAN), 1.0);
+        let mut p = Physics::new();
+        let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.25), 28.0);
+        let at = |x: f32| Mat4::from_translation(Vec3::new(x, 500.0, 0.0));
+        let plain = p.add_debris(&piece, at(0.0), Vec3::ZERO, Vec3::ZERO);
+        let carbine = p.add_debris(&piece, at(10.0), Vec3::ZERO, Vec3::ZERO);
+        let gunbox = p.add_cargo(&piece, at(20.0), Vec3::ZERO);
+        p.set_debris_gravity(carbine, 1.5);
+        p.set_debris_gravity(gunbox, 3.5);
+        for _ in 0..30 {
+            p.step(DT);
+        }
+        let fall = |id| -p.debris_velocity(id).unwrap().0.y / (30.0 * DT);
+        assert!((fall(plain) - WORLD_GRAVITY).abs() < 0.2, "{}", fall(plain));
+        assert!((fall(carbine) - 13.5).abs() < 0.3, "{}", fall(carbine));
+        assert!((fall(gunbox) - 31.5).abs() < 0.6, "{}", fall(gunbox));
+    }
 
     // The 360's rigid push tops speed up rather than adding to it (Xenia
     // phys5, a Phoenix's death): rising at 9.094 m/s, the frag's push

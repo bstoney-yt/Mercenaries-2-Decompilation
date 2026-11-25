@@ -1880,6 +1880,11 @@ pub struct Combat {
     /// The scripts made her invincible (while the screen fades, at the
     /// fanfare): nothing hurts her.
     pub invincible: bool,
+    /// Knocked down: lying limp until she gets up ([`KnockedHer`]).
+    pub knocked: Option<KnockedHer>,
+    /// Her template's `TossGetupSeconds`
+    /// ([`m2_engine::melee::TOSS_GETUP_SECONDS`] without one).
+    pub toss_getup: f32,
     /// Vehicles that ran into her, and the health they took.
     pub run_overs: (u32, f32),
     /// The scripts keep her from dying (`Player.SetHealthClamp`): her
@@ -2386,6 +2391,8 @@ impl Default for Combat {
             weapon: Weapon::Rifle,
             down: 0.0,
             invincible: false,
+            knocked: None,
+            toss_getup: m2_engine::melee::TOSS_GETUP_SECONDS,
             run_overs: (0, 0.0),
             health_clamp: false,
             survival: false,
@@ -3500,6 +3507,7 @@ impl Combat {
         {
             self.wreck(f.physics, v, i);
         }
+        self.knocked_step(f, dt);
         // Up again (revived, respawned, or put on her feet by a script):
         // her limp body goes. The state table's `Resurrect` leads from
         // `Die` and `Dead` straight to `Upright` `Idle`.
@@ -4559,6 +4567,117 @@ impl Combat {
             self.run_overs.0 += 1;
             self.run_overs.1 += lost;
             eprintln!("run over: a vehicle ran into her for {damage:.1} ({lost:.1} health lost)");
+            // No knockdown for her: the 360's knockdown on a vehicle's hit
+            // (0x82422480) is for those without a player record (0x8222C3E8
+            // on 0x83657FA8), and the stagger picker gives a player none
+            // for a direct hit that is not a melee bash (0x824220B0).
+        }
+    }
+
+    /// Knocks her down for `seconds` (0x82423848's time down): the state
+    /// table's `KnockDown` and `KnockedDown` `Idle` are of the mode `FULL`,
+    /// so she goes limp where she stands and lies, her controls dropped,
+    /// until [`KnockedHer::stands`]. Not while down already, nor seated.
+    pub fn knock_her_down(&mut self, f: &mut Field<'_>, seconds: f32) {
+        if f.player.down || f.player.driving.is_some() || f.player.seated || self.hp <= 0.0 {
+            return;
+        }
+        let body = f.player.model_matrix();
+        let Some((_, rig)) = &mut f.player.model else {
+            return;
+        };
+        rig.animator.set_upper(None);
+        rig.two_handed = false;
+        let (nodes, _) = rig.posed();
+        let world: Vec<Mat4> = nodes.iter().map(|m| body * *m).collect();
+        let id = f.physics.add_ragdoll_named(
+            &rig.skeleton.name_hashes,
+            &rig.skeleton.parents,
+            &world,
+            f.player
+                .launch
+                .take()
+                .unwrap_or(f.player.character.velocity),
+        );
+        f.player.ragdoll = Some(id);
+        f.player.down = true;
+        f.player.aiming = false;
+        eprintln!("knockdown: she is down for {seconds:.1} s");
+        self.knocked = Some(KnockedHer {
+            seconds,
+            ..KnockedHer::default()
+        });
+    }
+
+    /// A step of her knockdown: counting her time down and how her limp
+    /// body lies; up when [`KnockedHer::stands`], where the body lay,
+    /// facing along it.
+    fn knocked_step(&mut self, f: &mut Field<'_>, dt: f32) {
+        if f.player.tossed {
+            f.player.tossed = false;
+            let r = self.knock_rng.unit();
+            let seconds =
+                m2_engine::melee::knockdown_seconds(self.toss_getup, HER_PLAYER_RECORD, r);
+            self.knock_her_down(f, seconds);
+        }
+        let Some(k) = &mut self.knocked else {
+            return;
+        };
+        // Getting up: her controls back as the clip ends.
+        if let Some(left) = &mut k.rising {
+            *left -= dt;
+            if *left <= 0.0 {
+                self.knocked = None;
+                f.player.down = false;
+                eprintln!("knockdown: she is up");
+            }
+            return;
+        }
+        let Some(id) = f.player.ragdoll else {
+            self.knocked = None;
+            return;
+        };
+        k.step(crate::npc::limp_root(f.physics, id), dt);
+        if !k.stands() {
+            return;
+        }
+        let nodes = f.physics.ragdoll_nodes(id);
+        if let Some(at) = nodes.as_deref().and_then(crate::npc::limp_middle) {
+            let from = at + Vec3::Y;
+            let y = f
+                .physics
+                .cast_ray(from, -Vec3::Y, 6.0)
+                .map_or(f.player.character.position.y, |(d, _)| from.y - d + 0.05);
+            f.player.character.position = Vec3::new(at.x, y, at.z);
+            f.player.character.velocity = Vec3::ZERO;
+        }
+        if let (Some(n), Some((_, rig))) = (nodes.as_deref(), &f.player.model)
+            && let Some(yaw) = crate::npc::getup_yaw(n, &rig.skeleton.name_hashes)
+        {
+            f.player.facing = yaw;
+        }
+        f.physics.remove_ragdoll(id);
+        f.player.ragdoll = None;
+        // `Stand` leads to `KnockedDown` `Getup`, an action with a clip
+        // (mode `NONE`): her rig's get-up clip, snapped into, her controls
+        // held until it ends; without one she is up at once.
+        let clip = f.player.model.as_mut().and_then(|(_, rig)| {
+            let c = crate::npc::FightClips::find(rig).getup?;
+            rig.animator
+                .play_action(c, true, m2_engine::blend::action::GETUP);
+            Some(rig.clips[c].clip.header.duration)
+        });
+        eprintln!("knockdown: she gets up ({:.2} s clip)", clip.unwrap_or(0.0));
+        match clip {
+            Some(seconds) if seconds > 0.0 => {
+                if let Some(k) = &mut self.knocked {
+                    k.rising = Some(seconds);
+                }
+            }
+            _ => {
+                self.knocked = None;
+                f.player.down = false;
+            }
         }
     }
 
@@ -4709,7 +4828,10 @@ impl Combat {
             // `InVehicle` `Die` (ragdoll mode `NONE`), then `Dead`: she
             // stays in the seat, animated, playing the seat's own clips
             // ([`crate::hijack::seated_death`]).
-            let on_foot = f.player.driving.is_none() && !f.player.seated;
+            // Knocked down, she lies limp already: the same body dies.
+            self.knocked = None;
+            let on_foot =
+                f.player.driving.is_none() && !f.player.seated && f.player.ragdoll.is_none();
             let body = f.player.model_matrix();
             if let Some((_, rig)) = &mut f.player.model {
                 rig.animator.set_upper(None);
@@ -7762,6 +7884,51 @@ fn arc_clear(physics: &Physics, from: Vec3, velocity: Vec3, to: Vec3, gravity: f
     false
 }
 
+/// Whether her knockdowns take a player's time down
+/// ([`m2_engine::melee::PLAYER_KNOCKDOWN_SECONDS`], 0.5 s spread a fifth
+/// either way) rather than the knockdown's own (5 s run over,
+/// `TossGetupSeconds` tossed): 0x82423848 halves it for a person with a
+/// player record (table 0x83657FA8; see
+/// [`m2_engine::melee::knockdown_seconds`]). The one place her time down
+/// is decided.
+pub const HER_PLAYER_RECORD: bool = true;
+
+/// Her knockdown: her time down (0x82423848, the human state record's
+/// +0x38) and how her limp body has lain.
+///
+/// From the 360 code (0x8225CAE0, for a person in `KnockedDown` `Idle`):
+/// `Stand` is posted once she has been down longer than her time down
+/// and, her body being limp (kind 0xC), it has lain still over 0.5 s or
+/// been limp over 19 s, kept as for the people by the limp body's update
+/// 0x82190470 ([`crate::npc::LimpTimers`]: still is the body staying
+/// within 0.1 m of where it settled). Inferred: her time counts from the
+/// knockdown (the fall's own moment is not separated). She
+/// rises where the body lay, into her rig's `KnockedDown` `Getup` clip
+/// (the on-foot tables' handle ade601a9, clip 0xAEB6C9BD; from samples),
+/// as the people do.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct KnockedHer {
+    pub seconds: f32,
+    pub down_for: f32,
+    pub body: crate::npc::LimpTimers,
+    /// Getting up: seconds of the get-up clip left.
+    pub rising: Option<f32>,
+}
+
+impl KnockedHer {
+    /// A step of `dt` with her limp body's root at `at` (None: not
+    /// known).
+    pub fn step(&mut self, at: Option<Vec3>, dt: f32) {
+        self.down_for += dt;
+        self.body.step(at, dt);
+    }
+
+    /// Whether she gets up now (0x8225CAE0).
+    pub fn stands(&self) -> bool {
+        self.down_for > self.seconds && self.body.settled()
+    }
+}
+
 /// The velocity at `speed` that lobs a round furthest along `way`: 45
 /// degrees up.
 fn farthest(way: Vec3, speed: f32) -> Vec3 {
@@ -8009,6 +8176,48 @@ pub fn survival_check() -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Knocked down for 5 s, she stands once that is past and her body
+    /// has lain still half a second; tumbling, not before 19 s limp.
+    #[test]
+    fn she_gets_up_after_her_time_down_once_still() {
+        use super::KnockedHer;
+        let mut k = KnockedHer {
+            seconds: 5.0,
+            ..KnockedHer::default()
+        };
+        for _ in 0..50 {
+            k.step(Some(Vec3::ZERO), 0.1);
+        }
+        assert!(!k.stands(), "{k:?}");
+        k.step(Some(Vec3::ZERO), 0.11);
+        assert!(k.stands());
+        // Rolling 0.1 m a step: never still, up only past 19 s limp.
+        let mut rolling = KnockedHer {
+            seconds: 5.0,
+            ..KnockedHer::default()
+        };
+        let mut x = 0.0;
+        for _ in 0..189 {
+            x += 0.1;
+            rolling.step(Some(Vec3::X * x), 0.1);
+        }
+        assert!(!rolling.stands());
+        rolling.step(Some(Vec3::X * (x + 0.1)), 0.2);
+        assert!(rolling.stands());
+        // A body lying put while a limb swings (0x82190470 reads only the
+        // body's place): it drifts 5 cm about where it settled, and is
+        // still.
+        let mut twitching = KnockedHer {
+            seconds: 1.0,
+            ..KnockedHer::default()
+        };
+        for i in 0..20 {
+            let wobble = if i % 2 == 0 { 0.05 } else { -0.04 };
+            twitching.step(Some(Vec3::new(wobble, 0.0, 0.0)), 0.1);
+        }
+        assert!(twitching.stands(), "{twitching:?}");
+    }
+
     /// A template's blast for the tests: 9 m, 100 at its heart falling
     /// to nothing at its edge, `Explosion`, a push of 300.
     fn test_blast() -> Blast {
