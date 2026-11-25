@@ -427,6 +427,7 @@ impl Hud {
             let was_up = screen.showing();
             let black = info.mission.as_ref().map_or(0.0, |m| m.black);
             screen.update(info.loading, black, input.time.unwrap_or(0.0));
+            crate::warmup::screen(screen.showing());
             let counter = screen.cycle.counter();
             if self.profile && counter != config.options.loading_hint && !screen.showing() && was_up
             {

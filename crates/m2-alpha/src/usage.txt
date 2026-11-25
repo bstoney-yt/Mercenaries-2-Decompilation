@@ -233,6 +233,16 @@ m2-alpha [options]
                          must make the render pipelines it meets (logged as
                          pipelines: +N (total M) in X ms); prints
                          pipelines-check: PASS or FAIL, exits 1 on FAIL
+  --pipeline-warm-check  check: with --screenshot and --mission, no render
+                         pipeline may be built by a draw once play has
+                         begun (loading screen closed or controls on) with
+                         the screen down; prints pipeline-warm-check: PASS
+                         or FAIL (with the cache cold or warm), exits 1 on
+                         FAIL. Run twice: the first run writes the list
+  --pipeline-cache-dir <dir>
+                         keep the pipelines' list (pipelines.txt) and the
+                         driver's pipeline cache here instead of beside the
+                         settings file
   --survival-check       check: her health clamp and survival mode on the
                          game's own code (clamp, a crusher's hit, the cut);
                          PASS/FAIL, then exit

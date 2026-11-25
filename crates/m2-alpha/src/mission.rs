@@ -4149,6 +4149,7 @@ impl MissionLink {
                     },
                     Command::InputEnabled(on) => {
                         eprintln!("mission: controls {}", if *on { "on" } else { "off" });
+                        crate::warmup::controls(*on);
                         game.input_locked = !on;
                     }
                     Command::HealthClamp(on) => {

@@ -29,6 +29,7 @@ pub mod fasthash;
 pub mod gpu;
 pub mod key;
 pub mod null;
+pub mod pipeline_spec;
 pub mod pipeline_work;
 pub mod queue;
 pub mod texture;
@@ -45,6 +46,7 @@ pub use buffer::{
 };
 pub use key::{Layer, MaterialId, SortKey};
 pub use null::{Command, NullBackend, RecordingBackend};
+pub use pipeline_spec::{PipelineBlend, PipelineSpec};
 pub use pipeline_work::PipelineWork;
 pub use queue::{DrawQueue, Primitive, QueueError, SubmitStats};
 pub use texture::{

@@ -664,6 +664,27 @@ pub trait RenderBackend {
 
     /// Closes the frame and presents it.
     fn end_frame(&mut self) -> Result<(), BackendError>;
+
+    /// Builds `spec`'s pipeline now, ahead of the draws that need it,
+    /// rather than at the first of them: true when it was built, false
+    /// when it was already (or this backend builds none).
+    ///
+    /// Port-side and invented (see [`crate::pipeline_spec`]): it changes
+    /// when a pipeline is built, never what it draws.
+    fn prepare_pipeline(&mut self, spec: &crate::PipelineSpec) -> Result<bool, BackendError> {
+        let _ = spec;
+        Ok(false)
+    }
+
+    /// [`prepare_pipeline`](Self::prepare_pipeline) for each of `specs`:
+    /// how many were built.
+    fn prepare_pipelines(&mut self, specs: &[crate::PipelineSpec]) -> Result<usize, BackendError> {
+        let mut built = 0;
+        for spec in specs {
+            built += usize::from(self.prepare_pipeline(spec)?);
+        }
+        Ok(built)
+    }
 }
 
 #[cfg(test)]
