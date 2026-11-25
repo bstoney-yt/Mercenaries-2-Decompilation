@@ -6149,13 +6149,12 @@ impl Fleet {
             })
             .filter(|(_, g, models)| !ai_flown(&w, *g, models))
             // One of the layers' patrol boats the traffic already put out
-            // ([`crate::traffic`]) is that one.
+            // ([`crate::traffic`]), or road traffic, is that one: left to it.
             .filter(|(_, g, _)| {
-                !game
-                    .scene
-                    .vehicles
-                    .iter()
-                    .any(|v| v.spot.is_some_and(|(e, _, _)| e == *g))
+                !game.scene.vehicles.iter().any(|v| {
+                    v.spot.is_some_and(|(e, _, _)| e == *g)
+                        && (game.traffic.owns(*g) || game.roads.owns(v))
+                })
             })
             .collect();
         // Those the scripts still have in play near her count against the
@@ -6184,7 +6183,29 @@ impl Fleet {
             if !crew.is_empty() {
                 game.scene.mission_crews.insert(g, crew);
             }
-            game.scene.load_vehicle(g, models);
+            // One vehicle per entity: the layers' own, placed or loading,
+            // is the scripts' (q766: each of B, C and E's cars was loaded a
+            // second time by the scripts and the two shoved apart).
+            game.scene.script_owned.insert(g);
+            match crate::scene::scripts_find(&game.scene.vehicles, |e| game.layers_asked(e), g) {
+                crate::scene::ScriptsFind::Layers(i) => {
+                    let crew = game.scene.mission_crews.get(&g).cloned();
+                    let ruin = game.scene.ruins.contains(&g);
+                    let v = &mut game.scene.vehicles[i];
+                    v.take_for_scripts(g, crew.as_ref(), ruin);
+                    eprintln!(
+                        "mission vehicle {g:#x}: the layers' {}, taken over",
+                        v.spec.label
+                    );
+                }
+                crate::scene::ScriptsFind::LayersLoading => {
+                    game.scene.adopt_on_load.insert(g);
+                    eprintln!(
+                        "mission vehicle {g:#x}: the layers' still loading, theirs as it loads"
+                    );
+                }
+                crate::scene::ScriptsFind::Nothing => game.scene.load_vehicle(g, models),
+            }
         }
     }
 }

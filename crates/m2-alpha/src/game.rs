@@ -753,6 +753,12 @@ impl Game {
         })
     }
 
+    /// Whether the layers have asked for entity `entity`'s vehicle
+    /// (placed, or still loading).
+    pub(crate) fn layers_asked(&self, entity: u32) -> bool {
+        self.fetched.contains(&entity)
+    }
+
     /// Island vehicles asked for that have not been placed yet.
     pub fn island_vehicles_loading(&self) -> bool {
         if self.startup.as_ref().is_some_and(Startup::loading) {
@@ -889,6 +895,8 @@ impl Game {
                 rotation: e.rotation,
             }))
             .filter(|t| !self.fetched.contains(&t.entity) && t.at.y > HIDDEN_BELOW)
+            // One the scripts have made is theirs, not built twice.
+            .filter(|t| crate::scene::layers_may_build(&scene.script_owned, t.entity))
             .filter_map(|t| {
                 let d = t.at.distance(near);
                 (d <= VEHICLE_REACH).then_some((d, t))
