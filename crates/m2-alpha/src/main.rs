@@ -9874,6 +9874,12 @@ const XENIA_DEATH_UP: (f32, f32) = (9.0, 9.2);
 /// their dt and speed.
 const WRECK_STEPS_LOGGED: usize = 8;
 
+/// Xenia's counter, seconds: the cadence `--wreck-blast-check` judges the
+/// flight at. Assumed 1/30 s (Xenia's runs' 0.30 m/s of gravity a counter)
+/// until the massprobe reads the frame and physics dt (the recorded
+/// finding: one Havok step a frame, at the frame's dt).
+const XENIA_COUNTER: f32 = 1.0 / 30.0;
+
 /// The fall it flies under after (0.30 m/s a 1/30 s step, phys6).
 const XENIA_WRECK_G: f32 = 9.0;
 /// How near that a fitted fall must be.
@@ -10117,7 +10123,17 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
             .zip(her_from)
             .map_or(0.0, |(a, b)| a.with_y(0.0).distance(b.with_y(0.0)))
     );
-    let flew = wreck_flight_verdict(&flight, tick, top, landed);
+    // Judged at Xenia's cadence: her counters are 1/30 s (assumed, until
+    // the massprobe's frame and physics dt reads land: one Havok step a
+    // frame at the frame's dt), the port steps 1/60 s; so every
+    // `per`-th port step is one counter, and gravity is undone over 1/30.
+    let per = ((XENIA_COUNTER / tick).round() as usize).max(1);
+    let counters: Vec<(f32, Vec3)> = flight.iter().skip(per - 1).step_by(per).copied().collect();
+    eprintln!(
+        "wreck-blast-check: judged at Xenia's {XENIA_COUNTER:.4} s counters: every {per} port steps of {tick:.4} s ({} counters)",
+        counters.len()
+    );
+    let flew = wreck_flight_verdict(&counters, per as f32 * tick, top, landed);
     for line in &flew.lines {
         eprintln!("wreck-blast-check: {line}");
     }
