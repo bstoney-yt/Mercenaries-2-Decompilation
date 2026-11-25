@@ -9637,6 +9637,7 @@ fn cargo_check(game: &mut Game, tick: f32) {
     };
     let start = local(game);
     eprintln!("cargo-check: the {label}, {} crates aboard", start.len());
+    cargo_ground_slope(game, i, id, &label);
     let yaw = |game: &Game| {
         game.scene
             .world
@@ -9682,6 +9683,12 @@ fn cargo_check(game: &mut Game, tick: f32) {
                 },
                 tick,
             );
+            // Log only: the first steps after the move, each with its
+            // speed and what the truck's body and wheels touch (q680
+            // ee4254c5: it drifted at -2.0 m/s while standing).
+            if phase == "standing" && t < CARGO_FIRST_STEPS {
+                cargo_step_log(game, i, id, t + 1);
+            }
             if t % every == 0 {
                 let now = local(game);
                 let shifts: Vec<String> = now
@@ -9745,6 +9752,82 @@ fn cargo_check(game: &mut Game, tick: f32) {
         ),
         Err(why) => eprintln!("cargo-check: FAIL {why}"),
     }
+}
+
+/// How many steps after the move `--cargo-check` logs one by one.
+const CARGO_FIRST_STEPS: u32 = 10;
+
+/// Logs `--cargo-check`'s truck `id` (vehicle `i`) after standing step
+/// `n`: its speed and spin, its wheels down, each spring's squeeze, what
+/// its body touches, and the speed of each crate still aboard. Log only.
+fn cargo_step_log(game: &Game, i: usize, id: m2_engine::VehicleId, n: u32) {
+    let Some(world) = game.scene.world.as_ref() else {
+        return;
+    };
+    let physics = &world.physics;
+    let (down, wheels) = physics.vehicle_contacts(id);
+    let squeeze: Vec<String> = physics
+        .vehicle_suspension(id)
+        .iter()
+        .map(|s| format!("{s:.3}"))
+        .collect();
+    let touching: Vec<String> = physics
+        .vehicle_touching(id)
+        .iter()
+        .map(|(k, at, _)| format!("{k:?} at {at:.2}"))
+        .collect();
+    let crates: Vec<String> = game
+        .scene
+        .props
+        .cargo_pieces(i)
+        .into_iter()
+        .filter_map(|d| Some(format!("{:.2}", physics.debris_velocity(d)?.0)))
+        .collect();
+    eprintln!(
+        "cargo-check: step {n}: v {:.3}, spin {:.3}, wheels down {down} of {wheels}, springs squeezed [{}] m, touching [{}], crates [{}]",
+        physics.vehicle_velocity(id),
+        physics.vehicle_spin(id),
+        squeeze.join(", "),
+        touching.join("; "),
+        crates.join("; ")
+    );
+}
+
+/// Logs the ground under `--cargo-check`'s truck `id` (vehicle `i`) where
+/// it now stands: the height under each corner of its hull's footprint,
+/// and the ground's slope along it and across it, degrees. Log only.
+fn cargo_ground_slope(game: &Game, i: usize, id: m2_engine::VehicleId, label: &str) {
+    use m2_math::glam::Vec3;
+    let Some(world) = game.scene.world.as_ref() else {
+        return;
+    };
+    let physics = &world.physics;
+    let Some(m) = physics.vehicle_transform(id) else {
+        return;
+    };
+    let (lo, hi) = game.scene.vehicles[i].spec.hull;
+    // Front left, front right, back left, back right (model +Z ahead).
+    let corners = [(lo.x, hi.z), (hi.x, hi.z), (lo.x, lo.z), (hi.x, lo.z)]
+        .map(|(x, z)| m.transform_point3(Vec3::new(x, lo.y, z)));
+    let ground = corners.map(|c| {
+        physics
+            .cast_ray(c + Vec3::Y * 20.0, Vec3::NEG_Y, 60.0)
+            .map(|(d, _)| c.y + 20.0 - d)
+    });
+    let [Some(fl), Some(fr), Some(bl), Some(br)] = ground else {
+        eprintln!(
+            "cargo-check: ground under the {label}'s corners: {ground:.2?} (one or more with none)"
+        );
+        return;
+    };
+    let length = corners[0].with_y(0.0).distance(corners[2].with_y(0.0));
+    let width = corners[0].with_y(0.0).distance(corners[1].with_y(0.0));
+    let along = (((fl + fr) - (bl + br)) * 0.5).atan2(length).to_degrees();
+    let across = (((fr + br) - (fl + bl)) * 0.5).atan2(width).to_degrees();
+    eprintln!(
+        "cargo-check: ground under the {label}'s corners (front left, front right, back left, back right) {fl:.2}, {fr:.2}, {bl:.2}, {br:.2}: slope {along:+.1} deg along it (up ahead +), {across:+.1} deg across it (up to the right +); hull bottom corners at {:.2}, {:.2}, {:.2}, {:.2}",
+        corners[0].y, corners[1].y, corners[2].y, corners[3].y
+    );
 }
 
 /// How long `--cargo-check`'s straight must be, level and open, metres:
