@@ -3820,10 +3820,12 @@ impl Combat {
         self.fly(f, dt);
         self.burn_vehicles(f, dt);
         self.smoke_wrecks(f, dt);
-        // What this step's wrecks started goes off in this step too, after
-        // their launch (as above): pushes topped up against the launched
-        // speed, so level only where they push less than it rises.
-        self.part_blasts(f);
+        // What this step's wrecks started goes off at the start of the
+        // next step's actions (above), after that step's physics: Xenia
+        // phys8a-c, the explosions' level-only write lands a frame after
+        // the launch, deferred while the world is locked and flushed
+        // after its step (0x82644F18). q728p: fired here too, in the
+        // death step, they landed with the launch.
     }
 
     /// Where shots start and the way the crosshair points: along the

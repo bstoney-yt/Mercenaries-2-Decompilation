@@ -10345,10 +10345,8 @@ fn wreck_at_spot(game: &mut Game, id: m2_engine::VehicleId, label: &str, tick: f
             break;
         }
     }
-    let Some(base) = ground_at(game, x, z) else {
-        eprintln!("wreck-blast-check: FAIL the ground at the wreck spot went away");
-        return false;
-    };
+    // The ground as read before the car stood there (a ray at the spot
+    // now meets its roof: q728p read the paths 1.5 m below it).
     for h in 0..8 {
         let way = Quat::from_rotation_y(h as f32 * std::f32::consts::FRAC_PI_4) * Vec3::Z;
         let heights: Vec<String> = [4.0, 8.0, 12.0, 16.0]
@@ -10775,8 +10773,14 @@ fn wreck_flight_verdict(
             launched.length()
         ));
     }
-    if launch.is_none() {
-        fails.push("no launch logged".to_owned());
+    match launch {
+        // The death step carries the launch alone (q728p: the explosions
+        // landed in it too, z 1.94 -> 7.50).
+        Some(l) if (death - l).length() > 0.05 => fails.push(format!(
+            "death step {death:.3} carries more than its launch {l:.3}: the explosions landed in it, not the step after"
+        )),
+        Some(_) => {}
+        None => fails.push("no launch logged".to_owned()),
     }
     // Its explosions, the step after (phys8a: the frame after the death
     // frame, deferred): level only, beside that step's gravity and what
@@ -14012,6 +14016,17 @@ mod tests {
             lift.fails.iter().any(|f| f.contains("not level only")),
             "{:?}",
             lift.fails
+        );
+        // The explosions in the death step with the launch (q728p).
+        let mut early = flight.clone();
+        early[0].1 += Vec3::new(0.0, 0.0, 5.563);
+        let same = wreck_flight_verdict(&early, 5.1, Some(13.0), Some(launched));
+        assert!(
+            same.fails
+                .iter()
+                .any(|f| f.contains("carries more than its launch")),
+            "{:?}",
+            same.fails
         );
         let mut still = flight.clone();
         still[1].1 = launched - Vec3::Y * 9.0 * dt;
