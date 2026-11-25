@@ -559,6 +559,9 @@ struct Options {
     /// `--parked-settle-check`: the layers' parked vehicles, placed as
     /// authored, keep to their authored pose ([`parked_settle_check`]).
     parked_settle_check: bool,
+    /// With `--parked-settle-check`: at least this many vehicles must be
+    /// judged here, or it fails (`--settle-least <n>`).
+    settle_least: usize,
     /// `--prop-limits-check`: what blasts throw, kept in check by the
     /// disposer, and hulls meeting loose pieces ([`prop_limits_check`]).
     prop_limits_check: bool,
@@ -989,6 +992,9 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--prop-bodies-check" => {
                 o.prop_bodies_check = true;
                 o.drive = true;
+            }
+            "--settle-least" => {
+                o.settle_least = value()?.parse().context("--settle-least expects a count")?;
             }
             "--parked-settle-check" => {
                 o.parked_settle_check = true;
@@ -8077,7 +8083,7 @@ fn drive_for_screenshot(
         return prop_bodies_check(backend, game, fov, aspect, tick);
     }
     if options.parked_settle_check {
-        return parked_settle_check(backend, game, fov, aspect, tick);
+        return parked_settle_check(backend, game, fov, aspect, tick, options.settle_least);
     }
     if options.prop_limits_check {
         return prop_limits_check(backend, game, fov, aspect, tick);
@@ -13931,6 +13937,7 @@ fn parked_settle_check(
     fov: f32,
     aspect: f32,
     tick: f32,
+    least: usize,
 ) -> anyhow::Result<()> {
     use m2_math::glam::{Quat, Vec3};
     use std::collections::HashMap;
@@ -14153,6 +14160,11 @@ fn parked_settle_check(
     );
     if judged.is_empty() {
         eprintln!("parked-settle-check: FAIL no parked vehicle placed as authored here");
+    } else if judged.len() < least {
+        eprintln!(
+            "parked-settle-check: FAIL {} judged here, not at least {least}",
+            judged.len()
+        );
     } else if failed.is_empty() {
         eprintln!("parked-settle-check: PASS {passed} parked vehicles kept their authored pose");
     } else {
