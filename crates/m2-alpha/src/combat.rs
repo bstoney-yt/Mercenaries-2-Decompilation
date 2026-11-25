@@ -6197,10 +6197,14 @@ impl Combat {
                 launch.length()
             );
         }
-        // Its body's destroyed state now, so the explosions it starts go
-        // off in this frame, after the launch (0x82152B68's action list
-        // runs the launch and the explosion actions in one pass, before
-        // the frame's physics: docs/fidelity/physics-frame.md).
+        // Its body's destroyed state now: the explosions it starts push it
+        // a step later ([`Self::part_blasts`] runs before this in the next
+        // step, after its physics). Xenia phys8a (counter c69, then c70):
+        // the launch lands at once in the death frame (world +0x84 and
+        // +0x80 both 0), the explosions' level-only write in the next
+        // frame while the world is locked (+0x84 = 1), flushed after its
+        // step as deferred pushes (0x82644F18). The rebuilt body takes the
+        // old one's speed first; the port keeps one body, so it keeps it.
         v.follow_health();
         self.wrecks.push((i, 0.0));
         self.remarks.push(Remark::Wreck);

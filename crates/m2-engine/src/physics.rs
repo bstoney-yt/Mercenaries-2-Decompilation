@@ -6422,6 +6422,15 @@ impl Physics {
                 };
                 insert_collider(&mut self.world, c, Some(chassis));
             }
+            // Its mass and motion kept, as told: the colliders' masses
+            // summed afresh. Rapier adds a collider's mass to its body's as
+            // it is attached but takes nothing off as one is removed until
+            // its next step, so the intact body's mass was counted twice
+            // (q728k: the Phoenix's 2000 kg read 4000 in the step it was
+            // wrecked, when its death frame's blasts push it).
+            if let Some(body) = self.world.bodies.get_mut(chassis) {
+                body.recompute_mass_properties_from_colliders(&self.world.colliders);
+            }
             return;
         }
         body.set_linear_damping(WRECK_DAMPING);
@@ -12102,6 +12111,39 @@ mod tests {
         assert_eq!(hull(&p), 0.0);
         p.step(DT);
         assert_eq!(hull(&p), CAR_TIPPED_FRICTION);
+    }
+
+    // A wreck's rebuilt body keeps its mass from the moment it is wrecked,
+    // not only after a step: the death frame's blasts push it by that mass
+    // (0x8215CBC8 sizes each by 0x8262C120). q728k: 2000 kg read 4000.
+    #[test]
+    fn a_wrecks_rebuilt_body_keeps_its_mass_at_once() {
+        let mut p = Physics::new();
+        let mut spec = car();
+        spec.tuning.mass = Some(2000.0);
+        let (lo, hi) = (Vec3::new(-0.9, 0.4, -2.0), Vec3::new(0.9, 1.4, 2.0));
+        let corners: Vec<Vec3> = (0..8)
+            .map(|k| {
+                Vec3::new(
+                    if k & 1 == 0 { lo.x } else { hi.x },
+                    if k & 2 == 0 { lo.y } else { hi.y },
+                    if k & 4 == 0 { lo.z } else { hi.z },
+                )
+            })
+            .collect();
+        spec.wreck = Some(crate::vehicle::WreckBody {
+            shapes: vec![corners.clone(), corners].into(),
+            material: BodyMaterial::COMMON,
+        });
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, 5.0, 0.0), 0.0);
+        p.step(DT);
+        assert!((p.vehicle_chassis_mass(id).unwrap() - 2000.0).abs() < 1.0);
+        p.wreck_vehicle(id);
+        let now = p.vehicle_chassis_mass(id).unwrap();
+        assert!((now - 2000.0).abs() < 1.0, "{now}");
+        p.step(DT);
+        let later = p.vehicle_chassis_mass(id).unwrap();
+        assert!((later - 2000.0).abs() < 1.0, "{later}");
     }
 
     #[test]
