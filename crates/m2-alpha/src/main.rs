@@ -563,6 +563,9 @@ struct Options {
     /// vehicles placed where they said must be judged, or it fails
     /// (`--settle-given <n>`).
     settle_given: usize,
+    /// With `--parked-settle-check`: at least this many vehicles must be
+    /// judged here, or it fails (`--settle-least <n>`).
+    settle_least: usize,
     /// `--prop-limits-check`: what blasts throw, kept in check by the
     /// disposer, and hulls meeting loose pieces ([`prop_limits_check`]).
     prop_limits_check: bool,
@@ -993,6 +996,9 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--prop-bodies-check" => {
                 o.prop_bodies_check = true;
                 o.drive = true;
+            }
+            "--settle-least" => {
+                o.settle_least = value()?.parse().context("--settle-least expects a count")?;
             }
             "--parked-settle-check" => {
                 o.parked_settle_check = true;
@@ -8084,7 +8090,15 @@ fn drive_for_screenshot(
         return prop_bodies_check(backend, game, fov, aspect, tick);
     }
     if options.parked_settle_check {
-        return parked_settle_check(backend, game, fov, aspect, tick, options.settle_given);
+        return parked_settle_check(
+            backend,
+            game,
+            fov,
+            aspect,
+            tick,
+            options.settle_given,
+            options.settle_least,
+        );
     }
     if options.prop_limits_check {
         return prop_limits_check(backend, game, fov, aspect, tick);
@@ -12983,19 +12997,19 @@ impl ApplicationHandler for App {
 mod tests {
     use super::*;
 
-    // A boat is judged afloat, upright and near where it was authored,
-    // not at its authored height (q766 B).
+    // A boat may drop and tilt as it settles (the 360's moored boats
+    // dropped up to 2.33 m, boat1) but not move level more than a few
+    // centimetres, nor capsize.
     #[test]
-    fn a_boat_settles_afloat_upright_and_near_its_place() {
+    fn a_boat_settles_where_it_was_authored_however_far_it_drops() {
         use m2_math::glam::Vec3;
-        let authored = Vec3::new(10.0, 1.2, 5.0);
-        let afloat = Some(-0.3);
-        let here = Vec3::new(11.5, -0.4, 5.0);
-        assert!(boat_settled(here, authored, 0.99, afloat).is_ok());
-        assert!(boat_settled(here, authored, 0.5, afloat).is_err());
-        assert!(boat_settled(here, authored, 0.99, None).is_err());
-        assert!(boat_settled(Vec3::new(11.5, -2.0, 5.0), authored, 0.99, afloat).is_err());
-        assert!(boat_settled(Vec3::new(20.0, -0.3, 5.0), authored, 0.99, afloat).is_err());
+        let authored = Vec3::new(10.0, -31.713, 5.0);
+        let dropped = Vec3::new(10.01, -34.045, 5.0);
+        assert!(boat_settled(dropped, authored, 0.99,).is_ok());
+        // Tilted 7 degrees: still fine.
+        assert!(boat_settled(dropped, authored, 7f32.to_radians().cos()).is_ok());
+        assert!(boat_settled(dropped, authored, 0.2).is_err());
+        assert!(boat_settled(Vec3::new(10.3, -34.0, 5.0), authored, 0.99).is_err());
     }
 
     #[test]
@@ -13850,6 +13864,9 @@ const SETTLE_AFTER: f32 = 5.0;
 /// about a third more for other vehicles' suspension, and 5 degrees is
 /// well over its tilt.
 const SETTLE_MOST: (f32, f32, f32) = (0.35, 5.0, 0.05);
+/// Over how long before it is judged `--parked-settle-check` measures how
+/// fast a vehicle is moving, seconds.
+const SETTLE_STILL_OVER: f32 = 0.5;
 
 /// How long `--parked-settle-check` notes what each vehicle touches after
 /// it is placed, seconds, and the one whose every touch is logged as it
@@ -13885,39 +13902,37 @@ fn settle_touch_name(world: &m2_engine::World, key: Option<m2_engine::StaticKey>
     }
 }
 
-/// What `--parked-settle-check` allows a boat, by its own rule: metres
-/// level from its authored place, metres from the height it floats at,
-/// and the least up (its up axis's height). **Invented**: a boat is
-/// placed floating at its float depth, level ([`game::place`]), and rides
-/// the water from there, so its authored height and tilt don't apply
-/// (q766 B: four boats 0.67-2.33 m off their authored places).
-const BOAT_SETTLE: (f32, f32, f32) = (3.0, 0.5, 0.9);
+/// What `--parked-settle-check` allows a boat: metres it may move level
+/// from its authored place, and the least up (its up axis's height: not
+/// capsized). From Xenia's boat1 (OilCon020, 2026-11-25): the 360's moored
+/// boats appear at their authored transforms and drop and settle within
+/// about 7 s, then stay put. GunningBoat 0xFA47B dropped 0.906 m and
+/// drifted 2.2 cm in its last 20 s; the fishing boats 0xD5FC6, 0xD5FC4 and
+/// 0xD5FC7 dropped 0.765, 2.332 and 0.673 m, tilted 6-7 degrees, and moved
+/// under 1 cm level. So any drop and any tilt short of capsizing are
+/// allowed; level movement must stay within a few centimetres.
+const BOAT_SETTLE: (f32, f32) = (0.05, 0.5);
 
 /// A boat judged by [`BOAT_SETTLE`]: at `now`, authored at `authored`,
-/// `up` its up axis's height, `afloat` the height it floats at (`None`:
-/// no water here). In water, upright and near its authored place.
+/// `up` its up axis's height. It may drop and tilt as it settles; it must
+/// stay where it was authored, level, and not capsize.
 fn boat_settled(
     now: m2_math::glam::Vec3,
     authored: m2_math::glam::Vec3,
     up: f32,
-    afloat: Option<f32>,
 ) -> Result<(), String> {
-    let (level, depth, least_up) = BOAT_SETTLE;
-    let Some(afloat) = afloat else {
-        return Err("no water here".to_owned());
-    };
+    let (level, least_up) = BOAT_SETTLE;
     let off = now.with_y(0.0).distance(authored.with_y(0.0));
-    let sunk = (now.y - afloat).abs();
-    if sunk > depth {
+    let drop = authored.y - now.y;
+    if up < least_up {
         return Err(format!(
-            "{sunk:.2} m off the height it floats at ({afloat:.2}), not in the water"
+            "capsized (up {up:.2}); dropped {drop:+.2} m, {off:.3} m level"
         ));
     }
-    if up < least_up {
-        return Err(format!("not upright (up {up:.2})"));
-    }
     if off > level {
-        return Err(format!("{off:.2} m level from its authored place"));
+        return Err(format!(
+            "{off:.3} m level from its authored place (dropped {drop:+.2} m)"
+        ));
     }
     Ok(())
 }
@@ -13938,6 +13953,7 @@ fn parked_settle_check(
     aspect: f32,
     tick: f32,
     given_least: usize,
+    least: usize,
 ) -> anyhow::Result<()> {
     use m2_math::glam::{Quat, Vec3};
     use std::collections::HashMap;
@@ -13947,7 +13963,14 @@ fn parked_settle_check(
     #[allow(clippy::type_complexity)]
     let mut watched: HashMap<
         u32,
-        (Vec3, Quat, f32, String, std::collections::BTreeSet<String>),
+        (
+            Vec3,
+            Quat,
+            f32,
+            String,
+            std::collections::BTreeSet<String>,
+            Option<Vec3>,
+        ),
     > = HashMap::new();
     let (mut passed, mut failed) = (0usize, Vec::new());
     let mut judged = std::collections::HashSet::new();
@@ -13989,13 +14012,45 @@ fn parked_settle_check(
             } else {
                 v.spec.label.clone()
             };
+            // As it is placed: how far each corner of its hull's bottom is
+            // over what is under it (past its own bodies; negative: in it),
+            // to tell a hull put into the ground (q766 B: the Phoenix
+            // 0x10d5d8 flipped 178 deg touching only the terrain). Log only.
+            if let Some(m) =
+                v.id.and_then(|id| world.physics.vehicle_transform(id).zip(Some(id)))
+            {
+                let (m, id) = m;
+                let (lo, hi) = v.spec.hull;
+                let gaps: Vec<String> = [(lo.x, lo.z), (hi.x, lo.z), (lo.x, hi.z), (hi.x, hi.z)]
+                    .iter()
+                    .map(|&(x, z)| {
+                        let corner = m.transform_point3(Vec3::new(x, lo.y, z));
+                        world
+                            .physics
+                            .cast_ray_past(corner + Vec3::Y * 2.0, Vec3::NEG_Y, 6.0, id)
+                            .map_or("none".to_owned(), |(d, _)| format!("{:+.2}", d - 2.0))
+                    })
+                    .collect();
+                eprintln!(
+                    "parked-settle-check: {key:#x} {} placed: its hull's bottom corners over the ground [{}] m",
+                    v.spec.label,
+                    gaps.join(", ")
+                );
+            }
             watched.insert(
                 key,
-                (at, turn, 0.0, label, std::collections::BTreeSet::new()),
+                (
+                    at,
+                    turn,
+                    0.0,
+                    label,
+                    std::collections::BTreeSet::new(),
+                    None,
+                ),
             );
         }
         let mut done = Vec::new();
-        for (&entity, (at, turn, since, label, touched)) in &mut watched {
+        for (&entity, (at, turn, since, label, touched, mark)) in &mut watched {
             *since += tick;
             // What it touches as it is placed and over its first second
             // (log lines only; q766 B's Phoenix 0x10d5d8 flipped 152 deg
@@ -14022,6 +14077,20 @@ fn parked_settle_check(
                     );
                 }
                 touched.extend(now);
+            }
+            // Where it is half a second before it is judged: it is still
+            // if it has moved under SETTLE_MOST.2 m/s since.
+            if mark.is_none()
+                && *since >= SETTLE_AFTER - SETTLE_STILL_OVER
+                && let Some(id) = game
+                    .scene
+                    .vehicles
+                    .iter()
+                    .find(|v| v.spot.is_some_and(|s| s.0 == entity) || v.guid == Some(entity))
+                    .and_then(|v| v.id)
+                && let Some(m) = world.physics.vehicle_transform(id)
+            {
+                *mark = Some(m.w_axis.truncate());
             }
             if *since < SETTLE_AFTER {
                 continue;
@@ -14073,11 +14142,14 @@ fn parked_settle_check(
             // at its float depth), not at its authored height or tilt: it
             // is judged by its own rule.
             if v.spec.is_boat() {
-                let afloat = world
-                    .physics
-                    .water()
-                    .map(|w| w - m2_engine::physics::float_depth(&v.spec));
-                match boat_settled(now_at, *at, up, afloat) {
+                // Its offset split, level and down (boat1: the 360's drops
+                // were 0.67-2.33 m, its level movement under 1 cm).
+                eprintln!(
+                    "parked-settle-check: {entity:#x} {label} (a boat): {:.3} m level, dropped {:+.3} m, up {up:.2}",
+                    now_at.with_y(0.0).distance(at.with_y(0.0)),
+                    at.y - now_at.y
+                );
+                match boat_settled(now_at, *at, up) {
                     Ok(()) => passed += 1,
                     Err(why) => {
                         let line = format!(
@@ -14090,6 +14162,10 @@ fn parked_settle_check(
                 }
                 continue;
             }
+            // How fast it moved over the last half second (q766: one
+            // step's velocity read 0.06 m/s on every vehicle at rest).
+            let instant = speed;
+            let speed = mark.map_or(instant, |p| now_at.distance(p) / SETTLE_STILL_OVER);
             let ok = moved <= SETTLE_MOST.0
                 && turned <= SETTLE_MOST.1
                 && up > 0.5
@@ -14114,7 +14190,7 @@ fn parked_settle_check(
                         },
                     );
                 let line = format!(
-                    "{entity:#x} {label}: {moved:.2} m from its authored place, {turned:.1} deg turned, up {up:.2}, {speed:.2} m/s; {under}; touched in its first second: [{}]",
+                    "{entity:#x} {label}: {moved:.2} m from its authored place, {turned:.1} deg turned, up {up:.2}, {speed:.3} m/s over the last {SETTLE_STILL_OVER} s ({instant:.2} m/s this step); {under}; touched in its first second: [{}]",
                     touched.iter().cloned().collect::<Vec<_>>().join("; ")
                 );
                 eprintln!("parked-settle-check: off: {line}");
@@ -14139,6 +14215,11 @@ fn parked_settle_check(
     } else if given_judged < given_least {
         eprintln!(
             "parked-settle-check: FAIL {given_judged} of the scripts' vehicles placed where they said were judged, not at least {given_least}"
+        );
+    } else if judged.len() < least {
+        eprintln!(
+            "parked-settle-check: FAIL {} judged here, not at least {least}",
+            judged.len()
         );
     } else if failed.is_empty() {
         eprintln!("parked-settle-check: PASS {passed} parked vehicles kept their authored pose");
