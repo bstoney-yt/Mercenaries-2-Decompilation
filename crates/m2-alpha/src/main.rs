@@ -2855,7 +2855,7 @@ fn screenshot(
     let (w, h) = (config.window.width, config.window.height);
     let mut backend = WgpuBackend::headless(w, h)?;
     eprintln!("adapter: {:?}", backend.adapter_summary());
-    warmup::start(&mut backend);
+    warmup::start(&mut backend, true);
     let mut game = build_scene(
         &mut backend,
         install,
@@ -13227,7 +13227,7 @@ impl App {
             WgpuBackend::for_window(window.clone(), size.width, size.height, w.vsync)?;
         let adapter = backend.adapter_summary();
         eprintln!("adapter: {adapter:?}");
-        warmup::start(&mut backend);
+        warmup::start(&mut backend, false);
         backend.set_render_scale(w.render_scale);
         backend.set_light_shadows(cfg!(target_os = "android"));
         if w.render_scale < 1.0 {

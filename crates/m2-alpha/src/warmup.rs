@@ -9,9 +9,11 @@
 //! - every pipeline a run builds is written down ([`save`]) in the
 //!   settings' folder (`pipelines.txt`, the port's own text form,
 //!   [`m2_render::pipeline_spec`]; nothing from the game's files);
-//! - the next run reads them ([`start`]) and, while the loading screen is
-//!   up ([`screen`]), builds them a few each frame within
-//!   [`WARM_BUDGET`] ([`step`]), so the screen keeps moving;
+//! - the next run reads them ([`start`]) and builds them before its
+//!   scene's first draw: offscreen in one pass at the start (no screen to
+//!   keep moving), in the window a few each frame within [`WARM_BUDGET`]
+//!   ([`step`]) for as long as play hasn't begun (the start and loading
+//!   screens cover it) or a loading screen is up ([`screen`]);
 //! - where the driver keeps a pipeline cache (Vulkan), its data is saved
 //!   beside them (`pipelines-<adapter key>.bin`) and handed back on the
 //!   next run, so the warm-up itself compiles less.
@@ -24,8 +26,8 @@
 //! shaders precompiled and builds nothing at draw time; this changes when
 //! the port's pipelines are built, never what is drawn.
 //! `--pipeline-warm-check` ([`verdict`]) is the check: no pipeline built
-//! by a draw once play has begun (the loading screen closed, or the
-//! scripts gave her the controls) with the screen down.
+//! by a draw once the scripts have given her the controls, whatever is on
+//! screen, nor once a loading screen has closed with the screen down.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -91,6 +93,8 @@ pub struct Watch {
     /// Play has begun: the loading screen went down after being up, or
     /// the scripts gave her the controls.
     live: bool,
+    /// The scripts have given her the controls (once is enough).
+    controls_given: bool,
     /// Pipelines draws built in play with the screen down, and over how
     /// many frames.
     pub in_play: u32,
@@ -110,6 +114,7 @@ impl Watch {
 
     pub fn controls(&mut self, on: bool) {
         self.live |= on;
+        self.controls_given |= on;
     }
 
     /// A frame's draws built `made` pipelines.
@@ -117,7 +122,10 @@ impl Watch {
         if made == 0 {
             return;
         }
-        if self.live && !self.screen_up {
+        // Once she has had the controls, any build is in play, even under
+        // a later loading screen; before, only with the screen down after
+        // one has closed.
+        if self.controls_given || (self.live && !self.screen_up) {
             self.in_play += made;
             self.in_play_frames += 1;
         } else {
@@ -125,12 +133,14 @@ impl Watch {
         }
     }
 
-    pub fn screen_up(&self) -> bool {
-        self.screen_up
-    }
-
     pub fn live(&self) -> bool {
         self.live
+    }
+
+    /// Whether building ahead is covered now: before play begins (the
+    /// start and loading screens are up) or under a loading screen.
+    pub fn covered_now(&self) -> bool {
+        !self.live || self.screen_up
     }
 }
 
@@ -161,8 +171,10 @@ pub fn set_dir(dir: PathBuf) {
 }
 
 /// A backend starts: reads the list, and starts the driver's cache from
-/// its file where the device keeps one.
-pub fn start(backend: &mut WgpuBackend) {
+/// its file where the device keeps one. `at_once` (offscreen, where no
+/// screen has to keep moving): builds the whole list now, before the
+/// scene's first draw; otherwise [`step`] builds it frame by frame.
+pub fn start(backend: &mut WgpuBackend, at_once: bool) {
     STATE.with_borrow_mut(|s| {
         let Some(dir) = s.dir.clone() else { return };
         s.started = true;
@@ -199,23 +211,16 @@ pub fn start(backend: &mut WgpuBackend) {
         };
         eprintln!("pipelines: the driver's cache: {}", s.driver_cache);
     });
+    if at_once {
+        warm(backend, None, "before the first frame");
+    }
 }
 
-/// The loading screen is up (or not) this frame.
-pub fn screen(up: bool) {
-    STATE.with_borrow_mut(|s| s.watch.screen(up));
-}
-
-/// The scripts gave her the controls (or took them).
-pub fn controls(on: bool) {
-    STATE.with_borrow_mut(|s| s.watch.controls(on));
-}
-
-/// Before a frame's draws: under the loading screen, builds pipelines of
-/// the list within [`WARM_BUDGET`] (one at least).
-pub fn step(backend: &mut WgpuBackend) {
+/// Builds pipelines of the list, within `budget` (one at least) or all of
+/// them, and logs what it built.
+fn warm(backend: &mut WgpuBackend, budget: Option<Duration>, when: &str) {
     let built = STATE.with_borrow_mut(|s| {
-        if !s.watch.screen_up() || s.pending.is_empty() {
+        if s.pending.is_empty() {
             return None;
         }
         let started = Instant::now();
@@ -225,7 +230,7 @@ pub fn step(backend: &mut WgpuBackend) {
                 Ok(new) => built += u32::from(new),
                 Err(e) => eprintln!("pipelines: could not build {}: {e}", spec.to_line()),
             }
-            if started.elapsed() >= WARM_BUDGET {
+            if budget.is_some_and(|b| started.elapsed() >= b) {
                 break;
             }
         }
@@ -241,12 +246,35 @@ pub fn step(backend: &mut WgpuBackend) {
         s.warm_took += work.took;
     });
     eprintln!(
-        "pipelines: warmed +{built} (left {left}) in {:.0} ms",
+        "pipelines: warmed +{built} (left {left}) in {:.0} ms {when}",
         work.took.as_secs_f32() * 1000.0
     );
     if left == 0 {
         // All built: the driver's cache now holds them too.
         save(backend);
+    }
+}
+
+/// The loading screen is up (or not) this frame.
+pub fn screen(up: bool) {
+    STATE.with_borrow_mut(|s| s.watch.screen(up));
+}
+
+/// The scripts gave her the controls (or took them).
+pub fn controls(on: bool) {
+    STATE.with_borrow_mut(|s| s.watch.controls(on));
+}
+
+/// Before a frame's draws: while building ahead is covered (play not
+/// begun, or a loading screen up), builds pipelines of the list within
+/// [`WARM_BUDGET`] (one at least).
+pub fn step(backend: &mut WgpuBackend) {
+    if STATE.with_borrow(|s| s.watch.covered_now()) {
+        warm(
+            backend,
+            Some(WARM_BUDGET),
+            "under the start or loading screen",
+        );
     }
 }
 
@@ -306,8 +334,9 @@ pub fn verdict() -> (bool, String) {
     })
 }
 
-/// The verdict: play must have begun, and no draw in it with the screen
-/// down may have built a pipeline.
+/// The verdict: play must have begun, and no draw may have built a
+/// pipeline once she has had the controls, nor with the screen down once
+/// a loading screen has closed.
 pub fn verdict_of(
     w: &Watch,
     listed: usize,
@@ -321,7 +350,7 @@ pub fn verdict_of(
         format!("warm ({listed} listed)")
     };
     let summary = format!(
-        "cache {cache}; warmed +{warmed} in {:.0} ms under the loading screen; \
+        "cache {cache}; warmed +{warmed} in {:.0} ms ahead; \
          draws built +{} before play or under the screen; driver cache {driver_cache}",
         took.as_secs_f32() * 1000.0,
         w.covered
@@ -431,6 +460,32 @@ mod tests {
             line.starts_with("FAIL draws built +2 in play over 1 frames"),
             "{line}"
         );
+    }
+
+    #[test]
+    fn after_the_controls_any_build_fails_even_under_a_screen() {
+        let mut w = Watch::default();
+        w.screen(true);
+        w.drew(7);
+        w.controls(true);
+        // Up again over a later load, with the controls given: in play.
+        w.screen(true);
+        w.drew(2);
+        assert_eq!((w.covered, w.in_play), (7, 2));
+        assert!(!verdict_of(&w, 50, 50, Duration::ZERO, "none").0);
+    }
+
+    #[test]
+    fn building_ahead_is_covered_until_play_begins_or_under_a_screen() {
+        let mut w = Watch::default();
+        // At the start, before any screen (offscreen skip-to): covered.
+        assert!(w.covered_now());
+        w.controls(true);
+        assert!(!w.covered_now());
+        w.screen(true);
+        assert!(w.covered_now());
+        w.screen(false);
+        assert!(!w.covered_now());
     }
 
     #[test]
