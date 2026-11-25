@@ -1,17 +1,22 @@
 //! Saved games: each slot one file in the 360's save record layout
-//! ([`m2_game::save_record`], `m2-alpha-save<n>.sav`), with a small TOML
-//! file beside it (`.world.toml`) for what the port puts back that the
-//! 360's record does not hold.
+//! ([`m2_game::save_record`], `m2-alpha-save<n>.sav`), and nothing else.
 //!
 //! # Provenance
 //!
 //! **From the 360 code** ([`m2_game::save_record`]): the `.sav` file's
 //! bytes, 0x3458 of them; what goes in it (her cash and fuel, the time
-//! played, the last contract and percent done as `Sys.RequestAutosave`
-//! last gave them, when it was saved, the character, whether it was the
-//! autosave, the options block, the scripts' save text packed with zlib);
-//! and that loading hands the save text to the scripts
-//! ([`MissionLink::with_save`](crate::mission::MissionLink::with_save)).
+//! played, the last contract and percent done as the scripts last gave
+//! them, when it was saved, the character, whether it was the autosave,
+//! the options block, the scripts' save text packed with zlib); and what
+//! loading does: the record's fields come back and the save text is handed
+//! to the scripts as they start
+//! ([`MissionLink::with_save`](crate::mission::MissionLink::with_save)),
+//! after the world's reset ([`Game::reset_for_load`](crate::game::Game::reset_for_load)).
+//! Where she is, her health, weapons and rounds, the vehicles, wrecks and
+//! the dead are not saved: the 360's record holds none of them, and its
+//! load (`0x8239BE98`, `0x8230C880`, `0x8230C740`, then `LoadSingleton`)
+//! leaves them to the scripts. Checked in the game (#783): loaded the
+//! 360's way she is back at the scripted start, at full health and ammo.
 //!
 //! **Invented**:
 //!
@@ -19,41 +24,33 @@
 //!   (the 360 keeps them on its storage device, each named by the
 //!   profile's name, `auto_XXXXXXXX`).
 //! - The owner's id ([`m2_game::save_record::OWNER`]).
-//! - The `.world.toml` beside it: where she is, her facing and camera,
-//!   her health, her weapons and their rounds, grenades and explosives,
-//!   the island's vehicles with their places and wrecks, the soldiers
-//!   killed, and her support stock. The 360 saves none of these: its load
-//!   (`0x8230C880`, `0x8230C740`) resets the players (out of their seats,
-//!   out of survival mode) and leaves the rest to the scripts'
-//!   `LoadSingleton`. The port still puts them back, from that file, until
-//!   a check in the game shows where the scripts alone put her.
 //! - The options block is written at its defaults: the port keeps the
 //!   player's options in its own settings file.
 //!
-//! Saves of the port's own TOML format (`m2-alpha-save<n>.toml`, from
-//! before) are still read, and are replaced by the record when the slot
-//! is saved over. Nothing from the install goes in a save: vehicles and
-//! soldiers are named by their asset and entity hashes.
+//! Saves of the port's older formats are still read for what the 360's
+//! record carries (hero, cash, fuel, the scripts' save text): its own
+//! TOML saves (`m2-alpha-save<n>.toml`), whose world part is ignored, and
+//! the `.world.toml` that #781-#783 wrote beside each record, which is
+//! never read. Saving over a slot removes both.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use m2_game::save_record::{RecordInfo, SaveRecord};
-use m2_math::glam::Vec3;
 use serde::{Deserialize, Serialize};
 
 use crate::hero::Hero;
 
-/// The old TOML saves' version, and the `.world.toml`'s: bumped when one
-/// from an older build can no longer be read.
+/// The old TOML saves' version: one from another build is refused.
 pub const VERSION: u32 = 1;
 pub const FILE_NAME: &str = "m2-alpha-save.sav";
 /// The record's extension.
 pub const EXT: &str = "sav";
 /// The port's old TOML saves' extension.
 pub const LEGACY_EXT: &str = "toml";
-/// The invented world file's extension, beside the record.
-pub const WORLD_EXT: &str = "world.toml";
+/// The world file #781-#783 wrote beside each record: never read now,
+/// removed when the slot is saved over.
+pub const STALE_WORLD_EXT: &str = "world.toml";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SaveGame {
@@ -62,17 +59,10 @@ pub struct SaveGame {
     /// (the settings' hero stands in).
     #[serde(default)]
     pub hero: Option<Hero>,
-    /// Where she is and what she carries (**invented**: not in the 360's
-    /// record); none for a record without its world file.
-    #[serde(default)]
-    pub player: Option<PlayerSave>,
-    #[serde(default)]
-    pub vehicles: Vec<VehicleSave>,
-    /// Spawn entities of the soldiers killed.
-    #[serde(default)]
-    pub killed: Vec<u32>,
-    /// Her cash, fuel (the record's) and support stock (the world file's)
-    /// as the scripts held them; old saves from before money have none.
+    /// Her cash and fuel (the record's); the support stock only in old
+    /// TOML saves from before the scripts' data was kept (for those the
+    /// scripts have nothing else to restore it from). Old saves from before
+    /// money have none.
     #[serde(default)]
     pub pmc: Option<PmcSave>,
     /// The scripts' own save data, as Lua text
@@ -93,105 +83,8 @@ pub struct SaveGame {
 pub struct PmcSave {
     pub cash: f64,
     pub fuel: f64,
+    #[serde(default)]
     pub stock: Vec<(String, i64)>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PlayerSave {
-    /// Feet, world space.
-    pub position: [f32; 3],
-    pub facing: f32,
-    pub yaw: f32,
-    pub pitch: f32,
-    pub hp: f32,
-    /// What she has up: "rifle", "rpg" or "grenade launcher".
-    pub weapon: String,
-    /// What she carries in the launcher's place: "rpg", "grenade
-    /// launcher" or nothing (""); the RPG in saves from before it could
-    /// be anything else.
-    #[serde(default = "rpg")]
-    pub second: String,
-    /// The grenade launcher's rounds, in its clip and stored, if she
-    /// carries one.
-    #[serde(default)]
-    pub launcher: Option<[u32; 2]>,
-    /// Grenades she has; saves from before they ran out had her full.
-    #[serde(default = "full_grenades")]
-    pub grenades: u32,
-    /// The rifle's rounds, in its clip and stored; saves from before it
-    /// ran out had it full.
-    #[serde(default)]
-    pub rifle: Option<[u32; 2]>,
-    /// The templates of the guns in her hands' two places (her rifle's,
-    /// and what she carries in the launcher's), and the explosive she has
-    /// chosen with how many of C4 and mines she has; saves from before
-    /// had the carbine or her own, and none of either.
-    #[serde(default)]
-    pub guns: [String; 2],
-    #[serde(default)]
-    pub explosives: [u32; 3],
-}
-
-fn full_grenades() -> u32 {
-    crate::combat::MAX_GRENADES
-}
-
-fn rpg() -> String {
-    "rpg".into()
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct VehicleSave {
-    /// Model asset hash.
-    pub model: u32,
-    /// Model origin, world space.
-    pub position: [f32; 3],
-    /// Heading, radians clockwise from +z seen from above.
-    pub yaw: f32,
-    pub wrecked: bool,
-}
-
-impl VehicleSave {
-    pub fn position(&self) -> Vec3 {
-        Vec3::from(self.position)
-    }
-}
-
-/// The invented world file beside a record (see the module's provenance).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct WorldFile {
-    version: u32,
-    #[serde(default)]
-    player: Option<PlayerSave>,
-    #[serde(default)]
-    vehicles: Vec<VehicleSave>,
-    #[serde(default)]
-    killed: Vec<u32>,
-    #[serde(default)]
-    stock: Vec<(String, i64)>,
-}
-
-/// What a save's invented world file held, taken out of it
-/// ([`strip_world`]).
-#[derive(Clone, Debug, PartialEq)]
-pub struct WorldRef {
-    pub player: Option<PlayerSave>,
-    pub vehicles: usize,
-    pub killed: usize,
-}
-
-/// Leaves `save` as the 360's record alone would load it: no place,
-/// weapons, vehicles, dead or support stock (none of which the record
-/// holds). What it had is returned.
-pub fn strip_world(save: &mut SaveGame) -> WorldRef {
-    if let Some(p) = &mut save.pmc {
-        p.stock.clear();
-    }
-    WorldRef {
-        player: save.player.take(),
-        vehicles: std::mem::take(&mut save.vehicles).len(),
-        killed: std::mem::take(&mut save.killed).len(),
-    }
 }
 
 /// The record's character for `hero`: the save list movie's 1 Mattias,
@@ -222,6 +115,18 @@ pub fn now_secs() -> u64 {
 }
 
 impl SaveGame {
+    /// A save of `hero` with nothing else yet (the scripts' part and the
+    /// record's stamp are filled in by whoever writes it).
+    pub fn of(hero: Hero) -> Self {
+        Self {
+            version: VERSION,
+            hero: Some(hero),
+            pmc: None,
+            scripts: None,
+            info: RecordInfo::default(),
+        }
+    }
+
     /// Where saves go (see [`Config::file_beside`](crate::config::Config::file_beside)).
     pub fn default_path() -> PathBuf {
         crate::config::Config::file_beside(FILE_NAME)
@@ -268,7 +173,8 @@ impl SaveGame {
         toml::to_string_pretty(self).expect("a save always serialises")
     }
 
-    /// An old TOML save.
+    /// An old TOML save: its hero, cash, fuel, stock and the scripts' data
+    /// (the world part it also had is left out).
     pub fn from_toml(text: &str) -> anyhow::Result<Self> {
         let save: Self = toml::from_str(text)?;
         anyhow::ensure!(
@@ -302,78 +208,39 @@ impl SaveGame {
         Ok(record.to_bytes())
     }
 
-    /// A save from a record's bytes and, if there is one, its world
-    /// file's text.
-    pub fn from_record(bytes: &[u8], world: Option<&str>) -> anyhow::Result<Self> {
+    /// A save from a record's bytes.
+    pub fn from_record(bytes: &[u8]) -> anyhow::Result<Self> {
         let record = SaveRecord::from_bytes(bytes)?;
         let info = record.info();
-        let world: Option<WorldFile> = world
-            .map(|t| toml::from_str(t).context("its world file"))
-            .transpose()?;
-        if let Some(w) = &world {
-            anyhow::ensure!(
-                w.version == VERSION,
-                "world file version {} (this build reads {VERSION})",
-                w.version
-            );
-        }
-        let world = world.unwrap_or(WorldFile {
-            version: VERSION,
-            player: None,
-            vehicles: Vec::new(),
-            killed: Vec::new(),
-            stock: Vec::new(),
-        });
         Ok(Self {
             version: VERSION,
             hero: hero_of(info.character),
-            player: world.player,
-            vehicles: world.vehicles,
-            killed: world.killed,
             pmc: Some(PmcSave {
                 cash: f64::from(info.cash),
                 fuel: f64::from(info.fuel),
-                stock: world.stock,
+                stock: Vec::new(),
             }),
             scripts: record.script_text()?,
             info,
         })
     }
 
-    /// The world file's text.
-    fn world_toml(&self) -> String {
-        toml::to_string_pretty(&WorldFile {
-            version: VERSION,
-            player: self.player.clone(),
-            vehicles: self.vehicles.clone(),
-            killed: self.killed.clone(),
-            stock: self
-                .pmc
-                .as_ref()
-                .map(|p| p.stock.clone())
-                .unwrap_or_default(),
-        })
-        .expect("a world file always serialises")
-    }
-
-    /// Writes the record (and its world file) for `path`, stamped now; an
-    /// old TOML save in that slot goes, the record taking its place.
+    /// Writes the record for `path`, stamped now; an old TOML save or a
+    /// stale world file in that slot goes, the record taking its place.
     pub fn write(&self, path: &Path) -> anyhow::Result<()> {
         let record = record_path(path);
         let bytes = self.to_record(now_secs())?;
         std::fs::write(&record, bytes).with_context(|| format!("writing {}", record.display()))?;
-        let world = record.with_extension(WORLD_EXT);
-        std::fs::write(&world, self.world_toml())
-            .with_context(|| format!("writing {}", world.display()))?;
-        let legacy = record.with_extension(LEGACY_EXT);
-        if legacy.is_file() {
-            let _ = std::fs::remove_file(legacy);
+        for ext in [LEGACY_EXT, STALE_WORLD_EXT] {
+            let old = record.with_extension(ext);
+            if old.is_file() {
+                let _ = std::fs::remove_file(old);
+            }
         }
         Ok(())
     }
 
-    /// Reads the save at `path`: a record (with its world file if there is
-    /// one), or an old TOML save.
+    /// Reads the save at `path`: a record, or an old TOML save.
     pub fn read(path: &Path) -> anyhow::Result<Self> {
         let file = Self::found(path).unwrap_or_else(|| path.to_path_buf());
         if is_legacy(&file) {
@@ -382,18 +249,16 @@ impl SaveGame {
             return Self::from_toml(&text).with_context(|| format!("reading {}", file.display()));
         }
         let bytes = std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
-        let world = std::fs::read_to_string(file.with_extension(WORLD_EXT)).ok();
-        Self::from_record(&bytes, world.as_deref())
-            .with_context(|| format!("reading {}", file.display()))
+        Self::from_record(&bytes).with_context(|| format!("reading {}", file.display()))
     }
 }
 
-/// Whether `path` names an old TOML save (not a record's world file).
+/// Whether `path` names an old TOML save (not a stale world file).
 fn is_legacy(path: &Path) -> bool {
     let name = path
         .file_name()
         .map_or(String::new(), |n| n.to_string_lossy().into_owned());
-    name.ends_with(".toml") && !name.ends_with(&format!(".{WORLD_EXT}"))
+    name.ends_with(".toml") && !name.ends_with(&format!(".{STALE_WORLD_EXT}"))
 }
 
 /// The record's path for a save named `path` (whatever extension it was
@@ -403,7 +268,7 @@ fn record_path(path: &Path) -> PathBuf {
         .file_name()
         .map_or(String::new(), |n| n.to_string_lossy().into_owned());
     let stem = name
-        .strip_suffix(&format!(".{WORLD_EXT}"))
+        .strip_suffix(&format!(".{STALE_WORLD_EXT}"))
         .or_else(|| name.strip_suffix(&format!(".{LEGACY_EXT}")))
         .or_else(|| name.strip_suffix(&format!(".{EXT}")))
         .unwrap_or(&name);
@@ -418,31 +283,10 @@ mod tests {
         SaveGame {
             version: VERSION,
             hero: Some(Hero::Jennifer),
-            player: Some(PlayerSave {
-                position: [450.0, -32.5, -1950.0],
-                facing: 1.0,
-                yaw: 1.1,
-                pitch: -0.2,
-                hp: 64.0,
-                weapon: "grenade launcher".into(),
-                second: "grenade launcher".into(),
-                launcher: Some([4, 12]),
-                rifle: Some([12, 90]),
-                grenades: 3,
-                guns: ["Shotgun".into(), "Stinger".into()],
-                explosives: [0, 2, 1],
-            }),
-            vehicles: vec![VehicleSave {
-                model: 0x0307_555e,
-                position: [460.0, -32.0, -1940.0],
-                yaw: 0.5,
-                wrecked: true,
-            }],
-            killed: vec![7, 9],
             pmc: Some(PmcSave {
                 cash: 125_000.0,
                 fuel: 240.0,
-                stock: vec![("clusterbomb".into(), 2), ("Support".into(), 1)],
+                stock: Vec::new(),
             }),
             scripts: Some("{[\"nAvailableCostumes\"]=1,}".into()),
             info: RecordInfo {
@@ -462,12 +306,39 @@ mod tests {
         d
     }
 
+    /// An old TOML save as builds before #781 wrote it, world part and all.
+    const OLD: &str = r#"
+version = 1
+hero = "mattias"
+killed = [7, 9]
+scripts = "{[\"nTimeElapsed\"]=18,}"
+
+[[vehicles]]
+model = 50550110
+position = [460.0, -32.0, -1940.0]
+yaw = 0.5
+wrecked = true
+
+[player]
+position = [1.0, 2.0, 3.0]
+facing = 0.0
+yaw = 0.0
+pitch = 0.0
+hp = 64.0
+weapon = "rpg"
+
+[pmc]
+cash = 125000.0
+fuel = 240.0
+stock = [["clusterbomb", 2]]
+"#;
+
     #[test]
-    fn round_trips_through_the_record_and_its_world_file() {
+    fn round_trips_through_the_record() {
         let s = save();
         let bytes = s.to_record(1_795_000_000).unwrap();
         assert_eq!(bytes.len(), 0x3458);
-        let back = SaveGame::from_record(&bytes, Some(&s.world_toml())).unwrap();
+        let back = SaveGame::from_record(&bytes).unwrap();
         let mut want = s.clone();
         want.info.cash = 125_000;
         want.info.fuel = 240;
@@ -476,43 +347,18 @@ mod tests {
         assert_eq!(back, want);
     }
 
-    /// Without its world file a record still loads: the 360's own fields.
+    /// An old save's story data loads; its world part does not.
     #[test]
-    fn a_record_alone_has_the_360s_fields_only() {
-        let bytes = save().to_record(5).unwrap();
-        let s = SaveGame::from_record(&bytes, None).unwrap();
-        assert_eq!(s.hero, Some(Hero::Jennifer));
-        assert_eq!(s.player, None);
-        assert!(s.vehicles.is_empty() && s.killed.is_empty());
+    fn old_toml_saves_keep_what_the_record_carries() {
+        let s = SaveGame::from_toml(OLD).unwrap();
+        assert_eq!(s.hero, Some(Hero::Mattias));
+        assert_eq!(s.scripts.as_deref(), Some("{[\"nTimeElapsed\"]=18,}"));
         let pmc = s.pmc.unwrap();
-        assert_eq!((pmc.cash, pmc.fuel, pmc.stock.len()), (125_000.0, 240.0, 0));
-        assert_eq!(s.scripts.as_deref(), Some("{[\"nAvailableCostumes\"]=1,}"));
-        assert_eq!(
-            (s.info.played, s.info.contract.as_str(), s.info.percent),
-            (3725, "VzaCon001", 4)
-        );
-    }
-
-    #[test]
-    fn saves_from_before_the_grenade_launcher_carry_the_rpg() {
-        let old = r#"
-version = 1
-killed = []
-vehicles = []
-
-[player]
-position = [1.0, 2.0, 3.0]
-facing = 0.0
-yaw = 0.0
-pitch = 0.0
-hp = 100.0
-weapon = "rpg"
-"#;
-        let s = SaveGame::from_toml(old).unwrap();
-        let p = s.player.unwrap();
-        assert_eq!((p.second.as_str(), p.launcher), ("rpg", None));
+        assert_eq!((pmc.cash, pmc.fuel), (125_000.0, 240.0));
+        assert_eq!(pmc.stock, [("clusterbomb".to_owned(), 2)]);
         // From before money and heroes: none kept.
-        assert_eq!((s.pmc, s.scripts, s.hero), (None, None, None));
+        let bare = SaveGame::from_toml("version = 1\n").unwrap();
+        assert_eq!((bare.pmc, bare.scripts, bare.hero), (None, None, None));
     }
 
     #[test]
@@ -527,22 +373,22 @@ weapon = "rpg"
     }
 
     #[test]
-    fn old_toml_saves_are_read_and_replaced_by_the_record() {
+    fn saving_writes_the_record_alone_and_clears_old_files() {
         let d = dir("migrate");
         let slot = d.join("m2-alpha-save3.sav");
-        let mut old = save();
-        old.info = RecordInfo::default();
-        std::fs::write(d.join("m2-alpha-save3.toml"), old.to_toml()).unwrap();
+        std::fs::write(d.join("m2-alpha-save3.toml"), OLD).unwrap();
+        std::fs::write(d.join("m2-alpha-save3.world.toml"), "version = 1\n").unwrap();
         assert_eq!(SaveGame::found(&slot), Some(d.join("m2-alpha-save3.toml")));
         let read = SaveGame::read(&slot).unwrap();
-        assert_eq!(read, old);
+        assert_eq!(read.hero, Some(Hero::Mattias));
         read.write(&slot).unwrap();
         assert!(!d.join("m2-alpha-save3.toml").exists());
-        assert_eq!(SaveGame::found(&slot), Some(slot.clone()));
+        assert!(!d.join("m2-alpha-save3.world.toml").exists());
+        let files: Vec<_> = std::fs::read_dir(&d).unwrap().collect();
+        assert_eq!(files.len(), 1, "only the record");
         let again = SaveGame::read(&slot).unwrap();
-        assert_eq!(again.player, old.player);
-        assert_eq!(again.scripts, old.scripts);
-        assert_eq!(again.pmc, old.pmc);
+        assert_eq!(again.scripts, read.scripts);
+        assert_eq!(again.hero, read.hero);
         assert!(again.info.saved_at > 0);
         // A path given as the old file's still finds the record.
         assert_eq!(
@@ -552,32 +398,23 @@ weapon = "rpg"
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// A world file left beside a record by #781-#783 is never read.
+    #[test]
+    fn a_stale_world_file_is_ignored() {
+        let d = dir("stale");
+        let slot = d.join("m2-alpha-save4.sav");
+        std::fs::write(&slot, save().to_record(5).unwrap()).unwrap();
+        std::fs::write(d.join("m2-alpha-save4.world.toml"), "not toml [").unwrap();
+        let s = SaveGame::read(&slot).unwrap();
+        assert_eq!(s.hero, Some(Hero::Jennifer));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn other_versions_are_refused() {
         let mut s = save();
         s.version = VERSION + 1;
         assert!(SaveGame::from_toml(&s.to_toml()).is_err());
-        let bytes = save().to_record(1).unwrap();
-        let world = save().world_toml().replace("version = 1", "version = 9");
-        assert!(SaveGame::from_record(&bytes, Some(&world)).is_err());
-    }
-
-    #[test]
-    fn stripping_the_world_leaves_the_records_fields() {
-        let mut s = save();
-        let w = strip_world(&mut s);
-        assert_eq!(w.player, save().player);
-        assert_eq!((w.vehicles, w.killed), (1, 2));
-        assert_eq!(
-            (s.player.as_ref(), s.vehicles.len(), s.killed.len()),
-            (None, 0, 0)
-        );
-        let pmc = s.pmc.clone().unwrap();
-        assert_eq!((pmc.cash, pmc.fuel, pmc.stock.len()), (125_000.0, 240.0, 0));
-        // What a record alone loads.
-        let bytes = save().to_record(5).unwrap();
-        let alone = SaveGame::from_record(&bytes, None).unwrap();
-        assert_eq!((alone.player, alone.scripts), (s.player, s.scripts));
     }
 
     #[test]

@@ -50,10 +50,11 @@ The launcher reads the files `m2-alpha` writes (`m2-alpha-autosave.sav`,
 `m2-alpha-save<n>.sav`, beside its settings file). Each is one 360 save
 record (`m2-game/src/save_record.rs`): the time played, cash, fuel, last
 contract, percent done, character and time stamp the 360's save list
-shows, and the scripts' save data. The `.world.toml` beside each is the
-port's own (where she is, her weapons, the vehicles and the dead, which
-the 360 does not save); copying and deleting a slot take it along. Old
-`.toml` saves still list, without play time, contract or percent.
+shows, and the scripts' save data, and nothing else: like the 360, a save
+holds no place, health, weapons, vehicles or dead (loading puts her back
+at the scripts' start). A stale `.world.toml` left by earlier builds is
+not copied and is deleted with its slot. Old `.toml` saves still list,
+without play time, contract or percent.
 
 ## To come
 

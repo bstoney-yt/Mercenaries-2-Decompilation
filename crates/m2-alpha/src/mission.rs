@@ -2197,8 +2197,8 @@ impl MissionLink {
     }
 
     /// Starts the scripts from `save` rather than a new game, as loading
-    /// it does: her place, weapons and the world's wrecks and dead are put
-    /// back first, then the scripts are handed their own save data
+    /// the 360 does: she is put out of any seat ([`crate::game::Game::reset_for_load`]),
+    /// then the scripts are handed their own save data
     /// ([`Mission::load_save`]): the contracts done and on offer, her PMC,
     /// the factions. A save without script data (from before it was kept)
     /// starts a new game with her cash and stock made up to the save's.
@@ -4501,7 +4501,9 @@ impl MissionLink {
                     let mut save = *save;
                     let pmc = save.pmc.take();
                     let scripts = save.scripts.take();
-                    game.load(save);
+                    // The world's part of the 360's load (0x8230C740);
+                    // her place, health and weapons are the scripts'.
+                    game.reset_for_load();
                     match scripts {
                         Some(text) => {
                             mission.load_save(text);
