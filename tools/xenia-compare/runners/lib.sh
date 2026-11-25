@@ -14,7 +14,7 @@ one() { # name route probes-cmd
     pwsh -NoProfile -Command "Get-Process m2-alpha-xenia -ErrorAction SilentlyContinue | Stop-Process"; return 1; fi
   echo "attach ok $n"; (cd $S && $PY readfloats.py "title $n" && $PY blockdiff.py "title $n") >> $D/$n-floats.out 2>&1
   until grep -aqE "walkcam: at|walkcam .*TIMED|xenia closed|Traceback" $D/$n/route.log 2>/dev/null; do sleep 1; done
-  shift 2; (cd $S && eval "$@"; $PY blockdiff.py "ingame $n" >> $D/$n-floats.out 2>&1 &)
+  shift 2; (cd $S && eval "$@"; $PY blockdiff.py "ingame $n" >> $D/$n-floats.out 2>&1 & $PY worlddump.py > /dev/null 2>&1 &)
   until grep -aqE "xenia closed|Traceback" $D/$n/route.log 2>/dev/null; do sleep 3; done
   sleep 5; echo "done $n"
 }
