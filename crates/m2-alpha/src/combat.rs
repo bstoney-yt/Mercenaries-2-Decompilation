@@ -669,6 +669,28 @@ const UNTEMPLATED_FORCE: f32 = 300.0;
 /// How hard a rifle round shoves the one it kills, m/s.
 const SHOT_PUSH: f32 = 2.0;
 pub(crate) const REACH: f32 = 9.0;
+
+/// Her way out of a vehicle that died under her, and how it went, for
+/// the log and `--wreck-rider-check`: seconds since, the vehicle's origin
+/// and where she was put out, the launch her ragdoll took, her health
+/// then, when her ragdoll went live, the highest her limp body's root rose
+/// over where she was put out, how far out it came to lie, and when she
+/// was up.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DeathExit {
+    pub t: f32,
+    pub vehicle: Vec3,
+    pub out: Vec3,
+    pub launch: Vec3,
+    pub hp: f32,
+    pub hp_up: f32,
+    pub live_at: Option<f32>,
+    pub peak: f32,
+    pub peak_at: f32,
+    pub lay: f32,
+    pub up_at: Option<f32>,
+}
+
 /// The satellite-guided bomb's blasts, from the template database's
 /// laser-guided bomb ("Explosion (Airstike Bomb)" 80008e3f, its frag
 /// "Explosion (Airstrike Frag)" 8000a3df, and its final strike 8000af7d
@@ -713,6 +735,43 @@ fn blast_cell(table: Option<&DamageTable>, v: &ParkedVehicle, key: Option<u32>) 
         (Some(t), Some(row), Some(k)) => t.scale(row, k).unwrap_or(1.0),
         _ => 1.0,
     }
+}
+
+/// Pushes vehicle `v` (`id`, placed at `body`) by blast `push` as the
+/// 360 pushes a moving rigid body ([`BlastPush::rigid_pushes`],
+/// 0x8215CBC8): five impulses up its world box, each per kg times its
+/// mass, its `ExplosionFudge` scaling them.
+///
+/// [`BlastPush::rigid_pushes`]: m2_engine::durability::BlastPush::rigid_pushes
+fn blast_push_vehicle(
+    physics: &mut Physics,
+    v: &ParkedVehicle,
+    id: m2_engine::VehicleId,
+    body: Mat4,
+    push: m2_engine::durability::BlastPush,
+) {
+    // Sized by its body's collision, as the 360 sizes the Havok body it
+    // pushes; its drawn box without one.
+    let (lo, hi) = physics
+        .vehicle_body_box(id)
+        .unwrap_or_else(|| world_box(body, v.spec.bounds));
+    for (per_kg, point) in push.rigid_pushes(lo, hi, fudge(v)) {
+        physics.push_vehicle(id, per_kg * v.spec.mass, point);
+    }
+}
+
+/// The world box round a model box `(lo, hi)` placed at `at`.
+fn world_box(at: Mat4, (lo, hi): (Vec3, Vec3)) -> (Vec3, Vec3) {
+    let mut out = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for x in [lo.x, hi.x] {
+        for y in [lo.y, hi.y] {
+            for z in [lo.z, hi.z] {
+                let p = at.transform_point3(Vec3::new(x, y, z));
+                out = (out.0.min(p), out.1.max(p));
+            }
+        }
+    }
+    out
 }
 
 /// How hard a blast throws vehicle `v`, of its usual: its
@@ -1941,6 +2000,27 @@ pub struct Combat {
     /// the stream at `0x82B5E588`, from its start-up seed.
     knock_rng: m2_game::script_math::EngineRng,
     pub blasts: u32,
+    /// The effects that are explosions, by name hash: their `Radius` and
+    /// `MaxForce` (a wreck's blast, [`Combat::her_vehicle_wrecked`]).
+    pub blast_effects: std::collections::HashMap<u32, (f32, f32)>,
+    /// Put out of a vehicle that died under her, watched until she is up
+    /// ([`DeathExit`]).
+    death_exit: Option<DeathExit>,
+    /// The last such, once she is up again (`--wreck-rider-check`).
+    pub death_exit_done: Option<DeathExit>,
+    /// The effect templates that go off as blasts, by name hash: their own
+    /// `Explosive` and their `PhysicalLink`s' (each with the link's
+    /// offset). A vehicle part's state that starts one sets them all off
+    /// ([`Combat::part_blasts`]).
+    pub wreck_blasts: std::collections::HashMap<u32, Vec<(Vec3, Blast)>>,
+    /// The templates of the blasts part states have set off, in order
+    /// (`--wreck-blast-check`'s).
+    pub part_blasts_fired: Vec<u32>,
+    /// The vehicle she was put out of as it was wrecked: its own blasts
+    /// spare her ([`Combat::her_vehicle_wrecked`]).
+    rider_of: Option<usize>,
+    /// Set while the blasts of the wreck she was put out of go off.
+    spare_her: bool,
     /// Where the last one went off, and what it pushes what it breaks
     /// with, where known.
     pub last_blast: Option<Vec3>,
@@ -2378,6 +2458,13 @@ impl Default for Combat {
             hits: 0,
             knock_rng: m2_game::script_math::EngineRng::default(),
             blasts: 0,
+            blast_effects: std::collections::HashMap::new(),
+            death_exit: None,
+            death_exit_done: None,
+            wreck_blasts: std::collections::HashMap::new(),
+            part_blasts_fired: Vec::new(),
+            rider_of: None,
+            spare_her: false,
             last_blast: None,
             last_push: None,
             went_off: Vec::new(),
@@ -3427,6 +3514,8 @@ impl Combat {
         } else {
             trigger
         };
+        self.her_vehicle_wrecked(f);
+        self.her_death_exit(f, dt);
         for damage in std::mem::take(&mut self.pending_hurt) {
             let before = self.hp;
             let lost = self.hurt_player(f, damage, None);
@@ -3443,6 +3532,7 @@ impl Combat {
         }
         self.went_off.clear();
         self.struck.clear();
+        self.part_blasts(f);
         self.knocked_step(f, dt);
         // Up again (revived, respawned, or put on her feet by a script):
         // her limp body goes. The state table's `Resurrect` leads from
@@ -4549,6 +4639,9 @@ impl Combat {
     /// body lies; up when [`KnockedHer::stands`], where the body lay,
     /// facing along it.
     fn knocked_step(&mut self, f: &mut Field<'_>, dt: f32) {
+        if let Some(seconds) = f.player.knock_for.take() {
+            self.knock_her_down(f, seconds);
+        }
         if f.player.tossed {
             f.player.tossed = false;
             let r = self.knock_rng.unit();
@@ -4617,7 +4710,109 @@ impl Combat {
         }
     }
 
-    /// `damage` done to her from `from`: the health she lost.
+    /// The vehicle she is in was wrecked: the 360's death exit. She is put
+    /// out at her seat (else at a clear point), not hurt by it, and her
+    /// ragdoll goes live with a level launch away from the vehicle; she is
+    /// down [`crate::game::DEATH_EXIT_DOWN`] s, then gets up as from any
+    /// knockdown ([`Combat::knock_her_down`]).
+    ///
+    /// From the 360 code: the vehicle's death (0x82205BE0) posts each
+    /// rider the seat message kind 4 (queue 0x831C2498), mode 3 (2 if the
+    /// vehicle's flags have 0x10000000; then its ordinary exit choice, not
+    /// ported). The rider system (0x82299918 -> 0x822A55D0 -> 0x822A0F58)
+    /// takes exit 4 for mode 3 (0x822A2B60), 0x822A2178: a state change
+    /// 0xBFFCEEA0 to her, her time down 0x82423848(3.0), and, when her way
+    /// out is clear (0x8229AC90 false), her placed at the seat's own
+    /// transform (0x823F8370 -> 0x823F8178), else put out at a clear point
+    /// (0x822A13D0); no velocity. The ragdoll controller takes the same
+    /// message with byte +0x21 = 3 and launches her 10 m/s level away from
+    /// what the seat is attached to (0x82428EA0; that lookup 0x82156978 on
+    /// 0x83653DF8 gives the vehicle is inferred). Her limbs meet the wreck
+    /// as it is thrown up under her (the ragdoll's collision layer against
+    /// vehicles is not read: inferred). No damage reaches her (Xenia: 100
+    /// -> 100).
+    fn her_vehicle_wrecked(&mut self, f: &mut Field<'_>) {
+        let Some(i) = f.player.driving else {
+            return;
+        };
+        let Some(v) = f.vehicles.get(i).filter(|v| v.wrecked) else {
+            return;
+        };
+        let label = v.spec.label.clone();
+        let Some(vehicle) = crate::game::death_exit(f.physics, v, f.player) else {
+            return;
+        };
+        self.seat = 0;
+        self.rider_of = Some(i);
+        let out = f.player.character.position;
+        let launch = crate::game::death_launch(vehicle, out);
+        f.player.launch = Some(launch);
+        f.player.knock_for = Some(crate::game::DEATH_EXIT_DOWN);
+        self.death_exit = Some(DeathExit {
+            vehicle,
+            out,
+            launch,
+            hp: self.hp,
+            hp_up: self.hp,
+            ..DeathExit::default()
+        });
+        eprintln!(
+            "wreck: death exit out of the {label} at {out:.2}, launch {launch:.2} ({:.2} m/s level); health {:.1}",
+            launch.with_y(0.0).length(),
+            self.hp
+        );
+    }
+
+    /// Watches her death exit ([`DeathExit`]) until she is up: when her
+    /// ragdoll went live, how high and how far its root went, when she
+    /// stood; 10 s at most.
+    fn her_death_exit(&mut self, f: &Field<'_>, dt: f32) {
+        let Some(d) = &mut self.death_exit else {
+            return;
+        };
+        d.t += dt;
+        if let Some(id) = f.player.ragdoll {
+            d.live_at.get_or_insert(d.t);
+            if let Some(root) = crate::npc::limp_root(f.physics, id) {
+                let rise = root.y - d.out.y;
+                if rise > d.peak {
+                    d.peak = rise;
+                    d.peak_at = d.t;
+                }
+                d.lay = root.with_y(0.0).distance(d.vehicle.with_y(0.0));
+            }
+        }
+        let up = d.live_at.is_some() && !f.player.down;
+        if !up && d.t < 10.0 {
+            return;
+        }
+        if up {
+            d.up_at = Some(d.t);
+        }
+        d.hp_up = self.hp;
+        eprintln!(
+            "wreck: death exit: ragdoll live {}, peak +{:.2} m at {:.2} s, {:.2} m out, up {}; health {:.1} -> {:.1}",
+            d.live_at
+                .map_or("never".to_owned(), |t| format!("at {t:.3} s")),
+            d.peak,
+            d.peak_at,
+            d.lay,
+            d.up_at
+                .map_or("not in 10 s".to_owned(), |t| format!("at {t:.2} s")),
+            d.hp,
+            d.hp_up
+        );
+        self.death_exit_done = self.death_exit.take();
+        self.rider_of = None;
+    }
+
+    /// Takes all of vehicle `i`'s health through the vehicles' own damage
+    /// ([`Combat::hurt_vehicle`]): for `--wreck-rider-check`.
+    pub fn kill_vehicle(&mut self, physics: &mut Physics, v: &mut ParkedVehicle, i: usize) {
+        let all = v.most_health() * 2.0 + 1.0;
+        self.hurt_vehicle(physics, v, i, all);
+    }
+
     /// A blast at `at` of `DamageKey` `key` reached her: alive after it,
     /// she staggers as the 360 has area damage do
     /// ([`m2_engine::stagger`]: the long stagger, for the explosion keys
@@ -4705,6 +4900,7 @@ impl Combat {
         }
     }
 
+    /// `damage` done to her from `from`: the health she lost.
     fn hurt_player(&mut self, f: &mut Field<'_>, damage: f32, from: Option<Vec3>) -> f32 {
         self.hurt_player_as(f, damage, from, false)
     }
@@ -5948,6 +6144,71 @@ impl Combat {
         }
         self.wrecks.push((i, 0.0));
         self.remarks.push(Remark::Wreck);
+    }
+
+    /// Wrecks vehicle `i`, `v`, as damage would (its blast to go off at
+    /// the next step): for `--wreck-blast-check`.
+    pub fn wreck_now(&mut self, physics: &mut Physics, v: &mut ParkedVehicle, i: usize) {
+        self.wreck(physics, v, i);
+    }
+
+    /// The blasts vehicles' part states set off: each effect a state
+    /// started since the last step ([`m2_engine::vehicle_damage::PartDamage::take_started`])
+    /// that is an explosion goes off where its node is, with its
+    /// `PhysicalLink`s' blasts at the same place (plus each link's
+    /// offset), all in the same step: its damage, wear and push on every
+    /// vehicle it reaches, the one whose blast it is too.
+    ///
+    /// From the 360 code: a state's `StartEmitter` (0x8222FA30) resolves
+    /// its effect's template, takes the world transform of the node it
+    /// names on the object (0x8241E720) and spawns the template there
+    /// (0x82409B38); the object's `PhysicalLink`s spawn with it at its
+    /// transform and the link's own (0x82408C30 -> 0x82409AA8); each
+    /// `Explosive` among them builds an area-damage entity (0x82291440)
+    /// that hurts and pushes. On a car's death its body takes `DestroyMsg`
+    /// ([`m2_engine::vehicle_damage::PartDamage::body_destroyed`]), whose
+    /// state starts `fx_Explosion_Large` (7 m, 160 to 150, `Explosion`),
+    /// linking `Explosion (RPG Frag)` (15 m, 300 to 40, `Bullet`): the two
+    /// area-damage objects Xenia saw on the death frame.
+    fn part_blasts(&mut self, f: &mut Field<'_>) {
+        let mut due = Vec::new();
+        for (i, v) in f.vehicles.iter_mut().enumerate() {
+            let (Some(p), Some(dm)) = (v.parts.as_mut(), v.spec.damage.as_deref()) else {
+                continue;
+            };
+            let started = p.take_started();
+            let Some(body) = v.id.and_then(|id| f.physics.vehicle_transform(id)) else {
+                continue;
+            };
+            for (_, fx, n) in started {
+                let Some(blasts) = self.wreck_blasts.get(&fx) else {
+                    continue;
+                };
+                let at = body.transform_point3(dm.node_at(n));
+                for &(offset, b) in blasts {
+                    let here = at + body.transform_vector3(offset);
+                    eprintln!(
+                        "wreck: the {} sets off {:08x} at {here:.1} ({:.0} m, {:.0} to {:.0}, push {:.0}, key {:08x})",
+                        v.spec.label,
+                        b.template,
+                        b.radius,
+                        b.damage,
+                        b.min_damage,
+                        b.max_force,
+                        b.key.unwrap_or(0)
+                    );
+                    due.push((here, b, i));
+                    self.part_blasts_fired.push(b.template);
+                }
+            }
+        }
+        for (at, b, i) in due {
+            // The wreck she rode spares her: thrown clear of it, she took
+            // nothing from its blasts in Xenia (rounds 2-3).
+            self.spare_her = self.rider_of == Some(i);
+            self.explode_keyed(f, at, Some(b), b.key);
+            self.spare_her = false;
+        }
     }
 
     /// Vehicles running into each other, body to body: as a pair meets,
@@ -7226,10 +7487,15 @@ impl Combat {
             hold: None,
             turn: None,
         });
-        let hers = if b.key == Some(m2_assets::name_hash("ExplosionLarge")) {
-            self.hero_damage.explosion_large
-        } else {
-            self.hero_damage.explosion
+        // Her cell: the damage table's `Hero` row for the blast's own key,
+        // a key the table lacks finding its first column (0x82291640 ->
+        // 0x823987D0); without a table, the cells as read.
+        let hers = match (self.damage_table.as_ref(), b.key) {
+            (Some(t), Some(k)) => t.cell(m2_assets::name_hash("Hero"), k),
+            _ if b.key == Some(m2_assets::name_hash("ExplosionLarge")) => {
+                self.hero_damage.explosion_large
+            }
+            _ => self.hero_damage.explosion,
         };
         let reach = b.radius.max(0.5);
         let mut killed = false;
@@ -7254,10 +7520,35 @@ impl Combat {
             }
         }
         self.blast_explosives(f.explosives, at, reach, |d| b.damage_at(d), b.key);
-        if f.player.driving.is_none() && f.player.landed {
-            let d = (f.player.character.position + Vec3::Y).distance(at);
-            if d < reach {
-                self.tally.taken_blasts += self.hurt_player(f, b.damage_at(d) * hers, Some(at));
+        let d = (f.player.character.position + Vec3::Y).distance(at);
+        if d < reach * 2.0 && !(f.player.driving.is_none() && d < reach && !self.spare_her) {
+            eprintln!(
+                "blast: {:08x} {d:.1} m off spares her: {}",
+                b.template,
+                if self.spare_her {
+                    "the wreck she rode spares her"
+                } else if f.player.driving.is_some() {
+                    "she is in a vehicle"
+                } else {
+                    "past its reach"
+                }
+            );
+        }
+        // Whoever is in its reach, on the ground or not: the 360's area
+        // damage has no grounded test (0x82291B88's target filter is the
+        // body's type, an angle and a player's group). Not traced: whether
+        // a seated rider's body is among its targets (kept out here).
+        if f.player.driving.is_none() && d < reach && !self.spare_her {
+            {
+                let before = self.hp;
+                let lost = self.hurt_player(f, b.damage_at(d) * hers, Some(at));
+                eprintln!("hurt: her health {before:.1} -> {:.1}", self.hp);
+                eprintln!(
+                    "blast: {:08x} reaches her {d:.1} m off: {:.1} x {hers} = {lost:.1} lost",
+                    b.template,
+                    b.damage_at(d)
+                );
+                self.tally.taken_blasts += lost;
                 self.blast_staggers_her(f, at, b.key);
             }
         }
@@ -7279,12 +7570,17 @@ impl Combat {
                 let cell = blast_cell(self.damage_table.as_ref(), v, b.key) * weak;
                 v.blast_parts(body, at, reach, |p| b.damage_at(p) * cell);
                 self.hurt_vehicle(f.physics, v, i, damage);
-                if v.wrecked {
-                    let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
-                    let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass * fudge(v);
-                    f.physics
-                        .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
-                }
+            }
+            // Every vehicle in its reach is pushed, whole or wrecked (the
+            // wreck whose blast it is too), as the 360 pushes each moving
+            // body it reaches (0x8215C560 -> 0x8215CBC8).
+            if d < reach {
+                let push = m2_engine::durability::BlastPush {
+                    at,
+                    radius: reach,
+                    force: b.max_force,
+                };
+                blast_push_vehicle(f.physics, v, id, body, push);
             }
         }
         if killed {
@@ -8099,6 +8395,100 @@ mod tests {
     }
 
     use super::*;
+
+    // A vehicle's world box, for the blast's rigid push: turned a
+    // quarter, its length lies along x.
+    #[test]
+    fn a_vehicles_world_box_is_its_box_as_placed() {
+        let at = Mat4::from_rotation_translation(
+            Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+            Vec3::new(10.0, 1.0, 0.0),
+        );
+        let (lo, hi) = world_box(at, (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.5, 2.0)));
+        assert!((lo - Vec3::new(8.0, 1.0, -1.0)).length() < 1e-4);
+        assert!((hi - Vec3::new(12.0, 2.5, 1.0)).length() < 1e-4);
+    }
+
+    // A car's wreck on her: `fx_Explosion_Large` (7 m, 160 to 150, her
+    // `Explosion` cell 0.2) and its `Explosion (RPG Frag)` (15 m, 300 to
+    // 40, her `Bullet` cell 0.25), each `max(least, damage x falloff)`
+    // (0x82291640), come within 6% of every loss Xenia measured.
+    // The game's own path for a car's wreck on her: both blasts through
+    // `explode_keyed` in one step, as `part_blasts` sets them off.
+    #[test]
+    fn a_wrecks_two_blasts_through_the_game_hurt_her_as_xenia_measured() {
+        let blast = |template, radius, damage, min_damage, max_force, key: &str| Blast {
+            template,
+            radius,
+            damage,
+            min_damage,
+            max_force,
+            key: Some(m2_assets::name_hash(key)),
+        };
+        let a = blast(0x8000_5695, 7.0, 160.0, 150.0, 300.0, "Explosion");
+        let b = blast(0x8000_a27b, 15.0, 300.0, 40.0, 500.0, "Bullet");
+        for (d, seen) in [(2.9, 88.7), (3.21, 85.1), (5.8, 73.2), (6.42, 69.2)] {
+            let mut physics = crate::npc::tests::ground();
+            let mut player = Player::new(0.0, 0.0, 0.0, None);
+            for _ in 0..usize::from(crate::player::SETTLED) {
+                player.update(&physics, crate::player::Intent::default(), 1.0 / 60.0);
+            }
+            let mut people = People::default();
+            let arsenal = Arsenal::default();
+            let mut vehicles: Vec<ParkedVehicle> = Vec::new();
+            // The damage table's `Hero` row as read: `Explosion` 0.2,
+            // `Bullet` 0.25 (and its first column 0).
+            let h = m2_assets::name_hash;
+            let mut combat = Combat {
+                hp: 120.0,
+                max_hp: 120.0,
+                damage_table: Some(DamageTable::from_cells(
+                    vec![h("Hero")],
+                    vec![0xed05_7225, h("Bullet"), h("Explosion")],
+                    vec![0.0, 0.25, 0.2],
+                )),
+                ..Combat::default()
+            };
+            let mut field = Field {
+                physics: &mut physics,
+                player: &mut player,
+                people: &mut people,
+                vehicles: &mut vehicles,
+                arsenal: &arsenal,
+                explosives: &mut [],
+            };
+            // The blast at her chest height, `d` off across the ground.
+            let at = field.player.character.position + Vec3::new(d, 1.0, 0.0);
+            combat.explode_keyed(&mut field, at, Some(a), a.key);
+            combat.explode_keyed(&mut field, at, Some(b), b.key);
+            let lost = 120.0 - combat.hp;
+            eprintln!("{d} m: lost {lost}");
+            assert!(
+                (lost - seen).abs() <= seen * 0.06,
+                "{d} m: {lost} against {seen}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrecks_two_blasts_hurt_her_as_xenia_measured() {
+        use m2_engine::durability::blast_damage;
+        for (d, seen) in [
+            (2.9, 88.7),
+            (3.21, 85.1),
+            (3.8, 86.4),
+            (5.8, 73.2),
+            (5.9, 74.6),
+            (6.42, 69.2),
+        ] {
+            let hit = blast_damage(160.0, 150.0, 7.0, d) * 0.2
+                + blast_damage(300.0, 40.0, 15.0, d) * 0.25;
+            assert!(
+                (hit - seen).abs() <= seen * 0.06,
+                "{d} m: {hit} against {seen}"
+            );
+        }
+    }
 
     // Put out of a car sunk under her (Xenia: 120 -> 19.6): 100 of her
     // health, never below 1, heard as a hurt with no direction.
@@ -9064,6 +9454,84 @@ mod tests {
         physics.step(1.0 / 60.0);
         assert!(!arc_clear(&physics, from, low, to, gravity));
         assert!(arc_clear(&physics, from, high, to, gravity));
+    }
+
+    #[test]
+    fn her_wrecked_vehicle_throws_her_clear_unhurt() {
+        use m2_engine::tuning::VehicleTuning;
+        let mut physics = ground();
+        let dt = 1.0 / 60.0;
+        let spec = crate::npc::tests::tank(VehicleTuning::default());
+        let id = physics.add_vehicle(&spec, Vec3::new(0.0, 0.1, 0.0), 0.0);
+        physics.step(dt);
+        let mut vehicles = vec![ParkedVehicle {
+            spec,
+            model: crate::npc::tests::empty_model(),
+            id: Some(id),
+            wrecked: false,
+            guid: None,
+            spot: None,
+            crew: Vec::new(),
+            turret: 0.0,
+            hijack_nodes: Vec::new(),
+            door_turns: Vec::new(),
+            gun: 0.0,
+            aims: Vec::new(),
+            rolled: 0.0,
+            fired: 0,
+            mg_fired: 0,
+            damage: 0.0,
+            hit: 0.0,
+            parts: None,
+            loose: Vec::new(),
+            debris_thrown: false,
+        }];
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        player.driving = Some(0);
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        // Mattias's 120, as measured.
+        let mut combat = Combat {
+            hp: 120.0,
+            ..Combat::default()
+        };
+        let full = combat.hp;
+        let mut field = Field {
+            physics: &mut physics,
+            player: &mut player,
+            people: &mut people,
+            vehicles: &mut vehicles,
+            arsenal: &arsenal,
+            explosives: &mut [],
+        };
+        // Whole, she stays in it.
+        combat.step(&mut field, Trigger::default(), dt);
+        assert_eq!(field.player.driving, Some(0));
+        assert_eq!(combat.hp, full);
+        // Wrecked: the death exit, out at her seat, not hurt by it, her
+        // ragdoll to start 10 m/s level away from the vehicle (no rig
+        // here, so none is made: the launch stays as given).
+        field.vehicles[0].wrecked = true;
+        combat.step(&mut field, Trigger::default(), dt);
+        assert_eq!(field.player.driving, None);
+        assert_eq!(combat.hp, full, "no health lost at the wreck");
+        let d = combat.death_exit.expect("a death exit");
+        assert!((d.launch.with_y(0.0).length() - 7.071).abs() < 1e-3);
+        assert!((d.launch.y - 7.071).abs() < 1e-3);
+        assert!(d.launch.dot((d.out - d.vehicle).with_y(0.0)) >= 0.0);
+        let middle = field
+            .physics
+            .vehicle_transform(id)
+            .unwrap()
+            .w_axis
+            .truncate();
+        let away = field
+            .player
+            .character
+            .position
+            .with_y(0.0)
+            .distance(middle.with_y(0.0));
+        assert!(away < 4.0, "{away} m from it");
     }
 
     #[test]

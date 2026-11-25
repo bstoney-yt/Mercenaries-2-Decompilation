@@ -249,6 +249,10 @@ struct Options {
     plough: Option<String>,
     /// With `--drive`: wreck it at speed at the end and watch it stop.
     wreck: bool,
+    /// `--wreck-rider-check`: her car (a Ridgeline and a semi too, where
+    /// loaded) wrecked under her, her throw and landing checked against
+    /// the 360's (`wreck-rider-check:` lines, [`wreck_rider_check`]).
+    wreck_rider_check: bool,
     /// `--exit-land-check`: she gets out of the car she drives and must
     /// land at once, whatever streams ([`exit_land_check`]).
     exit_land_check: bool,
@@ -258,6 +262,13 @@ struct Options {
     /// With `--drive` and `--wreck` or `--shoot-up`: get out of the wreck,
     /// walk to the fuel can it left and take it (testing).
     fuel_check: bool,
+    /// `--wreck-blast-check`: the car she drives is wrecked with her
+    /// 5.9 m off, and its flight and her health are logged against the
+    /// 360's (`wreck-blast-check:` lines, [`wreck_blast_check`]).
+    wreck_blast_check: bool,
+    /// `--wreck-blast-at <m>`: how far from the car's middle
+    /// `--wreck-blast-check` stands her.
+    wreck_blast_at: Option<f32>,
     /// `--survival-check`: her health clamp and survival mode on the
     /// game's own code, offscreen ([`combat::survival_check`]); then exit.
     survival_check: bool,
@@ -322,6 +333,9 @@ struct Options {
     paradrop_check: bool,
     /// `--gravity-check`: measure the physics world's gravity ([`gravity_check`]).
     gravity_check: bool,
+    /// `--vehicle-gravity-check`: her vehicle's fall in the air by its
+    /// template's gravity scale ([`vehicle_gravity_check`]).
+    vehicle_gravity_check: bool,
     /// `--toss-check crash|exit`: (turns on --drive) her vehicle into a
     /// wall, or left at 17.5 m/s, against the 360's toss ([`toss_check`]).
     toss_check: Option<String>,
@@ -866,6 +880,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--plough" => o.plough = Some(value()?.to_ascii_lowercase()),
             "--wreck" => o.wreck = true,
+            "--wreck-rider-check" => {
+                o.wreck_rider_check = true;
+                o.drive = true;
+            }
             "--exit-land-check" => {
                 o.exit_land_check = true;
                 o.drive = true;
@@ -875,6 +893,17 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.drive = true;
             }
             "--fuel-check" => o.fuel_check = true,
+            "--wreck-blast-check" => {
+                o.wreck_blast_check = true;
+                o.drive = true;
+            }
+            "--wreck-blast-at" => {
+                o.wreck_blast_at = Some(
+                    value()?
+                        .parse()
+                        .context("--wreck-blast-at expects metres")?,
+                )
+            }
             "--survival-check" => o.survival_check = true,
             "--log-check" => o.log_check = true,
             "--shoot-up" => {
@@ -1181,6 +1210,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--gravity-check" => {
                 o.gravity_check = true;
+                o.drive = true;
+            }
+            "--vehicle-gravity-check" => {
+                o.vehicle_gravity_check = true;
                 o.drive = true;
             }
             "--toss-check" => {
@@ -8140,6 +8173,9 @@ fn drive_for_screenshot(
     for _ in 0..90 {
         game.step(Intent::default(), tick);
     }
+    if options.vehicle_gravity_check {
+        return vehicle_gravity_check(backend, game, fov, aspect, tick, options.vehicle.as_deref());
+    }
     // A vehicle asked for that isn't parked here: one is parked. With
     // `--seat-check` it must have a gunner's own entrance (the island's
     // own M151 Softtop has none), so the start position doesn't matter.
@@ -8647,6 +8683,14 @@ fn drive_for_screenshot(
             .collect::<Vec<_>>()
             .join(", ")
     );
+    if options.wreck_rider_check {
+        wreck_rider_check(game, tick);
+        return Ok(());
+    }
+    if options.wreck_blast_check {
+        wreck_blast_check(game, tick, options.wreck_blast_at);
+        return Ok(());
+    }
     if options.exit_land_check {
         exit_land_check(game, tick);
         return Ok(());
@@ -10557,6 +10601,411 @@ fn fuel_check(game: &mut Game, tick: f32) {
             "fuel-check: at {:.1}: taken {gone}, fuel earned {fuel}",
             p.at
         );
+    }
+}
+
+/// `--wreck-rider-check` (it turns on `--drive`): she is seated in the
+/// car she drives, then in a Ridgeline and a semi if their models are
+/// loaded (each put where she is, whole). Each is wrecked through the
+/// vehicles' own damage ([`combat::Combat::kill_vehicle`]) at full
+/// health and her death exit watched until she is up (12 s at most,
+/// [`combat::DeathExit`]). Each passes if her health is unchanged, her
+/// ragdoll went live within two of the 360's frames, its launch was 10
+/// m/s level away from the vehicle ([`game::death_launch`]), and she got
+/// up; how high and far she went and when she rose are printed against
+/// Xenia's (+2.81 m, 8.75 m, 2.7 s), not gated. One
+/// `wreck-rider-check: PASS` or `FAIL ...` line.
+fn wreck_rider_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::Vec3;
+    let Some(first) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("wreck-rider-check: FAIL she drives nothing");
+        return;
+    };
+    let mut picks = vec![first];
+    for name in ["Ridgeline", "Semi"] {
+        if let Some(i) = game
+            .scene
+            .vehicles
+            .iter()
+            .position(|v| !v.wrecked && v.spec.label.contains(name))
+            .filter(|i| !picks.contains(i))
+        {
+            picks.push(i);
+        }
+    }
+    let (mut passed, mut fails) = (Vec::new(), Vec::new());
+    for i in picks {
+        let label = game.scene.vehicles[i].spec.label.clone();
+        // Put where she is (on the ground), whole, her at the wheel.
+        let here = game.focus();
+        if let Some(world) = game.scene.world.as_mut() {
+            let v = &mut game.scene.vehicles[i];
+            if v.wrecked {
+                fails.push(format!("the {label} is already a wreck"));
+                continue;
+            }
+            if i != first || v.id.is_none() {
+                if let Some(id) = v.id.take() {
+                    world.physics.remove_vehicle(id);
+                }
+                v.id = Some(
+                    world
+                        .physics
+                        .add_vehicle(&v.spec, here + Vec3::Y * 0.5, 0.0),
+                );
+            }
+        }
+        if let Some(p) = game.scene.player.as_mut() {
+            p.driving = Some(i);
+            p.landed = true;
+        }
+        game.ride = None;
+        for _ in 0..(1.5 / tick) as u32 {
+            game.step(Intent::default(), tick);
+        }
+        game.combat.death_exit_done = None;
+        let hp = game.combat.hp;
+        game.on_foot = true;
+        if let Some(world) = game.scene.world.as_mut() {
+            let v = &mut game.scene.vehicles[i];
+            game.combat.kill_vehicle(&mut world.physics, v, i);
+        }
+        eprintln!("wreck-rider-check: the {label} wrecked under her at {hp:.1} health");
+        let mut done = None;
+        let every = ((0.1 / tick).round() as u32).max(1);
+        let half = ((0.5 / tick).round() as u32).max(1);
+        let mut last_root: Option<Vec3> = None;
+        for k in 0..(12.0 / tick) as u32 {
+            game.step(Intent::default(), tick);
+            // Each half second her limp body is down: where its root is,
+            // how far it moved in that half second, how far it lies from
+            // the wreck's hull, and what each limb touches (v vehicle, o
+            // her own limb, g ground, w other fixed collision, d a loose
+            // body: debris, prop body, goods or pickup, r another ragdoll).
+            if k % half == 0
+                && let (Some(p), Some(w)) = (game.scene.player.as_ref(), game.scene.world.as_ref())
+                && let Some(doll) = p.ragdoll
+                && let Some(root) = crate::npc::limp_root(&w.physics, doll)
+            {
+                let hull = game.scene.vehicles[i]
+                    .id
+                    .and_then(|id| w.physics.vehicle_body_box(id))
+                    .map_or(f32::NAN, |(lo, hi)| root.clamp(lo, hi).distance(root));
+                let moved = last_root.replace(root).map_or(0.0, |q| q.distance(root));
+                let limbs: Vec<String> = w
+                    .physics
+                    .ragdoll_limb_contacts(doll)
+                    .iter()
+                    .filter(|l| !l.2.is_empty() || l.1 >= 0.2)
+                    .map(|l| format!("{}:{:.2}{}", l.0, l.1, l.2))
+                    .collect();
+                eprintln!(
+                    "wreck-rider-check: {:.1} s: her limp root at {root:.2}, moved {moved:.2} m in 0.5 s, {hull:.2} m from the wreck's hull; limbs (index:speed m/s, touching) {}",
+                    k as f32 * tick,
+                    limbs.join(" ")
+                );
+            }
+            // Her limp body's root each tenth of a second.
+            if k % every == 0
+                && let Some(p) = game.scene.player.as_ref()
+            {
+                let root = p
+                    .ragdoll
+                    .zip(game.scene.world.as_ref())
+                    .and_then(|(id, w)| crate::npc::limp_root(&w.physics, id));
+                eprintln!(
+                    "wreck-rider-check: {:.1} s: she is at {:.2}, her limp body's root at {}, down {}",
+                    k as f32 * tick,
+                    p.character.position,
+                    root.map_or("-".to_owned(), |r| format!("{r:.2}")),
+                    p.down
+                );
+            }
+            if let Some(d) = game.combat.death_exit_done.take() {
+                done = Some(d);
+                break;
+            }
+        }
+        // Two of the 360's frames.
+        const LIVE_BY: f32 = 2.0 / 30.0;
+        match done {
+            None => fails.push(format!("the {label}: no death exit seen in 12 s")),
+            Some(d) => {
+                let level = d.launch.with_y(0.0);
+                let away = (d.out - d.vehicle).with_y(0.0).normalize_or_zero();
+                let (out, up) = (
+                    crate::game::DEATH_EXIT_LAUNCH * crate::game::DEATH_EXIT_ANGLE.cos(),
+                    crate::game::DEATH_EXIT_LAUNCH * crate::game::DEATH_EXIT_ANGLE.sin(),
+                );
+                let by_rule = (level.length() - out).abs() <= 0.01
+                    && (d.launch.y - up).abs() <= 0.01
+                    && level.normalize_or_zero().dot(away) > 0.999;
+                let line = format!(
+                    "the {label}: launch {:.2} ({}), ragdoll live {}, peak +{:.2} m at {:.2} s, {:.2} m out, up {} (Xenia: +2.81 m at 0.6 s, 8.75 m, up 2.7 s; recorded, not gated), health {:.1} -> {:.1}",
+                    d.launch,
+                    if by_rule {
+                        "by the rule"
+                    } else {
+                        "NOT by the rule"
+                    },
+                    d.live_at
+                        .map_or("never".to_owned(), |t| format!("at {t:.3} s")),
+                    d.peak,
+                    d.peak_at,
+                    d.lay,
+                    d.up_at
+                        .map_or("not in 10 s".to_owned(), |t| format!("at {t:.2} s")),
+                    d.hp,
+                    d.hp_up
+                );
+                let ok = (d.hp_up - d.hp).abs() < 0.01
+                    && d.live_at.is_some_and(|t| t <= LIVE_BY + 1e-4)
+                    && by_rule
+                    && d.up_at.is_some();
+                if ok {
+                    passed.push(line);
+                } else {
+                    fails.push(line);
+                }
+            }
+        }
+        // Back on her feet for the next.
+        for _ in 0..(1.0 / tick) as u32 {
+            game.step(Intent::default(), tick);
+        }
+    }
+    if fails.is_empty() {
+        eprintln!("wreck-rider-check: PASS {}", passed.join("; "));
+    } else {
+        eprintln!(
+            "wreck-rider-check: FAIL {} (passed: {})",
+            fails.join("; "),
+            passed.join("; ")
+        );
+    }
+}
+
+/// The 360's car wreck in Xenia (a Phoenix shot dead, GodMode off, the
+/// hero 5.9 m from its middle): the car rose 5.3 m at 1.1 s, landed
+/// 16.4-16.6 m off, its top speed 17-18 m/s in the first 0.5 s; she lost
+/// 74.6 and slid 1.7 m.
+const XENIA_WRECK: (f32, f32, f32, f32) = (5.3, 16.5, 17.5, 74.6);
+
+/// Her health lost to a car's wreck in Xenia, by her distance from its
+/// middle (metres, health; full health, GodMode off): runs carblast24,
+/// dmg3b, dmg6b, carblast3n, carblast6m and the 2.9 m read.
+const XENIA_WRECK_HITS: [(f32, f32); 6] = [
+    (2.9, 88.7),
+    (3.21, 85.1),
+    (3.8, 86.4),
+    (5.8, 73.2),
+    (5.9, 74.6),
+    (6.42, 69.2),
+];
+
+/// How near Xenia's her loss must come for `--wreck-blast-check` to
+/// pass, of it.
+const WRECK_HIT_SLACK: f32 = 0.06;
+
+/// The blasts a car's wreck must set off for `--wreck-blast-check` to
+/// pass: `fx_Explosion_Large` and its `PhysicalLink`'d `Explosion (RPG
+/// Frag)`, the two area-damage objects Xenia saw on the death frame.
+const WRECK_BLASTS: [u32; 2] = [0x8000_5695, 0x8000_a27b];
+
+/// `--wreck-blast-check` (it turns on `--drive`): she gets out of the
+/// car she drives and stands 5.9 m from its middle; it is wrecked
+/// ([`combat::Combat::wreck_now`]: its blast goes off at the next step)
+/// and watched 6 s. Logs its blast, its highest rise and when, how far
+/// off it came down, its top speed in the first 0.5 s, and her health
+/// lost and how far she moved, each beside Xenia's
+/// ([`XENIA_WRECK`]). `--wreck-blast-at <m>` stands her that far from
+/// its middle instead (2.9, 3.21, 3.8, 5.8, 5.9 or 6.42: Xenia's,
+/// [`XENIA_WRECK_HITS`]). Ends `wreck-blast-check: PASS` when the wreck
+/// set off both of [`WRECK_BLASTS`] and her loss is within
+/// [`WRECK_HIT_SLACK`] of Xenia's at that distance, else `FAIL` with
+/// why. Its rise, landing and speed are logged beside Xenia's, not
+/// judged.
+fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
+    use m2_math::glam::Vec3;
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("wreck-blast-check: FAIL she drives nothing");
+        return;
+    };
+    let Some(id) = game.scene.vehicles[i].id else {
+        eprintln!("wreck-blast-check: FAIL her vehicle has no body");
+        return;
+    };
+    // Stopped, a while, then her out and 5.9 m off its middle. The car
+    // is held still all the while (driverless it would roll on, and her
+    // distance from it with it: the q728 runs' blasts went off 1 to 5 m
+    // from where she was measured from).
+    let still = |game: &mut Game| {
+        if let Some(w) = game.scene.world.as_mut() {
+            w.physics.set_vehicle_velocity(id, Vec3::ZERO);
+            w.physics.set_vehicle_spin(id, Vec3::ZERO);
+        }
+    };
+    for _ in 0..(1.0 / tick) as u32 {
+        still(game);
+        game.step(Intent::default(), tick);
+    }
+    let place = |game: &Game| {
+        let physics = &game.scene.world.as_ref()?.physics;
+        let (lo, hi) = game.scene.vehicles[i].spec.bounds;
+        let m = physics.vehicle_transform(id)?;
+        Some((
+            m.transform_point3((lo + hi) * 0.5),
+            physics.vehicle_velocity(id),
+        ))
+    };
+    let Some((start, _)) = place(game) else {
+        return;
+    };
+    if let (Some(world), Some(p)) = (game.scene.world.as_ref(), game.scene.player.as_mut()) {
+        game::get_out(&world.physics, &game.scene.vehicles[i], None, p);
+    }
+    let side = game.scene.world.as_ref().map_or(Vec3::X, |world| {
+        game.scene.vehicles[i]
+            .id
+            .and_then(|id| world.physics.vehicle_transform(id))
+            .map_or(Vec3::X, |m| m.x_axis.truncate().normalize_or(Vec3::X))
+    });
+    game.ride = None;
+    // On foot: only then is she stepped, and lands where she was put
+    // (the q728c runs: never set, she hung where she was dropped).
+    game.on_foot = true;
+    // Put down at its side, then, if she doesn't come down there (the
+    // q728d runs at 2.9 and 3.8 m), at the other side: the distance from
+    // its middle is what Xenia's are, not the side. Each waits 1 s, then
+    // up to 5 s more for her to land.
+    let mut down = false;
+    for (k, way) in [side, -side].into_iter().enumerate() {
+        // Beside the car she just left: the ground is in, she lands at
+        // once ([`crate::player::Player::step_out_at`]; q728d: put down by
+        // `drop_at`, she waited on the whole world's streaming, which
+        // never stopped).
+        if let Some(p) = game.scene.player.as_mut() {
+            p.step_out_at(start + way * at.unwrap_or(5.9));
+        }
+        for _ in 0..(6.0 / tick) as u32 {
+            if game.scene.player.as_ref().is_some_and(|p| p.landed) {
+                break;
+            }
+            still(game);
+            game.step(Intent::default(), tick);
+        }
+        if game.scene.player.as_ref().is_some_and(|p| p.landed) {
+            down = true;
+            break;
+        }
+        eprintln!(
+            "wreck-blast-check: side {k}: she did not come down: {}",
+            game.scene
+                .player
+                .as_ref()
+                .map_or("no player".to_owned(), |p| p.landing_state())
+        );
+    }
+    for _ in 0..(1.0 / tick) as u32 {
+        still(game);
+        game.step(Intent::default(), tick);
+    }
+    if !down || !game.scene.player.as_ref().is_some_and(|p| p.landed) {
+        eprintln!("wreck-blast-check: FAIL she never came down where she was put (either side)");
+        return;
+    }
+    still(game);
+    // As Xenia's runs (Mattias, 120 of 120): so a near blast's loss is not
+    // cut by a lower whole health or her clamp.
+    game.combat.max_hp = 120.0;
+    game.combat.hp = 120.0;
+    let her = |game: &Game| game.scene.player.as_ref().map(|p| p.character.position);
+    let (hp, her_from) = (game.combat.hp, her(game));
+    // Where the car is now, as it is wrecked: her distance from its
+    // middle is what Xenia's are.
+    let start = place(game).map_or(start, |(m, _)| m);
+    let off = her_from.map_or(0.0, |h| h.with_y(0.0).distance(start.with_y(0.0)));
+    eprintln!(
+        "wreck-blast-check: the {} at {start:.1}, she {off:.1} m off with {hp:.1} health",
+        game.scene.vehicles[i].spec.label,
+    );
+    if (off - at.unwrap_or(5.9)).abs() > 0.3 {
+        eprintln!(
+            "wreck-blast-check: FAIL she stands {off:.1} m from the car's middle, not {:.2}",
+            at.unwrap_or(5.9)
+        );
+        return;
+    }
+    if let Some(world) = game.scene.world.as_mut() {
+        let v = &mut game.scene.vehicles[i];
+        game.combat.wreck_now(&mut world.physics, v, i);
+    }
+    let (mut top, mut top_at, mut fastest, mut landed) = (0.0f32, 0.0, 0.0f32, None);
+    let mut falling = false;
+    // Her least health in the watch: the blasts' loss, before her health
+    // comes back (4 s on, at 25 a second: by 6 s some 50 of it).
+    let mut least = game.combat.hp;
+    for k in 0..(6.0 / tick) as u32 {
+        game.step(Intent::default(), tick);
+        least = least.min(game.combat.hp);
+        let t = (k + 1) as f32 * tick;
+        let Some((at, v)) = place(game) else {
+            break;
+        };
+        let rise = at.y - start.y;
+        if rise > top {
+            (top, top_at) = (rise, t);
+        }
+        if t <= 0.5 {
+            fastest = fastest.max(v.length());
+        }
+        // Down again: falling after its height, then its fall stopped (a
+        // wreck at rest on its side or roof keeps its middle higher than
+        // it began: the q728c runs never saw it within 0.3 m).
+        if v.y < -2.0 && t > top_at {
+            falling = true;
+        }
+        if landed.is_none() && top > 0.5 && falling && v.y > -0.5 {
+            landed = Some(at.with_y(0.0).distance(start.with_y(0.0)));
+        }
+    }
+    let (rise, off, speed, lost) = XENIA_WRECK;
+    eprintln!(
+        "wreck-blast-check: rose {top:.1} m at {top_at:.2} s (360 {rise}), landed {} m off (360 {off}), top speed {fastest:.1} m/s (360 {speed}); she lost {:.1} (360 {lost}) and moved {:.1} m",
+        landed.map_or("never".to_owned(), |d| format!("{d:.1}")),
+        hp - least,
+        her(game)
+            .zip(her_from)
+            .map_or(0.0, |(a, b)| a.with_y(0.0).distance(b.with_y(0.0)))
+    );
+    let away = at.unwrap_or(5.9);
+    let lost = hp - least;
+    let fired = &game.combat.part_blasts_fired;
+    let missing: Vec<String> = WRECK_BLASTS
+        .iter()
+        .filter(|t| !fired.contains(t))
+        .map(|t| format!("{t:08x}"))
+        .collect();
+    let want = XENIA_WRECK_HITS
+        .iter()
+        .find(|(d, _)| (d - away).abs() < 0.01)
+        .map(|&(_, h)| h);
+    match want {
+        _ if !missing.is_empty() => eprintln!(
+            "wreck-blast-check: FAIL the {} set off {fired:08x?}, not {}",
+            game.scene.vehicles[i].spec.label,
+            missing.join(", ")
+        ),
+        None => eprintln!(
+            "wreck-blast-check: FAIL {away} m is none of Xenia's distances (2.9, 3.21, 3.8, 5.8, 5.9, 6.42)"
+        ),
+        Some(h) if (lost - h).abs() <= h * WRECK_HIT_SLACK => {
+            eprintln!("wreck-blast-check: PASS she lost {lost:.1} at {away} m (Xenia {h})")
+        }
+        Some(h) => eprintln!(
+            "wreck-blast-check: FAIL she lost {lost:.1} at {away} m, Xenia {h} (within {:.0}% asked)",
+            WRECK_HIT_SLACK * 100.0
+        ),
     }
 }
 
@@ -13697,6 +14146,16 @@ impl ApplicationHandler for App {
 mod tests {
     use super::*;
 
+    // A scaled tank's airborne fall by the code: 18 for all its bodies,
+    // plus the tracks' 9 on its chassis shared over all its mass; 27 with
+    // no turret, less with one.
+    #[test]
+    fn a_joined_tank_falls_at_18_plus_its_chassis_share_of_9() {
+        assert!((joined_tank_fall(2.0, 2.0, 50_000.0, 0.0) - 27.0).abs() < 1e-4);
+        assert!((joined_tank_fall(2.0, 2.0, 30_000.0, 10_000.0) - 24.75).abs() < 1e-3);
+        assert!((joined_tank_fall(1.0, 1.0, 30_000.0, 10_000.0) - 9.0).abs() < 1e-4);
+    }
+
     // `--drive`: it went 8 m or more, upright and whole, with her in it;
     // ploughing asks only upright and whole.
     #[test]
@@ -14008,121 +14467,160 @@ fn ditch_check(game: &mut Game, tick: f32) {
     eprintln!("ditch-check: {}", verdict(ok && ok2));
 }
 
-/// `--runover-check`: she gets out of her vehicle, stands 7 m ahead of
-/// it, and it is driven straight at her for 3 s at 0, 4, 8 and 12 m/s,
-/// against the 360's proxy contact damage ([`m2_engine::run_over`]). The
-/// per-update `run over: contact:` lines (stderr) give the closing, the
-/// event size and the damage.
-///
-/// Pass: at 0 m/s she loses nothing (the 360: a driverless bike lying by
-/// her); at 8 m/s she loses health; at 12 m/s more than at 8. The 4 m/s
-/// push is printed, not gated: the 360's code gives nothing there for
-/// her standing still (closing under 6 m/s), while Xenia saw 2.1-2.6 a
-/// frame on slow pushes with her walking about the lane.
-fn runover_check(game: &mut Game, tick: f32) -> bool {
-    use m2_math::glam::Vec3;
-    let verdict = |ok: bool| if ok { "PASS" } else { "FAIL" };
-    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
-        println!("runover-check: FAIL not in a vehicle");
-        return false;
+/// How near `--vehicle-gravity-check` asks a scaled tank's airborne fall
+/// to come to [`joined_tank_fall`]'s, m/s².
+const SCALED_TANK_SLACK: f32 = 0.5;
+
+/// A scaled tank's airborne fall, m/s², by the 360 code (not yet
+/// measured: Xenia's tank3): every one of its object's moving bodies,
+/// chassis, turret and gun, is pulled at `scale` x the world's 9.0 by
+/// its gravity action (0x821831B0 gives each one, 0x82180778); and every
+/// step, with no gate on being airborne, `_TankPhysics`' step
+/// (0x821A49E8) calls 0x821A4F10, which counts its six track points in
+/// contact (bytes +0x80 .. +0x300 of the tracks, stride 0x80) and pulls
+/// the **chassis** (its own mass, 0x8262C120 of the body at +0x18) down
+/// by (GravityFactor - 1) x (6 - those) x mass x 1.5 (0x820D2F6C) through
+/// its motion (vfunc +0x58 with the step's dt, taken as a force over it:
+/// unverified). The turret and gun ride on the chassis by their hinges,
+/// so the whole takes the chassis's pull over all its mass: `scale x 9 +
+/// (GravityFactor - 1) x 6 x 1.5 x chassis / (chassis + turret and
+/// gun)`. For the M1A2 (scale 2, factor 2): 18 + 9 x its chassis share.
+fn joined_tank_fall(scale: f32, gravity_factor: f32, chassis: f32, others: f32) -> f32 {
+    let share = chassis / (chassis + others).max(1e-3);
+    m2_engine::physics::WORLD_GRAVITY * scale + (gravity_factor - 1.0) * 6.0 * 1.5 * share
+}
+
+/// `--vehicle-gravity-check` (it turns on `--drive`): a tank whose
+/// template carries a `PhysicsPropertyGravityScaler` of 2 (one whose label
+/// holds `--vehicle`'s name first, an M1A2 asked), from those loaded, or,
+/// with none, the island's tanks parked for it and waited for (up to
+/// 90 s). Its spec, alone in an empty physics world 500 m up, is let fall
+/// 0.5 s; its fall (m/s², from its speed) is logged beside the world's
+/// gravity times its scale. Nothing is seated: q771 (ace782f1, ffe269f7)
+/// asked her into an M1A2 and got `drive: no vehicle to get in`, and no
+/// verdict. `PASS` when it falls within [`SCALED_TANK_SLACK`] of [`joined_tank_fall`]; else `FAIL`
+/// with why, no scaled tank among them included.
+fn vehicle_gravity_check(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    tick: f32,
+    want: Option<&str>,
+) -> anyhow::Result<()> {
+    use m2_engine::Physics;
+    use m2_engine::physics::{WORLD_GRAVITY, vehicle_gravity_scale};
+    use m2_math::glam::{Quat, Vec3};
+    const DT: f32 = 1.0 / 60.0;
+    let pick = |game: &Game| -> Option<usize> {
+        let scaled = |v: &crate::scene::ParkedVehicle| v.spec.tuning.gravity_scale == Some(2.0);
+        let named = |v: &crate::scene::ParkedVehicle| {
+            want.is_some_and(|w| v.spec.label.to_ascii_lowercase().contains(w))
+        };
+        let vs = &game.scene.vehicles;
+        (0..vs.len())
+            .find(|&i| scaled(&vs[i]) && named(&vs[i]))
+            .or_else(|| (0..vs.len()).find(|&i| scaled(&vs[i])))
     };
-    let label = game.scene.vehicles[i].spec.label.clone();
-    let mass = game.scene.vehicles[i].spec.mass;
-    let Some(id) = game.scene.vehicles[i].id else {
-        println!("runover-check: FAIL the {label} has no body");
-        return false;
-    };
-    let mut input = input::Input::default();
-    input.button(input::Action::Use, true);
-    game.tick(&mut input, &config::CameraConfig::default(), false, tick);
-    let mut input = input::Input::default();
-    input.button(input::Action::Use, false);
-    game.tick(&mut input, &config::CameraConfig::default(), false, tick);
-    let mut t = 0.0;
-    while t < 2.0 {
-        game.step(Intent::default(), tick);
-        t += tick;
-    }
-    if game
-        .scene
-        .player
-        .as_ref()
-        .is_none_or(|p| p.driving.is_some())
-    {
-        println!("runover-check: FAIL she did not get out of the {label}");
-        return false;
-    }
-    let Some(start) = game
-        .scene
-        .world
-        .as_ref()
-        .and_then(|w| w.physics.vehicle_transform(id))
-    else {
-        println!("runover-check: FAIL the {label} has no place");
-        return false;
-    };
-    let (_, facing, home) = start.to_scale_rotation_translation();
-    let ahead = start
-        .transform_vector3(Vec3::Z)
-        .with_y(0.0)
-        .normalize_or(Vec3::Z);
-    let mut lost = Vec::new();
-    for speed in [0.0f32, 4.0, 8.0, 12.0] {
-        // Each run from where she parked it, her 7 m ahead.
-        if let Some(w) = game.scene.world.as_mut() {
-            w.physics.place_vehicle(id, home + Vec3::Y * 0.2, facing);
-        }
-        let spot = home + ahead * 7.0;
-        let ground = game
+    if pick(game).is_none() {
+        let tanks: Vec<m2_engine::CatalogueEntry> = game
             .scene
-            .world
+            .catalogue
             .as_ref()
-            .and_then(|w| w.physics.cast_ray(spot + Vec3::Y * 3.0, -Vec3::Y, 10.0))
-            .map_or(spot.y, |(d, _)| spot.y + 3.0 - d);
-        game.combat.hp = 100.0;
-        game.combat.down = 0.0;
-        let before = game.combat.run_overs;
-        if let Some(p) = game.scene.player.as_mut() {
-            p.character.position = Vec3::new(spot.x, ground, spot.z);
-            p.character.velocity = Vec3::ZERO;
-        }
-        let mut t = 0.0;
-        while t < 3.0 {
-            if let Some(w) = game.scene.world.as_mut() {
-                let v = w.physics.vehicle_velocity(id);
-                w.physics
-                    .set_vehicle_velocity(id, ahead * speed + Vec3::Y * v.y.min(0.0));
-            }
-            game.step(Intent::default(), tick);
-            // Kept alive (her health back to full each update) so every
-            // contact update is counted: a heavy vehicle would kill her
-            // and the dead take no more (each update's damage is logged).
-            game.combat.hp = game.combat.max_hp;
-            t += tick;
-        }
-        let hits = game.combat.run_overs.0 - before.0;
-        let health = game.combat.run_overs.1 - before.1; // kept alive: the damage done
-        println!(
-            "runover-check: the {label} ({mass:.0} kg) at {speed:.0} m/s into her standing:              {hits} damaging contact updates, {health:.1} health lost"
+            .map(|c| {
+                let mut t: Vec<_> = c
+                    .vehicles
+                    .iter()
+                    .filter(|e| e.kind == "tank")
+                    .cloned()
+                    .collect();
+                // The asked one first.
+                t.sort_by_key(|e| !want.is_some_and(|w| e.label.to_ascii_lowercase().contains(w)));
+                t
+            })
+            .unwrap_or_default();
+        eprintln!(
+            "vehicle-gravity-check: no scaled tank loaded; parking the island's {} tanks",
+            tanks.len()
         );
-        lost.push(health);
+        if !tanks.is_empty() {
+            game.park_more(tanks);
+            let waited = Instant::now();
+            while pick(game).is_none() && waited.elapsed() < Duration::from_secs(90) {
+                game.step(Intent::default(), tick);
+                render(backend, game, fov, aspect, None)?;
+            }
+        }
     }
-    let still = lost[0] == 0.0;
-    let fast = lost[2] > 0.0;
-    let faster = lost[3] > lost[2];
-    println!("runover-check: at rest it does nothing: {}", verdict(still));
-    println!("runover-check: at 8 m/s it hurts her: {}", verdict(fast));
-    println!(
-        "runover-check: at 12 m/s more than at 8: {}",
-        verdict(faster)
+    let Some(i) = pick(game) else {
+        let loaded: Vec<String> = game
+            .scene
+            .vehicles
+            .iter()
+            .map(|v| format!("{} {:?}", v.spec.label, v.spec.tuning.gravity_scale))
+            .collect();
+        eprintln!(
+            "vehicle-gravity-check: FAIL no tank with a gravity scale of 2 loaded or parked in 90 s (loaded: {})",
+            loaded.join(", ")
+        );
+        return Ok(());
+    };
+    let spec = &game.scene.vehicles[i].spec;
+    let scale = spec.tuning.gravity_scale;
+    let mut p = Physics::new();
+    let id = p.add_vehicle_turned(spec, Vec3::new(0.0, 500.0, 0.0), Quat::IDENTITY);
+    let steps = 30;
+    for _ in 0..steps {
+        p.step(DT);
+    }
+    let fall = -p.vehicle_velocity(id).y / (steps as f32 * DT);
+    // Each term that pulls a chassis down in the air, as the port has
+    // them (log only): the world's gravity times its scale (the gravity
+    // action, 0x82180778); a tracked vehicle's pull on each track point
+    // off the ground, (GravityFactor - 1) x 1.5 m/s² a point
+    // (`drive_tracks`, 0x821A4F10); a car's GravityFactor pull
+    // (x GRAVITY_360) applies only with most wheels down, so none here.
+    let points = spec.wheels.len();
+    let track = spec.tuning.tank.map(|t| {
+        (
+            t.gravity_factor,
+            (t.gravity_factor - 1.0) * points as f32 * 1.5,
+        )
+    });
+    let car = spec.tuning.springs.map(|s| s.gravity_factor);
+    eprintln!(
+        "vehicle-gravity-check: terms: world {WORLD_GRAVITY} x scale {} = {:.2}; tracks {} ({points} points off the ground, GravityFactor {:?}) = {:.2}; car GravityFactor {car:?} (wheels down only: 0 in the air); sum {:.2}, measured {fall:.2}",
+        vehicle_gravity_scale(scale),
+        WORLD_GRAVITY * vehicle_gravity_scale(scale),
+        if track.is_some() { "pull" } else { "none" },
+        track.map(|t| t.0),
+        track.map_or(0.0, |t| t.1),
+        WORLD_GRAVITY * vehicle_gravity_scale(scale) + track.map_or(0.0, |t| t.1),
     );
-    println!(
-        "runover-check: slow push at 4 m/s: {:.1} lost (360 code: none for her standing;          Xenia: 2.1-2.6 a frame with her walking): not gated",
-        lost[1]
+    let (chassis, others) = p.vehicle_body_masses(id).unwrap_or((spec.mass, 0.0));
+    let gravity_factor = spec.tuning.tank.map_or(1.0, |t| t.gravity_factor);
+    let want_fall = joined_tank_fall(
+        vehicle_gravity_scale(scale),
+        gravity_factor,
+        chassis,
+        others,
     );
-    let ok = still && fast && faster;
-    println!("runover-check: {}", verdict(ok));
-    ok
+    let slack = SCALED_TANK_SLACK;
+    eprintln!(
+        "vehicle-gravity-check: bodies: chassis {chassis:.0} kg, turret and gun {others:.0} kg; GravityFactor {gravity_factor}; the 360's joined fall {want_fall:.2}"
+    );
+    eprintln!(
+        "vehicle-gravity-check: the {} (scale {scale:?}) falls at {fall:.2} m/s/s in the air; the world's {WORLD_GRAVITY} x {} = {:.2}; a scaled tank's {want_fall} with its six track points' pull (code-derived, not yet measured)",
+        spec.label,
+        vehicle_gravity_scale(scale),
+        WORLD_GRAVITY * vehicle_gravity_scale(scale)
+    );
+    if (fall - want_fall).abs() <= slack {
+        eprintln!("vehicle-gravity-check: PASS");
+    } else {
+        eprintln!("vehicle-gravity-check: FAIL it falls at {fall:.2}, not {want_fall} +- {slack}");
+    }
+    Ok(())
 }
 
 /// `--toss-check crash|exit`, against the 360's toss (0x822A2B60,
@@ -14387,6 +14885,123 @@ fn toss_check(game: &mut Game, tick: f32, mode: &str) {
         }
         _ => println!("toss-check: FAIL unknown mode {mode:?} (crash or exit)"),
     }
+}
+
+/// `--runover-check`: she gets out of her vehicle, stands 7 m ahead of
+/// it, and it is driven straight at her for 3 s at 0, 4, 8 and 12 m/s,
+/// against the 360's proxy contact damage ([`m2_engine::run_over`]). The
+/// per-update `run over: contact:` lines (stderr) give the closing, the
+/// event size and the damage.
+///
+/// Pass: at 0 m/s she loses nothing (the 360: a driverless bike lying by
+/// her); at 8 m/s she loses health; at 12 m/s more than at 8. The 4 m/s
+/// push is printed, not gated: the 360's code gives nothing there for
+/// her standing still (closing under 6 m/s), while Xenia saw 2.1-2.6 a
+/// frame on slow pushes with her walking about the lane.
+fn runover_check(game: &mut Game, tick: f32) -> bool {
+    use m2_math::glam::Vec3;
+    let verdict = |ok: bool| if ok { "PASS" } else { "FAIL" };
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        println!("runover-check: FAIL not in a vehicle");
+        return false;
+    };
+    let label = game.scene.vehicles[i].spec.label.clone();
+    let mass = game.scene.vehicles[i].spec.mass;
+    let Some(id) = game.scene.vehicles[i].id else {
+        println!("runover-check: FAIL the {label} has no body");
+        return false;
+    };
+    let mut input = input::Input::default();
+    input.button(input::Action::Use, true);
+    game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+    let mut input = input::Input::default();
+    input.button(input::Action::Use, false);
+    game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+    let mut t = 0.0;
+    while t < 2.0 {
+        game.step(Intent::default(), tick);
+        t += tick;
+    }
+    if game
+        .scene
+        .player
+        .as_ref()
+        .is_none_or(|p| p.driving.is_some())
+    {
+        println!("runover-check: FAIL she did not get out of the {label}");
+        return false;
+    }
+    let Some(start) = game
+        .scene
+        .world
+        .as_ref()
+        .and_then(|w| w.physics.vehicle_transform(id))
+    else {
+        println!("runover-check: FAIL the {label} has no place");
+        return false;
+    };
+    let (_, facing, home) = start.to_scale_rotation_translation();
+    let ahead = start
+        .transform_vector3(Vec3::Z)
+        .with_y(0.0)
+        .normalize_or(Vec3::Z);
+    let mut lost = Vec::new();
+    for speed in [0.0f32, 4.0, 8.0, 12.0] {
+        // Each run from where she parked it, her 7 m ahead.
+        if let Some(w) = game.scene.world.as_mut() {
+            w.physics.place_vehicle(id, home + Vec3::Y * 0.2, facing);
+        }
+        let spot = home + ahead * 7.0;
+        let ground = game
+            .scene
+            .world
+            .as_ref()
+            .and_then(|w| w.physics.cast_ray(spot + Vec3::Y * 3.0, -Vec3::Y, 10.0))
+            .map_or(spot.y, |(d, _)| spot.y + 3.0 - d);
+        game.combat.hp = 100.0;
+        game.combat.down = 0.0;
+        let before = game.combat.run_overs;
+        if let Some(p) = game.scene.player.as_mut() {
+            p.character.position = Vec3::new(spot.x, ground, spot.z);
+            p.character.velocity = Vec3::ZERO;
+        }
+        let mut t = 0.0;
+        while t < 3.0 {
+            if let Some(w) = game.scene.world.as_mut() {
+                let v = w.physics.vehicle_velocity(id);
+                w.physics
+                    .set_vehicle_velocity(id, ahead * speed + Vec3::Y * v.y.min(0.0));
+            }
+            game.step(Intent::default(), tick);
+            // Kept alive (her health back to full each update) so every
+            // contact update is counted: a heavy vehicle would kill her
+            // and the dead take no more (each update's damage is logged).
+            game.combat.hp = game.combat.max_hp;
+            t += tick;
+        }
+        let hits = game.combat.run_overs.0 - before.0;
+        let health = game.combat.run_overs.1 - before.1; // kept alive: the damage done
+        println!(
+            "runover-check: the {label} ({mass:.0} kg) at {speed:.0} m/s into her standing:              {hits} damaging contact updates, {health:.1} health lost"
+        );
+        lost.push(health);
+    }
+    let still = lost[0] == 0.0;
+    let fast = lost[2] > 0.0;
+    let faster = lost[3] > lost[2];
+    println!("runover-check: at rest it does nothing: {}", verdict(still));
+    println!("runover-check: at 8 m/s it hurts her: {}", verdict(fast));
+    println!(
+        "runover-check: at 12 m/s more than at 8: {}",
+        verdict(faster)
+    );
+    println!(
+        "runover-check: slow push at 4 m/s: {:.1} lost (360 code: none for her standing;          Xenia: 2.1-2.6 a frame with her walking): not gated",
+        lost[1]
+    );
+    let ok = still && fast && faster;
+    println!("runover-check: {}", verdict(ok));
+    ok
 }
 
 fn gravity_check(game: &Game) {
