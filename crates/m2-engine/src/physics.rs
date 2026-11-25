@@ -3568,7 +3568,8 @@ pub struct Physics {
     /// their contacts (a new contact wakes a body in rapier).
     prop_sleep: Vec<r::RigidBodyHandle>,
     /// Goods just loaded, put to sleep again after the step they were
-    /// added in unless something awake touches them ([`Physics::add_cargo`]).
+    /// added in unless something awake outside them touches them
+    /// ([`Physics::add_cargo`]).
     cargo_sleep: Vec<r::RigidBodyHandle>,
     /// Every loaded piece of goods: one asleep is woken once an awake
     /// dynamic body's collision pairs with it (Havok wakes an inactive
@@ -3826,10 +3827,23 @@ impl Physics {
                 rest.asleep = true;
             }
         }
-        for h in std::mem::take(&mut self.cargo_sleep) {
-            if !self.paired_with_awake(h, false)
+        // Goods just loaded go back to sleep together, as the 360 adds
+        // them (activation 0, 0x82165A18; Xenia settle8: the truck and its
+        // crates one island, asleep throughout at velocity 0, none pushed
+        // apart where their records overlap). Only an awake body outside
+        // the batch keeps one awake: the truck once it is awake, or a
+        // passer-by. Rapier woke every one of them at this step (each was
+        // just added), so a pair within the batch says nothing.
+        let batch = std::mem::take(&mut self.cargo_sleep);
+        for &h in &batch {
+            if !self.paired_with_awake_except(h, false, &batch)
                 && let Some(b) = self.world.bodies.get_mut(h)
             {
+                // Not put back where it was loaded: moving a body wakes its
+                // island in Rapier. The one step Rapier ran it awake moves
+                // it by at most a step of gravity (g dt², under 3 mm).
+                b.set_linvel(r::Vector::ZERO, false);
+                b.set_angvel(r::Vector::ZERO, false);
                 b.sleep();
             }
         }
@@ -4392,6 +4406,17 @@ impl Physics {
     /// `gap_only`, only a pair with no contact point yet (one in contact
     /// Rapier's islands wake by themselves).
     fn paired_with_awake(&self, h: r::RigidBodyHandle, gap_only: bool) -> bool {
+        self.paired_with_awake_except(h, gap_only, &[])
+    }
+
+    /// [`paired_with_awake`](Self::paired_with_awake), not counting the
+    /// bodies in `except`.
+    fn paired_with_awake_except(
+        &self,
+        h: r::RigidBodyHandle,
+        gap_only: bool,
+        except: &[r::RigidBodyHandle],
+    ) -> bool {
         let Some(b) = self.world.bodies.get(h) else {
             return false;
         };
@@ -4409,7 +4434,7 @@ impl Physics {
                     .colliders
                     .get(other)
                     .and_then(|o| o.parent())
-                    .filter(|&ob| ob != h)
+                    .filter(|&ob| ob != h && !except.contains(&ob))
                     .and_then(|ob| self.world.bodies.get(ob))
                     .is_some_and(|ob| ob.is_dynamic() && !ob.is_sleeping())
             })

@@ -11871,8 +11871,12 @@ const WRECK_LAND_HEIGHT: f32 = 0.6;
 /// 23.7 ms gap), which no body speed in phys8a reaches.
 const XENIA_NEXT_SPEED: f32 = 11.66;
 const NEXT_SPEED_SLACK: f32 = 1.5;
-/// Its highest rise and where it lands, metres (phys3-6).
-const XENIA_WRECK_PEAK: (f32, f32) = (4.9, 5.3);
+/// Its highest rise and where it lands, metres (phys3-6). The rise's top
+/// holds Xenia's own launch (changed 2026-11-25): its up speed 9.813 m/s
+/// at the 360's gravity of 9 rises 9.813² / (2 x 9) = 5.3497 m, which
+/// Xenia prints rounded as "5.3"; 5.35, inclusive, is the least two-place
+/// value that holds it (was 5.3).
+const XENIA_WRECK_PEAK: (f32, f32) = (4.9, 5.35);
 const XENIA_WRECK_LANDS: (f32, f32) = (11.0, 15.6);
 /// The step after: its blasts' change, level only (up topped away, as
 /// 0x8215BF38 tops it; phys8a: they land a frame after the launch, as
@@ -15747,6 +15751,15 @@ mod tests {
         assert!(parked_sleep_verdict(&[w(Some(3.5), 0.0)]).is_err());
         assert!(parked_sleep_verdict(&[w(Some(1.0), 0.06)]).is_err());
         assert!(parked_sleep_verdict(&[]).is_err());
+    }
+
+    // The wreck's rise band holds the rise of Xenia's own launch (up
+    // 9.813 m/s at the 360's gravity of 9), and no more than to two places.
+    #[test]
+    fn the_wreck_rise_band_holds_xenias_own_launch() {
+        let rise = 9.813_f32 * 9.813 / (2.0 * 9.0);
+        assert!(rise > 5.3 && rise <= XENIA_WRECK_PEAK.1, "{rise}");
+        assert!(XENIA_WRECK_PEAK.1 - rise < 0.01);
     }
 
     // The parked truck's crates pass when all stay aboard, none fell

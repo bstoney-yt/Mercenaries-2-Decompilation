@@ -3053,6 +3053,38 @@ mod tests {
     // Goods are added asleep and at rest (the 360's add, activation 0,
     // 0x82165958), and wake once something awake touches them: a moving
     // truck's bed, here a body dropped onto them.
+    // Goods loaded where their records overlap (0.3-0.5 m, as the El
+    // Grande's do) go back to sleep together after the step they were
+    // added at, at rest, and are not pushed apart (Xenia settle8: one
+    // island asleep throughout, velocity 0); within the batch, Rapier's
+    // wake of a body just added keeps none awake.
+    #[test]
+    fn overlapping_goods_loaded_together_stay_asleep_and_put() {
+        let mut physics = crate::npc::tests::ground();
+        let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.4), 50.0);
+        let places = [
+            Vec3::new(0.0, 0.41, 0.0),
+            Vec3::new(0.35, 0.41, 0.0),
+            Vec3::new(0.0, 0.41, 0.45),
+            Vec3::new(0.3, 0.61, 0.3),
+        ];
+        let crates: Vec<_> = places
+            .iter()
+            .map(|&p| physics.add_cargo(&piece, Mat4::from_translation(p)))
+            .collect();
+        for _ in 0..120 {
+            physics.step(1.0 / 60.0);
+        }
+        for (c, p) in crates.iter().zip(places) {
+            assert_eq!(physics.debris_asleep(*c), Some(true), "awake at {p}");
+            assert_eq!(physics.debris_velocity(*c).map(|v| v.0), Some(Vec3::ZERO));
+            let at = physics.debris_place(*c).unwrap().w_axis.truncate();
+            // At most the one step Rapier runs a body just added awake
+            // (a step of gravity, g dt² = 2.7 mm), not pushed apart.
+            assert!((at - p).length() < 5e-3, "pushed from {p} to {at}");
+        }
+    }
+
     #[test]
     fn loaded_goods_start_asleep_and_wake_when_touched() {
         let mut physics = crate::npc::tests::ground();
