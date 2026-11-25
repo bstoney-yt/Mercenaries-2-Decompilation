@@ -2240,6 +2240,19 @@ impl Game {
                     .into_iter()
                     .map(|(id, label, vy)| (id, label, vy, KICK_LOOK)),
             );
+            // What a vehicle carries is held on its bed until it has
+            // settled where it was placed ([`Props::hold_until_settled`]).
+            let vehicles = &self.scene.vehicles;
+            for (index, since, n) in self.scene.props.hold_until_settled(
+                &mut world.physics,
+                |i| vehicles.get(i).and_then(|v| v.id),
+                dt,
+            ) {
+                eprintln!(
+                    "cargo: the {}'s {n} loaded pieces let go after {since:.2} s, it settled where it was placed",
+                    vehicles.get(index).map_or("?", |v| v.spec.label.as_str())
+                );
+            }
             let physics = &world.physics;
             self.kicks.retain_mut(|(id, label, vy, left)| {
                 *left -= dt;

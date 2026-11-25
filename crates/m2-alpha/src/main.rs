@@ -580,6 +580,9 @@ struct Options {
     /// `--cargo-check`: Xenia's El Grande drive with its crates aboard
     /// ([`cargo_check`]): each crate's shift, phase by phase.
     cargo_check: bool,
+    /// `--cargo-settle-check`: the contract's loaded truck left parked
+    /// ([`cargo_settle_check`]).
+    cargo_settle_check: bool,
     /// `--prop-bodies-check`: props that come loose whole as bodies of
     /// their own from the start (gap P7, [`prop_bodies_check`]).
     prop_bodies_check: bool,
@@ -1040,6 +1043,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--swim-check" => o.swim_check = true,
             "--cargo-check" => {
                 o.cargo_check = true;
+                o.mission = true;
+            }
+            "--cargo-settle-check" => {
+                o.cargo_settle_check = true;
                 o.mission = true;
             }
             "--prop-bodies-check" => {
@@ -5412,7 +5419,8 @@ fn mission_for_screenshot(
     let mut death_check = options.death_check.then(DeathCheck::default);
     // Seconds she has been where --props-check hits the props.
     let mut props_ready = 0.0;
-    let mut cargo_wait = options.cargo_check.then(CargoWait::default);
+    let mut cargo_wait =
+        (options.cargo_check || options.cargo_settle_check).then(CargoWait::default);
     let mut shop_check = options.shop_check.clone().map(shopcheck::ShopCheck::new);
     let mut cheat_check = options.cheat_check.then(cheats::Check::default);
     let mut context = ContextCheck::default();
@@ -6009,7 +6017,11 @@ fn mission_for_screenshot(
                 1.0,
             )
         {
-            cargo_check(game, tick);
+            if options.cargo_settle_check {
+                cargo_settle_check(game, tick);
+            } else {
+                cargo_check(game, tick);
+            }
             break;
         }
         // With --props-check, every placed prop is hit once she has been
@@ -9943,6 +9955,134 @@ fn cargo_split_start(
 ) -> (Vec<(u32, m2_math::glam::Vec3, bool)>, Vec<u32>) {
     let (aboard, off): (Vec<_>, Vec<_>) = crates.into_iter().partition(|c| c.2);
     (aboard, off.into_iter().map(|c| c.0).collect())
+}
+
+/// How long `--cargo-settle-check` watches the parked truck, seconds:
+/// Xenia settle3's window (20 s from the truck's first record).
+const CARGO_SETTLE_WATCH: f32 = 20.0;
+/// The most a crate may have moved on the bed from where it was loaded,
+/// in the truck's frame, metres: Xenia settle3's 21 crates moved 0.24 to
+/// 0.50 m (load-time depenetration, 0x11D3A0 the most), so 0.50 plus a
+/// tenth for the port's measure (its box middle, the 360's record
+/// position). The tenth is invented.
+const CARGO_SETTLE_MOST: f32 = 0.55;
+
+/// `--cargo-settle-check` (it turns on `--mission`; start it with
+/// `--skip-to OilCon020`): once the contract's truck has its cargo aboard
+/// (as `--cargo-check` waits for it), the truck is left where it was
+/// parked, nobody driving, for [`CARGO_SETTLE_WATCH`] s more. Logs each
+/// crate's move on the bed from where it was loaded (the truck's frame)
+/// and whether it is aboard, each second the truck's place, and at the
+/// end each crate's line. `PASS` when every crate is aboard, none came off
+/// before the watch began, and none moved more than
+/// [`CARGO_SETTLE_MOST`] (Xenia settle3: none off, 0.24-0.50 m); else
+/// `FAIL` with which.
+fn cargo_settle_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::Vec3;
+    let vehicles = &game.scene.vehicles;
+    let Some(i) = (0..vehicles.len()).find(|&i| {
+        vehicles[i].id.is_some() && !vehicles[i].wrecked && game.scene.props.carrying(i)
+    }) else {
+        eprintln!("cargo-settle-check: FAIL no vehicle with cargo aboard");
+        return;
+    };
+    let Some(id) = game.scene.vehicles[i].id else {
+        return;
+    };
+    let label = game.scene.vehicles[i].spec.label.clone();
+    let read = |game: &Game| {
+        game.scene
+            .world
+            .as_ref()
+            .map(|w| game.scene.props.cargo_from_loaded(&w.physics, i, id))
+            .unwrap_or_default()
+    };
+    let start = read(game);
+    let before = start.iter().filter(|c| !c.2).count();
+    eprintln!(
+        "cargo-settle-check: the {label} parked with {} crates loaded, {before} already off",
+        start.len()
+    );
+    let mut most: Vec<(u32, f32)> = start.iter().map(|c| (c.0, c.1)).collect();
+    let steps = (CARGO_SETTLE_WATCH / tick) as u32;
+    let every = (1.0 / tick).round().max(1.0) as u32;
+    for k in 1..=steps {
+        game.step(crate::player::Intent::default(), tick);
+        for (e, d, _) in read(game) {
+            if let Some(m) = most.iter_mut().find(|m| m.0 == e) {
+                m.1 = m.1.max(d);
+            }
+        }
+        if k % every == 0 {
+            let at = game
+                .scene
+                .world
+                .as_ref()
+                .and_then(|w| w.physics.vehicle_transform(id))
+                .map_or(Vec3::NAN, |m| m.w_axis.truncate());
+            let off = read(game).iter().filter(|c| !c.2).count();
+            eprintln!(
+                "cargo-settle-check: {:.0} s: the {label} at {at:.2}, {off} off",
+                k as f32 * tick
+            );
+        }
+    }
+    let end = read(game);
+    for (e, d, aboard) in &end {
+        let m = most.iter().find(|m| m.0 == *e).map_or(*d, |m| m.1);
+        eprintln!(
+            "cargo-settle-check: {e:#x} moved {d:.2} m on the bed from where it was loaded (most {m:.2}){}",
+            if *aboard { "" } else { ", OFF" }
+        );
+    }
+    match cargo_settle_verdict(&end, &most, before) {
+        Ok(()) => eprintln!(
+            "cargo-settle-check: PASS all {} crates aboard the parked {label} for {CARGO_SETTLE_WATCH} s, none off before, most moved {:.2} m",
+            end.len(),
+            most.iter().map(|m| m.1).fold(0.0f32, f32::max)
+        ),
+        Err(why) => eprintln!("cargo-settle-check: FAIL {why}"),
+    }
+}
+
+/// `--cargo-settle-check`'s verdict: every crate aboard at the end
+/// (`end`), none off before the watch began (`before`), and none moved
+/// more than [`CARGO_SETTLE_MOST`] from where it was loaded (`most`).
+fn cargo_settle_verdict(
+    end: &[(u32, f32, bool)],
+    most: &[(u32, f32)],
+    before: usize,
+) -> Result<(), String> {
+    if end.is_empty() {
+        return Err("no crates loaded".into());
+    }
+    if before > 0 {
+        return Err(format!("{before} already off before the watch began"));
+    }
+    let off: Vec<String> = end
+        .iter()
+        .filter(|c| !c.2)
+        .map(|c| format!("{:#x}", c.0))
+        .collect();
+    if !off.is_empty() {
+        return Err(format!(
+            "{} came off the parked truck: {}",
+            off.len(),
+            off.join(", ")
+        ));
+    }
+    let far: Vec<String> = most
+        .iter()
+        .filter(|m| m.1 > CARGO_SETTLE_MOST)
+        .map(|m| format!("{:#x} {:.2} m", m.0, m.1))
+        .collect();
+    if !far.is_empty() {
+        return Err(format!(
+            "moved more than {CARGO_SETTLE_MOST} m on the bed: {}",
+            far.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 /// How many steps after the move `--cargo-check` logs one by one.
@@ -14996,6 +15136,19 @@ mod tests {
             none.fails
         );
         assert!(!wreck_flight_verdict(&[], 0.0, None, None).fails.is_empty());
+    }
+
+    // The parked truck's crates pass when all stay aboard, none fell
+    // before, and none moved past Xenia's 0.50 m (plus a tenth).
+    #[test]
+    fn the_parked_cargo_check_passes_only_when_all_stay_near_where_loaded() {
+        let end = [(1, 0.3, true), (2, 0.5, true)];
+        let most = [(1, 0.31), (2, 0.5)];
+        assert!(cargo_settle_verdict(&end, &most, 0).is_ok());
+        assert!(cargo_settle_verdict(&end, &most, 1).is_err());
+        assert!(cargo_settle_verdict(&[(1, 1.4, false)], &[(1, 1.4)], 0).is_err());
+        assert!(cargo_settle_verdict(&end, &[(1, 0.31), (2, 0.8)], 0).is_err());
+        assert!(cargo_settle_verdict(&[], &[], 0).is_err());
     }
 
     // Crates off before the check began are not judged: only those aboard
