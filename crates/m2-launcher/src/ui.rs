@@ -660,7 +660,7 @@ impl App {
         }
         // The game's name, at the banner's foot (clear of the pictures'
         // middles).
-        let logo = pos2(hero.left() + PAD, hero.bottom() - 74.0);
+        let logo = pos2(hero.left() + PAD, hero.bottom() - 62.0);
         for (offset, colour) in [
             (vec2(3.0, 3.0), Color32::from_black_alpha(200)),
             (vec2(0.0, 0.0), TEXT),
@@ -670,7 +670,7 @@ impl App {
                 Role::Heading,
                 logo + offset,
                 Align2::LEFT_BOTTOM,
-                60.0,
+                50.0,
                 colour,
                 "MERCENARIES 2",
             );
@@ -679,7 +679,7 @@ impl App {
                 Role::Heading,
                 logo + offset + vec2(2.0, 2.0),
                 Align2::LEFT_TOP,
-                24.0,
+                21.0,
                 if offset.x > 0.0 {
                     colour
                 } else {
