@@ -14935,6 +14935,33 @@ fn parked_settle_check(
             // its heading, so one rolling back at 0.6 m/s passed as still
             // (q769: two Fuel Trailers judged at -0.68 and -0.58 m/s).
             let speed = world.physics.vehicle_velocity(id).length();
+            // Every vehicle in the scene that is this entity, the layers' or
+            // the scripts' (#766: one per entity), so a run shows it is one.
+            // Log only.
+            let copies: Vec<String> = game
+                .scene
+                .vehicles
+                .iter()
+                .filter(|c| c.spot.is_some_and(|(e, _, _)| e == entity) || c.guid == Some(entity))
+                .map(|c| {
+                    let whose = if c.guid.is_some() {
+                        "the scripts'"
+                    } else {
+                        "the layers'"
+                    };
+                    let at =
+                        c.id.and_then(|i| world.physics.vehicle_transform(i))
+                            .map_or("unplaced".to_owned(), |m| {
+                                format!("{:.2}", m.w_axis.truncate())
+                            });
+                    format!("{whose} {:?} at {at}", c.id)
+                })
+                .collect();
+            eprintln!(
+                "parked-settle-check: {entity:#x} {label}: {} copies of this entity in the scene [{}]",
+                copies.len(),
+                copies.join("; ")
+            );
             // A trailer (q769: Fuel Trailers 0.4-0.5 m off): its wheels as
             // its spec has them and its pitch now, 5 s on. Log only.
             if v.spec.label.to_ascii_lowercase().contains("trailer") {
