@@ -1561,6 +1561,22 @@ impl MissionLink {
         Some(m.world().borrow().autosave_info.clone())
     }
 
+    /// The pause screen opening: what it tells the engine of the game's
+    /// progress (`SetFlashPauseMenu`, [`m2_game::mission::Mission::stamp_pause`])
+    /// is kept for the next save's record.
+    pub fn stamp_pause(&mut self) -> Option<m2_game::save_record::AutosaveInfo> {
+        let State::Running(m) = &mut self.state else {
+            return None;
+        };
+        match m.stamp_pause() {
+            Ok(info) => Some(info),
+            Err(e) => {
+                eprintln!("mission: the pause screen's progress: {e}");
+                None
+            }
+        }
+    }
+
     pub fn script_save(&self) -> Option<String> {
         let State::Running(m) = &self.state else {
             return None;

@@ -56,6 +56,10 @@ m2-alpha [options]
   --save-check <slot>    with --screenshot --mission: 20 s in, saves to that
                          slot in the 360's record layout, reads it back and
                          compares its fields; PASS or FAIL, and the run ends
+  --save-check-no-world  with --load <save> --screenshot --mission: loads
+                         the record alone (the 360's way, its .world.toml
+                         left out); 20 s in logs her place, health and
+                         weapons against the world file's; PASS within 10 m
   --shell-click <x,y>    a left click there (screen pixels) in --front-end,
                          in its turn among the --shell-keys
   --after-contract <s>   with --mission --autoplay --screenshot: play on

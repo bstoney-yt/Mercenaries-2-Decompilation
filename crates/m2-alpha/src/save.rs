@@ -171,6 +171,29 @@ struct WorldFile {
     stock: Vec<(String, i64)>,
 }
 
+/// What a save's invented world file held, taken out of it
+/// ([`strip_world`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorldRef {
+    pub player: Option<PlayerSave>,
+    pub vehicles: usize,
+    pub killed: usize,
+}
+
+/// Leaves `save` as the 360's record alone would load it: no place,
+/// weapons, vehicles, dead or support stock (none of which the record
+/// holds). What it had is returned.
+pub fn strip_world(save: &mut SaveGame) -> WorldRef {
+    if let Some(p) = &mut save.pmc {
+        p.stock.clear();
+    }
+    WorldRef {
+        player: save.player.take(),
+        vehicles: std::mem::take(&mut save.vehicles).len(),
+        killed: std::mem::take(&mut save.killed).len(),
+    }
+}
+
 /// The record's character for `hero`: the save list movie's 1 Mattias,
 /// 2 Chris, 3 Jennifer.
 pub fn character(hero: Hero) -> u8 {
@@ -537,6 +560,24 @@ weapon = "rpg"
         let bytes = save().to_record(1).unwrap();
         let world = save().world_toml().replace("version = 1", "version = 9");
         assert!(SaveGame::from_record(&bytes, Some(&world)).is_err());
+    }
+
+    #[test]
+    fn stripping_the_world_leaves_the_records_fields() {
+        let mut s = save();
+        let w = strip_world(&mut s);
+        assert_eq!(w.player, save().player);
+        assert_eq!((w.vehicles, w.killed), (1, 2));
+        assert_eq!(
+            (s.player.as_ref(), s.vehicles.len(), s.killed.len()),
+            (None, 0, 0)
+        );
+        let pmc = s.pmc.clone().unwrap();
+        assert_eq!((pmc.cash, pmc.fuel, pmc.stock.len()), (125_000.0, 240.0, 0));
+        // What a record alone loads.
+        let bytes = save().to_record(5).unwrap();
+        let alone = SaveGame::from_record(&bytes, None).unwrap();
+        assert_eq!((alone.player, alone.scripts), (s.player, s.scripts));
     }
 
     #[test]

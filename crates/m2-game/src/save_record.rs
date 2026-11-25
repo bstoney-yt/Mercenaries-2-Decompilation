@@ -214,8 +214,22 @@ pub fn percent_from_share(share: f32) -> u8 {
     ((f64::from(s) * 100.0 + 0.5) as u64).min(100) as u8
 }
 
-/// What `Sys.RequestAutosave` last told the engine (`0x82345D70`), which
-/// each save stamps into its record.
+/// What the scripts last told the engine of the game's progress, which
+/// each save stamps into its record. Two natives write the same four
+/// fields of the script manager (+0xC44, +0xC45, +0xC68, +0xC6C), and
+/// nothing else writes them: the engine keeps no play clock of its own
+/// (from the 360 code: the only stores to +0xC68 are in
+/// `Sys.RequestAutosave` `0x82345D70` and `_GuiInternal.SetFlashPauseMenu`
+/// `0x82322D50`; its only reader is the save stamp `0x8230C4A8`).
+///
+/// - `Sys.RequestAutosave(mission, contract, seconds, share)`, from
+///   `WifMissionFlow`'s autosave after a contract.
+/// - `_GuiInternal.SetFlashPauseMenu(widget, mission, contract, seconds,
+///   share)`, which the pause screen calls as it opens ([`PAUSE_STAMP`]):
+///   every save made from the pause menu carries the time as it opened.
+///
+/// A save before either was called (none in the 360's own play: it saves
+/// only from the pause menu or an autosave) is stamped 0, "" and 0 %.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AutosaveInfo {
     /// Its first argument: a mission on (+0xC44).
@@ -248,6 +262,38 @@ impl AutosaveInfo {
             percent: percent_from_share(share.unwrap_or(0.0)),
         }
     }
+}
+
+/// What the pause screen hands `_GuiInternal.SetFlashPauseMenu` as it
+/// opens, after its widget (from the scripts' bytecode, script
+/// `344E1959` lines 260-263): whether a mission is on
+/// (`MrxPlayState.Get() == MrxPlayState._knMission`), the last contract
+/// completed or `"none"`, the scripts' total time elapsed and their
+/// percent completed (a share, 0 to 1). `WifMissionFlow`'s autosave
+/// (script `01A266D2` line 1257) gives `Sys.RequestAutosave` the same
+/// time and percent.
+pub const PAUSE_STAMP: &str = r#"
+return MrxPlayState.Get() == MrxPlayState._knMission,
+    WifMissionFlow.GetLastCompletedContractName() or "none",
+    MrxPlayState.GetTotalTimeElapsed(),
+    MrxStatsManager.GetPercentCompleted()
+"#;
+
+/// The scripts' answer to [`PAUSE_STAMP`] now, as `SetFlashPauseMenu`
+/// keeps it (`0x82322D50`).
+pub fn pause_stamp(lua: &mlua::Lua) -> mlua::Result<AutosaveInfo> {
+    let (mission, contract, played, share): (
+        Option<bool>,
+        Option<String>,
+        Option<f32>,
+        Option<f32>,
+    ) = lua.load(PAUSE_STAMP).set_name("=m2-pause-stamp").eval()?;
+    Ok(AutosaveInfo::from_args(
+        mission,
+        contract.as_deref(),
+        played,
+        share,
+    ))
 }
 
 /// A record's fields in Rust's terms.
@@ -643,6 +689,44 @@ mod tests {
         r.set_info(&i);
         assert_eq!(r.info().contract.len(), 31);
         assert_eq!(r.header.contract[31], 0);
+    }
+
+    /// The pause screen's stamp: the scripts' own clock and percent, the
+    /// last contract or "none" (a new game has completed none).
+    #[test]
+    fn the_pause_stamp_takes_the_scripts_clock() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            MrxPlayState = { _knMission = 3, Get = function() return 1 end,
+                GetTotalTimeElapsed = function() return 18 end }
+            WifMissionFlow = { GetLastCompletedContractName = function() return nil end }
+            MrxStatsManager = { GetPercentCompleted = function() return 0.034 end }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(
+            pause_stamp(&lua).unwrap(),
+            AutosaveInfo {
+                mission_on: false,
+                contract: "none".into(),
+                played: 18.0,
+                percent: 3,
+            }
+        );
+        lua.load(
+            r#"MrxPlayState.Get = function() return 3 end
+            WifMissionFlow.GetLastCompletedContractName = function() return "VzaCon001" end
+            MrxPlayState.GetTotalTimeElapsed = function() return 3725.9 end"#,
+        )
+        .exec()
+        .unwrap();
+        let s = pause_stamp(&lua).unwrap();
+        assert_eq!(
+            (s.mission_on, s.contract.as_str(), s.played as u32),
+            (true, "VzaCon001", 3725)
+        );
     }
 
     #[test]
