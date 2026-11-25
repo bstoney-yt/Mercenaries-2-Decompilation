@@ -1072,6 +1072,9 @@ pub struct ScriptWorld {
     pub vo: crate::vo::Lines,
     /// The player has subtitles off (`Sys.SubtitlesEnabled`).
     pub subtitles_off: bool,
+    /// What `Sys.RequestAutosave` last said: the contract, time played
+    /// and percent done each save stamps into its record.
+    pub autosave_info: crate::save_record::AutosaveInfo,
     /// The player has the tutorial tips off (`Sys.TutorialsEnabled`).
     pub tutorials_off: bool,
     /// The developer's skip-to-mission switch (`Sys.GetSkipMission`, read
@@ -5487,8 +5490,23 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&sys, "GetForceNewGame", |_, _, _| values([Value::Nil]))?;
     // `WifMissionFlow.Autosave` asks this after a contract (with whether
     // a mission is on, the last contract, the time played and the share
-    // of the game done): the game saves.
-    add(&sys, "RequestAutosave", |w, _, _| {
+    // of the game done): the game saves. From the 360 code (0x82345D70):
+    // the four are kept for every save after to stamp into its record
+    // ([`crate::save_record::AutosaveInfo`]).
+    add(&sys, "RequestAutosave", |w, _, a| {
+        let text = match a.get(1) {
+            Some(Value::String(s)) => Some(s.to_string_lossy()),
+            _ => None,
+        };
+        w.autosave_info = crate::save_record::AutosaveInfo::from_args(
+            match a.first() {
+                Some(Value::Boolean(b)) => Some(*b),
+                _ => None,
+            },
+            text.as_deref(),
+            num(a.get(2)),
+            num(a.get(3)),
+        );
         w.commands.push(Command::Save {
             slot: AUTOSAVE.into(),
         });
@@ -8377,6 +8395,16 @@ mod tests {
                     slot: AUTOSAVE.into()
                 }
             ]
+        );
+        // What the record will be stamped with (0x82345D70).
+        assert_eq!(
+            world.borrow().autosave_info,
+            crate::save_record::AutosaveInfo {
+                mission_on: true,
+                contract: "VzaCon001".into(),
+                played: 600.0,
+                percent: 100,
+            }
         );
     }
 

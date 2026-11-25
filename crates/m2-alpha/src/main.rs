@@ -163,6 +163,11 @@ use scene::Scene;
 const TICK: Duration = Duration::from_nanos(1_000_000_000 / 60);
 /// How long `--newgame-cover-check` waits for the intro (invented).
 const COVER_CHECK_LIMIT: Duration = Duration::from_secs(240);
+/// How long `--launch-check` waits for play to start (invented).
+const LAUNCH_CHECK_LIMIT: Duration = Duration::from_secs(240);
+/// Seconds of play before `--save-check` saves (invented: the island and
+/// the scripts' first steps are in by then).
+const SAVE_CHECK_AFTER: f32 = 20.0;
 /// Longest real time a single frame may advance the simulation by, so a
 /// stall (dragging the window, a breakpoint) doesn't fast-forward the game.
 const MAX_FRAME: Duration = Duration::from_millis(250);
@@ -535,6 +540,20 @@ struct Options {
     /// soon as the front end is up; each frame logs the cover's state, and
     /// the run ends at the intro movie with PASS or FAIL ([`cover::Check`]).
     newgame_cover_check: bool,
+    /// `--new-game` or `--load-slot <n>` (the launcher's Play): what the
+    /// front end does as soon as it is up, as its own New Game or Load
+    /// Game would.
+    start: Option<flow::Start>,
+    /// `--launch-check`: with `--new-game` or `--load-slot`, the run ends
+    /// once play has started from it, PASS if it started as asked (the
+    /// save read and its hero up, or a new game as the `--hero`), FAIL on
+    /// anything else or after [`LAUNCH_CHECK_LIMIT`].
+    launch_check: bool,
+    /// `--save-check <slot>`: with `--screenshot --mission`, once the
+    /// scripts have run [`SAVE_CHECK_AFTER`] seconds the game is saved to
+    /// that pause-menu slot in the 360's record layout, read back and its
+    /// fields compared with what was saved; PASS or FAIL, and the run ends.
+    save_check: Option<u32>,
     /// With `--screenshot` on foot and `--gait`: put the nearest soldier
     /// this many metres ahead of her at the start, at the water's height
     /// there, and log each second whether he swims (`npc-swim:` lines).
@@ -1348,6 +1367,28 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.face_test = Some(value()?.parse().context("--face-test expects seconds")?)
             }
             "--pause-at" => o.pause_at = Some(value()?.parse()?),
+            "--new-game" => o.start = Some(flow::Start::NewGame),
+            "--launch-check" => o.launch_check = true,
+            "--save-check" => {
+                let n: u32 = value()?
+                    .parse()
+                    .context("--save-check expects a slot number")?;
+                anyhow::ensure!(
+                    n <= PAUSE_SLOTS,
+                    "--save-check: slot {n}: the slots go 0 to {PAUSE_SLOTS}"
+                );
+                o.save_check = Some(n);
+            }
+            "--load-slot" => {
+                let n: u32 = value()?
+                    .parse()
+                    .context("--load-slot expects a slot number")?;
+                anyhow::ensure!(
+                    n <= PAUSE_SLOTS,
+                    "--load-slot {n}: slots go to {PAUSE_SLOTS}"
+                );
+                o.start = Some(flow::Start::Slot(n));
+            }
             "--newgame-cover-check" => {
                 o.newgame_cover_check = true;
                 o.alpha = true;
@@ -1375,7 +1416,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
     }
     // Launched plainly (only where the game is, the window and settings
     // named): the whole game, as `--alpha`.
-    const PLAIN: [&str; 18] = [
+    const PLAIN: [&str; 22] = [
         "--install",
         "--config",
         "--size",
@@ -1390,6 +1431,11 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
         "--skip-mode-off",
         "--skip-mode-on",
         "--script-join",
+        // The launcher's Play.
+        "--new-game",
+        "--load-slot",
+        "--hero",
+        "--launch-check",
         // Co-op plays the whole game too.
         "--host",
         "--join",
@@ -2016,6 +2062,8 @@ fn run(
         load_at: options.load_at,
         pause_at: options.pause_at,
         newgame_cover_check: options.newgame_cover_check,
+        start: options.start,
+        launch_check: options.launch_check,
         successor: None,
         state: None,
         error: None,
@@ -2256,12 +2304,7 @@ const PAUSE_SLOTS: u32 = 20;
 /// loads), by when its file was written.
 fn newest_save() -> Option<u32> {
     (0..=PAUSE_SLOTS)
-        .filter_map(|n| {
-            let when = std::fs::metadata(pause_save_path(n))
-                .and_then(|m| m.modified())
-                .ok()?;
-            Some((when, n))
-        })
+        .filter_map(|n| Some((save::SaveGame::modified(&pause_save_path(n))?, n)))
         .max()
         .map(|(_, n)| n)
 }
@@ -2281,11 +2324,17 @@ fn pause_saves(hero: Hero) -> Vec<pause::SaveEntry> {
     (0..=PAUSE_SLOTS)
         .filter_map(|n| {
             let path = pause_save_path(n);
-            let when = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+            let when = save::SaveGame::modified(&path)?;
             let s = save::SaveGame::read(&path).ok()?;
-            let secs = when
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
+            // The record's own stamp (from the 360 code: `addSaveGame`'s
+            // fields, 0x8237E2F0); the file's time for an old TOML save.
+            let secs = match s.info.saved_at {
+                0 => when
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+                t => t,
+            };
+            let legacy = s.info.saved_at == 0;
             let pmc = s.pmc.unwrap_or_default();
             Some(pause::SaveEntry {
                 number: n,
@@ -2297,10 +2346,14 @@ fn pause_saves(hero: Hero) -> Vec<pause::SaveEntry> {
                 },
                 money: pmc.cash,
                 fuel: pmc.fuel,
-                played: String::new(),
-                last_contract: String::new(),
-                auto: n == 0,
-                percent: 0.0,
+                played: if legacy {
+                    String::new()
+                } else {
+                    m2_game::save_record::played_text(s.info.played)
+                },
+                last_contract: s.info.contract,
+                auto: n == 0 || s.info.autosave,
+                percent: f64::from(s.info.percent),
             })
         })
         .collect()
@@ -2313,13 +2366,26 @@ fn write_save(game: &Game, mission: Option<&mission::MissionLink>, path: &std::p
     };
     s.pmc = mission.and_then(mission::MissionLink::pmc_save);
     s.scripts = mission.and_then(mission::MissionLink::script_save);
+    // The record's stamp (from the 360 code, 0x8230C4A8): what the
+    // scripts' last `Sys.RequestAutosave` said, and whether this is their
+    // autosave's slot (0x8239ACB0).
+    let said = mission
+        .and_then(mission::MissionLink::autosave_info)
+        .unwrap_or_default();
+    s.info.played = said.played.max(0.0) as u32;
+    s.info.contract = said.contract;
+    s.info.percent = said.percent;
+    s.info.autosave = path.file_stem().is_some_and(|n| n == "m2-alpha-autosave");
     match s.write(path) {
         Ok(()) => {
             eprintln!(
-                "game saved to {} (cash {}, scripts' data {} bytes)",
+                "game saved to {} (cash {}, scripts' data {} bytes, played {}, last contract {:?}, {}% done)",
                 path.display(),
                 s.pmc.as_ref().map_or(0.0, |p| p.cash),
-                s.scripts.as_ref().map_or(0, String::len)
+                s.scripts.as_ref().map_or(0, String::len),
+                m2_game::save_record::played_text(s.info.played),
+                s.info.contract,
+                s.info.percent
             );
             if let Some(c) = mission.and_then(mission::MissionLink::contracts) {
                 eprintln!("game saved with {c}");
@@ -2333,14 +2399,130 @@ fn write_save(game: &Game, mission: Option<&mission::MissionLink>, path: &std::p
     }
 }
 
+/// `--save-check`: saves the game to pause-menu slot `slot`, reads the
+/// file back and compares it with what was saved: the 360's record
+/// length and header, the character, cash and fuel, the scripts' save
+/// text, and the time played, contract and percent the scripts' last
+/// `Sys.RequestAutosave` gave. Each line logged; whether all held.
+fn save_check(game: &Game, link: &mission::MissionLink, slot: u32) -> bool {
+    let path = pause_save_path(slot);
+    eprintln!("save-check: saving to slot {slot} ({})", path.display());
+    if !write_save(game, Some(link), &path) {
+        eprintln!("save-check: FAIL: nothing was saved");
+        return false;
+    }
+    let mut ok = true;
+    let mut check = |what: &str, good: bool, said: String| {
+        eprintln!(
+            "save-check: {} {what}: {said}",
+            if good { "ok  " } else { "BAD " }
+        );
+        ok &= good;
+    };
+    let bytes = std::fs::read(&path).unwrap_or_default();
+    check(
+        "record length",
+        bytes.len() == m2_game::save_record::FILE_LEN,
+        format!("{:#x} bytes", bytes.len()),
+    );
+    let header = bytes.get(..8).map(|b| {
+        (
+            u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+            u32::from_be_bytes([b[4], b[5], b[6], b[7]]),
+        )
+    });
+    check(
+        "record header",
+        header
+            == Some((
+                m2_game::profile::RECORD_VERSION,
+                m2_game::profile::RECORD_SIZE,
+            )),
+        format!("version and size {header:x?}"),
+    );
+    let back = match save::SaveGame::read(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("save-check: FAIL: it does not read back: {e:#}");
+            return false;
+        }
+    };
+    check(
+        "character",
+        back.hero == Some(game.scene.hero),
+        format!("{:?} for {}", back.hero, game.scene.hero),
+    );
+    let pmc = link.pmc_save().unwrap_or_default();
+    let got = back.pmc.clone().unwrap_or_default();
+    check(
+        "cash and fuel",
+        (got.cash, got.fuel) == (pmc.cash.max(0.0).round(), pmc.fuel.round()),
+        format!(
+            "{} and {} (held {} and {})",
+            got.cash, got.fuel, pmc.cash, pmc.fuel
+        ),
+    );
+    let text = link.script_save();
+    check(
+        "scripts' save text",
+        back.scripts.is_some() && back.scripts == text,
+        format!(
+            "{} bytes back, {} held",
+            back.scripts.as_ref().map_or(0, String::len),
+            text.as_ref().map_or(0, String::len)
+        ),
+    );
+    let said = link.autosave_info().unwrap_or_default();
+    check(
+        "time played, contract, percent",
+        (
+            back.info.played,
+            back.info.contract.as_str(),
+            back.info.percent,
+        ) == (
+            said.played.max(0.0) as u32,
+            said.contract.as_str(),
+            said.percent,
+        ),
+        format!(
+            "{} {:?} {}%",
+            m2_game::save_record::played_text(back.info.played),
+            back.info.contract,
+            back.info.percent
+        ),
+    );
+    let now = save::now_secs();
+    check(
+        "time stamp",
+        back.info.saved_at <= now && now - back.info.saved_at < 60,
+        format!(
+            "{} ({} s ago)",
+            back.info.saved_at,
+            now.saturating_sub(back.info.saved_at)
+        ),
+    );
+    check(
+        "world file (invented)",
+        back.player.is_some(),
+        format!(
+            "{} vehicles, {} killed",
+            back.vehicles.len(),
+            back.killed.len()
+        ),
+    );
+    eprintln!("save-check: {}", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
 /// The launch's arguments `args` with `--load save` in place of any
 /// `--load` they had, and without `--load-at` (which would load again).
 fn args_loading(args: impl IntoIterator<Item = String>, save: &std::path::Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut args = args.into_iter();
     while let Some(a) = args.next() {
-        if a == "--load" || a == "--load-at" {
+        if a == "--load" || a == "--load-at" || a == "--load-slot" {
             args.next();
+        } else if a == "--new-game" {
         } else {
             out.push(a);
         }
@@ -2356,10 +2538,10 @@ fn args_front_end(args: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut args = args.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--load" => {
+            "--load" | "--load-slot" => {
                 args.next();
             }
-            "--to-front-end" => {}
+            "--to-front-end" | "--new-game" => {}
             _ => out.push(a),
         }
     }
@@ -6017,6 +6199,11 @@ fn mission_for_screenshot(
             if write_save(game, Some(&link), &save::SaveGame::slot_path(&slot)) {
                 game.save_icon = game::SAVE_ICON_SECONDS;
             }
+        }
+        if let Some(slot) = options.save_check
+            && i as f32 * tick >= SAVE_CHECK_AFTER
+        {
+            errlog::exit(if save_check(game, &link, slot) { 0 } else { 1 });
         }
         // With --placed-check, what the layers have put out is tried
         // every few seconds ([`placed::check`]).
@@ -13309,6 +13496,19 @@ struct Running {
     cover_check: Option<(cover::Check, Instant)>,
     /// The new game was started for the check.
     cover_check_started: bool,
+    /// `--new-game` or `--load-slot`, not yet done.
+    start: Option<flow::Start>,
+    /// `--launch-check`: what was asked, the hero play should start as
+    /// once known (the save's, read as it loads), and when it gives up.
+    launch_check: Option<LaunchCheck>,
+}
+
+/// `--launch-check`'s state.
+#[derive(Debug)]
+struct LaunchCheck {
+    start: flow::Start,
+    want: Option<Hero>,
+    limit: Instant,
 }
 
 struct App {
@@ -13362,6 +13562,10 @@ struct App {
     pause_at: Option<f32>,
     /// `--newgame-cover-check`.
     newgame_cover_check: bool,
+    /// `--new-game` or `--load-slot`.
+    start: Option<flow::Start>,
+    /// `--launch-check`.
+    launch_check: bool,
     /// The alpha started again (the pause menu's Quit, loading a save),
     /// which this one waits for once its window is closed.
     successor: Option<std::process::Child>,
@@ -13557,6 +13761,24 @@ impl App {
                 )
             }),
             cover_check_started: false,
+            launch_check: match (self.launch_check, self.start) {
+                (true, Some(start)) => {
+                    eprintln!(
+                        "launch-check: {start:?} once the front end is up; PASS needs play started from it as the hero asked"
+                    );
+                    Some(LaunchCheck {
+                        start,
+                        want: matches!(start, flow::Start::NewGame).then_some(self.config.hero),
+                        limit: Instant::now() + LAUNCH_CHECK_LIMIT,
+                    })
+                }
+                (true, None) => {
+                    eprintln!("launch-check: FAIL needs --new-game or --load-slot");
+                    errlog::exit(1);
+                }
+                _ => None,
+            },
+            start: self.start.take(),
         };
         running.apply_options(&self.config);
         Ok(running)
@@ -13675,6 +13897,38 @@ impl Running {
             };
             if let Some(line) = flow.cover.tick(inputs, dt as f32) {
                 eprintln!("{line}");
+            }
+        }
+        if let Some(check) = &self.launch_check {
+            let playing = self
+                .flow
+                .as_ref()
+                .is_some_and(|f| f.stage == flow::Stage::Game);
+            let hero = self.game.scene.hero;
+            match check.want {
+                Some(want) if playing && hero == want => {
+                    eprintln!(
+                        "launch-check: PASS {:?}: play started as {hero}",
+                        check.start
+                    );
+                    errlog::exit(0);
+                }
+                Some(want) if playing => {
+                    eprintln!(
+                        "launch-check: FAIL {:?}: play started as {hero}, not {want}",
+                        check.start
+                    );
+                    errlog::exit(1);
+                }
+                _ if now >= check.limit => {
+                    eprintln!(
+                        "launch-check: FAIL {:?}: play had not started from it after {} s",
+                        check.start,
+                        LAUNCH_CHECK_LIMIT.as_secs()
+                    );
+                    errlog::exit(1);
+                }
+                _ => {}
             }
         }
         if let Some((check, limit)) = &self.cover_check
@@ -14363,6 +14617,10 @@ impl Running {
             }
         };
         let hero = s.hero.unwrap_or(config.hero);
+        if let Some(check) = &mut self.launch_check {
+            eprintln!("launch-check: the save is read ({})", path.display());
+            check.want = Some(hero);
+        }
         config.hero = hero;
         if hero != self.game.scene.hero {
             eprintln!("hero: playing as {hero}");
@@ -14555,6 +14813,14 @@ impl Running {
                 if let Ok(mut mixer) = self.audio.out.mixer.lock() {
                     flow.start_new_game(&mut mixer);
                 }
+            }
+            // The launcher's Play: New Game or Load Game as soon as the
+            // front end is up.
+            if flow.at_front_end()
+                && let Some(start) = self.start.take()
+                && let Ok(mut mixer) = self.audio.out.mixer.lock()
+            {
+                flow.start(start, &mut mixer);
             }
             if let Some(how) = flow.take_intro_started()
                 && let Some((check, _)) = &mut self.cover_check
@@ -15587,6 +15853,17 @@ mod tests {
         assert_eq!(
             args_front_end(args),
             ["--size", "1280x720", "--to-front-end"]
+        );
+        // The launcher's Play is done once: Quit doesn't load it again.
+        let args = ["--load-slot", "3", "--new-game", "--size", "1280x720"].map(String::from);
+        assert_eq!(
+            args_front_end(args),
+            ["--size", "1280x720", "--to-front-end"]
+        );
+        let args = ["--alpha", "--load-slot", "3", "--new-game"].map(String::from);
+        assert_eq!(
+            args_loading(args, std::path::Path::new("new.toml")),
+            ["--alpha", "--load", "new.toml"]
         );
         assert_eq!(args_front_end(Vec::new()), ["--to-front-end"]);
     }

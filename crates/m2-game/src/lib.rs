@@ -40,6 +40,7 @@ pub mod profile;
 pub mod radar_anim;
 pub mod report;
 pub mod reverb;
+pub mod save_record;
 pub mod savedata;
 pub mod screen_queries;
 pub mod script;

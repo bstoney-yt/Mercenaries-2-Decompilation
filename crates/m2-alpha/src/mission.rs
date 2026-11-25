@@ -1551,6 +1551,16 @@ impl MissionLink {
 
     /// The scripts' own save data, to keep in a save
     /// ([`Mission::save_data`]).
+    /// What `Sys.RequestAutosave` last told the game (the contract, time
+    /// played and percent done a save's record is stamped with: from the
+    /// 360 code, [`m2_game::save_record::AutosaveInfo`]).
+    pub fn autosave_info(&self) -> Option<m2_game::save_record::AutosaveInfo> {
+        let State::Running(m) = &self.state else {
+            return None;
+        };
+        Some(m.world().borrow().autosave_info.clone())
+    }
+
     pub fn script_save(&self) -> Option<String> {
         let State::Running(m) = &self.state else {
             return None;

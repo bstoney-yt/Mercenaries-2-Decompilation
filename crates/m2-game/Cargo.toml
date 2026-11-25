@@ -12,11 +12,9 @@ m2-engine.workspace = true
 m2-layout.workspace = true
 m2-math.workspace = true
 m2-assets.workspace = true
+miniz_oxide.workspace = true
 mlua.workspace = true
 thiserror.workspace = true
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-miniz_oxide.workspace = true
