@@ -6478,7 +6478,13 @@ pub(crate) fn death_exit(
 ) -> Option<Vec3> {
     let id = v.id?;
     let at = physics.vehicle_transform(id).filter(|m| m.is_finite())?;
-    let (_, blocked) = exit_way(physics, v, None, at);
+    // Blocked as the 360 finds it (0x822A2178 -> 0x8229AC90): her
+    // character's capsule cast where she sits meets something (true:
+    // 0x82166660 returns its hits' count, non-zero), her own vehicle's hull
+    // counted (its query passes no body to skip), so a seat inside a cab
+    // always is; then she goes out by her exit path (0x822A13D0), else
+    // stays where she is. The way to her door as before besides.
+    let blocked = seat_in_hull(&v.spec) || exit_way(physics, v, None, at).1;
     let place = if blocked {
         door_out(at, &v.spec)
     } else {
@@ -6500,6 +6506,27 @@ pub(crate) fn death_exit(
         }
     );
     Some(at.transform_point3(Vec3::ZERO))
+}
+
+/// The character capsule the 360's death exit casts where a rider sits
+/// (0x8229AC90): radius 0.4 m (0x82B7C0F0), from 0.6 m (0x82B7C0E8) to
+/// 1.8 m (0x82B7C0EC) up from her feet.
+const EXIT_CAPSULE: (f32, f32, f32) = (0.4, 0.6, 1.8);
+
+/// Whether a rider's capsule at the vehicle's seat ([`EXIT_CAPSULE`],
+/// model space, her feet at the seat) meets its hull box: as the 360's
+/// cast meets the cab she sits in. Inferred: the hull box stands for the
+/// vehicle's collision shapes.
+pub(crate) fn seat_in_hull(spec: &VehicleSpec) -> bool {
+    let (r, low, high) = EXIT_CAPSULE;
+    let seat = spec.seat.unwrap_or(Vec3::ZERO);
+    let (lo, hi) = spec.hull;
+    // The capsule's axis, from (low + r) to (high - r) up, sampled.
+    (0..=8).any(|k| {
+        let y = low + r + (high - low - 2.0 * r) * k as f32 / 8.0;
+        let p = seat + Vec3::Y * y;
+        p.clamp(lo, hi).distance(p) <= r
+    })
 }
 
 /// Her ragdoll's launch out of a vehicle that died with its origin at
@@ -6758,6 +6785,28 @@ mod tests {
         assert!((over - Vec3::new(0.0, h, h)).length() < 1e-4, "{over}");
     }
     use std::collections::HashMap;
+
+    // A rider sat inside a cab is blocked as the 360's capsule cast finds
+    // her (0x8229AC90 meets the cab) and goes out at her door, outside the
+    // vehicle's box; one sat over an open bed's edge is not.
+    #[test]
+    fn a_rider_inside_a_cab_exits_at_her_door_outside_it() {
+        use m2_math::glam::{Mat4, Vec3};
+        let mut spec = crate::npc::tests::tank(m2_engine::tuning::VehicleTuning::default());
+        spec.hull = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 2.0, 2.0));
+        spec.bounds = spec.hull;
+        spec.seat = Some(Vec3::new(0.4, 0.3, 0.5));
+        spec.door = Some(Vec3::new(1.0, 0.0, 0.3));
+        assert!(super::seat_in_hull(&spec));
+        let out = super::door_out(Mat4::IDENTITY, &spec);
+        let (lo, hi) = spec.bounds;
+        let inside = (lo.x..=hi.x).contains(&out.x) && (lo.z..=hi.z).contains(&out.z);
+        assert!(!inside, "{out}");
+        assert!(out.x > hi.x + 0.5, "{out}");
+        // A seat well clear of the box (a bike's, out over its side).
+        spec.seat = Some(Vec3::new(2.0, 2.5, 0.0));
+        assert!(!super::seat_in_hull(&spec));
+    }
 
     #[test]
     fn a_pickup_taken_sets_off_its_pickup_effect() {
