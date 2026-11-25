@@ -152,6 +152,10 @@ pub struct Game {
     /// The layers' parked vehicles' whole authored turns, by entity:
     /// placed as authored ([`place`]).
     authored: HashMap<u32, Quat>,
+    /// The island's vehicles placed since the last physics step: entity,
+    /// body and where it was put, logged after their very first step
+    /// ([`Game::log_first_steps`]).
+    just_placed: Vec<(u32, m2_engine::VehicleId, Vec3, Quat)>,
     /// The scripts' (mission) vehicles placed as authored (their layer
     /// entity's `Transform`), by guid: where and turned how
     /// (`--parked-settle-check`).
@@ -583,6 +587,7 @@ impl Game {
             winches: Default::default(),
             fetched: HashSet::new(),
             authored: HashMap::new(),
+            just_placed: Vec::new(),
             authored_guids: HashMap::new(),
             traffic: crate::traffic::Traffic::default(),
             gunships: crate::gunships::Gunships::default(),
@@ -821,6 +826,12 @@ impl Game {
                     "island vehicle {entity:#x}: {} parked at ({:.0}, {:.0}, {:.0})",
                     v.spec.label, at.x, at.y, at.z
                 );
+                if let Some(id) = v.id
+                    && let Some(m) = world.physics.vehicle_transform(id)
+                {
+                    let (_, turn, put) = m.to_scale_rotation_translation();
+                    self.just_placed.push((entity, id, put, turn));
+                }
             }
         }
         self.vehicle_wait -= dt;
@@ -1895,6 +1906,7 @@ impl Game {
             }
         }
         split("game: player and physics");
+        self.log_first_steps();
         // The vehicles' load beds, looked up once a model.
         if let Some(source) = self.scene.source.as_mut() {
             for v in &self.scene.vehicles {
@@ -5709,6 +5721,55 @@ fn spray(world: &World, vehicles: &[ParkedVehicle], combat: &mut Combat) {
 }
 
 impl Game {
+    /// Logs each island vehicle placed before this step, after its very
+    /// first physics step: how far it moved and turned, its speed and spin,
+    /// its wheels down and each spring's squeeze from its rest length, and
+    /// what its body touches. A spring launch (squeezed springs, a speed up)
+    /// tells apart from a shove (a touch, a speed level). Log only.
+    fn log_first_steps(&mut self) {
+        if self.just_placed.is_empty() {
+            return;
+        }
+        let Some(world) = self.scene.world.as_ref() else {
+            return;
+        };
+        let physics = &world.physics;
+        for (entity, id, put, turn) in std::mem::take(&mut self.just_placed) {
+            let Some(m) = physics.vehicle_transform(id) else {
+                continue;
+            };
+            let (_, now_turn, now) = m.to_scale_rotation_translation();
+            let label = self
+                .scene
+                .vehicles
+                .iter()
+                .find(|v| v.id == Some(id))
+                .map_or("?", |v| v.spec.label.as_str());
+            let (down, wheels) = physics.vehicle_contacts(id);
+            let squeeze: Vec<String> = physics
+                .vehicle_suspension(id)
+                .iter()
+                .map(|s| format!("{s:.3}"))
+                .collect();
+            let touching: Vec<String> = physics
+                .vehicle_touching(id)
+                .iter()
+                .map(|(k, at, _)| format!("{k:?} at {at:.2}"))
+                .collect();
+            eprintln!(
+                "first step: island vehicle {entity:#x} {label}: moved {:.3} (dy {:+.3}), turned {:.2} deg, v {:.3} (up {:+.3}), spin {:.3}, wheels down {down} of {wheels}, springs squeezed [{}] m, touching [{}]",
+                now.distance(put),
+                now.y - put.y,
+                turn.angle_between(now_turn).to_degrees(),
+                physics.vehicle_velocity(id),
+                physics.vehicle_velocity(id).y,
+                physics.vehicle_spin(id),
+                squeeze.join(", "),
+                touching.join("; ")
+            );
+        }
+    }
+
     /// The authored turn of the layers' parked vehicle `entity`, if one
     /// was placed as authored ([`place`]).
     pub fn authored_turn(&self, entity: u32) -> Option<Quat> {
