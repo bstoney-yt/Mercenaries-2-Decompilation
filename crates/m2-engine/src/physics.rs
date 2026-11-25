@@ -2776,11 +2776,34 @@ fn drive_tracks(
     let [dx, dy, dz] = tun.ang_damp;
     let damp = side * (w.dot(side) * dx) + up * (w.dot(up) * dy) + ahead * (w.dot(ahead) * dz);
     push(-damp * mass * dt, None);
-    let off = f.points.iter().filter(|p| p.is_none()).count() as f32;
-    let pull = (tun.gravity_factor - 1.0) * off * mass * -1.5;
+    let pull = track_air_pull(tun.gravity_factor, f.points, mass);
     if pull != 0.0 {
         push(Vec3::Y * pull * dt, Some(f.centre));
     }
+}
+
+/// How many points a tracked vehicle's tracks have, as the 360 code
+/// counts them (0x821A5D30's loop, 0x821A4F10's count: stride 0x80 from
+/// +0x80 to +0x300): its six track hardpoints ([`crate::vehicle::track_hardpoints`]).
+pub const TRACK_POINTS: usize = 6;
+
+/// The pull, newtons up (so negative: down), on a tracked vehicle of
+/// `mass` kg for its track points off the ground, as 0x821A4F10 gives it
+/// every step with no other gate: `(GravityFactor - 1) x off x mass x
+/// -1.5` (0x820D2F6C), `off` being [`TRACK_POINTS`] less those of
+/// `points` in contact (a point is in contact when its ray, cast down its
+/// suspension from its hardpoint, meets the ground within its length:
+/// 0x821A5D30 sets +0x80). Applied over the step (`x dt`) at its centre
+/// of mass. Unverified: that the motion's vfunc +0x58 the 360 hands it to
+/// takes it as a force over the step's dt.
+fn track_air_pull(gravity_factor: f32, points: &[Option<TrackContact>], mass: f32) -> f32 {
+    let touching = points
+        .iter()
+        .filter(|p| p.is_some())
+        .count()
+        .min(TRACK_POINTS);
+    let off = (TRACK_POINTS - touching) as f32;
+    (gravity_factor - 1.0) * off * mass * -1.5
 }
 
 /// A motorbike's balance for a step of `dt` s, as the 360 code holds it
@@ -4683,6 +4706,10 @@ impl Physics {
                         .unwrap_or(BodyMaterial::COMMON)
                         .angular_damping,
                 )
+                // Its template's `PhysicsPropertyGravityScaler`
+                // ([`vehicle_gravity_scale`]): a tank falls at twice the
+                // world's gravity, in the air and on the ground.
+                .gravity_scale(vehicle_gravity_scale(spec.tuning.gravity_scale))
                 .can_sleep(false)
                 .ccd_enabled(true),
         );
@@ -5074,6 +5101,21 @@ impl Physics {
             });
         let top = if boat { BOAT_TOP } else { TOP_SPEED };
         let tyres = (!spec.tracked).then(|| spec.tuning.tyres.unwrap_or(Tyres::DEFAULT));
+        // Its turret's and gun's bodies are its object's bodies too: the
+        // 360's set-up (0x821831B0) gives every moving body of the object
+        // the gravity action, and the turret update only hinges two of
+        // them (0x82273F90 takes both from the object, 0x82182708 and
+        // 0x82170620, and joins them, 0x8216B350): each is pulled by the
+        // same scale.
+        if let Some(h) = &hinge {
+            let scale = vehicle_gravity_scale(spec.tuning.gravity_scale);
+            let handles = std::iter::once(h.body).chain(h.gun.as_ref().map(|g| g.body));
+            for handle in handles {
+                if let Some(b) = self.world.bodies.get_mut(handle) {
+                    b.set_gravity_scale(scale, true);
+                }
+            }
+        }
         let id = VehicleId(self.vehicles.len());
         self.vehicles.push(Some(VehicleBody {
             controller,
@@ -6584,6 +6626,17 @@ impl Physics {
         body.set_angvel(vector(angular + top_up(dw, angular)), true);
     }
 
+    /// A vehicle's chassis body's mass and its turret's and gun's bodies'
+    /// together, kg (0 for a vehicle with none).
+    pub fn vehicle_body_masses(&self, id: VehicleId) -> Option<(f32, f32)> {
+        let v = self.vehicles.get(id.0)?.as_ref()?;
+        let mass = |h: r::RigidBodyHandle| self.world.bodies.get(h).map_or(0.0, |b| b.mass());
+        let others = v.hinge.as_ref().map_or(0.0, |h| {
+            mass(h.body) + h.gun.as_ref().map_or(0.0, |g| mass(g.body))
+        });
+        Some((mass(v.controller.chassis), others))
+    }
+
     /// Shoves a vehicle: `impulse` (kg m/s) applied at world point `at`.
     pub fn push_vehicle(&mut self, id: VehicleId, impulse: Vec3, at: Vec3) {
         let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
@@ -7100,6 +7153,66 @@ impl Physics {
                             Some(q) if chassis.contains(&q) => 'v',
                             Some(q) if own.contains(&q) => 's',
                             _ => 'g',
+                        };
+                        if !what.contains(tag) {
+                            what.push(tag);
+                        }
+                    }
+                }
+                Some((k, vec3(b.linvel()).length(), what))
+            })
+            .collect()
+    }
+
+    /// What each limb of ragdoll `id` touches, by kind, for tracing what
+    /// keeps a limp body moving: `v` a vehicle's body, `o` another limb of
+    /// its own, `g` the ground (a terrain cell), `w` other fixed collision
+    /// (a building, a fixed prop), `d` a loose body (debris, a prop body,
+    /// goods, a pickup lying loose), `r` another ragdoll, `?` anything
+    /// else. Each limb's index, speed (m/s) and tags.
+    pub fn ragdoll_limb_contacts(&self, id: RagdollId) -> Vec<(usize, f32, String)> {
+        let Some(doll) = self.ragdolls.get(id.0).and_then(Option::as_ref) else {
+            return Vec::new();
+        };
+        let chassis: Vec<_> = self
+            .vehicles
+            .iter()
+            .flatten()
+            .map(|v| v.controller.chassis)
+            .collect();
+        let own: Vec<_> = doll.bodies.iter().flatten().copied().collect();
+        let loose: Vec<_> = self.debris.iter().flatten().copied().collect();
+        let dolls: Vec<_> = self
+            .ragdolls
+            .iter()
+            .flatten()
+            .flat_map(|d| d.bodies.iter().flatten().copied())
+            .collect();
+        doll.bodies
+            .iter()
+            .enumerate()
+            .filter_map(|(k, h)| {
+                let b = self.world.bodies.get((*h)?)?;
+                let mut what = String::new();
+                for &c in b.colliders() {
+                    for p in self.world.narrow_phase.contact_pairs_with(c) {
+                        if !p.has_any_active_contact() {
+                            continue;
+                        }
+                        let other = if p.collider1 == c {
+                            p.collider2
+                        } else {
+                            p.collider1
+                        };
+                        let parent = self.world.colliders.get(other).and_then(|o| o.parent());
+                        let tag = match (parent, self.keys.get(&other)) {
+                            (Some(q), _) if chassis.contains(&q) => 'v',
+                            (Some(q), _) if own.contains(&q) => 'o',
+                            (Some(q), _) if loose.contains(&q) => 'd',
+                            (Some(q), _) if dolls.contains(&q) => 'r',
+                            (_, Some(StaticKey::Cell(_))) => 'g',
+                            (_, Some(_)) => 'w',
+                            _ => '?',
                         };
                         if !what.contains(tag) {
                             what.push(tag);
@@ -7891,6 +8004,23 @@ impl Physics {
     }
 }
 
+/// A vehicle's `PhysicsPropertyGravityScaler` `scale` as the 360 applies
+/// it: as a prop's ([`prop_gravity_scale`]), none read as 1.
+///
+/// From the 360 code: a vehicle's bodies are built by the same set-up as
+/// a prop's (0x823FDB60 for a car, then 0x821831B0), which gives each
+/// moving body a gravity action (vtable 0x820C8284, scale at +0x28). Its
+/// step (0x82180778), every physics step whatever the body touches, gives
+/// the body `(scale - 1) x mass x dt` times the gravity of the world the
+/// body is in (the vector loaded from its world, body +8, at +0x10:
+/// [`WORLD_GRAVITY`]), through 0x821755C8. So a scaled body is pulled by
+/// `scale x` [`WORLD_GRAVITY`] in all: 18 m/s² for a tank's 2. The car
+/// code's own `GravityFactor` pull ([`GRAVITY_360`], with its wheels
+/// down) is a separate push on top, from the car's own step.
+pub fn vehicle_gravity_scale(scale: Option<f32>) -> f32 {
+    scale.map_or(1.0, prop_gravity_scale)
+}
+
 /// A template's `PhysicsPropertyGravityScaler` as the 360 applies it to a
 /// prop's bodies: clamped to [-10, 10] (0x821831B0 with 0x82DE8C30 and
 /// 0x820BAEEC); not a number reads 1.
@@ -8080,8 +8210,6 @@ mod tests {
         assert_eq!(ai_wobble(3.0, 0.6), [0.0; 3]);
     }
 
-    // 0x82153B30: a building, the ground or debris lets a road vehicle
-    // come out in its box; a prop there doesn't.
     #[test]
     fn a_spawn_box_is_kept_by_props_not_by_buildings() {
         let mut p = Physics::new();
@@ -8925,6 +9053,93 @@ mod tests {
             (all - Vec3::new(-6.862, 0.0, 3.766)).length() < 1e-3,
             "{all}"
         );
+    }
+
+    // A tank's `PhysicsPropertyGravityScaler` of 2 pulls it at twice the
+    // world's gravity in the air, 18 m/s²; one with none at the world's
+    // 9; the scale is clamped as a prop's.
+    // A scaled tank's turret is a body of its own on a hinge, and is
+    // pulled by the same scale as its chassis (0x821831B0 gives each of
+    // the object's moving bodies the action): with no tracks, the whole
+    // falls at 2 x 9.0 = 18.
+    #[test]
+    fn a_scaled_tanks_turret_falls_with_its_chassis() {
+        let mut scaled = tank();
+        let block = |lo: Vec3, hi: Vec3| {
+            (0..8)
+                .map(|i| {
+                    Vec3::new(
+                        if i & 1 == 0 { lo.x } else { hi.x },
+                        if i & 2 == 0 { lo.y } else { hi.y },
+                        if i & 4 == 0 { lo.z } else { hi.z },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        scaled.turret_shapes =
+            vec![block(Vec3::new(-1.0, 1.6, -1.0), Vec3::new(1.0, 2.4, 1.0))].into();
+        scaled.turret_mass = Some(crate::vehicle::Chassis {
+            mass: 3000.0,
+            inertia: Mat3::from_diagonal(Vec3::new(2000.0, 2500.0, 1000.0)),
+            centre_of_mass: Vec3::new(0.0, 2.0, 0.0),
+        });
+        scaled.pivot = Some(Vec3::new(0.0, 2.0, 0.0));
+        scaled.tuning.turret = Some(crate::tuning::TurretTuning {
+            main: true,
+            yaw_speed: 1.0,
+            yaw_accel: 20.0,
+            pitch: (-0.1, 0.3),
+            pitch_speed: 1.0,
+            pitch_accel: 20.0,
+            yaw: None,
+        });
+        scaled.tuning.gravity_scale = Some(2.0);
+        let mut p = Physics::new();
+        let id = p.add_vehicle_turned(&scaled, Vec3::new(0.0, 500.0, 0.0), Quat::IDENTITY);
+        for _ in 0..30 {
+            p.step(DT);
+        }
+        let fall = -p.vehicle_velocity(id).y / (30.0 * DT);
+        assert!((fall - 18.0).abs() < 0.5, "{fall}");
+    }
+
+    // The tracks' pull off the ground (0x821A4F10): none with all six
+    // points down (a tank on flat ground), in proportion to those off
+    // (half off: half of it), and all of it in the air: (GravityFactor - 1)
+    // x 6 x 1.5 m/s², 9 for the tanks' factor of 2.
+    #[test]
+    fn a_tracks_pull_grows_with_its_points_off_the_ground() {
+        let down = Some(TrackContact {
+            at: Vec3::ZERO,
+            normal: Vec3::Y,
+            start: Vec3::Y,
+        });
+        let mass = 1000.0;
+        assert_eq!(track_air_pull(2.0, &[down; 6], mass), 0.0);
+        let half = [down, down, down, None, None, None];
+        assert!((track_air_pull(2.0, &half, mass) + 3.0 * 1.5 * mass).abs() < 1e-3);
+        let air = [None; 6];
+        assert!((track_air_pull(2.0, &air, mass) / mass + 9.0).abs() < 1e-4);
+        // A factor of 1 pulls nothing, however many are off.
+        assert_eq!(track_air_pull(1.0, &air, mass), 0.0);
+    }
+
+    #[test]
+    fn a_scaled_tank_falls_at_twice_the_worlds_gravity() {
+        assert_eq!(vehicle_gravity_scale(None), 1.0);
+        assert_eq!(vehicle_gravity_scale(Some(2.0)), 2.0);
+        assert_eq!(vehicle_gravity_scale(Some(40.0)), 10.0);
+        let mut p = Physics::new();
+        let mut scaled = tank();
+        scaled.tuning.gravity_scale = Some(2.0);
+        let plain = p.add_vehicle_turned(&tank(), Vec3::new(0.0, 500.0, 0.0), Quat::IDENTITY);
+        let heavy = p.add_vehicle_turned(&scaled, Vec3::new(30.0, 500.0, 0.0), Quat::IDENTITY);
+        for _ in 0..30 {
+            p.step(DT);
+        }
+        let fall = |id| -p.vehicle_velocity(id).y / (30.0 * DT);
+        assert!((fall(plain) - WORLD_GRAVITY).abs() < 0.3, "{}", fall(plain));
+        assert!((fall(heavy) - 18.0).abs() < 0.5, "{}", fall(heavy));
     }
 
     // The 360's rigid push tops speed up rather than adding to it (Xenia

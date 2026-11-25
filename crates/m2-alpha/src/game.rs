@@ -526,6 +526,13 @@ impl Game {
                     (!all.is_empty()).then(|| (m2_assets::name_hash(name), all))
                 })
                 .collect();
+            combat.blast_effects = db
+                .explosions
+                .iter()
+                .filter_map(|(t, e)| {
+                    Some((m2_assets::name_hash(db.names.get(t)?), (e.radius, e.force)))
+                })
+                .collect();
         }
         combat.particle_table = scene.particle_table();
         own_explosives(&mut combat, scene.hero_explosives());
@@ -6393,19 +6400,7 @@ fn exit_plan(
     let index = seating.and_then(|s| her_seat.and_then(|n| s.seat(n)).or_else(|| s.driver()));
     let seat = seating.zip(index).map(|(s, i)| &s.seats[i]);
     let exit = seating.zip(index).and_then(|(s, i)| s.exit_of(i));
-    let local = exit
-        .and_then(|e| v.spec.entrance_at(e.name))
-        .map(|p| Vec3::new(p.x, 0.0, p.z));
-    let (lo, hi) = v.spec.bounds;
-    let local = local.filter(|p| !(lo.x..=hi.x).contains(&p.x) || !(lo.z..=hi.z).contains(&p.z));
-    let place = local.map(|p| at.transform_point3(p));
-    // The 360 sweeps her capsule (0.4 m, 0.6 to 1.8 m up) from her seat to
-    // the hardpoint (0x8229AC90); here one ray at 1.2 m.
-    let blocked = place.zip(v.id).is_some_and(|(to, id)| {
-        let from = at.transform_point3(v.spec.seat.unwrap_or(Vec3::ZERO)) + Vec3::Y * 1.2;
-        let way = to + Vec3::Y * 1.2 - from;
-        physics.cast_ray_past(from, way, way.length(), id).is_some()
-    });
+    let (place, blocked) = exit_way(physics, v, her_seat, at);
     let up_y = at.transform_vector3(Vec3::Y).normalize_or_zero().y;
     // A helicopter's landed share is not modelled: it counts as landed
     // (Invented; 0x822A2B60 ditches from one in the air).
@@ -6424,6 +6419,124 @@ fn exit_plan(
         (_, Some(p)) => p,
     };
     (kind, place)
+}
+
+/// Her way out of `v` (standing at `at`) from `her_seat` (else the
+/// driver's): the exit point by its entrance, if it lies outside the hull,
+/// and whether the way there is blocked. The 360 sweeps her capsule (0.4
+/// m, 0.6 to 1.8 m up) from her seat to the hardpoint (0x8229AC90); here
+/// one ray at 1.2 m.
+fn exit_way(
+    physics: &Physics,
+    v: &ParkedVehicle,
+    her_seat: Option<u32>,
+    at: Mat4,
+) -> (Option<Vec3>, bool) {
+    let seating = v.spec.seating.as_deref();
+    let index = seating.and_then(|s| her_seat.and_then(|n| s.seat(n)).or_else(|| s.driver()));
+    let exit = seating.zip(index).and_then(|(s, i)| s.exit_of(i));
+    let local = exit
+        .and_then(|e| v.spec.entrance_at(e.name))
+        .map(|p| Vec3::new(p.x, 0.0, p.z));
+    let (lo, hi) = v.spec.bounds;
+    let local = local.filter(|p| !(lo.x..=hi.x).contains(&p.x) || !(lo.z..=hi.z).contains(&p.z));
+    let place = local.map(|p| at.transform_point3(p));
+    let blocked = place.zip(v.id).is_some_and(|(to, id)| {
+        let from = at.transform_point3(v.spec.seat.unwrap_or(Vec3::ZERO)) + Vec3::Y * 1.2;
+        let way = to + Vec3::Y * 1.2 - from;
+        physics.cast_ray_past(from, way, way.length(), id).is_some()
+    });
+    (place, blocked)
+}
+
+/// The launch her ragdoll takes out of a vehicle that died under her, m/s,
+/// away from it and [`DEATH_EXIT_ANGLE`] up (0x82428EA0: the speed at
+/// 0x82DE889C for the player, 0x82DE8894 for anyone else).
+pub const DEATH_EXIT_LAUNCH: f32 = 10.0;
+/// How far up from level that launch goes, radians (0x82DE88A0 for the
+/// player, 0x82DE8898 for anyone else). From Xenia: the image holds 0.0,
+/// but both read 0.7854 (45 degrees) live at the title screen and at the
+/// death; something writes them before the title screen (the writer is
+/// not found: likely a tunables load).
+pub const DEATH_EXIT_ANGLE: f32 = std::f32::consts::FRAC_PI_4;
+/// How long she is held down after that exit, seconds (0x822A2178 sets
+/// her record's +0x38 from 0x82423848(3.0, …); that it is her time down
+/// is inferred).
+pub const DEATH_EXIT_DOWN: f32 = 3.0;
+
+/// Out of `v`, which died under her: the 360's death exit (exit 4,
+/// 0x822A2178, chosen by 0x822A2B60 for the death message's mode 3,
+/// posted by 0x82205BE0). She is put at her seat's own place when her way
+/// out is clear, else out at a clear point (0x8229AC90 blocked:
+/// 0x822A13D0); no velocity. Her ragdoll is to start with
+/// [`death_launch`]. Returns the vehicle's origin, or `None` if it isn't
+/// placed.
+pub(crate) fn death_exit(
+    physics: &Physics,
+    v: &ParkedVehicle,
+    player: &mut Player,
+) -> Option<Vec3> {
+    let id = v.id?;
+    let at = physics.vehicle_transform(id).filter(|m| m.is_finite())?;
+    // Blocked as the 360 finds it (0x822A2178 -> 0x8229AC90): her
+    // character's capsule cast where she sits meets something (true:
+    // 0x82166660 returns its hits' count, non-zero), her own vehicle's hull
+    // counted (its query passes no body to skip), so a seat inside a cab
+    // always is; then she goes out by her exit path (0x822A13D0), else
+    // stays where she is. The way to her door as before besides.
+    let blocked = seat_in_hull(&v.spec) || exit_way(physics, v, None, at).1;
+    let place = if blocked {
+        door_out(at, &v.spec)
+    } else {
+        at.transform_point3(v.spec.seat.unwrap_or(Vec3::ZERO))
+    };
+    player.step_out_at(place);
+    player.character.velocity = Vec3::ZERO;
+    player.driving = None;
+    player.chase_target = None;
+    player.seated = false;
+    player.seat_frame = None;
+    eprintln!(
+        "exit: {} death exit at {place:.2} ({})",
+        v.spec.label,
+        if blocked {
+            "way blocked: put out clear"
+        } else {
+            "at her seat"
+        }
+    );
+    Some(at.transform_point3(Vec3::ZERO))
+}
+
+/// The character capsule the 360's death exit casts where a rider sits
+/// (0x8229AC90): radius 0.4 m (0x82B7C0F0), from 0.6 m (0x82B7C0E8) to
+/// 1.8 m (0x82B7C0EC) up from her feet.
+const EXIT_CAPSULE: (f32, f32, f32) = (0.4, 0.6, 1.8);
+
+/// Whether a rider's capsule at the vehicle's seat ([`EXIT_CAPSULE`],
+/// model space, her feet at the seat) meets its hull box: as the 360's
+/// cast meets the cab she sits in. Inferred: the hull box stands for the
+/// vehicle's collision shapes.
+pub(crate) fn seat_in_hull(spec: &VehicleSpec) -> bool {
+    let (r, low, high) = EXIT_CAPSULE;
+    let seat = spec.seat.unwrap_or(Vec3::ZERO);
+    let (lo, hi) = spec.hull;
+    // The capsule's axis, from (low + r) to (high - r) up, sampled.
+    (0..=8).any(|k| {
+        let y = low + r + (high - low - 2.0 * r) * k as f32 / 8.0;
+        let p = seat + Vec3::Y * y;
+        p.clamp(lo, hi).distance(p) <= r
+    })
+}
+
+/// Her ragdoll's launch out of a vehicle that died with its origin at
+/// `vehicle`, she at `her`: [`DEATH_EXIT_LAUNCH`] at [`DEATH_EXIT_ANGLE`]
+/// up, from it to her across the ground (0x82428EA0); along +Z if she is
+/// right over it.
+pub fn death_launch(vehicle: Vec3, her: Vec3) -> Vec3 {
+    let away = Vec3::new(her.x - vehicle.x, 0.0, her.z - vehicle.z).normalize_or(Vec3::Z);
+    away * (DEATH_EXIT_LAUNCH * DEATH_EXIT_ANGLE.cos())
+        + Vec3::Y * (DEATH_EXIT_LAUNCH * DEATH_EXIT_ANGLE.sin())
 }
 
 /// Whether `v`, standing at `at`, is a boat afloat: its origin (its
@@ -6658,7 +6771,42 @@ fn switch_weapon(
 
 #[cfg(test)]
 mod tests {
+
+    // Out of a vehicle that died under her: 10 m/s at 45 degrees, 7.07
+    // out from its origin towards her and 7.07 up (0x82428EA0, the live
+    // values); along +Z right over it.
+    #[test]
+    fn a_death_exit_launches_her_away_from_the_vehicle_at_45_degrees() {
+        let h = 10.0 * std::f32::consts::FRAC_PI_4.cos();
+        let v = death_launch(Vec3::new(1.0, 5.0, 1.0), Vec3::new(4.0, 7.0, 5.0));
+        assert!((v - Vec3::new(0.6 * h, h, 0.8 * h)).length() < 1e-4, "{v}");
+        assert!((v.with_y(0.0).length() - 7.071).abs() < 1e-3);
+        let over = death_launch(Vec3::ZERO, Vec3::Y * 2.0);
+        assert!((over - Vec3::new(0.0, h, h)).length() < 1e-4, "{over}");
+    }
     use std::collections::HashMap;
+
+    // A rider sat inside a cab is blocked as the 360's capsule cast finds
+    // her (0x8229AC90 meets the cab) and goes out at her door, outside the
+    // vehicle's box; one sat over an open bed's edge is not.
+    #[test]
+    fn a_rider_inside_a_cab_exits_at_her_door_outside_it() {
+        use m2_math::glam::{Mat4, Vec3};
+        let mut spec = crate::npc::tests::tank(m2_engine::tuning::VehicleTuning::default());
+        spec.hull = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 2.0, 2.0));
+        spec.bounds = spec.hull;
+        spec.seat = Some(Vec3::new(0.4, 0.3, 0.5));
+        spec.door = Some(Vec3::new(1.0, 0.0, 0.3));
+        assert!(super::seat_in_hull(&spec));
+        let out = super::door_out(Mat4::IDENTITY, &spec);
+        let (lo, hi) = spec.bounds;
+        let inside = (lo.x..=hi.x).contains(&out.x) && (lo.z..=hi.z).contains(&out.z);
+        assert!(!inside, "{out}");
+        assert!(out.x > hi.x + 0.5, "{out}");
+        // A seat well clear of the box (a bike's, out over its side).
+        spec.seat = Some(Vec3::new(2.0, 2.5, 0.0));
+        assert!(!super::seat_in_hull(&spec));
+    }
 
     #[test]
     fn a_pickup_taken_sets_off_its_pickup_effect() {

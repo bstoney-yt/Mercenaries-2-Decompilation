@@ -473,6 +473,10 @@ pub struct Player {
     pub down: bool,
     /// Thrown off a vehicle (exit 3, 0x822A1B70): to be knocked down.
     pub tossed: bool,
+    /// Put out of a vehicle that died under her (exit 4, 0x822A2178): to
+    /// be knocked down for that many seconds, her ragdoll starting with
+    /// [`launch`](Self::launch).
+    pub knock_for: Option<f32>,
     /// The launch her ragdoll starts with, from the exit message
     /// ([`m2_engine::ragdoll_launch::exit_launch`]).
     pub launch: Option<Vec3>,
@@ -725,6 +729,7 @@ impl Player {
             launcher: false,
             down: false,
             tossed: false,
+            knock_for: None,
             launch: None,
             last_toss: None,
             fall: on_foot::FallWatch::default(),
