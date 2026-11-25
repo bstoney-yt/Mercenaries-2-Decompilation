@@ -129,6 +129,7 @@ mod support;
 mod touch;
 mod traffic;
 mod ui;
+mod warmup;
 mod winches;
 
 use crate::hero::Hero;
@@ -262,6 +263,12 @@ struct Options {
     /// `--pipelines-check`: with `--screenshot`, the first frame drawn
     /// must log the pipelines it made ([`pipelines_check`]).
     pipelines_check: bool,
+    /// `--pipeline-warm-check`: with `--screenshot`, no pipeline may be
+    /// built by a draw once play has begun ([`warmup::verdict`]).
+    pipeline_warm_check: bool,
+    /// `--pipeline-cache-dir`: where the pipelines' list and the driver's
+    /// cache are kept, instead of the settings' folder ([`warmup`]).
+    pipeline_cache_dir: Option<PathBuf>,
     /// With `--drive` and `--wreck` or `--shoot-up`: get out of the wreck,
     /// walk to the fuel can it left and take it (testing).
     fuel_check: bool,
@@ -898,6 +905,8 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.drive = true;
             }
             "--pipelines-check" => o.pipelines_check = true,
+            "--pipeline-warm-check" => o.pipeline_warm_check = true,
+            "--pipeline-cache-dir" => o.pipeline_cache_dir = Some(value()?.into()),
             "--no-blast-check" => {
                 o.no_blast_check = true;
                 o.drive = true;
@@ -1411,6 +1420,7 @@ const SCREENSHOT_ONLY: &[&str] = &[
     "--sound",
     "--mission-shots",
     "--pipelines-check",
+    "--pipeline-warm-check",
 ];
 
 /// Those of [`SCREENSHOT_ONLY`] given without `--screenshot`, in the order
@@ -1843,6 +1853,12 @@ fn run(
         .clone()
         .unwrap_or_else(Config::default_path);
     let mut config = Config::load(&config_path)?;
+    warmup::set_dir(options.pipeline_cache_dir.clone().unwrap_or_else(|| {
+        config_path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf)
+    }));
     if let Some(hero) = options.hero {
         config.hero = hero;
     }
@@ -1936,6 +1952,14 @@ fn run(
     }
     if let Some(out) = &options.screenshot {
         let shot = screenshot(&config, install.as_ref(), &mode, &options, out);
+        if options.pipeline_warm_check {
+            if let Err(e) = &shot {
+                eprintln!("pipeline-warm-check: the run failed: {e:#}");
+            }
+            let (ok, line) = warmup::verdict();
+            eprintln!("pipeline-warm-check: {line}");
+            errlog::exit(if ok && shot.is_ok() { 0 } else { 1 });
+        }
         if options.pipelines_check {
             if let Err(e) = &shot {
                 eprintln!("pipelines-check: the run failed: {e:#}");
@@ -2473,6 +2497,7 @@ fn note_pipelines(backend: &mut WgpuBackend) {
         spans::add("draw: pipelines", work.took);
         eprintln!("{line}");
     }
+    warmup::drew(backend, work.made);
 }
 
 /// `--pipelines-check`: prints the verdict of the run's frames
@@ -2497,6 +2522,7 @@ fn render(
         view.lighting.fog_density = 0.00025;
     }
     let focus = game.focus();
+    warmup::step(backend);
     spans::time("stream", || game.scene.update(backend, focus))?;
     log_gpu_memory(backend, game);
     let mut queue = DrawQueue::new();
@@ -2829,6 +2855,7 @@ fn screenshot(
     let (w, h) = (config.window.width, config.window.height);
     let mut backend = WgpuBackend::headless(w, h)?;
     eprintln!("adapter: {:?}", backend.adapter_summary());
+    warmup::start(&mut backend, true);
     let mut game = build_scene(
         &mut backend,
         install,
@@ -6160,6 +6187,7 @@ fn mission_for_screenshot(
             for step in screen_cycle.update(wanted, tick, false) {
                 eprintln!("loading screen: {step:?} at {:.1} s", i as f32 * tick);
             }
+            warmup::screen(screen_cycle.up());
         }
         // `--shop-key`: the shop key pressed, by the clock, as in play,
         // with cash given her as the contract ends (as if picked up) for
@@ -13199,6 +13227,7 @@ impl App {
             WgpuBackend::for_window(window.clone(), size.width, size.height, w.vsync)?;
         let adapter = backend.adapter_summary();
         eprintln!("adapter: {adapter:?}");
+        warmup::start(&mut backend, false);
         backend.set_render_scale(w.render_scale);
         backend.set_light_shadows(cfg!(target_os = "android"));
         if w.render_scale < 1.0 {

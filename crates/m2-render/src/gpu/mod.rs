@@ -513,6 +513,28 @@ enum BlendKind {
     Additive,
 }
 
+impl From<BlendKind> for crate::PipelineBlend {
+    fn from(b: BlendKind) -> Self {
+        match b {
+            BlendKind::Opaque => Self::Opaque,
+            BlendKind::Masked => Self::Masked,
+            BlendKind::Translucent => Self::Translucent,
+            BlendKind::Additive => Self::Additive,
+        }
+    }
+}
+
+impl From<crate::PipelineBlend> for BlendKind {
+    fn from(b: crate::PipelineBlend) -> Self {
+        match b {
+            crate::PipelineBlend::Opaque => Self::Opaque,
+            crate::PipelineBlend::Masked => Self::Masked,
+            crate::PipelineBlend::Translucent => Self::Translucent,
+            crate::PipelineBlend::Additive => Self::Additive,
+        }
+    }
+}
+
 /// A vertex layout's number among the backend's ([`Layouts`]):
 /// pipeline keys hold it rather than the layout, so a draw's key is
 /// copied and hashed without the layout's list of elements (a heap copy
@@ -819,6 +841,10 @@ pub struct WgpuBackend {
     /// The pipelines made on first use and the time that took
     /// ([`take_pipeline_work`](Self::take_pipeline_work)).
     pipeline_work: crate::PipelineWork,
+    /// The driver's pipeline cache, where the device keeps one (Vulkan):
+    /// every pipeline built goes through it, and its data is saved for
+    /// the next run ([`use_pipeline_cache`](Self::use_pipeline_cache)).
+    pipeline_cache: Option<wgpu::PipelineCache>,
     /// When the backend started, for animated surfaces.
     started: std::time::Instant,
     /// Bloom, exposure and grade after the world.
@@ -1410,6 +1436,7 @@ impl WgpuBackend {
             glow_pipelines: FastMap::default(),
             shadow_pipelines: FastMap::default(),
             pipeline_work: crate::PipelineWork::default(),
+            pipeline_cache: None,
             cascades: std::cell::Cell::new(None),
             started: std::time::Instant::now(),
             post,
@@ -2022,6 +2049,7 @@ impl WgpuBackend {
             _ => None,
         };
         let topology = wgpu_topology(key.topology)?;
+        let cache = self.pipeline_cache.as_ref();
         let make = |entry: &str, blend: Option<wgpu::BlendState>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(entry),
@@ -2073,7 +2101,7 @@ impl WgpuBackend {
                     })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache,
             })
         };
         // The glow layer's (see `encode_glows`): a glow adds itself, by its
@@ -2224,7 +2252,7 @@ impl WgpuBackend {
                     targets: &[],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: self.pipeline_cache.as_ref(),
             });
         self.shadow_pipelines.insert(*key, pipeline);
         self.pipeline_work.record(1, started.elapsed());
@@ -2852,7 +2880,10 @@ async fn open(
             label: Some("m2"),
             // Timestamps for the frame timer, where the adapter has them;
             // arrays of textures for the materials' maps (`TextureSlots`).
-            required_features: (adapter.features() & timer::features()) | maps_features(),
+            // And the driver's pipeline cache, where it keeps one (Vulkan).
+            required_features: (adapter.features()
+                & (timer::features() | wgpu::Features::PIPELINE_CACHE))
+                | maps_features(),
             // Five groups: frame, draw, material, scene and the materials'
             // maps.
             required_limits: wgpu::Limits {
@@ -2871,6 +2902,47 @@ async fn open(
 }
 
 impl RenderBackend for WgpuBackend {
+    fn prepare_pipeline(&mut self, spec: &crate::PipelineSpec) -> Result<bool, BackendError> {
+        let before = self.pipelines.len() + self.shadow_pipelines.len();
+        match spec {
+            crate::PipelineSpec::Draw {
+                layout,
+                topology,
+                strip_index,
+                blend,
+                double_sided,
+                depth_bias,
+            } => {
+                wgpu_topology(*topology)?;
+                let key = PipelineKey {
+                    layout: self.layouts.id(layout),
+                    topology: *topology,
+                    strip_index: *strip_index,
+                    blend: (*blend).into(),
+                    double_sided: *double_sided,
+                    depth_bias: *depth_bias,
+                };
+                self.ensure_pipeline(&key)?;
+            }
+            crate::PipelineSpec::Shadow {
+                layout,
+                topology,
+                strip_index,
+                masked,
+            } => {
+                wgpu_topology(*topology)?;
+                let key = ShadowKey {
+                    layout: self.layouts.id(layout),
+                    topology: *topology,
+                    strip_index: *strip_index,
+                    masked: *masked,
+                };
+                self.ensure_shadow_pipeline(&key)?;
+            }
+        }
+        Ok(self.pipelines.len() + self.shadow_pipelines.len() > before)
+    }
+
     fn create_vertex_buffer(
         &mut self,
         desc: &VertexBufferDesc,
@@ -3341,6 +3413,74 @@ impl WgpuBackend {
     /// took, and how many in all ([`crate::PipelineWork`]).
     pub fn take_pipeline_work(&mut self) -> crate::PipelineWork {
         self.pipeline_work.take()
+    }
+
+    /// Every pipeline built so far, described for the next run
+    /// ([`crate::PipelineSpec`]).
+    pub fn used_pipelines(&self) -> Vec<crate::PipelineSpec> {
+        let draws = self.pipelines.keys().map(|k| crate::PipelineSpec::Draw {
+            layout: self.layouts.get(k.layout).clone(),
+            topology: k.topology,
+            strip_index: k.strip_index,
+            blend: k.blend.into(),
+            double_sided: k.double_sided,
+            depth_bias: k.depth_bias,
+        });
+        let shadows = self
+            .shadow_pipelines
+            .keys()
+            .map(|k| crate::PipelineSpec::Shadow {
+                layout: self.layouts.get(k.layout).clone(),
+                topology: k.topology,
+                strip_index: k.strip_index,
+                masked: k.masked,
+            });
+        draws.chain(shadows).collect()
+    }
+
+    /// The name the driver's pipeline cache data is kept under: none
+    /// where this device keeps no such cache.
+    pub fn pipeline_cache_key(&self) -> Option<String> {
+        if !self
+            .device
+            .features()
+            .contains(wgpu::Features::PIPELINE_CACHE)
+        {
+            return None;
+        }
+        wgpu::util::pipeline_cache_key(&self.adapter.get_info())
+    }
+
+    /// Starts the driver's pipeline cache (where the device keeps one),
+    /// from `data` that a previous run's
+    /// [`pipeline_cache_data`](Self::pipeline_cache_data) gave under the
+    /// same [`pipeline_cache_key`](Self::pipeline_cache_key): whether
+    /// there is a cache now. Pipelines built before this are not in it.
+    pub fn use_pipeline_cache(&mut self, data: Option<&[u8]>) -> bool {
+        if self.pipeline_cache_key().is_none() {
+            return false;
+        }
+        // SAFETY: `data` is only ever bytes this backend's
+        // `pipeline_cache_data` returned on an earlier run, saved by the
+        // caller under this adapter's `pipeline_cache_key` with a length
+        // and checksum it verifies before passing them on (m2-alpha's
+        // `warmup`); wgpu checks the adapter and driver its header names
+        // and, with `fallback`, starts empty when they don't match.
+        let cache = unsafe {
+            self.device
+                .create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                    label: Some("pipelines"),
+                    data,
+                    fallback: true,
+                })
+        };
+        self.pipeline_cache = Some(cache);
+        true
+    }
+
+    /// The driver's pipeline cache's data to save, where there is one.
+    pub fn pipeline_cache_data(&self) -> Option<Vec<u8>> {
+        self.pipeline_cache.as_ref()?.get_data()
     }
 }
 
