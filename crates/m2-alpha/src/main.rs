@@ -13844,6 +13844,40 @@ const SETTLE_AFTER: f32 = 5.0;
 /// well over its tilt.
 const SETTLE_MOST: (f32, f32, f32) = (0.35, 5.0, 0.05);
 
+/// How long `--parked-settle-check` notes what each vehicle touches after
+/// it is placed, seconds, and the one whose every touch is logged as it
+/// goes (q766 B's Phoenix, flipped 152 deg): log lines only.
+const SETTLE_TOUCH_WATCH: f32 = 1.0;
+const SETTLE_TOUCH_WATCHED: u32 = 0x0010_d5d8;
+
+/// What a vehicle touches, named for `--parked-settle-check`'s log: a
+/// terrain cell, a static layer's placed object (its entity guid and
+/// template's name), a state layer's entity, or a moving body.
+fn settle_touch_name(world: &m2_engine::World, key: Option<m2_engine::StaticKey>) -> String {
+    use m2_engine::StaticKey;
+    let object = |i: usize| {
+        world
+            .index
+            .objects
+            .get(i)
+            .map_or(format!("object #{i}"), |o| {
+                let name = world
+                    .index
+                    .template_db
+                    .by_id(o.template)
+                    .map_or(format!("model {:08x}", o.model), |(n, _)| n.to_owned());
+                format!("{:#x} {name} (a static layer's)", o.entity)
+            })
+    };
+    match key {
+        Some(StaticKey::Cell(h)) => format!("terrain cell {h:08x}"),
+        Some(StaticKey::Object(i)) => object(i),
+        Some(StaticKey::Member(i, k)) => format!("building {k} of {}", object(i)),
+        Some(StaticKey::Entity(g)) => format!("{g:#x} (a state layer's)"),
+        None => "a moving body (a vehicle, prop body or debris)".to_owned(),
+    }
+}
+
 /// What `--parked-settle-check` allows a boat, by its own rule: metres
 /// level from its authored place, metres from the height it floats at,
 /// and the least up (its up axis's height). **Invented**: a boat is
@@ -13900,7 +13934,13 @@ fn parked_settle_check(
     use m2_math::glam::{Quat, Vec3};
     use std::collections::HashMap;
     // Entity -> (authored place, authored turn, seconds since placed).
-    let mut watched: HashMap<u32, (Vec3, Quat, f32, String)> = HashMap::new();
+    // Entity -> (authored place, authored turn, seconds since placed,
+    // label, what it touched in its first second).
+    #[allow(clippy::type_complexity)]
+    let mut watched: HashMap<
+        u32,
+        (Vec3, Quat, f32, String, std::collections::BTreeSet<String>),
+    > = HashMap::new();
     let (mut passed, mut failed) = (0usize, Vec::new());
     let mut judged = std::collections::HashSet::new();
     let mut t = 0.0f32;
@@ -13928,11 +13968,46 @@ fn parked_settle_check(
             if judged.contains(&key) || watched.contains_key(&key) {
                 continue;
             }
-            watched.insert(key, (at, turn, 0.0, v.spec.label.clone()));
+            watched.insert(
+                key,
+                (
+                    at,
+                    turn,
+                    0.0,
+                    v.spec.label.clone(),
+                    std::collections::BTreeSet::new(),
+                ),
+            );
         }
         let mut done = Vec::new();
-        for (&entity, (at, turn, since, label)) in &mut watched {
+        for (&entity, (at, turn, since, label, touched)) in &mut watched {
             *since += tick;
+            // What it touches as it is placed and over its first second
+            // (log lines only; q766 B's Phoenix 0x10d5d8 flipped 152 deg
+            // from a pose authored on the terrain).
+            if *since <= SETTLE_TOUCH_WATCH + tick
+                && let Some(id) = game
+                    .scene
+                    .vehicles
+                    .iter()
+                    .find(|v| v.spot.is_some_and(|s| s.0 == entity) || v.guid == Some(entity))
+                    .and_then(|v| v.id)
+            {
+                let now: Vec<String> = world
+                    .physics
+                    .vehicle_touching(id)
+                    .into_iter()
+                    .map(|(key, _, _)| settle_touch_name(world, key))
+                    .collect();
+                if entity == SETTLE_TOUCH_WATCHED {
+                    eprintln!(
+                        "parked-settle-check: {entity:#x} {label} at {:.2} s touches [{}]",
+                        *since,
+                        now.join("; ")
+                    );
+                }
+                touched.extend(now);
+            }
             if *since < SETTLE_AFTER {
                 continue;
             }
@@ -13967,7 +14042,10 @@ fn parked_settle_check(
                 match boat_settled(now_at, *at, up, afloat) {
                     Ok(()) => passed += 1,
                     Err(why) => {
-                        let line = format!("{entity:#x} {label} (a boat): {why}");
+                        let line = format!(
+                            "{entity:#x} {label} (a boat): {why}; touched in its first second: [{}]",
+                            touched.iter().cloned().collect::<Vec<_>>().join("; ")
+                        );
                         eprintln!("parked-settle-check: off: {line}");
                         failed.push(line);
                     }
@@ -13987,7 +14065,8 @@ fn parked_settle_check(
                     |(d, _)| format!("something {:.2} m under its authored place", d - 2.0),
                 );
                 let line = format!(
-                    "{entity:#x} {label}: {moved:.2} m from its authored place, {turned:.1} deg turned, up {up:.2}, {speed:.2} m/s; {under}"
+                    "{entity:#x} {label}: {moved:.2} m from its authored place, {turned:.1} deg turned, up {up:.2}, {speed:.2} m/s; {under}; touched in its first second: [{}]",
+                    touched.iter().cloned().collect::<Vec<_>>().join("; ")
                 );
                 eprintln!("parked-settle-check: off: {line}");
                 failed.push(line);
