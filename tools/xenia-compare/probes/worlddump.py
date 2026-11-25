@@ -16,7 +16,7 @@ for _ in range(60):
     world = u32(ph + 8) if pc.ok_ptr(ph) else 0
     if pc.ok_ptr(world): break
     time.sleep(1)
-b = g.read(world, 0x400) if pc.ok_ptr(world) else None
+b = g.read(world, 0x500) if pc.ok_ptr(world) else None
 with open(OUT, "w") as fh:
     fh.write(f"# Havok world object, read-only dump {time.strftime('%Y-%m-%d %H:%M:%S')} (Jennifer run). Via her proxy phantom {ph:#x} +8.\n")
     fh.write(f"world {world:#x} vtable {u32(world):#x}\n")
@@ -28,7 +28,7 @@ with open(OUT, "w") as fh:
 # lock +0x84, so +0x6C = m_collisionInput (chosen); +0x68 (the member before it) is dumped as a fallback.
 if b:
     with open(OUT, "a") as fh:
-        for off in (0x6C, 0x68):
+        for off in (0x7C, 0x6C, 0x68):  # 0x7C = collision input per the world ctor 0x82624898 / 0x826425C8 (vehicle thread)
             q = struct.unpack_from(">I", b, off)[0]; cb = g.read(q, 0x100) if pc.ok_ptr(q) else None
             fh.write(f"world+{off:#x} -> {q:#x} vtable {u32(q) if pc.ok_ptr(q) else 0:#x}\n")
             if cb:
