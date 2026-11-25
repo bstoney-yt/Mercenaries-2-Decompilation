@@ -630,7 +630,7 @@ pub fn getup_yaw(nodes: &[Mat4], hashes: &[u32]) -> Option<f32> {
     (line.length_squared() > 1e-8).then(|| line.x.atan2(line.z))
 }
 
-fn limp_middle(nodes: &[Mat4]) -> Option<Vec3> {
+pub(crate) fn limp_middle(nodes: &[Mat4]) -> Option<Vec3> {
     if nodes.is_empty() {
         return None;
     }
@@ -1369,7 +1369,7 @@ pub struct Npc {
     rise: bool,
     /// Knocked down and limp: seconds the body has lain still, and
     /// seconds it has been limp ([`LIMP_STILL`], [`LIMP_LONGEST`]).
-    limp: (f32, f32),
+    limp: LimpTimers,
     /// Where the round now striking them landed and the way it flew, set
     /// by the shot just before [`hurt`](Self::hurt) and read by it.
     pub last_hit: Option<(Vec3, Vec3)>,
@@ -1430,6 +1430,9 @@ pub struct Npc {
     /// seconds until he may ask again ([`m2_engine::ai_cover::RETRY`]).
     pub cover_ask: Option<Vec3>,
     pub cover_spot: Option<Vec3>,
+    /// The cover object his spot is on and how long he has been heading
+    /// there, for his claim ([`People::renew_cover_claims`]).
+    pub cover_claim: Option<(u32, f32)>,
     cover_retry: f32,
     /// How they move on foot, as the 360's people do
     /// ([`m2_engine::on_foot`]): their kind's paces and turn, the way and
@@ -1564,13 +1567,75 @@ pub fn empty_rig() -> Rig {
 /// their physics object is of kind 0xC, once a float of it (+0x300) is
 /// over 0.5 (0x820D9EDC) or another (+0x304) over 19.0 (0x820F8C84).
 ///
-/// **Inferred**: kind 0xC is the limp body, the first float the seconds
-/// it has lain still and the second the seconds it has been limp. So
-/// they do not get up while still tumbling, but always after 19 s.
-/// Under [`LIMP_AT_REST`] m/s counts as still (invented).
-const LIMP_STILL: f32 = 0.5;
-const LIMP_LONGEST: f32 = 19.0;
-const LIMP_AT_REST: f32 = 0.2;
+/// Both floats are kept by the limp body's update, 0x82190470 (see
+/// [`LimpTimers`]): +0x300 the seconds it has lain still, +0x304 the
+/// seconds it has been limp. So they do not get up while still tumbling,
+/// but always after 19 s.
+pub const LIMP_STILL: f32 = 0.5;
+pub const LIMP_LONGEST: f32 = 19.0;
+
+/// A limp body's two timers, as its update 0x82190470 keeps them.
+///
+/// From the 360 code:
+/// - The body's position (its object transform's translation,
+///   0x82185FE0) is held against an anchor (+0x2AC). Once it is 0.1 m or
+///   more from it (squared 0.01, 0x820C8114), the anchor moves there and
+///   the still time (+0x300) goes back to 0; otherwise the still time
+///   grows by the step. So "still" is the body staying within 0.1 m of
+///   where it last settled, not any limb's speed: a limb swinging about
+///   a body that lies put does not hold it down.
+/// - The limp time (+0x304) grows by the step, held at 20 s (0x820BB204).
+/// - Both start at 0 as it goes limp (0x82190F48, 0x8218F200).
+///
+/// **Inferred**: the object's position is the ragdoll's root bone (its
+/// first node). **Not ported**: two other ways 0x82190470 counts the body
+/// as still (a contact counter +0x2F0 over two updates, and a held part
+/// +0x310 with a positive +0x50); what sets them is not traced.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LimpTimers {
+    /// Seconds it has lain within [`Self::RADIUS`] of [`Self::anchor`].
+    pub still: f32,
+    /// Seconds it has been limp, up to [`Self::MOST`].
+    pub limp: f32,
+    pub anchor: Option<Vec3>,
+}
+
+impl LimpTimers {
+    /// 0x820C8114 is its square.
+    pub const RADIUS: f32 = 0.1;
+    /// 0x820BB204.
+    pub const MOST: f32 = 20.0;
+
+    /// A step of `dt` with the body's root at `at` (None: not known,
+    /// counted as still).
+    pub fn step(&mut self, at: Option<Vec3>, dt: f32) {
+        let moved = match (at, self.anchor) {
+            (Some(p), Some(a)) => p.distance_squared(a) >= Self::RADIUS * Self::RADIUS,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if moved {
+            self.anchor = at;
+            self.still = 0.0;
+        } else {
+            self.still += dt;
+        }
+        self.limp = (self.limp + dt).min(Self::MOST);
+    }
+
+    /// Lain still over 0.5 s, or limp over 19 s (0x8225CAE0).
+    pub fn settled(&self) -> bool {
+        self.still > LIMP_STILL || self.limp > LIMP_LONGEST
+    }
+}
+
+/// A limp body's root (its first node), for [`LimpTimers`].
+pub fn limp_root(physics: &m2_engine::Physics, id: m2_engine::RagdollId) -> Option<Vec3> {
+    physics
+        .ragdoll_nodes(id)?
+        .first()
+        .map(|m| m.w_axis.truncate())
+}
 
 /// Seconds a fall takes, someone lies knocked down, gets up, and is
 /// subdued (all invented). The time down the 360 sets counts from when
@@ -1619,7 +1684,7 @@ impl Npc {
             fling: None,
             launch: None,
             rise: false,
-            limp: (0.0, 0.0),
+            limp: LimpTimers::default(),
             last_hit: None,
             dying: None,
             face: {
@@ -1730,6 +1795,7 @@ impl Npc {
             swim_speed: crate::player::SWIM_SPEED,
             cover_ask: None,
             cover_spot: None,
+            cover_claim: None,
             cover_retry: 0.0,
             motion: m2_engine::on_foot::HumanMotion::default(),
             ground: Vec2::ZERO,
@@ -2425,12 +2491,7 @@ impl Npc {
             Down::Falling(t) => Some(Down::Falling(t - dt)),
             // Their time down over, but the limp body still tumbling:
             // not yet.
-            Down::Knocked(t)
-                if t - dt <= 0.0
-                    && self.ragdoll.is_some()
-                    && self.limp.0 <= LIMP_STILL
-                    && self.limp.1 <= LIMP_LONGEST =>
-            {
+            Down::Knocked(t) if t - dt <= 0.0 && self.ragdoll.is_some() && !self.limp.settled() => {
                 Some(Down::Knocked(0.0))
             }
             Down::Knocked(t) if t - dt <= 0.0 => {
@@ -2756,6 +2817,24 @@ impl Npc {
         physics.cast_ray(eye, to / distance, distance).is_none()
     }
 
+    /// The 10 s mark a destination whose check failed leaves in his list
+    /// (0x822C7CF0; read by nothing, as in the 360).
+    pub fn destination_refused(&mut self, at: Vec3) {
+        self.dither.mark_for(at, 10.0);
+    }
+
+    /// The step's caller after a move given up with no path held
+    /// (0x822B34A8): he stops dead, and his destination goes so that the
+    /// behaviour picks again.
+    fn give_up_move(&mut self) {
+        self.character.velocity.x = 0.0;
+        self.character.velocity.z = 0.0;
+        self.ground = Vec2::ZERO;
+        self.step = None;
+        self.detour = None;
+        self.cover_spot = None;
+    }
+
     /// A soldier's tick in a fight with the player at `threat`. While he
     /// sees her within his gun's `FireRange` he turns to her, aims and
     /// fires in its bursts (no nearer than its `MinFireRange`), and
@@ -2868,10 +2947,18 @@ impl Npc {
         if !beyond {
             self.cover_spot = None;
         }
+        // The cover gate (0x822C6B78, [`m2_engine::ai_cover::may_ask`]):
+        // its timer out and her 10 to 40 m off; after an attempt the timer
+        // is 15 to 25 s (0x822C7348).
         self.cover_retry -= dt;
-        if beyond && !hiding && self.cover_spot.is_none() && self.cover_retry <= 0.0 {
+        if beyond
+            && !hiding
+            && self.cover_spot.is_none()
+            && m2_engine::ai_cover::may_ask(self.cover_retry, distance)
+        {
             self.cover_ask = Some(threat);
-            self.cover_retry = m2_engine::ai_cover::RETRY;
+            self.cover_retry = m2_engine::ai_cover::RETRY
+                + m2_engine::ai_cover::RETRY_SPREAD * rng.range(0.0, 1.0);
         }
         let to_cover = self.push(self.ai.combat_speed);
         let covered = match self.cover_spot.filter(|_| beyond && !hiding) {
@@ -2937,10 +3024,7 @@ impl Npc {
                         target = at + flat.normalize() * length;
                     }
                 }
-                // Not to a spot he dithered at lately ([`m2_engine::ai_dither`]).
-                if !self.dither.bad(target) {
-                    self.step = Some((target, length / (self.push(self.ai.combat_speed))));
-                }
+                self.step = Some((target, length / (self.push(self.ai.combat_speed))));
             }
             if let Some((target, left)) = &mut self.step {
                 *left -= dt;
@@ -2991,21 +3075,49 @@ impl Npc {
             wanted = Vec3::ZERO;
         }
         self.move_dry(physics, wanted, dt);
-        // Swinging back and forth in the fight: past 8 swings he gives the
-        // move up and marks the spot bad for a minute, as the 360's
-        // `HumanCombat` path step does (0x822B3130, 0x822BF4D8).
-        if self.dither.step(Vec2::new(wanted.x, wanted.z), dt) {
+        let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
+        // Swinging back and forth in the fight: as the 360's `HumanCombat`
+        // path step does (0x822B3130), only a step to a destination that
+        // made no progress counts its swings (0x822CB340, 0x822BF4D8);
+        // past 8 he gives the move up, marks where he stands bad for a
+        // minute, stops, and picks again ([`m2_engine::ai_dither`]).
+        // Inferred: "no progress" is the stall below (pushing and not
+        // moving), and his step, way round and cover spot are the
+        // destination given up. The spots marked are kept but read by
+        // nothing, as in the 360 (no chooser passes them over).
+        let stuck = self.pushed > 0.3 && moved < 0.2;
+        let way = if stuck {
+            Vec2::new(wanted.x, wanted.z)
+        } else {
+            Vec2::ZERO
+        };
+        let gave_up = self.dither.step(way, dt);
+        if gave_up {
+            // What he was doing, for finding which pick keeps coming back.
+            let doing = if hiding {
+                "hiding"
+            } else if covered {
+                "to cover"
+            } else if self.step.is_some() {
+                "stepping"
+            } else if self.detour.is_some() {
+                "going round"
+            } else if seen && distance < reach {
+                "close in"
+            } else {
+                "chasing"
+            };
             eprintln!(
-                "people: {:08x} dithers at {:.1}: gives the move up",
+                "people: {:08x} dithers at {:.1}: gives the move up ({doing}, cover spot {:.1?}, \
+                 her {distance:.1} m off, seen {seen})",
                 self.spawn.unwrap_or(u32::MAX),
-                self.character.position
+                self.character.position,
+                self.cover_spot
             );
             self.dither.mark(self.character.position);
-            self.step = None;
-            self.detour = None;
+            self.give_up_move();
         }
-        let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
-        if self.pushed > 0.3 && moved < 0.2 && self.stalled >= STALLED {
+        if !gave_up && self.pushed > 0.3 && moved < 0.2 && self.stalled >= STALLED {
             // Walked into something: stop stepping; a chase goes round it
             // (along it the clearer way, or back if it is a corner) for a
             // while, then on.
@@ -3776,6 +3888,8 @@ pub fn threat_reaction_seconds(
 /// Everyone on the island but the player.
 #[derive(Debug, Default)]
 pub struct People {
+    /// The cover spots claimed ([`m2_engine::ai_cover::Claims`]).
+    pub cover_claims: m2_engine::ai_cover::Claims,
     pub kinds: Vec<PersonKind>,
     pub npcs: Vec<Npc>,
     /// How long the `ThreatReaction` action lasts, seconds: its clip's
@@ -4336,6 +4450,37 @@ pub fn in_ram(local: Vec3, (lo, hi): (Vec3, Vec3)) -> bool {
 }
 
 impl People {
+    /// While he heads for a cover spot, his claim on it is made again each
+    /// update from where he is, for its first
+    /// [`m2_engine::ai_cover::CLAIM_AGE`] seconds (0x822C7CF0 ->
+    /// 0x822EDA60); refused, the spot goes into his list for 10 s and he
+    /// has none. Not ported: the sweep re-check (0x822CC840) in the same
+    /// window, and what happens past the window (read as: the claim stands).
+    fn renew_cover_claim(
+        claims: &mut m2_engine::ai_cover::Claims,
+        owner: u32,
+        npc: &mut Npc,
+        dt: f32,
+    ) {
+        let (Some(spot), Some((object, age))) = (npc.cover_spot, npc.cover_claim) else {
+            npc.cover_claim = None;
+            return;
+        };
+        if age > m2_engine::ai_cover::CLAIM_AGE {
+            return;
+        }
+        npc.cover_claim = Some((object, age + dt));
+        if !claims.claim(owner, object, npc.character.position, spot) {
+            eprintln!(
+                "people: {:08x} drops cover at {spot:.1}: claimed by another",
+                npc.spawn.unwrap_or(u32::MAX)
+            );
+            npc.destination_refused(spot);
+            npc.cover_spot = None;
+            npc.cover_claim = None;
+        }
+    }
+
     /// The kind of the catalogue's model a name's role asks for
     /// ([`role_for`]), for soldiers whose template has no model of its own.
     pub fn kind_for(&self, name: &str) -> Option<usize> {
@@ -5424,7 +5569,7 @@ impl People {
             .iter()
             .map(|n| (n.shooter, n.ai.modifier.unwrap_or(human)))
             .collect();
-        for npc in &mut self.npcs {
+        for (i, npc) in self.npcs.iter_mut().enumerate() {
             npc.smart = self.smarter;
             npc.target_armour = npc.foe_armour.unwrap_or(self.target_armour).max(1);
             // What his target is and what it takes of his weapons: a
@@ -5480,6 +5625,7 @@ impl People {
             crate::spans::time("people: each one's update", || {
                 npc.update(physics, &mut self.rng, threat, dt)
             });
+            Self::renew_cover_claim(&mut self.cover_claims, i as u32, npc, dt);
             let p = npc.character.position;
             crate::spans::time("people: checks", || {
                 self.checks
@@ -5495,11 +5641,9 @@ impl People {
             // limp.
             match npc.ragdoll.filter(|_| npc.alive) {
                 Some(id) => {
-                    let still = physics.ragdoll_speed(id).is_none_or(|v| v < LIMP_AT_REST);
-                    npc.limp.0 = if still { npc.limp.0 + dt } else { 0.0 };
-                    npc.limp.1 += dt;
+                    npc.limp.step(limp_root(physics, id), dt);
                 }
-                None => npc.limp = (0.0, 0.0),
+                None => npc.limp = LimpTimers::default(),
             }
             // Up from a knockdown (or subdued): where the limp body lay,
             // on the ground under it.
@@ -6928,6 +7072,44 @@ pub(crate) mod tests {
         let mut backend = m2_render::NullBackend::default();
         let mut materials = m2_engine::MaterialCache::new();
         GpuModel::upload(&mut backend, &mut materials, &cpu).unwrap()
+    }
+
+    /// 0x822C7CF0: heading for a cover spot another holds with a better
+    /// score, his renewed claim is refused within the first 2 s and he
+    /// drops the spot; past 2 s his claim is not checked again.
+    #[test]
+    fn a_cover_spot_another_holds_is_dropped_in_the_first_two_seconds() {
+        use m2_engine::ai_cover::Claims;
+        let spot = Vec3::new(0.0, 0.0, 0.0);
+        let mut claims = Claims::default();
+        // Soldier 1, 2 m off it, holds it (score 96).
+        assert!(claims.claim(1, 7, Vec3::new(2.0, 0.0, 0.0), spot));
+        let mut n = Npc::new(
+            0,
+            &rig(),
+            Vec3::new(5.0, 0.0, 0.0),
+            0.0,
+            Brain::Post { facing: 0.0 },
+            None,
+        );
+        n.cover_spot = Some(spot);
+        n.cover_claim = Some((7, 0.0));
+        People::renew_cover_claim(&mut claims, 0, &mut n, 0.1);
+        assert_eq!(n.cover_spot, None, "refused: 75 is under 1.1 x 96");
+        assert!(n.dither.bad(spot), "in his list (read by nothing)");
+        // Past the window: kept, not checked.
+        let mut n = Npc::new(
+            0,
+            &rig(),
+            Vec3::new(5.0, 0.0, 0.0),
+            0.0,
+            Brain::Post { facing: 0.0 },
+            None,
+        );
+        n.cover_spot = Some(spot);
+        n.cover_claim = Some((7, 2.5));
+        People::renew_cover_claim(&mut claims, 0, &mut n, 0.1);
+        assert_eq!(n.cover_spot, Some(spot));
     }
 
     pub(crate) fn rig() -> Rig {
@@ -9539,11 +9721,18 @@ pub(crate) mod tests {
         m.ragdoll = Some(ground().add_ragdoll(&[None], &[Mat4::IDENTITY], Vec3::ZERO));
         m.update_down(0.1);
         assert_eq!(m.down, Some(Down::Knocked(0.0)));
-        m.limp = (0.0, LIMP_LONGEST + 0.1);
+        m.limp = LimpTimers {
+            limp: LIMP_LONGEST + 0.1,
+            ..LimpTimers::default()
+        };
         m.update_down(0.1);
         assert!(matches!(m.down, Some(Down::GettingUp(_))) && m.rise);
         m.down = Some(Down::Knocked(0.0));
-        m.limp = (LIMP_STILL + 0.1, 1.0);
+        m.limp = LimpTimers {
+            still: LIMP_STILL + 0.1,
+            limp: 1.0,
+            ..LimpTimers::default()
+        };
         m.update_down(0.1);
         assert!(matches!(m.down, Some(Down::GettingUp(_))));
         step(&mut n, FALL_SECONDS + 0.1, &mut rng);
