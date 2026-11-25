@@ -165,6 +165,9 @@ const TICK: Duration = Duration::from_nanos(1_000_000_000 / 60);
 const COVER_CHECK_LIMIT: Duration = Duration::from_secs(240);
 /// How long `--launch-check` waits for play to start (invented).
 const LAUNCH_CHECK_LIMIT: Duration = Duration::from_secs(240);
+/// Seconds of play before `--save-check` saves (invented: the island and
+/// the scripts' first steps are in by then).
+const SAVE_CHECK_AFTER: f32 = 20.0;
 /// Longest real time a single frame may advance the simulation by, so a
 /// stall (dragging the window, a breakpoint) doesn't fast-forward the game.
 const MAX_FRAME: Duration = Duration::from_millis(250);
@@ -546,6 +549,11 @@ struct Options {
     /// save read and its hero up, or a new game as the `--hero`), FAIL on
     /// anything else or after [`LAUNCH_CHECK_LIMIT`].
     launch_check: bool,
+    /// `--save-check <slot>`: with `--screenshot --mission`, once the
+    /// scripts have run [`SAVE_CHECK_AFTER`] seconds the game is saved to
+    /// that pause-menu slot in the 360's record layout, read back and its
+    /// fields compared with what was saved; PASS or FAIL, and the run ends.
+    save_check: Option<u32>,
     /// With `--screenshot` on foot and `--gait`: put the nearest soldier
     /// this many metres ahead of her at the start, at the water's height
     /// there, and log each second whether he swims (`npc-swim:` lines).
@@ -1354,6 +1362,16 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--pause-at" => o.pause_at = Some(value()?.parse()?),
             "--new-game" => o.start = Some(flow::Start::NewGame),
             "--launch-check" => o.launch_check = true,
+            "--save-check" => {
+                let n: u32 = value()?
+                    .parse()
+                    .context("--save-check expects a slot number")?;
+                anyhow::ensure!(
+                    n <= PAUSE_SLOTS,
+                    "--save-check: slot {n}: the slots go 0 to {PAUSE_SLOTS}"
+                );
+                o.save_check = Some(n);
+            }
             "--load-slot" => {
                 let n: u32 = value()?
                     .parse()
@@ -2279,12 +2297,7 @@ const PAUSE_SLOTS: u32 = 20;
 /// loads), by when its file was written.
 fn newest_save() -> Option<u32> {
     (0..=PAUSE_SLOTS)
-        .filter_map(|n| {
-            let when = std::fs::metadata(pause_save_path(n))
-                .and_then(|m| m.modified())
-                .ok()?;
-            Some((when, n))
-        })
+        .filter_map(|n| Some((save::SaveGame::modified(&pause_save_path(n))?, n)))
         .max()
         .map(|(_, n)| n)
 }
@@ -2304,11 +2317,17 @@ fn pause_saves(hero: Hero) -> Vec<pause::SaveEntry> {
     (0..=PAUSE_SLOTS)
         .filter_map(|n| {
             let path = pause_save_path(n);
-            let when = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+            let when = save::SaveGame::modified(&path)?;
             let s = save::SaveGame::read(&path).ok()?;
-            let secs = when
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
+            // The record's own stamp (from the 360 code: `addSaveGame`'s
+            // fields, 0x8237E2F0); the file's time for an old TOML save.
+            let secs = match s.info.saved_at {
+                0 => when
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+                t => t,
+            };
+            let legacy = s.info.saved_at == 0;
             let pmc = s.pmc.unwrap_or_default();
             Some(pause::SaveEntry {
                 number: n,
@@ -2320,10 +2339,14 @@ fn pause_saves(hero: Hero) -> Vec<pause::SaveEntry> {
                 },
                 money: pmc.cash,
                 fuel: pmc.fuel,
-                played: String::new(),
-                last_contract: String::new(),
-                auto: n == 0,
-                percent: 0.0,
+                played: if legacy {
+                    String::new()
+                } else {
+                    m2_game::save_record::played_text(s.info.played)
+                },
+                last_contract: s.info.contract,
+                auto: n == 0 || s.info.autosave,
+                percent: f64::from(s.info.percent),
             })
         })
         .collect()
@@ -2336,13 +2359,26 @@ fn write_save(game: &Game, mission: Option<&mission::MissionLink>, path: &std::p
     };
     s.pmc = mission.and_then(mission::MissionLink::pmc_save);
     s.scripts = mission.and_then(mission::MissionLink::script_save);
+    // The record's stamp (from the 360 code, 0x8230C4A8): what the
+    // scripts' last `Sys.RequestAutosave` said, and whether this is their
+    // autosave's slot (0x8239ACB0).
+    let said = mission
+        .and_then(mission::MissionLink::autosave_info)
+        .unwrap_or_default();
+    s.info.played = said.played.max(0.0) as u32;
+    s.info.contract = said.contract;
+    s.info.percent = said.percent;
+    s.info.autosave = path.file_stem().is_some_and(|n| n == "m2-alpha-autosave");
     match s.write(path) {
         Ok(()) => {
             eprintln!(
-                "game saved to {} (cash {}, scripts' data {} bytes)",
+                "game saved to {} (cash {}, scripts' data {} bytes, played {}, last contract {:?}, {}% done)",
                 path.display(),
                 s.pmc.as_ref().map_or(0.0, |p| p.cash),
-                s.scripts.as_ref().map_or(0, String::len)
+                s.scripts.as_ref().map_or(0, String::len),
+                m2_game::save_record::played_text(s.info.played),
+                s.info.contract,
+                s.info.percent
             );
             if let Some(c) = mission.and_then(mission::MissionLink::contracts) {
                 eprintln!("game saved with {c}");
@@ -2354,6 +2390,121 @@ fn write_save(game: &Game, mission: Option<&mission::MissionLink>, path: &std::p
             false
         }
     }
+}
+
+/// `--save-check`: saves the game to pause-menu slot `slot`, reads the
+/// file back and compares it with what was saved: the 360's record
+/// length and header, the character, cash and fuel, the scripts' save
+/// text, and the time played, contract and percent the scripts' last
+/// `Sys.RequestAutosave` gave. Each line logged; whether all held.
+fn save_check(game: &Game, link: &mission::MissionLink, slot: u32) -> bool {
+    let path = pause_save_path(slot);
+    eprintln!("save-check: saving to slot {slot} ({})", path.display());
+    if !write_save(game, Some(link), &path) {
+        eprintln!("save-check: FAIL: nothing was saved");
+        return false;
+    }
+    let mut ok = true;
+    let mut check = |what: &str, good: bool, said: String| {
+        eprintln!(
+            "save-check: {} {what}: {said}",
+            if good { "ok  " } else { "BAD " }
+        );
+        ok &= good;
+    };
+    let bytes = std::fs::read(&path).unwrap_or_default();
+    check(
+        "record length",
+        bytes.len() == m2_game::save_record::FILE_LEN,
+        format!("{:#x} bytes", bytes.len()),
+    );
+    let header = bytes.get(..8).map(|b| {
+        (
+            u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+            u32::from_be_bytes([b[4], b[5], b[6], b[7]]),
+        )
+    });
+    check(
+        "record header",
+        header
+            == Some((
+                m2_game::profile::RECORD_VERSION,
+                m2_game::profile::RECORD_SIZE,
+            )),
+        format!("version and size {header:x?}"),
+    );
+    let back = match save::SaveGame::read(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("save-check: FAIL: it does not read back: {e:#}");
+            return false;
+        }
+    };
+    check(
+        "character",
+        back.hero == Some(game.scene.hero),
+        format!("{:?} for {}", back.hero, game.scene.hero),
+    );
+    let pmc = link.pmc_save().unwrap_or_default();
+    let got = back.pmc.clone().unwrap_or_default();
+    check(
+        "cash and fuel",
+        (got.cash, got.fuel) == (pmc.cash.max(0.0).round(), pmc.fuel.round()),
+        format!(
+            "{} and {} (held {} and {})",
+            got.cash, got.fuel, pmc.cash, pmc.fuel
+        ),
+    );
+    let text = link.script_save();
+    check(
+        "scripts' save text",
+        back.scripts.is_some() && back.scripts == text,
+        format!(
+            "{} bytes back, {} held",
+            back.scripts.as_ref().map_or(0, String::len),
+            text.as_ref().map_or(0, String::len)
+        ),
+    );
+    let said = link.autosave_info().unwrap_or_default();
+    check(
+        "time played, contract, percent",
+        (
+            back.info.played,
+            back.info.contract.as_str(),
+            back.info.percent,
+        ) == (
+            said.played.max(0.0) as u32,
+            said.contract.as_str(),
+            said.percent,
+        ),
+        format!(
+            "{} {:?} {}%",
+            m2_game::save_record::played_text(back.info.played),
+            back.info.contract,
+            back.info.percent
+        ),
+    );
+    let now = save::now_secs();
+    check(
+        "time stamp",
+        back.info.saved_at <= now && now - back.info.saved_at < 60,
+        format!(
+            "{} ({} s ago)",
+            back.info.saved_at,
+            now.saturating_sub(back.info.saved_at)
+        ),
+    );
+    check(
+        "world file (invented)",
+        back.player.is_some(),
+        format!(
+            "{} vehicles, {} killed",
+            back.vehicles.len(),
+            back.killed.len()
+        ),
+    );
+    eprintln!("save-check: {}", if ok { "PASS" } else { "FAIL" });
+    ok
 }
 
 /// The launch's arguments `args` with `--load save` in place of any
@@ -6040,6 +6191,11 @@ fn mission_for_screenshot(
             if write_save(game, Some(&link), &save::SaveGame::slot_path(&slot)) {
                 game.save_icon = game::SAVE_ICON_SECONDS;
             }
+        }
+        if let Some(slot) = options.save_check
+            && i as f32 * tick >= SAVE_CHECK_AFTER
+        {
+            errlog::exit(if save_check(game, &link, slot) { 0 } else { 1 });
         }
         // With --placed-check, what the layers have put out is tried
         // every few seconds ([`placed::check`]).

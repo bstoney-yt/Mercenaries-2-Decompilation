@@ -55,10 +55,11 @@
 //! compressed at level 9 (`0x828141A8`), behind a 12-byte header, when it
 //! fits ([`fits_in_record`]; `0x8230C4A8`). Loading uncompresses it
 //! (`0x82814260`) and runs `return ` and the text (`0x8230C880`), as
-//! ours does. Saving also stamps the record: the time at +0x38, a count
-//! from the scripts at +0x28, a 0x20-character name at +0x40 and a byte
-//! at +0x65 (what each shows wasn't traced). Unknown fields are named by
-//! offset.
+//! ours does. Saving also stamps the record: the time at +0x38, the
+//! seconds played at +0x28, the last contract at +0x40 and the percent
+//! done at +0x65, as `Sys.RequestAutosave` last gave them; cash and fuel
+//! are +0x2C and +0x30. The whole record as a save file is
+//! [`crate::save_record`]. Unknown fields are named by offset.
 
 use m2_layout::assert_layout;
 

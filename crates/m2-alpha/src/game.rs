@@ -3265,7 +3265,7 @@ impl Game {
         Some(SaveGame {
             version: save::VERSION,
             hero: Some(self.scene.hero),
-            player: PlayerSave {
+            player: Some(PlayerSave {
                 position: at.to_array(),
                 facing: player.facing,
                 yaw: player.yaw,
@@ -3302,20 +3302,26 @@ impl Game {
                     self.combat.charges,
                     self.combat.mines,
                 ],
-            },
+            }),
             vehicles,
             killed: self.scene.people.all_killed(),
             // The scripts' to fill in ([`crate::mission::MissionLink::pmc_save`]).
             pmc: None,
             scripts: None,
+            info: Default::default(),
         })
     }
 
     /// Puts the game back as `save` left it: the player drops to the ground
     /// where she was, vehicles go back as their models load, and the dead
-    /// stay dead.
+    /// stay dead. All of that is the port's own (the save's invented world
+    /// file, [`crate::save`]): a 360 record alone has none of it, and the
+    /// game is left as it is for the scripts to put back.
     pub fn load(&mut self, save: SaveGame) {
         let (Some(world), Some(player)) = (&mut self.scene.world, &mut self.scene.player) else {
+            return;
+        };
+        let Some(p) = &save.player else {
             return;
         };
         for v in &mut self.scene.vehicles {
@@ -3325,7 +3331,6 @@ impl Game {
             v.wrecked = false;
             v.damage = 0.0;
         }
-        let p = &save.player;
         player.drop_at(Vec3::from(p.position));
         player.driving = None;
         player.chase_target = None;
