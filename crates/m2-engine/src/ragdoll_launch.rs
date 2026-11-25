@@ -252,3 +252,42 @@ mod tests {
         assert!(!l.wait(0.25));
     }
 }
+
+/// The most level speed a seat exit hands a ragdoll, m/s (0x820B7B44).
+pub const EXIT_LAUNCH_MOST: f32 = 15.0;
+/// The share of that speed it is also thrown up with (0x820C7734).
+pub const EXIT_LAUNCH_UP: f32 = 0.4;
+
+/// The launch a seat exit carrying velocity `v` (the vehicle's, as the
+/// crash ejection 0x8218A138 posts it) hands the rider's ragdoll.
+///
+/// From the 360 code: the ragdoll controller's message handler 0x82428658
+/// takes the exit message (byte +0x21 = 1, kind 4) and keeps, at its
+/// +0x1B0, `v`'s level direction times `min(|v_xz|, 15)` with `0.4` of that
+/// speed upward (mode 0); 0x82428568 hands it to the ragdoll's start
+/// 0x82427828 (its +0x2B8, flag 0x80 of +0x324) as the action goes FULL.
+/// The toss itself (0x822A1B70) only places her. **Inferred**: whatever
+/// reads +0x2B8 gives every body that velocity.
+pub fn exit_launch(v: Vec3) -> Vec3 {
+    let level = Vec3::new(v.x, 0.0, v.z);
+    let speed = level.length().min(EXIT_LAUNCH_MOST);
+    level.normalize_or_zero() * speed + Vec3::Y * speed * EXIT_LAUNCH_UP
+}
+
+#[cfg(test)]
+mod exit_launch_tests {
+    use super::*;
+
+    /// A bike crashing at 19.4 m/s throws its rider 15 m/s out and 6 up;
+    /// at 10 m/s, 10 out and 4 up. Its fall plays no part.
+    #[test]
+    fn an_exit_throws_her_level_speed_capped_at_15_and_four_tenths_up() {
+        let fast = exit_launch(Vec3::new(-19.4, -3.0, 0.2));
+        assert!((fast.with_y(0.0).length() - 15.0).abs() < 1e-4);
+        assert!((fast.y - 6.0).abs() < 1e-4);
+        assert!(fast.x < -14.9);
+        let slow = exit_launch(Vec3::new(0.0, 0.0, 10.0));
+        assert!((slow - Vec3::new(0.0, 4.0, 10.0)).length() < 1e-4);
+        assert_eq!(exit_launch(Vec3::Y * 5.0), Vec3::ZERO);
+    }
+}

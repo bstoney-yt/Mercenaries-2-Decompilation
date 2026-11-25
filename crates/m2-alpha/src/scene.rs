@@ -2537,6 +2537,15 @@ impl Scene {
         }
     }
 
+    /// The hero's `TossGetupSeconds`, from their template.
+    pub fn hero_toss_getup(&self) -> Option<f32> {
+        self.world
+            .as_ref()?
+            .index
+            .template_db
+            .toss_getup_seconds(self.hero.template())
+    }
+
     /// The hero's `Health` when whole, from their template.
     pub fn hero_health(&self) -> Option<f32> {
         self.world
