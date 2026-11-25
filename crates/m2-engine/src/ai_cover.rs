@@ -77,8 +77,25 @@ pub struct Request {
 
 /// The search radius when not anchored (0x822C43B8).
 pub const SEARCH: f32 = 20.0;
-/// A failed search is tried again after this long, seconds.
-pub const RETRY: f32 = 5.0;
+/// After a cover attempt the next waits `RETRY + RETRY_SPREAD x
+/// random(0..1)` seconds (0x822C7348 sets the move block's cover timer
+/// +0xB4 so; 0x822C8530 counts it down).
+pub const RETRY: f32 = 15.0;
+pub const RETRY_SPREAD: f32 = 10.0;
+/// Cover is asked for only with the target this far off, metres
+/// (0x822C6B78: between 0x820BAEEC and 0x820BAFA8).
+pub const ASK_NEAR: f32 = 10.0;
+pub const ASK_FAR: f32 = 40.0;
+
+/// Whether a person may ask for cover now (the gate 0x822C6B78): his
+/// cover timer run out and the target between [`ASK_NEAR`] and
+/// [`ASK_FAR`]. Inferred or left out of the gate: the cover-capable
+/// entry (+0x4EC), the global pause, the target's validity, the state
+/// and flag checks (+0x128, +0xCC bit 0x80, +0x8C) and 0x822C04A0, all
+/// taken to pass.
+pub fn may_ask(timer: f32, distance: f32) -> bool {
+    timer < 0.0 && (ASK_NEAR..=ASK_FAR).contains(&distance)
+}
 /// How near a spot to avoid rules a candidate out, metres.
 const AVOID: f32 = 2.2;
 /// How far a Point spot stands off its obstacle, and how far a lean
@@ -191,7 +208,10 @@ pub fn candidates(req: &Request, placed: &Placed, hint: &Hint) -> Vec<Candidate>
     match hint.kind {
         Kind::Offset => {
             let spot = placed.position + placed.rotation * hint.position;
-            if flat(spot - req.centre).length() > hint.restrict {
+            // The gather skips a hint whose own range the requester is
+            // beyond, in 3D (0x822CBA38: squared distance over the hint's
+            // +0x30 squared).
+            if (spot - req.centre).length_squared() > hint.restrict * hint.restrict {
                 return out;
             }
             // The threat within the arc about its facing.
@@ -199,13 +219,15 @@ pub fn candidates(req: &Request, placed: &Placed, hint: &Hint) -> Vec<Candidate>
             let facing = flat(placed.rotation * Vec3::new(sy, 0.0, cy)).normalize_or_zero();
             let to = flat(req.threat - spot).normalize_or_zero();
             let half = (hint.range * 0.5).to_radians();
+            // Both rays, to the spot and 0.9 m over it, must come out
+            // blocked (0x822CC908).
             if facing.dot(to) >= half.cos() {
-                push(spot, None, 0b001);
+                push(spot, None, 0b011);
             }
         }
         Kind::Point => {
             let centre = placed.position + placed.rotation * hint.position;
-            if flat(centre - req.centre).length() > hint.restrict {
+            if (centre - req.centre).length_squared() > hint.restrict * hint.restrict {
                 return out;
             }
             let to = flat(req.threat - centre).normalize_or_zero();
@@ -269,9 +291,19 @@ pub fn choose(
     ground: impl Fn(Vec3) -> Option<f32>,
     blocked: impl Fn(Vec3, Vec3) -> bool,
 ) -> Option<Vec3> {
-    let mut order: Vec<&Candidate> = cands.iter().collect();
-    order.sort_by(|a, b| b.score.total_cmp(&a.score));
-    for c in order {
+    choose_index(req, cands, ground, blocked).map(|(at, _)| at)
+}
+
+/// As [`choose`], with the chosen candidate's place in `cands`.
+pub fn choose_index(
+    req: &Request,
+    cands: &[Candidate],
+    ground: impl Fn(Vec3) -> Option<f32>,
+    blocked: impl Fn(Vec3, Vec3) -> bool,
+) -> Option<(Vec3, usize)> {
+    let mut order: Vec<(usize, &Candidate)> = cands.iter().enumerate().collect();
+    order.sort_by(|a, b| b.1.score.total_cmp(&a.1.score));
+    for (k, c) in order {
         let Some(g) = ground(c.spot) else { continue };
         let foot = c.spot.with_y(g);
         if req
@@ -294,10 +326,72 @@ pub fn choose(
             .enumerate()
             .fold(0u8, |m, (i, &(a, b))| m | (u8::from(blocked(a, b)) << i));
         if mask == c.expected {
-            return Some(foot);
+            return Some((foot, k));
         }
     }
     None
+}
+
+/// One soldier's claim on a cover object's spot (the table at 0x83656DE8).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Claim {
+    pub owner: u32,
+    pub object: u32,
+    pub score: f32,
+    pub at: Vec3,
+}
+
+/// The cover claims (0x822EDA60): one per owner, his latest. 0x822C7CF0
+/// claims as the person starts for the spot and claims again every update
+/// while the destination is at most [`CLAIM_AGE`] old, each time scored
+/// from where he is then; a refusal in that window drops the destination.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Claims {
+    claims: Vec<Claim>,
+}
+
+/// How long after he starts for a cover spot his claim is checked and
+/// renewed each update, seconds (0x822C7CF0: the goal age +0x98 at most
+/// 2.0).
+pub const CLAIM_AGE: f32 = 2.0;
+
+/// A claim's score: 100 less the squared flat distance from the claimer to
+/// the spot (0x822EDA60; a hint kind 13 scores 100, not mapped here).
+pub fn claim_score(from: Vec3, at: Vec3) -> f32 {
+    100.0 - flat(at - from).length_squared()
+}
+
+impl Claims {
+    /// `owner`, at `from`, claims the spot `at` of cover object `object`:
+    /// refused when another owner's claim on the same object lies within
+    /// 1 m on x/z and this one's score is under 1.1 times that one's;
+    /// otherwise it replaces the owner's earlier claim. Whether it was
+    /// granted.
+    pub fn claim(&mut self, owner: u32, object: u32, from: Vec3, at: Vec3) -> bool {
+        let score = claim_score(from, at);
+        let refused = self.claims.iter().any(|c| {
+            c.owner != owner
+                && c.object == object
+                && flat(c.at - at).length_squared() < 1.0
+                && score < 1.1 * c.score
+        });
+        if refused {
+            return false;
+        }
+        self.claims.retain(|c| c.owner != owner);
+        self.claims.push(Claim {
+            owner,
+            object,
+            score,
+            at,
+        });
+        true
+    }
+
+    /// The claims held.
+    pub fn held(&self) -> &[Claim] {
+        &self.claims
+    }
 }
 
 #[cfg(test)]
@@ -325,6 +419,80 @@ mod tests {
             no_x: false,
             no_z: false,
         }
+    }
+
+    #[test]
+    fn cover_is_asked_for_between_10_and_40_m_once_the_timer_is_out() {
+        assert!(may_ask(-0.1, 25.0));
+        assert!(!may_ask(0.5, 25.0), "timer running");
+        assert!(!may_ask(-0.1, 9.0) && !may_ask(-0.1, 41.0));
+    }
+
+    /// 0x822EDA60: a claim near another's on the same object is refused
+    /// unless it scores 1.1 times as well; elsewhere, or on another
+    /// object, it is granted; a new claim replaces its owner's last.
+    #[test]
+    fn a_cover_claim_yields_to_a_nearer_soldiers() {
+        let mut c = Claims::default();
+        let spot = Vec3::new(0.0, 0.0, 0.0);
+        // Soldier 1, 3 m off: score 91.
+        assert!(c.claim(1, 7, Vec3::new(3.0, 0.0, 0.0), spot));
+        // Soldier 2, 4 m off (84 < 1.1 x 91): refused, 0.5 m off it too.
+        assert!(!c.claim(2, 7, Vec3::new(4.0, 0.0, 0.0), spot));
+        assert!(!c.claim(2, 7, Vec3::new(4.0, 0.0, 0.0), Vec3::new(0.5, 3.0, 0.0)));
+        // 1.5 m from the first, or another object's: granted.
+        assert!(c.claim(2, 7, Vec3::new(4.0, 0.0, 0.0), Vec3::new(1.5, 0.0, 0.0)));
+        assert!(c.claim(3, 8, Vec3::new(9.0, 0.0, 0.0), spot));
+        // Right on top of it (score 100 >= 1.1 x 91? no: 100 < 100.1): refused.
+        assert!(!c.claim(4, 7, spot, spot));
+        // Soldier 1 claims elsewhere: his first claim goes.
+        assert!(c.claim(1, 9, Vec3::ZERO, Vec3::new(50.0, 0.0, 0.0)));
+        assert!(c.claim(4, 7, spot, spot));
+        assert_eq!(c.held().iter().filter(|h| h.owner == 1).count(), 1);
+    }
+
+    /// An Offset spot is taken only when both rays from the threat, to
+    /// the spot and 0.9 m over it, come out blocked (0x822CC908).
+    #[test]
+    fn an_offset_spot_wants_both_rays_blocked() {
+        let req = Request {
+            centre: Vec3::new(0.0, 0.0, -2.0),
+            radius: SEARCH,
+            threat: Vec3::new(0.0, 1.5, 30.0),
+            avoid: Vec::new(),
+        };
+        let hint = Hint {
+            kind: Kind::Offset,
+            rating: 3,
+            animation: 0,
+            position: Vec3::new(0.0, 0.0, -1.0),
+            facing_or_radius: 0.0,
+            range: 90.0,
+            restrict: 10.0,
+            no_x: false,
+            no_z: false,
+        };
+        let c = candidates(&req, &wall(), &hint);
+        assert_eq!(c.len(), 1);
+        let ground = |_: Vec3| Some(0.0);
+        // A wall 2 m high: both rays blocked, taken.
+        let high = |a: Vec3, b: Vec3| {
+            let t = a.z / (a.z - b.z);
+            (a.z > 0.0) != (b.z > 0.0) && a.lerp(b, t).y < 3.0
+        };
+        assert!(choose(&req, &c, ground, high).is_some());
+        // A low one: the upper ray clear, not taken.
+        let low = |a: Vec3, b: Vec3| {
+            let t = a.z / (a.z - b.z);
+            (a.z > 0.0) != (b.z > 0.0) && a.lerp(b, t).y < 1.6
+        };
+        assert!(choose(&req, &c, ground, low).is_none());
+        // Beyond the hint's own range in 3D (10 m up): not offered.
+        let far = Request {
+            centre: Vec3::new(0.0, 12.0, -2.0),
+            ..req.clone()
+        };
+        assert!(candidates(&far, &wall(), &hint).is_empty());
     }
 
     #[test]
