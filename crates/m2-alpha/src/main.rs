@@ -9909,6 +9909,25 @@ fn cargo_sane(phase: &str, fastest: f32, turned: f32, airborne: f32) -> Result<(
     Ok(())
 }
 
+/// Where `--cargo-check` puts its truck: at `at`'s level place, upright
+/// (no tilt or roll: what it stood on before doesn't come with it), its
+/// origin `ride` over the ground at `ground` (its wheels on it, its
+/// springs as its model has them: their rest, #766), heading `yaw`
+/// (radians, from +z towards +x) turned `k` eighths.
+fn cargo_upright(
+    at: m2_math::glam::Vec3,
+    ground: f32,
+    ride: f32,
+    yaw: f32,
+    k: i32,
+) -> m2_math::glam::Mat4 {
+    use m2_math::glam::{Mat4, Quat, Vec3};
+    Mat4::from_rotation_translation(
+        Quat::from_rotation_y(yaw + k as f32 * std::f32::consts::FRAC_PI_4),
+        Vec3::new(at.x, ground + ride, at.z),
+    )
+}
+
 /// How long `--cargo-check`'s straight must be, level and open, metres:
 /// its 6 s held to 11 m/s.
 const CARGO_STRAIGHT: f32 = 40.0;
@@ -9922,7 +9941,7 @@ const CARGO_STRAIGHT: f32 = 40.0;
 /// (as `--prop-limits-check`'s lane). False, with `cargo-check: FAIL no
 /// clear straight`, if none is.
 fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, label: &str) -> bool {
-    use m2_math::glam::{Mat4, Quat, Vec3};
+    use m2_math::glam::{Quat, Vec3};
     let Some(world) = game.scene.world.as_mut() else {
         return false;
     };
@@ -9944,6 +9963,8 @@ fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, lab
     // The truck's and its crates' footprint corners (model space of the
     // truck): every one must have ground under it where it is moved to.
     let (lo, hi) = game.scene.vehicles[i].spec.hull;
+    let ride = game.scene.vehicles[i].spec.ride_height();
+    let snapped_yaw = snapped;
     let inv = m.inverse();
     let mut corners: Vec<Vec3> = [(lo.x, lo.z), (hi.x, lo.z), (lo.x, hi.z), (hi.x, hi.z)]
         .iter()
@@ -9989,12 +10010,11 @@ fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, lab
             eprintln!("cargo-check: the {label}'s own heading is clear for {CARGO_STRAIGHT} m");
             return true;
         }
-        // Turned about where it stands, its cargo with it.
-        let turn = Mat4::from_translation(here)
-            * Mat4::from_rotation_y(k as f32 * std::f32::consts::FRAC_PI_4)
-            * Mat4::from_translation(-here);
+        // Turned where it stands, upright on its wheels, its cargo with it.
+        let target = cargo_upright(here, floor, ride, snapped_yaw, k);
+        let turn = target * inv;
         {
-            let (_, r, t) = (turn * m).to_scale_rotation_translation();
+            let (_, r, t) = target.to_scale_rotation_translation();
             world.physics.place_vehicle(id, t, r);
         }
         for d in game.scene.props.cargo_pieces(i) {
@@ -10034,13 +10054,10 @@ fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, lab
             }
             if let Some(k) = (0..8).find(|&k| clear(spot, base, turned(k))) {
                 // Ground under every truck and crate corner there.
-                let to = Vec3::new(spot.x, base + (here.y - floor), spot.z);
-                let moved = Mat4::from_translation(to)
-                    * Mat4::from_rotation_y(k as f32 * std::f32::consts::FRAC_PI_4)
-                    * Mat4::from_translation(-here);
+                let target = cargo_upright(spot, base, ride, snapped_yaw, k);
                 let bare = corners
                     .iter()
-                    .map(|&c| (moved * m).transform_point3(c))
+                    .map(|&c| target.transform_point3(c))
                     .filter(|c| ground(c.x, c.z, c.y).is_none_or(|y| (y - c.y).abs() > 3.0))
                     .count();
                 if bare > 0 {
@@ -10064,16 +10081,19 @@ fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, lab
         );
         return false;
     };
-    let to = Vec3::new(spot.x, base + (here.y - floor), spot.z);
-    let moved = Mat4::from_translation(to)
-        * Mat4::from_rotation_y(k as f32 * std::f32::consts::FRAC_PI_4)
-        * Mat4::from_translation(-here);
+    // Upright on its wheels on the ground there, heading as cleared: not
+    // the tilt it stood with where it was (q680 5e4483a5: moved keeping it,
+    // its hull's bottom corners read -0.10, 0.36, -0.33 and 0.13 m over
+    // ground level within 0.03 m).
+    let target = cargo_upright(spot, base, ride, snapped_yaw, k);
+    let to = target.w_axis.truncate();
+    let moved = target * inv;
     // Ground under every corner of the truck and under every crate where
     // they are moved to (q680 eb5b8507: moved onto no ground, the truck
     // fell 33 m in 2.75 s).
     let missing: Vec<Vec3> = corners
         .iter()
-        .map(|&c| (moved * m).transform_point3(c))
+        .map(|&c| target.transform_point3(c))
         .filter(|c| ground(c.x, c.z, c.y).is_none_or(|y| (y - c.y).abs() > 3.0))
         .collect();
     if !missing.is_empty() {
@@ -10086,7 +10106,7 @@ fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, lab
         return false;
     }
     {
-        let (_, r, t) = (moved * m).to_scale_rotation_translation();
+        let (_, r, t) = target.to_scale_rotation_translation();
         world.physics.place_vehicle(id, t, r);
     }
     for d in game.scene.props.cargo_pieces(i) {
@@ -14310,6 +14330,44 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The truck is put upright where it is moved, whatever tilt it stood
+    // with: its hull's bottom corners level over level ground (q680
+    // 5e4483a5: kept, a 10-degree roll read -0.10..0.36 m), its origin its
+    // ride height over the ground, its heading the cleared one.
+    #[test]
+    fn a_moved_cargo_truck_stands_upright_on_its_wheels() {
+        use m2_math::glam::{Mat4, Quat, Vec3};
+        let tilted = Mat4::from_rotation_translation(
+            Quat::from_rotation_y(0.3) * Quat::from_rotation_z(0.18),
+            Vec3::new(5.0, 2.0, 5.0),
+        );
+        let target = cargo_upright(
+            Vec3::new(40.0, 9.0, -20.0),
+            -31.34,
+            0.47,
+            -std::f32::consts::FRAC_PI_4,
+            1,
+        );
+        assert!((target.y_axis.truncate() - Vec3::Y).length() < 1e-5);
+        assert!((target.w_axis.y - (-31.34 + 0.47)).abs() < 1e-5);
+        let f = target.transform_vector3(Vec3::Z);
+        assert!(f.x.atan2(f.z).abs() < 1e-5, "heading {}", f.x.atan2(f.z));
+        let (lo, hi) = (Vec3::new(-1.2, 0.1, -3.0), Vec3::new(1.2, 2.5, 3.0));
+        let ys: Vec<f32> = [(lo.x, lo.z), (hi.x, lo.z), (lo.x, hi.z), (hi.x, hi.z)]
+            .iter()
+            .map(|&(x, z)| target.transform_point3(Vec3::new(x, lo.y, z)).y)
+            .collect();
+        assert!(ys.iter().all(|y| (y - ys[0]).abs() < 1e-4), "{ys:?}");
+        // What the old move did: its tilt carried over.
+        let kept = (Mat4::from_translation(Vec3::new(40.0, 0.0, -20.0)) * tilted)
+            .transform_point3(Vec3::new(lo.x, lo.y, lo.z))
+            .y
+            - (Mat4::from_translation(Vec3::new(40.0, 0.0, -20.0)) * tilted)
+                .transform_point3(Vec3::new(hi.x, lo.y, lo.z))
+                .y;
+        assert!(kept.abs() > 0.3, "{kept}");
+    }
 
     // q680 6d991f6e's drive fails as not on its wheels: no wheel down,
     // -24.6 m/s standing, 93 degrees on its straight; its hull 2.1-2.4 m
