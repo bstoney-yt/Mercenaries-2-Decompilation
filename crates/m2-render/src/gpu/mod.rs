@@ -816,6 +816,9 @@ pub struct WgpuBackend {
     /// The glow layer's pipelines for additive and translucent keys.
     glow_pipelines: FastMap<PipelineKey, wgpu::RenderPipeline>,
     shadow_pipelines: FastMap<ShadowKey, wgpu::RenderPipeline>,
+    /// The pipelines made on first use and the time that took
+    /// ([`take_pipeline_work`](Self::take_pipeline_work)).
+    pipeline_work: crate::PipelineWork,
     /// When the backend started, for animated surfaces.
     started: std::time::Instant,
     /// Bloom, exposure and grade after the world.
@@ -1406,6 +1409,7 @@ impl WgpuBackend {
             pipelines: FastMap::default(),
             glow_pipelines: FastMap::default(),
             shadow_pipelines: FastMap::default(),
+            pipeline_work: crate::PipelineWork::default(),
             cascades: std::cell::Cell::new(None),
             started: std::time::Instant::now(),
             post,
@@ -1991,6 +1995,7 @@ impl WgpuBackend {
         if self.pipelines.contains_key(key) {
             return Ok(());
         }
+        let started = std::time::Instant::now();
         // The world draws in floating point; the post pass brings it to
         // the frame.
         let color_format = post::HDR_FORMAT;
@@ -2095,10 +2100,12 @@ impl WgpuBackend {
         };
         debug_assert_eq!(glow.is_some(), in_glow_layer(key.blend));
         let pipeline = make("fs_main", blend);
+        let made = 1 + u32::from(glow.is_some());
         if let Some(glow) = glow {
             self.glow_pipelines.insert(*key, glow);
         }
         self.pipelines.insert(*key, pipeline);
+        self.pipeline_work.record(made, started.elapsed());
         Ok(())
     }
 
@@ -2169,6 +2176,7 @@ impl WgpuBackend {
         if self.shadow_pipelines.contains_key(key) {
             return Ok(());
         }
+        let started = std::time::Instant::now();
         let topology = wgpu_topology(key.topology)?;
         let layout = self.layouts.get(key.layout).clone();
         let attributes = vertex_attributes(&layout);
@@ -2219,6 +2227,7 @@ impl WgpuBackend {
                 cache: None,
             });
         self.shadow_pipelines.insert(*key, pipeline);
+        self.pipeline_work.record(1, started.elapsed());
         Ok(())
     }
 
@@ -3326,6 +3335,12 @@ impl WgpuBackend {
             texture_bytes: live(&self.textures).map(|t| t.bytes).sum(),
             materials: self.materials.len(),
         }
+    }
+
+    /// The pipelines made on first use since last taken, the time they
+    /// took, and how many in all ([`crate::PipelineWork`]).
+    pub fn take_pipeline_work(&mut self) -> crate::PipelineWork {
+        self.pipeline_work.take()
     }
 }
 

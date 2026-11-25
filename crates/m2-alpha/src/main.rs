@@ -259,6 +259,9 @@ struct Options {
     /// `--no-blast-check`: a chain cannon's round (no blast) fired at a
     /// soldier ([`no_blast_check`]).
     no_blast_check: bool,
+    /// `--pipelines-check`: with `--screenshot`, the first frame drawn
+    /// must log the pipelines it made ([`pipelines_check`]).
+    pipelines_check: bool,
     /// With `--drive` and `--wreck` or `--shoot-up`: get out of the wreck,
     /// walk to the fuel can it left and take it (testing).
     fuel_check: bool,
@@ -894,6 +897,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.exit_land_check = true;
                 o.drive = true;
             }
+            "--pipelines-check" => o.pipelines_check = true,
             "--no-blast-check" => {
                 o.no_blast_check = true;
                 o.drive = true;
@@ -1406,6 +1410,7 @@ const SCREENSHOT_ONLY: &[&str] = &[
     "--movies",
     "--sound",
     "--mission-shots",
+    "--pipelines-check",
 ];
 
 /// Those of [`SCREENSHOT_ONLY`] given without `--screenshot`, in the order
@@ -1930,7 +1935,14 @@ fn run(
         return screenshot(&config, Some(install), &mode, &options, &out);
     }
     if let Some(out) = &options.screenshot {
-        return screenshot(&config, install.as_ref(), &mode, &options, out);
+        let shot = screenshot(&config, install.as_ref(), &mode, &options, out);
+        if options.pipelines_check {
+            if let Err(e) = &shot {
+                eprintln!("pipelines-check: the run failed: {e:#}");
+            }
+            pipelines_check();
+        }
+        return shot;
     }
 
     let event_loop = event_loop()?;
@@ -2398,6 +2410,79 @@ fn log_gpu_memory(backend: &WgpuBackend, game: &Game) {
     );
 }
 
+/// What the frames have made of pipelines, for `--pipelines-check`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct PipelineFrames {
+    /// Frames noted, and the first one's pipelines made (and ms).
+    frames: u64,
+    first: Option<(u32, f32)>,
+    /// Frames that made any, and the most one made (and ms).
+    making: u64,
+    most: (u32, f32),
+}
+
+impl PipelineFrames {
+    /// A frame made `made` pipelines in `ms`.
+    fn note(&mut self, made: u32, ms: f32) {
+        self.frames += 1;
+        self.first.get_or_insert((made, ms));
+        if made > 0 {
+            self.making += 1;
+            if ms > self.most.1 {
+                self.most = (made, ms);
+            }
+        }
+    }
+
+    /// `--pipelines-check`'s verdict: the first frame drawn must have
+    /// made pipelines (the scene's kinds of draw, met for the first time),
+    /// and say so.
+    fn verdict(&self) -> (bool, String) {
+        let summary = format!(
+            "{} frames, {} made pipelines, the most +{} in {:.0} ms",
+            self.frames, self.making, self.most.0, self.most.1
+        );
+        match self.first {
+            Some((made, ms)) if made > 0 => (
+                true,
+                format!("PASS the first frame made +{made} in {ms:.0} ms; {summary}"),
+            ),
+            Some(_) => (false, format!("FAIL the first frame made none; {summary}")),
+            None => (false, "FAIL no frame was drawn".to_owned()),
+        }
+    }
+}
+
+thread_local! {
+    static PIPELINE_FRAMES: std::cell::Cell<PipelineFrames> =
+        const { std::cell::Cell::new(PipelineFrames { frames: 0, first: None, making: 0, most: (0, 0.0) }) };
+}
+
+/// The pipelines the backend made for this frame's draws: their time is
+/// the `draw: pipelines` span (inside `draw`), and a frame that made any
+/// logs `pipelines: +N (total M) in X ms`.
+fn note_pipelines(backend: &mut WgpuBackend) {
+    let work = backend.take_pipeline_work();
+    let ms = work.took.as_secs_f32() * 1000.0;
+    PIPELINE_FRAMES.with(|p| {
+        let mut f = p.get();
+        f.note(work.made, ms);
+        p.set(f);
+    });
+    if let Some(line) = work.line() {
+        spans::add("draw: pipelines", work.took);
+        eprintln!("{line}");
+    }
+}
+
+/// `--pipelines-check`: prints the verdict of the run's frames
+/// ([`PipelineFrames::verdict`]) and exits 1 on a FAIL, 0 on a PASS.
+fn pipelines_check() -> ! {
+    let (ok, line) = PIPELINE_FRAMES.with(|p| p.get().verdict());
+    eprintln!("pipelines-check: {line}");
+    errlog::exit(if ok { 0 } else { 1 });
+}
+
 /// Streams around the player (or camera) and draws a frame.
 fn render(
     backend: &mut WgpuBackend,
@@ -2421,6 +2506,7 @@ fn render(
         spans::drawn(queue.flush(&view, backend)?.draws);
         Ok(())
     })?;
+    note_pipelines(backend);
     spans::time("present", || match hud {
         Some(hud) => backend.end_frame_with(&mut |t| hud.paint(t)),
         None => backend.end_frame(),
@@ -3721,6 +3807,7 @@ fn run_bench(
         game.scene.draw(backend, &mut queue, &view, &game.combat)?;
         part(2, &mut lap, &mut cpu);
         let drawn = queue.flush(&view, backend)?.draws as u64;
+        note_pipelines(backend);
         part(3, &mut lap, &mut cpu);
         backend.end_frame()?;
         part(4, &mut lap, &mut cpu);
@@ -15039,6 +15126,45 @@ mod tests {
         assert_eq!(
             screenshot_only_ignored(&args(&["--mission", "--mission-shots", "5"])),
             ["--mission-shots"]
+        );
+    }
+
+    #[test]
+    fn the_pipelines_check_passes_only_when_the_first_frame_made_some() {
+        // No frame drawn: FAIL.
+        assert!(!PipelineFrames::default().verdict().0);
+        // The first frame made none (a warm cache would): FAIL, even if a
+        // later frame made some.
+        let mut f = PipelineFrames::default();
+        f.note(0, 0.0);
+        f.note(3, 40.0);
+        let (ok, line) = f.verdict();
+        assert!(!ok);
+        assert!(line.starts_with("FAIL the first frame made none"), "{line}");
+        // The first frame made some: PASS, and the costliest frame named.
+        let mut f = PipelineFrames::default();
+        f.note(12, 3400.0);
+        f.note(0, 0.0);
+        f.note(2, 4000.0);
+        let (ok, line) = f.verdict();
+        assert!(ok);
+        assert_eq!(
+            line,
+            "PASS the first frame made +12 in 3400 ms; 3 frames, 2 made pipelines, the most +2 in 4000 ms"
+        );
+    }
+
+    #[test]
+    fn the_pipelines_check_is_read_offscreen_only() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(
+            parse_args(&args(&["--pipelines-check"]))
+                .unwrap()
+                .pipelines_check
+        );
+        assert_eq!(
+            screenshot_only_ignored(&args(&["--mission", "--pipelines-check"])),
+            ["--pipelines-check"]
         );
     }
 
