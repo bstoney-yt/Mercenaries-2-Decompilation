@@ -7290,6 +7290,23 @@ impl Physics {
             .map(|(_, hit)| (hit.time_of_impact, vec3(hit.normal)))
     }
 
+    /// [`cast_ray`](Self::cast_ray) that meets only what stands fixed:
+    /// the terrain, buildings and placed objects, not a vehicle, a person,
+    /// debris or a crate. To read the ground under something that stands
+    /// on it (q680: from above, a truck's ground ray met its own bed and
+    /// crates, 2 m up, and it was moved 2 m into the ground).
+    pub fn cast_ray_fixed(&self, origin: Vec3, direction: Vec3, max: f32) -> Option<(f32, Vec3)> {
+        let ray = r::Ray::new(vector(origin), vector(direction.normalize_or_zero()));
+        let fixed = |_: r::ColliderHandle, c: &r::Collider| {
+            c.parent()
+                .is_none_or(|b| self.world.bodies.get(b).is_some_and(|b| b.is_fixed()))
+        };
+        self.world
+            .query_pipeline_with_filter(solid().predicate(&fixed))
+            .cast_ray_and_get_normal(&ray, max, true)
+            .map(|(_, hit)| (hit.time_of_impact, vec3(hit.normal)))
+    }
+
     /// The bodies vehicle `id` is made of: its chassis, and its turret's
     /// and gun's where they hinge on it as bodies of their own.
     fn vehicle_bodies(&self, id: VehicleId) -> Vec<r::RigidBodyHandle> {
@@ -12191,6 +12208,28 @@ mod tests {
         assert_eq!(hull(&p), 0.0);
         p.step(DT);
         assert_eq!(hull(&p), CAR_TIPPED_FRICTION);
+    }
+
+    // The ground under a car read from above: the plain ray meets its
+    // roof, the fixed one the ground it stands on.
+    #[test]
+    fn a_fixed_ray_reads_the_ground_under_a_car_not_its_roof() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 50.0);
+        p.step(DT);
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        for _ in 0..60 {
+            p.step(DT);
+        }
+        let top = p.vehicle_transform(id).unwrap().w_axis.y;
+        let from = Vec3::new(0.0, 20.0, 0.0);
+        let plain = 20.0 - p.cast_ray(from, Vec3::NEG_Y, 60.0).unwrap().0;
+        let fixed = 20.0 - p.cast_ray_fixed(from, Vec3::NEG_Y, 60.0).unwrap().0;
+        assert!(
+            plain > 0.3,
+            "the plain ray meets the car: {plain} (car at {top})"
+        );
+        assert!(fixed.abs() < 0.05, "the fixed ray meets the floor: {fixed}");
     }
 
     #[test]

@@ -9637,7 +9637,12 @@ fn cargo_check(game: &mut Game, tick: f32) {
     };
     let start = local(game);
     eprintln!("cargo-check: the {label}, {} crates aboard", start.len());
-    cargo_ground_slope(game, i, id, &label);
+    if !cargo_ground_slope(game, i, id, &label) {
+        return;
+    }
+    // Each phase's fastest speed, its most turn from where it began and
+    // its longest run with no wheel down (after the first second).
+    let mut sane: Vec<Result<(), String>> = Vec::new();
     let yaw = |game: &Game| {
         game.scene
             .world
@@ -9668,6 +9673,7 @@ fn cargo_check(game: &mut Game, tick: f32) {
     ] {
         let ticks = (seconds / tick) as u32;
         let yaw0 = yaw(game);
+        let (mut fastest, mut turned, mut air, mut longest) = (0.0f32, 0.0f32, 0u32, 0u32);
         for t in 0..ticks {
             let v = speed(game);
             let movement = match phase {
@@ -9689,6 +9695,16 @@ fn cargo_check(game: &mut Game, tick: f32) {
             if phase == "standing" && t < CARGO_FIRST_STEPS {
                 cargo_step_log(game, i, id, t + 1);
             }
+            fastest = fastest.max(speed(game).abs());
+            turned = turned.max(((yaw(game) - yaw0 + 540.0).rem_euclid(360.0) - 180.0).abs());
+            let down = game
+                .scene
+                .world
+                .as_ref()
+                .map_or(0, |w| w.physics.vehicle_contacts(id).0);
+            let settling = phase == "standing" && (t as f32) * tick < 1.0;
+            air = if down == 0 && !settling { air + 1 } else { 0 };
+            longest = longest.max(air);
             if t % every == 0 {
                 let now = local(game);
                 let shifts: Vec<String> = now
@@ -9740,12 +9756,16 @@ fn cargo_check(game: &mut Game, tick: f32) {
         eprintln!("cargo-check: {line}");
         table.push(line);
         ends.push((phase, median, most, off, now.len()));
+        sane.push(cargo_sane(phase, fastest, turned, longest as f32 * tick));
     }
     eprintln!("cargo-check: TABLE (shift from start in the truck's frame, of those still aboard)");
     for l in table {
         eprintln!("cargo-check:   {l}");
     }
-    let verdict = cargo_verdict(&ends);
+    let verdict = sane.into_iter().find(Result::is_err).map_or_else(
+        || cargo_verdict(&ends),
+        |e| e.map_err(|why| format!("not a drive on its wheels: {why}")),
+    );
     match verdict {
         Ok(()) => eprintln!(
             "cargo-check: PASS the crates kept still standing, stayed aboard driving straight, and slid as they went"
@@ -9796,14 +9816,14 @@ fn cargo_step_log(game: &Game, i: usize, id: m2_engine::VehicleId, n: u32) {
 /// Logs the ground under `--cargo-check`'s truck `id` (vehicle `i`) where
 /// it now stands: the height under each corner of its hull's footprint,
 /// and the ground's slope along it and across it, degrees. Log only.
-fn cargo_ground_slope(game: &Game, i: usize, id: m2_engine::VehicleId, label: &str) {
+fn cargo_ground_slope(game: &Game, i: usize, id: m2_engine::VehicleId, label: &str) -> bool {
     use m2_math::glam::Vec3;
     let Some(world) = game.scene.world.as_ref() else {
-        return;
+        return false;
     };
     let physics = &world.physics;
     let Some(m) = physics.vehicle_transform(id) else {
-        return;
+        return false;
     };
     let (lo, hi) = game.scene.vehicles[i].spec.hull;
     // Front left, front right, back left, back right (model +Z ahead).
@@ -9811,14 +9831,14 @@ fn cargo_ground_slope(game: &Game, i: usize, id: m2_engine::VehicleId, label: &s
         .map(|(x, z)| m.transform_point3(Vec3::new(x, lo.y, z)));
     let ground = corners.map(|c| {
         physics
-            .cast_ray(c + Vec3::Y * 20.0, Vec3::NEG_Y, 60.0)
+            .cast_ray_fixed(c + Vec3::Y * 20.0, Vec3::NEG_Y, 60.0)
             .map(|(d, _)| c.y + 20.0 - d)
     });
     let [Some(fl), Some(fr), Some(bl), Some(br)] = ground else {
         eprintln!(
-            "cargo-check: ground under the {label}'s corners: {ground:.2?} (one or more with none)"
+            "cargo-check: FAIL ground under the {label}'s corners: {ground:.2?} (one or more with none)"
         );
-        return;
+        return false;
     };
     let length = corners[0].with_y(0.0).distance(corners[2].with_y(0.0));
     let width = corners[0].with_y(0.0).distance(corners[1].with_y(0.0));
@@ -9828,6 +9848,65 @@ fn cargo_ground_slope(game: &Game, i: usize, id: m2_engine::VehicleId, label: &s
         "cargo-check: ground under the {label}'s corners (front left, front right, back left, back right) {fl:.2}, {fr:.2}, {bl:.2}, {br:.2}: slope {along:+.1} deg along it (up ahead +), {across:+.1} deg across it (up to the right +); hull bottom corners at {:.2}, {:.2}, {:.2}, {:.2}",
         corners[0].y, corners[1].y, corners[2].y, corners[3].y
     );
+    let under: Vec<f32> = corners
+        .iter()
+        .zip([fl, fr, bl, br])
+        .map(|(c, g)| c.y - g)
+        .collect();
+    if let Err(why) = cargo_hull_over_ground(&under) {
+        eprintln!("cargo-check: FAIL the {label} {why}");
+        return false;
+    }
+    true
+}
+
+/// How far a hull's bottom corner may sit under the ground it reads,
+/// metres, before `--cargo-check` fails: its tyres' squeeze and a little
+/// more.
+const CARGO_HULL_UNDER: f32 = 0.3;
+
+/// Whether the hull's bottom corners, each so far over the ground under
+/// it (`over`, metres, under is negative), stand on it: none more than
+/// [`CARGO_HULL_UNDER`] under.
+fn cargo_hull_over_ground(over: &[f32]) -> Result<(), String> {
+    match over.iter().copied().reduce(f32::min) {
+        Some(least) if least < -CARGO_HULL_UNDER => Err(format!(
+            "stands in the ground: its hull's bottom corners {over:.2?} m over the ground under them"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The sane range of `--cargo-check`'s drive: never faster than this,
+/// m/s (its straight is held to 11), nor turned more than this on its
+/// straight or standing, degrees, nor without a wheel on the ground more
+/// than this many seconds running after the first second.
+const CARGO_SANE_SPEED: f32 = 14.0;
+const CARGO_SANE_YAW: f32 = 20.0;
+const CARGO_SANE_AIRBORNE: f32 = 0.5;
+
+/// Whether a phase of `--cargo-check`'s drive was a drive on its wheels:
+/// its fastest speed (either way), how far it turned from where it began
+/// (degrees; only a standing or straight phase is held to it), and its
+/// longest run with no wheel down, seconds (q680 6d991f6e: no wheel down
+/// any step, -24.6 and -84.4 m/s, turned 93 degrees on its straight).
+fn cargo_sane(phase: &str, fastest: f32, turned: f32, airborne: f32) -> Result<(), String> {
+    if fastest > CARGO_SANE_SPEED {
+        return Err(format!(
+            "{phase}: {fastest:.1} m/s, over {CARGO_SANE_SPEED}"
+        ));
+    }
+    if matches!(phase, "standing" | "straight" | "standing after") && turned > CARGO_SANE_YAW {
+        return Err(format!(
+            "{phase}: turned {turned:.0} degrees, over {CARGO_SANE_YAW}"
+        ));
+    }
+    if airborne > CARGO_SANE_AIRBORNE {
+        return Err(format!(
+            "{phase}: no wheel down for {airborne:.2} s running, over {CARGO_SANE_AIRBORNE}"
+        ));
+    }
+    Ok(())
 }
 
 /// How long `--cargo-check`'s straight must be, level and open, metres:
@@ -9875,9 +9954,12 @@ fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, lab
             corners.push(inv.transform_point3(at.w_axis.truncate()));
         }
     }
+    // What stands fixed only: from above, a plain ray met the truck's own
+    // bed and crates 2 m up, and the truck was moved 2 m into the ground
+    // (q680 6d991f6e: its hull 2.1-2.4 m under the ground it read).
     let ground = |x: f32, z: f32, near: f32| {
         physics
-            .cast_ray(Vec3::new(x, near + 20.0, z), Vec3::NEG_Y, 60.0)
+            .cast_ray_fixed(Vec3::new(x, near + 20.0, z), Vec3::NEG_Y, 60.0)
             .map(|(d, _)| near + 20.0 - d)
     };
     let Some(floor) = ground(here.x, here.z, here.y) else {
@@ -14228,6 +14310,21 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // q680 6d991f6e's drive fails as not on its wheels: no wheel down,
+    // -24.6 m/s standing, 93 degrees on its straight; its hull 2.1-2.4 m
+    // under the ground it read. A real drive's numbers pass.
+    #[test]
+    fn a_cargo_drive_off_its_wheels_or_in_the_ground_fails() {
+        assert!(cargo_sane("standing", 24.6, 3.0, 0.0).is_err());
+        assert!(cargo_sane("straight", 11.0, 93.0, 0.0).is_err());
+        assert!(cargo_sane("standing", 0.1, 3.0, 2.9).is_err());
+        assert!(cargo_sane("straight", 11.2, 4.0, 0.0).is_ok());
+        assert!(cargo_sane("hard turn", 9.0, 120.0, 0.1).is_ok());
+        assert!(cargo_hull_over_ground(&[-2.12, -1.66, -2.38, -1.91]).is_err());
+        assert!(cargo_hull_over_ground(&[0.35, 0.38, 0.31, 0.33]).is_ok());
+        assert!(cargo_hull_over_ground(&[-0.1, 0.2, 0.0, 0.1]).is_ok());
+    }
 
     // A scaled tank's airborne fall by the code: 18 for all its bodies,
     // plus the tracks' 9 on its chassis shared over all its mass; 27 with
