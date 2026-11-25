@@ -9728,7 +9728,26 @@ fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, lab
         .transform_vector3(Vec3::Z)
         .with_y(0.0)
         .normalize_or(Vec3::Z);
+    // Snapped to the nearest of eight world headings, so the search is the
+    // same from run to run (q680: eb5b8507 and the run before moved the
+    // truck to different places from headings a few degrees apart).
+    let step = std::f32::consts::FRAC_PI_4;
+    let snapped = (ahead.x.atan2(ahead.z) / step).round() * step;
+    let ahead = Vec3::new(snapped.sin(), 0.0, snapped.cos());
     let physics = &world.physics;
+    // The truck's and its crates' footprint corners (model space of the
+    // truck): every one must have ground under it where it is moved to.
+    let (lo, hi) = game.scene.vehicles[i].spec.hull;
+    let inv = m.inverse();
+    let mut corners: Vec<Vec3> = [(lo.x, lo.z), (hi.x, lo.z), (lo.x, hi.z), (hi.x, hi.z)]
+        .iter()
+        .map(|&(x, z)| Vec3::new(x, lo.y, z))
+        .collect();
+    for d in game.scene.props.cargo_pieces(i) {
+        if let Some(at) = physics.debris_place(d) {
+            corners.push(inv.transform_point3(at.w_axis.truncate()));
+        }
+    }
     let ground = |x: f32, z: f32, near: f32| {
         physics
             .cast_ray(Vec3::new(x, near + 20.0, z), Vec3::NEG_Y, 60.0)
@@ -9786,6 +9805,9 @@ fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, lab
     // have ground under it and room for the truck. Truck and cargo are
     // moved there by one rigid move, as high over the ground as here.
     let mut found = None;
+    // Places clear and level but with a truck or crate corner over no
+    // ground (or ground not loaded yet).
+    let mut ungrounded = 0;
     'rings: for r in (1..=10).map(|n| n as f32 * 20.0) {
         for a in 0..16 {
             let turn = Quat::from_rotation_y(a as f32 * std::f32::consts::TAU / 16.0);
@@ -9802,12 +9824,32 @@ fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, lab
                 continue;
             }
             if let Some(k) = (0..8).find(|&k| clear(spot, base, turned(k))) {
+                // Ground under every truck and crate corner there.
+                let to = Vec3::new(spot.x, base + (here.y - floor), spot.z);
+                let moved = Mat4::from_translation(to)
+                    * Mat4::from_rotation_y(k as f32 * std::f32::consts::FRAC_PI_4)
+                    * Mat4::from_translation(-here);
+                let bare = corners
+                    .iter()
+                    .map(|&c| (moved * m).transform_point3(c))
+                    .filter(|c| ground(c.x, c.z, c.y).is_none_or(|y| (y - c.y).abs() > 3.0))
+                    .count();
+                if bare > 0 {
+                    ungrounded += 1;
+                    continue;
+                }
                 found = Some((spot, base, k));
                 break 'rings;
             }
         }
     }
     let Some((spot, base, k)) = found else {
+        if ungrounded > 0 {
+            eprintln!(
+                "cargo-check: FAIL no ground under the move target: {ungrounded} clear, level places within 200 m had a truck or crate corner over no ground"
+            );
+            return false;
+        }
         eprintln!(
             "cargo-check: FAIL no clear straight within 200 m: none of eight headings at the {label} ({here:.0}) or at any loaded place round it has {CARGO_STRAIGHT} m of level, open ground"
         );
@@ -9817,6 +9859,23 @@ fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, lab
     let moved = Mat4::from_translation(to)
         * Mat4::from_rotation_y(k as f32 * std::f32::consts::FRAC_PI_4)
         * Mat4::from_translation(-here);
+    // Ground under every corner of the truck and under every crate where
+    // they are moved to (q680 eb5b8507: moved onto no ground, the truck
+    // fell 33 m in 2.75 s).
+    let missing: Vec<Vec3> = corners
+        .iter()
+        .map(|&c| (moved * m).transform_point3(c))
+        .filter(|c| ground(c.x, c.z, c.y).is_none_or(|y| (y - c.y).abs() > 3.0))
+        .collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "cargo-check: FAIL no ground under the move target {to:.0}: {} of {} truck and crate corners have none within 3 m ({:.0?})",
+            missing.len(),
+            corners.len(),
+            missing
+        );
+        return false;
+    }
     {
         let (_, r, t) = (moved * m).to_scale_rotation_translation();
         world.physics.place_vehicle(id, t, r);
