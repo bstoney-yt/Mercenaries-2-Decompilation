@@ -9874,6 +9874,10 @@ const XENIA_DEATH_UP: (f32, f32) = (9.0, 9.2);
 /// their dt and speed.
 const WRECK_STEPS_LOGGED: usize = 8;
 
+/// Xenia's death frame, seconds: the gravity her death sample carries
+/// (phys3-6's counters; phys7b-d's ran 0.033-0.047 s).
+const XENIA_DEATH_FRAME: f32 = 1.0 / 30.0;
+
 /// The fall it flies under after (0.30 m/s a 1/30 s step, phys6).
 const XENIA_WRECK_G: f32 = 9.0;
 /// How near that a fitted fall must be.
@@ -10207,10 +10211,15 @@ fn wreck_flight_verdict(
         "death step {death:.3}, launched |{launched:.2}| (360 |{:?}|, up {:?})",
         XENIA_DEATH_SPEED, XENIA_DEATH_UP
     ));
-    if !within(launched, XENIA_DEATH_SPEED) || !within(death.y, XENIA_DEATH_UP) {
+    // The port's loop is the 360's rotated: its frame steps physics, then
+    // runs the actions (the launch, the explosions), so its death sample
+    // carries no gravity yet; Xenia's carries its death frame's (1/30 s,
+    // phys3-6). Her band is compared after that much gravity.
+    let death_up = death.y - XENIA_WRECK_G * XENIA_DEATH_FRAME;
+    if !within(launched, XENIA_DEATH_SPEED) || !within(death_up, XENIA_DEATH_UP) {
         fails.push(format!(
-            "death step launched |{:.2}| up {:.2}, not {:?} up {:?}",
-            launched, death.y, XENIA_DEATH_SPEED, XENIA_DEATH_UP
+            "death step launched |{:.2}| up {:.2} after a 1/30 s frame's gravity, not {:?} up {:?}",
+            launched, death_up, XENIA_DEATH_SPEED, XENIA_DEATH_UP
         ));
     }
     // Its explosions, in the death frame after the launch: level only
@@ -10219,13 +10228,14 @@ fn wreck_flight_verdict(
         Some(launched) => {
             let change = death - launched;
             let level = change.with_y(0.0).length();
-            let up = change.y + XENIA_WRECK_G * tick;
+            // No gravity between them in the port's frame (see above).
+            let up = change.y;
             lines.push(format!(
-                "death frame's explosions: change {change:.3} from the launch, level {level:.2}, up past gravity {up:.2}"
+                "death frame's explosions: change {change:.3} from the launch, level {level:.2}, up {up:.2}"
             ));
             if up.abs() > WRECK_NEXT_UP_SLACK || level < WRECK_NEXT_LEAST_LEVEL {
                 fails.push(format!(
-                    "the death frame's explosions not level only (level {level:.2}, up past gravity {up:.2})"
+                    "the death frame's explosions not level only (level {level:.2}, up {up:.2})"
                 ));
             }
         }
@@ -13407,15 +13417,17 @@ mod tests {
     use super::*;
 
     // A flight like Xenia's passes: launched |9.82|; in the death frame its
-    // explosions push it level only and the frame's gravity takes 0.30, to
-    // 9.10 up; then it falls at 9. A launch of 10.2 (the +2 square to it
+    // explosions push it level only (9.40 up, 9.10 after Xenia's 1/30 s of
+    // gravity); then it falls at 9. A launch of 10.2 (the +2 square to it
     // in full) fails its death frame, as does explosions lifting it.
     #[test]
     fn a_wreck_flight_like_xenias_passes_and_an_unfallen_one_fails() {
         use m2_math::glam::Vec3;
         let dt = 1.0 / 30.0;
         let launched = Vec3::new(2.0, 9.4, 2.0);
-        let death = launched + Vec3::new(-5.0, -9.0 * dt, -5.0);
+        // The port's death sample: the launch and its explosions' level
+        // pushes, no gravity yet (its frame steps physics first).
+        let death = launched + Vec3::new(-5.0, 0.0, -5.0);
         let mut flight = vec![(dt, death)];
         let mut v = death;
         for k in 2..20 {
