@@ -152,10 +152,10 @@ pub struct Game {
     /// The layers' parked vehicles' whole authored turns, by entity:
     /// placed as authored ([`place`]).
     authored: HashMap<u32, Quat>,
-    /// The island's vehicles placed since the last physics step: entity,
-    /// body and where it was put, logged after their very first step
+    /// The island's vehicles placed and still watched: entity, body,
+    /// where it was put and how, and how many steps logged so far
     /// ([`Game::log_first_steps`]).
-    just_placed: Vec<(u32, m2_engine::VehicleId, Vec3, Quat)>,
+    just_placed: Vec<(u32, m2_engine::VehicleId, Vec3, Quat, u32)>,
     /// The scripts' (mission) vehicles placed as authored (their layer
     /// entity's `Transform`), by guid: where and turned how
     /// (`--parked-settle-check`).
@@ -830,7 +830,7 @@ impl Game {
                     && let Some(m) = world.physics.vehicle_transform(id)
                 {
                     let (_, turn, put) = m.to_scale_rotation_translation();
-                    self.just_placed.push((entity, id, put, turn));
+                    self.just_placed.push((entity, id, put, turn, 0));
                 }
             }
         }
@@ -5725,7 +5725,11 @@ impl Game {
     /// first physics step: how far it moved and turned, its speed and spin,
     /// its wheels down and each spring's squeeze from its rest length, and
     /// what its body touches. A spring launch (squeezed springs, a speed up)
-    /// tells apart from a shove (a touch, a speed level). Log only.
+    /// tells apart from a shove (a touch, a speed level). The ones in
+    /// [`FIRST_STEPS_WATCHED`] are logged each step for
+    /// [`FIRST_STEPS_LONG`] steps, with how far up they face, each wheel's
+    /// drive force and brake, whether it is held parked, who drives it
+    /// and whether the scripts have it. Log only.
     fn log_first_steps(&mut self) {
         if self.just_placed.is_empty() {
             return;
@@ -5734,17 +5738,16 @@ impl Game {
             return;
         };
         let physics = &world.physics;
-        for (entity, id, put, turn) in std::mem::take(&mut self.just_placed) {
+        let mut keep = Vec::new();
+        for (entity, id, put, turn, n) in std::mem::take(&mut self.just_placed) {
             let Some(m) = physics.vehicle_transform(id) else {
                 continue;
             };
+            let n = n + 1;
+            let long = FIRST_STEPS_WATCHED.contains(&entity);
             let (_, now_turn, now) = m.to_scale_rotation_translation();
-            let label = self
-                .scene
-                .vehicles
-                .iter()
-                .find(|v| v.id == Some(id))
-                .map_or("?", |v| v.spec.label.as_str());
+            let vehicle = self.scene.vehicles.iter().find(|v| v.id == Some(id));
+            let label = vehicle.map_or("?", |v| v.spec.label.as_str());
             let (down, wheels) = physics.vehicle_contacts(id);
             let squeeze: Vec<String> = physics
                 .vehicle_suspension(id)
@@ -5756,8 +5759,38 @@ impl Game {
                 .iter()
                 .map(|(k, at, _)| format!("{k:?} at {at:.2}"))
                 .collect();
+            let head = if n == 1 {
+                "first step".to_owned()
+            } else {
+                format!("step {n}")
+            };
+            let more = if long {
+                let forces: Vec<String> = physics
+                    .vehicle_wheel_forces(id)
+                    .iter()
+                    .map(|(f, b)| format!("{f:.0}/{b:.0}"))
+                    .collect();
+                let index = self.scene.vehicles.iter().position(|v| v.id == Some(id));
+                let driver = index.map_or("none".to_owned(), |i| {
+                    let her = self
+                        .scene
+                        .player
+                        .as_ref()
+                        .is_some_and(|p| p.driving == Some(i));
+                    let crew = vehicle.map_or(0, |v| v.crew.len());
+                    format!("her {her}, crew {crew}")
+                });
+                format!(
+                    ", up {:.3}, wheel drive/brake [{}], driver {driver}, guid {:?}",
+                    m.y_axis.y,
+                    forces.join(", "),
+                    vehicle.and_then(|v| v.guid)
+                )
+            } else {
+                String::new()
+            };
             eprintln!(
-                "first step: island vehicle {entity:#x} {label}: moved {:.3} (dy {:+.3}), turned {:.2} deg, v {:.3} (up {:+.3}), spin {:.3}, wheels down {down} of {wheels}, springs squeezed [{}] m, touching [{}]",
+                "{head}: island vehicle {entity:#x} {label}: moved {:.3} (dy {:+.3}), turned {:.2} deg, v {:.3} (up {:+.3}), spin {:.3}, wheels down {down} of {wheels}, springs squeezed [{}] m, touching [{}]{more}",
                 now.distance(put),
                 now.y - put.y,
                 turn.angle_between(now_turn).to_degrees(),
@@ -5767,7 +5800,11 @@ impl Game {
                 squeeze.join(", "),
                 touching.join("; ")
             );
+            if long && n < FIRST_STEPS_LONG {
+                keep.push((entity, id, put, turn, n));
+            }
         }
+        self.just_placed = keep;
     }
 
     /// The authored turn of the layers' parked vehicle `entity`, if one
@@ -5776,6 +5813,13 @@ impl Game {
         self.authored.get(&entity).copied()
     }
 }
+
+/// The island vehicles [`Game::log_first_steps`] logs each step after
+/// they are placed, for [`FIRST_STEPS_LONG`] steps (#766's B, C and E
+/// spots: the Phoenix, the Van (Green) and the M151 that left their
+/// authored places).
+const FIRST_STEPS_WATCHED: [u32; 3] = [0x10_d5d8, 0x12_b8fc, 0x13_3ba2];
+const FIRST_STEPS_LONG: u32 = 60;
 
 /// Puts a vehicle where it stands: false while what it stands on hasn't
 /// loaded. A boat on the sea floats on it.
