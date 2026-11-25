@@ -387,6 +387,9 @@ pub struct Templates {
     /// Each person template's jump, gravity, turn and paces, by id
     /// ([`crate::tuning::human_motion`]).
     pub human_motion: HashMap<u32, crate::on_foot::HumanMotion>,
+    /// Each person template's `TossGetupSeconds`
+    /// ([`crate::tuning::toss_getup_seconds`]).
+    pub toss_getup: HashMap<u32, f32>,
     /// Each template's cover hints, by id ([`crate::tuning::cover_hints`]).
     pub cover_hints: HashMap<u32, Vec<crate::ai_cover::Hint>>,
     /// Each person template's `HumanAnimationSet` gender and character
@@ -677,6 +680,13 @@ impl Templates {
         self.ids(name)
             .iter()
             .find_map(|id| self.swim_speeds.get(id).copied())
+    }
+
+    /// Template `name`'s `TossGetupSeconds`, whatever its case.
+    pub fn toss_getup_seconds(&self, name: &str) -> Option<f32> {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.toss_getup.get(id).copied())
     }
 
     /// Template `name`'s jump, gravity, turn and paces, whatever its case.
@@ -1217,6 +1227,7 @@ impl Templates {
             speeds: crate::tuning::human_speeds(&db),
             swim_speeds: crate::tuning::human_swim_speeds(&db),
             human_motion: crate::tuning::human_motion(&db),
+            toss_getup: crate::tuning::toss_getup_seconds(&db),
             cover_hints: crate::tuning::cover_hints(&db),
             human_sets: crate::tuning::human_animation_sets(&db),
             face_actors: crate::tuning::face_actors(&db),
