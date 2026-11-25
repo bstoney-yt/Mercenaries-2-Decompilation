@@ -95,9 +95,9 @@ pub struct Flow {
     /// The cover over a new game's start ([`crate::cover`]): up from New
     /// Game (or a save) until play may show.
     pub cover: crate::cover::Cover,
-    /// The scripts' movie that ended the cover was handed out this tick,
-    /// once: whether it was skipped (could not be played).
-    intro_started: Option<bool>,
+    /// How the scripts' movie that ended the cover went (its first frame
+    /// presented, or skipped and why), once.
+    intro_started: Option<crate::cover::Intro>,
 }
 
 impl Flow {
@@ -167,9 +167,9 @@ impl Flow {
         eprintln!("flow: new game as {} (the check)", self.hero);
     }
 
-    /// The scripts' movie that took the cover down was handed out (once):
-    /// whether it was skipped.
-    pub fn take_intro_started(&mut self) -> Option<bool> {
+    /// How the scripts' movie that took the cover down went (once): its
+    /// first frame presented, or skipped and why.
+    pub fn take_intro_started(&mut self) -> Option<crate::cover::Intro> {
         self.intro_started.take()
     }
 
@@ -464,16 +464,17 @@ impl Flow {
                             self.scripted = false;
                             // Handed out all the same: the cover's intro
                             // is over, unplayed.
-                            if let Some(line) = self.cover.movie_skipped() {
-                                eprintln!("{line} ({name})");
-                                self.intro_started = Some(true);
-                            }
+                            let why = if self.ffmpeg.is_none() {
+                                crate::cover::Skip::NoDecoder
+                            } else {
+                                crate::cover::Skip::OpenError
+                            };
+                            self.skip_intro(why, &name);
                             mission.movie_done();
                             return;
                         }
                         if let Some(line) = self.cover.movie_started() {
                             eprintln!("{line} ({name})");
-                            self.intro_started = Some(false);
                         }
                         if let Some(lines) = lines {
                             if self.captions.is_none() {
@@ -489,10 +490,17 @@ impl Flow {
                     }
                     return;
                 }
-                let over = self
+                let mut over = self
                     .movie
                     .as_mut()
                     .is_some_and(|m| pressed || m.update(|p| mixer.play(p)));
+                // The intro the cover hands over to must present a frame:
+                // one that ends or runs out of time first was not played.
+                if self.cover.in_handover() && (over || self.cover.handover_expired()) {
+                    let name = self.movie.as_ref().map(|m| m.name.clone());
+                    self.skip_intro(crate::cover::Skip::NoFrame, &name.unwrap_or_default());
+                    over = true;
+                }
                 if let (Some(s), Some(m)) = (&mut self.subtitles, &self.movie)
                     && let Some((frame, _)) = &m.frame
                 {
@@ -519,6 +527,14 @@ impl Flow {
                     }
                 }
             }
+        }
+    }
+
+    /// The cover's intro was handed out but not played, for `why`.
+    fn skip_intro(&mut self, why: crate::cover::Skip, name: &str) {
+        if let Some(line) = self.cover.movie_skipped(why) {
+            eprintln!("{line} ({name})");
+            self.intro_started = Some(crate::cover::Intro::Skipped(why));
         }
     }
 
@@ -622,6 +638,14 @@ impl Flow {
                     Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                     Color32::WHITE,
                 );
+                // The intro's first frame drawn: the cover fades into it
+                // from this frame.
+                if self.stage == Stage::Game
+                    && let Some(line) = self.cover.movie_presented()
+                {
+                    eprintln!("{line} ({})", m.name);
+                    self.intro_started = Some(crate::cover::Intro::Presented);
+                }
             }
         }
         if let (Some(s), Some(Some(c))) = (&self.subtitles, &mut self.captions) {
