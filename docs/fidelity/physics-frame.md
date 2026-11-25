@@ -54,6 +54,32 @@ substep, on the bodies the rebuild pass has just made.
   level-only changes between substeps, and the world read locked between
   frames.
 
+## The port's frame against the 360's (from the code of both)
+
+- **The 360's frame (0x8221E340):** the manager's actions (rebuild,
+  0x82155480, the action list, message queues, per-object +0xCC), then the
+  1-3 substeps (0x82152E20), then the rider system (0x82299918) and the rest.
+- **The port's frame (`Game::step`):** the player and physics phase
+  (`Physics::step_frame`, the same 1-3 substeps of dt/n), then the riders,
+  scripts and `Combat::step` (shots, blasts, wrecks, the death launch, the
+  explosion pushes).
+- **The cyclic order is the same**: actions, substeps, riders, actions,
+  substeps, riders... The port's frame boundary falls between the riders
+  and the actions instead of before the actions. A sample taken at the end
+  of a port frame sees that frame's actions without their gravity. The
+  360's sees them with it. Checks that compare per-frame values with Xenia
+  account for that (#728's `--wreck-blast-check`).
+
+### Still differs
+
+- **The substeps after a frame's actions use the next frame's dt in the
+  port.** The 360 steps frame N's actions with frame N's dt (its
+  substeps follow them in the same frame). The port's actions of frame N
+  are integrated by frame N+1's `step_frame`, with frame N+1's dt and
+  substep count. At a steady frame rate the two are the same. When the
+  frame time changes (a slow frame after a fast one), the first substeps
+  after an action differ in length and count.
+
 ## Consequences for the port (Inferred; not yet changed)
 
 - The port steps physics at a fixed 1/60 s, which is the 360 at 60 fps.
