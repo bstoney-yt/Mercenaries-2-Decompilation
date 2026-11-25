@@ -229,6 +229,10 @@ m2-alpha [options]
   --log-check            testing: 5 numbered lines and log-check: RESULT PASS
                          to standard error, then exit at once, as a check
                          ends; all must reach a piped standard error
+  --pipelines-check      check: with --screenshot, the first frame drawn
+                         must make the render pipelines it meets (logged as
+                         pipelines: +N (total M) in X ms); prints
+                         pipelines-check: PASS or FAIL, exits 1 on FAIL
   --survival-check       check: her health clamp and survival mode on the
                          game's own code (clamp, a crusher's hit, the cut);
                          PASS/FAIL, then exit
