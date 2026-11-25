@@ -9874,12 +9874,6 @@ const XENIA_DEATH_UP: (f32, f32) = (9.0, 9.2);
 /// their dt and speed.
 const WRECK_STEPS_LOGGED: usize = 8;
 
-/// Xenia's counter, seconds: the cadence `--wreck-blast-check` judges the
-/// flight at. Assumed 1/30 s (Xenia's runs' 0.30 m/s of gravity a counter)
-/// until the massprobe reads the frame and physics dt (the recorded
-/// finding: one Havok step a frame, at the frame's dt).
-const XENIA_COUNTER: f32 = 1.0 / 30.0;
-
 /// The fall it flies under after (0.30 m/s a 1/30 s step, phys6).
 const XENIA_WRECK_G: f32 = 9.0;
 /// How near that a fitted fall must be.
@@ -10123,17 +10117,15 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
             .zip(her_from)
             .map_or(0.0, |(a, b)| a.with_y(0.0).distance(b.with_y(0.0)))
     );
-    // Judged at Xenia's cadence: her counters are 1/30 s (assumed, until
-    // the massprobe's frame and physics dt reads land: one Havok step a
-    // frame at the frame's dt), the port steps 1/60 s; so every
-    // `per`-th port step is one counter, and gravity is undone over 1/30.
-    let per = ((XENIA_COUNTER / tick).round() as usize).max(1);
-    let counters: Vec<(f32, Vec3)> = flight.iter().skip(per - 1).step_by(per).copied().collect();
+    // Judged per frame (the port's frame is one step, `tick`), its gravity
+    // undone over the frame: the 360's death frame is its launch, then its
+    // explosions' level-only pushes, then the frame's substeps of gravity
+    // (docs/fidelity/physics-frame.md).
     eprintln!(
-        "wreck-blast-check: judged at Xenia's {XENIA_COUNTER:.4} s counters: every {per} port steps of {tick:.4} s ({} counters)",
-        counters.len()
+        "wreck-blast-check: judged per frame of {tick:.4} s; launched {:.3}",
+        game.combat.launched.unwrap_or(Vec3::NAN)
     );
-    let flew = wreck_flight_verdict(&counters, per as f32 * tick, top, landed);
+    let flew = wreck_flight_verdict(&flight, tick, top, landed, game.combat.launched);
     for line in &flew.lines {
         eprintln!("wreck-blast-check: {line}");
     }
@@ -10195,6 +10187,7 @@ fn wreck_flight_verdict(
     tick: f32,
     top: f32,
     landed: Option<f32>,
+    launch: Option<m2_math::glam::Vec3>,
 ) -> FlightVerdict {
     use m2_math::glam::Vec3;
     let mut lines = Vec::new();
@@ -10204,9 +10197,12 @@ fn wreck_flight_verdict(
         fails.push("it never was wrecked".to_owned());
         return FlightVerdict { lines, fails };
     };
-    // Its launch: the death step's speed with that step's gravity undone
-    // (phys6: (2.12, 9.18, 1.30) is |9.80| launched).
-    let launched = (death + Vec3::Y * XENIA_WRECK_G * tick).length();
+    // Its launch: as it was launched, else the death frame's speed with the
+    // frame's gravity undone (phys6: (2.12, 9.18, 1.30) is |9.80|).
+    let launched = launch.map_or_else(
+        || (death + Vec3::Y * XENIA_WRECK_G * tick).length(),
+        Vec3::length,
+    );
     lines.push(format!(
         "death step {death:.3}, launched |{launched:.2}| (360 |{:?}|, up {:?})",
         XENIA_DEATH_SPEED, XENIA_DEATH_UP
@@ -10217,26 +10213,28 @@ fn wreck_flight_verdict(
             launched, death.y, XENIA_DEATH_SPEED, XENIA_DEATH_UP
         ));
     }
-    match flight.get(1) {
-        Some(&(_, next)) => {
-            let change = next - death;
+    // Its explosions, in the death frame after the launch: level only
+    // (the change from the launch, the frame's gravity undone).
+    match launch {
+        Some(launched) => {
+            let change = death - launched;
             let level = change.with_y(0.0).length();
             let up = change.y + XENIA_WRECK_G * tick;
             lines.push(format!(
-                "next step {next:.3}: change {change:.3}, level {level:.2}, up past gravity {up:.2}"
+                "death frame's explosions: change {change:.3} from the launch, level {level:.2}, up past gravity {up:.2}"
             ));
             if up.abs() > WRECK_NEXT_UP_SLACK || level < WRECK_NEXT_LEAST_LEVEL {
                 fails.push(format!(
-                    "next step's change not level only (level {level:.2}, up past gravity {up:.2})"
+                    "the death frame's explosions not level only (level {level:.2}, up past gravity {up:.2})"
                 ));
             }
         }
-        None => fails.push("no step after the death step".to_owned()),
+        None => fails.push("no launch logged".to_owned()),
     }
-    // The fall while it rises, from the step after next.
+    // The fall while it rises, from the frame after the death frame.
     let rising: Vec<(f32, f32)> = flight
         .iter()
-        .skip(2)
+        .skip(1)
         .take_while(|(_, v)| v.y > 0.0)
         .map(|&(t, v)| (t, v.y))
         .collect();
@@ -13408,29 +13406,44 @@ impl ApplicationHandler for App {
 mod tests {
     use super::*;
 
-    // Xenia's phys6 flight passes: 9.18 up after one gravity step, the
-    // next step level only, then 9 m/s/s; a 10.2 launch with no gravity
-    // fails its death step.
+    // A flight like Xenia's passes: launched |9.82|; in the death frame its
+    // explosions push it level only and the frame's gravity takes 0.30, to
+    // 9.10 up; then it falls at 9. A launch of 10.2 (the +2 square to it
+    // in full) fails its death frame, as does explosions lifting it.
     #[test]
     fn a_wreck_flight_like_xenias_passes_and_an_unfallen_one_fails() {
         use m2_math::glam::Vec3;
         let dt = 1.0 / 30.0;
-        let mut flight = vec![(dt, Vec3::new(2.12, 9.18, 1.30))];
-        let mut v = Vec3::new(-4.87, 9.18 - 0.30, -5.42);
+        let launched = Vec3::new(2.0, 9.4, 2.0);
+        let death = launched + Vec3::new(-5.0, -9.0 * dt, -5.0);
+        let mut flight = vec![(dt, death)];
+        let mut v = death;
         for k in 2..20 {
-            flight.push((k as f32 * dt, v));
             v.y -= 9.0 * dt;
+            flight.push((k as f32 * dt, v));
         }
-        let ok = wreck_flight_verdict(&flight, dt, 5.1, Some(13.0));
+        let ok = wreck_flight_verdict(&flight, dt, 5.1, Some(13.0), Some(launched));
         assert!(ok.fails.is_empty(), "{:?}", ok.fails);
-        flight[0].1 = Vec3::new(2.0, 9.9, 1.0);
-        let bad = wreck_flight_verdict(&flight, dt, 5.1, Some(13.0));
+        let fast = Vec3::new(2.0, 9.95, 2.5);
+        let bad = wreck_flight_verdict(&flight, dt, 5.1, Some(13.0), Some(fast));
         assert!(
             bad.fails.iter().any(|f| f.starts_with("death step")),
             "{:?}",
             bad.fails
         );
-        assert!(!wreck_flight_verdict(&[], dt, 0.0, None).fails.is_empty());
+        let mut lifted = flight.clone();
+        lifted[0].1.y += 1.0;
+        let lift = wreck_flight_verdict(&lifted, dt, 5.1, Some(13.0), Some(launched));
+        assert!(
+            lift.fails.iter().any(|f| f.contains("not level only")),
+            "{:?}",
+            lift.fails
+        );
+        assert!(
+            !wreck_flight_verdict(&[], dt, 0.0, None, None)
+                .fails
+                .is_empty()
+        );
     }
 
     #[test]

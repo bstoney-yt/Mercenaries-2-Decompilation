@@ -2005,6 +2005,9 @@ pub struct Combat {
     /// A vehicle to wreck in the next step, after that step's part blasts
     /// ([`Self::wreck_now`]): as damage wrecks it mid-step.
     wreck_due: Option<usize>,
+    /// The last wreck's speed right after its death launch
+    /// (`--wreck-blast-check` judges its blasts' change from it).
+    pub launched: Option<Vec3>,
     /// Where the last one went off, and what it pushes what it breaks
     /// with, where known.
     pub last_blast: Option<Vec3>,
@@ -2445,6 +2448,7 @@ impl Default for Combat {
             wreck_blasts: std::collections::HashMap::new(),
             part_blasts_fired: Vec::new(),
             wreck_due: None,
+            launched: None,
             last_blast: None,
             last_push: None,
             went_off: Vec::new(),
@@ -3769,6 +3773,10 @@ impl Combat {
         self.fly(f, dt);
         self.burn_vehicles(f, dt);
         self.smoke_wrecks(f, dt);
+        // What this step's wrecks started goes off in this step too, after
+        // their launch (as above): pushes topped up against the launched
+        // speed, so level only where they push less than it rises.
+        self.part_blasts(f);
     }
 
     /// Where shots start and the way the crosshair points: along the
@@ -6029,12 +6037,18 @@ impl Combat {
             let launch = m2_engine::durability::death_launch(rx, rz, 1.0);
             let before = physics.vehicle_velocity(id);
             physics.set_vehicle_velocity(id, before + launch);
+            self.launched = Some(before + launch);
             eprintln!(
                 "wreck: the {} is launched {launch:.2} (|{:.2}|) from {before:.2}",
                 v.spec.label,
                 launch.length()
             );
         }
+        // Its body's destroyed state now, so the explosions it starts go
+        // off in this frame, after the launch (0x82152B68's action list
+        // runs the launch and the explosion actions in one pass, before
+        // the frame's physics: docs/fidelity/physics-frame.md).
+        v.follow_health();
         self.wrecks.push((i, 0.0));
         self.remarks.push(Remark::Wreck);
     }
