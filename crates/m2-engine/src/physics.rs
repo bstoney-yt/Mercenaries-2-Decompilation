@@ -8595,8 +8595,10 @@ mod tests {
         // 0x82182418: every body's mass summed; 0 once one does not move.
         let mut p = Physics::new();
         let id = p.add_vehicle(&gun_tank(), Vec3::new(0.0, 0.5, 0.0), 0.0);
-        // Its turret and gun each a hundredth of its 30,000 kg chassis
-        // ([`hinge_body`], 0x82273E48), not their records' mass.
+        // The test fixture `gun_tank` (not the M1A2): its turret and gun
+        // each a hundredth of its own 30,000 kg chassis ([`hinge_body`],
+        // 0x82273E48), not their records' mass. The real M1A2's chassis is
+        // its template's `Mass`, 32,000 kg (0x82182848), so 320 + 320.
         let m = p.vehicle_mass(id).unwrap();
         assert!((m - 30_600.0).abs() < 1.0, "{m}");
         p.hold_vehicle(id, true);
