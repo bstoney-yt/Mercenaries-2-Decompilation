@@ -5101,6 +5101,21 @@ impl Physics {
             });
         let top = if boat { BOAT_TOP } else { TOP_SPEED };
         let tyres = (!spec.tracked).then(|| spec.tuning.tyres.unwrap_or(Tyres::DEFAULT));
+        // Its turret's and gun's bodies are its object's bodies too: the
+        // 360's set-up (0x821831B0) gives every moving body of the object
+        // the gravity action, and the turret update only hinges two of
+        // them (0x82273F90 takes both from the object, 0x82182708 and
+        // 0x82170620, and joins them, 0x8216B350): each is pulled by the
+        // same scale.
+        if let Some(h) = &hinge {
+            let scale = vehicle_gravity_scale(spec.tuning.gravity_scale);
+            let handles = std::iter::once(h.body).chain(h.gun.as_ref().map(|g| g.body));
+            for handle in handles {
+                if let Some(b) = self.world.bodies.get_mut(handle) {
+                    b.set_gravity_scale(scale, true);
+                }
+            }
+        }
         let id = VehicleId(self.vehicles.len());
         self.vehicles.push(Some(VehicleBody {
             controller,
@@ -6609,6 +6624,17 @@ impl Physics {
         let dw = vec3(body.angvel()) - angular;
         body.set_linvel(vector(linear + top_up(dv, linear)), true);
         body.set_angvel(vector(angular + top_up(dw, angular)), true);
+    }
+
+    /// A vehicle's chassis body's mass and its turret's and gun's bodies'
+    /// together, kg (0 for a vehicle with none).
+    pub fn vehicle_body_masses(&self, id: VehicleId) -> Option<(f32, f32)> {
+        let v = self.vehicles.get(id.0)?.as_ref()?;
+        let mass = |h: r::RigidBodyHandle| self.world.bodies.get(h).map_or(0.0, |b| b.mass());
+        let others = v.hinge.as_ref().map_or(0.0, |h| {
+            mass(h.body) + h.gun.as_ref().map_or(0.0, |g| mass(g.body))
+        });
+        Some((mass(v.controller.chassis), others))
     }
 
     /// Shoves a vehicle: `impulse` (kg m/s) applied at world point `at`.
@@ -8919,6 +8945,51 @@ mod tests {
     // A tank's `PhysicsPropertyGravityScaler` of 2 pulls it at twice the
     // world's gravity in the air, 18 m/s²; one with none at the world's
     // 9; the scale is clamped as a prop's.
+    // A scaled tank's turret is a body of its own on a hinge, and is
+    // pulled by the same scale as its chassis (0x821831B0 gives each of
+    // the object's moving bodies the action): with no tracks, the whole
+    // falls at 2 x 9.0 = 18.
+    #[test]
+    fn a_scaled_tanks_turret_falls_with_its_chassis() {
+        let mut scaled = tank();
+        let block = |lo: Vec3, hi: Vec3| {
+            (0..8)
+                .map(|i| {
+                    Vec3::new(
+                        if i & 1 == 0 { lo.x } else { hi.x },
+                        if i & 2 == 0 { lo.y } else { hi.y },
+                        if i & 4 == 0 { lo.z } else { hi.z },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        scaled.turret_shapes =
+            vec![block(Vec3::new(-1.0, 1.6, -1.0), Vec3::new(1.0, 2.4, 1.0))].into();
+        scaled.turret_mass = Some(crate::vehicle::Chassis {
+            mass: 3000.0,
+            inertia: Mat3::from_diagonal(Vec3::new(2000.0, 2500.0, 1000.0)),
+            centre_of_mass: Vec3::new(0.0, 2.0, 0.0),
+        });
+        scaled.pivot = Some(Vec3::new(0.0, 2.0, 0.0));
+        scaled.tuning.turret = Some(crate::tuning::TurretTuning {
+            main: true,
+            yaw_speed: 1.0,
+            yaw_accel: 20.0,
+            pitch: (-0.1, 0.3),
+            pitch_speed: 1.0,
+            pitch_accel: 20.0,
+            yaw: None,
+        });
+        scaled.tuning.gravity_scale = Some(2.0);
+        let mut p = Physics::new();
+        let id = p.add_vehicle_turned(&scaled, Vec3::new(0.0, 500.0, 0.0), Quat::IDENTITY);
+        for _ in 0..30 {
+            p.step(DT);
+        }
+        let fall = -p.vehicle_velocity(id).y / (30.0 * DT);
+        assert!((fall - 18.0).abs() < 0.5, "{fall}");
+    }
+
     // The tracks' pull off the ground (0x821A4F10): none with all six
     // points down (a tank on flat ground), in proportion to those off
     // (half off: half of it), and all of it in the air: (GravityFactor - 1)

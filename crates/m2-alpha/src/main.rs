@@ -12976,6 +12976,16 @@ impl ApplicationHandler for App {
 mod tests {
     use super::*;
 
+    // A scaled tank's airborne fall by the code: 18 for all its bodies,
+    // plus the tracks' 9 on its chassis shared over all its mass; 27 with
+    // no turret, less with one.
+    #[test]
+    fn a_joined_tank_falls_at_18_plus_its_chassis_share_of_9() {
+        assert!((joined_tank_fall(2.0, 2.0, 50_000.0, 0.0) - 27.0).abs() < 1e-4);
+        assert!((joined_tank_fall(2.0, 2.0, 30_000.0, 10_000.0) - 24.75).abs() < 1e-3);
+        assert!((joined_tank_fall(1.0, 1.0, 30_000.0, 10_000.0) - 9.0).abs() < 1e-4);
+    }
+
     #[test]
     fn autoplay_retries_a_failed_contract_only_with_a_retry_save_and_not_forever() {
         assert!(retry_or_continue(true, 0));
@@ -13258,18 +13268,28 @@ fn ditch_check(game: &mut Game, tick: f32) {
     eprintln!("ditch-check: {}", verdict(ok && ok2));
 }
 
-/// The airborne fall `--vehicle-gravity-check` asks of a scaled tank, of
-/// gravity scale 2 and `GravityFactor` 2 (the M1A2's, the DLC M1A1's and
-/// every other scaled tank's), m/s², and how near. Code-derived, not yet
-/// measured (Xenia is to measure the M1A2's): the gravity action
-/// (0x82180778) pulls it at 2 x the world's 9.0 = 18; and every step,
-/// with no gate on being airborne, `_TankPhysics`' step (0x821A49E8)
-/// calls 0x821A4F10, which counts its six track points in contact
-/// (bytes +0x80 .. +0x300 of the tracks, stride 0x80), and pulls it
-/// down by (GravityFactor - 1) x (6 - those) x mass x 1.5 (0x820D2F6C,
-/// -1.5) through its motion (vfunc +0x58, with the step's dt): in the
-/// air, (2 - 1) x 6 x 1.5 = 9 more. 27 in all.
-const SCALED_TANK_FALL: (f32, f32) = (27.0, 0.5);
+/// How near `--vehicle-gravity-check` asks a scaled tank's airborne fall
+/// to come to [`joined_tank_fall`]'s, m/s².
+const SCALED_TANK_SLACK: f32 = 0.5;
+
+/// A scaled tank's airborne fall, m/s², by the 360 code (not yet
+/// measured: Xenia's tank3): every one of its object's moving bodies,
+/// chassis, turret and gun, is pulled at `scale` x the world's 9.0 by
+/// its gravity action (0x821831B0 gives each one, 0x82180778); and every
+/// step, with no gate on being airborne, `_TankPhysics`' step
+/// (0x821A49E8) calls 0x821A4F10, which counts its six track points in
+/// contact (bytes +0x80 .. +0x300 of the tracks, stride 0x80) and pulls
+/// the **chassis** (its own mass, 0x8262C120 of the body at +0x18) down
+/// by (GravityFactor - 1) x (6 - those) x mass x 1.5 (0x820D2F6C) through
+/// its motion (vfunc +0x58 with the step's dt, taken as a force over it:
+/// unverified). The turret and gun ride on the chassis by their hinges,
+/// so the whole takes the chassis's pull over all its mass: `scale x 9 +
+/// (GravityFactor - 1) x 6 x 1.5 x chassis / (chassis + turret and
+/// gun)`. For the M1A2 (scale 2, factor 2): 18 + 9 x its chassis share.
+fn joined_tank_fall(scale: f32, gravity_factor: f32, chassis: f32, others: f32) -> f32 {
+    let share = chassis / (chassis + others).max(1e-3);
+    m2_engine::physics::WORLD_GRAVITY * scale + (gravity_factor - 1.0) * 6.0 * 1.5 * share
+}
 
 /// `--vehicle-gravity-check` (it turns on `--drive`): a tank whose
 /// template carries a `PhysicsPropertyGravityScaler` of 2 (one whose label
@@ -13279,7 +13299,7 @@ const SCALED_TANK_FALL: (f32, f32) = (27.0, 0.5);
 /// 0.5 s; its fall (m/s², from its speed) is logged beside the world's
 /// gravity times its scale. Nothing is seated: q771 (ace782f1, ffe269f7)
 /// asked her into an M1A2 and got `drive: no vehicle to get in`, and no
-/// verdict. `PASS` when it falls within [`SCALED_TANK_FALL`]; else `FAIL`
+/// verdict. `PASS` when it falls within [`SCALED_TANK_SLACK`] of [`joined_tank_fall`]; else `FAIL`
 /// with why, no scaled tank among them included.
 fn vehicle_gravity_check(
     backend: &mut WgpuBackend,
@@ -13378,7 +13398,18 @@ fn vehicle_gravity_check(
         track.map_or(0.0, |t| t.1),
         WORLD_GRAVITY * vehicle_gravity_scale(scale) + track.map_or(0.0, |t| t.1),
     );
-    let (want_fall, slack) = SCALED_TANK_FALL;
+    let (chassis, others) = p.vehicle_body_masses(id).unwrap_or((spec.mass, 0.0));
+    let gravity_factor = spec.tuning.tank.map_or(1.0, |t| t.gravity_factor);
+    let want_fall = joined_tank_fall(
+        vehicle_gravity_scale(scale),
+        gravity_factor,
+        chassis,
+        others,
+    );
+    let slack = SCALED_TANK_SLACK;
+    eprintln!(
+        "vehicle-gravity-check: bodies: chassis {chassis:.0} kg, turret and gun {others:.0} kg; GravityFactor {gravity_factor}; the 360's joined fall {want_fall:.2}"
+    );
     eprintln!(
         "vehicle-gravity-check: the {} (scale {scale:?}) falls at {fall:.2} m/s/s in the air; the world's {WORLD_GRAVITY} x {} = {:.2}; a scaled tank's {want_fall} with its six track points' pull (code-derived, not yet measured)",
         spec.label,
