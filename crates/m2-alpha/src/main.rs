@@ -12976,6 +12976,21 @@ impl ApplicationHandler for App {
 mod tests {
     use super::*;
 
+    // A boat is judged afloat, upright and near where it was authored,
+    // not at its authored height (q766 B).
+    #[test]
+    fn a_boat_settles_afloat_upright_and_near_its_place() {
+        use m2_math::glam::Vec3;
+        let authored = Vec3::new(10.0, 1.2, 5.0);
+        let afloat = Some(-0.3);
+        let here = Vec3::new(11.5, -0.4, 5.0);
+        assert!(boat_settled(here, authored, 0.99, afloat).is_ok());
+        assert!(boat_settled(here, authored, 0.5, afloat).is_err());
+        assert!(boat_settled(here, authored, 0.99, None).is_err());
+        assert!(boat_settled(Vec3::new(11.5, -2.0, 5.0), authored, 0.99, afloat).is_err());
+        assert!(boat_settled(Vec3::new(20.0, -0.3, 5.0), authored, 0.99, afloat).is_err());
+    }
+
     #[test]
     fn autoplay_retries_a_failed_contract_only_with_a_retry_save_and_not_forever() {
         assert!(retry_or_continue(true, 0));
@@ -13829,6 +13844,43 @@ const SETTLE_AFTER: f32 = 5.0;
 /// well over its tilt.
 const SETTLE_MOST: (f32, f32, f32) = (0.35, 5.0, 0.05);
 
+/// What `--parked-settle-check` allows a boat, by its own rule: metres
+/// level from its authored place, metres from the height it floats at,
+/// and the least up (its up axis's height). **Invented**: a boat is
+/// placed floating at its float depth, level ([`game::place`]), and rides
+/// the water from there, so its authored height and tilt don't apply
+/// (q766 B: four boats 0.67-2.33 m off their authored places).
+const BOAT_SETTLE: (f32, f32, f32) = (3.0, 0.5, 0.9);
+
+/// A boat judged by [`BOAT_SETTLE`]: at `now`, authored at `authored`,
+/// `up` its up axis's height, `afloat` the height it floats at (`None`:
+/// no water here). In water, upright and near its authored place.
+fn boat_settled(
+    now: m2_math::glam::Vec3,
+    authored: m2_math::glam::Vec3,
+    up: f32,
+    afloat: Option<f32>,
+) -> Result<(), String> {
+    let (level, depth, least_up) = BOAT_SETTLE;
+    let Some(afloat) = afloat else {
+        return Err("no water here".to_owned());
+    };
+    let off = now.with_y(0.0).distance(authored.with_y(0.0));
+    let sunk = (now.y - afloat).abs();
+    if sunk > depth {
+        return Err(format!(
+            "{sunk:.2} m off the height it floats at ({afloat:.2}), not in the water"
+        ));
+    }
+    if up < least_up {
+        return Err(format!("not upright (up {up:.2})"));
+    }
+    if off > level {
+        return Err(format!("{off:.2} m level from its authored place"));
+    }
+    Ok(())
+}
+
 /// `--parked-settle-check` (it turns on `--drive`; give a `--spawn`): for
 /// [`SETTLE_WATCH`] s the game runs as played, the layers' parked vehicles
 /// coming in as she stands there, each placed as authored ([`game::place`]).
@@ -13885,13 +13937,15 @@ fn parked_settle_check(
                 continue;
             }
             done.push(entity);
-            let Some(id) = game
+            let Some(v) = game
                 .scene
                 .vehicles
                 .iter()
                 .find(|v| v.spot.is_some_and(|s| s.0 == entity) || v.guid == Some(entity))
-                .and_then(|v| v.id)
             else {
+                continue;
+            };
+            let Some(id) = v.id else {
                 continue;
             };
             let Some(m) = world.physics.vehicle_transform(id) else {
@@ -13902,6 +13956,24 @@ fn parked_settle_check(
             let turned = now_turn.angle_between(*turn).to_degrees();
             let up = m.transform_vector3(Vec3::Y).normalize_or_zero().y;
             let speed = world.physics.vehicle_speed(id);
+            // A boat floats where the water puts it (`game::place`: level,
+            // at its float depth), not at its authored height or tilt: it
+            // is judged by its own rule.
+            if v.spec.is_boat() {
+                let afloat = world
+                    .physics
+                    .water()
+                    .map(|w| w - m2_engine::physics::float_depth(&v.spec));
+                match boat_settled(now_at, *at, up, afloat) {
+                    Ok(()) => passed += 1,
+                    Err(why) => {
+                        let line = format!("{entity:#x} {label} (a boat): {why}");
+                        eprintln!("parked-settle-check: off: {line}");
+                        failed.push(line);
+                    }
+                }
+                continue;
+            }
             let ok = moved <= SETTLE_MOST.0
                 && turned <= SETTLE_MOST.1
                 && up > 0.5
