@@ -426,15 +426,15 @@ pub struct Screen {
 }
 
 /// What `SetFlashPauseMenu` keeps (360 `0x82322D50`): the Flash widget,
-/// its flag and name (31 characters at most), a number, and a share kept
-/// as a whole percent (0 to 100, rounded, from a number 0 to 1).
+/// and the progress the pause screen gives it as it opens (whether a
+/// mission is on, the last contract, the scripts' time elapsed and their
+/// percent completed: [`crate::save_record::PAUSE_STAMP`]), which the 360
+/// keeps where `Sys.RequestAutosave` keeps its own, for the next save's
+/// record.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FlashPauseMenu {
     pub widget: u32,
-    pub on: bool,
-    pub name: String,
-    pub value: f32,
-    pub percent: u8,
+    pub stamp: crate::save_record::AutosaveInfo,
 }
 
 impl Screen {
@@ -2448,8 +2448,9 @@ natives! {
         }
         Ok(MultiValue::new())
     },
-    // (flash widget, flag, name, number[, share]) (0x82322D50): the
-    // pause menu's movie and what it was set with.
+    // (flash widget, mission on, last contract, seconds played, share)
+    // (0x82322D50): the pause menu's movie and the progress to stamp the
+    // next save with.
     "SetFlashPauseMenu" => |s, _, a| {
         let id = a.id(0);
         let (true, Some(Value::Boolean(on)), Some(name), Some(value)) = (
@@ -2460,13 +2461,14 @@ natives! {
         ) else {
             return Ok(MultiValue::new());
         };
-        let share = a.f(4).unwrap_or(0.0).clamp(0.0, 1.0);
         s.pause_menu = Some(FlashPauseMenu {
             widget: id,
-            on: *on,
-            name: name.chars().take(31).collect(),
-            value,
-            percent: ((share * 100.0 + 0.5) as u8).min(100),
+            stamp: crate::save_record::AutosaveInfo::from_args(
+                Some(*on),
+                Some(name.as_str()),
+                Some(value),
+                a.f(4),
+            ),
         });
         Ok(MultiValue::new())
     },
@@ -3872,10 +3874,10 @@ mod tests {
             assert_eq!(s.pda_widget.map(|p| p.1), Some(flash));
             let p = s.pause_menu.clone().unwrap();
             assert_eq!(
-                (p.widget, p.on, p.name.as_str()),
+                (p.widget, p.stamp.mission_on, p.stamp.contract.as_str()),
                 (flash, true, "pause_menu")
             );
-            assert_eq!((p.value, p.percent), (2.0, 76));
+            assert_eq!((p.stamp.played, p.stamp.percent), (2.0, 76));
             s.set_movie_frame(film, Some(42));
         }
         let (frame, closed): (i64, bool) = host
