@@ -908,9 +908,21 @@ impl World {
             .zip(loose.starts(placed))
             .map(|(piece, at)| self.physics.add_debris(piece, at, velocity, spin))
             .collect::<Vec<_>>();
+        let template = self.index.objects[i].template;
+        self.scale_gravity(&pieces, template);
         self.physics.group_debris(&pieces, placed);
         self.knocked.insert(i, pieces);
         true
+    }
+
+    /// Gives placed object bodies `pieces` their template's gravity scale
+    /// ([`crate::physics::Physics::set_debris_gravity`]).
+    fn scale_gravity(&mut self, pieces: &[crate::physics::DebrisId], template: u32) {
+        if let Some(&g) = self.index.template_db.gravity_scales.get(&template) {
+            for &d in pieces {
+                self.physics.set_debris_gravity(d, g);
+            }
+        }
     }
 
     /// The `_PropPhysics` of the first placed object of model `model`
@@ -991,6 +1003,7 @@ impl World {
                 .zip(l.starts(at))
                 .map(|(piece, start)| self.physics.add_prop_body(piece, start, true))
                 .collect();
+            self.scale_gravity(&pieces, o.template);
             self.physics.group_debris(&pieces, at);
             self.knocked.insert(i, pieces);
             self.as_body.insert(i);

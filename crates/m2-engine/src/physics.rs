@@ -4122,6 +4122,35 @@ impl Physics {
         id
     }
 
+    /// Gives a prop's body (a loose piece, a prop body, cargo) its
+    /// template's `PhysicsPropertyGravityScaler` `scale`: pulled by
+    /// [`prop_gravity_scale`]`(scale)` times the world's gravity.
+    ///
+    /// From the 360 code: building a prop's bodies (0x821831B0), each body
+    /// that is neither fixed nor keyframed (motion byte +0xD8 not 6 or 7)
+    /// is given a gravity action (vtable 0x820C8284) holding the scale,
+    /// clamped to [-10, 10] (0x82DE8C30, 0x820BAEEC), whose step
+    /// (0x82180778) gives it `(scale - 1) x mass x dt` of the world's
+    /// gravity: in all, `scale` times the world's pull, which is what a
+    /// rapier body's gravity scale is.
+    pub fn set_debris_gravity(&mut self, id: DebrisId, scale: f32) {
+        let scale = prop_gravity_scale(scale);
+        if scale == 1.0 {
+            return;
+        }
+        if let Some(b) = self
+            .debris
+            .get(id.0)
+            .copied()
+            .flatten()
+            .and_then(|h| self.world.bodies.get_mut(h))
+            && !b.is_fixed()
+            && !b.is_kinematic()
+        {
+            b.set_gravity_scale(scale, true);
+        }
+    }
+
     /// As [`add_debris`](Self::add_debris), a piece a building broke
     /// into: [`RUBBLE`], which lands on the world and nothing else.
     pub fn add_rubble(
@@ -7735,6 +7764,17 @@ impl Physics {
     }
 }
 
+/// A template's `PhysicsPropertyGravityScaler` as the 360 applies it to a
+/// prop's bodies: clamped to [-10, 10] (0x821831B0 with 0x82DE8C30 and
+/// 0x820BAEEC); not a number reads 1.
+pub fn prop_gravity_scale(scale: f32) -> f32 {
+    if scale.is_finite() {
+        scale.clamp(-10.0, 10.0)
+    } else {
+        1.0
+    }
+}
+
 /// A push's change `change` to a velocity `before`, per axis as the
 /// 360's rigid push takes it (0x8215BF38): along an axis where the push
 /// goes the way the body already moves, only what it exceeds that speed
@@ -8705,6 +8745,33 @@ mod tests {
     }
 
     const DT: f32 = 1.0 / 60.0;
+
+    // A prop's body falls at its template's gravity scale times the
+    // world's 9.0 (OilCon020's gun box, 3.5: 31.5 m/s^2; its carbine,
+    // 1.5: 13.5), clamped to +-10 as the 360 clamps it; one with none
+    // falls at the world's.
+    #[test]
+    fn a_prop_body_falls_by_its_templates_gravity_scale() {
+        assert_eq!(prop_gravity_scale(3.5), 3.5);
+        assert_eq!(prop_gravity_scale(25.0), 10.0);
+        assert_eq!(prop_gravity_scale(-25.0), -10.0);
+        assert_eq!(prop_gravity_scale(f32::NAN), 1.0);
+        let mut p = Physics::new();
+        let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.25), 28.0);
+        let at = |x: f32| Mat4::from_translation(Vec3::new(x, 500.0, 0.0));
+        let plain = p.add_debris(&piece, at(0.0), Vec3::ZERO, Vec3::ZERO);
+        let carbine = p.add_debris(&piece, at(10.0), Vec3::ZERO, Vec3::ZERO);
+        let gunbox = p.add_cargo(&piece, at(20.0), Vec3::ZERO);
+        p.set_debris_gravity(carbine, 1.5);
+        p.set_debris_gravity(gunbox, 3.5);
+        for _ in 0..30 {
+            p.step(DT);
+        }
+        let fall = |id| -p.debris_velocity(id).unwrap().0.y / (30.0 * DT);
+        assert!((fall(plain) - WORLD_GRAVITY).abs() < 0.2, "{}", fall(plain));
+        assert!((fall(carbine) - 13.5).abs() < 0.3, "{}", fall(carbine));
+        assert!((fall(gunbox) - 31.5).abs() < 0.6, "{}", fall(gunbox));
+    }
 
     // The 360's rigid push tops speed up rather than adding to it (Xenia
     // phys5, a Phoenix's death): rising at 9.094 m/s, the frag's push
