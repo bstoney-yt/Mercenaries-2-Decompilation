@@ -500,6 +500,9 @@ impl Game {
             combat.hp = hp;
         }
         combat.hero_damage = scene.hero_damage();
+        if let Some(t) = scene.hero_toss_getup() {
+            combat.toss_getup = t;
+        }
         if let Some(rifle) = scene.hero_rifle() {
             combat.take_own_rifle(rifle);
         }
@@ -2212,6 +2215,25 @@ impl Game {
                     v.spec.label
                 );
             }
+            // A crash throws her off the seat she rides, no exit pressed
+            // (0x8218A138's rider loop: its velocity changed by more than
+            // her seat's `TossSpeedChange` in one update; Xenia: a Chopper
+            // stopping from 19.4 m/s, |dv| 18.34 then 21.08 m/s).
+            if let Some(player) = &mut self.scene.player
+                && let Some(i) = player.driving
+                && let Some(v) = self.scene.vehicles.get(i)
+            {
+                let seat = self.ride.filter(|r| r.0 == i).map(|r| r.1);
+                let jolt = v.id.map_or(0.0, |id| world.physics.vehicle_jolt(id));
+                if her_seat_of(v, seat).is_some_and(|s| s.tosses_at(jolt)) {
+                    eprintln!(
+                        "toss: the {} lurches {jolt:.1} m/s in an update: she is thrown off",
+                        v.spec.label
+                    );
+                    get_out(&world.physics, v, seat, player);
+                    self.ride = None;
+                }
+            }
             // Vehicles running into each other hurt each other and the
             // parts where they met.
             let crashes = self
@@ -2462,9 +2484,29 @@ impl Game {
         if let Some(world) = &mut self.scene.world
             && (!self.on_foot || self.scene.player.as_ref().is_none_or(|p| p.landed))
         {
-            self.scene
-                .people
-                .update(&mut world.physics, &world.index.spawns, focus, threat, dt);
+            // Their path searches meet the hinted objects' `AiHintNode`
+            // points, as the vehicles' do.
+            let (objects, props, path_hints) =
+                (&world.index.objects, &self.scene.props, &self.path_hints);
+            let hints = |key: StaticKey| {
+                path_hints.of(key, |k| match k {
+                    StaticKey::Object(i) => {
+                        objects.get(i).map(|o| (o.template, o.position, o.rotation))
+                    }
+                    StaticKey::Entity(e) => props
+                        .get(e)
+                        .map(|(p, _)| (p.template, p.position, p.rotation)),
+                    _ => None,
+                })
+            };
+            self.scene.people.update_with_hints(
+                &mut world.physics,
+                &world.index.spawns,
+                focus,
+                threat,
+                &hints,
+                dt,
+            );
             self.social.step(
                 &world.index,
                 &world.destroyed,
@@ -6405,6 +6447,16 @@ const WADE: f32 = 1.4;
 /// the hull by the door when the way there is blocked (Invented stand-in
 /// for 0x822A13D0's clear point) or the hardpoint lies within the hull (a
 /// boat's driver gets out at the seat itself).
+/// Her seat in `v` (its `SeatLink` name `her_seat`; `None`, the
+/// driver's), as [`exit_plan`] finds it.
+fn her_seat_of(v: &ParkedVehicle, her_seat: Option<u32>) -> Option<&m2_engine::seats::Seat> {
+    let seating = v.spec.seating.as_deref()?;
+    let index = her_seat
+        .and_then(|n| seating.seat(n))
+        .or_else(|| seating.driver())?;
+    seating.seats.get(index)
+}
+
 fn exit_plan(
     physics: &Physics,
     v: &ParkedVehicle,
@@ -6434,10 +6486,12 @@ fn exit_plan(
     let up_y = at.transform_vector3(Vec3::Y).normalize_or_zero().y;
     // A helicopter's landed share is not modelled: it counts as landed
     // (Invented; 0x822A2B60 ditches from one in the air).
+    let jolt = v.id.map_or(0.0, |id| physics.vehicle_jolt(id));
     let kind = seats::exit_kind(
         seat,
         exit.map(|e| &e.params),
         velocity.length(),
+        jolt,
         false,
         up_y,
         blocked,
@@ -6533,7 +6587,23 @@ pub(crate) fn get_out(
         use m2_engine::seats::ExitKind;
         let velocity = physics.vehicle_velocity(id);
         let (kind, place) = exit_plan(physics, v, seat, at, velocity);
-        if matches!(kind, ExitKind::Ditch | ExitKind::Toss) {
+        // Tossed, she is knocked down ([`crate::combat::Combat`] takes
+        // it up: 0x822A1B70 sets her time down from `TossGetupSeconds`).
+        player.tossed = kind == ExitKind::Toss;
+        if kind == ExitKind::Toss {
+            // 0x822A1B70's toss only places her: half a metre along the
+            // vehicle's up (FUN_82855F48, its up axis, times 0x82B7C128).
+            // The exit message carries the vehicle's velocity before the
+            // jolt (0x8218A138), and her ragdoll starts with the launch
+            // the controller makes of it (0x82428658).
+            let up = at.transform_vector3(Vec3::Y).normalize_or(Vec3::Y);
+            player.drop_at(place + up * 0.5);
+            player.character.velocity = Vec3::ZERO;
+            let carried = physics.vehicle_velocity_pre_jolt(id);
+            let launch = m2_engine::ragdoll_launch::exit_launch(carried);
+            player.launch = Some(launch);
+            player.last_toss = Some((carried, launch));
+        } else if kind == ExitKind::Ditch {
             // Ditching (0x822A1B70): half a metre over the exit's place,
             // pushed off, in the air: she lands as from a jump.
             let out = place - at.transform_point3(Vec3::ZERO);
@@ -7306,6 +7376,12 @@ mod picture_tests {
 /// own filters are not modelled); the threat's eye is taken 1.3 m over
 /// where she stands (inferred).
 fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
+    crate::npc::fight_time::time(crate::npc::fight_time::COVER, || {
+        serve_cover_untimed(world, people)
+    });
+}
+
+fn serve_cover_untimed(world: &m2_engine::World, people: &mut crate::npc::People) {
     use m2_engine::ai_cover::{self, Placed, Request};
     let asks: Vec<(usize, Vec3, Vec3)> = people
         .npcs
@@ -7330,6 +7406,8 @@ fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
             avoid,
         };
         let mut cands = Vec::new();
+        // Each candidate's cover object, for its claim.
+        let mut objects: Vec<u32> = Vec::new();
         for (o, _) in world.near(centre, ai_cover::SEARCH) {
             let p = &world.index.objects[o];
             let Some(hints) = world.index.template_db.cover_hints.get(&p.template) else {
@@ -7344,7 +7422,9 @@ fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
                 bounds: model.bounds,
             };
             for h in hints {
-                cands.extend(ai_cover::candidates(&req, &placed, h));
+                let c = ai_cover::candidates(&req, &placed, h);
+                objects.extend(std::iter::repeat_n(o as u32, c.len()));
+                cands.extend(c);
             }
         }
         let physics = &world.physics;
@@ -7359,9 +7439,27 @@ fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
                 .cast_ray(a, to, to.length())
                 .is_some_and(|(d, _)| d < to.length() - 0.05)
         };
-        let found = ai_cover::choose(&req, &cands, ground, blocked);
+        let picked = ai_cover::choose_index(&req, &cands, ground, blocked);
+        // As he starts for it, he claims it (0x822C7CF0 -> 0x822EDA60), and
+        // again each update for 2 s ([`crate::npc::People`]): refused, the
+        // spot goes into his list for 10 s and he has none.
+        let found = picked.and_then(|(at, k)| {
+            let object = objects[k];
+            if people.cover_claims.claim(i as u32, object, centre, at) {
+                Some((at, object))
+            } else {
+                eprintln!(
+                    "people: {:08x} cover at {at:.1} refused: claimed by another",
+                    people.npcs[i].spawn.unwrap_or(u32::MAX)
+                );
+                people.npcs[i].destination_refused(at);
+                None
+            }
+        });
         let n = &mut people.npcs[i];
         n.cover_ask = None;
+        n.cover_claim = found.map(|(_, object)| (object, 0.0));
+        let found = found.map(|(at, _)| at);
         n.cover_spot = found;
         if let Some(at) = found {
             eprintln!(

@@ -2448,6 +2448,7 @@ impl Scene {
         let y = world.index.rough_height(x, z) + 40.0;
         self.focus = (Vec3::new(x, y, z), Vec3::new(x, y - 20.0, z + 60.0));
         self.props.physics_props = world.index.template_db.prop_physics.clone();
+        self.props.gravity_scales = world.index.template_db.gravity_scales.clone();
         self.people.mixer_profiles = world.index.template_db.mixer_profiles.clone();
         self.world = Some(world);
 
@@ -2534,6 +2535,15 @@ impl Scene {
             explosion_large: scale("ExplosionLarge").unwrap_or(known.explosion_large),
             bullet_large: scale("BulletLarge").unwrap_or(known.bullet_large),
         }
+    }
+
+    /// The hero's `TossGetupSeconds`, from their template.
+    pub fn hero_toss_getup(&self) -> Option<f32> {
+        self.world
+            .as_ref()?
+            .index
+            .template_db
+            .toss_getup_seconds(self.hero.template())
     }
 
     /// The hero's `Health` when whole, from their template.
