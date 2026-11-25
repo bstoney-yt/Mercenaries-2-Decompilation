@@ -10243,9 +10243,11 @@ fn wreck_rider_check(game: &mut Game, tick: f32) {
 
 /// The 360's car wreck in Xenia (a Phoenix shot dead, GodMode off, the
 /// hero 5.9 m from its middle): the car rose 5.3 m at 1.1 s, landed
-/// 16.4-16.6 m off, its top speed 17-18 m/s in the first 0.5 s; she lost
-/// 74.6 and slid 1.7 m.
-const XENIA_WRECK: (f32, f32, f32, f32) = (5.3, 16.5, 17.5, 74.6);
+/// 16.4-16.6 m off (its last samples; landed 11.0-15.6, see
+/// [`XENIA_WRECK_LANDS`]); she lost 74.6 and slid 1.7 m. Its speed is
+/// phys8a's the step after the explosions ([`XENIA_NEXT_SPEED`]; the
+/// differenced 17-18 m/s is not a body speed).
+const XENIA_WRECK: (f32, f32, f32, f32) = (5.3, 16.5, XENIA_NEXT_SPEED, 74.6);
 
 /// The vehicle `--wreck-blast-check` wrecks unless `--vehicle` names
 /// another: Xenia's phys3-6 runs, whose bands it is judged by, wrecked a
@@ -10278,6 +10280,13 @@ fn wreck_blast_model(game: &Game, options: &Options) -> Option<u32> {
 /// start (phys8a: body at (2653.789, -13.786, -996.733) as it stood).
 /// Run with `--spawn 2654,-997` so the world round it is loaded.
 const WRECK_SPOT: (f32, f32) = (2653.8, -996.7);
+
+/// How Xenia's Phoenix stood there, its turn (x, y, z, w): facing -137.5
+/// degrees (from +z towards +x). Its wrecks always landed along that,
+/// bearing -126 to -153 degrees, whichever side she stood
+/// (car-blast-source.md, "Wreck landing spread": yaw quat (~0, -0.932,
+/// ~0, 0.362)).
+const WRECK_TURN: (f32, f32, f32, f32) = (0.0, -0.932, 0.0, 0.362);
 
 /// How far out `--wreck-blast-check` logs the ground and what stands
 /// round its spot, metres: Xenia's wrecks land 11-15.6 m out.
@@ -10313,19 +10322,14 @@ fn wreck_at_spot(game: &mut Game, id: m2_engine::VehicleId, label: &str, tick: f
     let Some(world) = game.scene.world.as_mut() else {
         return false;
     };
-    let Some(m) = world.physics.vehicle_transform(id) else {
-        return false;
-    };
-    let ahead = m
-        .transform_vector3(Vec3::Z)
-        .with_y(0.0)
-        .normalize_or(Vec3::Z);
     let to = Vec3::new(x, base + ride + 0.05, z);
+    let (qx, qy, qz, qw) = WRECK_TURN;
     world
         .physics
-        .place_vehicle(id, to, Quat::from_rotation_y(ahead.x.atan2(ahead.z)));
+        .place_vehicle(id, to, Quat::from_xyzw(qx, qy, qz, qw).normalize());
     eprintln!(
-        "wreck-blast-check: the {label} put upright at Xenia's wreck spot {to:.2} (ground {base:.2})"
+        "wreck-blast-check: the {label} put upright at Xenia's wreck spot {to:.2} (ground {base:.2}), facing {:.1} deg as Xenia's",
+        2.0 * qy.atan2(qw).to_degrees()
     );
     let waited = Instant::now();
     let mut k = 0u32;
@@ -10407,6 +10411,22 @@ const WRECK_STEPS_LOGGED: usize = 8;
 const XENIA_WRECK_G: f32 = 9.0;
 /// How near that a fitted fall must be.
 const WRECK_G_SLACK: f32 = 0.5;
+/// How near where it stood a wreck must have come back down to count as
+/// landed, metres: Xenia's band's own measure (car-blast-source.md: the
+/// first sample after the peak within 0.6 m of its rest height).
+const WRECK_LAND_HEIGHT: f32 = 0.6;
+/// Its speed on the step after its explosions, all of it (phys8a, c70:
+/// launch (-2.623, 9.707, 1.583) and the explosions' (-2.416, 0, -5.610),
+/// |(-5.04, 9.71, -4.03)| = 11.66; gravity's 0.15 over the step aside),
+/// and how near it must come: 1.5 m/s, the level part of a launch being
+/// random per wreck (its direction from rx and rz, `death_launch`), so
+/// the port's draw and phys8a's single one add to the explosions'
+/// differently. One sample: phys8b/c can narrow it. Replaces the 17-18
+/// m/s "top speed in the first 0.5 s" (blast-launch.md), differenced from
+/// 15-20 Hz positions on uneven wall time (gren2's step 5: |15.2| on a
+/// 23.7 ms gap), which no body speed in phys8a reaches.
+const XENIA_NEXT_SPEED: f32 = 11.66;
+const NEXT_SPEED_SLACK: f32 = 1.5;
 /// Its highest rise and where it lands, metres (phys3-6).
 const XENIA_WRECK_PEAK: (f32, f32) = (4.9, 5.3);
 const XENIA_WRECK_LANDS: (f32, f32) = (11.0, 15.6);
@@ -10613,6 +10633,11 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
     // touches anything after it has left the ground, apart from where it
     // comes to rest.
     let (mut logged, mut airborne, mut first_touch) = (0, false, None);
+    // Landed as Xenia's band measures it (car-blast-source.md, "Wreck
+    // landing spread"): the first sample after its peak within
+    // [`WRECK_LAND_HEIGHT`] of where it stood, its distance level from
+    // there.
+    let mut came_down: Option<(f32, f32)> = None;
     for k in 0..(6.0 / tick) as u32 {
         game.step(Intent::default(), tick);
         least = least.min(game.combat.hp);
@@ -10648,6 +10673,9 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
         if rise > top {
             (top, top_at) = (rise, t);
         }
+        if came_down.is_none() && top > 0.5 && t > top_at && rise <= WRECK_LAND_HEIGHT {
+            came_down = Some((at.with_y(0.0).distance(start.with_y(0.0)), t));
+        }
         if t <= 0.5 {
             fastest = fastest.max(v.length());
         }
@@ -10663,13 +10691,15 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
     }
     let (rise, off, speed, lost) = XENIA_WRECK;
     eprintln!(
-        "wreck-blast-check: first touch {} m off, at rest {} m off (360 lands {:?})",
+        "wreck-blast-check: came down (first step after its peak within {WRECK_LAND_HEIGHT} m of where it stood, as Xenia's band) {} m off at {} s; first touch {} m off, at rest {} m off (360 lands {:?})",
+        came_down.map_or("never".to_owned(), |(d, _)| format!("{d:.1}")),
+        came_down.map_or("never".to_owned(), |(_, t)| format!("{t:.2}")),
         first_touch.map_or("never".to_owned(), |d| format!("{d:.1}")),
         landed.map_or("never".to_owned(), |d| format!("{d:.1}")),
         XENIA_WRECK_LANDS
     );
     eprintln!(
-        "wreck-blast-check: rose {top:.1} m at {top_at:.2} s (360 {rise}), landed {} m off (360 {off}), top speed {fastest:.1} m/s (360 {speed}); she lost {:.1} (360 {lost}) and moved {:.1} m",
+        "wreck-blast-check: rose {top:.1} m at {top_at:.2} s (360 {rise}), landed {} m off (360 {off}), top speed in 0.5 s {fastest:.1} m/s (360 the step after its explosions {speed}); she lost {:.1} (360 {lost}) and moved {:.1} m",
         landed.map_or("never".to_owned(), |d| format!("{d:.1}")),
         hp - least,
         her(game)
@@ -10684,7 +10714,12 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
         "wreck-blast-check: judged per frame of {tick:.4} s; launched {:.3}",
         game.combat.launched.unwrap_or(Vec3::NAN)
     );
-    let flew = wreck_flight_verdict(&flight, top, landed, game.combat.launched);
+    let flew = wreck_flight_verdict(
+        &flight,
+        top,
+        came_down.map(|(d, _)| d),
+        game.combat.launched,
+    );
     for line in &flew.lines {
         eprintln!("wreck-blast-check: {line}");
     }
@@ -10742,7 +10777,9 @@ struct FlightVerdict {
 /// speed before is under 0.1 m/s while it stands); the next step's
 /// change level only (its up change gravity's alone, less
 /// [`WRECK_NEXT_CONTACT`] to more by [`WRECK_NEXT_UP_SLACK`], its level
-/// change at least [`WRECK_NEXT_LEAST_LEVEL`]); after that a fall fitted within
+/// change at least [`WRECK_NEXT_LEAST_LEVEL`], its whole speed within
+/// [`NEXT_SPEED_SLACK`] of [`XENIA_NEXT_SPEED`]); `landed` as Xenia's
+/// band measures it ([`WRECK_LAND_HEIGHT`]); after that a fall fitted within
 /// [`WRECK_G_SLACK`] of [`XENIA_WRECK_G`] while it rises; its rise within
 /// [`XENIA_WRECK_PEAK`] and its landing within [`XENIA_WRECK_LANDS`].
 fn wreck_flight_verdict(
@@ -10793,8 +10830,15 @@ fn wreck_flight_verdict(
             let gravity = -XENIA_WRECK_G * dt;
             let up = change.y;
             lines.push(format!(
-                "next step's explosions: change {change:.3}, level {level:.2}, up {up:.3} (gravity alone {gravity:.3})"
+                "next step's explosions: change {change:.3}, level {level:.2}, up {up:.3} (gravity alone {gravity:.3}); |v| {:.2} (360 {XENIA_NEXT_SPEED} +/- {NEXT_SPEED_SLACK})",
+                next.length()
             ));
+            if (next.length() - XENIA_NEXT_SPEED).abs() > NEXT_SPEED_SLACK {
+                fails.push(format!(
+                    "|v| {:.2} the step after its explosions, not {XENIA_NEXT_SPEED} +/- {NEXT_SPEED_SLACK}",
+                    next.length()
+                ));
+            }
             if up > gravity + WRECK_NEXT_UP_SLACK
                 || up < gravity - WRECK_NEXT_CONTACT
                 || level < WRECK_NEXT_LEAST_LEVEL
@@ -14016,6 +14060,19 @@ mod tests {
             lift.fails.iter().any(|f| f.contains("not level only")),
             "{:?}",
             lift.fails
+        );
+        // A speed the step after its explosions far from phys8a's 11.66
+        // (the differenced 17.5 the old band took).
+        let mut fast = flight.clone();
+        fast[1].1 += Vec3::new(-3.0, 0.0, -3.5);
+        let quick = wreck_flight_verdict(&fast, 5.1, Some(13.0), Some(launched));
+        assert!(
+            quick
+                .fails
+                .iter()
+                .any(|f| f.contains("the step after its explosions")),
+            "{:?}",
+            quick.fails
         );
         // The explosions in the death step with the launch (q728p).
         let mut early = flight.clone();
