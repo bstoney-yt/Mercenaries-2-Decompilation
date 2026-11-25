@@ -9478,10 +9478,15 @@ fn cargo_check(game: &mut Game, tick: f32) {
                     })
                     .collect();
                 eprintln!(
-                    "cargo-check: {phase} {:.2} s, {:.1} m/s, yaw {:.0}: {}",
+                    "cargo-check: {phase} {:.2} s, {:.1} m/s, yaw {:.0}, truck at {:.2}: {}",
                     t as f32 * tick,
                     speed(game),
                     yaw(game),
+                    game.scene
+                        .world
+                        .as_ref()
+                        .and_then(|w| w.physics.vehicle_transform(id))
+                        .map_or(Vec3::NAN, |m| m.transform_point3(Vec3::ZERO)),
                     shifts.join("; ")
                 );
             }
