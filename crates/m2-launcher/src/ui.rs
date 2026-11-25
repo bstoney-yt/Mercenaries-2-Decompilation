@@ -544,11 +544,14 @@ impl App {
                 // Behind the bill, in its oval (invented placement: the
                 // bill's middle, 80% of its height).
                 let bill = cover_rect(tex, hero);
-                let side = bill.height() * 0.8;
+                // The oval is left of the bill's middle (measured on the
+                // VM's screenshot: 6% of its width).
+                let side = bill.height() * 0.9;
+                let centre = bill.center() - vec2(bill.width() * 0.06, 0.0);
                 p.rect_filled(hero, 0.0, Color32::from_rgb(0x12, 0x10, 0x0c));
                 p.image(
                     head.id(),
-                    Rect::from_center_size(bill.center(), vec2(side, side)),
+                    Rect::from_center_size(centre, vec2(side, side)),
                     Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                     Color32::WHITE,
                 );
@@ -655,8 +658,9 @@ impl App {
                 why,
             );
         }
-        // The game's name over it.
-        let logo = pos2(hero.center().x, hero.top() + hero.height() * 0.22);
+        // The game's name, at the banner's foot (clear of the pictures'
+        // middles).
+        let logo = pos2(hero.left() + PAD, hero.bottom() - 74.0);
         for (offset, colour) in [
             (vec2(3.0, 3.0), Color32::from_black_alpha(200)),
             (vec2(0.0, 0.0), TEXT),
@@ -665,17 +669,17 @@ impl App {
                 &p,
                 Role::Heading,
                 logo + offset,
-                Align2::CENTER_BOTTOM,
-                76.0,
+                Align2::LEFT_BOTTOM,
+                60.0,
                 colour,
                 "MERCENARIES 2",
             );
             self.fonts.text(
                 &p,
                 Role::Heading,
-                logo + offset + vec2(0.0, 6.0),
-                Align2::CENTER_TOP,
-                30.0,
+                logo + offset + vec2(2.0, 2.0),
+                Align2::LEFT_TOP,
+                24.0,
                 if offset.x > 0.0 {
                     colour
                 } else {
