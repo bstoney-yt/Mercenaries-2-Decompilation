@@ -273,6 +273,9 @@ pub struct Entity {
     pub name: String,
     pub at: [f32; 3],
     pub yaw: f32,
+    /// Its whole authored turn (x, y, z, w), its `Transform`'s: a parked
+    /// vehicle stands as authored, tilt and all.
+    pub rotation: [f32; 4],
     /// The outline of a region entity (`LineRegion`).
     pub region: Option<Region>,
     /// Its labels' name hashes: its template's and its own (`Label`).
@@ -555,6 +558,7 @@ impl GameData {
                             name: entity.to_owned(),
                             at: p.map_or([0.0; 3], |p| p.position),
                             yaw: p.map_or(0.0, |p| yaw(p.rotation)),
+                            rotation: p.map_or([0.0, 0.0, 0.0, 1.0], |p| p.rotation),
                             region: None,
                             labels: own.remove(&guid).unwrap_or_default(),
                             script: scripts.get(&guid).copied(),
@@ -1771,6 +1775,7 @@ impl Mission {
         for g in [Some(PLAYER), vehicle].into_iter().flatten() {
             if let Some(o) = w.objects.get_mut(&g) {
                 o.position = at;
+                o.rotation = None;
             }
         }
     }
@@ -1863,6 +1868,7 @@ impl Mission {
         if let Some(o) = w.objects.get_mut(&guid) {
             o.position = at;
             o.yaw = yaw;
+            o.rotation = None;
         } else if let Some(e) = w.entities.get_mut(&guid) {
             // A layer's entity no script has made an object of yet (a
             // truck's rum jugs riding on it): where the scripts' area
@@ -2088,6 +2094,7 @@ impl Mission {
             let mut w = self.world.borrow_mut();
             if let Some(o) = w.objects.get_mut(&guid) {
                 o.position = at;
+                o.rotation = None;
             }
             w.strikes.designators.get(&guid).copied()
         };
@@ -2156,6 +2163,7 @@ impl Mission {
             let mut w = self.world.borrow_mut();
             if let Some(o) = w.objects.get_mut(&guid) {
                 o.position = at;
+                o.rotation = None;
             }
             w.strikes.take(guid, arrival)
         };
@@ -3104,6 +3112,7 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
         if load {
             let mut o = Object::new(&e.name, e.at);
             o.yaw = e.yaw;
+            o.rotation = Some(e.rotation);
             o.label_hashes.clone_from(&e.labels);
             o.faction = e.faction;
             w.insert(e.guid, o);
@@ -4749,6 +4758,7 @@ mod tests {
             name: "PMC001_EntourageScorpion".into(),
             at: [5.0, 0.0, 5.0],
             yaw: 0.0,
+            rotation: [0.0, 0.0, 0.0, 1.0],
             region: None,
             labels: Vec::new(),
             script: None,

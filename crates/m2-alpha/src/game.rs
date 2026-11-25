@@ -35,6 +35,8 @@ struct Spot<'a> {
     name: &'a str,
     at: Vec3,
     yaw: f32,
+    /// Its whole authored turn.
+    rotation: Quat,
 }
 
 /// How quickly her lens eases to its gun's share aiming and back, a second
@@ -147,6 +149,17 @@ pub struct Game {
     pub winches: crate::winches::Winches,
     /// Layer entities of the island's vehicles asked for so far.
     fetched: HashSet<u32>,
+    /// The layers' parked vehicles' whole authored turns, by entity:
+    /// placed as authored ([`place`]).
+    authored: HashMap<u32, Quat>,
+    /// The island's vehicles placed and still watched: entity, body,
+    /// where it was put and how, and how many steps logged so far
+    /// ([`Game::log_first_steps`]).
+    just_placed: Vec<Watched>,
+    /// The scripts' (mission) vehicles placed as authored (their layer
+    /// entity's `Transform`), by guid: where and turned how
+    /// (`--parked-settle-check`).
+    pub(crate) authored_guids: HashMap<u32, (Vec3, Quat)>,
     /// The island's traffic spawners and what they have out.
     pub traffic: crate::traffic::Traffic,
     /// A pursuit's gunships ([`crate::gunships`]).
@@ -573,6 +586,9 @@ impl Game {
             beds_told: HashSet::new(),
             winches: Default::default(),
             fetched: HashSet::new(),
+            authored: HashMap::new(),
+            just_placed: Vec::new(),
+            authored_guids: HashMap::new(),
             traffic: crate::traffic::Traffic::default(),
             gunships: crate::gunships::Gunships::default(),
             pursuers: crate::pursuers::Pursuers::default(),
@@ -737,6 +753,12 @@ impl Game {
         })
     }
 
+    /// Whether the layers have asked for entity `entity`'s vehicle
+    /// (placed, or still loading).
+    pub(crate) fn layers_asked(&self, entity: u32) -> bool {
+        self.fetched.contains(&entity)
+    }
+
     /// Island vehicles asked for that have not been placed yet.
     pub fn island_vehicles_loading(&self) -> bool {
         if self.startup.as_ref().is_some_and(Startup::loading) {
@@ -798,12 +820,34 @@ impl Game {
                 continue;
             }
             if let Some((entity, at, yaw)) = v.spot
-                && place(&mut world.physics, v, at, yaw)
+                && place(
+                    &mut world.physics,
+                    v,
+                    at,
+                    yaw,
+                    self.authored.get(&entity).copied(),
+                )
             {
                 eprintln!(
                     "island vehicle {entity:#x}: {} parked at ({:.0}, {:.0}, {:.0})",
                     v.spec.label, at.x, at.y, at.z
                 );
+                if let Some(id) = v.id
+                    && let Some(m) = world.physics.vehicle_transform(id)
+                {
+                    let (_, turn, put) = m.to_scale_rotation_translation();
+                    self.just_placed.push(Watched {
+                        entity,
+                        id,
+                        put,
+                        turn,
+                        n: 0,
+                        crossed: 0,
+                        last: put,
+                        still: 0.0,
+                        moved: false,
+                    });
+                }
             }
         }
         self.vehicle_wait -= dt;
@@ -840,6 +884,7 @@ impl Game {
                     name: &t.name,
                     at: t.position,
                     yaw: f.x.atan2(f.z),
+                    rotation: t.rotation,
                 }
             })
             .chain(state_layers.iter().map(|e| Spot {
@@ -847,8 +892,11 @@ impl Game {
                 name: &e.name,
                 at: e.position,
                 yaw: e.yaw,
+                rotation: e.rotation,
             }))
             .filter(|t| !self.fetched.contains(&t.entity) && t.at.y > HIDDEN_BELOW)
+            // One the scripts have made is theirs, not built twice.
+            .filter(|t| crate::scene::layers_may_build(&scene.script_owned, t.entity))
             .filter_map(|t| {
                 let d = t.at.distance(near);
                 (d <= VEHICLE_REACH).then_some((d, t))
@@ -883,6 +931,7 @@ impl Game {
                 scene.ruins.insert(t.entity);
             }
             let crew = world.index.template_db.crew(t.name);
+            self.authored.insert(t.entity, t.rotation);
             loads.push((t.entity, t.at, t.yaw, crew, models));
         }
         for (entity, at, yaw, crew, models) in loads {
@@ -1875,6 +1924,7 @@ impl Game {
             }
         }
         split("game: player and physics");
+        self.log_first_steps(dt);
         // The vehicles' load beds, looked up once a model.
         if let Some(source) = self.scene.source.as_mut() {
             for v in &self.scene.vehicles {
@@ -4388,8 +4438,13 @@ const PARK_LOOK: f32 = 60.0;
 const PARK_SHORE: f32 = 0.5;
 const PARK_SLACK: f32 = 2.0;
 /// Vehicles are let go this far above where they rest, to settle onto
-/// their wheels, metres.
+/// their wheels, metres (those not placed as authored: invented).
 const DROP: f32 = 0.3;
+/// A vehicle placed as authored waits for something under its origin
+/// within this many metres (its deck, bridge or ground), metres.
+/// Invented: the survey's vehicles stand within 0.2 m of what is under
+/// them, bar those on what loads later.
+pub const AUTHORED_FLOOR: f32 = 1.5;
 /// Room left between parked vehicles, metres.
 const PARK_GAP: f32 = 1.5;
 
@@ -5683,10 +5738,227 @@ fn spray(world: &World, vehicles: &[ParkedVehicle], combat: &mut Combat) {
     }
 }
 
-/// Puts a vehicle on the ground at `at` facing `yaw`, tilted to the
-/// ground under its wheels; false while the ground there hasn't loaded.
-/// A boat on the sea floats on it.
-pub(crate) fn place(physics: &mut Physics, v: &mut ParkedVehicle, at: Vec3, yaw: f32) -> bool {
+impl Game {
+    /// Logs each island vehicle placed before this step, after its very
+    /// first physics step: how far it moved and turned, its speed and spin,
+    /// its wheels down and each spring's squeeze from its rest length, and
+    /// what its body touches. A spring launch (squeezed springs, a speed up)
+    /// tells apart from a shove (a touch, a speed level).
+    ///
+    /// The ones in [`FIRST_STEPS_WATCHED`] are then watched until they
+    /// rest (still [`WATCH_REST`] s after moving) or [`WATCH_LONGEST`] s
+    /// pass: an event line the first step each passes each of
+    /// [`WATCH_SPEEDS`] (what touches it, its driver and crew, each wheel's
+    /// drive and brake, where it is, the step and time, how far it jumped
+    /// that step, and every vehicle in the scene that is this entity, the
+    /// layers' or the scripts'), a line for any jump over 1 m in a step,
+    /// and a short line each second (where, speed, up). Log only.
+    fn log_first_steps(&mut self, dt: f32) {
+        if self.just_placed.is_empty() {
+            return;
+        }
+        let Some(world) = self.scene.world.as_ref() else {
+            return;
+        };
+        let physics = &world.physics;
+        let mut keep = Vec::new();
+        for mut w in std::mem::take(&mut self.just_placed) {
+            let id = w.id;
+            let Some(m) = physics.vehicle_transform(id) else {
+                eprintln!(
+                    "watch: island vehicle {:#x}: its body is gone at step {}",
+                    w.entity,
+                    w.n + 1
+                );
+                continue;
+            };
+            w.n += 1;
+            let n = w.n;
+            let t = n as f32 * dt;
+            let (_, now_turn, now) = m.to_scale_rotation_translation();
+            let v = physics.vehicle_velocity(id);
+            let vehicle = self.scene.vehicles.iter().find(|c| c.id == Some(id));
+            let label = vehicle.map_or("?", |c| c.spec.label.as_str());
+            let touching = || -> String {
+                physics
+                    .vehicle_touching(id)
+                    .iter()
+                    .map(|(k, at, _)| format!("{k:?} at {at:.2}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            if n == 1 {
+                let (down, wheels) = physics.vehicle_contacts(id);
+                let squeeze: Vec<String> = physics
+                    .vehicle_suspension(id)
+                    .iter()
+                    .map(|s| format!("{s:.3}"))
+                    .collect();
+                eprintln!(
+                    "first step: island vehicle {:#x} {label}: moved {:.3} (dy {:+.3}), turned {:.2} deg, v {v:.3} (up {:+.3}), spin {:.3}, wheels down {down} of {wheels}, springs squeezed [{}] m, touching [{}]",
+                    w.entity,
+                    now.distance(w.put),
+                    now.y - w.put.y,
+                    w.turn.angle_between(now_turn).to_degrees(),
+                    v.y,
+                    physics.vehicle_spin(id),
+                    squeeze.join(", "),
+                    touching()
+                );
+            }
+            if !FIRST_STEPS_WATCHED.contains(&w.entity) {
+                continue;
+            }
+            let speed = v.length();
+            let jump = now.distance(w.last);
+            for (k, &limit) in WATCH_SPEEDS.iter().enumerate() {
+                if speed <= limit || w.crossed & (1 << k) != 0 {
+                    continue;
+                }
+                w.crossed |= 1 << k;
+                let forces: Vec<String> = physics
+                    .vehicle_wheel_forces(id)
+                    .iter()
+                    .map(|(f, b)| format!("{f:.0}/{b:.0}"))
+                    .collect();
+                let index = self.scene.vehicles.iter().position(|c| c.id == Some(id));
+                let her = index.is_some_and(|i| {
+                    self.scene
+                        .player
+                        .as_ref()
+                        .is_some_and(|p| p.driving == Some(i))
+                });
+                let crew = vehicle.map_or(0, |c| c.crew.len());
+                let copies: Vec<String> = self
+                    .scene
+                    .vehicles
+                    .iter()
+                    .filter(|c| {
+                        c.spot.is_some_and(|(e, _, _)| e == w.entity) || c.guid == Some(w.entity)
+                    })
+                    .map(|c| {
+                        let at =
+                            c.id.and_then(|i| physics.vehicle_transform(i))
+                                .map_or("unplaced".to_owned(), |m| {
+                                    format!("{:.2}", m.w_axis.truncate())
+                                });
+                        let whose = if c.guid.is_some() {
+                            "the scripts'"
+                        } else {
+                            "the layers'"
+                        };
+                        format!("{whose} {:?} at {at}", c.id)
+                    })
+                    .collect();
+                eprintln!(
+                    "watch: island vehicle {:#x} {label} passed {limit} m/s at step {n} ({t:.2} s): at {now:.2}, v {v:.2}, moved {:.2} from where put, jumped {jump:.2} this step, up {:.3}; touching [{}]; driver her {her}, crew {crew}; wheel drive/brake [{}]; copies of this entity in the scene [{}]",
+                    w.entity,
+                    now.distance(w.put),
+                    m.y_axis.y,
+                    touching(),
+                    forces.join(", "),
+                    copies.join("; ")
+                );
+            }
+            if jump > 1.0 {
+                eprintln!(
+                    "watch: island vehicle {:#x} {label} jumped {jump:.2} m at step {n} ({t:.2} s), to {now:.2}",
+                    w.entity
+                );
+            }
+            if n % ((1.0 / dt).round().max(1.0) as u32) == 0 {
+                eprintln!(
+                    "watch: island vehicle {:#x} {label} at {t:.1} s: at {now:.2}, v {v:.2}, up {:.3}, {:.2} m from where put",
+                    w.entity,
+                    m.y_axis.y,
+                    now.distance(w.put)
+                );
+            }
+            w.last = now;
+            w.moved |= speed > WATCH_SPEEDS[0];
+            w.still = if speed < 0.05 { w.still + dt } else { 0.0 };
+            let rested = w.moved && w.still >= WATCH_REST;
+            if rested || t >= WATCH_LONGEST {
+                eprintln!(
+                    "watch: island vehicle {:#x} {label} {} at {t:.1} s: at {now:.2}, {:.2} m from where put, turned {:.1} deg",
+                    w.entity,
+                    if rested {
+                        "rests"
+                    } else {
+                        "watched long enough"
+                    },
+                    now.distance(w.put),
+                    w.turn.angle_between(now_turn).to_degrees()
+                );
+                continue;
+            }
+            keep.push(w);
+        }
+        self.just_placed = keep;
+    }
+
+    /// The authored turn of the layers' parked vehicle `entity`, if one
+    /// was placed as authored ([`place`]).
+    pub fn authored_turn(&self, entity: u32) -> Option<Quat> {
+        self.authored.get(&entity).copied()
+    }
+}
+
+/// The island vehicles [`Game::log_first_steps`] watches after they are
+/// placed (#766's B, C and E spots: the Phoenix, the Van (Green) and the
+/// M151 that left their authored places after their first second).
+const FIRST_STEPS_WATCHED: [u32; 3] = [0x10_d5d8, 0x12_b8fc, 0x13_3ba2];
+/// The speeds whose first passing is logged, m/s.
+const WATCH_SPEEDS: [f32; 2] = [0.5, 2.0];
+/// Still this long, s, after moving: rested, the watch ends.
+const WATCH_REST: f32 = 1.0;
+/// The longest a watch lasts, s.
+const WATCH_LONGEST: f32 = 60.0;
+
+/// One island vehicle [`Game::log_first_steps`] watches.
+#[derive(Debug)]
+struct Watched {
+    entity: u32,
+    id: m2_engine::VehicleId,
+    /// Where and how it was put.
+    put: Vec3,
+    turn: Quat,
+    /// Steps logged so far.
+    n: u32,
+    /// Which of [`WATCH_SPEEDS`] it has passed, a bit each.
+    crossed: u8,
+    /// Where it was last step.
+    last: Vec3,
+    /// How long it has been still, s, and whether it has moved.
+    still: f32,
+    moved: bool,
+}
+
+/// Puts a vehicle where it stands: false while what it stands on hasn't
+/// loaded. A boat on the sea floats on it.
+///
+/// One a layer placed (`authored`: its `Transform`'s whole turn) is put
+/// **as authored**, at `at` turned by `authored`, with no fit to the ground
+/// and no drop. From the 360 code: a layer's vehicle is made by the layer
+/// loader (0x823E6AB8 -> 0x82408C30 -> its physics creator, 0x823FDB60
+/// for a car -> 0x821831B0), its body at the object's own matrix
+/// (0x8218CAA8: 0x82185FE0 -> vfunc +0x128) with nothing reading the
+/// ground. The layers author them at rest (survey of 1397 state-layer
+/// and 35 static cars and tanks: 871 within 5 cm of the wheels' rest on
+/// the terrain). It waits until there is something under it within
+/// [`AUTHORED_FLOOR`] (its deck or bridge loaded, not only the terrain far
+/// below): invented, the 360 makes it with its layer.
+///
+/// Any other (a script's, `None`) is put on the ground at `at` facing
+/// `yaw`, tilted to the ground under its wheels, and let go [`DROP`] over
+/// it: **invented** (the 360's spawn, 0x82409B38, is not yet traced).
+pub(crate) fn place(
+    physics: &mut Physics,
+    v: &mut ParkedVehicle,
+    at: Vec3,
+    yaw: f32,
+    authored: Option<Quat>,
+) -> bool {
     // From a little above where the layers put it (so one under a bridge
     // or a gantry stays under it), else from well above.
     let ground = |p: Vec3| {
@@ -5706,6 +5978,17 @@ pub(crate) fn place(physics: &mut Physics, v: &mut ParkedVehicle, at: Vec3, yaw:
     if let Some(water) = float {
         let at = Vec3::new(at.x, water - float_depth(&v.spec), at.z);
         v.id = Some(physics.add_vehicle_turned(&v.spec, at, Quat::from_rotation_y(yaw)));
+        return true;
+    }
+    // As authored: where its layer put it, turned as it put it.
+    if let Some(turn) = authored.filter(|q| q.is_finite() && !v.spec.is_boat()) {
+        let floor = physics
+            .cast_ray(at + Vec3::Y * 2.0, Vec3::NEG_Y, 2.0 + AUTHORED_FLOOR)
+            .is_some();
+        if !floor {
+            return false;
+        }
+        v.id = Some(physics.add_vehicle_turned(&v.spec, at, turn.normalize()));
         return true;
     }
     // (Never where it came out NaN: round 88 lost the start boat, and her
@@ -6785,6 +7068,79 @@ mod tests {
         assert!((over - Vec3::new(0.0, h, h)).length() < 1e-4, "{over}");
     }
     use std::collections::HashMap;
+
+    // A layer's parked vehicle is put as authored: where and as turned as
+    // its `Transform` says (here a little tilted, 0.05 m over the ground),
+    // with no fit to the ground and no drop; a script's still rests on the
+    // ground under it and is let go DROP over it.
+    #[test]
+    fn a_layer_vehicle_is_placed_as_authored_a_scripts_on_the_ground() {
+        use m2_math::glam::{Quat, Vec3};
+        let mut physics = m2_engine::Physics::new();
+        let ground = m2_engine::CollisionShape::cuboid(Vec3::new(50.0, 0.5, 50.0));
+        physics.add_static(
+            m2_engine::StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -0.5, 0.0),
+            Quat::IDENTITY,
+        );
+        physics.step(1.0 / 60.0);
+        let parked = || crate::scene::ParkedVehicle {
+            spec: crate::npc::tests::tank(m2_engine::tuning::VehicleTuning::default()),
+            model: crate::npc::tests::empty_model(),
+            id: None,
+            wrecked: false,
+            guid: None,
+            spot: None,
+            crew: Vec::new(),
+            turret: 0.0,
+            hijack_nodes: Vec::new(),
+            door_turns: Vec::new(),
+            gun: 0.0,
+            aims: Vec::new(),
+            rolled: 0.0,
+            fired: 0,
+            mg_fired: 0,
+            damage: 0.0,
+            hit: 0.0,
+            parts: None,
+            loose: Vec::new(),
+            debris_thrown: false,
+        };
+        let turn = Quat::from_rotation_y(0.7) * Quat::from_rotation_x(0.03);
+        let at = Vec3::new(3.0, 0.05, -2.0);
+        let mut v = parked();
+        assert!(super::place(&mut physics, &mut v, at, 0.7, Some(turn)));
+        let m = physics.vehicle_transform(v.id.unwrap()).unwrap();
+        let (_, r, p) = m.to_scale_rotation_translation();
+        assert!(p.distance(at) < 1e-3, "{p}");
+        assert!(r.angle_between(turn) < 1e-3);
+        // Nothing under it within reach: it waits.
+        let mut high = parked();
+        assert!(!super::place(
+            &mut physics,
+            &mut high,
+            at + Vec3::Y * 10.0,
+            0.0,
+            Some(turn)
+        ));
+        assert!(high.id.is_none());
+        // A script's: on the ground, let go DROP over its rest.
+        let mut s = parked();
+        assert!(super::place(
+            &mut physics,
+            &mut s,
+            Vec3::new(-10.0, 5.0, 0.0),
+            0.0,
+            None
+        ));
+        let y = physics.vehicle_transform(s.id.unwrap()).unwrap().w_axis.y;
+        let rest = s.spec.ride_height();
+        assert!(
+            (y - (rest + super::DROP)).abs() < 0.05,
+            "{y} against {rest}"
+        );
+    }
 
     // A rider sat inside a cab is blocked as the 360's capsule cast finds
     // her (0x8229AC90 meets the cab) and goes out at her door, outside the
