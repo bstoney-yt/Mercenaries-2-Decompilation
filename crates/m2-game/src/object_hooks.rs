@@ -195,6 +195,7 @@ mod tests {
             name: "mine".into(),
             at: [0.0; 3],
             yaw: 0.0,
+            rotation: [0.0, 0.0, 0.0, 1.0],
             region: None,
             labels: Vec::new(),
             script: None,

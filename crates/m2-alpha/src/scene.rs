@@ -1436,6 +1436,13 @@ pub struct Scene {
     /// guid ([`m2_game::mission::Mission::crew_of`]): an entity's own
     /// riders where its template has none.
     pub mission_crews: std::collections::HashMap<u32, Vec<(String, String)>>,
+    /// The entities whose vehicle the mission scripts have (made, or took
+    /// over from the layers): one vehicle per entity, so the layers don't
+    /// build these again ([`scripts_find`]).
+    pub script_owned: std::collections::HashSet<u32>,
+    /// The layers' vehicles still loading that the scripts asked for: each
+    /// is theirs as it loads ([`ParkedVehicle::take_for_scripts`]).
+    pub adopt_on_load: std::collections::HashSet<u32>,
     /// The layers' props with a crew aboard, as the scripts last had them
     /// ([`m2_game::mission::Mission::crews_aboard`]): each prop's guid and
     /// its riders' (seat, guid, template). The PMC HQ's interior
@@ -1529,6 +1536,45 @@ pub struct Scene {
     pub streamed: [Duration; 3],
 }
 
+/// What the scripts find for their object `g` (an entity of the layers
+/// too, for the vehicles a state layer parks): one vehicle per entity, as
+/// the 360's layer loader makes each entity once (0x823E6AB8 ->
+/// 0x82408C30), and the scripts' handle on it is that same object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScriptsFind {
+    /// The layers' vehicle, in [`Scene::vehicles`] at this index: theirs.
+    Layers(usize),
+    /// The layers have asked for it and it is still loading: theirs as it
+    /// loads ([`Scene::adopt_on_load`]).
+    LayersLoading,
+    /// None: the scripts load their own.
+    Nothing,
+}
+
+/// [`ScriptsFind`] for the scripts' object `g`, among `vehicles`, where
+/// `layers_asked` says whether the layers have asked for an entity's
+/// vehicle (placed or still loading).
+pub fn scripts_find(
+    vehicles: &[ParkedVehicle],
+    layers_asked: impl Fn(u32) -> bool,
+    g: u32,
+) -> ScriptsFind {
+    match vehicles
+        .iter()
+        .position(|v| v.spot.is_some_and(|(e, _, _)| e == g))
+    {
+        Some(i) => ScriptsFind::Layers(i),
+        None if layers_asked(g) => ScriptsFind::LayersLoading,
+        None => ScriptsFind::Nothing,
+    }
+}
+
+/// Whether the layers may build entity `entity`'s vehicle: not one the
+/// scripts have ([`Scene::script_owned`]).
+pub fn layers_may_build(script_owned: &std::collections::HashSet<u32>, entity: u32) -> bool {
+    !script_owned.contains(&entity)
+}
+
 /// A vehicle to drive: what it is, its model, and its body once placed.
 #[derive(Debug)]
 pub struct ParkedVehicle {
@@ -1585,6 +1631,24 @@ pub struct ParkedVehicle {
     /// Whether its wreck has thrown its chunks ([`Chunk`]); a vehicle
     /// loaded wrecked never does.
     pub debris_thrown: bool,
+}
+
+impl ParkedVehicle {
+    /// Makes the layers' vehicle the scripts' object `g`, as the scripts'
+    /// own would be ([`Loaded::MissionVehicle`]): their guid on it, their
+    /// crew in it where the scripts' layers seat one, and a ruin's wreck if
+    /// it hasn't come down yet. Where it stands, its body and everything
+    /// else stay.
+    pub fn take_for_scripts(&mut self, g: u32, crew: Option<&Vec<(String, String)>>, ruin: bool) {
+        self.guid = Some(g);
+        if let Some(own) = crew.filter(|c| !c.is_empty()) {
+            self.crew = own.clone();
+        }
+        if ruin && self.id.is_none() {
+            self.wrecked = true;
+            self.debris_thrown = true;
+        }
+    }
 }
 
 /// A part a vehicle threw off (a door, the hood): drawn from the
@@ -2261,6 +2325,8 @@ impl Scene {
             hero_face: Default::default(),
             frame: 0,
             mission_crews: Default::default(),
+            script_owned: Default::default(),
+            adopt_on_load: Default::default(),
             prop_crews: Vec::new(),
             prop_rider_spots: Vec::new(),
             ground,
@@ -3224,6 +3290,20 @@ impl Scene {
                     loose: Vec::new(),
                     debris_thrown: self.ruins.contains(&entity),
                 };
+                let mut vehicle = vehicle;
+                // The scripts asked for it while it loaded: theirs now, not
+                // a second one.
+                if self.adopt_on_load.remove(&entity) {
+                    vehicle.take_for_scripts(
+                        entity,
+                        self.mission_crews.get(&entity),
+                        self.ruins.contains(&entity),
+                    );
+                    eprintln!(
+                        "island vehicle {entity:#x}: {} is the scripts' own (asked for as it loaded)",
+                        vehicle.spec.label
+                    );
+                }
                 match old {
                     Some(i) => self.vehicles[i] = vehicle,
                     None => self.vehicles.push(vehicle),
@@ -4339,6 +4419,79 @@ fn rifle_clips(
 
 #[cfg(test)]
 mod tests {
+    fn parked(spot: Option<u32>, guid: Option<u32>) -> super::ParkedVehicle {
+        super::ParkedVehicle {
+            spec: crate::npc::tests::tank(m2_engine::tuning::VehicleTuning::default()),
+            model: crate::npc::tests::empty_model(),
+            id: None,
+            wrecked: false,
+            guid,
+            spot: spot.map(|e| (e, m2_math::glam::Vec3::ZERO, 0.0)),
+            crew: vec![("Driver".to_owned(), "Soldier".to_owned())],
+            turret: 0.0,
+            hijack_nodes: Vec::new(),
+            door_turns: Vec::new(),
+            gun: 0.0,
+            aims: Vec::new(),
+            rolled: 0.0,
+            fired: 0,
+            mg_fired: 0,
+            damage: 0.0,
+            hit: 0.0,
+            parts: None,
+            loose: Vec::new(),
+            debris_thrown: false,
+        }
+    }
+
+    // One vehicle per entity, whichever comes first (q766: B, C and E's
+    // cars each loaded twice, the layers' and the scripts', and shoved
+    // apart). The 360's layer loader makes each entity once (0x823E6AB8 ->
+    // 0x82408C30); the scripts' object is that one.
+    #[test]
+    fn the_scripts_and_the_layers_share_one_vehicle_per_entity() {
+        use super::{ScriptsFind, layers_may_build, scripts_find};
+        let van = 0x12_b8fc;
+        // The layers' first, placed (or loaded): the scripts take it over.
+        let vehicles = vec![parked(Some(0x99), None), parked(Some(van), None)];
+        assert_eq!(
+            scripts_find(&vehicles, |_| true, van),
+            ScriptsFind::Layers(1)
+        );
+        // The layers' asked for and still loading: theirs as it loads.
+        let loading = vec![parked(Some(0x99), None)];
+        assert_eq!(
+            scripts_find(&loading, |e| e == van, van),
+            ScriptsFind::LayersLoading
+        );
+        // Not the layers' at all: the scripts load their own ...
+        assert_eq!(scripts_find(&loading, |_| false, van), ScriptsFind::Nothing);
+        // ... and the layers don't build it after them.
+        let owned: std::collections::HashSet<u32> = [van].into();
+        assert!(!layers_may_build(&owned, van));
+        assert!(layers_may_build(&owned, 0x99));
+    }
+
+    // Taken over, the layers' vehicle is the scripts' as their own would
+    // be: their guid, their crew where they seat one, a ruin's wreck before
+    // it is placed; where it stands stays.
+    #[test]
+    fn a_taken_over_vehicle_carries_what_the_scripts_set() {
+        let van = 0x12_b8fc;
+        let mut v = parked(Some(van), None);
+        let crew = vec![("Gunner".to_owned(), "Mercenary".to_owned())];
+        v.take_for_scripts(van, Some(&crew), false);
+        assert_eq!(v.guid, Some(van));
+        assert_eq!(v.crew, crew);
+        assert_eq!(v.spot.map(|s| s.0), Some(van));
+        assert!(!v.wrecked);
+        // No crew of the scripts': its own stays.
+        let mut w = parked(Some(van), None);
+        w.take_for_scripts(van, Some(&Vec::new()), true);
+        assert_eq!(w.crew.len(), 1);
+        assert!(w.wrecked && w.debris_thrown);
+    }
+
     /// The 360's sprint with its own clip plays it whole, the rifle in
     /// both hands; the walk and the alpha's sprint (the 360's run) play
     /// their own gait clips with nothing over them, the jog its low

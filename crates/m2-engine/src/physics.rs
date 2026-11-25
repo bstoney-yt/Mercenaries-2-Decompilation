@@ -5889,6 +5889,22 @@ impl Physics {
             .unwrap_or_default()
     }
 
+    /// Each of a vehicle's wheels' drive force and brake as last set, in
+    /// spec order (what the controls put on it; for logs).
+    pub fn vehicle_wheel_forces(&self, id: VehicleId) -> Vec<(f32, f32)> {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map(|v| {
+                v.controller
+                    .wheels()
+                    .iter()
+                    .map(|w| (w.engine_force, w.brake))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// How far each of a vehicle's wheels sits above where its model has
     /// it, chassis space, metres, in spec order: up as its spring squeezes
     /// over a bump, down as it hangs off a ledge or in the air. Draw the
