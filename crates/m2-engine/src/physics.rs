@@ -84,9 +84,15 @@ fn insert_collider(
 /// Rapier's own rules have no such mean). A terrain at the rigid-body
 /// default 0.5 (0x82621820 +0x9C) under a wreck's 0.3 grips at 0.39, not
 /// the 0.3 the least of the two gave.
-struct HavokFriction;
+///
+/// It also drops a ragdoll limb's contacts with the triangles of a fixed
+/// model's shapes on layers the ragdoll's layer does not meet
+/// ([`collision_layers::meets_ragdolls`]; [`CollisionShape::off_ragdoll`]).
+struct HavokFriction<'a> {
+    off_ragdoll: &'a HashMap<r::ColliderHandle, Arc<[(u32, u32)]>>,
+}
 
-impl r::PhysicsHooks for HavokFriction {
+impl r::PhysicsHooks for HavokFriction<'_> {
     fn modify_solver_contacts(&self, context: &mut r::ContactModificationContext) {
         let (Some(a), Some(b)) = (
             context.colliders.get(context.collider1),
@@ -94,8 +100,22 @@ impl r::PhysicsHooks for HavokFriction {
         ) else {
             return;
         };
+        let limb = |c: &r::Collider| c.collision_groups().memberships.contains(RAGDOLL);
+        let passed = |handle, subshape: u32| {
+            self.off_ragdoll
+                .get(&handle)
+                .is_some_and(|runs| runs.iter().any(|&(s, e)| (s..e).contains(&subshape)))
+        };
+        let (limb_a, limb_b) = (limb(a), limb(b));
+        let (h1, h2) = (context.collider1, context.collider2);
         let mixed = (a.friction() * b.friction()).max(0.0).sqrt();
         if let Some(m) = context.rigid_mut() {
+            let through = (limb_a && passed(h2, m.manifold.subshape2))
+                || (limb_b && passed(h1, m.manifold.subshape1));
+            if through {
+                m.solver_contacts.clear();
+                return;
+            }
             *m.friction = mixed;
         }
     }
@@ -190,6 +210,10 @@ pub struct CollisionShape {
     pub path: PathSolid,
     /// Its shapes no vehicle meets ([`Ghost`]), if it has both kinds.
     pub ghost: Option<Ghost>,
+    /// Runs of its triangles (first, past the last) on layers a vehicle
+    /// meets but a ragdoll does not ([`collision_layers::meets_ragdolls`]:
+    /// foliage): a limp body passes through them.
+    pub off_ragdoll: Arc<[(u32, u32)]>,
     /// The box round all its `PHY2` shapes on parts it shows intact,
     /// leaves and shapes nothing meets included (model space), as a path
     /// search sizes it up. From the 360 code: an obstacle's box is its
@@ -314,6 +338,8 @@ struct Split {
     ghost: Vec<[u32; 3]>,
     ghost_path: Vec<[u32; 3]>,
     ghost_part: bool,
+    /// Runs of `solid` a ragdoll passes through.
+    off_ragdoll: Vec<(u32, u32)>,
 }
 
 /// Splits `runs` of `triangles` by `preset`'s layers: a shape on a layer
@@ -333,6 +359,10 @@ fn split_shapes(runs: &[ShapeRun], triangles: &[[u32; 3]], preset: Preset) -> Sp
             } else {
                 out.path_part = true;
             }
+            if !collision_layers::meets_ragdolls(layer) {
+                let from = out.solid.len() as u32;
+                out.off_ragdoll.push((from, from + tris.len() as u32));
+            }
             out.solid.extend_from_slice(tris);
         } else {
             if seen {
@@ -350,6 +380,32 @@ fn split_shapes(runs: &[ShapeRun], triangles: &[[u32; 3]], preset: Preset) -> Sp
         out.ghost_part = false;
     }
     out
+}
+
+/// `runs` of `triangles` (first, past the last) as they fall in the mesh
+/// [`CollisionShape::mesh_of`] keeps of them, which drops the degenerate
+/// ones and so renumbers the rest.
+fn kept_runs(vertices: &[Vec3], triangles: &[[u32; 3]], runs: &[(u32, u32)]) -> Arc<[(u32, u32)]> {
+    if runs.is_empty() {
+        return Arc::new([]);
+    }
+    let n = vertices.len() as u32;
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    let mut kept = 0u32;
+    for (k, t) in triangles.iter().enumerate() {
+        if !(t.iter().all(|&i| i < n) && t[0] != t[1] && t[1] != t[2] && t[0] != t[2]) {
+            continue;
+        }
+        let k = k as u32;
+        if runs.iter().any(|&(a, b)| (a..b).contains(&k)) {
+            match out.last_mut() {
+                Some(last) if last.1 == kept => last.1 = kept + 1,
+                _ => out.push((kept, kept + 1)),
+            }
+        }
+        kept += 1;
+    }
+    out.into()
 }
 
 /// Whether a path search meets `PHY2` shape `s` of a building's model.
@@ -991,6 +1047,7 @@ impl CollisionShape {
             surfaces: Arc::new([]),
             path: PathSolid::All,
             ghost: None,
+            off_ragdoll: Arc::new([]),
             entity_box: None,
             source: None,
             leaves: None,
@@ -1038,6 +1095,7 @@ impl CollisionShape {
             surfaces: runs.into(),
             path: PathSolid::All,
             ghost: None,
+            off_ragdoll: Arc::new([]),
             entity_box: None,
             source: None,
             leaves: None,
@@ -1104,6 +1162,7 @@ impl CollisionShape {
         let surface = self.surfaces.first().map_or(0, |r| r.1);
         let surfaces = vec![surface; split.solid.len()];
         let mut shape = Self::mesh_of(&src.vertices, &split.solid, &surfaces)?;
+        shape.off_ragdoll = kept_runs(&src.vertices, &split.solid, &split.off_ragdoll);
         if split.path_part {
             shape.path = PathSolid::of(&src.vertices, &split.path);
         }
@@ -1210,6 +1269,7 @@ impl CollisionShape {
         let mut ghost_triangles = Vec::new();
         let mut ghost_path = Vec::new();
         let mut ghost_part = false;
+        let mut off_ragdoll: Vec<(u32, u32)> = Vec::new();
         let mut entity_box: Option<(Vec3, Vec3)> = None;
         // Each standing shape's flags, kind and triangles, kept for the
         // other presets ([CollisionShape::as_preset]).
@@ -1288,6 +1348,7 @@ impl CollisionShape {
             ghost_triangles = split.ghost;
             ghost_path = split.ghost_path;
             ghost_part = split.ghost_part;
+            off_ragdoll = split.off_ragdoll;
         }
         let stand_in = !shaped && triangles.is_empty();
         if stand_in {
@@ -1362,6 +1423,7 @@ impl CollisionShape {
             surfaces = vec![drawn_surface(model, lod); triangles.len()];
         }
         let mut shape = Self::mesh_of(&vertices, &triangles, &surfaces)?;
+        shape.off_ragdoll = kept_runs(&vertices, &triangles, &off_ragdoll);
         if path_part {
             shape.path = PathSolid::of(&vertices, &path_triangles);
         }
@@ -1773,6 +1835,11 @@ struct VehicleBody {
     before: Vec3,
     /// Its spin before the last step, radians a second about each axis.
     spin_before: Vec3,
+    /// Its velocities as the last two steps began, newest first
+    /// (`None` before its first step), and how much its velocity changed
+    /// over that one 360 update ([`Physics::vehicle_jolt`]).
+    history: Option<[Vec3; 2]>,
+    jolt: f32,
     /// A boat's: it floats instead of rolling on wheels.
     hull: Option<Hull>,
     /// A helicopter's: it flies.
@@ -3399,6 +3466,9 @@ pub struct Physics {
     surfaces: HashMap<r::ColliderHandle, CollisionShape>,
     /// What of a static a path search does not see in full ([`PathSolid`]).
     path_solid: HashMap<r::ColliderHandle, PathSolid>,
+    /// Fixed models' triangles a ragdoll passes through
+    /// ([`CollisionShape::off_ragdoll`]), by collider.
+    off_ragdoll: HashMap<r::ColliderHandle, Arc<[(u32, u32)]>>,
     /// Each static's shapes no vehicle meets ([Ghost]).
     ghosts: HashMap<StaticKey, r::ColliderHandle>,
     /// Each static's box as a path search sizes it up ([CollisionShape::entity_box]).
@@ -3493,6 +3563,7 @@ impl Physics {
             keys: HashMap::new(),
             surfaces: HashMap::new(),
             path_solid: HashMap::new(),
+            off_ragdoll: HashMap::new(),
             ghosts: HashMap::new(),
             boxes: HashMap::new(),
             debris_groups: HashMap::new(),
@@ -3567,6 +3638,9 @@ impl Physics {
         if !matches!(shape.path, PathSolid::All) {
             self.path_solid.insert(handle, shape.path.clone());
         }
+        if !shape.off_ragdoll.is_empty() {
+            self.off_ragdoll.insert(handle, shape.off_ragdoll.clone());
+        }
         if let Some(b) = shape.entity_box {
             self.boxes.insert(key, b);
         }
@@ -3639,6 +3713,7 @@ impl Physics {
                 self.keys.remove(&h);
                 self.surfaces.remove(&h);
                 self.path_solid.remove(&h);
+                self.off_ragdoll.remove(&h);
                 self.world.remove_collider(h);
             }
         }
@@ -3733,6 +3808,11 @@ impl Physics {
                 .bodies
                 .get(v.controller.chassis)
                 .map_or(Vec3::ZERO, |b| vec3(b.angvel()));
+            // Its velocity's change over one 360 update (1/30 s: two of
+            // these steps).
+            let h = v.history.get_or_insert([v.before; 2]);
+            v.jolt = (v.before - h[1]).length();
+            *h = [v.before, h[0]];
             if v.held {
                 continue;
             }
@@ -3813,7 +3893,12 @@ impl Physics {
         self.fly_helicopters(dt);
         self.cap_debris_speeds();
         self.weigh_down_ragdolls(dt);
-        self.world.step_with_events(&HavokFriction, &());
+        self.world.step_with_events(
+            &HavokFriction {
+                off_ragdoll: &self.off_ragdoll,
+            },
+            &(),
+        );
         self.cap_ragdoll_speeds();
         self.hold_ragdolls_together();
         self.settle_debris();
@@ -5047,6 +5132,8 @@ impl Physics {
             held: false,
             before: Vec3::ZERO,
             spin_before: Vec3::ZERO,
+            history: None,
+            jolt: 0.0,
             hull,
             rotor,
         }));
@@ -6388,6 +6475,31 @@ impl Physics {
 
     /// A vehicle's velocity before the last step, m/s: what it hit things
     /// with (a crash stops it within the step).
+    /// How much vehicle `id`'s velocity changed over the last 360 update
+    /// (1/30 s, two of these steps), m/s: what its seats'
+    /// `TossSpeedChange` is measured against. From the 360 code: the car
+    /// physics' update (0x8218A138) keeps `|v - v_last|²` at +0x14C (v
+    /// from vfunc +0x4C, v_last at +0x140), which its vfunc +0x68
+    /// (0x82188A78) answers and the exit kind (0x822A2B60) tests.
+    pub fn vehicle_jolt(&self, id: VehicleId) -> f32 {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map_or(0.0, |v| v.jolt)
+    }
+
+    /// Vehicle `id`'s velocity one 360 update ago (the older of its
+    /// history's two, before any jolt [`vehicle_jolt`](Self::vehicle_jolt)
+    /// measures): the +0x140 the car physics keeps (0x8218A138), which its
+    /// crash ejection hands its riders.
+    pub fn vehicle_velocity_pre_jolt(&self, id: VehicleId) -> Vec3 {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .and_then(|v| v.history.map(|h| h[1]))
+            .unwrap_or(Vec3::ZERO)
+    }
+
     pub fn vehicle_velocity_before(&self, id: VehicleId) -> Vec3 {
         self.vehicles
             .get(id.0)
@@ -6432,11 +6544,39 @@ impl Physics {
     /// Sets a vehicle's velocity, m/s (as it was before something it hit
     /// gave way).
     pub fn set_vehicle_velocity(&mut self, id: VehicleId, velocity: Vec3) {
+        let Some(v) = self.vehicles.get_mut(id.0).and_then(Option::as_mut) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
+            body.set_linvel(vector(velocity), true);
+        }
+        // Set, not driven into: no jolt ([`Physics::vehicle_jolt`]).
+        v.history = None;
+        v.jolt = 0.0;
+    }
+
+    /// Holds a vehicle at `velocity`, m/s, keeping its velocity history:
+    /// a run-up for the offscreen checks, so a crash after it still counts
+    /// as a jolt ([`vehicle_jolt`](Self::vehicle_jolt)).
+    pub fn hold_vehicle_velocity(&mut self, id: VehicleId, velocity: Vec3) {
         let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
             return;
         };
         if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
             body.set_linvel(vector(velocity), true);
+        }
+    }
+
+    /// Puts a vehicle at `position` facing `rotation`, at rest (for the
+    /// offscreen checks).
+    pub fn place_vehicle(&mut self, id: VehicleId, position: Vec3, rotation: Quat) {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
+            body.set_position(pose(position, rotation.normalize()), true);
+            body.set_linvel(vector(Vec3::ZERO), true);
+            body.set_angvel(vector(Vec3::ZERO), true);
         }
     }
 
@@ -6457,6 +6597,30 @@ impl Physics {
             body.set_linvel(r::Vector::ZERO, true);
             body.set_angvel(r::Vector::ZERO, true);
         }
+    }
+
+    /// A blast's push on a vehicle, as the 360's rigid push gives it
+    /// (0x8215CBC8): the impulses `pushes` (kg m/s, each at its world
+    /// point) are applied, then the change they made to its linear and
+    /// angular velocity is **topped up** per axis against what it had
+    /// before ([`top_up`], 0x8215BF38), and its velocities are set to the
+    /// old ones plus that (0x8262AA20, 0x8262AAC0). A push never adds to
+    /// speed already going its way, only brings it up to the push's.
+    pub fn push_vehicle_topped(&mut self, id: VehicleId, pushes: &[(Vec3, Vec3)]) {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return;
+        };
+        let Some(body) = self.world.bodies.get_mut(v.controller.chassis) else {
+            return;
+        };
+        let (linear, angular) = (vec3(body.linvel()), vec3(body.angvel()));
+        for &(impulse, at) in pushes {
+            body.apply_impulse_at_point(vector(impulse), vector(at), true);
+        }
+        let dv = vec3(body.linvel()) - linear;
+        let dw = vec3(body.angvel()) - angular;
+        body.set_linvel(vector(linear + top_up(dv, linear)), true);
+        body.set_angvel(vector(angular + top_up(dw, angular)), true);
     }
 
     /// Shoves a vehicle: `impulse` (kg m/s) applied at world point `at`.
@@ -6909,6 +7073,53 @@ impl Physics {
                 .map(|b| vec3(b.linvel()).length())
                 .fold(0.0, f32::max),
         )
+    }
+
+    /// Each limb's speed, m/s, and whether it touches anything (for
+    /// tracing what keeps a limp body from lying still).
+    /// What each touches: `v` a vehicle, `s` another limb of the same
+    /// body, `g` anything else (the ground, a wall), empty nothing.
+    pub fn ragdoll_limb_speeds(&self, id: RagdollId) -> Vec<(usize, f32, String)> {
+        let Some(doll) = self.ragdolls.get(id.0).and_then(Option::as_ref) else {
+            return Vec::new();
+        };
+        let chassis: Vec<_> = self
+            .vehicles
+            .iter()
+            .flatten()
+            .map(|v| v.controller.chassis)
+            .collect();
+        let own: Vec<_> = doll.bodies.iter().flatten().copied().collect();
+        doll.bodies
+            .iter()
+            .enumerate()
+            .filter_map(|(k, h)| {
+                let b = self.world.bodies.get((*h)?)?;
+                let mut what = String::new();
+                for &c in b.colliders() {
+                    for p in self.world.narrow_phase.contact_pairs_with(c) {
+                        if !p.has_any_active_contact() {
+                            continue;
+                        }
+                        let other = if p.collider1 == c {
+                            p.collider2
+                        } else {
+                            p.collider1
+                        };
+                        let parent = self.world.colliders.get(other).and_then(|o| o.parent());
+                        let tag = match parent {
+                            Some(q) if chassis.contains(&q) => 'v',
+                            Some(q) if own.contains(&q) => 's',
+                            _ => 'g',
+                        };
+                        if !what.contains(tag) {
+                            what.push(tag);
+                        }
+                    }
+                }
+                Some((k, vec3(b.linvel()).length(), what))
+            })
+            .collect()
     }
 
     /// Shoves every limb of a ragdoll by `velocity` (m/s).
@@ -7700,6 +7911,25 @@ pub fn prop_gravity_scale(scale: f32) -> f32 {
     } else {
         1.0
     }
+}
+
+/// A push's change `change` to a velocity `before`, per axis as the
+/// 360's rigid push takes it (0x8215BF38): along an axis where the push
+/// goes the way the body already moves, only what it exceeds that speed
+/// by (never less than nothing); against it, or from rest, all of it.
+pub fn top_up(change: Vec3, before: Vec3) -> Vec3 {
+    let axis = |d: f32, b: f32| {
+        if d * b > 0.0 {
+            d.signum() * (d.abs() - b.abs()).max(0.0)
+        } else {
+            d
+        }
+    };
+    Vec3::new(
+        axis(change.x, before.x),
+        axis(change.y, before.y),
+        axis(change.z, before.z),
+    )
 }
 
 /// Normals flatter than this (their up part, of 1) are walls a walk
@@ -8681,6 +8911,29 @@ mod tests {
         assert!((fall(gunbox) - 31.5).abs() < 0.6, "{}", fall(gunbox));
     }
 
+    // The 360's rigid push tops speed up rather than adding to it (Xenia
+    // phys5, a Phoenix's death): rising at 9.094 m/s, the frag's push
+    // (7.5 m/s each way, away (-0.676, -0.737)) and then the fx's (4.5)
+    // give it (-6.43, 0, -5.53) between them, none upward: the measured
+    // (-6.43, gravity only, -5.55).
+    #[test]
+    fn a_blast_push_tops_speed_up_and_never_adds_to_it() {
+        let away = Vec3::new(-0.676, 0.0, -0.737);
+        let push = |p: f32| Vec3::new(away.x * p, p, away.z * p);
+        let start = Vec3::new(3.394, 9.094, 1.171);
+        let a = start + top_up(push(7.5), start);
+        let b = a + top_up(push(4.5), a);
+        let change = b - start;
+        assert!((change.x + 6.43).abs() < 0.01, "{change}");
+        assert!((change.z + 5.53).abs() < 0.01, "{change}");
+        assert_eq!(change.y, 0.0);
+        // From rest it is all of it; against the way it moves, all of it.
+        assert_eq!(top_up(push(4.5), Vec3::ZERO), push(4.5));
+        assert_eq!(top_up(Vec3::X * -2.0, Vec3::X * 3.0), Vec3::X * -2.0);
+        // The same way and slower than it already goes: nothing.
+        assert_eq!(top_up(Vec3::Y * 2.0, Vec3::Y * 3.0), Vec3::ZERO);
+    }
+
     /// A square of `half` metres at height `y`, centred on (x, z).
     fn floor(physics: &mut Physics, key: u32, x: f32, z: f32, y: f32, half: f32) {
         let v = [
@@ -8897,6 +9150,45 @@ mod tests {
         p.step(DT);
         let fastest = p.ragdoll_speed(id).unwrap();
         assert!(fastest <= RAGDOLL_MAX_SPEED + 1e-3, "{fastest}");
+    }
+
+    #[test]
+    fn a_ragdoll_falls_through_foliage_and_lands_on_a_solid_shape() {
+        // A slab 1.0 to 1.4 m up under a ragdoll dropped from 2 m: solid
+        // (layer 3), it holds the body up; foliage (layer 19, which a
+        // ragdoll's layer 20 does not meet), the body falls to the ground.
+        let rest = |off: bool| {
+            let mut p = ready();
+            let mut slab = CollisionShape::cuboid(Vec3::new(3.0, 0.2, 3.0));
+            if off {
+                slab.off_ragdoll = Arc::new([(0, 1)]);
+            }
+            p.add_static(
+                StaticKey::Cell(7),
+                &slab,
+                Vec3::new(0.0, 1.2, 0.0),
+                Quat::IDENTITY,
+            );
+            let parents = [None, Some(0), Some(1), Some(2), Some(2)];
+            let ys = [2.0, 3.0, 3.45, 3.75, 3.4];
+            let nodes: Vec<Mat4> = ys
+                .iter()
+                .enumerate()
+                .map(|(i, &y)| Mat4::from_translation(Vec3::new(i as f32 * 0.01, y, 0.0)))
+                .collect();
+            let id = p.add_ragdoll(&parents, &nodes, Vec3::ZERO);
+            for _ in 0..240 {
+                p.step(DT);
+            }
+            p.ragdoll_nodes(id).unwrap()[1..]
+                .iter()
+                .map(|m| m.w_axis.y)
+                .fold(f32::MAX, f32::min)
+        };
+        let on_slab = rest(false);
+        let through = rest(true);
+        assert!(on_slab > 1.3, "held by a solid slab: {on_slab}");
+        assert!(through < 0.8, "through foliage to the ground: {through}");
     }
 
     #[test]
@@ -12315,6 +12607,7 @@ mod tests {
             surfaces: Arc::new([]),
             path: PathSolid::All,
             ghost: None,
+            off_ragdoll: Arc::new([]),
             entity_box: None,
             source: None,
             leaves: None,
