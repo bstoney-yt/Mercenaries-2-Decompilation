@@ -2776,11 +2776,34 @@ fn drive_tracks(
     let [dx, dy, dz] = tun.ang_damp;
     let damp = side * (w.dot(side) * dx) + up * (w.dot(up) * dy) + ahead * (w.dot(ahead) * dz);
     push(-damp * mass * dt, None);
-    let off = f.points.iter().filter(|p| p.is_none()).count() as f32;
-    let pull = (tun.gravity_factor - 1.0) * off * mass * -1.5;
+    let pull = track_air_pull(tun.gravity_factor, f.points, mass);
     if pull != 0.0 {
         push(Vec3::Y * pull * dt, Some(f.centre));
     }
+}
+
+/// How many points a tracked vehicle's tracks have, as the 360 code
+/// counts them (0x821A5D30's loop, 0x821A4F10's count: stride 0x80 from
+/// +0x80 to +0x300): its six track hardpoints ([`crate::vehicle::track_hardpoints`]).
+pub const TRACK_POINTS: usize = 6;
+
+/// The pull, newtons up (so negative: down), on a tracked vehicle of
+/// `mass` kg for its track points off the ground, as 0x821A4F10 gives it
+/// every step with no other gate: `(GravityFactor - 1) x off x mass x
+/// -1.5` (0x820D2F6C), `off` being [`TRACK_POINTS`] less those of
+/// `points` in contact (a point is in contact when its ray, cast down its
+/// suspension from its hardpoint, meets the ground within its length:
+/// 0x821A5D30 sets +0x80). Applied over the step (`x dt`) at its centre
+/// of mass. Unverified: that the motion's vfunc +0x58 the 360 hands it to
+/// takes it as a force over the step's dt.
+fn track_air_pull(gravity_factor: f32, points: &[Option<TrackContact>], mass: f32) -> f32 {
+    let touching = points
+        .iter()
+        .filter(|p| p.is_some())
+        .count()
+        .min(TRACK_POINTS);
+    let off = (TRACK_POINTS - touching) as f32;
+    (gravity_factor - 1.0) * off * mass * -1.5
 }
 
 /// A motorbike's balance for a step of `dt` s, as the 360 code holds it
@@ -8896,6 +8919,27 @@ mod tests {
     // A tank's `PhysicsPropertyGravityScaler` of 2 pulls it at twice the
     // world's gravity in the air, 18 m/s²; one with none at the world's
     // 9; the scale is clamped as a prop's.
+    // The tracks' pull off the ground (0x821A4F10): none with all six
+    // points down (a tank on flat ground), in proportion to those off
+    // (half off: half of it), and all of it in the air: (GravityFactor - 1)
+    // x 6 x 1.5 m/s², 9 for the tanks' factor of 2.
+    #[test]
+    fn a_tracks_pull_grows_with_its_points_off_the_ground() {
+        let down = Some(TrackContact {
+            at: Vec3::ZERO,
+            normal: Vec3::Y,
+            start: Vec3::Y,
+        });
+        let mass = 1000.0;
+        assert_eq!(track_air_pull(2.0, &[down; 6], mass), 0.0);
+        let half = [down, down, down, None, None, None];
+        assert!((track_air_pull(2.0, &half, mass) + 3.0 * 1.5 * mass).abs() < 1e-3);
+        let air = [None; 6];
+        assert!((track_air_pull(2.0, &air, mass) / mass + 9.0).abs() < 1e-4);
+        // A factor of 1 pulls nothing, however many are off.
+        assert_eq!(track_air_pull(1.0, &air, mass), 0.0);
+    }
+
     #[test]
     fn a_scaled_tank_falls_at_twice_the_worlds_gravity() {
         assert_eq!(vehicle_gravity_scale(None), 1.0);
