@@ -46,13 +46,14 @@ front end later does not repeat them.
 
 ## Saves
 
-The launcher reads the files `m2-alpha` writes (`m2-alpha-autosave.toml`,
-`m2-alpha-save<n>.toml`, beside its settings file). That file format is
-the port's own: the contracts done, the factions and the stockpile in it
-are the game scripts' own save data, but the wrapper and the world state
-beside it are not the 360's save record (traced in
-`m2-game/src/profile.rs`, not yet written). So play time, last contract
-and percent complete are not shown; a faithful save port would add them.
+The launcher reads the files `m2-alpha` writes (`m2-alpha-autosave.sav`,
+`m2-alpha-save<n>.sav`, beside its settings file). Each is one 360 save
+record (`m2-game/src/save_record.rs`): the time played, cash, fuel, last
+contract, percent done, character and time stamp the 360's save list
+shows, and the scripts' save data. The `.world.toml` beside each is the
+port's own (where she is, her weapons, the vehicles and the dead, which
+the 360 does not save); copying and deleting a slot take it along. Old
+`.toml` saves still list, without play time, contract or percent.
 
 ## To come
 

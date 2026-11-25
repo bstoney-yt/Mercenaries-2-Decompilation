@@ -6,8 +6,10 @@
 //! functions and anything else that can't be written, and tables met a
 //! second time on the way down, are left out.
 //!
-//! The engine's own save format is not followed (it isn't read); the data
-//! is the scripts'. Loading it hands it back to the bootstrap
+//! The text is packed into the 360's save record as the engine packs its
+//! own ([`crate::save_record`]); how the 360 itself writes the scripts'
+//! tables out as text is not followed (this writer is the port's). Loading
+//! it hands it back to the bootstrap
 //! (`LoadSingleton(data)` instead of a new game's `LoadSingleton(nil)`:
 //! [`Mission::load_save`](crate::mission::Mission::load_save)), which
 //! gives each module its part as the game does.

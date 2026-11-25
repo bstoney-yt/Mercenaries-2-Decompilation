@@ -285,6 +285,17 @@ impl App {
         if fuel {
             parts.push(format!("Fuel {}", s.fuel.round()));
         }
+        // The 360's save list's play time, contract and percent (the
+        // record's; old saves have none).
+        if let Some(t) = s.played_text() {
+            parts.push(t);
+        }
+        if fuel && !s.contract.is_empty() {
+            parts.push(s.contract.clone());
+        }
+        if let Some(p) = s.percent {
+            parts.push(format!("{p}%"));
+        }
         if let Some(w) = s.written {
             parts.push(saves::ago(SystemTime::now(), w));
         }
