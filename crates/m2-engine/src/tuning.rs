@@ -48,6 +48,10 @@ pub struct VehicleTuning {
     /// Health below which it burns down by itself (`TickDamage`'s field
     /// 9a6663a4: the AMX-30's 30).
     pub burns_below: Option<f32>,
+    /// Its `PhysicsPropertyGravityScaler` `Scale`: how many times the
+    /// world's gravity pulls its bodies (2 on the tanks, the AMX30 AA's 1;
+    /// none on cars, boats or helicopters).
+    pub gravity_scale: Option<f32>,
     /// What rounds do to it, of their damage, by its `ModifierKey` in the
     /// game's damage table (an M151's `Car`: a rifle round a fortieth).
     pub rounds: Option<RoundScale>,
@@ -1927,6 +1931,7 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
     let hint = Table::new(db, "ObjectHint");
     let stimulus = Table::new(db, "Stimulus");
     let fudge = Table::new(db, "ExplosionFudge");
+    let scaler = Table::new(db, "PhysicsPropertyGravityScaler");
     let tick = Table::new(db, "TickDamage");
     let modifier = Table::new(db, "ModifierKey");
     let heli = Table::new(db, "_HelicopterPhysics");
@@ -1980,6 +1985,11 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                 audibility: stimulus.get(id, "Audibility"),
                 blast_scale: fudge.number(id, BLAST_SCALE),
                 burns_below: tick.number(id, BURNS_BELOW),
+                gravity_scale: scaler
+                    .of_template(id)
+                    .first()
+                    .and_then(|r| scaler.float(r, name_hash("Scale")))
+                    .filter(|s| s.is_finite()),
                 // The whole vehicle's key: its record with no `Name` (the
                 // named ones are parts).
                 rounds: whole_key(&modifier, id).and_then(|key| damage?.rounds(key)),
