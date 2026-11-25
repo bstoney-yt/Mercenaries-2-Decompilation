@@ -460,57 +460,125 @@ impl<W: PathWorld> Search<'_, W> {
     }
 }
 
-/// Finds a way for a vehicle of `size` from `start` to `goal`
-/// (0x822E64A8, stepped to its end).
-pub fn find(world: &mut impl PathWorld, size: Size, start: Vec3, goal: Vec3) -> Option<Way> {
-    let start = world.ground(start).map_or(start, |(g, _)| g);
-    let (goal, goal_on) = world.ground(goal).unwrap_or((goal, None));
-    let mut s = Search {
-        world,
-        size,
-        goal,
-        goal_on,
-        nodes: vec![Node {
-            at: start,
-            parent: None,
-            cost: 0.0,
-            key: FIRST,
-            on: None,
-        }],
-        open: [None; 16],
-        best: HashMap::new(),
-        pairs: HashSet::new(),
-        done: None,
-    };
-    s.nodes.push(Node {
-        at: goal,
-        parent: Some(0),
-        cost: (goal - start).length(),
-        key: GOAL,
-        on: goal_on,
-    });
-    s.push(1);
-    for _ in 0..256 {
-        if s.done.is_some() {
-            break;
-        }
-        let Some(slot) = (0..16).filter(|&i| s.open[i].is_some()).min_by(|&a, &b| {
-            s.score(s.open[a].unwrap())
-                .total_cmp(&s.score(s.open[b].unwrap()))
-        }) else {
-            break;
+/// How many nodes a search expands at most before it gives up (the
+/// 360's node pool).
+const MOST_STEPS: u32 = 256;
+
+/// A search under way, stepped a few nodes at a time ([`Pending::step`]),
+/// as the 360's search manager (0x822E7CE0) serves its searches over
+/// frames.
+#[derive(Clone, Debug)]
+pub struct Pending {
+    size: Size,
+    goal: Vec3,
+    goal_on: Option<u64>,
+    nodes: Vec<Node>,
+    open: [Option<usize>; 16],
+    best: HashMap<Key, usize>,
+    pairs: HashSet<(Key, Key)>,
+    done: Option<usize>,
+    steps: u32,
+}
+
+impl Pending {
+    /// A search for a body of `size` from `start` to `goal` (0x822E64A8),
+    /// not yet stepped.
+    pub fn begin(world: &mut impl PathWorld, size: Size, start: Vec3, goal: Vec3) -> Self {
+        let start = world.ground(start).map_or(start, |(g, _)| g);
+        let (goal, goal_on) = world.ground(goal).unwrap_or((goal, None));
+        let mut p = Self {
+            size,
+            goal,
+            goal_on,
+            nodes: vec![
+                Node {
+                    at: start,
+                    parent: None,
+                    cost: 0.0,
+                    key: FIRST,
+                    on: None,
+                },
+                Node {
+                    at: goal,
+                    parent: Some(0),
+                    cost: (goal - start).length(),
+                    key: GOAL,
+                    on: goal_on,
+                },
+            ],
+            open: [None; 16],
+            best: HashMap::new(),
+            pairs: HashSet::new(),
+            done: None,
+            steps: 0,
         };
-        let n = s.open[slot].take()?;
-        s.expand(n);
+        p.open[0] = Some(1);
+        p
     }
-    let mut at = s.done?;
-    let mut points = vec![s.nodes[at].at];
-    while let Some(p) = s.nodes[at].parent {
-        points.push(s.nodes[p].at);
-        at = p;
+
+    /// Expands at most `budget` nodes. `Some` once the search is over:
+    /// the way, or `None` when it found none (out of nodes to try, or past
+    /// its [`MOST_STEPS`]). Also how many nodes it expanded this time.
+    pub fn step(&mut self, world: &mut impl PathWorld, budget: u32) -> (Option<Option<Way>>, u32) {
+        let mut s = Search {
+            world,
+            size: self.size,
+            goal: self.goal,
+            goal_on: self.goal_on,
+            nodes: std::mem::take(&mut self.nodes),
+            open: self.open,
+            best: std::mem::take(&mut self.best),
+            pairs: std::mem::take(&mut self.pairs),
+            done: self.done,
+        };
+        let mut used = 0;
+        let mut over = false;
+        while used < budget {
+            if s.done.is_some() || self.steps >= MOST_STEPS {
+                over = true;
+                break;
+            }
+            let Some(slot) = (0..16).filter(|&i| s.open[i].is_some()).min_by(|&a, &b| {
+                s.score(s.open[a].unwrap())
+                    .total_cmp(&s.score(s.open[b].unwrap()))
+            }) else {
+                over = true;
+                break;
+            };
+            let Some(n) = s.open[slot].take() else {
+                over = true;
+                break;
+            };
+            self.steps += 1;
+            used += 1;
+            s.expand(n);
+        }
+        over |= s.done.is_some() || self.steps >= MOST_STEPS;
+        self.nodes = s.nodes;
+        self.open = s.open;
+        self.best = s.best;
+        self.pairs = s.pairs;
+        self.done = s.done;
+        (over.then(|| self.way()), used)
     }
-    points.reverse();
-    Some(Way { points })
+
+    fn way(&self) -> Option<Way> {
+        let mut at = self.done?;
+        let mut points = vec![self.nodes[at].at];
+        while let Some(p) = self.nodes[at].parent {
+            points.push(self.nodes[p].at);
+            at = p;
+        }
+        points.reverse();
+        Some(Way { points })
+    }
+}
+
+/// Finds a way for a vehicle of `size` from `start` to `goal`
+/// (0x822E64A8, stepped to its end at once).
+pub fn find(world: &mut impl PathWorld, size: Size, start: Vec3, goal: Vec3) -> Option<Way> {
+    let mut p = Pending::begin(world, size, start, goal);
+    p.step(world, u32::MAX).0.flatten()
 }
 
 /// 0x822E2770's lookahead: the larger of 3 m, half the vehicle's box's
@@ -777,6 +845,31 @@ mod tests {
         assert_eq!(c[0].1, 8);
         assert!((c[0].0.z - 12.0).abs() < 0.01, "{}", c[0].0);
         assert!((c[0].0.x - 2.0).abs() < 0.01, "{}", c[0].0);
+    }
+
+    /// Stepped a few nodes at a time, as the manager serves it, a search
+    /// comes to the same way as one run to its end at once.
+    #[test]
+    fn a_search_stepped_over_frames_finds_the_same_way() {
+        let size = Size {
+            width: 2.0,
+            height: 2.0,
+        };
+        let (from, to) = (Vec3::ZERO, Vec3::new(0.0, 0.0, 40.0));
+        let whole = find(&mut Wall, size, from, to);
+        assert!(whole.is_some());
+        let mut p = Pending::begin(&mut Wall, size, from, to);
+        let mut frames = 0;
+        let way = loop {
+            frames += 1;
+            let (over, used) = p.step(&mut Wall, 2);
+            assert!(used <= 2);
+            if let Some(w) = over {
+                break w;
+            }
+        };
+        assert!(frames > 1, "spread over frames");
+        assert_eq!(way, whole);
     }
 
     #[test]
