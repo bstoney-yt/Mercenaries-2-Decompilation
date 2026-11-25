@@ -14048,7 +14048,27 @@ fn parked_settle_check(
             let moved = now_at.distance(*at);
             let turned = now_turn.angle_between(*turn).to_degrees();
             let up = m.transform_vector3(Vec3::Y).normalize_or_zero().y;
-            let speed = world.physics.vehicle_speed(id);
+            // Its whole speed: `vehicle_speed` is the signed speed along
+            // its heading, so one rolling back at 0.6 m/s passed as still
+            // (q769: two Fuel Trailers judged at -0.68 and -0.58 m/s).
+            let speed = world.physics.vehicle_velocity(id).length();
+            // A trailer (q769: Fuel Trailers 0.4-0.5 m off): its wheels as
+            // its spec has them and its pitch now, 5 s on. Log only.
+            if v.spec.label.to_ascii_lowercase().contains("trailer") {
+                let ahead = m.transform_vector3(Vec3::Z).normalize_or_zero();
+                let pitch = ahead.y.clamp(-1.0, 1.0).asin().to_degrees();
+                let wheels: Vec<String> = v
+                    .spec
+                    .wheels
+                    .iter()
+                    .map(|w| format!("{:.2}", w.centre))
+                    .collect();
+                eprintln!(
+                    "parked-settle-check: {entity:#x} {label}: pitch {pitch:+.1} deg at {SETTLE_AFTER} s; {} wheels at [{}] (model space)",
+                    wheels.len(),
+                    wheels.join(", ")
+                );
+            }
             // A boat floats where the water puts it (`game::place`: level,
             // at its float depth), not at its authored height or tilt: it
             // is judged by its own rule.
@@ -14077,11 +14097,22 @@ fn parked_settle_check(
             if ok {
                 passed += 1;
             } else {
+                // Past its own bodies (q769: a Fuel Trailer's tank, taller
+                // than the probe's 2 m start, met the probe at once).
                 let from = *at + Vec3::Y * 2.0;
-                let under = world.physics.cast_ray(from, Vec3::NEG_Y, 5.0).map_or(
-                    "nothing within 3 m under its authored place".to_owned(),
-                    |(d, _)| format!("something {:.2} m under its authored place", d - 2.0),
-                );
+                let under = world
+                    .physics
+                    .cast_ray_past(from, Vec3::NEG_Y, 5.0, id)
+                    .map_or(
+                        "nothing within 3 m under its authored place (past its own bodies)"
+                            .to_owned(),
+                        |(d, _)| {
+                            format!(
+                                "something {:+.2} m under its authored place (past its own bodies)",
+                                d - 2.0
+                            )
+                        },
+                    );
                 let line = format!(
                     "{entity:#x} {label}: {moved:.2} m from its authored place, {turned:.1} deg turned, up {up:.2}, {speed:.2} m/s; {under}; touched in its first second: [{}]",
                     touched.iter().cloned().collect::<Vec<_>>().join("; ")
