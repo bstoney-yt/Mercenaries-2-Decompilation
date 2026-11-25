@@ -9379,9 +9379,13 @@ fn cargo_check(game: &mut Game, tick: f32) {
             return Vec::new();
         };
         let inv = at.inverse();
+        // From the crates' bodies, not where they were last shown: the
+        // first reading is taken right after the rigid move, before the
+        // props follow (q680, 3d99c9b7: judged against the old place,
+        // standing measured 39.85 m).
         game.scene
             .props
-            .cargo_riding()
+            .cargo_riding_now(&world.physics)
             .into_iter()
             .filter(|c| c.1 == i)
             .map(|(e, _, centre, aboard)| (e, inv.transform_point3(centre), aboard))
