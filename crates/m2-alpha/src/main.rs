@@ -15083,6 +15083,17 @@ mod tests {
         assert!(boat_settled(Vec3::new(10.3, -34.0, 5.0), authored, 0.99).is_err());
     }
 
+    // The M1A2 with its turret and gun each a hundredth of its 32,000 kg
+    // chassis (0x82273E48): 18 + 9 x 32000/32640 = 26.82, Xenia tank3b's
+    // 26.83 (all three bodies, -0.4471 a 1/60 s step); with its records'
+    // 14,132 kg it was 24.25.
+    #[test]
+    fn an_m1a2_falls_as_xenia_measured_with_its_hinged_parts_sized() {
+        let fall = joined_tank_fall(2.0, 2.0, 32_000.0, 640.0);
+        assert!((fall - XENIA_M1A2_FALL).abs() < 0.05, "{fall}");
+        assert!((joined_tank_fall(2.0, 2.0, 32_000.0, 14_132.0) - 24.25).abs() < 0.05);
+    }
+
     // A scaled tank's airborne fall by the code: 18 for all its bodies,
     // plus the tracks' 9 on its chassis shared over all its mass; 27 with
     // no turret, less with one.
@@ -15447,8 +15458,13 @@ fn ditch_check(game: &mut Game, tick: f32) {
 /// to come to [`joined_tank_fall`]'s, m/s².
 const SCALED_TANK_SLACK: f32 = 0.5;
 
-/// A scaled tank's airborne fall, m/s², by the 360 code (not yet
-/// measured: Xenia's tank3): every one of its object's moving bodies,
+/// The M1A2's airborne fall in Xenia tank3b, m/s²: all three of its bodies
+/// (chassis, turret, gun) -0.4471 m/s a 1/60 s step.
+const XENIA_M1A2_FALL: f32 = 26.83;
+
+/// A scaled tank's airborne fall, m/s², by the 360 code (measured: Xenia
+/// tank3b's M1A2, [`XENIA_M1A2_FALL`], with its turret and gun sized as
+/// the code sizes them, `Physics`' `hinge_body`): every one of its object's moving bodies,
 /// chassis, turret and gun, is pulled at `scale` x the world's 9.0 by
 /// its gravity action (0x821831B0 gives each one, 0x82180778); and every
 /// step, with no gate on being airborne, `_TankPhysics`' step
@@ -15591,8 +15607,20 @@ fn vehicle_gravity_check(
         vehicle_gravity_scale(scale),
         WORLD_GRAVITY * vehicle_gravity_scale(scale)
     );
-    if (fall - want_fall).abs() <= slack {
+    // The M1A2 against Xenia's own measure too (tank3b).
+    let m1a2 = spec.label.starts_with("M1A2");
+    if m1a2 {
+        eprintln!(
+            "vehicle-gravity-check: Xenia tank3b's M1A2 fell at {XENIA_M1A2_FALL} (all three bodies); this one {fall:.2}"
+        );
+    }
+    let xenia_ok = !m1a2 || (fall - XENIA_M1A2_FALL).abs() <= slack;
+    if (fall - want_fall).abs() <= slack && xenia_ok {
         eprintln!("vehicle-gravity-check: PASS");
+    } else if !xenia_ok {
+        eprintln!(
+            "vehicle-gravity-check: FAIL it falls at {fall:.2}, not Xenia's {XENIA_M1A2_FALL} +- {slack}"
+        );
     } else {
         eprintln!("vehicle-gravity-check: FAIL it falls at {fall:.2}, not {want_fall} +- {slack}");
     }

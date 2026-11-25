@@ -182,6 +182,34 @@ fn chassis_mass(c: &crate::vehicle::Chassis, mass: Option<f32>) -> (f32, Mat3) {
     }
 }
 
+/// A hinged part's body (a tank's turret or its gun) as the 360's turret
+/// update sizes it against its vehicle's chassis body (0x82273E48, from
+/// 0x82273F90): with the chassis at least [`HINGE_LEAST`] kg, the part's
+/// mass is first set to [`HINGE_INERTIA_SHARE`] of the chassis's and its
+/// inertia scaled to that from its `PHY2` record's (0x82629D80, then
+/// 0x82167700, clipped as [`clip_inertia`]), then its mass alone set to
+/// [`HINGE_MASS_SHARE`] of the chassis's (0x82629D80 again, which leaves
+/// the inertia be). Xenia tank3b: the M1A2's turret and gun 320 kg each
+/// (inverse mass 1/320) on its 32,000 kg chassis. A lighter chassis
+/// leaves the record as it is.
+pub(crate) fn hinge_body(record: crate::vehicle::Chassis, chassis: f32) -> crate::vehicle::Chassis {
+    if chassis.is_nan() || chassis < HINGE_LEAST || record.mass <= 0.0 {
+        return record;
+    }
+    crate::vehicle::Chassis {
+        mass: chassis * HINGE_MASS_SHARE,
+        inertia: clip_inertia(record.inertia * (chassis * HINGE_INERTIA_SHARE / record.mass)),
+        centre_of_mass: record.centre_of_mass,
+    }
+}
+
+/// [`hinge_body`]'s constants, from the 360 code (0x82273E48): the least
+/// chassis mass (0x820B7A44), the share its inertia is scaled to
+/// (0x820BB468) and the share it keeps as its mass (0x820B7AE0).
+const HINGE_LEAST: f32 = 1.0e-4;
+const HINGE_INERTIA_SHARE: f32 = 0.1;
+const HINGE_MASS_SHARE: f32 = 0.01;
+
 /// A static collision shape, shared between every place it is used.
 #[derive(Clone)]
 pub struct CollisionShape {
@@ -4614,6 +4642,7 @@ impl Physics {
     fn add_gun(
         &mut self,
         gun: &crate::vehicle::GunBody,
+        chassis_mass: f32,
         trunnion: Vec3,
         turret: r::RigidBodyHandle,
         position: Vec3,
@@ -4622,7 +4651,9 @@ impl Physics {
         groups: r::InteractionGroups,
         friction: f32,
     ) -> GunHinge {
-        let m = gun.mass;
+        // Sized against the chassis as the turret is ([`hinge_body`]; Xenia
+        // tank3b: the M1A2's gun 320 kg, as its turret).
+        let m = hinge_body(gun.mass, chassis_mass);
         let body = self.world.insert_body(
             r::RigidBodyBuilder::dynamic()
                 .pose(pose(position, rotation))
@@ -4885,7 +4916,11 @@ impl Physics {
             })
             .collect();
         let hinge = match (spec.turret_mass, spec.turret_mount()) {
-            (Some(m), Some(mount)) if !shapes.is_empty() => {
+            (Some(record), Some(mount)) if !shapes.is_empty() => {
+                // Sized against the chassis as the 360's turret update
+                // sizes it ([`hinge_body`]).
+                let chassis_mass = m;
+                let m = hinge_body(record, chassis_mass);
                 let turret_body = self.world.insert_body(
                     r::RigidBodyBuilder::dynamic()
                         .pose(pose(position, rotation))
@@ -4930,6 +4965,7 @@ impl Physics {
                     .map(|(g, trunnion)| {
                         self.add_gun(
                             g,
+                            chassis_mass,
                             trunnion,
                             turret_body,
                             position,
@@ -8530,6 +8566,26 @@ mod tests {
         }
     }
 
+    // A hinged part is sized against its chassis (0x82273E48): its mass a
+    // hundredth of the chassis's, its inertia its record's scaled to a
+    // tenth of the chassis's mass (then clipped). The M1A2's turret record
+    // (6100.8 kg) on its 32,000 kg chassis: 320 kg, as Xenia tank3b read
+    // (inverse mass 1/320). A chassis under 1e-4 kg leaves the record.
+    #[test]
+    fn a_hinged_part_is_a_hundredth_of_its_chassis() {
+        let record = crate::vehicle::Chassis {
+            mass: 6100.8,
+            inertia: Mat3::from_diagonal(Vec3::new(9000.0, 12000.0, 8000.0)),
+            centre_of_mass: Vec3::new(0.0, 2.0, 0.5),
+        };
+        let h = hinge_body(record, 32_000.0);
+        assert!((h.mass - 320.0).abs() < 1e-3, "{}", h.mass);
+        assert_eq!(h.centre_of_mass, record.centre_of_mass);
+        let want = clip_inertia(record.inertia * (3200.0 / 6100.8));
+        assert!((h.inertia.col(0) - want.col(0)).length() < 1e-2);
+        assert_eq!(hinge_body(record, 0.0).mass, 6100.8);
+    }
+
     // A turret on its own body follows the angle asked on its hinge's
     // motor (20 x the angle to go, a second; 0x82273F90): asked to move at
     // 1 rad/s it keeps up a twentieth of a second behind, and turns the
@@ -8539,12 +8595,14 @@ mod tests {
         // 0x82182418: every body's mass summed; 0 once one does not move.
         let mut p = Physics::new();
         let id = p.add_vehicle(&gun_tank(), Vec3::new(0.0, 0.5, 0.0), 0.0);
+        // Its turret and gun each a hundredth of its 30,000 kg chassis
+        // ([`hinge_body`], 0x82273E48), not their records' mass.
         let m = p.vehicle_mass(id).unwrap();
-        assert!((m - 33_080.0).abs() < 1.0, "{m}");
+        assert!((m - 30_600.0).abs() < 1.0, "{m}");
         p.hold_vehicle(id, true);
         assert_eq!(p.vehicle_mass(id), Some(0.0));
         p.hold_vehicle(id, false);
-        assert!((p.vehicle_mass(id).unwrap() - 33_080.0).abs() < 1.0);
+        assert!((p.vehicle_mass(id).unwrap() - 30_600.0).abs() < 1.0);
         // A car alone: its chassis.
         let alone = p.add_vehicle(&car(), Vec3::new(10.0, 0.5, 0.0), 0.0);
         assert!((p.vehicle_mass(alone).unwrap() - car().mass).abs() < 1.0);
