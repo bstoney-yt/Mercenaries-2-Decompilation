@@ -14030,7 +14030,10 @@ fn parked_settle_check(
             let moved = now_at.distance(*at);
             let turned = now_turn.angle_between(*turn).to_degrees();
             let up = m.transform_vector3(Vec3::Y).normalize_or_zero().y;
-            let speed = world.physics.vehicle_speed(id);
+            // Its whole speed: `vehicle_speed` is the signed speed along
+            // its heading, so one rolling back at 0.6 m/s passed as still
+            // (q769: two Fuel Trailers judged at -0.68 and -0.58 m/s).
+            let speed = world.physics.vehicle_velocity(id).length();
             // A boat floats where the water puts it (`game::place`: level,
             // at its float depth), not at its authored height or tilt: it
             // is judged by its own rule.
