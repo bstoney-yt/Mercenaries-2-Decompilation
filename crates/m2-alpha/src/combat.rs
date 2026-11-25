@@ -737,20 +737,25 @@ fn blast_push_vehicle(
     // One blast's impulses together, their change topped up per axis
     // against the speed before (0x8215BF38): each blast on its own, as
     // each explosion action pushes in its own step call.
+    // Each impulse per kg times the body's own mass, as 0x8215CBC8 sizes it
+    // (0x8262C120 of the body it pushes), so its speed change is the per-kg
+    // push whatever the body weighs (q728 30d6b115: sized by the spec's
+    // mass, half the Phoenix body's, every push came out halved).
+    let mass = physics.vehicle_chassis_mass(id).unwrap_or(v.spec.mass);
     let pushes: Vec<(Vec3, Vec3)> = push
         .rigid_pushes(lo, hi, fudge(v))
         .into_iter()
-        .map(|(per_kg, point)| (per_kg * v.spec.mass, point))
+        .map(|(per_kg, point)| (per_kg * mass, point))
         .collect();
     let before = physics.vehicle_velocity(id);
     physics.push_vehicle_topped(id, &pushes);
     // Log only: the push's linear change before and after the per-axis
     // top-up (0x8215BF38), up part apart.
-    let raw: Vec3 = pushes.iter().map(|p| p.0).sum::<Vec3>() / v.spec.mass.max(1.0);
+    let raw: Vec3 = pushes.iter().map(|p| p.0).sum::<Vec3>() / mass.max(1.0);
     let topped = physics.vehicle_velocity(id) - before;
     eprintln!(
-        "blast push: the {} from {before:.3}: raw {raw:.3} (up {:.3}), topped {topped:.3} (up {:.3})",
-        v.spec.label, raw.y, topped.y
+        "blast push: the {} (body {mass:.0} kg, spec {:.0} kg) from {before:.3}: raw {raw:.3} (up {:.3}), topped {topped:.3} (up {:.3})",
+        v.spec.label, v.spec.mass, raw.y, topped.y
     );
 }
 
