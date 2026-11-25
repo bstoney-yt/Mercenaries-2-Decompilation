@@ -13843,6 +13843,9 @@ const SETTLE_AFTER: f32 = 5.0;
 /// about a third more for other vehicles' suspension, and 5 degrees is
 /// well over its tilt.
 const SETTLE_MOST: (f32, f32, f32) = (0.35, 5.0, 0.05);
+/// Over how long before it is judged `--parked-settle-check` measures how
+/// fast a vehicle is moving, seconds.
+const SETTLE_STILL_OVER: f32 = 0.5;
 
 /// How long `--parked-settle-check` notes what each vehicle touches after
 /// it is placed, seconds, and the one whose every touch is logged as it
@@ -13937,7 +13940,14 @@ fn parked_settle_check(
     #[allow(clippy::type_complexity)]
     let mut watched: HashMap<
         u32,
-        (Vec3, Quat, f32, String, std::collections::BTreeSet<String>),
+        (
+            Vec3,
+            Quat,
+            f32,
+            String,
+            std::collections::BTreeSet<String>,
+            Option<Vec3>,
+        ),
     > = HashMap::new();
     let (mut passed, mut failed) = (0usize, Vec::new());
     let mut judged = std::collections::HashSet::new();
@@ -13966,6 +13976,31 @@ fn parked_settle_check(
             if judged.contains(&key) || watched.contains_key(&key) {
                 continue;
             }
+            // As it is placed: how far each corner of its hull's bottom is
+            // over what is under it (past its own bodies; negative: in it),
+            // to tell a hull put into the ground (q766 B: the Phoenix
+            // 0x10d5d8 flipped 178 deg touching only the terrain). Log only.
+            if let Some(m) =
+                v.id.and_then(|id| world.physics.vehicle_transform(id).zip(Some(id)))
+            {
+                let (m, id) = m;
+                let (lo, hi) = v.spec.hull;
+                let gaps: Vec<String> = [(lo.x, lo.z), (hi.x, lo.z), (lo.x, hi.z), (hi.x, hi.z)]
+                    .iter()
+                    .map(|&(x, z)| {
+                        let corner = m.transform_point3(Vec3::new(x, lo.y, z));
+                        world
+                            .physics
+                            .cast_ray_past(corner + Vec3::Y * 2.0, Vec3::NEG_Y, 6.0, id)
+                            .map_or("none".to_owned(), |(d, _)| format!("{:+.2}", d - 2.0))
+                    })
+                    .collect();
+                eprintln!(
+                    "parked-settle-check: {key:#x} {} placed: its hull's bottom corners over the ground [{}] m",
+                    v.spec.label,
+                    gaps.join(", ")
+                );
+            }
             watched.insert(
                 key,
                 (
@@ -13974,11 +14009,12 @@ fn parked_settle_check(
                     0.0,
                     v.spec.label.clone(),
                     std::collections::BTreeSet::new(),
+                    None,
                 ),
             );
         }
         let mut done = Vec::new();
-        for (&entity, (at, turn, since, label, touched)) in &mut watched {
+        for (&entity, (at, turn, since, label, touched, mark)) in &mut watched {
             *since += tick;
             // What it touches as it is placed and over its first second
             // (log lines only; q766 B's Phoenix 0x10d5d8 flipped 152 deg
@@ -14005,6 +14041,20 @@ fn parked_settle_check(
                     );
                 }
                 touched.extend(now);
+            }
+            // Where it is half a second before it is judged: it is still
+            // if it has moved under SETTLE_MOST.2 m/s since.
+            if mark.is_none()
+                && *since >= SETTLE_AFTER - SETTLE_STILL_OVER
+                && let Some(id) = game
+                    .scene
+                    .vehicles
+                    .iter()
+                    .find(|v| v.spot.is_some_and(|s| s.0 == entity) || v.guid == Some(entity))
+                    .and_then(|v| v.id)
+                && let Some(m) = world.physics.vehicle_transform(id)
+            {
+                *mark = Some(m.w_axis.truncate());
             }
             if *since < SETTLE_AFTER {
                 continue;
@@ -14056,6 +14106,10 @@ fn parked_settle_check(
                 }
                 continue;
             }
+            // How fast it moved over the last half second (q766: one
+            // step's velocity read 0.06 m/s on every vehicle at rest).
+            let instant = speed;
+            let speed = mark.map_or(instant, |p| now_at.distance(p) / SETTLE_STILL_OVER);
             let ok = moved <= SETTLE_MOST.0
                 && turned <= SETTLE_MOST.1
                 && up > 0.5
@@ -14063,13 +14117,24 @@ fn parked_settle_check(
             if ok {
                 passed += 1;
             } else {
+                // Past its own bodies (q766 A: four Guntrucks' probe met
+                // their own hulls, -2.00).
                 let from = *at + Vec3::Y * 2.0;
-                let under = world.physics.cast_ray(from, Vec3::NEG_Y, 5.0).map_or(
-                    "nothing within 3 m under its authored place".to_owned(),
-                    |(d, _)| format!("something {:.2} m under its authored place", d - 2.0),
-                );
+                let under = world
+                    .physics
+                    .cast_ray_past(from, Vec3::NEG_Y, 5.0, id)
+                    .map_or(
+                        "nothing within 3 m under its authored place (past its own bodies)"
+                            .to_owned(),
+                        |(d, _)| {
+                            format!(
+                                "something {:+.2} m under its authored place (past its own bodies)",
+                                d - 2.0
+                            )
+                        },
+                    );
                 let line = format!(
-                    "{entity:#x} {label}: {moved:.2} m from its authored place, {turned:.1} deg turned, up {up:.2}, {speed:.2} m/s; {under}; touched in its first second: [{}]",
+                    "{entity:#x} {label}: {moved:.2} m from its authored place, {turned:.1} deg turned, up {up:.2}, {speed:.3} m/s over the last {SETTLE_STILL_OVER} s ({instant:.2} m/s this step); {under}; touched in its first second: [{}]",
                     touched.iter().cloned().collect::<Vec<_>>().join("; ")
                 );
                 eprintln!("parked-settle-check: off: {line}");
