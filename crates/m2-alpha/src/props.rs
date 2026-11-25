@@ -857,22 +857,10 @@ impl Props {
 
     /// What is loaded on vehicles: each prop, its vehicle's index, the
     /// middle of its collision box (world) and whether it is still aboard.
-    pub fn cargo_riding(&self) -> Vec<(u32, usize, Vec3, bool)> {
-        self.cargo
-            .iter()
-            .filter_map(|(&e, r)| {
-                let p = self.shown.get(&e)?;
-                let at = Mat4::from_rotation_translation(p.rotation, p.position);
-                let (lo, hi) = r.bounds;
-                Some((e, r.vehicle, at.transform_point3((lo + hi) * 0.5), r.aboard))
-            })
-            .collect()
-    }
-
-    /// As [`cargo_riding`](Self::cargo_riding), but each from where its
-    /// body is now rather than where it was last shown: right after the
-    /// bodies are moved (`--cargo-check`'s rigid move to a clear
-    /// straight), before the props follow them ([`carry`](Self::carry)).
+    /// Read from where its body is now, not where it was last shown: so
+    /// right after the bodies are moved (`--cargo-check`'s rigid move to
+    /// a clear straight), before the props follow ([`carry`](Self::carry)),
+    /// it is where they went.
     pub fn cargo_riding_now(&self, physics: &Physics) -> Vec<(u32, usize, Vec3, bool)> {
         self.cargo
             .iter()
@@ -3061,7 +3049,7 @@ mod tests {
         );
         let moved = Mat4::from_translation(Vec3::new(40.0, 0.0, 0.0));
         physics.move_debris(body, moved * at);
-        let shown = props.cargo_riding()[0].2;
+        let shown = props.shown[&9].position;
         let now = props.cargo_riding_now(&physics)[0];
         assert!(shown.distance(Vec3::new(0.0, 100.0, 0.0)) < 1e-3, "{shown}");
         assert_eq!((now.0, now.1, now.3), (9, 3, true));

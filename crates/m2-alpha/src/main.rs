@@ -9583,7 +9583,10 @@ fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, lab
         let turn = Mat4::from_translation(here)
             * Mat4::from_rotation_y(k as f32 * std::f32::consts::FRAC_PI_4)
             * Mat4::from_translation(-here);
-        world.physics.place_vehicle(id, turn * m);
+        {
+            let (_, r, t) = (turn * m).to_scale_rotation_translation();
+            world.physics.place_vehicle(id, t, r);
+        }
         for d in game.scene.props.cargo_pieces(i) {
             if let Some(at) = world.physics.debris_place(d) {
                 world.physics.move_debris(d, turn * at);
@@ -9632,7 +9635,10 @@ fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, lab
     let moved = Mat4::from_translation(to)
         * Mat4::from_rotation_y(k as f32 * std::f32::consts::FRAC_PI_4)
         * Mat4::from_translation(-here);
-    world.physics.place_vehicle(id, moved * m);
+    {
+        let (_, r, t) = (moved * m).to_scale_rotation_translation();
+        world.physics.place_vehicle(id, t, r);
+    }
     for d in game.scene.props.cargo_pieces(i) {
         if let Some(at) = world.physics.debris_place(d) {
             world.physics.move_debris(d, moved * at);

@@ -6526,21 +6526,6 @@ impl Physics {
         }
     }
 
-    /// Puts a vehicle's body at `at` (world; scale ignored), at rest: a
-    /// check's set-up (`--cargo-check` turning the truck to a clear
-    /// straight), not the game's.
-    pub fn place_vehicle(&mut self, id: VehicleId, at: Mat4) {
-        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
-            return;
-        };
-        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
-            let (_, rotation, translation) = at.to_scale_rotation_translation();
-            body.set_position(pose(translation, rotation.normalize()), true);
-            body.set_linvel(vector(Vec3::ZERO), true);
-            body.set_angvel(vector(Vec3::ZERO), true);
-        }
-    }
-
     /// Sets a vehicle's velocity, m/s (as it was before something it hit
     /// gave way).
     pub fn set_vehicle_velocity(&mut self, id: VehicleId, velocity: Vec3) {
