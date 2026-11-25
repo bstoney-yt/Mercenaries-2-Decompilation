@@ -52,6 +52,15 @@ const BOAT_REFERENCE_SPEED: f32 = 25.0;
 /// A vehicle not loaded after this many seconds never will be.
 const GIVE_UP: f32 = 30.0;
 
+/// How many spawners [`Traffic::nearest_road`] turned away, by why: no
+/// route (it stands), nothing on its list, its layer not in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoadRejects {
+    pub standing: usize,
+    pub nothing_listed: usize,
+    pub layer_out: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct Traffic {
     /// Spawners by entity, once the island is indexed.
@@ -425,6 +434,54 @@ fn look_ahead(route: &[Vec3], next: usize, closed: bool, here: Vec3, ahead: f32)
 }
 
 impl Traffic {
+    /// Whether layer entity `e` is one of the traffic spawners'.
+    pub fn is_traffic(&self, e: u32) -> bool {
+        self.points.contains_key(&e)
+    }
+
+    /// The traffic spawner nearest `focus` that sends a car along a road
+    /// (a route of two or more waypoints, something on its list) and whose
+    /// layer is in (`layer_in`, as [`spawn`](Self::spawn) asks it), for
+    /// `--traffic` to stand her by: its entity, its name, where its car
+    /// starts and which way, and its reach; and how many spawners each
+    /// filter turned away. `None` before the spawners are read
+    /// ([`spawn`](Self::spawn) reads them).
+    #[allow(clippy::type_complexity)]
+    pub fn nearest_road(
+        &self,
+        focus: Vec3,
+        layer_in: impl Fn(Option<u32>) -> bool,
+    ) -> (Option<(u32, String, Vec3, Vec3, f32)>, RoadRejects) {
+        let mut rejects = RoadRejects::default();
+        let best = self
+            .points
+            .values()
+            .filter(|t| {
+                if t.route.len() < 2 {
+                    rejects.standing += 1;
+                    false
+                } else if t.vehicles.is_empty() {
+                    rejects.nothing_listed += 1;
+                    false
+                } else if !layer_in(t.layer) {
+                    rejects.layer_out += 1;
+                    false
+                } else {
+                    true
+                }
+            })
+            .min_by(|a, b| {
+                flat(a.position - focus)
+                    .length()
+                    .total_cmp(&flat(b.position - focus).length())
+            })
+            .map(|t| {
+                let (at, forward) = start_of(t);
+                (t.entity, t.name.clone(), at, forward, t.spawner.reach())
+            });
+        (best, rejects)
+    }
+
     /// A line per traffic vehicle out: what, where, how fast, which
     /// waypoint; and the spawners nearest `focus`, for checking.
     pub fn report(
@@ -650,6 +707,65 @@ mod tests {
         assert_eq!(start_of(&t), (Vec3::new(50.0, 0.0, 50.0), Vec3::X));
         t.route.clear();
         assert_eq!(start_of(&t).0, t.position);
+    }
+
+    // `--traffic` stands her by the nearest spawner that sends a car along
+    // a road with its layer always in: not a standing one, not one with
+    // nothing to send, not one in a mission's state layer.
+    #[test]
+    fn the_nearest_road_spawner_sends_a_car_along_a_road() {
+        let point =
+            |entity: u32, x: f32, route: usize, list: bool, layer: Option<u32>| TrafficPoint {
+                entity,
+                name: format!("p{entity}"),
+                position: Vec3::new(x, 0.0, 0.0),
+                rotation: m2_math::glam::Quat::IDENTITY,
+                layer,
+                static_layer: false,
+                spawner: m2_engine::population::Spawner {
+                    list: 0,
+                    seconds_per_cycle: 10.0,
+                    active_radius: 120.0,
+                    kind: 0,
+                    far: None,
+                },
+                vehicles: if list {
+                    vec![("Taxi".to_owned(), 1.0)]
+                } else {
+                    Vec::new()
+                },
+                route: (0..route)
+                    .map(|k| Vec3::new(x, 0.0, k as f32 * 30.0))
+                    .collect(),
+                haste: None,
+            };
+        let mut t = Traffic::default();
+        assert!(t.nearest_road(Vec3::ZERO, |_| true).0.is_none());
+        for p in [
+            point(1, 10.0, 0, true, None),
+            point(2, 20.0, 3, false, None),
+            point(3, 30.0, 3, true, Some(7)),
+            point(4, 400.0, 3, true, None),
+            point(5, 900.0, 2, true, None),
+        ] {
+            t.points.insert(p.entity, p);
+        }
+        // Layer 7 not in: the state layer's one is turned away.
+        let (best, rejects) = t.nearest_road(Vec3::ZERO, |l| l.is_none());
+        let (e, _, at, forward, reach) = best.unwrap();
+        assert_eq!((e, reach), (4, 120.0));
+        assert_eq!(at, Vec3::new(400.0, 0.0, 0.0));
+        assert_eq!(forward, Vec3::Z);
+        assert_eq!(
+            rejects,
+            RoadRejects {
+                standing: 1,
+                nothing_listed: 1,
+                layer_out: 1
+            }
+        );
+        // Its layer in, it is the nearest.
+        assert_eq!(t.nearest_road(Vec3::ZERO, |_| true).0.unwrap().0, 3);
     }
 
     #[test]
