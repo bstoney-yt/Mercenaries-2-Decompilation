@@ -2448,6 +2448,7 @@ impl Scene {
         let y = world.index.rough_height(x, z) + 40.0;
         self.focus = (Vec3::new(x, y, z), Vec3::new(x, y - 20.0, z + 60.0));
         self.props.physics_props = world.index.template_db.prop_physics.clone();
+        self.props.gravity_scales = world.index.template_db.gravity_scales.clone();
         self.people.mixer_profiles = world.index.template_db.mixer_profiles.clone();
         self.world = Some(world);
 

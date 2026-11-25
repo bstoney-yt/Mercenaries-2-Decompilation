@@ -2494,9 +2494,29 @@ impl Game {
         if let Some(world) = &mut self.scene.world
             && (!self.on_foot || self.scene.player.as_ref().is_none_or(|p| p.landed))
         {
-            self.scene
-                .people
-                .update(&mut world.physics, &world.index.spawns, focus, threat, dt);
+            // Their path searches meet the hinted objects' `AiHintNode`
+            // points, as the vehicles' do.
+            let (objects, props, path_hints) =
+                (&world.index.objects, &self.scene.props, &self.path_hints);
+            let hints = |key: StaticKey| {
+                path_hints.of(key, |k| match k {
+                    StaticKey::Object(i) => {
+                        objects.get(i).map(|o| (o.template, o.position, o.rotation))
+                    }
+                    StaticKey::Entity(e) => props
+                        .get(e)
+                        .map(|(p, _)| (p.template, p.position, p.rotation)),
+                    _ => None,
+                })
+            };
+            self.scene.people.update_with_hints(
+                &mut world.physics,
+                &world.index.spawns,
+                focus,
+                threat,
+                &hints,
+                dt,
+            );
             self.social.step(
                 &world.index,
                 &world.destroyed,
@@ -7272,6 +7292,12 @@ mod picture_tests {
 /// own filters are not modelled); the threat's eye is taken 1.3 m over
 /// where she stands (inferred).
 fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
+    crate::npc::fight_time::time(crate::npc::fight_time::COVER, || {
+        serve_cover_untimed(world, people)
+    });
+}
+
+fn serve_cover_untimed(world: &m2_engine::World, people: &mut crate::npc::People) {
     use m2_engine::ai_cover::{self, Placed, Request};
     let asks: Vec<(usize, Vec3, Vec3)> = people
         .npcs
@@ -7296,6 +7322,8 @@ fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
             avoid,
         };
         let mut cands = Vec::new();
+        // Each candidate's cover object, for its claim.
+        let mut objects: Vec<u32> = Vec::new();
         for (o, _) in world.near(centre, ai_cover::SEARCH) {
             let p = &world.index.objects[o];
             let Some(hints) = world.index.template_db.cover_hints.get(&p.template) else {
@@ -7310,7 +7338,9 @@ fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
                 bounds: model.bounds,
             };
             for h in hints {
-                cands.extend(ai_cover::candidates(&req, &placed, h));
+                let c = ai_cover::candidates(&req, &placed, h);
+                objects.extend(std::iter::repeat_n(o as u32, c.len()));
+                cands.extend(c);
             }
         }
         let physics = &world.physics;
@@ -7325,9 +7355,27 @@ fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
                 .cast_ray(a, to, to.length())
                 .is_some_and(|(d, _)| d < to.length() - 0.05)
         };
-        let found = ai_cover::choose(&req, &cands, ground, blocked);
+        let picked = ai_cover::choose_index(&req, &cands, ground, blocked);
+        // As he starts for it, he claims it (0x822C7CF0 -> 0x822EDA60), and
+        // again each update for 2 s ([`crate::npc::People`]): refused, the
+        // spot goes into his list for 10 s and he has none.
+        let found = picked.and_then(|(at, k)| {
+            let object = objects[k];
+            if people.cover_claims.claim(i as u32, object, centre, at) {
+                Some((at, object))
+            } else {
+                eprintln!(
+                    "people: {:08x} cover at {at:.1} refused: claimed by another",
+                    people.npcs[i].spawn.unwrap_or(u32::MAX)
+                );
+                people.npcs[i].destination_refused(at);
+                None
+            }
+        });
         let n = &mut people.npcs[i];
         n.cover_ask = None;
+        n.cover_claim = found.map(|(_, object)| (object, 0.0));
+        let found = found.map(|(at, _)| at);
         n.cover_spot = found;
         if let Some(at) = found {
             eprintln!(
