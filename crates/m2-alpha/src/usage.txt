@@ -50,6 +50,9 @@ m2-alpha [options]
   --load-slot <n>        the whole game, with Load Game of save slot n (0 the
                          autosave, 1-20 the player's) taken as soon as the
                          front end is up (the launcher's Play on a save)
+  --launch-check         with --new-game or --load-slot: ends once play has
+                         started from it, PASS if as asked (the save read and
+                         its hero up; a new game as the --hero), else FAIL
   --shell-click <x,y>    a left click there (screen pixels) in --front-end,
                          in its turn among the --shell-keys
   --after-contract <s>   with --mission --autoplay --screenshot: play on
