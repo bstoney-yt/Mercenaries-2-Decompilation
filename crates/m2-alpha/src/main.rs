@@ -258,6 +258,9 @@ struct Options {
     /// With `--drive` and `--wreck` or `--shoot-up`: get out of the wreck,
     /// walk to the fuel can it left and take it (testing).
     fuel_check: bool,
+    /// `--ragdoll-check`: the ragdoll camera driven by a scripted look,
+    /// offscreen, PASS/FAIL against the 360 ([`game::ragdoll_check`]).
+    ragdoll_check: bool,
     /// `--survival-check`: her health clamp and survival mode on the
     /// game's own code, offscreen ([`combat::survival_check`]); then exit.
     survival_check: bool,
@@ -869,6 +872,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.drive = true;
             }
             "--fuel-check" => o.fuel_check = true,
+            "--ragdoll-check" => o.ragdoll_check = true,
             "--survival-check" => o.survival_check = true,
             "--log-check" => o.log_check = true,
             "--shoot-up" => {
@@ -1803,6 +1807,9 @@ fn run(
     if options.write_config {
         print!("{}", config.to_toml());
         return Ok(());
+    }
+    if options.ragdoll_check {
+        errlog::exit(if game::ragdoll_check() { 0 } else { 1 });
     }
     let install = match &config.install {
         Some(dir) => Some(Install::find(dir)?),
