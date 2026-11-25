@@ -12976,19 +12976,19 @@ impl ApplicationHandler for App {
 mod tests {
     use super::*;
 
-    // A boat is judged afloat, upright and near where it was authored,
-    // not at its authored height (q766 B).
+    // A boat may drop and tilt as it settles (the 360's moored boats
+    // dropped up to 2.33 m, boat1) but not move level more than a few
+    // centimetres, nor capsize.
     #[test]
-    fn a_boat_settles_afloat_upright_and_near_its_place() {
+    fn a_boat_settles_where_it_was_authored_however_far_it_drops() {
         use m2_math::glam::Vec3;
-        let authored = Vec3::new(10.0, 1.2, 5.0);
-        let afloat = Some(-0.3);
-        let here = Vec3::new(11.5, -0.4, 5.0);
-        assert!(boat_settled(here, authored, 0.99, afloat).is_ok());
-        assert!(boat_settled(here, authored, 0.5, afloat).is_err());
-        assert!(boat_settled(here, authored, 0.99, None).is_err());
-        assert!(boat_settled(Vec3::new(11.5, -2.0, 5.0), authored, 0.99, afloat).is_err());
-        assert!(boat_settled(Vec3::new(20.0, -0.3, 5.0), authored, 0.99, afloat).is_err());
+        let authored = Vec3::new(10.0, -31.713, 5.0);
+        let dropped = Vec3::new(10.01, -34.045, 5.0);
+        assert!(boat_settled(dropped, authored, 0.99,).is_ok());
+        // Tilted 7 degrees: still fine.
+        assert!(boat_settled(dropped, authored, 7f32.to_radians().cos()).is_ok());
+        assert!(boat_settled(dropped, authored, 0.2).is_err());
+        assert!(boat_settled(Vec3::new(10.3, -34.0, 5.0), authored, 0.99).is_err());
     }
 
     #[test]
@@ -13878,39 +13878,37 @@ fn settle_touch_name(world: &m2_engine::World, key: Option<m2_engine::StaticKey>
     }
 }
 
-/// What `--parked-settle-check` allows a boat, by its own rule: metres
-/// level from its authored place, metres from the height it floats at,
-/// and the least up (its up axis's height). **Invented**: a boat is
-/// placed floating at its float depth, level ([`game::place`]), and rides
-/// the water from there, so its authored height and tilt don't apply
-/// (q766 B: four boats 0.67-2.33 m off their authored places).
-const BOAT_SETTLE: (f32, f32, f32) = (3.0, 0.5, 0.9);
+/// What `--parked-settle-check` allows a boat: metres it may move level
+/// from its authored place, and the least up (its up axis's height: not
+/// capsized). From Xenia's boat1 (OilCon020, 2026-11-25): the 360's moored
+/// boats appear at their authored transforms and drop and settle within
+/// about 7 s, then stay put. GunningBoat 0xFA47B dropped 0.906 m and
+/// drifted 2.2 cm in its last 20 s; the fishing boats 0xD5FC6, 0xD5FC4 and
+/// 0xD5FC7 dropped 0.765, 2.332 and 0.673 m, tilted 6-7 degrees, and moved
+/// under 1 cm level. So any drop and any tilt short of capsizing are
+/// allowed; level movement must stay within a few centimetres.
+const BOAT_SETTLE: (f32, f32) = (0.05, 0.5);
 
 /// A boat judged by [`BOAT_SETTLE`]: at `now`, authored at `authored`,
-/// `up` its up axis's height, `afloat` the height it floats at (`None`:
-/// no water here). In water, upright and near its authored place.
+/// `up` its up axis's height. It may drop and tilt as it settles; it must
+/// stay where it was authored, level, and not capsize.
 fn boat_settled(
     now: m2_math::glam::Vec3,
     authored: m2_math::glam::Vec3,
     up: f32,
-    afloat: Option<f32>,
 ) -> Result<(), String> {
-    let (level, depth, least_up) = BOAT_SETTLE;
-    let Some(afloat) = afloat else {
-        return Err("no water here".to_owned());
-    };
+    let (level, least_up) = BOAT_SETTLE;
     let off = now.with_y(0.0).distance(authored.with_y(0.0));
-    let sunk = (now.y - afloat).abs();
-    if sunk > depth {
+    let drop = authored.y - now.y;
+    if up < least_up {
         return Err(format!(
-            "{sunk:.2} m off the height it floats at ({afloat:.2}), not in the water"
+            "capsized (up {up:.2}); dropped {drop:+.2} m, {off:.3} m level"
         ));
     }
-    if up < least_up {
-        return Err(format!("not upright (up {up:.2})"));
-    }
     if off > level {
-        return Err(format!("{off:.2} m level from its authored place"));
+        return Err(format!(
+            "{off:.3} m level from its authored place (dropped {drop:+.2} m)"
+        ));
     }
     Ok(())
 }
@@ -14038,11 +14036,14 @@ fn parked_settle_check(
             // at its float depth), not at its authored height or tilt: it
             // is judged by its own rule.
             if v.spec.is_boat() {
-                let afloat = world
-                    .physics
-                    .water()
-                    .map(|w| w - m2_engine::physics::float_depth(&v.spec));
-                match boat_settled(now_at, *at, up, afloat) {
+                // Its offset split, level and down (boat1: the 360's drops
+                // were 0.67-2.33 m, its level movement under 1 cm).
+                eprintln!(
+                    "parked-settle-check: {entity:#x} {label} (a boat): {:.3} m level, dropped {:+.3} m, up {up:.2}",
+                    now_at.with_y(0.0).distance(at.with_y(0.0)),
+                    at.y - now_at.y
+                );
+                match boat_settled(now_at, *at, up) {
                     Ok(()) => passed += 1,
                     Err(why) => {
                         let line = format!(
