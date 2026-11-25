@@ -44,6 +44,15 @@ pub enum Stage {
     Game,
 }
 
+/// What the launcher's Play starts once the front end is up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Start {
+    /// The front end's New Game, as the hero it has up (`--hero`).
+    NewGame,
+    /// Its Load Game, of this save slot (0 the autosave).
+    Slot(u32),
+}
+
 pub struct Flow {
     pub stage: Stage,
     install: Install,
@@ -165,6 +174,27 @@ impl Flow {
         self.enter_game(mixer);
         self.picked = Some(self.hero);
         eprintln!("flow: new game as {} (the check)", self.hero);
+    }
+
+    /// Does what the launcher's Play asked (`--new-game`, `--load-slot`)
+    /// as the front end's own New Game or Load Game does: play starts, as
+    /// the hero up or from the save in that slot.
+    pub fn start(&mut self, start: Start, mixer: &mut Mixer) {
+        if self.stage == Stage::Game {
+            return;
+        }
+        match start {
+            Start::NewGame => {
+                self.enter_game(mixer);
+                self.picked = Some(self.hero);
+                eprintln!("flow: new game as {} (the launcher)", self.hero);
+            }
+            Start::Slot(n) => {
+                self.news.load = Some(n);
+                self.enter_game(mixer);
+                eprintln!("flow: the launcher loads slot {n}");
+            }
+        }
     }
 
     /// How the scripts' movie that took the cover down went (once): its

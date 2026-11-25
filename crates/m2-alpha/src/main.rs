@@ -163,6 +163,8 @@ use scene::Scene;
 const TICK: Duration = Duration::from_nanos(1_000_000_000 / 60);
 /// How long `--newgame-cover-check` waits for the intro (invented).
 const COVER_CHECK_LIMIT: Duration = Duration::from_secs(240);
+/// How long `--launch-check` waits for play to start (invented).
+const LAUNCH_CHECK_LIMIT: Duration = Duration::from_secs(240);
 /// Longest real time a single frame may advance the simulation by, so a
 /// stall (dragging the window, a breakpoint) doesn't fast-forward the game.
 const MAX_FRAME: Duration = Duration::from_millis(250);
@@ -535,6 +537,15 @@ struct Options {
     /// soon as the front end is up; each frame logs the cover's state, and
     /// the run ends at the intro movie with PASS or FAIL ([`cover::Check`]).
     newgame_cover_check: bool,
+    /// `--new-game` or `--load-slot <n>` (the launcher's Play): what the
+    /// front end does as soon as it is up, as its own New Game or Load
+    /// Game would.
+    start: Option<flow::Start>,
+    /// `--launch-check`: with `--new-game` or `--load-slot`, the run ends
+    /// once play has started from it, PASS if it started as asked (the
+    /// save read and its hero up, or a new game as the `--hero`), FAIL on
+    /// anything else or after [`LAUNCH_CHECK_LIMIT`].
+    launch_check: bool,
     /// With `--screenshot` on foot and `--gait`: put the nearest soldier
     /// this many metres ahead of her at the start, at the water's height
     /// there, and log each second whether he swims (`npc-swim:` lines).
@@ -1341,6 +1352,18 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.face_test = Some(value()?.parse().context("--face-test expects seconds")?)
             }
             "--pause-at" => o.pause_at = Some(value()?.parse()?),
+            "--new-game" => o.start = Some(flow::Start::NewGame),
+            "--launch-check" => o.launch_check = true,
+            "--load-slot" => {
+                let n: u32 = value()?
+                    .parse()
+                    .context("--load-slot expects a slot number")?;
+                anyhow::ensure!(
+                    n <= PAUSE_SLOTS,
+                    "--load-slot {n}: slots go to {PAUSE_SLOTS}"
+                );
+                o.start = Some(flow::Start::Slot(n));
+            }
             "--newgame-cover-check" => {
                 o.newgame_cover_check = true;
                 o.alpha = true;
@@ -1368,7 +1391,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
     }
     // Launched plainly (only where the game is, the window and settings
     // named): the whole game, as `--alpha`.
-    const PLAIN: [&str; 18] = [
+    const PLAIN: [&str; 22] = [
         "--install",
         "--config",
         "--size",
@@ -1383,6 +1406,11 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
         "--skip-mode-off",
         "--skip-mode-on",
         "--script-join",
+        // The launcher's Play.
+        "--new-game",
+        "--load-slot",
+        "--hero",
+        "--launch-check",
         // Co-op plays the whole game too.
         "--host",
         "--join",
@@ -2009,6 +2037,8 @@ fn run(
         load_at: options.load_at,
         pause_at: options.pause_at,
         newgame_cover_check: options.newgame_cover_check,
+        start: options.start,
+        launch_check: options.launch_check,
         successor: None,
         state: None,
         error: None,
@@ -2332,8 +2362,9 @@ fn args_loading(args: impl IntoIterator<Item = String>, save: &std::path::Path) 
     let mut out = Vec::new();
     let mut args = args.into_iter();
     while let Some(a) = args.next() {
-        if a == "--load" || a == "--load-at" {
+        if a == "--load" || a == "--load-at" || a == "--load-slot" {
             args.next();
+        } else if a == "--new-game" {
         } else {
             out.push(a);
         }
@@ -2349,10 +2380,10 @@ fn args_front_end(args: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut args = args.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--load" => {
+            "--load" | "--load-slot" => {
                 args.next();
             }
-            "--to-front-end" => {}
+            "--to-front-end" | "--new-game" => {}
             _ => out.push(a),
         }
     }
@@ -13170,6 +13201,19 @@ struct Running {
     cover_check: Option<(cover::Check, Instant)>,
     /// The new game was started for the check.
     cover_check_started: bool,
+    /// `--new-game` or `--load-slot`, not yet done.
+    start: Option<flow::Start>,
+    /// `--launch-check`: what was asked, the hero play should start as
+    /// once known (the save's, read as it loads), and when it gives up.
+    launch_check: Option<LaunchCheck>,
+}
+
+/// `--launch-check`'s state.
+#[derive(Debug)]
+struct LaunchCheck {
+    start: flow::Start,
+    want: Option<Hero>,
+    limit: Instant,
 }
 
 struct App {
@@ -13223,6 +13267,10 @@ struct App {
     pause_at: Option<f32>,
     /// `--newgame-cover-check`.
     newgame_cover_check: bool,
+    /// `--new-game` or `--load-slot`.
+    start: Option<flow::Start>,
+    /// `--launch-check`.
+    launch_check: bool,
     /// The alpha started again (the pause menu's Quit, loading a save),
     /// which this one waits for once its window is closed.
     successor: Option<std::process::Child>,
@@ -13418,6 +13466,24 @@ impl App {
                 )
             }),
             cover_check_started: false,
+            launch_check: match (self.launch_check, self.start) {
+                (true, Some(start)) => {
+                    eprintln!(
+                        "launch-check: {start:?} once the front end is up; PASS needs play started from it as the hero asked"
+                    );
+                    Some(LaunchCheck {
+                        start,
+                        want: matches!(start, flow::Start::NewGame).then_some(self.config.hero),
+                        limit: Instant::now() + LAUNCH_CHECK_LIMIT,
+                    })
+                }
+                (true, None) => {
+                    eprintln!("launch-check: FAIL needs --new-game or --load-slot");
+                    errlog::exit(1);
+                }
+                _ => None,
+            },
+            start: self.start.take(),
         };
         running.apply_options(&self.config);
         Ok(running)
@@ -13536,6 +13602,38 @@ impl Running {
             };
             if let Some(line) = flow.cover.tick(inputs, dt as f32) {
                 eprintln!("{line}");
+            }
+        }
+        if let Some(check) = &self.launch_check {
+            let playing = self
+                .flow
+                .as_ref()
+                .is_some_and(|f| f.stage == flow::Stage::Game);
+            let hero = self.game.scene.hero;
+            match check.want {
+                Some(want) if playing && hero == want => {
+                    eprintln!(
+                        "launch-check: PASS {:?}: play started as {hero}",
+                        check.start
+                    );
+                    errlog::exit(0);
+                }
+                Some(want) if playing => {
+                    eprintln!(
+                        "launch-check: FAIL {:?}: play started as {hero}, not {want}",
+                        check.start
+                    );
+                    errlog::exit(1);
+                }
+                _ if now >= check.limit => {
+                    eprintln!(
+                        "launch-check: FAIL {:?}: play had not started from it after {} s",
+                        check.start,
+                        LAUNCH_CHECK_LIMIT.as_secs()
+                    );
+                    errlog::exit(1);
+                }
+                _ => {}
             }
         }
         if let Some((check, limit)) = &self.cover_check
@@ -14224,6 +14322,10 @@ impl Running {
             }
         };
         let hero = s.hero.unwrap_or(config.hero);
+        if let Some(check) = &mut self.launch_check {
+            eprintln!("launch-check: the save is read ({})", path.display());
+            check.want = Some(hero);
+        }
         config.hero = hero;
         if hero != self.game.scene.hero {
             eprintln!("hero: playing as {hero}");
@@ -14416,6 +14518,14 @@ impl Running {
                 if let Ok(mut mixer) = self.audio.out.mixer.lock() {
                     flow.start_new_game(&mut mixer);
                 }
+            }
+            // The launcher's Play: New Game or Load Game as soon as the
+            // front end is up.
+            if flow.at_front_end()
+                && let Some(start) = self.start.take()
+                && let Ok(mut mixer) = self.audio.out.mixer.lock()
+            {
+                flow.start(start, &mut mixer);
             }
             if let Some(how) = flow.take_intro_started()
                 && let Some((check, _)) = &mut self.cover_check
@@ -15434,6 +15544,17 @@ mod tests {
         assert_eq!(
             args_front_end(args),
             ["--size", "1280x720", "--to-front-end"]
+        );
+        // The launcher's Play is done once: Quit doesn't load it again.
+        let args = ["--load-slot", "3", "--new-game", "--size", "1280x720"].map(String::from);
+        assert_eq!(
+            args_front_end(args),
+            ["--size", "1280x720", "--to-front-end"]
+        );
+        let args = ["--alpha", "--load-slot", "3", "--new-game"].map(String::from);
+        assert_eq!(
+            args_loading(args, std::path::Path::new("new.toml")),
+            ["--alpha", "--load", "new.toml"]
         );
         assert_eq!(args_front_end(Vec::new()), ["--to-front-end"]);
     }
