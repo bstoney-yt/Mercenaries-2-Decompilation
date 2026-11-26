@@ -10280,8 +10280,18 @@ const CARGO_TRUCK: &str = "GunPickup";
 struct CargoWait {
     t: f32,
     put_at: Option<f32>,
+    /// When she was put at [`CARGO_APPROACH`] from the contract's truck.
+    near_at: Option<f32>,
     done: bool,
 }
+
+/// How far from the contract's truck she is first put, metres: within its
+/// `HibernationControl` reach (1.2 x 250 = 300 m: it comes out and its
+/// springs settle it) but beyond its crates' (1.2 x 100 and 1.2 x 65), as
+/// she comes up to it in Xenia cargo1 (the truck out with her 240 m away,
+/// asleep 2.6 s after; the crates out at 120 and 78 m, 18 and 22 s later).
+/// Once it sleeps she is put by it.
+const CARGO_APPROACH: f32 = 200.0;
 
 impl CargoWait {
     fn tick(
@@ -10317,18 +10327,31 @@ impl CargoWait {
                 .iter()
                 .position(|v| v.id.is_some() && !v.wrecked && v.spec.label.contains("El Grande"));
             if grande.is_none()
+                && self.near_at.is_none()
                 && let Some(at) = truck
             {
                 eprintln!(
-                    "cargo-check: she is put 8 m from the contract's truck {CARGO_TRUCK} at {at:.0}"
+                    "cargo-check: she is put {CARGO_APPROACH:.0} m from the contract's truck {CARGO_TRUCK} at {at:.0}"
                 );
                 if let Some(p) = game.scene.player.as_mut() {
                     p.driving = None;
-                    p.drop_at(at + Vec3::X * 8.0 + Vec3::Y * 2.0);
+                    p.drop_at(at + Vec3::X * CARGO_APPROACH + Vec3::Y * 2.0);
                 }
                 game.ride = None;
                 game.on_foot = true;
-                self.put_at = Some(self.t);
+                self.near_at = Some(self.t);
+                return false;
+            }
+            // Come up to it: once it is out and asleep (or after
+            // [`CARGO_WAIT`] s), she is put by it.
+            if self.near_at.is_some_and(|t| self.t - t <= CARGO_WAIT)
+                && !grande.is_some_and(|i| {
+                    vehicles[i]
+                        .id
+                        .zip(game.scene.world.as_ref())
+                        .is_some_and(|(id, w)| w.physics.vehicle_asleep(id))
+                })
+            {
                 return false;
             }
             let to_mark = grande.is_none().then(|| marks.first().copied()).flatten();

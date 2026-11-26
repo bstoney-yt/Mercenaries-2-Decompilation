@@ -5699,15 +5699,17 @@ impl Game {
                     .map(|s| format!("{s:.3}"))
                     .collect();
                 eprintln!(
-                    "first step: island vehicle {:#x} {label}: moved {:.3} (dy {:+.3}), turned {:.2} deg, v {v:.3} (up {:+.3}), spin {:.3}, wheels down {down} of {wheels}, springs squeezed [{}] m, touching [{}]",
+                    "first step: island vehicle {:#x} {label} ({:?}): moved {:.3} (dy {:+.3}), turned {:.2} deg, v {v:.3} (up {:+.3}), spin {:.3}, wheels down {down} of {wheels}, springs squeezed [{}] m, touching [{}], bodies [{}]",
                     w.entity,
+                    id,
                     now.distance(w.put),
                     now.y - w.put.y,
                     w.turn.angle_between(now_turn).to_degrees(),
                     v.y,
                     physics.vehicle_spin(id),
                     squeeze.join(", "),
-                    touching()
+                    touching(),
+                    physics.vehicle_touching_bodies(id).join("; ")
                 );
             }
             // Its springs' first kick, step by step: the 360's first wheel

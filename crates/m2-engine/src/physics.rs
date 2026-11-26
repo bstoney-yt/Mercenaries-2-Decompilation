@@ -6373,6 +6373,56 @@ impl Physics {
     /// the box the thing touched fills, world space. To find what holds a
     /// stuck vehicle.
     #[allow(clippy::type_complexity)]
+    /// What vehicle `id`'s body touches that is not a static: each other
+    /// body's owner (another vehicle's chassis by its id, a loose piece by
+    /// its debris id, else a body) and whether it is awake. Log only.
+    pub fn vehicle_touching_bodies(&self, id: VehicleId) -> Vec<String> {
+        let Some(body) = self
+            .vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .and_then(|v| self.world.bodies.get(v.controller.chassis))
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for &c in body.colliders() {
+            for pair in self.world.narrow_phase.contact_pairs_with(c) {
+                if !pair.has_any_active_contact() {
+                    continue;
+                }
+                let other = if pair.collider1 == c {
+                    pair.collider2
+                } else {
+                    pair.collider1
+                };
+                if self.keys.contains_key(&other) {
+                    continue;
+                }
+                let Some(h) = self.world.colliders.get(other).and_then(|o| o.parent()) else {
+                    continue;
+                };
+                let awake = self.world.bodies.get(h).is_some_and(|b| !b.is_sleeping());
+                let owner = if let Some(v) = self
+                    .vehicles
+                    .iter()
+                    .position(|v| v.as_ref().is_some_and(|v| v.controller.chassis == h))
+                {
+                    format!("vehicle {v}")
+                } else if let Some(d) = self.debris.iter().position(|d| *d == Some(h)) {
+                    format!("debris {d}")
+                } else {
+                    "a body".to_owned()
+                };
+                let line = format!("{owner} ({})", if awake { "awake" } else { "asleep" });
+                if !out.contains(&line) {
+                    out.push(line);
+                }
+            }
+        }
+        out
+    }
+
     pub fn vehicle_touching(&self, id: VehicleId) -> Vec<(Option<StaticKey>, Vec3, (Vec3, Vec3))> {
         let Some(body) = self
             .vehicles
@@ -12899,6 +12949,30 @@ mod tests {
         assert!(own.with_car_wheels(&same).spring_wheels.is_none());
         // None: no change.
         assert!(spec.with_car_wheels(&[]).spring_wheels.is_none());
+    }
+
+    // What a vehicle's body touches that is no static is told by its
+    // owner: another vehicle's chassis by its id (the first-step log).
+    #[test]
+    fn a_vehicles_touches_name_their_owners() {
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let h = car().ride_height();
+        let a = p.add_vehicle(&car(), Vec3::new(0.0, h, 0.0), 0.0);
+        let b = p.add_vehicle(&car(), Vec3::new(0.5, h, 0.0), 0.0);
+        p.step(DT);
+        let told = p.vehicle_touching_bodies(a);
+        assert!(
+            told.iter()
+                .any(|t| t.starts_with(&format!("vehicle {}", b.0))),
+            "{told:?}"
+        );
     }
 
     // The push is never a pull: a spring stretching fast enough that its
