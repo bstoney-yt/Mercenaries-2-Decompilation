@@ -43,6 +43,7 @@ available, (6) Correction, (7) Verification and (8) Risk.
 | [P5](#p5) | Collision materials: friction and restitution per surface not read | Behavioral | P3 | Data, Ghidra |
 | [P6](#p6) | Projectile guidance law, drag and range not established from code | Behavioral | P3 | Ghidra |
 | [P7](#p7) | Props as bodies: the fake-prop mass changer, prop-to-prop and prop-to-person contacts, crash rules on island objects' bodies | Behavioral | P2 | Ghidra, footage |
+| [P8](#p8) | Fast-mover sweep: the 360's per-body anti-tunnelling cast and plane limit vs. Rapier CCD on every body | Behavioral | P3 | Ghidra, footage |
 | [I1](#i1) | Layer `Anchor` component not ported: anchor distances and threat-release bits unread | Behavioral | P2 | Ghidra, data |
 | [U6](#u6) | Flash text: one color per field, no kerning, HTML reduced to `<font color>` | Visual | P3 | Data census |
 | [M4](#m4) | Swimming depths, float height, speed and stroke rate invented | Animation/movement | P3 | Footage, Ghidra |
@@ -684,6 +685,24 @@ P2
 6. **Correction:** Add a contact-modification hook that scales the vehicle's side by `min(1, m_prop / m_vehicle x ratio)` for fake props. Let debris meet debris once pieces start apart. Give island objects' bodies the crash rules, then drop #676's corrections.
 7. **Verification:** `--prop-bodies-check` and `--prop-limits-check` in a town (`--spawn 2800,-1100`), `--cargo-check` at OilCon020 (goods that came in as bodies must ride), `--wreck-blast-check` (blasts push body props), and Xenia drives into café furniture against the port's speed loss.
 8. **Risk:** Medium. Every prop that comes loose is now a body: watch frame time in dense towns, and goods on load beds.
+
+### P8
+
+**Fast-mover sweep (anti-tunnelling)** · Behavioral discrepancy · P3
+
+1. **Original:** From the 360 code:
+   - Each object rebuild (0x821831B0) ends by building a sweep object per body (0x82183FC8 -> 0x821A0A78; vtable 0x820C9460). It has a filter on layers 2..7 (0x824CD1A0) and a size at +0x6C.
+   - Its update (0x821A0E90) runs on every third call (a counter 0, 1, 2).
+     - When the body's speed x dt x a factor (0x820F9644) exceeds the size, and it has moved less than a bound (0x820D9F18) since the last cast, it casts from its last place to its place (0x82167400).
+     - It keeps the hit plane and the collider, and the last place otherwise.
+   - Its step (0x821A0C00) intersects the body's next move with that plane (0x82198DD8) and, if it would cross, limits it (vector code, not decoded).
+2. **Ours:** Rapier's continuous collision (`ccd_enabled`) is on for every loose piece, gun, vehicle chassis, turret body and ragdoll body (`Physics::add_piece`, `add_gun`, `add_vehicle_turned`, `add_asset_ragdoll`, `add_ragdoll`). It applies Rapier's own sweep every step and its own speed rule; it has none of the 360's period, factor, size or plane limit.
+3. **Difference:** Not measured. Expected: the port sweeps more often and on different terms; a fast body's stop at a thin wall may differ.
+4. **Likely cause:** Rapier's CCD stands in; the 360's sweep was found only while tracing the trailers (#769).
+5. **Evidence:** 360 code as listed. The factor 0x820F9644, the bound 0x820D9F18, and the size each body's sweep is given are not read. The limit in 0x821A0C00 is vector code.
+6. **Correction:** Read the constants and the limit. Then either drive Rapier's CCD per body by the 360's rule (the size, the factor, every third step), or port the sweep and its plane limit and turn Rapier's CCD off.
+7. **Verification:** A thin-wall test: a body at the 360's threshold speed against a 0.1 m wall. Footage or Xenia of a flung wreck or debris against a fence (#728's wreck spot).
+8. **Risk:** Medium. It changes every fast body's collisions: wrecks, debris, ragdolls and vehicles at speed.
 
 ## UI
 
