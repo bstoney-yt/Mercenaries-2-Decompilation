@@ -16103,6 +16103,26 @@ impl ApplicationHandler for App {
 
 #[cfg(test)]
 mod tests {
+    // The dock's trailers are judged by how far back along their own
+    // length they rest against Xenia sub1's (0.50 m for the Fuel Trailer),
+    // whichever way they face.
+    #[test]
+    fn a_dock_trailer_is_judged_by_its_ease_back() {
+        use m2_math::glam::{Quat, Vec3};
+        let turn = Quat::from_rotation_y(1.62);
+        let authored = Vec3::new(1269.755, -27.547, 381.730);
+        let back = turn * Vec3::NEG_Z;
+        let at = |d: f32| authored + back * d + Vec3::NEG_Y * 0.07;
+        assert!(trailer_settled(at(0.42), authored, turn, 0.50, 0.7, 1.0, 0.0).is_ok());
+        assert!(trailer_settled(at(0.78), authored, turn, 0.50, 0.7, 1.0, 0.0).is_err());
+        assert!(trailer_settled(at(0.00), authored, turn, 0.50, 0.7, 1.0, 0.0).is_err());
+        // Forward instead of back.
+        assert!(trailer_settled(at(-0.50), authored, turn, 0.50, 0.7, 1.0, 0.0).is_err());
+        // Moving, or turned past 5 degrees.
+        assert!(trailer_settled(at(0.50), authored, turn, 0.50, 0.7, 1.0, 0.2).is_err());
+        assert!(trailer_settled(at(0.50), authored, turn, 0.50, 9.0, 1.0, 0.0).is_err());
+    }
+
     use super::*;
 
     /// `--save-check-no-world`'s verdict: the saved place first, then
@@ -17516,6 +17536,46 @@ fn settle_touch_name(world: &m2_engine::World, key: Option<m2_engine::StaticKey>
 /// allowed; level movement must stay within a few centimetres.
 const BOAT_SETTLE: (f32, f32) = (0.05, 0.5);
 
+/// Where `--parked-settle-check` expects the dock's trailers to rest, by
+/// entity: metres back along their own length from their authored place,
+/// as Xenia sub1 measured (2026-11-26): the Fuel Trailer 0xF0309 0.50 m
+/// (1269.259, 381.708 from 1269.755, 381.730), the Box Trailer 0x10001EA5
+/// 0.25 m (1272.022, 397.758 from 1272.254, 397.668); each one's twin
+/// likewise. Their kick pitches them and they ease back as they land.
+const TRAILER_SETTLE: [(u32, f32); 4] = [
+    (0x000f_0309, 0.50),
+    (0x000f_030b, 0.50),
+    (0x1000_1ea5, 0.25),
+    (0x1000_1ea6, 0.25),
+];
+/// How far from [`TRAILER_SETTLE`]'s target a trailer may rest, metres.
+/// Invented.
+const TRAILER_SETTLE_WIDTH: f32 = 0.20;
+
+/// A dock trailer judged by [`TRAILER_SETTLE`]: at `now`, authored at
+/// `authored` turned `turn`; `back` its target. Its offset back along its
+/// own length (its authored -z) must be within [`TRAILER_SETTLE_WIDTH`] of
+/// it; it may not be turned past 5 degrees, on its side, or moving. Returns
+/// its offset back.
+fn trailer_settled(
+    now: m2_math::glam::Vec3,
+    authored: m2_math::glam::Vec3,
+    turn: m2_math::glam::Quat,
+    back: f32,
+    turned: f32,
+    up: f32,
+    speed: f32,
+) -> Result<f32, String> {
+    let along = -(now - authored).dot(turn * m2_math::glam::Vec3::Z);
+    let off = (along - back).abs();
+    if off > TRAILER_SETTLE_WIDTH || turned > SETTLE_MOST.1 || up <= 0.5 || speed >= SETTLE_MOST.2 {
+        return Err(format!(
+            "{along:.2} m back along its length (Xenia sub1 {back:.2} +-{TRAILER_SETTLE_WIDTH:.2}), {turned:.1} deg turned, up {up:.2}, {speed:.3} m/s"
+        ));
+    }
+    Ok(along)
+}
+
 /// A boat judged by [`BOAT_SETTLE`]: at `now`, authored at `authored`,
 /// `up` its up axis's height. It may drop and tilt as it settles; it must
 /// stay where it was authored, level, and not capsize.
@@ -17796,6 +17856,23 @@ fn parked_settle_check(
             // step's velocity read 0.06 m/s on every vehicle at rest).
             let instant = speed;
             let speed = mark.map_or(instant, |p| now_at.distance(p) / SETTLE_STILL_OVER);
+            // The dock's trailers by Xenia sub1's rest ([`TRAILER_SETTLE`]).
+            if let Some(&(_, back)) = TRAILER_SETTLE.iter().find(|(e, _)| *e == entity) {
+                match trailer_settled(now_at, *at, *turn, back, turned, up, speed) {
+                    Ok(along) => {
+                        eprintln!(
+                            "parked-settle-check: {entity:#x} {label}: {along:.2} m back along its length (Xenia sub1 {back:.2} +-{TRAILER_SETTLE_WIDTH:.2}): kept"
+                        );
+                        passed += 1;
+                    }
+                    Err(why) => {
+                        let line = format!("{entity:#x} {label}: {why}");
+                        eprintln!("parked-settle-check: off: {line}");
+                        failed.push(line);
+                    }
+                }
+                continue;
+            }
             let ok = moved <= SETTLE_MOST.0
                 && turned <= SETTLE_MOST.1
                 && up > 0.5
