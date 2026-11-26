@@ -173,6 +173,9 @@ pub struct MaterialDesc {
     /// The base map's mip LOD bias, as the 360 sets it per texture from
     /// its header (0x82203958; negative: sharper).
     pub lod_bias: f32,
+    /// The base map's header flags (`INFO` 0x08), which pick its filter
+    /// and which coordinates clamp as the 360 binds it (0x82203958).
+    pub texture_flags: u16,
     /// Shade as the game's ground: `texture` is the cell's colour map,
     /// `layers` are weighted by the vertex colour and the colour map makes
     /// up the rest and takes over with distance; `detail` adds signed grain
@@ -272,6 +275,7 @@ impl Default for MaterialDesc {
         Self {
             texture: None,
             lod_bias: 0.0,
+            texture_flags: 0,
             color: [1.0; 4],
             blend: BlendMode::Opaque,
             double_sided: false,

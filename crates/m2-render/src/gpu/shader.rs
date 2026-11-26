@@ -224,7 +224,8 @@ struct Material {
     tex: vec4<u32>,
     // Its ground layers' places in `maps`
     layer_tex: vec4<u32>,
-    // x: its base map's sampler in `samplers` (0: repeating, 1: clamped),
+    // x: its base map's sampler in `samplers` (by filter, then v and u
+    // clamped),
     // y: its base map's mip LOD bias (f32 bits)
     samp: vec4<u32>,
 };

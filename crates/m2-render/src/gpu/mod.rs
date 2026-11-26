@@ -706,9 +706,40 @@ struct MaterialUniforms {
     tex: [u32; 4],
     /// Its ground layers' places.
     layer_tex: [u32; 4],
-    /// x: its base map's sampler (0: repeating, 1: clamped), y: its
-    /// base map's mip LOD bias (f32 bits).
+    /// x: its base map's sampler ([`sampler_index`]), y: its base map's
+    /// mip LOD bias (f32 bits).
     samp: [u32; 4],
+}
+
+/// Samplers in the material maps' group: four filters, each with u and v
+/// repeating or clamped (see [`sampler_index`]).
+const SAMPLERS: usize = 16;
+/// Filters: linear with linear mips (the default), linear with the nearest
+/// mip, point with no mips, and linear with no mips.
+const SAMPLE_LINEAR: usize = 0;
+const SAMPLE_NEAREST_MIP: usize = 1;
+const SAMPLE_POINT: usize = 2;
+const SAMPLE_BASE_MAP: usize = 3;
+
+/// The sampler a material's base map takes, as the 360 sets it from the
+/// texture header's flags when it binds it (0x82203958): 0x01 point with
+/// no mips, else 0x80 linear with no mips (and anisotropic, which no
+/// texture asks for), else 0x40 the nearest mip, else linear mips; 0x02 and
+/// 0x04 clamp u and v. The material's own `clamp` (terrain) clamps both.
+fn sampler_index(desc: &MaterialDesc) -> u32 {
+    let f = desc.texture_flags;
+    let filter = if f & 0x01 != 0 {
+        SAMPLE_POINT
+    } else if f & 0x80 != 0 {
+        SAMPLE_BASE_MAP
+    } else if f & 0x40 != 0 {
+        SAMPLE_NEAREST_MIP
+    } else {
+        SAMPLE_LINEAR
+    };
+    let u = desc.clamp || f & 0x02 != 0;
+    let v = desc.clamp || f & 0x04 != 0;
+    (filter * 4 + usize::from(v) * 2 + usize::from(u)) as u32
 }
 
 /// A 2D float texture binding visible to the fragment stage.
@@ -824,8 +855,8 @@ pub struct WgpuBackend {
     palette_buffer: wgpu::Buffer,
     slot_buffer: wgpu::Buffer,
     draw_group: wgpu::BindGroup,
-    /// Repeating, then clamping.
-    samplers: [wgpu::Sampler; 2],
+    /// By [`sampler_index`].
+    samplers: [wgpu::Sampler; SAMPLERS],
     white: wgpu::TextureView,
     /// Every material's record ([`Materials`]).
     material_records: Materials,
@@ -1364,18 +1395,33 @@ impl WgpuBackend {
         } else {
             wgpu::AddressMode::Repeat
         };
-        let samplers = [repeat, wgpu::AddressMode::ClampToEdge].map(|mode| {
+        let samplers: [wgpu::Sampler; SAMPLERS] = std::array::from_fn(|i| {
+            let (filter, clamp_v, clamp_u) = (i / 4, i & 2 != 0, i & 1 != 0);
+            let mode = |clamp| {
+                if clamp {
+                    wgpu::AddressMode::ClampToEdge
+                } else {
+                    repeat
+                }
+            };
+            let (texel, mip) = match filter {
+                SAMPLE_POINT => (wgpu::FilterMode::Nearest, wgpu::MipmapFilterMode::Nearest),
+                SAMPLE_NEAREST_MIP => (wgpu::FilterMode::Linear, wgpu::MipmapFilterMode::Nearest),
+                _ => (wgpu::FilterMode::Linear, wgpu::MipmapFilterMode::Linear),
+            };
+            let base_only = matches!(filter, SAMPLE_POINT | SAMPLE_BASE_MAP);
             device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("base"),
-                address_mode_u: mode,
-                address_mode_v: mode,
-                address_mode_w: mode,
-                mag_filter: wgpu::FilterMode::Linear,
-                min_filter: wgpu::FilterMode::Linear,
-                mipmap_filter: wgpu::MipmapFilterMode::Linear,
-                // The 360 filters textures linearly with linear mips and
-                // no anisotropy (0x82203958 asks for it only on header
-                // flag 0x80, which no texture sets).
+                address_mode_u: mode(clamp_u),
+                address_mode_v: mode(clamp_v),
+                address_mode_w: wgpu::AddressMode::Repeat,
+                mag_filter: texel,
+                min_filter: texel,
+                mipmap_filter: mip,
+                // The base map only, where the 360 asks for it.
+                lod_max_clamp: if base_only { 0.0 } else { 32.0 },
+                // The 360 filters with no anisotropy (0x82203958 asks for
+                // it only on header flag 0x80, which no texture sets).
                 anisotropy_clamp: 1,
                 ..Default::default()
             })
@@ -1673,7 +1719,7 @@ impl WgpuBackend {
             ],
             tex: [textures[0], textures[1], textures[2], textures[3]],
             layer_tex: [textures[4], textures[5], textures[6], textures[7]],
-            samp: [u32::from(desc.clamp), desc.lod_bias.to_bits(), 0, 0],
+            samp: [sampler_index(desc), desc.lod_bias.to_bits(), 0, 0],
         }
     }
 
@@ -1722,13 +1768,14 @@ impl WgpuBackend {
         })
     }
 
-    /// Group 2: `views` by place, and the repeating and clamped samplers.
+    /// Group 2: `views` by place, and the samplers (see [`sampler_index`]).
     fn maps_group(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         views: &[&wgpu::TextureView],
-        samplers: &[wgpu::Sampler; 2],
+        samplers: &[wgpu::Sampler; SAMPLERS],
     ) -> wgpu::BindGroup {
+        let samplers: Vec<&wgpu::Sampler> = samplers.iter().collect();
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("material maps"),
             layout,
@@ -1739,7 +1786,7 @@ impl WgpuBackend {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::SamplerArray(&[&samplers[0], &samplers[1]]),
+                    resource: wgpu::BindingResource::SamplerArray(&samplers),
                 },
             ],
         })
@@ -2914,9 +2961,9 @@ async fn open(
             // maps.
             required_limits: wgpu::Limits {
                 max_bind_groups: 5,
-                // The textures and the two samplers.
-                max_binding_array_elements_per_shader_stage: MAX_TEXTURES + 2,
-                max_binding_array_sampler_elements_per_shader_stage: 2,
+                // The textures and the samplers.
+                max_binding_array_elements_per_shader_stage: MAX_TEXTURES + SAMPLERS as u32,
+                max_binding_array_sampler_elements_per_shader_stage: SAMPLERS as u32,
                 ..wgpu::Limits::default()
             }
             .using_resolution(adapter.limits()),
@@ -3844,6 +3891,30 @@ mod material_slot_tests {
     }
 
     #[test]
+    fn the_texture_header_flags_pick_the_sampler() {
+        let index = |texture_flags, clamp| {
+            sampler_index(&MaterialDesc {
+                texture_flags,
+                clamp,
+                ..MaterialDesc::default()
+            })
+        };
+        // 0x82203958: linear by default, u and v clamped by 0x02 and 0x04.
+        assert_eq!(index(0x00, false), 0);
+        assert_eq!(index(0x20, false), 0);
+        assert_eq!(index(0x02, false), 1);
+        assert_eq!(index(0x06, false), 3);
+        assert_eq!(index(0x0e, false), 3);
+        assert_eq!(index(0x00, true), 3);
+        // 0x40 the nearest mip, 0x01 point with no mips (over 0x40),
+        // 0x80 no mips.
+        assert_eq!(index(0x40, false), 4);
+        assert_eq!(index(0x47, false), 11);
+        assert_eq!(index(0x80, false), 12);
+        assert!((0..=0xff).all(|f| (index(f, false) as usize) < SAMPLERS));
+    }
+
+    #[test]
     fn records_are_aligned_and_name_their_maps_and_sampler() {
         assert_eq!(material_stride(256) % 256, 0);
         assert!(material_stride(256) >= std::mem::size_of::<MaterialUniforms>() as u64);
@@ -3855,7 +3926,7 @@ mod material_slot_tests {
         let r = WgpuBackend::material_uniforms(&desc, [1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(r.tex, [1, 2, 3, 4]);
         assert_eq!(r.layer_tex, [5, 6, 7, 8]);
-        assert_eq!(r.samp[0], 1);
+        assert_eq!(r.samp[0], 3);
         assert_eq!(f32::from_bits(r.samp[1]), -1.0);
         let r = WgpuBackend::material_uniforms(&MaterialDesc::default(), [0; 8]);
         assert_eq!((r.tex, r.samp[0]), ([0; 4], 0));

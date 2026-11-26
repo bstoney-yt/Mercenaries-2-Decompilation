@@ -42,6 +42,8 @@ pub struct Uploaded {
     pub alpha_x: bool,
     /// Its mip LOD bias (see [`DecodedTexture::lod_bias`]).
     pub lod_bias: f32,
+    /// Its header's flags (see [`DecodedTexture::flags`]).
+    pub flags: u16,
 }
 
 /// What a model material is cached by.
@@ -148,6 +150,7 @@ impl MaterialCache {
                     alpha,
                     alpha_x: alpha_holds_x(t),
                     lod_bias: t.lod_bias,
+                    flags: t.flags,
                 })
             }
             _ => None,
@@ -382,6 +385,9 @@ impl MaterialCache {
             lod_bias: texture_hash
                 .and_then(|t| self.uploaded(t))
                 .map_or(0.0, |t| t.lod_bias),
+            texture_flags: texture_hash
+                .and_then(|t| self.uploaded(t))
+                .map_or(0, |t| t.flags),
             ..MaterialDesc::default()
         };
         let tinted = debug_tint(material, desc.texture.is_some());
@@ -2776,6 +2782,7 @@ mod tests {
             alpha: true,
             linear: false,
             lod_bias: 0.0,
+            flags: 0,
         };
         let (handle, alpha) = upload_texture(&mut backend, &t).unwrap();
         assert!(alpha);
@@ -2797,6 +2804,7 @@ mod tests {
             alpha: false,
             linear: false,
             lod_bias: 0.0,
+            flags: 0,
         };
         cache.add_texture(&mut backend, 10, Some(&t)).unwrap();
         cache.add_texture(&mut backend, 11, Some(&t)).unwrap();
@@ -2836,10 +2844,12 @@ mod tests {
             alpha: false,
             linear: false,
             lod_bias: 0.0,
+            flags: 0,
         };
         let cutout = DecodedTexture {
             alpha: true,
             lod_bias: -1.0,
+            flags: 0x47,
             ..opaque.clone()
         };
         cache.add_texture(&mut backend, 10, Some(&opaque)).unwrap();
@@ -2969,6 +2979,7 @@ mod complete_mips_tests {
             alpha: false,
             linear: false,
             lod_bias: 0.0,
+            flags: 0,
         }
     }
 
