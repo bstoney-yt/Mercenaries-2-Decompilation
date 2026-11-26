@@ -1824,6 +1824,9 @@ struct VehicleBody {
     /// How well it stands on the ground under it now ([`Tyres::footing`];
     /// 1 on the flat).
     footing: f32,
+    /// The footing the springs' level parts are taken off by this step:
+    /// the last step's (none before its wheels have had ground).
+    last_footing: f32,
     /// Its weight on the ground, of its plain weight ([`Springs`]'s
     /// `gravity_factor`; 1 for a tank).
     gravity_factor: f32,
@@ -3188,14 +3191,19 @@ fn stand(v: &mut VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
         return;
     };
     let wheels = v.controller.wheels();
+    // Of the wheels the 360's step gave ground ([`Damper::grounded`]).
     let normals: Vec<Vec3> = wheels
         .iter()
-        .map(|w| w.raycast_info())
+        .enumerate()
+        .filter(|(i, _)| v.dampers.get(*i).is_none_or(|d| d.grounded))
+        .map(|(_, w)| w.raycast_info())
         .filter(|r| r.is_in_contact)
         .map(|r| vec3(r.contact_normal_ws))
         .collect();
+    let strip = v.last_footing;
     if normals.is_empty() {
         v.footing = 0.0;
+        v.last_footing = 0.0;
         return;
     }
     let mean = normals.iter().sum::<Vec3>() / normals.len() as f32;
@@ -3203,6 +3211,7 @@ fn stand(v: &mut VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
         .min(1.0)
         .asin();
     v.footing = tyres.footing(tilt);
+    v.last_footing = v.footing;
     let Some(body) = bodies.get_mut(v.controller.chassis) else {
         return;
     };
@@ -3218,7 +3227,7 @@ fn stand(v: &mut VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
         let damped = v.dampers.get(i).map_or(0.0, |d| d.extra);
         let push = w.wheel_suspension_force.min(w.max_suspension_force) * dt + damped;
         let normal = vec3(ray.contact_normal_ws);
-        let level = normal.with_y(0.0) * push * v.footing;
+        let level = normal.with_y(0.0) * push * strip;
         body.apply_impulse_at_point(vector(-level), ray.contact_point_ws, true);
         // The 360 code pushes at the spring's top, not its contact
         // (0x8219F510 hands 0x8219C27C the push and the wheel's +0x48,
@@ -5553,6 +5562,7 @@ impl Physics {
             tyres,
             axles: Axle::standing(&tyres),
             footing: 1.0,
+            last_footing: 0.0,
             gravity_factor,
             tracked: spec.tracked,
             bike: bike.map(|tuning| Bike { tuning, steer: 0.0 }),
@@ -13014,13 +13024,17 @@ mod tests {
         );
     }
 
-    // On gentle ground a wheel's whole push, its damping's first-step kick
-    // too, is straight up (the level part off by the footing, 0x8219E020 /
-    // 0x8219C27C): a trailer kicked on its legs on a 2-degree slope is not
-    // thrown sideways (q769j: the dock's four trailers got -0.15 m/s across
-    // the slope at their kick, the Fuel Trailers ending 0.78 m off).
+    // A vehicle's first-step kick follows its ground's normal, as the 360's
+    // does: the wheel step pushes along the contact plane's normal at the
+    // spring's top (0x8219F510), and the car step takes each push's level
+    // part off by the footing (x and z times 1 - C+0x178, 0x8219C27C), which
+    // 0x8219E020 works out before the wheel steps, so from the wheels'
+    // ground before this step: none on the kick (the first step has none).
+    // Xenia p769b: the El Grande's kick on its 9-degree pad, (-0.41, 1.98,
+    // -0.12), within about 3 degrees of its up. Inferred: that 0x8219E020
+    // reads the last step's ground (C+0x178's writer is not found).
     #[test]
-    fn a_first_step_kick_on_a_gentle_slope_goes_straight_up() {
+    fn a_first_step_kick_on_a_slope_follows_its_ground() {
         let mut spec = car();
         spec.tuning.springs = Some(Springs {
             strength: (4.5, 15.0),
@@ -13059,7 +13073,7 @@ mod tests {
         );
         let mut p = Physics::new();
         let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
-        let tilt = Quat::from_rotation_z(2f32.to_radians());
+        let tilt = Quat::from_rotation_z(9f32.to_radians());
         p.add_static(
             StaticKey::Cell(1),
             &ground,
@@ -13070,8 +13084,13 @@ mod tests {
         p.step(DT);
         p.step(DT);
         let v = p.vehicle_velocity(id);
-        assert!(v.y > 4.0, "no kick: {v}");
-        assert!(v.x.abs() < 0.05, "thrown across the slope: {v}");
+        assert!(v.length() > 4.0, "no kick: {v}");
+        let normal = tilt * Vec3::Y;
+        let off = v.normalize().angle_between(normal).to_degrees();
+        assert!(
+            off < 3.0,
+            "kick {v} is {off:.1} deg off its ground's normal"
+        );
     }
 
     // A parked trailer (nobody at the wheel) on its legs and one axle, as
