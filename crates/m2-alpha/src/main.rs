@@ -17522,8 +17522,9 @@ fn dinghy_settled(
     let up_off = up.angle_between(target_up).to_degrees();
     let rest = authored + Vec3::new(DINGHY_LEVEL_MOVE.0, 0.0, DINGHY_LEVEL_MOVE.1);
     let level = now.with_y(0.0).distance(rest.with_y(0.0));
+    let off = (now - rest).with_y(0.0);
     let line = format!(
-        "dropped {drop:.3} m (360 {DINGHY_DROP:.3}), tilted {tilt:.1} deg (360 {target_tilt:.1}), up {up:.3} {up_off:.1} deg off the 360's, {level:.3} m level from the 360's rest, {speed:.3} m/s"
+        "dropped {drop:.3} m (360 {DINGHY_DROP:.3}), tilted {tilt:.1} deg (360 {target_tilt:.1}), up {up:.3} {up_off:.1} deg off the 360's, {level:.3} m level from the 360's rest, {speed:.3} m/s; at {now:.4}, off the 360's rest by {off:.4}"
     );
     let ok = (drop - DINGHY_DROP).abs() <= drop_within
         && (tilt - target_tilt).abs() <= tilt_within
@@ -17731,6 +17732,16 @@ fn parked_settle_check(
             if entity == DINGHY {
                 let still = mark.map_or(speed, |p| now_at.distance(p) / SETTLE_STILL_OVER);
                 let up_axis = m.transform_vector3(Vec3::Y).normalize_or_zero();
+                // And that offset in its own frame (log only).
+                let rest = *at + Vec3::new(DINGHY_LEVEL_MOVE.0, 0.0, DINGHY_LEVEL_MOVE.1);
+                let off = (now_at - rest).with_y(0.0);
+                let ahead = m.transform_vector3(Vec3::Z).with_y(0.0).normalize_or_zero();
+                let side = m.transform_vector3(Vec3::X).with_y(0.0).normalize_or_zero();
+                eprintln!(
+                    "parked-settle-check: {entity:#x} {label}: off the 360's rest {:+.3} m along its hull, {:+.3} m across",
+                    off.dot(ahead),
+                    off.dot(side)
+                );
                 match dinghy_settled(now_at, up_axis, *at, still) {
                     Ok(line) => {
                         eprintln!(
