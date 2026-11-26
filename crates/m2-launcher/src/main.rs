@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! m2-launcher [--dir <game folder>] [--install <dir>]
-//!             [--screenshot <out.png>] [--tab play|saves|stats|achievements|contracts|options]
+//!             [--screenshot <out.png>] [--tab play|saves|stats|achievements|contracts|whatsnew|options]
 //! ```
 //!
 //! `--dir` is where `m2-alpha` and its saves are (default: the launcher's
@@ -113,15 +113,16 @@ fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
                     "stats" => ui::Tab::Stats,
                     "achievements" => ui::Tab::Achievements,
                     "contracts" => ui::Tab::Contracts,
+                    "whatsnew" => ui::Tab::WhatsNew,
                     "options" => ui::Tab::Options,
                     v => bail!(
-                        "--tab {v}: expected play, saves, stats, achievements, contracts or options"
+                        "--tab {v}: expected play, saves, stats, achievements, contracts, whatsnew or options"
                     ),
                 }
             }
             "-h" | "--help" => {
                 println!(
-                    "m2-launcher [--dir <game folder>] [--install <dir>] [--screenshot <out.png>] [--tab play|saves|stats|achievements|contracts|options]"
+                    "m2-launcher [--dir <game folder>] [--install <dir>] [--screenshot <out.png>] [--tab play|saves|stats|achievements|contracts|whatsnew|options]"
                 );
                 std::process::exit(0);
             }

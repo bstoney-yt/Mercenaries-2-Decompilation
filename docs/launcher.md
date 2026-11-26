@@ -15,7 +15,7 @@ points of interest). Nothing from the game is committed or cached on disk.
 ## Layout
 
 - **Sidebar:** who is playing, the game (Mercenaries 2), the pages still
-  to come (What's New, Mods, Gallery) and Settings.
+  to come (Mods, Gallery) and Settings.
 - **Header:** the game's name and the tabs: Play, Saves, Stats,
   Achievements, Options, and Patch Notes (to come).
 - **Play:** the banner (steps on every 12 s; arrows and dots step it by
@@ -106,8 +106,28 @@ without play time, contract or percent.
 
 Each fits as a sidebar page or a tab:
 
-- **What's New / Patch Notes:** the merged pull requests' playtest notes.
 - **Play builds:** pick main or a test build to start.
 - **Mods:** a mod manager for `m2-modapi`.
 - **Bug report:** bundles `last-run.log` and the build's details.
 - **Gallery:** the game's movies and music, from the install.
+
+## What's New
+
+The **WHAT'S NEW** tab (sidebar and header) lists the merged pull requests,
+newest first, by the day they were merged: number, title and a one-line
+summary. It reads `docs/changelog.toml`, built into the launcher, so it works
+offline. That file is made from the pull requests' public titles and
+descriptions by `tools/changelog/changelog.py` (`gh pr list`; attribution
+lines, headings, check details, paths, links and the names given in
+`CHANGELOG_PRIVATE` are left out). Regenerate it before a release:
+
+```powershell
+$env:CHANGELOG_PRIVATE = '<names to leave out>'; python -I tools\changelog\changelog.py
+```
+
+## Window size on a first run
+
+With no settings file yet, the game's window size starts at the primary
+monitor's size in pixels (even, at least 640x360) instead of a fixed
+1920x1080; once the settings are saved the chosen size is kept
+(invented: the game's own launcher had no such default).
