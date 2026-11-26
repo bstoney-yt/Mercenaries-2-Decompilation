@@ -3394,6 +3394,41 @@ mod tests {
         assert!(entity_template(&db, "nothing", 0x8000_0099).is_none());
     }
 
+    // A catalogue car takes its model's template's tuning (no template is
+    // named by a model's name): `civ_veh_car_phoenix` is "Phoenix
+    // (crappy)"'s model, 2000 kg; "Phoenix", Xenia's 2500 kg one, is
+    // `global_veh_phoenix_body`'s (the installed data's masses).
+    #[test]
+    fn a_catalogue_car_takes_its_models_template_mass() {
+        let mut db = Templates::default();
+        let car = |model| TemplateInfo {
+            model: Some(model),
+            vehicle: Some(VehicleKind::Car),
+            engine: None,
+            person: false,
+            human: false,
+        };
+        for (id, name, model, mass) in [
+            (0x8000_5c55, "Phoenix", 0x4a57_9010, 2500.0),
+            (0x8000_85c1, "Phoenix (crappy)", 0x8c83_f560, 2000.0),
+        ] {
+            db.names.insert(id, name.to_owned());
+            db.infos.insert(id, car(model));
+            db.by_name.insert(name.to_ascii_lowercase(), car(model));
+            db.tuning.insert(
+                id,
+                VehicleTuning {
+                    mass: Some(mass),
+                    ..VehicleTuning::default()
+                },
+            );
+        }
+        let mass = |name, model| db.tuning_for(name, model).and_then(|t| t.mass);
+        assert_eq!(mass("civ_veh_car_phoenix", 0x8c83_f560), Some(2000.0));
+        assert_eq!(mass("global_veh_phoenix_body", 0x4a57_9010), Some(2500.0));
+        assert_eq!(mass("Phoenix", 0), Some(2500.0));
+    }
+
     use super::*;
 
     #[test]

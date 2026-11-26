@@ -1,0 +1,80 @@
+# The launcher (`m2-launcher`)
+
+A small native program that sits beside `m2-alpha.exe`, lists the save
+slots and starts the game. Build it with
+`cargo build --release -p m2-launcher` (add `--features windowed` for a
+build that opens no console window) and put `m2-launcher.exe` in the same
+folder as `m2-alpha.exe`.
+
+Everything it shows from the game is read from the player's own install
+at run time (the same `m2-assets` readers the game uses): the Scaleform
+fonts (Gunplay for headings, Franklin Gothic Medium for body text) and the
+banner pictures (the main menu's, a loading picture, contract briefings,
+points of interest). Nothing from the game is committed or cached on disk.
+
+## Layout
+
+- **Sidebar:** who is playing, the game (Mercenaries 2), the pages still
+  to come (What's New, Achievements, Mods, Gallery) and Settings.
+- **Header:** the game's name and the tabs: Play, Saves, Stats, Options,
+  and Patch Notes (to come).
+- **Play:** the banner (steps on every 12 s; arrows and dots step it by
+  hand) over the bar: the save picker on the left (Continue with the
+  newest save, any other save, or a new game), Play in the middle, and
+  who plays with what is happening on the right.
+- **Saves:** New Game with the hero to start as, then every slot (the
+  autosave and saves 1 to 20) with who, cash, fuel and when it was last
+  written, and Play, Copy (into the first free slot) and Delete (asks
+  once).
+- **Stats:** two parts, kept apart. **All saves** (marked
+  *launcher-tracked*): the total time the game ran, the sessions, the
+  longest one and when it was last played, which the launcher counts
+  itself in `m2-launcher-stats.toml` beside it (a session runs from Play
+  to the game's exit; closing the launcher meanwhile only hides it, so
+  the session is still counted). **Each save**: its time played, percent
+  done, cash and fuel from the 360 record, and from the scripts' save data
+  packed in it the contracts finished and each faction's standing with the
+  PMC (Hostile, Neutral or Friendly, as the game's scripts grade it). A
+  record stamped 0:00:00 (saved without the pause menu opening, which the
+  360 never does) shows the scripts' own clock instead, marked `*`.
+- **Options:** the game window (size, windowed or fullscreen), skipping
+  the EA and Pandemic movies, keeping the launcher open, and the install,
+  program and save folders. Kept in `m2-launcher.toml` beside it.
+
+## Starting the game
+
+Play runs `m2-alpha` in its own folder with `--size`, `--display`,
+`--to-front-end` (when the movies are skipped), `--install` (only when
+the launcher was told where the game is), and then:
+
+- a save: `--load-slot <n>`; the game's front end comes up and does its
+  own Load Game of that slot at once;
+- a new game: `--hero <name> --new-game`; the front end does its own New
+  Game as that hero at once.
+
+Both are the whole game's launch (as `--alpha`), and quitting to the
+front end later does not repeat them.
+
+## Saves
+
+The launcher reads the files `m2-alpha` writes (`m2-alpha-autosave.sav`,
+`m2-alpha-save<n>.sav`, beside its settings file). Each is one 360 save
+record (`m2-game/src/save_record.rs`): the time played, cash, fuel, last
+contract, percent done, character and time stamp the 360's save list
+shows, and the scripts' save data, and nothing else: like the 360, a save
+holds no place, health, weapons, vehicles or dead (loading puts her back
+at the scripts' start). A stale `.world.toml` left by earlier builds is
+not copied and is deleted with its slot. Old `.toml` saves still list,
+without play time, contract or percent.
+
+## To come
+
+Each fits as a sidebar page or a tab:
+
+- **What's New / Patch Notes:** the merged pull requests' playtest notes.
+- **Play builds:** pick main or a test build to start.
+- **Mods:** a mod manager for `m2-modapi`.
+- **Bug report:** bundles `last-run.log` and the build's details.
+- **Gallery:** the game's movies and music, from the install.
+- **Achievements:** the game's single-player achievements, from its own
+  list.

@@ -2,7 +2,8 @@ m2-alpha: Mercenaries 2 on a native Rust engine, from your own install.
 
 m2-alpha [options]
   (no options, or only --install/--config/--size/--vsync/--fullscreen/
-  --display/--refresh/--no-boot/--smarter-ai/--dev/--skip-mode-on: the whole game, as --alpha)
+  --display/--refresh/--no-boot/--smarter-ai/--dev/--skip-mode-on/
+  --new-game/--load-slot: the whole game, as --alpha)
   --alpha                the game as it launches: the boot movies (EA,
                          Pandemic), the front end (Enter starts), the first
                          contract with its movies, then on to free roam.
@@ -44,6 +45,27 @@ m2-alpha [options]
                          0 presses nothing)
   --to-front-end         start at the front end, without the boot movies
                          (what the pause menu's Quit starts again with)
+  --new-game             the whole game, with New Game taken as soon as the
+                         front end is up, as the --hero (the launcher's Play)
+  --load-slot <n>        the whole game, with Load Game of save slot n (0 the
+                         autosave, 1-20 the player's) taken as soon as the
+                         front end is up (the launcher's Play on a save)
+  --launch-check         with --new-game or --load-slot: ends once play has
+                         started from it, PASS if as asked (the save read and
+                         its hero up; a new game as the --hero), else FAIL
+  --save-check <slot>    with --screenshot --mission: 20 s in, saves to that
+                         slot in the 360's record layout, reads it back and
+                         compares its fields; PASS or FAIL, and the run ends
+  --load-check           with --load <save> --screenshot --mission (after a
+                         --save-check-move run): 20 s in logs her place
+                         against the saved one and the starts, health, rifle
+                         rounds and the scripts' clock; PASS when she is back
+                         at the start at full health and ammo, story data
+                         back (the 360's load). --save-check-no-world: the same
+  --save-check-move      with --save-check: first sends her to the first town
+                         (over 100 m from the start), hurts her to half health
+                         and spends rounds, puts her second weapon up, then
+                         saves; what was saved goes in <save>.check.txt
   --shell-click <x,y>    a left click there (screen pixels) in --front-end,
                          in its turn among the --shell-keys
   --after-contract <s>   with --mission --autoplay --screenshot: play on
@@ -229,6 +251,20 @@ m2-alpha [options]
   --log-check            testing: 5 numbered lines and log-check: RESULT PASS
                          to standard error, then exit at once, as a check
                          ends; all must reach a piped standard error
+  --pipelines-check      check: with --screenshot, the first frame drawn
+                         must make the render pipelines it meets (logged as
+                         pipelines: +N (total M) in X ms); prints
+                         pipelines-check: PASS or FAIL, exits 1 on FAIL
+  --pipeline-warm-check  check: with --screenshot and --mission, no render
+                         pipeline may be built by a draw once play has
+                         begun (loading screen closed or controls on) with
+                         the screen down; prints pipeline-warm-check: PASS
+                         or FAIL (with the cache cold or warm), exits 1 on
+                         FAIL. Run twice: the first run writes the list
+  --pipeline-cache-dir <dir>
+                         keep the pipelines' list (pipelines.txt) and the
+                         driver's pipeline cache here instead of beside the
+                         settings file
   --survival-check       check: her health clamp and survival mode on the
                          game's own code (clamp, a crusher's hit, the cut);
                          PASS/FAIL, then exit

@@ -144,6 +144,9 @@ pub struct Hud {
     pub game: Option<GameHud>,
     /// The game's loading screen, if `Loading.wad` reads.
     pub loading: Option<crate::loading::LoadingScreen>,
+    /// The new game's cover is up ([`crate::cover`]): black over the
+    /// whole frame, under the loading screen, so no world shows.
+    pub blackout: bool,
     /// Each frame waits for the game's HUD to draw it (play run offscreen,
     /// faster than the HUD's scripts would keep up with).
     pub wait: bool,
@@ -197,6 +200,7 @@ impl Hud {
             frame: None,
             game: None,
             loading: None,
+            blackout: false,
             wait: false,
             profile: false,
             hint_taken: false,
@@ -427,6 +431,7 @@ impl Hud {
             let was_up = screen.showing();
             let black = info.mission.as_ref().map_or(0.0, |m| m.black);
             screen.update(info.loading, black, input.time.unwrap_or(0.0));
+            crate::warmup::screen(screen.showing());
             let counter = screen.cycle.counter();
             if self.profile && counter != config.options.loading_hint && !screen.showing() && was_up
             {
@@ -437,9 +442,11 @@ impl Hud {
                 eprintln!("{line}");
             }
         }
-        let covered = loading
-            .as_deref()
-            .is_some_and(crate::loading::LoadingScreen::showing);
+        let blackout = self.blackout;
+        let covered = blackout
+            || loading
+                .as_deref()
+                .is_some_and(crate::loading::LoadingScreen::showing);
         let output = self.ctx.run_ui(input, |ui| {
             hud(ui, info, game, covered);
             if let (false, false, Some(touch)) = (menu, covered, &info.touch) {
@@ -450,12 +457,16 @@ impl Hud {
                 ));
                 crate::touch::paint(touch, &painter, ctx.content_rect(), ctx.pixels_per_point());
             }
+            let ctx = ui.ctx().clone();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                "loading screen".into(),
+            ));
+            if blackout {
+                // Opaque, under the loading screen in its own layer.
+                painter.rect_filled(ctx.content_rect(), 0.0, egui::Color32::BLACK);
+            }
             if let Some(screen) = loading.as_deref_mut() {
-                let ctx = ui.ctx().clone();
-                let painter = ctx.layer_painter(egui::LayerId::new(
-                    egui::Order::Foreground,
-                    "loading screen".into(),
-                ));
                 screen.paint(&ctx, &painter);
             }
             if let (true, Some(cheats)) = (menu, cheats) {

@@ -1551,6 +1551,32 @@ impl MissionLink {
 
     /// The scripts' own save data, to keep in a save
     /// ([`Mission::save_data`]).
+    /// What `Sys.RequestAutosave` last told the game (the contract, time
+    /// played and percent done a save's record is stamped with: from the
+    /// 360 code, [`m2_game::save_record::AutosaveInfo`]).
+    pub fn autosave_info(&self) -> Option<m2_game::save_record::AutosaveInfo> {
+        let State::Running(m) = &self.state else {
+            return None;
+        };
+        Some(m.world().borrow().autosave_info.clone())
+    }
+
+    /// The pause screen opening: what it tells the engine of the game's
+    /// progress (`SetFlashPauseMenu`, [`m2_game::mission::Mission::stamp_pause`])
+    /// is kept for the next save's record.
+    pub fn stamp_pause(&mut self) -> Option<m2_game::save_record::AutosaveInfo> {
+        let State::Running(m) = &mut self.state else {
+            return None;
+        };
+        match m.stamp_pause() {
+            Ok(info) => Some(info),
+            Err(e) => {
+                eprintln!("mission: the pause screen's progress: {e}");
+                None
+            }
+        }
+    }
+
     pub fn script_save(&self) -> Option<String> {
         let State::Running(m) = &self.state else {
             return None;
@@ -2136,6 +2162,19 @@ impl MissionLink {
         ))
     }
 
+    /// Where the scripts' object named `name` stands (a layer entity's
+    /// own name, as `GunPickup`), if one is in their world.
+    pub fn place_named(&self, name: &str) -> Option<Vec3> {
+        let State::Running(m) = &self.state else {
+            return None;
+        };
+        let w = m.world().borrow();
+        w.objects
+            .values()
+            .find(|o| o.name.eq_ignore_ascii_case(name))
+            .map(|o| Vec3::from(o.position))
+    }
+
     /// Where the scripts' markers stand: on their targets.
     pub fn marked_places(&self) -> Vec<Vec3> {
         let State::Running(m) = &self.state else {
@@ -2158,8 +2197,8 @@ impl MissionLink {
     }
 
     /// Starts the scripts from `save` rather than a new game, as loading
-    /// it does: her place, weapons and the world's wrecks and dead are put
-    /// back first, then the scripts are handed their own save data
+    /// the 360 does: she is put out of any seat ([`crate::game::Game::reset_for_load`]),
+    /// then the scripts are handed their own save data
     /// ([`Mission::load_save`]): the contracts done and on offer, her PMC,
     /// the factions. A save without script data (from before it was kept)
     /// starts a new game with her cash and stock made up to the save's.
@@ -2660,6 +2699,7 @@ impl MissionLink {
                 self.spawn_tries = 0;
                 if p.character.position.distance(at) > SPAWN_NEAR {
                     p.drop_at(at);
+                    game.placements = game.placements.wrapping_add(1);
                     p.driving = None;
                     p.chase_target = None;
                     eprintln!("mission: she starts at the scripts' spawn point {name} ({at:.1})");
@@ -4136,6 +4176,7 @@ impl MissionLink {
                     },
                     Command::InputEnabled(on) => {
                         eprintln!("mission: controls {}", if *on { "on" } else { "off" });
+                        crate::warmup::controls(*on);
                         game.input_locked = !on;
                     }
                     Command::HealthClamp(on) => {
@@ -4460,7 +4501,9 @@ impl MissionLink {
                     let mut save = *save;
                     let pmc = save.pmc.take();
                     let scripts = save.scripts.take();
-                    game.load(save);
+                    // The world's part of the 360's load (0x8230C740);
+                    // her place, health and weapons are the scripts'.
+                    game.reset_for_load();
                     match scripts {
                         Some(text) => {
                             mission.load_save(text);

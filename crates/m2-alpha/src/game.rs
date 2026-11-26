@@ -23,7 +23,7 @@ use crate::mission::{WATERLINE, template_models};
 use crate::moving::MovingProps;
 use crate::player::{ChaseRig, Intent, Player};
 use crate::props::Props;
-use crate::save::{self, PlayerSave, SaveGame, VehicleSave};
+use crate::save::SaveGame;
 use crate::scene::{ParkedVehicle, Scene};
 use crate::startup::Startup;
 use crate::support::{self, Call, Impact, Support};
@@ -121,8 +121,6 @@ pub struct Game {
     /// Looks for parking so far; each widens the search and allows
     /// steeper ground, until [`PARK_TRIES`] give up.
     park_tries: u32,
-    /// Vehicles from a loaded save, placed as their models load.
-    restore: Vec<VehicleSave>,
     pub combat: Combat,
     /// The island's placed objects worn down and brought down by blasts.
     pub destruction: Destruction,
@@ -193,6 +191,9 @@ pub struct Game {
     ///
     /// [`teleported`]: Self::teleported
     pub arrival: Option<f32>,
+    /// How many times the scripts (or the start) have put her somewhere,
+    /// for the new game's cover ([`crate::cover`]).
+    pub placements: u32,
     /// The start-up's state layers have their models up.
     props_up: bool,
     /// The driver's throttle last tick, -1 (reverse) to 1.
@@ -579,7 +580,6 @@ impl Game {
             on_foot,
             park_wait: 0.0,
             park_tries: 0,
-            restore: Vec::new(),
             combat,
             destruction: Destruction::default(),
             picked_up: Vec::new(),
@@ -607,6 +607,7 @@ impl Game {
             vehicle_wait: 0.0,
             startup: None,
             arrival: None,
+            placements: 0,
             props_up: false,
             throttle: 0.0,
             steer: 0.0,
@@ -1100,9 +1101,30 @@ impl Game {
     /// that is a load (the second contract's end takes her to PMC HQ), and
     /// the loading screen stays up while the place loads.
     pub fn teleported(&mut self, from: Vec3, to: Vec3) {
+        self.placements = self.placements.wrapping_add(1);
         if from.distance(to) > FAR_TELEPORT {
             self.arrival = Some(0.0);
         }
+    }
+
+    /// Whether anything near her is still loading: the island-wide tiles,
+    /// its vehicles, the props near her or the world's pieces (the new
+    /// game's cover waits for none, [`crate::cover`]).
+    pub fn streaming_busy(&self) -> bool {
+        let counts = self.scene.props.counts();
+        let world = self.scene.world.as_ref().is_some_and(|w| {
+            let s = w.stats();
+            s.tiles + s.failed < w.index.tiles.len() || s.pending > 0
+        });
+        world || self.scene.vehicles_loading() || counts.loading + counts.waiting_near > 0
+    }
+
+    /// She stands (landed, or seated in a vehicle), for the cover.
+    pub fn standing(&self) -> bool {
+        self.scene
+            .player
+            .as_ref()
+            .is_some_and(|p| p.landed || p.driving.is_some())
     }
 
     /// The arrival's load, `dt` seconds on: over once her surroundings are
@@ -1264,9 +1286,6 @@ impl Game {
                 player.streaming = streaming;
                 player.models_coming = models_coming;
                 self.park_wait -= dt;
-                if !self.restore.is_empty() {
-                    restore(physics, &mut scene.vehicles, &mut self.restore);
-                }
                 let waiting = scene.vehicles.iter().any(parkable);
                 if player.landed && waiting && self.park_wait <= 0.0 && self.park_tries < PARK_TRIES
                 {
@@ -3213,178 +3232,30 @@ impl Game {
         }
     }
 
-    /// The game as it stands, to save; `None` without an island or player.
+    /// The game to save; `None` without an island or player. The 360's
+    /// record holds who she is, her cash and fuel and the scripts' data
+    /// (filled in by [`crate::mission::MissionLink`]), not her place, health,
+    /// weapons, the vehicles or the dead ([`crate::save`]).
     pub fn save(&self) -> Option<SaveGame> {
-        let world = self.scene.world.as_ref()?;
-        let player = self.scene.player.as_ref()?;
-        let mut at = player.character.position;
-        if let Some(v) = player.driving.and_then(|i| self.scene.vehicles.get(i))
-            && let Some(m) = v.id.and_then(|id| world.physics.vehicle_transform(id))
-        {
-            // Saved beside the vehicle, not in it.
-            at = m.transform_point3(Vec3::new(v.spec.bounds.0.x - 1.0, 0.0, 0.0));
-        }
-        let vehicles = self
-            .scene
-            .vehicles
-            .iter()
-            // The mission's vehicles are the scripts' to place, the
-            // island's the layers'.
-            .filter(|v| v.guid.is_none() && v.spot.is_none())
-            .filter_map(|v| {
-                let m = world.physics.vehicle_transform(v.id?)?;
-                let f = m.transform_vector3(Vec3::Z);
-                Some(VehicleSave {
-                    model: v.spec.model,
-                    position: m.transform_point3(Vec3::ZERO).to_array(),
-                    yaw: f.x.atan2(f.z),
-                    wrecked: v.wrecked,
-                })
-            })
-            // Vehicles a save placed whose models haven't loaded yet.
-            .chain(self.restore.iter().cloned())
-            .collect();
-        Some(SaveGame {
-            version: save::VERSION,
-            hero: Some(self.scene.hero),
-            player: PlayerSave {
-                position: at.to_array(),
-                facing: player.facing,
-                yaw: player.yaw,
-                pitch: player.pitch,
-                hp: self.combat.hp,
-                weapon: match self.combat.weapon {
-                    Weapon::Rifle => "rifle",
-                    Weapon::Rpg => "rpg",
-                    Weapon::GrenadeLauncher => "grenade launcher",
-                }
-                .into(),
-                second: match self.combat.second {
-                    Some(Weapon::GrenadeLauncher) => "grenade launcher",
-                    Some(_) => "rpg",
-                    None => "",
-                }
-                .into(),
-                launcher: self
-                    .combat
-                    .launcher_rounds
-                    .filter(|_| self.combat.second.is_some())
-                    .map(|r| [r.clip, r.stored]),
-                grenades: self.combat.grenades,
-                rifle: Some([
-                    self.combat.rifle_rounds.clip,
-                    self.combat.rifle_rounds.stored,
-                ]),
-                guns: [
-                    self.combat.rifle.name.clone(),
-                    self.combat.launcher.name.clone(),
-                ],
-                explosives: [
-                    self.combat.explosive as u32,
-                    self.combat.charges,
-                    self.combat.mines,
-                ],
-            },
-            vehicles,
-            killed: self.scene.people.all_killed(),
-            // The scripts' to fill in ([`crate::mission::MissionLink::pmc_save`]).
-            pmc: None,
-            scripts: None,
-        })
+        self.scene.world.as_ref()?;
+        self.scene.player.as_ref()?;
+        Some(SaveGame::of(self.scene.hero))
     }
 
-    /// Puts the game back as `save` left it: the player drops to the ground
-    /// where she was, vehicles go back as their models load, and the dead
-    /// stay dead.
-    pub fn load(&mut self, save: SaveGame) {
-        let (Some(world), Some(player)) = (&mut self.scene.world, &mut self.scene.player) else {
+    /// The world's part of a load, as the 360 does it before the scripts
+    /// are handed their data (from the 360 code: `0x8230C740` puts every
+    /// player out of her seat, `0x822A1280`, and leaves the rest to the
+    /// scripts' `LoadSingleton`): she is put on foot where she is.
+    pub fn reset_for_load(&mut self) {
+        let Some(player) = &mut self.scene.player else {
             return;
         };
-        for v in &mut self.scene.vehicles {
-            if let Some(id) = v.id.take() {
-                world.physics.remove_vehicle(id);
-            }
-            v.wrecked = false;
-            v.damage = 0.0;
+        if player.driving.take().is_some() {
+            let at = player.character.position;
+            player.drop_at(at);
         }
-        let p = &save.player;
-        player.drop_at(Vec3::from(p.position));
-        player.driving = None;
         player.chase_target = None;
-        player.down = false;
-        player.aiming = false;
-        player.facing = p.facing;
-        player.yaw = p.yaw;
-        player.pitch = p.pitch;
-        let max_hp = self.combat.max_hp;
-        let old = std::mem::take(&mut self.combat);
-        self.combat.max_hp = max_hp;
-        self.combat.rifle = old.rifle;
-        self.combat.own_rifle = old.own_rifle;
-        self.combat.scripted_loadout = old.scripted_loadout;
-        self.combat.hero_damage = old.hero_damage;
-        // What the templates gave her weapons stays.
-        self.combat.damage_table = old.damage_table;
-        self.combat.throwables = old.throwables;
-        self.combat.carbine = old.carbine;
-        self.combat.rpg = old.rpg;
-        self.combat.gl = old.gl;
-        self.combat.launcher = self.combat.rpg.clone();
-        self.combat.hp = p.hp.clamp(1.0, max_hp);
-        let [rifle, launcher] = &p.guns;
-        let named = |name: &str| {
-            self.scene
-                .arms()
-                .and_then(|a| a.named(name))
-                .filter(|w| w.class.is_some() && !name.is_empty())
-                .map(|spec| self.combat.stock(spec))
-        };
-        let (rifle, launcher) = (named(rifle), named(launcher));
-        match (p.second.as_str(), p.launcher, launcher) {
-            (_, rounds, Some(gun)) if gun.slot() != Weapon::Rifle => {
-                self.combat.equip_gun(gun, 0);
-                if let Some([clip, stored]) = rounds {
-                    self.combat.launcher_rounds = Some(combat::Rounds { clip, stored });
-                }
-            }
-            ("grenade launcher", Some([clip, stored]), _) => {
-                self.combat.equip(Weapon::GrenadeLauncher, 0);
-                self.combat.launcher_rounds = Some(combat::Rounds { clip, stored });
-            }
-            ("rpg", rounds, _) => {
-                if let Some([clip, stored]) = rounds {
-                    self.combat.launcher_rounds = Some(combat::Rounds { clip, stored });
-                }
-            }
-            _ => self.combat.carbine_only(),
-        }
-        // The gun in her rifle's place, if the save names one.
-        if let Some(gun) = rifle.filter(|g| g.slot() == Weapon::Rifle) {
-            self.combat.equip_gun(gun, 0);
-        }
-        self.combat.weapon = match p.weapon.as_str() {
-            "rifle" => Weapon::Rifle,
-            _ => self.combat.second.unwrap_or(Weapon::Rifle),
-        };
-        self.combat.grenades = p.grenades.min(combat::MAX_GRENADES);
-        let [explosive, charges, mines] = p.explosives;
-        self.combat.charges = charges;
-        self.combat.mines = mines;
-        self.combat.explosive = (explosive as usize).min(2);
-        if let Some([clip, stored]) = p.rifle {
-            self.combat.rifle_rounds = combat::Rounds {
-                clip: clip.min(self.combat.rifle.clip),
-                stored: stored.min(self.combat.rifle.spare),
-            };
-        }
-        self.combat.weapon = match (p.weapon.as_str(), self.combat.second) {
-            ("rpg" | "grenade launcher", Some(w)) => w,
-            _ => Weapon::Rifle,
-        };
-        self.scene.people.reset(save.killed);
-        self.restore = save.vehicles;
-        // Vehicles not in the save park afresh.
-        self.park_tries = 0;
+        self.ride = None;
         self.on_foot = true;
     }
 
@@ -5964,7 +5835,8 @@ struct Watched {
 /// (0x8218CAA8: 0x82185FE0 -> vfunc +0x128) with nothing reading the
 /// ground. The layers author them at rest (survey of 1397 state-layer
 /// and 35 static cars and tanks: 871 within 5 cm of the wheels' rest on
-/// the terrain). It waits until there is something under it within
+/// the terrain). It is added asleep ([`Physics::sleep_vehicle`]). It
+/// waits until there is something under it within
 /// [`AUTHORED_FLOOR`] (its deck or bridge loaded, not only the terrain far
 /// below): invented, the 360 makes it with its layer.
 ///
@@ -6021,7 +5893,13 @@ pub(crate) fn place(
         if !floor {
             return false;
         }
-        v.id = Some(physics.add_vehicle_turned(&v.spec, at, turn.normalize()));
+        let id = physics.add_vehicle_turned(&v.spec, at, turn.normalize());
+        // Added asleep, as the 360's layer loader adds it (its bodies added
+        // with activation 0, 0x82165958; Xenia settle7: a fresh parked
+        // Phoenix asleep from its first sample), until its driver, a push
+        // or something awake touching it wakes it.
+        physics.sleep_vehicle(id);
+        v.id = Some(id);
         return true;
     }
     // As the scripts said: there, upright at its yaw, once any ground
@@ -6064,24 +5942,6 @@ const VEHICLE_REACH: f32 = 400.0;
 const WORLD_VEHICLES: usize = 12;
 /// Seconds between looks for vehicles to load.
 const VEHICLE_LOOK: f32 = 1.0;
-
-/// Puts vehicles from a save back where they were, as their models load.
-fn restore(physics: &mut Physics, vehicles: &mut [ParkedVehicle], saved: &mut Vec<VehicleSave>) {
-    for v in vehicles.iter_mut().filter(|v| parkable(v)) {
-        let Some(k) = saved.iter().position(|s| s.model == v.spec.model) else {
-            continue;
-        };
-        let s = saved.swap_remove(k);
-        // A little high, to settle onto its wheels.
-        let at = s.position() + Vec3::Y * 0.3;
-        let id = physics.add_vehicle(&v.spec, at, s.yaw);
-        v.id = Some(id);
-        v.wrecked = s.wrecked;
-        if v.wrecked {
-            physics.wreck_vehicle(id);
-        }
-    }
-}
 
 impl Game {
     /// What her binoculars' reticle is on: the nearest vehicle or person

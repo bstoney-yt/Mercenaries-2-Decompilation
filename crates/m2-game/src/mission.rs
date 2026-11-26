@@ -1945,6 +1945,18 @@ impl Mission {
 
     /// The scripts' own save data now, as Lua text
     /// ([`crate::savedata::generate`]).
+    /// What the pause screen tells the engine as it opens
+    /// (`_GuiInternal.SetFlashPauseMenu`, from the 360 code `0x82322D50`):
+    /// the progress the next save is stamped with, kept as
+    /// `Sys.RequestAutosave` keeps it ([`crate::save_record::pause_stamp`]).
+    /// The port's pause menu runs its movie on the HUD's thread, so the
+    /// mission's scripts are asked here for the same values.
+    pub fn stamp_pause(&mut self) -> Result<crate::save_record::AutosaveInfo, MissionError> {
+        let info = crate::save_record::pause_stamp(self.host.lua())?;
+        self.world.borrow_mut().autosave_info = info.clone();
+        Ok(info)
+    }
+
     pub fn save_data(&self) -> Result<String, MissionError> {
         Ok(crate::savedata::generate(self.host.lua(), BOOTSTRAP)?)
     }

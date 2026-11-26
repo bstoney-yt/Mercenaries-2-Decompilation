@@ -63,6 +63,7 @@ mod cheats;
 mod combat;
 mod config;
 mod coop;
+mod cover;
 mod death;
 mod destruct;
 mod disguise;
@@ -129,6 +130,7 @@ mod support;
 mod touch;
 mod traffic;
 mod ui;
+mod warmup;
 mod winches;
 
 use crate::hero::Hero;
@@ -159,6 +161,16 @@ use scene::Scene;
 
 /// Simulation rate; rendering runs as fast as presentation allows.
 const TICK: Duration = Duration::from_nanos(1_000_000_000 / 60);
+/// How long `--newgame-cover-check` waits for the intro (invented).
+const COVER_CHECK_LIMIT: Duration = Duration::from_secs(240);
+/// How long `--launch-check` waits for play to start (invented).
+const LAUNCH_CHECK_LIMIT: Duration = Duration::from_secs(240);
+/// Seconds of play before `--save-check` saves (invented: the island and
+/// the scripts' first steps are in by then).
+const SAVE_CHECK_AFTER: f32 = 20.0;
+/// How near a start `--load-check` wants her (or the saved place for
+/// it to count as restored), metres (invented).
+const WORLD_CHECK_METRES: f32 = 10.0;
 /// Longest real time a single frame may advance the simulation by, so a
 /// stall (dragging the window, a breakpoint) doesn't fast-forward the game.
 const MAX_FRAME: Duration = Duration::from_millis(250);
@@ -259,6 +271,15 @@ struct Options {
     /// `--no-blast-check`: a chain cannon's round (no blast) fired at a
     /// soldier ([`no_blast_check`]).
     no_blast_check: bool,
+    /// `--pipelines-check`: with `--screenshot`, the first frame drawn
+    /// must log the pipelines it made ([`pipelines_check`]).
+    pipelines_check: bool,
+    /// `--pipeline-warm-check`: with `--screenshot`, no pipeline may be
+    /// built by a draw once play has begun ([`warmup::verdict`]).
+    pipeline_warm_check: bool,
+    /// `--pipeline-cache-dir`: where the pipelines' list and the driver's
+    /// cache are kept, instead of the settings' folder ([`warmup`]).
+    pipeline_cache_dir: Option<PathBuf>,
     /// With `--drive` and `--wreck` or `--shoot-up`: get out of the wreck,
     /// walk to the fuel can it left and take it (testing).
     fuel_check: bool,
@@ -518,6 +539,37 @@ struct Options {
     /// Escape would, this many seconds after play begins. For testing what
     /// pausing asks of the sound (the pause music).
     pause_at: Option<f32>,
+    /// `--newgame-cover-check`: in the window, New Game is started as
+    /// soon as the front end is up; each frame logs the cover's state, and
+    /// the run ends at the intro movie with PASS or FAIL ([`cover::Check`]).
+    newgame_cover_check: bool,
+    /// `--new-game` or `--load-slot <n>` (the launcher's Play): what the
+    /// front end does as soon as it is up, as its own New Game or Load
+    /// Game would.
+    start: Option<flow::Start>,
+    /// `--launch-check`: with `--new-game` or `--load-slot`, the run ends
+    /// once play has started from it, PASS if it started as asked (the
+    /// save read and its hero up, or a new game as the `--hero`), FAIL on
+    /// anything else or after [`LAUNCH_CHECK_LIMIT`].
+    launch_check: bool,
+    /// `--save-check <slot>`: with `--screenshot --mission`, once the
+    /// scripts have run [`SAVE_CHECK_AFTER`] seconds the game is saved to
+    /// that pause-menu slot in the 360's record layout, read back and its
+    /// fields compared with what was saved; PASS or FAIL, and the run ends.
+    save_check: Option<u32>,
+    /// `--load-check` (`--save-check-no-world` still names it): with
+    /// `--load <save> --screenshot --mission`, [`SAVE_CHECK_AFTER`] seconds
+    /// into the load her place, health, rifle rounds and the scripts' clock
+    /// are compared with run A's note ([`CheckNote`]); PASS when she is
+    /// back at a start, at full health and ammo, the story data back.
+    load_check: bool,
+    /// `--save-check-move`: with `--save-check`, she is first sent over
+    /// [`MOVE_CHECK_METRES`] from where play began, hurt and re-armed
+    /// ([`move_check`]); what was saved and the start are kept beside the
+    /// save ([`CheckNote`]) for `--load-check`.
+    save_check_move: bool,
+    /// The file `--load` read.
+    load_path: Option<PathBuf>,
     /// With `--screenshot` on foot and `--gait`: put the nearest soldier
     /// this many metres ahead of her at the start, at the water's height
     /// there, and log each second whether he swims (`npc-swim:` lines).
@@ -567,6 +619,16 @@ struct Options {
     /// swim her forward walking, at her pace and sprinting, logging how
     /// fast she goes (`swim-check:` lines).
     swim_check: bool,
+    /// `--cargo-check`: Xenia's El Grande drive with its crates aboard
+    /// ([`cargo_check`]): each crate's shift, phase by phase.
+    cargo_check: bool,
+    /// `--cargo-settle-check`: the contract's loaded truck left parked
+    /// ([`cargo_settle_check`]).
+    cargo_settle_check: bool,
+    /// `--parked-car-sleeps-check`: the parked cars and tanks the layers
+    /// put out at the mission's start go to sleep and stay put
+    /// ([`ParkedSleep`]).
+    parked_car_sleeps_check: bool,
     /// `--prop-bodies-check`: props that come loose whole as bodies of
     /// their own from the start (gap P7, [`prop_bodies_check`]).
     prop_bodies_check: bool,
@@ -895,6 +957,9 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.exit_land_check = true;
                 o.drive = true;
             }
+            "--pipelines-check" => o.pipelines_check = true,
+            "--pipeline-warm-check" => o.pipeline_warm_check = true,
+            "--pipeline-cache-dir" => o.pipeline_cache_dir = Some(value()?.into()),
             "--no-blast-check" => {
                 o.no_blast_check = true;
                 o.drive = true;
@@ -903,6 +968,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--wreck-blast-check" => {
                 o.wreck_blast_check = true;
                 o.drive = true;
+                // Xenia's phys3-6 bands are a Phoenix's (q728 ran a Semi
+                // and was judged against them); `--vehicle` still picks.
+                o.vehicle
+                    .get_or_insert_with(|| WRECK_BLAST_VEHICLE.to_owned());
             }
             "--wreck-blast-at" => {
                 o.wreck_blast_at = Some(
@@ -1022,6 +1091,18 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.vehicle.get_or_insert_with(|| "m151".to_owned());
             }
             "--swim-check" => o.swim_check = true,
+            "--cargo-check" => {
+                o.cargo_check = true;
+                o.mission = true;
+            }
+            "--cargo-settle-check" => {
+                o.cargo_settle_check = true;
+                o.mission = true;
+            }
+            "--parked-car-sleeps-check" => {
+                o.parked_car_sleeps_check = true;
+                o.mission = true;
+            }
             "--prop-bodies-check" => {
                 o.prop_bodies_check = true;
                 o.drive = true;
@@ -1076,7 +1157,11 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                         .unwrap_or_else(|_| m2_assets::name_hash(&v)),
                 );
             }
-            "--load" => o.load = Some(save::SaveGame::read(&PathBuf::from(value()?))?),
+            "--load" => {
+                let path = PathBuf::from(value()?);
+                o.load = Some(save::SaveGame::read(&path)?);
+                o.load_path = Some(path);
+            }
             "--save-to" => o.save_to = Some(value()?.into()),
             "--load-at" => o.load_at = Some(value()?.parse().context("--load-at expects seconds")?),
             "--mission-driver" => {
@@ -1317,6 +1402,34 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.face_test = Some(value()?.parse().context("--face-test expects seconds")?)
             }
             "--pause-at" => o.pause_at = Some(value()?.parse()?),
+            "--new-game" => o.start = Some(flow::Start::NewGame),
+            "--launch-check" => o.launch_check = true,
+            "--load-check" | "--save-check-no-world" => o.load_check = true,
+            "--save-check-move" => o.save_check_move = true,
+            "--save-check" => {
+                let n: u32 = value()?
+                    .parse()
+                    .context("--save-check expects a slot number")?;
+                anyhow::ensure!(
+                    n <= PAUSE_SLOTS,
+                    "--save-check: slot {n}: the slots go 0 to {PAUSE_SLOTS}"
+                );
+                o.save_check = Some(n);
+            }
+            "--load-slot" => {
+                let n: u32 = value()?
+                    .parse()
+                    .context("--load-slot expects a slot number")?;
+                anyhow::ensure!(
+                    n <= PAUSE_SLOTS,
+                    "--load-slot {n}: slots go to {PAUSE_SLOTS}"
+                );
+                o.start = Some(flow::Start::Slot(n));
+            }
+            "--newgame-cover-check" => {
+                o.newgame_cover_check = true;
+                o.alpha = true;
+            }
             "--contracts" => {
                 o.contracts = value()?.parse().context("--contracts expects a count")?
             }
@@ -1340,7 +1453,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
     }
     // Launched plainly (only where the game is, the window and settings
     // named): the whole game, as `--alpha`.
-    const PLAIN: [&str; 18] = [
+    const PLAIN: [&str; 22] = [
         "--install",
         "--config",
         "--size",
@@ -1355,6 +1468,11 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
         "--skip-mode-off",
         "--skip-mode-on",
         "--script-join",
+        // The launcher's Play.
+        "--new-game",
+        "--load-slot",
+        "--hero",
+        "--launch-check",
         // Co-op plays the whole game too.
         "--host",
         "--join",
@@ -1402,6 +1520,8 @@ const SCREENSHOT_ONLY: &[&str] = &[
     "--movies",
     "--sound",
     "--mission-shots",
+    "--pipelines-check",
+    "--pipeline-warm-check",
 ];
 
 /// Those of [`SCREENSHOT_ONLY`] given without `--screenshot`, in the order
@@ -1834,6 +1954,12 @@ fn run(
         .clone()
         .unwrap_or_else(Config::default_path);
     let mut config = Config::load(&config_path)?;
+    warmup::set_dir(options.pipeline_cache_dir.clone().unwrap_or_else(|| {
+        config_path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf)
+    }));
     if let Some(hero) = options.hero {
         config.hero = hero;
     }
@@ -1926,7 +2052,22 @@ fn run(
         return screenshot(&config, Some(install), &mode, &options, &out);
     }
     if let Some(out) = &options.screenshot {
-        return screenshot(&config, install.as_ref(), &mode, &options, out);
+        let shot = screenshot(&config, install.as_ref(), &mode, &options, out);
+        if options.pipeline_warm_check {
+            if let Err(e) = &shot {
+                eprintln!("pipeline-warm-check: the run failed: {e:#}");
+            }
+            let (ok, line) = warmup::verdict();
+            eprintln!("pipeline-warm-check: {line}");
+            errlog::exit(if ok && shot.is_ok() { 0 } else { 1 });
+        }
+        if options.pipelines_check {
+            if let Err(e) = &shot {
+                eprintln!("pipelines-check: the run failed: {e:#}");
+            }
+            pipelines_check();
+        }
+        return shot;
     }
 
     let event_loop = event_loop()?;
@@ -1957,6 +2098,9 @@ fn run(
         load: options.load.clone(),
         load_at: options.load_at,
         pause_at: options.pause_at,
+        newgame_cover_check: options.newgame_cover_check,
+        start: options.start,
+        launch_check: options.launch_check,
         successor: None,
         state: None,
         error: None,
@@ -2197,12 +2341,7 @@ const PAUSE_SLOTS: u32 = 20;
 /// loads), by when its file was written.
 fn newest_save() -> Option<u32> {
     (0..=PAUSE_SLOTS)
-        .filter_map(|n| {
-            let when = std::fs::metadata(pause_save_path(n))
-                .and_then(|m| m.modified())
-                .ok()?;
-            Some((when, n))
-        })
+        .filter_map(|n| Some((save::SaveGame::modified(&pause_save_path(n))?, n)))
         .max()
         .map(|(_, n)| n)
 }
@@ -2222,11 +2361,17 @@ fn pause_saves(hero: Hero) -> Vec<pause::SaveEntry> {
     (0..=PAUSE_SLOTS)
         .filter_map(|n| {
             let path = pause_save_path(n);
-            let when = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+            let when = save::SaveGame::modified(&path)?;
             let s = save::SaveGame::read(&path).ok()?;
-            let secs = when
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
+            // The record's own stamp (from the 360 code: `addSaveGame`'s
+            // fields, 0x8237E2F0); the file's time for an old TOML save.
+            let secs = match s.info.saved_at {
+                0 => when
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+                t => t,
+            };
+            let legacy = s.info.saved_at == 0;
             let pmc = s.pmc.unwrap_or_default();
             Some(pause::SaveEntry {
                 number: n,
@@ -2238,10 +2383,14 @@ fn pause_saves(hero: Hero) -> Vec<pause::SaveEntry> {
                 },
                 money: pmc.cash,
                 fuel: pmc.fuel,
-                played: String::new(),
-                last_contract: String::new(),
-                auto: n == 0,
-                percent: 0.0,
+                played: if legacy {
+                    String::new()
+                } else {
+                    m2_game::save_record::played_text(s.info.played)
+                },
+                last_contract: s.info.contract,
+                auto: n == 0 || s.info.autosave,
+                percent: f64::from(s.info.percent),
             })
         })
         .collect()
@@ -2254,13 +2403,26 @@ fn write_save(game: &Game, mission: Option<&mission::MissionLink>, path: &std::p
     };
     s.pmc = mission.and_then(mission::MissionLink::pmc_save);
     s.scripts = mission.and_then(mission::MissionLink::script_save);
+    // The record's stamp (from the 360 code, 0x8230C4A8): what the
+    // scripts' last `Sys.RequestAutosave` said, and whether this is their
+    // autosave's slot (0x8239ACB0).
+    let said = mission
+        .and_then(mission::MissionLink::autosave_info)
+        .unwrap_or_default();
+    s.info.played = said.played.max(0.0) as u32;
+    s.info.contract = said.contract;
+    s.info.percent = said.percent;
+    s.info.autosave = path.file_stem().is_some_and(|n| n == "m2-alpha-autosave");
     match s.write(path) {
         Ok(()) => {
             eprintln!(
-                "game saved to {} (cash {}, scripts' data {} bytes)",
+                "game saved to {} (cash {}, scripts' data {} bytes, played {}, last contract {:?}, {}% done)",
                 path.display(),
                 s.pmc.as_ref().map_or(0.0, |p| p.cash),
-                s.scripts.as_ref().map_or(0, String::len)
+                s.scripts.as_ref().map_or(0, String::len),
+                m2_game::save_record::played_text(s.info.played),
+                s.info.contract,
+                s.info.percent
             );
             if let Some(c) = mission.and_then(mission::MissionLink::contracts) {
                 eprintln!("game saved with {c}");
@@ -2274,14 +2436,455 @@ fn write_save(game: &Game, mission: Option<&mission::MissionLink>, path: &std::p
     }
 }
 
+/// Where a load left her (`--load-check`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoadVerdict {
+    /// Within [`WORLD_CHECK_METRES`] of where she was saved.
+    Restored,
+    /// Within it of a start (where run A's play began, or this run's), not
+    /// of the saved place: the 360's load, which leaves her place to the
+    /// scripts' start.
+    ResetToStart,
+    /// Near neither.
+    Elsewhere,
+}
+
+impl LoadVerdict {
+    /// From her distances to the saved place and to the starts known.
+    fn from_gaps(saved: f32, starts: &[f32]) -> Self {
+        if saved <= WORLD_CHECK_METRES {
+            Self::Restored
+        } else if starts.iter().any(|&d| d <= WORLD_CHECK_METRES) {
+            Self::ResetToStart
+        } else {
+            Self::Elsewhere
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Restored => "RESTORED",
+            Self::ResetToStart => "RESET_TO_START",
+            Self::Elsewhere => "ELSEWHERE",
+        }
+    }
+}
+
+/// Her state as the load checks compare it.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct CheckState {
+    position: [f32; 3],
+    hp: f32,
+    max_hp: f32,
+    /// The rifle's rounds in its clip and stored, and a full clip.
+    rifle: [u32; 2],
+    rifle_full: u32,
+    grenades: u32,
+    weapon: String,
+}
+
+impl CheckState {
+    fn of(game: &Game) -> Option<Self> {
+        let p = game.scene.player.as_ref()?;
+        let c = &game.combat;
+        Some(Self {
+            position: p.character.position.to_array(),
+            hp: c.hp,
+            max_hp: c.max_hp,
+            rifle: [c.rifle_rounds.clip, c.rifle_rounds.stored],
+            rifle_full: c.rifle.clip,
+            grenades: c.grenades,
+            weapon: format!("{:?}", c.weapon),
+        })
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "{:?}, health {:.0} of {:.0}, {} up, rifle {:?} (full clip {}), grenades {}",
+            self.position,
+            self.hp,
+            self.max_hp,
+            self.weapon,
+            self.rifle,
+            self.rifle_full,
+            self.grenades
+        )
+    }
+}
+
+/// What run A (`--save-check-move`) keeps beside the save for run B
+/// (`m2-alpha-save<n>.check.txt`; invented, for the checks only): where
+/// play began, her state as saved, and the seconds played the record has.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct CheckNote {
+    start: [f32; 3],
+    saved: CheckState,
+    played: u32,
+}
+
+impl CheckNote {
+    fn path(save: &std::path::Path) -> std::path::PathBuf {
+        let name = save
+            .file_name()
+            .map_or(String::new(), |n| n.to_string_lossy().into_owned());
+        let stem = name.split('.').next().unwrap_or("save").to_owned();
+        save.with_file_name(format!("{stem}.check.txt"))
+    }
+
+    fn to_text(&self) -> String {
+        let [x, y, z] = self.start;
+        let [a, b, c] = self.saved.position;
+        format!(
+            "start {x} {y} {z}\nsaved {a} {b} {c}\nhp {} {}\nrifle {} {} {}\ngrenades {}\nplayed {}\n",
+            self.saved.hp,
+            self.saved.max_hp,
+            self.saved.rifle[0],
+            self.saved.rifle[1],
+            self.saved.rifle_full,
+            self.saved.grenades,
+            self.played
+        )
+    }
+
+    fn from_text(text: &str) -> Option<Self> {
+        let mut n = Self::default();
+        for line in text.lines() {
+            let mut w = line.split_whitespace();
+            let key = w.next()?;
+            let v: Vec<f32> = w.filter_map(|x| x.parse().ok()).collect();
+            match (key, v.as_slice()) {
+                ("start", [x, y, z]) => n.start = [*x, *y, *z],
+                ("saved", [x, y, z]) => n.saved.position = [*x, *y, *z],
+                ("hp", [h, m]) => (n.saved.hp, n.saved.max_hp) = (*h, *m),
+                ("rifle", [c, s, f]) => {
+                    n.saved.rifle = [*c as u32, *s as u32];
+                    n.saved.rifle_full = *f as u32;
+                }
+                ("grenades", [g]) => n.saved.grenades = *g as u32,
+                ("played", [p]) => n.played = *p as u32,
+                _ => return None,
+            }
+        }
+        Some(n)
+    }
+}
+
+/// `--load-check` (or `--save-check-no-world`): where she is after a load
+/// (now always the 360's way: the record and the scripts' `LoadSingleton`),
+/// against run A's note ([`CheckNote`]) and where this run began
+/// (`own_start`): place, health, rifle rounds, and the scripts' own clock
+/// (whether their save data came back). PASS when the load did what the
+/// 360's does: she is at a start ([`LoadVerdict::ResetToStart`]), at full
+/// health with a full rifle clip, and the scripts' clock carried on from
+/// the record's play time.
+fn load_check(
+    game: &Game,
+    link: &mut mission::MissionLink,
+    note: Option<&CheckNote>,
+    own_start: Option<[f32; 3]>,
+) -> bool {
+    use m2_math::glam::Vec3;
+    let Some(note) = note else {
+        eprintln!(
+            "load-check: FAIL: no check note beside the save (run A with --save-check-move first)"
+        );
+        return false;
+    };
+    let Some(now) = CheckState::of(game) else {
+        eprintln!("load-check: FAIL: she is not on the island");
+        return false;
+    };
+    let here = Vec3::from(now.position);
+    let gap = |to: [f32; 3]| here.distance(Vec3::from(to));
+    let level = |to: [f32; 3]| (here - Vec3::from(to)).with_y(0.0).length();
+    eprintln!("load-check: now: {}", now.summary());
+    eprintln!("load-check: saved: {}", note.saved.summary());
+    let mut starts = Vec::new();
+    for (what, at, start) in [
+        ("the saved place", Some(note.saved.position), false),
+        ("run A's start", Some(note.start), true),
+        ("this run's start", own_start, true),
+    ] {
+        match at {
+            Some(at) => {
+                eprintln!(
+                    "load-check: place vs {what} {at:?}: {:.1} m apart ({:.1} m level)",
+                    gap(at),
+                    level(at)
+                );
+                if start {
+                    starts.push(gap(at));
+                }
+            }
+            None => eprintln!("load-check: place vs {what}: not known"),
+        }
+    }
+    let verdict = LoadVerdict::from_gaps(gap(note.saved.position), &starts);
+    let full_health = (now.hp - now.max_hp).abs() < 0.5;
+    let full_clip = now.rifle[0] == now.rifle_full;
+    let clock = link.stamp_pause().map_or(0, |s| s.played.max(0.0) as u32);
+    let story = clock >= note.played;
+    let mut ok = verdict == LoadVerdict::ResetToStart;
+    for (what, good, said) in [
+        (
+            "health full",
+            full_health,
+            format!(
+                "{:.0} of {:.0} (saved {:.0})",
+                now.hp, now.max_hp, note.saved.hp
+            ),
+        ),
+        (
+            "rifle clip full",
+            full_clip,
+            format!("{:?} (saved {:?})", now.rifle, note.saved.rifle),
+        ),
+        (
+            "story data restored",
+            story,
+            format!(
+                "the scripts' clock {clock} s, the record's {} s",
+                note.played
+            ),
+        ),
+    ] {
+        eprintln!(
+            "load-check: {} {what}: {said}",
+            if good { "ok  " } else { "BAD " }
+        );
+        ok &= good;
+    }
+    eprintln!(
+        "load-check: {} ({:.1} m from the saved place; {WORLD_CHECK_METRES} m counts)",
+        verdict.name(),
+        gap(note.saved.position)
+    );
+    eprintln!("load-check: {}", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// `--save-check-move`'s preparation for run A: where play began, when
+/// she was sent away.
+#[derive(Debug, Default)]
+struct MoveCheck {
+    start: Option<[f32; 3]>,
+    sent_at: Option<f32>,
+}
+
+/// When `--save-check-move` sends her away, seconds into play; how long
+/// she has to land there; how long after landing she is changed and
+/// saved (invented).
+const MOVE_CHECK_AT: f32 = 10.0;
+const MOVE_CHECK_LAND_LIMIT: f32 = 90.0;
+const MOVE_CHECK_SETTLE: f32 = 3.0;
+/// How far she must be from the start for run A to count.
+const MOVE_CHECK_METRES: f32 = 100.0;
+
+/// `--save-check-move`, a tick at `t` seconds: sends her to the first
+/// town ([`scene::DEFAULT_SPAWN`], land; from the boat start about 4.6
+/// km), and once she has landed there hurts her to half health, spends
+/// rifle rounds and a grenade and puts her second weapon up. `Some`
+/// when it is time to save (whether the preparation held), with the note
+/// for run B (its played time filled in once saved), else `None`.
+fn move_check(game: &mut Game, check: &mut MoveCheck, t: f32) -> Option<(bool, CheckNote)> {
+    use m2_math::glam::Vec3;
+    if t < MOVE_CHECK_AT {
+        return None;
+    }
+    let Some(sent) = check.sent_at else {
+        let p = game.scene.player.as_mut()?;
+        let start = p.character.position.to_array();
+        check.start = Some(start);
+        p.driving = None;
+        let (x, z) = scene::DEFAULT_SPAWN;
+        p.drop_at(Vec3::new(x, 400.0, z));
+        game.ride = None;
+        game.on_foot = true;
+        check.sent_at = Some(t);
+        eprintln!("save-check-move: play began at {start:?}; sent to ({x:.0}, {z:.0}) on foot");
+        return None;
+    };
+    let landed = game
+        .scene
+        .player
+        .as_ref()
+        .is_some_and(|p| p.landed && p.driving.is_none());
+    if !landed {
+        if t - sent > MOVE_CHECK_LAND_LIMIT {
+            eprintln!("save-check-move: FAIL: she had not landed {MOVE_CHECK_LAND_LIMIT} s after");
+            return Some((false, CheckNote::default()));
+        }
+        return None;
+    }
+    if t - sent < MOVE_CHECK_SETTLE {
+        return None;
+    }
+    let before = CheckState::of(game)?;
+    let c = &mut game.combat;
+    c.hp = (c.max_hp * 0.5).round().max(1.0);
+    c.rifle_rounds.clip = c.rifle_rounds.clip.saturating_sub(7);
+    c.grenades = c.grenades.saturating_sub(1);
+    if let Some(w) = c.second {
+        c.weapon = w;
+    }
+    let after = CheckState::of(game)?;
+    let start = check.start.unwrap_or_default();
+    let away = Vec3::from(after.position).distance(Vec3::from(start));
+    eprintln!("save-check-move: before: {}", before.summary());
+    eprintln!(
+        "save-check-move: saving: {} ({away:.0} m from the start)",
+        after.summary()
+    );
+    let moved = away > MOVE_CHECK_METRES;
+    let hurt = (after.hp - before.hp).abs() >= 0.5;
+    let armed = after.rifle != before.rifle
+        || after.grenades != before.grenades
+        || after.weapon != before.weapon;
+    for (what, ok) in [
+        ("moved over 100 m", moved),
+        ("health changed", hurt),
+        ("weapons or rounds changed", armed),
+    ] {
+        eprintln!(
+            "save-check-move: {} {what}",
+            if ok { "ok  " } else { "BAD " }
+        );
+    }
+    Some((
+        moved && hurt && armed,
+        CheckNote {
+            start,
+            saved: after,
+            played: 0,
+        },
+    ))
+}
+
+/// `--save-check`: saves the game to pause-menu slot `slot`, reads the
+/// file back and compares it with what was saved: the 360's record
+/// length and header, the character, cash and fuel, the scripts' save
+/// text, and the time played, contract and percent the pause screen
+/// stamped as it opened. Each line logged; whether all held.
+fn save_check(game: &Game, link: &mission::MissionLink, slot: u32) -> bool {
+    let path = pause_save_path(slot);
+    eprintln!("save-check: saving to slot {slot} ({})", path.display());
+    if !write_save(game, Some(link), &path) {
+        eprintln!("save-check: FAIL: nothing was saved");
+        return false;
+    }
+    let mut ok = true;
+    let mut check = |what: &str, good: bool, said: String| {
+        eprintln!(
+            "save-check: {} {what}: {said}",
+            if good { "ok  " } else { "BAD " }
+        );
+        ok &= good;
+    };
+    let bytes = std::fs::read(&path).unwrap_or_default();
+    check(
+        "record length",
+        bytes.len() == m2_game::save_record::FILE_LEN,
+        format!("{:#x} bytes", bytes.len()),
+    );
+    let header = bytes.get(..8).map(|b| {
+        (
+            u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+            u32::from_be_bytes([b[4], b[5], b[6], b[7]]),
+        )
+    });
+    check(
+        "record header",
+        header
+            == Some((
+                m2_game::profile::RECORD_VERSION,
+                m2_game::profile::RECORD_SIZE,
+            )),
+        format!("version and size {header:x?}"),
+    );
+    let back = match save::SaveGame::read(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("save-check: FAIL: it does not read back: {e:#}");
+            return false;
+        }
+    };
+    check(
+        "character",
+        back.hero == Some(game.scene.hero),
+        format!("{:?} for {}", back.hero, game.scene.hero),
+    );
+    let pmc = link.pmc_save().unwrap_or_default();
+    let got = back.pmc.clone().unwrap_or_default();
+    check(
+        "cash and fuel",
+        (got.cash, got.fuel) == (pmc.cash.max(0.0).round(), pmc.fuel.round()),
+        format!(
+            "{} and {} (held {} and {})",
+            got.cash, got.fuel, pmc.cash, pmc.fuel
+        ),
+    );
+    let text = link.script_save();
+    check(
+        "scripts' save text",
+        back.scripts.is_some() && back.scripts == text,
+        format!(
+            "{} bytes back, {} held",
+            back.scripts.as_ref().map_or(0, String::len),
+            text.as_ref().map_or(0, String::len)
+        ),
+    );
+    let said = link.autosave_info().unwrap_or_default();
+    check(
+        "time played, contract, percent",
+        (
+            back.info.played,
+            back.info.contract.as_str(),
+            back.info.percent,
+        ) == (
+            said.played.max(0.0) as u32,
+            said.contract.as_str(),
+            said.percent,
+        ),
+        format!(
+            "{} {:?} {}%",
+            m2_game::save_record::played_text(back.info.played),
+            back.info.contract,
+            back.info.percent
+        ),
+    );
+    let now = save::now_secs();
+    check(
+        "time stamp",
+        back.info.saved_at <= now && now - back.info.saved_at < 60,
+        format!(
+            "{} ({} s ago)",
+            back.info.saved_at,
+            now.saturating_sub(back.info.saved_at)
+        ),
+    );
+    let world = path.with_extension(save::STALE_WORLD_EXT);
+    check(
+        "the record alone (no world file)",
+        !world.exists(),
+        format!(
+            "{} {}",
+            world.display(),
+            if world.exists() { "there" } else { "absent" }
+        ),
+    );
+    eprintln!("save-check: {}", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
 /// The launch's arguments `args` with `--load save` in place of any
 /// `--load` they had, and without `--load-at` (which would load again).
 fn args_loading(args: impl IntoIterator<Item = String>, save: &std::path::Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut args = args.into_iter();
     while let Some(a) = args.next() {
-        if a == "--load" || a == "--load-at" {
+        if a == "--load" || a == "--load-at" || a == "--load-slot" {
             args.next();
+        } else if a == "--new-game" {
         } else {
             out.push(a);
         }
@@ -2297,10 +2900,10 @@ fn args_front_end(args: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut args = args.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--load" => {
+            "--load" | "--load-slot" => {
                 args.next();
             }
-            "--to-front-end" => {}
+            "--to-front-end" | "--new-game" => {}
             _ => out.push(a),
         }
     }
@@ -2394,6 +2997,80 @@ fn log_gpu_memory(backend: &WgpuBackend, game: &Game) {
     );
 }
 
+/// What the frames have made of pipelines, for `--pipelines-check`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct PipelineFrames {
+    /// Frames noted, and the first one's pipelines made (and ms).
+    frames: u64,
+    first: Option<(u32, f32)>,
+    /// Frames that made any, and the most one made (and ms).
+    making: u64,
+    most: (u32, f32),
+}
+
+impl PipelineFrames {
+    /// A frame made `made` pipelines in `ms`.
+    fn note(&mut self, made: u32, ms: f32) {
+        self.frames += 1;
+        self.first.get_or_insert((made, ms));
+        if made > 0 {
+            self.making += 1;
+            if ms > self.most.1 {
+                self.most = (made, ms);
+            }
+        }
+    }
+
+    /// `--pipelines-check`'s verdict: the first frame drawn must have
+    /// made pipelines (the scene's kinds of draw, met for the first time),
+    /// and say so.
+    fn verdict(&self) -> (bool, String) {
+        let summary = format!(
+            "{} frames, {} made pipelines, the most +{} in {:.0} ms",
+            self.frames, self.making, self.most.0, self.most.1
+        );
+        match self.first {
+            Some((made, ms)) if made > 0 => (
+                true,
+                format!("PASS the first frame made +{made} in {ms:.0} ms; {summary}"),
+            ),
+            Some(_) => (false, format!("FAIL the first frame made none; {summary}")),
+            None => (false, "FAIL no frame was drawn".to_owned()),
+        }
+    }
+}
+
+thread_local! {
+    static PIPELINE_FRAMES: std::cell::Cell<PipelineFrames> =
+        const { std::cell::Cell::new(PipelineFrames { frames: 0, first: None, making: 0, most: (0, 0.0) }) };
+}
+
+/// The pipelines the backend made for this frame's draws: their time is
+/// the `draw: pipelines` span (inside `draw`), and a frame that made any
+/// logs `pipelines: +N (total M) in X ms`.
+fn note_pipelines(backend: &mut WgpuBackend) {
+    let work = backend.take_pipeline_work();
+    let ms = work.took.as_secs_f32() * 1000.0;
+    PIPELINE_FRAMES.with(|p| {
+        let mut f = p.get();
+        f.note(work.made, ms);
+        p.set(f);
+    });
+    if let Some(line) = work.line() {
+        spans::add("draw: pipelines", work.took);
+        eprintln!("{line}");
+    }
+    warmup::drew(backend, work.made);
+}
+
+/// `--pipelines-check`: prints the verdict of the run's frames
+/// ([`PipelineFrames::verdict`]) and exits 1 on a FAIL, 0 on a PASS.
+fn pipelines_check() -> ! {
+    let (ok, line) = PIPELINE_FRAMES.with(|p| p.get().verdict());
+    eprintln!("pipelines-check: {line}");
+    errlog::exit(if ok { 0 } else { 1 });
+}
+
 /// Streams around the player (or camera) and draws a frame.
 fn render(
     backend: &mut WgpuBackend,
@@ -2402,21 +3079,39 @@ fn render(
     aspect: f32,
     hud: Option<&mut ui::Hud>,
 ) -> anyhow::Result<()> {
+    render_frame(backend, game, fov, aspect, hud, true)
+}
+
+/// As [`render`]; `world` false streams but draws no world (the new
+/// game's cover, [`cover`], before she is placed): the frame is the HUD's
+/// alone.
+fn render_frame(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    hud: Option<&mut ui::Hud>,
+    world: bool,
+) -> anyhow::Result<()> {
     game.lens = (fov, aspect);
     let mut view = game.view(fov, aspect);
     if game.scene.world.is_some() {
         view.lighting.fog_density = 0.00025;
     }
     let focus = game.focus();
+    warmup::step(backend);
     spans::time("stream", || game.scene.update(backend, focus))?;
     log_gpu_memory(backend, game);
     let mut queue = DrawQueue::new();
     spans::time("draw", || -> anyhow::Result<()> {
         backend.begin_frame(&view)?;
-        game.scene.draw(backend, &mut queue, &view, &game.combat)?;
+        if world {
+            game.scene.draw(backend, &mut queue, &view, &game.combat)?;
+        }
         spans::drawn(queue.flush(&view, backend)?.draws);
         Ok(())
     })?;
+    note_pipelines(backend);
     spans::time("present", || match hud {
         Some(hud) => backend.end_frame_with(&mut |t| hud.paint(t)),
         None => backend.end_frame(),
@@ -2739,6 +3434,7 @@ fn screenshot(
     let (w, h) = (config.window.width, config.window.height);
     let mut backend = WgpuBackend::headless(w, h)?;
     eprintln!("adapter: {:?}", backend.adapter_summary());
+    warmup::start(&mut backend, true);
     let mut game = build_scene(
         &mut backend,
         install,
@@ -2997,9 +3693,10 @@ fn screenshot(
             aspect,
             out,
         )?);
-    } else if let Some(s) = &options.load {
-        // Without the scripts only the world's part loads.
-        game.load(s.clone());
+    } else if options.load.is_some() {
+        // Without the scripts only the world's reset of the 360's load
+        // (0x8230C740) is done: the rest is the scripts'.
+        game.reset_for_load();
     }
     if let Some(path) = &options.save_to {
         write_save(&game, link.as_ref(), path);
@@ -3717,6 +4414,7 @@ fn run_bench(
         game.scene.draw(backend, &mut queue, &view, &game.combat)?;
         part(2, &mut lap, &mut cpu);
         let drawn = queue.flush(&view, backend)?.draws as u64;
+        note_pipelines(backend);
         part(3, &mut lap, &mut cpu);
         backend.end_frame()?;
         part(4, &mut lap, &mut cpu);
@@ -5128,6 +5826,9 @@ fn mission_for_screenshot(
     out: &std::path::Path,
 ) -> anyhow::Result<mission::MissionLink> {
     let tick = TICK.as_secs_f32();
+    if options.load_check && options.load.is_none() {
+        eprintln!("load-check: FAIL needs --load <save>");
+    }
     let mut link = mission::MissionLink::start(install, options.mission_drivers.clone())
         .with_save(options.load.clone())
         .with_support(options.support.clone())
@@ -5294,6 +5995,9 @@ fn mission_for_screenshot(
     let mut death_check = options.death_check.then(DeathCheck::default);
     // Seconds she has been where --props-check hits the props.
     let mut props_ready = 0.0;
+    let mut cargo_wait =
+        (options.cargo_check || options.cargo_settle_check).then(CargoWait::default);
+    let mut parked_sleep = options.parked_car_sleeps_check.then(ParkedSleep::default);
     let mut shop_check = options.shop_check.clone().map(shopcheck::ShopCheck::new);
     let mut cheat_check = options.cheat_check.then(cheats::Check::default);
     let mut context = ContextCheck::default();
@@ -5323,6 +6027,8 @@ fn mission_for_screenshot(
     // `--mission-shots` pictured so far (they are kept sorted).
     let mut mission_shots_taken = 0;
     let mut support_denials = 0u32;
+    let mut move_prep = MoveCheck::default();
+    let mut own_start: Option<[f32; 3]> = None;
     for i in 0..(seconds / tick).round() as u32 {
         lap.mark("loop: pictures and checks");
         let intent = match auto.as_mut().filter(|_| play_done.is_none()) {
@@ -5863,6 +6569,49 @@ fn mission_for_screenshot(
                 game.save_icon = game::SAVE_ICON_SECONDS;
             }
         }
+        // `--save-check-move`: she is sent away, hurt and re-armed first;
+        // the save waits for it.
+        let prepared = match (options.save_check, options.save_check_move) {
+            (Some(_), true) => move_check(game, &mut move_prep, i as f32 * tick),
+            (Some(_), false) => {
+                (i as f32 * tick >= SAVE_CHECK_AFTER).then(|| (true, CheckNote::default()))
+            }
+            _ => None,
+        };
+        if let (Some(slot), Some((ready, mut note))) = (options.save_check, prepared) {
+            // Saved from the pause menu, as the 360 saves: the pause
+            // screen opening stamps the progress first.
+            link.stamp_pause();
+            let saved = save_check(game, &link, slot);
+            if options.save_check_move {
+                // For run B: what was saved, and where play began.
+                let path = pause_save_path(slot);
+                note.played = save::SaveGame::read(&path).map_or(0, |s| s.info.played);
+                if let Err(e) = std::fs::write(CheckNote::path(&path), note.to_text()) {
+                    eprintln!("save-check-move: could not keep the check note: {e}");
+                }
+            }
+            errlog::exit(if ready && saved { 0 } else { 1 });
+        }
+        if options.load_check && own_start.is_none() {
+            own_start = game
+                .scene
+                .player
+                .as_ref()
+                .map(|p| p.character.position.to_array());
+        }
+        if options.load_check && i as f32 * tick >= SAVE_CHECK_AFTER {
+            let note = options
+                .load_path
+                .as_deref()
+                .and_then(|p| std::fs::read_to_string(CheckNote::path(p)).ok())
+                .and_then(|t| CheckNote::from_text(&t));
+            errlog::exit(if load_check(game, &mut link, note.as_ref(), own_start) {
+                0
+            } else {
+                1
+            });
+        }
         // With --placed-check, what the layers have put out is tried
         // every few seconds ([`placed::check`]).
         // Not before she is ashore: the first contract's boat ride is
@@ -5877,6 +6626,32 @@ fn mission_for_screenshot(
             && game.scene.player.as_ref().is_some_and(|p| p.landed)
         {
             placed::check(game, &mut placed_tried, tick);
+        }
+        // With --cargo-check, once the contract has put out a vehicle with
+        // cargo aboard (she is put by it so it streams in), it is driven
+        // ([`cargo_check`]); then the run ends.
+        if let Some(w) = &mut cargo_wait
+            && i % (1.0 / tick).round() as u32 == 0
+            && w.tick(
+                game,
+                link.place_named(CARGO_TRUCK),
+                &link.marked_places(),
+                1.0,
+            )
+        {
+            if options.cargo_settle_check {
+                cargo_settle_check(game, tick);
+            } else {
+                cargo_check(game, tick);
+            }
+            break;
+        }
+        // With --parked-car-sleeps-check, the layers' parked cars and tanks
+        // are watched from when each is placed; then the run ends.
+        if let Some(w) = &mut parked_sleep
+            && w.tick(game, tick)
+        {
+            break;
         }
         // With --props-check, every placed prop is hit once she has been
         // ashore (and in --props-area, if given) a while, for the
@@ -6053,6 +6828,7 @@ fn mission_for_screenshot(
             for step in screen_cycle.update(wanted, tick, false) {
                 eprintln!("loading screen: {step:?} at {:.1} s", i as f32 * tick);
             }
+            warmup::screen(screen_cycle.up());
         }
         // `--shop-key`: the shop key pressed, by the clock, as in play,
         // with cash given her as the contract ends (as if picked up) for
@@ -8176,10 +8952,12 @@ fn drive_for_screenshot(
     // A vehicle asked for that isn't parked here: one is parked. With
     // `--seat-check` it must have a gunner's own entrance (the island's
     // own M151 Softtop has none), so the start position doesn't matter.
+    let only_model = wreck_blast_model(game, options);
     if let Some(want) = &options.vehicle {
         let fits = |v: &crate::scene::ParkedVehicle| {
             v.id.is_some()
                 && v.spec.label.to_ascii_lowercase().contains(want.as_str())
+                && only_model.is_none_or(|m| v.spec.model == m)
                 && (!options.seat_check
                     || v.spec
                         .seating
@@ -8197,6 +8975,7 @@ fn drive_for_screenshot(
                     c.vehicles
                         .iter()
                         .filter(|e| e.label.to_ascii_lowercase().contains(want.as_str()))
+                        .filter(|e| only_model.is_none_or(|m| e.model == m))
                         .cloned()
                         .collect()
                 })
@@ -8317,6 +9096,7 @@ fn drive_for_screenshot(
                 .iter()
                 .enumerate()
                 .filter(|(_, v)| v.spec.label.to_ascii_lowercase().contains(want.as_str()))
+                .filter(|(_, v)| only_model.is_none_or(|m| v.spec.model == m))
                 .filter_map(|(i, v)| {
                     let at = world?
                         .physics
@@ -8356,6 +9136,12 @@ fn drive_for_screenshot(
     }
     if options.ditch_check {
         ditch_check(game, tick);
+        return Ok(());
+    }
+    // No drive: the car is put at Xenia's wreck spot as it stands
+    // (q728m, q728n: the drive left it upside down on the coast).
+    if options.wreck_blast_check {
+        wreck_blast_check(game, tick, options.wreck_blast_at);
         return Ok(());
     }
     let label = game
@@ -8693,10 +9479,6 @@ fn drive_for_screenshot(
     );
     if options.wreck_rider_check {
         wreck_rider_check(game, tick);
-        return Ok(());
-    }
-    if options.wreck_blast_check {
-        wreck_blast_check(game, tick, options.wreck_blast_at);
         return Ok(());
     }
     if options.exit_land_check {
@@ -9468,6 +10250,1053 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 /// `--swim-check`: she is put in the nearest water over 4 m deep (looked
 /// for in rings out to 600 m) and swims forward for 4 s walking, at her
 /// pace and sprinting, through the game's tick; logs her speed each time.
+/// `--cargo-check`: Xenia's El Grande profile (`elgrande-crates.md`) on
+/// the first vehicle with cargo aboard (OilCon020's El Grande and its
+/// crates), her at the wheel: standing 3 s, full throttle straight 6 s
+/// (held to 11 m/s), a hard left turn at speed 2 s, hard braking (reverse
+/// throttle) until it stops or 4 s, then standing 3 s. Each crate's shift
+/// in the truck's frame from where it started is logged 4 times a
+/// second, and at each phase's end the median and most shift of those
+/// still aboard and how many have come off, as `cargo-check: <phase>:
+/// median <m> m, max <m> m, <n> of <k> off`.
+/// How long `--cargo-check` waits for a vehicle with cargo aboard after
+/// she is put by one that might carry some, seconds.
+const CARGO_WAIT: f32 = 60.0;
+
+/// OilCon020's El Grande with the gun crates: its layer entity's name
+/// (`vz_state_oilcon020`, guid 0xFA056, at about [2756, -34, -423]).
+/// From samples. The q680g run went to the scripts' first marker instead,
+/// [2632, -14, -998], 590 m from the truck, and it never streamed in.
+const CARGO_TRUCK: &str = "GunPickup";
+
+/// `--cargo-check`'s wait in the mission for a vehicle with cargo aboard
+/// (the contract's layers put out OilCon020's El Grande and its crates):
+/// each second, once a vehicle carries cargo it is time; before that,
+/// she is put 8 m from an El Grande that is out, else from the contract's
+/// truck where its layer has it ([`CARGO_TRUCK`]), else from the place the
+/// scripts mark first, else from
+/// the first vehicle, so the truck and its crates stream in; [`CARGO_WAIT`] s after, a `FAIL` with what was there.
+#[derive(Debug, Default)]
+struct CargoWait {
+    t: f32,
+    put_at: Option<f32>,
+    done: bool,
+}
+
+impl CargoWait {
+    fn tick(
+        &mut self,
+        game: &mut Game,
+        truck: Option<m2_math::glam::Vec3>,
+        marks: &[m2_math::glam::Vec3],
+        dt: f32,
+    ) -> bool {
+        use m2_math::glam::Vec3;
+        if self.done {
+            return false;
+        }
+        self.t += dt;
+        let vehicles = &game.scene.vehicles;
+        if (0..vehicles.len()).any(|i| {
+            vehicles[i].id.is_some() && !vehicles[i].wrecked && game.scene.props.carrying(i)
+        }) {
+            self.done = true;
+            eprintln!(
+                "cargo-check: a vehicle has cargo aboard after {:.0} s",
+                self.t
+            );
+            return true;
+        }
+        // Not before the contract's layers have had a moment.
+        if self.put_at.is_none() && self.t >= 10.0 {
+            // The El Grande if it is out; else the contract's truck where
+            // its layer has it (so it and its crates stream in there);
+            // else the place the scripts mark first; else the first
+            // vehicle.
+            let grande = vehicles
+                .iter()
+                .position(|v| v.id.is_some() && !v.wrecked && v.spec.label.contains("El Grande"));
+            if grande.is_none()
+                && let Some(at) = truck
+            {
+                eprintln!(
+                    "cargo-check: she is put 8 m from the contract's truck {CARGO_TRUCK} at {at:.0}"
+                );
+                if let Some(p) = game.scene.player.as_mut() {
+                    p.driving = None;
+                    p.drop_at(at + Vec3::X * 8.0 + Vec3::Y * 2.0);
+                }
+                game.ride = None;
+                game.on_foot = true;
+                self.put_at = Some(self.t);
+                return false;
+            }
+            let to_mark = grande.is_none().then(|| marks.first().copied()).flatten();
+            if let Some(at) = to_mark {
+                eprintln!("cargo-check: she is put 8 m from the scripts' marker at {at:.0}");
+                if let Some(p) = game.scene.player.as_mut() {
+                    p.driving = None;
+                    p.drop_at(at + Vec3::X * 8.0 + Vec3::Y * 2.0);
+                }
+                game.ride = None;
+                game.on_foot = true;
+                self.put_at = Some(self.t);
+                return false;
+            }
+            let pick =
+                grande.or_else(|| vehicles.iter().position(|v| v.id.is_some() && !v.wrecked));
+            let at = pick.and_then(|i| {
+                let id = vehicles[i].id?;
+                let m = game.scene.world.as_ref()?.physics.vehicle_transform(id)?;
+                Some((i, m.w_axis.truncate(), m.x_axis.truncate()))
+            });
+            match at {
+                Some((i, at, side)) => {
+                    eprintln!(
+                        "cargo-check: she is put 8 m from the {} at {at:.0}",
+                        vehicles[i].spec.label
+                    );
+                    if let Some(p) = game.scene.player.as_mut() {
+                        p.driving = None;
+                        p.drop_at(at + side.normalize_or(Vec3::X) * 8.0 + Vec3::Y);
+                    }
+                    game.ride = None;
+                    game.on_foot = true;
+                }
+                None => eprintln!("cargo-check: no vehicle out yet at {:.0} s", self.t),
+            }
+            self.put_at = Some(self.t);
+        }
+        if self.put_at.is_some_and(|t| self.t - t > CARGO_WAIT) {
+            self.done = true;
+            let props = &game.scene.props;
+            eprintln!(
+                "cargo-check: FAIL no vehicle with cargo aboard {CARGO_WAIT} s after she was put by one ({} vehicles, {} props loaded on any, {} shown)",
+                game.scene.vehicles.len(),
+                props.cargo_places().len(),
+                props.shown().count()
+            );
+        }
+        false
+    }
+}
+
+fn cargo_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::{Vec2, Vec3};
+    let vehicles = &game.scene.vehicles;
+    let Some(i) = (0..vehicles.len()).find(|&i| {
+        vehicles[i].id.is_some() && !vehicles[i].wrecked && game.scene.props.carrying(i)
+    }) else {
+        eprintln!("cargo-check: FAIL no vehicle with cargo aboard");
+        return;
+    };
+    let Some(id) = game.scene.vehicles[i].id else {
+        return;
+    };
+    let label = game.scene.vehicles[i].spec.label.clone();
+    if let Some(p) = game.scene.player.as_mut() {
+        p.driving = Some(i);
+        p.landed = true;
+    }
+    // A clear, level straight to drive (q680h drove its parked heading
+    // into a tall rock 25 m on): its heading if that is clear, else the
+    // first of seven others, the truck and its cargo turned to it where
+    // it stands.
+    if !cargo_clear_straight(game, i, id, &label) {
+        return;
+    }
+    let local = |game: &Game| -> Vec<(u32, Vec3, bool)> {
+        let Some(world) = game.scene.world.as_ref() else {
+            return Vec::new();
+        };
+        let Some(at) = world.physics.vehicle_transform(id) else {
+            return Vec::new();
+        };
+        let inv = at.inverse();
+        // From the crates' bodies, not where they were last shown: the
+        // first reading is taken right after the rigid move, before the
+        // props follow (q680, 3d99c9b7: judged against the old place,
+        // standing measured 39.85 m).
+        game.scene
+            .props
+            .cargo_riding_now(&world.physics)
+            .into_iter()
+            .filter(|c| c.1 == i)
+            .map(|(e, _, centre, aboard)| (e, inv.transform_point3(centre), aboard))
+            .collect()
+    };
+    // Crates already off the truck when the check starts (q680 1555b736:
+    // 0x11d39d fell off 17 s before, as the El Grande, now placed as
+    // authored on its 10-degree slope, rose and settled where it was
+    // parked) are not the check's to judge: logged, and left out of every
+    // phase.
+    let (start, before) = cargo_split_start(local(game));
+    for e in &before {
+        eprintln!(
+            "cargo-check: {e:#x} was already off the {label} before the check began (while it stood where it was parked): not counted"
+        );
+    }
+    let local = |game: &Game| -> Vec<(u32, Vec3, bool)> {
+        local(game)
+            .into_iter()
+            .filter(|c| !before.contains(&c.0))
+            .collect()
+    };
+    eprintln!(
+        "cargo-check: the {label}, {} crates aboard ({} already off, not counted)",
+        start.len(),
+        before.len()
+    );
+    if !cargo_ground_slope(game, i, id, &label) {
+        return;
+    }
+    // Each phase's fastest speed, its most turn from where it began and
+    // its longest run with no wheel down (after the first second).
+    let mut sane: Vec<Result<(), String>> = Vec::new();
+    let yaw = |game: &Game| {
+        game.scene
+            .world
+            .as_ref()
+            .and_then(|w| w.physics.vehicle_transform(id))
+            .map_or(0.0, |m| {
+                let f = m.transform_vector3(Vec3::Z);
+                f.x.atan2(f.z).to_degrees()
+            })
+    };
+    let speed = |game: &Game| {
+        game.scene
+            .world
+            .as_ref()
+            .map_or(0.0, |w| w.physics.vehicle_speed(id))
+    };
+    let mut table = Vec::new();
+    // Each phase's median and most shift of those aboard, how many off,
+    // and how many in all: for the verdict.
+    let mut ends: Vec<(&str, f32, f32, usize, usize)> = Vec::new();
+    let every = ((0.25 / tick) as u32).max(1);
+    for (phase, seconds) in [
+        ("standing", 3.0f32),
+        ("straight", 6.0),
+        ("hard turn", 2.0),
+        ("braking", 4.0),
+        ("standing after", 3.0),
+    ] {
+        let ticks = (seconds / tick) as u32;
+        let yaw0 = yaw(game);
+        let (mut fastest, mut turned, mut air, mut longest) = (0.0f32, 0.0f32, 0u32, 0u32);
+        for t in 0..ticks {
+            let v = speed(game);
+            let movement = match phase {
+                "straight" => Vec2::new(0.0, if v < 11.0 { 1.0 } else { 0.0 }),
+                "hard turn" => Vec2::new(-1.0, if v < 11.0 { 1.0 } else { 0.0 }),
+                "braking" => Vec2::new(0.0, if v > 0.5 { -1.0 } else { 0.0 }),
+                _ => Vec2::ZERO,
+            };
+            game.step(
+                crate::player::Intent {
+                    movement,
+                    ..Default::default()
+                },
+                tick,
+            );
+            // Log only: the first steps after the move, each with its
+            // speed and what the truck's body and wheels touch (q680
+            // ee4254c5: it drifted at -2.0 m/s while standing).
+            if phase == "standing" && t < CARGO_FIRST_STEPS {
+                cargo_step_log(game, i, id, t + 1);
+            }
+            fastest = fastest.max(speed(game).abs());
+            turned = turned.max(((yaw(game) - yaw0 + 540.0).rem_euclid(360.0) - 180.0).abs());
+            let down = game
+                .scene
+                .world
+                .as_ref()
+                .map_or(0, |w| w.physics.vehicle_contacts(id).0);
+            let settling = phase == "standing" && (t as f32) * tick < 1.0;
+            air = if down == 0 && !settling { air + 1 } else { 0 };
+            longest = longest.max(air);
+            if t % every == 0 {
+                let now = local(game);
+                let shifts: Vec<String> = now
+                    .iter()
+                    .filter_map(|(e, p, aboard)| {
+                        let s = start.iter().find(|s| s.0 == *e)?;
+                        let d = *p - s.1;
+                        Some(format!(
+                            "{e:#x} {:+.2},{:+.2},{:+.2}{}",
+                            d.x,
+                            d.y,
+                            d.z,
+                            if *aboard { "" } else { " off" }
+                        ))
+                    })
+                    .collect();
+                eprintln!(
+                    "cargo-check: {phase} {:.2} s, {:.1} m/s, yaw {:.0}, truck at {:.2}: {}",
+                    t as f32 * tick,
+                    speed(game),
+                    yaw(game),
+                    game.scene
+                        .world
+                        .as_ref()
+                        .and_then(|w| w.physics.vehicle_transform(id))
+                        .map_or(Vec3::NAN, |m| m.transform_point3(Vec3::ZERO)),
+                    shifts.join("; ")
+                );
+            }
+            if phase == "braking" && speed(game) < 0.5 && t as f32 * tick > 0.5 {
+                break;
+            }
+        }
+        let now = local(game);
+        let mut aboard: Vec<f32> = now
+            .iter()
+            .filter(|c| c.2)
+            .filter_map(|(e, p, _)| Some((*p - start.iter().find(|s| s.0 == *e)?.1).length()))
+            .collect();
+        let off = now.iter().filter(|c| !c.2).count();
+        let (median, most) = median_and_most(&mut aboard);
+        let line = format!(
+            "{phase}: median {median:.2} m, max {most:.2} m, {off} of {} off (yaw {:.0} -> {:.0}, {:.1} m/s)",
+            now.len(),
+            yaw0,
+            yaw(game),
+            speed(game)
+        );
+        eprintln!("cargo-check: {line}");
+        table.push(line);
+        ends.push((phase, median, most, off, now.len()));
+        sane.push(cargo_sane(phase, fastest, turned, longest as f32 * tick));
+    }
+    eprintln!("cargo-check: TABLE (shift from start in the truck's frame, of those still aboard)");
+    for l in table {
+        eprintln!("cargo-check:   {l}");
+    }
+    let verdict = sane.into_iter().find(Result::is_err).map_or_else(
+        || cargo_verdict(&ends),
+        |e| e.map_err(|why| format!("not a drive on its wheels: {why}")),
+    );
+    match verdict {
+        Ok(()) => eprintln!(
+            "cargo-check: PASS the crates kept still standing, stayed aboard driving straight, and slid as they went"
+        ),
+        Err(why) => eprintln!("cargo-check: FAIL {why}"),
+    }
+}
+
+/// `--cargo-check`'s crates at its start split into those aboard (its
+/// judged set) and the ids of those already off (fallen before the check
+/// began, while the truck stood where it was parked).
+fn cargo_split_start(
+    crates: Vec<(u32, m2_math::glam::Vec3, bool)>,
+) -> (Vec<(u32, m2_math::glam::Vec3, bool)>, Vec<u32>) {
+    let (aboard, off): (Vec<_>, Vec<_>) = crates.into_iter().partition(|c| c.2);
+    (aboard, off.into_iter().map(|c| c.0).collect())
+}
+
+/// How long `--cargo-settle-check` watches the parked truck, seconds:
+/// Xenia settle3's window (20 s from the truck's first record).
+const CARGO_SETTLE_WATCH: f32 = 20.0;
+/// The most a crate may have moved on the bed from where it was loaded,
+/// in the truck's frame, metres, judged by its place (its origin, as
+/// Xenia settle3 read each crate's record position): settle3's 21 crates
+/// moved 0.24 to 0.50 m (load-time depenetration, 0x11D3A0 the most).
+const CARGO_SETTLE_MOST: f32 = 0.50;
+
+/// `--cargo-settle-check` (it turns on `--mission`; start it with
+/// `--skip-to OilCon020`): once the contract's truck has its cargo aboard
+/// (as `--cargo-check` waits for it), the truck is left where it was
+/// parked, nobody driving, for [`CARGO_SETTLE_WATCH`] s more. Logs each
+/// crate's move on the bed from where it was loaded (the truck's frame)
+/// and whether it is aboard, each second the truck's place, and at the
+/// end each crate's line. `PASS` when every crate is aboard, none came off
+/// before the watch began, and none moved more than
+/// [`CARGO_SETTLE_MOST`] (Xenia settle3: none off, 0.24-0.50 m); else
+/// `FAIL` with which.
+fn cargo_settle_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::Vec3;
+    let vehicles = &game.scene.vehicles;
+    let Some(i) = (0..vehicles.len()).find(|&i| {
+        vehicles[i].id.is_some() && !vehicles[i].wrecked && game.scene.props.carrying(i)
+    }) else {
+        eprintln!("cargo-settle-check: FAIL no vehicle with cargo aboard");
+        return;
+    };
+    let Some(id) = game.scene.vehicles[i].id else {
+        return;
+    };
+    let label = game.scene.vehicles[i].spec.label.clone();
+    let read = |game: &Game| {
+        game.scene
+            .world
+            .as_ref()
+            .map(|w| game.scene.props.cargo_from_loaded(&w.physics, i, id))
+            .unwrap_or_default()
+    };
+    let start = read(game);
+    let before = start.iter().filter(|c| !c.2).count();
+    eprintln!(
+        "cargo-settle-check: the {label} parked with {} crates loaded, {before} already off",
+        start.len()
+    );
+    let mut most: Vec<(u32, f32)> = start.iter().map(|c| (c.0, c.1)).collect();
+    let steps = (CARGO_SETTLE_WATCH / tick) as u32;
+    let every = (1.0 / tick).round().max(1.0) as u32;
+    for k in 1..=steps {
+        game.step(crate::player::Intent::default(), tick);
+        for (e, d, _) in read(game) {
+            if let Some(m) = most.iter_mut().find(|m| m.0 == e) {
+                m.1 = m.1.max(d);
+            }
+        }
+        if k % every == 0 {
+            let at = game
+                .scene
+                .world
+                .as_ref()
+                .and_then(|w| w.physics.vehicle_transform(id))
+                .map_or(Vec3::NAN, |m| m.w_axis.truncate());
+            let off = read(game).iter().filter(|c| !c.2).count();
+            eprintln!(
+                "cargo-settle-check: {:.0} s: the {label} at {at:.2}, {off} off",
+                k as f32 * tick
+            );
+        }
+    }
+    let end = read(game);
+    for (e, d, aboard) in &end {
+        let m = most.iter().find(|m| m.0 == *e).map_or(*d, |m| m.1);
+        eprintln!(
+            "cargo-settle-check: {e:#x} moved {d:.2} m on the bed from where it was loaded (most {m:.2}){}",
+            if *aboard { "" } else { ", OFF" }
+        );
+    }
+    match cargo_settle_verdict(&end, &most, before) {
+        Ok(()) => eprintln!(
+            "cargo-settle-check: PASS all {} crates aboard the parked {label} for {CARGO_SETTLE_WATCH} s, none off before, most moved {:.2} m",
+            end.len(),
+            most.iter().map(|m| m.1).fold(0.0f32, f32::max)
+        ),
+        Err(why) => eprintln!("cargo-settle-check: FAIL {why}"),
+    }
+}
+
+/// `--cargo-settle-check`'s verdict: every crate aboard at the end
+/// (`end`), none off before the watch began (`before`), and none moved
+/// more than [`CARGO_SETTLE_MOST`] from where it was loaded (`most`).
+fn cargo_settle_verdict(
+    end: &[(u32, f32, bool)],
+    most: &[(u32, f32)],
+    before: usize,
+) -> Result<(), String> {
+    if end.is_empty() {
+        return Err("no crates loaded".into());
+    }
+    if before > 0 {
+        return Err(format!("{before} already off before the watch began"));
+    }
+    let off: Vec<String> = end
+        .iter()
+        .filter(|c| !c.2)
+        .map(|c| format!("{:#x}", c.0))
+        .collect();
+    if !off.is_empty() {
+        return Err(format!(
+            "{} came off the parked truck: {}",
+            off.len(),
+            off.join(", ")
+        ));
+    }
+    let far: Vec<String> = most
+        .iter()
+        .filter(|m| m.1 > CARGO_SETTLE_MOST)
+        .map(|m| format!("{:#x} {:.2} m", m.0, m.1))
+        .collect();
+    if !far.is_empty() {
+        return Err(format!(
+            "moved more than {CARGO_SETTLE_MOST} m on the bed: {}",
+            far.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// How long after it is placed `--parked-car-sleeps-check` gives a parked
+/// car or tank to be asleep, seconds: the 360's time to sleep for a body
+/// that keeps still, 6 checks 0.2 s apart (0x824CE9C8; the world's
+/// `highFrequencyDeactivationPeriod`, 0x820AA278) and one period more for
+/// the first check (1.4 s), plus a second for one dropped onto its wheels
+/// to settle (invented). A layer's car is added asleep, at 0 s.
+const PARKED_SLEEP_BY: f32 = 2.4;
+/// The most a parked car or tank may move from where it fell asleep while
+/// `--parked-car-sleeps-check` watches it, metres: the 360's reference
+/// distance (0.02 m, 0x820AA278) plus 3 cm for its springs (invented).
+const PARKED_SLEEP_MOVE: f32 = 0.05;
+/// How long `--parked-car-sleeps-check` watches, seconds from the first
+/// parked vehicle placed.
+const PARKED_SLEEP_WATCH: f32 = 20.0;
+/// The most parked vehicles it watches (the first placed).
+const PARKED_SLEEP_MOST: usize = 12;
+
+/// One parked vehicle `--parked-car-sleeps-check` watches: when it was
+/// placed (s), when and where it first fell asleep, and the most it has
+/// moved from there.
+#[derive(Clone, Debug)]
+struct ParkedWatch {
+    index: usize,
+    label: String,
+    placed: f32,
+    asleep: Option<(f32, m2_math::glam::Vec3)>,
+    moved: f32,
+    awake_after: bool,
+}
+
+/// `--parked-car-sleeps-check` (it turns on `--mission`): every parked car
+/// and tank a layer put out (one with a layer guid, no crew, not a boat or
+/// a helicopter, nobody driving it), up to [`PARKED_SLEEP_MOST`], is
+/// watched from when it is placed for [`PARKED_SLEEP_WATCH`] s from the
+/// first. `PASS` when each was asleep within [`PARKED_SLEEP_BY`] s of being
+/// placed and moved no more than [`PARKED_SLEEP_MOVE`] from where it fell
+/// asleep; else `FAIL` with which.
+#[derive(Default)]
+struct ParkedSleep {
+    t: f32,
+    first: Option<f32>,
+    watched: Vec<ParkedWatch>,
+}
+
+impl ParkedSleep {
+    /// One step: true once it has judged.
+    fn tick(&mut self, game: &Game, dt: f32) -> bool {
+        self.t += dt;
+        let Some(physics) = game.scene.world.as_ref().map(|w| &w.physics) else {
+            return false;
+        };
+        let driven = game.scene.player.as_ref().and_then(|p| p.driving);
+        for (i, v) in game.scene.vehicles.iter().enumerate() {
+            let Some(id) = v.id else { continue };
+            if self.watched.len() >= PARKED_SLEEP_MOST
+                || self.watched.iter().any(|w| w.index == i)
+                || v.wrecked
+                || v.guid.is_none()
+                || !v.crew.is_empty()
+                || v.spec.is_boat()
+                || v.spec.is_helicopter()
+                || driven == Some(i)
+                || physics.vehicle_transform(id).is_none()
+            {
+                continue;
+            }
+            eprintln!(
+                "parked-car-sleeps-check: the {} ({:#x}) placed at {:.2} s",
+                v.spec.label,
+                v.guid.unwrap_or(0),
+                self.t
+            );
+            self.first.get_or_insert(self.t);
+            self.watched.push(ParkedWatch {
+                index: i,
+                label: v.spec.label.clone(),
+                placed: self.t,
+                asleep: None,
+                moved: 0.0,
+                awake_after: false,
+            });
+        }
+        for w in &mut self.watched {
+            let Some(id) = game.scene.vehicles.get(w.index).and_then(|v| v.id) else {
+                continue;
+            };
+            let Some(at) = physics.vehicle_transform(id).map(|m| m.w_axis.truncate()) else {
+                continue;
+            };
+            let asleep = physics.vehicle_asleep(id);
+            match w.asleep {
+                None if asleep => {
+                    eprintln!(
+                        "parked-car-sleeps-check: the {} asleep {:.2} s after it was placed",
+                        w.label,
+                        self.t - w.placed
+                    );
+                    w.asleep = Some((self.t, at));
+                }
+                Some((_, from)) => {
+                    w.moved = w.moved.max(at.distance(from));
+                    if !asleep && !w.awake_after {
+                        w.awake_after = true;
+                        eprintln!(
+                            "parked-car-sleeps-check: the {} woke at {:.2} s",
+                            w.label, self.t
+                        );
+                    }
+                }
+                None => {}
+            }
+        }
+        let Some(first) = self.first else {
+            if self.t > 60.0 {
+                eprintln!("parked-car-sleeps-check: FAIL no parked car or tank placed in 60 s");
+                return true;
+            }
+            return false;
+        };
+        if self.t - first < PARKED_SLEEP_WATCH {
+            return false;
+        }
+        for w in &self.watched {
+            eprintln!(
+                "parked-car-sleeps-check: the {}: {}, moved {:.3} m{}",
+                w.label,
+                w.asleep
+                    .map_or("never asleep".to_string(), |(t, _)| format!(
+                        "asleep {:.2} s after placed",
+                        t - w.placed
+                    )),
+                w.moved,
+                if w.awake_after { ", woke again" } else { "" }
+            );
+        }
+        match parked_sleep_verdict(&self.watched) {
+            Ok(()) => eprintln!(
+                "parked-car-sleeps-check: PASS all {} asleep within {PARKED_SLEEP_BY} s and within {PARKED_SLEEP_MOVE} m for {PARKED_SLEEP_WATCH} s",
+                self.watched.len()
+            ),
+            Err(why) => eprintln!("parked-car-sleeps-check: FAIL {why}"),
+        }
+        true
+    }
+}
+
+/// `--parked-car-sleeps-check`'s verdict on what it watched.
+fn parked_sleep_verdict(watched: &[ParkedWatch]) -> Result<(), String> {
+    if watched.is_empty() {
+        return Err("no parked car or tank watched".into());
+    }
+    let mut bad = Vec::new();
+    for w in watched {
+        match w.asleep {
+            None => bad.push(format!("the {} never slept", w.label)),
+            Some((t, _)) if t - w.placed > PARKED_SLEEP_BY => bad.push(format!(
+                "the {} slept {:.2} s after placed",
+                w.label,
+                t - w.placed
+            )),
+            Some(_) if w.moved > PARKED_SLEEP_MOVE => {
+                bad.push(format!("the {} moved {:.3} m", w.label, w.moved));
+            }
+            Some(_) => {}
+        }
+    }
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        Err(bad.join(", "))
+    }
+}
+
+/// How many steps after the move `--cargo-check` logs one by one.
+const CARGO_FIRST_STEPS: u32 = 10;
+
+/// Logs `--cargo-check`'s truck `id` (vehicle `i`) after standing step
+/// `n`: its speed and spin, its wheels down, each spring's squeeze, what
+/// its body touches, and the speed of each crate still aboard. Log only.
+fn cargo_step_log(game: &Game, i: usize, id: m2_engine::VehicleId, n: u32) {
+    let Some(world) = game.scene.world.as_ref() else {
+        return;
+    };
+    let physics = &world.physics;
+    let (down, wheels) = physics.vehicle_contacts(id);
+    let squeeze: Vec<String> = physics
+        .vehicle_suspension(id)
+        .iter()
+        .map(|s| format!("{s:.3}"))
+        .collect();
+    let touching: Vec<String> = physics
+        .vehicle_touching(id)
+        .iter()
+        .map(|(k, at, _)| format!("{k:?} at {at:.2}"))
+        .collect();
+    let crates: Vec<String> = game
+        .scene
+        .props
+        .cargo_pieces(i)
+        .into_iter()
+        .filter_map(|d| Some(format!("{:.2}", physics.debris_velocity(d)?.0)))
+        .collect();
+    eprintln!(
+        "cargo-check: step {n}: v {:.3}, spin {:.3}, wheels down {down} of {wheels}, springs squeezed [{}] m, touching [{}], crates [{}]",
+        physics.vehicle_velocity(id),
+        physics.vehicle_spin(id),
+        squeeze.join(", "),
+        touching.join("; "),
+        crates.join("; ")
+    );
+}
+
+/// Logs the ground under `--cargo-check`'s truck `id` (vehicle `i`) where
+/// it now stands: the height under each corner of its hull's footprint,
+/// and the ground's slope along it and across it, degrees. Log only.
+fn cargo_ground_slope(game: &Game, i: usize, id: m2_engine::VehicleId, label: &str) -> bool {
+    use m2_math::glam::Vec3;
+    let Some(world) = game.scene.world.as_ref() else {
+        return false;
+    };
+    let physics = &world.physics;
+    let Some(m) = physics.vehicle_transform(id) else {
+        return false;
+    };
+    let (lo, hi) = game.scene.vehicles[i].spec.hull;
+    // Front left, front right, back left, back right (model +Z ahead).
+    let corners = [(lo.x, hi.z), (hi.x, hi.z), (lo.x, lo.z), (hi.x, lo.z)]
+        .map(|(x, z)| m.transform_point3(Vec3::new(x, lo.y, z)));
+    let ground = corners.map(|c| {
+        physics
+            .cast_ray_fixed(c + Vec3::Y * 20.0, Vec3::NEG_Y, 60.0)
+            .map(|(d, _)| c.y + 20.0 - d)
+    });
+    let [Some(fl), Some(fr), Some(bl), Some(br)] = ground else {
+        eprintln!(
+            "cargo-check: FAIL ground under the {label}'s corners: {ground:.2?} (one or more with none)"
+        );
+        return false;
+    };
+    let length = corners[0].with_y(0.0).distance(corners[2].with_y(0.0));
+    let width = corners[0].with_y(0.0).distance(corners[1].with_y(0.0));
+    let along = (((fl + fr) - (bl + br)) * 0.5).atan2(length).to_degrees();
+    let across = (((fr + br) - (fl + bl)) * 0.5).atan2(width).to_degrees();
+    eprintln!(
+        "cargo-check: ground under the {label}'s corners (front left, front right, back left, back right) {fl:.2}, {fr:.2}, {bl:.2}, {br:.2}: slope {along:+.1} deg along it (up ahead +), {across:+.1} deg across it (up to the right +); hull bottom corners at {:.2}, {:.2}, {:.2}, {:.2}",
+        corners[0].y, corners[1].y, corners[2].y, corners[3].y
+    );
+    let under: Vec<f32> = corners
+        .iter()
+        .zip([fl, fr, bl, br])
+        .map(|(c, g)| c.y - g)
+        .collect();
+    if let Err(why) = cargo_hull_over_ground(&under) {
+        eprintln!("cargo-check: FAIL the {label} {why}");
+        return false;
+    }
+    true
+}
+
+/// How far a hull's bottom corner may sit under the ground it reads,
+/// metres, before `--cargo-check` fails: its tyres' squeeze and a little
+/// more.
+const CARGO_HULL_UNDER: f32 = 0.3;
+
+/// Whether the hull's bottom corners, each so far over the ground under
+/// it (`over`, metres, under is negative), stand on it: none more than
+/// [`CARGO_HULL_UNDER`] under.
+fn cargo_hull_over_ground(over: &[f32]) -> Result<(), String> {
+    match over.iter().copied().reduce(f32::min) {
+        Some(least) if least < -CARGO_HULL_UNDER => Err(format!(
+            "stands in the ground: its hull's bottom corners {over:.2?} m over the ground under them"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The sane range of `--cargo-check`'s drive: never faster than this,
+/// m/s (its straight is held to 11), nor turned more than this on its
+/// straight or standing, degrees, nor without a wheel on the ground more
+/// than this many seconds running after the first second.
+const CARGO_SANE_SPEED: f32 = 14.0;
+const CARGO_SANE_YAW: f32 = 20.0;
+const CARGO_SANE_AIRBORNE: f32 = 0.5;
+
+/// Whether a phase of `--cargo-check`'s drive was a drive on its wheels:
+/// its fastest speed (either way), how far it turned from where it began
+/// (degrees; only a standing or straight phase is held to it), and its
+/// longest run with no wheel down, seconds (q680 6d991f6e: no wheel down
+/// any step, -24.6 and -84.4 m/s, turned 93 degrees on its straight).
+fn cargo_sane(phase: &str, fastest: f32, turned: f32, airborne: f32) -> Result<(), String> {
+    if fastest > CARGO_SANE_SPEED {
+        return Err(format!(
+            "{phase}: {fastest:.1} m/s, over {CARGO_SANE_SPEED}"
+        ));
+    }
+    if matches!(phase, "standing" | "straight" | "standing after") && turned > CARGO_SANE_YAW {
+        return Err(format!(
+            "{phase}: turned {turned:.0} degrees, over {CARGO_SANE_YAW}"
+        ));
+    }
+    if airborne > CARGO_SANE_AIRBORNE {
+        return Err(format!(
+            "{phase}: no wheel down for {airborne:.2} s running, over {CARGO_SANE_AIRBORNE}"
+        ));
+    }
+    Ok(())
+}
+
+/// Where `--cargo-check` puts its truck: at `at`'s level place, upright
+/// (no tilt or roll: what it stood on before doesn't come with it), its
+/// origin `ride` over the ground at `ground` (its wheels on it, its
+/// springs as its model has them: their rest, #766), heading `yaw`
+/// (radians, from +z towards +x) turned `k` eighths.
+fn cargo_upright(
+    at: m2_math::glam::Vec3,
+    ground: f32,
+    ride: f32,
+    yaw: f32,
+    k: i32,
+) -> m2_math::glam::Mat4 {
+    use m2_math::glam::{Mat4, Quat, Vec3};
+    Mat4::from_rotation_translation(
+        Quat::from_rotation_y(yaw + k as f32 * std::f32::consts::FRAC_PI_4),
+        Vec3::new(at.x, ground + ride, at.z),
+    )
+}
+
+/// How long `--cargo-check`'s straight must be, level and open, metres:
+/// its 6 s held to 11 m/s.
+const CARGO_STRAIGHT: f32 = 40.0;
+
+/// Finds `--cargo-check` a clear, level [`CARGO_STRAIGHT`] for vehicle
+/// `i` (`id`): its own heading if clear, else the first clear one of the
+/// seven others 45 degrees apart, to which the truck and what rides on it
+/// are turned where they stand. A heading is clear when the ground under
+/// a sample every 4 m stays within 1.5 m of the truck's and a 3.2 m wide,
+/// 2.1 m tall box over each is free of every placed object and building
+/// (as `--prop-limits-check`'s lane). False, with `cargo-check: FAIL no
+/// clear straight`, if none is.
+fn cargo_clear_straight(game: &mut Game, i: usize, id: m2_engine::VehicleId, label: &str) -> bool {
+    use m2_math::glam::{Quat, Vec3};
+    let Some(world) = game.scene.world.as_mut() else {
+        return false;
+    };
+    let Some(m) = world.physics.vehicle_transform(id) else {
+        return false;
+    };
+    let here = m.w_axis.truncate();
+    let ahead = m
+        .transform_vector3(Vec3::Z)
+        .with_y(0.0)
+        .normalize_or(Vec3::Z);
+    // Snapped to the nearest of eight world headings, so the search is the
+    // same from run to run (q680: eb5b8507 and the run before moved the
+    // truck to different places from headings a few degrees apart).
+    let step = std::f32::consts::FRAC_PI_4;
+    let snapped = (ahead.x.atan2(ahead.z) / step).round() * step;
+    let ahead = Vec3::new(snapped.sin(), 0.0, snapped.cos());
+    let physics = &world.physics;
+    // The truck's and its crates' footprint corners (model space of the
+    // truck): every one must have ground under it where it is moved to.
+    let (lo, hi) = game.scene.vehicles[i].spec.hull;
+    let ride = game.scene.vehicles[i].spec.ride_height();
+    let snapped_yaw = snapped;
+    let inv = m.inverse();
+    let mut corners: Vec<Vec3> = [(lo.x, lo.z), (hi.x, lo.z), (lo.x, hi.z), (hi.x, hi.z)]
+        .iter()
+        .map(|&(x, z)| Vec3::new(x, lo.y, z))
+        .collect();
+    for d in game.scene.props.cargo_pieces(i) {
+        if let Some(at) = physics.debris_place(d) {
+            corners.push(inv.transform_point3(at.w_axis.truncate()));
+        }
+    }
+    // What stands fixed only: from above, a plain ray met the truck's own
+    // bed and crates 2 m up, and the truck was moved 2 m into the ground
+    // (q680 6d991f6e: its hull 2.1-2.4 m under the ground it read).
+    let ground = |x: f32, z: f32, near: f32| {
+        physics
+            .cast_ray_fixed(Vec3::new(x, near + 20.0, z), Vec3::NEG_Y, 60.0)
+            .map(|(d, _)| near + 20.0 - d)
+    };
+    let Some(floor) = ground(here.x, here.z, here.y) else {
+        eprintln!("cargo-check: FAIL no clear straight (no ground under the {label})");
+        return false;
+    };
+    // A clear, level straight from `from` (on the ground at `base`) along
+    // `way`: the ground loaded and within 1.5 m of `base` every 4 m, and a
+    // 3.2 m wide box over each free of placed objects and buildings.
+    let clear = |from: Vec3, base: f32, way: Vec3| {
+        (0..=((CARGO_STRAIGHT / 4.0) as i32)).all(|k| {
+            let c = from + way * (5.0 + 4.0 * k as f32);
+            let Some(y) = ground(c.x, c.z, base).filter(|y| (y - base).abs() <= 1.5) else {
+                return false;
+            };
+            let c = Vec3::new(c.x, y, c.z);
+            physics.box_clear(
+                c + Vec3::new(-1.6, 0.4, -1.6),
+                c + Vec3::new(1.6, 2.5, 1.6),
+                |key| !matches!(key, m2_engine::StaticKey::Cell(_)),
+            )
+        })
+    };
+    let turned = |k: i32| Quat::from_rotation_y(k as f32 * std::f32::consts::FRAC_PI_4) * ahead;
+    if let Some(k) = (0..8).find(|&k| clear(here, floor, turned(k))) {
+        if k == 0 {
+            eprintln!("cargo-check: the {label}'s own heading is clear for {CARGO_STRAIGHT} m");
+            return true;
+        }
+        // Turned where it stands, upright on its wheels, its cargo with it.
+        let target = cargo_upright(here, floor, ride, snapped_yaw, k);
+        let turn = target * inv;
+        {
+            let (_, r, t) = target.to_scale_rotation_translation();
+            world.physics.place_vehicle(id, t, r);
+        }
+        for d in game.scene.props.cargo_pieces(i) {
+            if let Some(at) = world.physics.debris_place(d) {
+                world.physics.move_debris(d, turn * at);
+            }
+        }
+        eprintln!(
+            "cargo-check: the {label} is turned {} degrees where it stands: its own heading is blocked, that one is clear for {CARGO_STRAIGHT} m",
+            k * 45
+        );
+        return true;
+    }
+    // None here (q680 at a6fcbef0: on the waterfront): the nearest clear,
+    // level straight on ground already loaded within 200 m, rings 20 m
+    // apart, 16 places a ring, eight headings each; the place itself must
+    // have ground under it and room for the truck. Truck and cargo are
+    // moved there by one rigid move, as high over the ground as here.
+    let mut found = None;
+    // Places clear and level but with a truck or crate corner over no
+    // ground (or ground not loaded yet).
+    let mut ungrounded = 0;
+    'rings: for r in (1..=10).map(|n| n as f32 * 20.0) {
+        for a in 0..16 {
+            let turn = Quat::from_rotation_y(a as f32 * std::f32::consts::TAU / 16.0);
+            let at = here + turn * Vec3::Z * r;
+            let Some(base) = ground(at.x, at.z, here.y) else {
+                continue;
+            };
+            let spot = Vec3::new(at.x, base, at.z);
+            if !physics.box_clear(
+                spot + Vec3::new(-2.0, 0.4, -2.0),
+                spot + Vec3::new(2.0, 3.0, 2.0),
+                |key| !matches!(key, m2_engine::StaticKey::Cell(_)),
+            ) {
+                continue;
+            }
+            if let Some(k) = (0..8).find(|&k| clear(spot, base, turned(k))) {
+                // Ground under every truck and crate corner there.
+                let target = cargo_upright(spot, base, ride, snapped_yaw, k);
+                let bare = corners
+                    .iter()
+                    .map(|&c| target.transform_point3(c))
+                    .filter(|c| ground(c.x, c.z, c.y).is_none_or(|y| (y - c.y).abs() > 3.0))
+                    .count();
+                if bare > 0 {
+                    ungrounded += 1;
+                    continue;
+                }
+                found = Some((spot, base, k));
+                break 'rings;
+            }
+        }
+    }
+    let Some((spot, base, k)) = found else {
+        if ungrounded > 0 {
+            eprintln!(
+                "cargo-check: FAIL no ground under the move target: {ungrounded} clear, level places within 200 m had a truck or crate corner over no ground"
+            );
+            return false;
+        }
+        eprintln!(
+            "cargo-check: FAIL no clear straight within 200 m: none of eight headings at the {label} ({here:.0}) or at any loaded place round it has {CARGO_STRAIGHT} m of level, open ground"
+        );
+        return false;
+    };
+    // Upright on its wheels on the ground there, heading as cleared: not
+    // the tilt it stood with where it was (q680 5e4483a5: moved keeping it,
+    // its hull's bottom corners read -0.10, 0.36, -0.33 and 0.13 m over
+    // ground level within 0.03 m).
+    let target = cargo_upright(spot, base, ride, snapped_yaw, k);
+    let to = target.w_axis.truncate();
+    let moved = target * inv;
+    // Ground under every corner of the truck and under every crate where
+    // they are moved to (q680 eb5b8507: moved onto no ground, the truck
+    // fell 33 m in 2.75 s).
+    let missing: Vec<Vec3> = corners
+        .iter()
+        .map(|&c| target.transform_point3(c))
+        .filter(|c| ground(c.x, c.z, c.y).is_none_or(|y| (y - c.y).abs() > 3.0))
+        .collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "cargo-check: FAIL no ground under the move target {to:.0}: {} of {} truck and crate corners have none within 3 m ({:.0?})",
+            missing.len(),
+            corners.len(),
+            missing
+        );
+        return false;
+    }
+    {
+        let (_, r, t) = target.to_scale_rotation_translation();
+        world.physics.place_vehicle(id, t, r);
+    }
+    for d in game.scene.props.cargo_pieces(i) {
+        if let Some(at) = world.physics.debris_place(d) {
+            world.physics.move_debris(d, moved * at);
+        }
+    }
+    eprintln!(
+        "cargo-check: the {label} and its cargo are moved {:.0} m to {to:.0}, turned {} degrees from its own heading (now {:.0} degrees, from +z towards +x): a clear, level {CARGO_STRAIGHT} m straight",
+        to.with_y(0.0).distance(here.with_y(0.0)),
+        k * 45,
+        (snapped_yaw + k as f32 * std::f32::consts::FRAC_PI_4).to_degrees()
+    );
+    true
+}
+
+/// `--cargo-check`'s verdict on its phases' ends (phase, median and most
+/// shift of those aboard, how many off so far, how many in all), against
+/// Xenia's crate runs (eg2, and block 2, `crates-hold.md`: 19 crates on
+/// the El Grande, each a plain dynamic body under its gravity scaler, no
+/// attach link). There they shift as physics starts and slide in the bed
+/// from the first pull-away, so how far they move is **not** gated. What
+/// is gated: none comes off standing, on a gentle straight or in a hard
+/// brake; a hard turn may shed a few (Xenia: 4 of 19), but most stay (no
+/// more than half off by the end).
+fn cargo_verdict(ends: &[(&str, f32, f32, usize, usize)]) -> Result<(), String> {
+    let at = |name: &str| ends.iter().find(|e| e.0 == name).copied();
+    let (Some(still), Some(straight), Some(turn), Some(brake), Some(last)) = (
+        at("standing"),
+        at("straight"),
+        at("hard turn"),
+        at("braking"),
+        at("standing after"),
+    ) else {
+        return Err("the drive ended before all its phases".into());
+    };
+    if still.4 == 0 {
+        return Err("no crates aboard".into());
+    }
+    if still.3 > 0 {
+        return Err(format!("{} came off standing", still.3));
+    }
+    if straight.3 > still.3 {
+        return Err(format!(
+            "{} came off driving straight",
+            straight.3 - still.3
+        ));
+    }
+    if brake.3 > turn.3 {
+        return Err(format!("{} came off braking", brake.3 - turn.3));
+    }
+    if last.3 * 2 > last.4 {
+        return Err(format!(
+            "{} of {} came off: most should stay",
+            last.3, last.4
+        ));
+    }
+    Ok(())
+}
+
+/// The median and the most of `shifts` (0 for none), as the Xenia
+/// table gives them: the upper middle of an even count.
+fn median_and_most(shifts: &mut [f32]) -> (f32, f32) {
+    shifts.sort_by(f32::total_cmp);
+    (
+        shifts.get(shifts.len() / 2).copied().unwrap_or(0.0),
+        shifts.last().copied().unwrap_or(0.0),
+    )
+}
+
 /// `--sink-check`: the first car loaded (no boat, no helicopter; parked
 /// or, with nowhere to park by her, not) is put on water more than 6 m
 /// deep near her with her at the wheel, and held
@@ -10264,9 +12093,208 @@ fn wreck_rider_check(game: &mut Game, tick: f32) {
 
 /// The 360's car wreck in Xenia (a Phoenix shot dead, GodMode off, the
 /// hero 5.9 m from its middle): the car rose 5.3 m at 1.1 s, landed
-/// 16.4-16.6 m off, its top speed 17-18 m/s in the first 0.5 s; she lost
-/// 74.6 and slid 1.7 m.
-const XENIA_WRECK: (f32, f32, f32, f32) = (5.3, 16.5, 17.5, 74.6);
+/// 16.4-16.6 m off (its last samples; landed 11.0-15.6, see
+/// [`XENIA_WRECK_LANDS`]); she lost 74.6 and slid 1.7 m. Its speed is
+/// phys8a's the step after the explosions ([`XENIA_NEXT_SPEED`]; the
+/// differenced 17-18 m/s is not a body speed).
+const XENIA_WRECK: (f32, f32, f32, f32) = (5.3, 16.5, XENIA_NEXT_SPEED, 74.6);
+
+/// The vehicle `--wreck-blast-check` wrecks unless `--vehicle` names
+/// another: Xenia's phys3-6 runs, whose bands it is judged by, wrecked a
+/// Phoenix.
+const WRECK_BLAST_VEHICLE: &str = "phoenix";
+
+/// The template whose car `--wreck-blast-check` wrecks: Xenia's
+/// phys3-6 Phoenix, 2500 kg. Its model is `global_veh_phoenix_body`; the
+/// catalogue's `civ_veh_car_phoenix` is "Phoenix (crappy)"'s, 2000 kg
+/// (q728k drove that one, the first catalogue label with "phoenix").
+const WRECK_BLAST_TEMPLATE: &str = "Phoenix";
+
+/// The model `--wreck-blast-check` must wreck when it picks its own
+/// vehicle ([`WRECK_BLAST_TEMPLATE`]'s), else none asked.
+fn wreck_blast_model(game: &Game, options: &Options) -> Option<u32> {
+    if !options.wreck_blast_check || options.vehicle.as_deref() != Some(WRECK_BLAST_VEHICLE) {
+        return None;
+    }
+    game.scene
+        .world
+        .as_ref()?
+        .index
+        .template_db
+        .get(WRECK_BLAST_TEMPLATE)?
+        .model
+}
+
+/// Where `--wreck-blast-check` wrecks its car, level (x, z): where
+/// Xenia's phys3-8 wrecked theirs, the Phoenix parked at the OilCon020
+/// start (phys8a: body at (2653.789, -13.786, -996.733) as it stood).
+/// Run with `--spawn 2654,-997` so the world round it is loaded.
+const WRECK_SPOT: (f32, f32) = (2653.8, -996.7);
+
+/// How Xenia's Phoenix stood there, its turn (x, y, z, w): facing -137.5
+/// degrees (from +z towards +x). Its wrecks always landed along that,
+/// bearing -126 to -153 degrees, whichever side she stood
+/// (car-blast-source.md, "Wreck landing spread": yaw quat (~0, -0.932,
+/// ~0, 0.362)).
+const WRECK_TURN: (f32, f32, f32, f32) = (0.0, -0.932, 0.0, 0.362);
+
+/// How far out `--wreck-blast-check` logs the ground and what stands
+/// round its spot, metres: Xenia's wrecks land 11-15.6 m out.
+const WRECK_PATH: f32 = 16.0;
+
+/// Puts vehicle `id` (which she drives) at [`WRECK_SPOT`] for
+/// `--wreck-blast-check`: upright on its wheels on the ground there, its
+/// heading kept, still; then holds it still until the world has no loads
+/// pending (at least 1 s, at most 10 s). Logs, along eight headings, the
+/// ground 4, 8, 12 and 16 m out against the car's, and each placed object
+/// or building of 1 m or more within [`WRECK_PATH`] (log only: the flight
+/// is judged by its own numbers). False, with `wreck-blast-check: FAIL`,
+/// when there is no ground at the spot.
+fn wreck_at_spot(game: &mut Game, id: m2_engine::VehicleId, label: &str, tick: f32) -> bool {
+    use m2_math::glam::{Quat, Vec3};
+    let Some(i) = game.scene.vehicles.iter().position(|v| v.id == Some(id)) else {
+        return false;
+    };
+    let ride = game.scene.vehicles[i].spec.ride_height();
+    let (x, z) = WRECK_SPOT;
+    let ground_at = |game: &Game, x: f32, z: f32| {
+        let physics = &game.scene.world.as_ref()?.physics;
+        physics
+            .cast_ray(Vec3::new(x, 400.0, z), Vec3::NEG_Y, 800.0)
+            .map(|(d, _)| 400.0 - d)
+    };
+    let Some(base) = ground_at(game, x, z) else {
+        eprintln!(
+            "wreck-blast-check: FAIL no ground at the wreck spot ({x}, {z}): run with --spawn 2654,-997"
+        );
+        return false;
+    };
+    let Some(world) = game.scene.world.as_mut() else {
+        return false;
+    };
+    let to = Vec3::new(x, base + ride + 0.05, z);
+    let (qx, qy, qz, qw) = WRECK_TURN;
+    world
+        .physics
+        .place_vehicle(id, to, Quat::from_xyzw(qx, qy, qz, qw).normalize());
+    eprintln!(
+        "wreck-blast-check: the {label} put upright at Xenia's wreck spot {to:.2} (ground {base:.2}), facing {:.1} deg as Xenia's",
+        2.0 * qy.atan2(qw).to_degrees()
+    );
+    let waited = Instant::now();
+    let mut k = 0u32;
+    loop {
+        if let Some(w) = game.scene.world.as_mut() {
+            w.physics.set_vehicle_velocity(id, Vec3::ZERO);
+            w.physics.set_vehicle_spin(id, Vec3::ZERO);
+        }
+        game.step(Intent::default(), tick);
+        k += 1;
+        let pending = game.scene.world.as_ref().map_or(0, |w| w.stats().pending);
+        if (k as f32 * tick >= 1.0 && pending == 0) || waited.elapsed() > Duration::from_secs(10) {
+            eprintln!(
+                "wreck-blast-check: waited {:.1} s at the spot, {pending} loads pending",
+                k as f32 * tick
+            );
+            break;
+        }
+    }
+    // The ground as read before the car stood there (a ray at the spot
+    // now meets its roof: q728p read the paths 1.5 m below it).
+    for h in 0..8 {
+        let way = Quat::from_rotation_y(h as f32 * std::f32::consts::FRAC_PI_4) * Vec3::Z;
+        let heights: Vec<String> = [4.0, 8.0, 12.0, 16.0]
+            .iter()
+            .map(|&d| {
+                let c = Vec3::new(x, 0.0, z) + way * d;
+                ground_at(game, c.x, c.z).map_or("none".to_owned(), |y| format!("{:+.2}", y - base))
+            })
+            .collect();
+        eprintln!(
+            "wreck-blast-check: path {:>3} deg (from +z towards +x): ground 4/8/12/16 m out {}",
+            h * 45,
+            heights.join(" ")
+        );
+    }
+    if let Some(world) = game.scene.world.as_ref() {
+        let r = WRECK_PATH;
+        let mut near: Vec<(f32, f32, Vec3)> = world
+            .physics
+            .fixed_near(
+                Vec3::new(x - r, base + 0.3, z - r),
+                Vec3::new(x + r, base + 4.0, z + r),
+            )
+            .into_iter()
+            .filter(|&(_, size)| size >= 1.0)
+            .map(|(c, size)| (c.with_y(0.0).distance(Vec3::new(x, 0.0, z)) - size, size, c))
+            .filter(|&(gap, _, _)| gap < r)
+            .collect();
+        near.sort_by(|a, b| a.0.total_cmp(&b.0));
+        eprintln!(
+            "wreck-blast-check: {} placed objects of 1 m or more within {r} m (0.3-4 m up): {}",
+            near.len(),
+            near.iter()
+                .take(8)
+                .map(|(gap, size, c)| format!("{gap:.1} m off (size {size:.1}, at {c:.1})"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    true
+}
+
+/// Xenia's car death launch (phys8a, Phoenix 0x40005ED5, counter c69):
+/// the rebuilt body's change of speed, applied at once in the death
+/// frame, `10 x normalize(rx, 4, rz)` plus 2 square to it: |10.198| =
+/// sqrt(10² + 2²). The rebuilt body takes the old one's speed first
+/// (0.036 there), so its speed after differs from that by no more than
+/// what it had.
+const XENIA_LAUNCH: f32 = 10.198;
+/// How near its speed as launched must come to that: the speed it had
+/// before (held still, under 0.1 m/s) plus a little.
+const LAUNCH_SLACK: f32 = 0.12;
+/// How many steps from the wreck on `--wreck-blast-check` logs, with
+/// their dt and speed.
+const WRECK_STEPS_LOGGED: usize = 8;
+
+/// The fall it flies under after (0.30 m/s a 1/30 s step, phys6).
+const XENIA_WRECK_G: f32 = 9.0;
+/// How near that a fitted fall must be.
+const WRECK_G_SLACK: f32 = 0.5;
+/// How near where it stood a wreck must have come back down to count as
+/// landed, metres: Xenia's band's own measure (car-blast-source.md: the
+/// first sample after the peak within 0.6 m of its rest height).
+const WRECK_LAND_HEIGHT: f32 = 0.6;
+/// Its speed on the step after its explosions, all of it (phys8a, c70:
+/// launch (-2.623, 9.707, 1.583) and the explosions' (-2.416, 0, -5.610),
+/// |(-5.04, 9.71, -4.03)| = 11.66; gravity's 0.15 over the step aside),
+/// and how near it must come: 1.5 m/s, the level part of a launch being
+/// random per wreck (its direction from rx and rz, `death_launch`), so
+/// the port's draw and phys8a's single one add to the explosions'
+/// differently. One sample: phys8b/c can narrow it. Replaces the 17-18
+/// m/s "top speed in the first 0.5 s" (blast-launch.md), differenced from
+/// 15-20 Hz positions on uneven wall time (gren2's step 5: |15.2| on a
+/// 23.7 ms gap), which no body speed in phys8a reaches.
+const XENIA_NEXT_SPEED: f32 = 11.66;
+const NEXT_SPEED_SLACK: f32 = 1.5;
+/// Its highest rise and where it lands, metres (phys3-6). The rise's top
+/// holds Xenia's own launch (changed 2026-11-25): its up speed 9.813 m/s
+/// at the 360's gravity of 9 rises 9.813² / (2 x 9) = 5.3497 m, which
+/// Xenia prints rounded as "5.3"; 5.35, inclusive, is the least two-place
+/// value that holds it (was 5.3).
+const XENIA_WRECK_PEAK: (f32, f32) = (4.9, 5.35);
+const XENIA_WRECK_LANDS: (f32, f32) = (11.0, 15.6);
+/// The step after: its blasts' change, level only (up topped away, as
+/// 0x8215BF38 tops it; phys8a: they land a frame after the launch, as
+/// deferred pushes flushed after that frame's step), its level change
+/// at least the least. Its up change is that step's gravity plus what
+/// the ground still under it takes off: at most this much more than
+/// gravity's alone, or this little less (phys8a: the contact solve took
+/// 0.193, then 0.156, 0.035 and 0.116 a substep while the rebuilt car
+/// still touched the ground).
+const WRECK_NEXT_UP_SLACK: f32 = 0.15;
+const WRECK_NEXT_CONTACT: f32 = 0.4;
+const WRECK_NEXT_LEAST_LEVEL: f32 = 1.0;
 
 /// Her health lost to a car's wreck in Xenia, by her distance from its
 /// middle (metres, health; full health, GodMode off): runs carblast24,
@@ -10297,11 +12325,11 @@ const WRECK_BLASTS: [u32; 2] = [0x8000_5695, 0x8000_a27b];
 /// lost and how far she moved, each beside Xenia's
 /// ([`XENIA_WRECK`]). `--wreck-blast-at <m>` stands her that far from
 /// its middle instead (2.9, 3.21, 3.8, 5.8, 5.9 or 6.42: Xenia's,
-/// [`XENIA_WRECK_HITS`]). Ends `wreck-blast-check: PASS` when the wreck
-/// set off both of [`WRECK_BLASTS`] and her loss is within
-/// [`WRECK_HIT_SLACK`] of Xenia's at that distance, else `FAIL` with
-/// why. Its rise, landing and speed are logged beside Xenia's, not
-/// judged.
+/// [`XENIA_WRECK_HITS`]). Ends `wreck-blast-check: PASS` when it flew
+/// as Xenia's ([`wreck_flight_verdict`]: its death step, the level-only
+/// step after, its fall, rise and landing), the wreck set off both of
+/// [`WRECK_BLASTS`] and her loss is within [`WRECK_HIT_SLACK`] of Xenia's
+/// at that distance, else `FAIL` with why.
 fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
     use m2_math::glam::Vec3;
     let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
@@ -10312,6 +12340,38 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
         eprintln!("wreck-blast-check: FAIL her vehicle has no body");
         return;
     };
+    // Judged by a Phoenix's bands: another vehicle can't pass.
+    let label = game.scene.vehicles[i].spec.label.clone();
+    if !label.to_ascii_lowercase().contains(WRECK_BLAST_VEHICLE) {
+        eprintln!(
+            "wreck-blast-check: FAIL she drives the {label}, not a {WRECK_BLAST_VEHICLE} (Xenia's bands are a Phoenix's)"
+        );
+        return;
+    }
+    let phoenix = game
+        .scene
+        .world
+        .as_ref()
+        .and_then(|w| w.index.template_db.get(WRECK_BLAST_TEMPLATE))
+        .and_then(|t| t.model);
+    if phoenix.is_some_and(|m| game.scene.vehicles[i].spec.model != m) {
+        eprintln!(
+            "wreck-blast-check: FAIL she drives the {label} (model {:08x}), not the template {WRECK_BLAST_TEMPLATE:?}'s model {:08x?} (Xenia's 2500 kg Phoenix)",
+            game.scene.vehicles[i].spec.model, phoenix
+        );
+        return;
+    }
+    eprintln!(
+        "wreck-blast-check: the {label}: spec {:.0} kg, body {:.0?} kg ({WRECK_BLAST_TEMPLATE:?} is 2500, as Xenia's)",
+        game.scene.vehicles[i].spec.mass,
+        game.scene
+            .world
+            .as_ref()
+            .and_then(|w| w.physics.vehicle_chassis_mass(id))
+    );
+    if !wreck_at_spot(game, id, &label, tick) {
+        return;
+    }
     // Stopped, a while, then her out and 5.9 m off its middle. The car
     // is held still all the while (driverless it would roll on, and her
     // distance from it with it: the q728 runs' blasts went off 1 to 5 m
@@ -10413,15 +12473,25 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
         );
         return;
     }
-    if let Some(world) = game.scene.world.as_mut() {
-        let v = &mut game.scene.vehicles[i];
-        game.combat.wreck_now(&mut world.physics, v, i);
-    }
+    game.combat.wreck_now(i);
+    // Its speed each step from the one it is wrecked in (the death step),
+    // and the time then.
+    let mut flight: Vec<(f32, Vec3)> = Vec::new();
     let (mut top, mut top_at, mut fastest, mut landed) = (0.0f32, 0.0, 0.0f32, None);
     let mut falling = false;
     // Her least health in the watch: the blasts' loss, before her health
     // comes back (4 s on, at 25 a second: by 6 s some 50 of it).
     let mut least = game.combat.hp;
+    // Log only: each step's dt and speed from the wreck on (the port
+    // steps at 1/60 s, Xenia's counters are 1/30 s), and where it first
+    // touches anything after it has left the ground, apart from where it
+    // comes to rest.
+    let (mut logged, mut airborne, mut first_touch) = (0, false, None);
+    // Landed as Xenia's band measures it (car-blast-source.md, "Wreck
+    // landing spread"): the first sample after its peak within
+    // [`WRECK_LAND_HEIGHT`] of where it stood, its distance level from
+    // there.
+    let mut came_down: Option<(f32, f32)> = None;
     for k in 0..(6.0 / tick) as u32 {
         game.step(Intent::default(), tick);
         least = least.min(game.combat.hp);
@@ -10429,9 +12499,36 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
         let Some((at, v)) = place(game) else {
             break;
         };
+        if game.scene.vehicles[i].wrecked && landed.is_none() {
+            flight.push((t, v));
+            if logged < WRECK_STEPS_LOGGED {
+                logged += 1;
+                eprintln!(
+                    "wreck-blast-check: step {logged} at {t:.4} s, dt {tick:.4} s: v {v:.3}, |v| {:.2}",
+                    v.length()
+                );
+            }
+            let touching = game
+                .scene
+                .world
+                .as_ref()
+                .is_some_and(|w| !w.physics.vehicle_touching(id).is_empty());
+            if !touching {
+                airborne = true;
+            } else if airborne && first_touch.is_none() {
+                let d = at.with_y(0.0).distance(start.with_y(0.0));
+                eprintln!(
+                    "wreck-blast-check: first touch after leaving the ground at {t:.2} s, {d:.1} m off, v {v:.2}"
+                );
+                first_touch = Some(d);
+            }
+        }
         let rise = at.y - start.y;
         if rise > top {
             (top, top_at) = (rise, t);
+        }
+        if came_down.is_none() && top > 0.5 && t > top_at && rise <= WRECK_LAND_HEIGHT {
+            came_down = Some((at.with_y(0.0).distance(start.with_y(0.0)), t));
         }
         if t <= 0.5 {
             fastest = fastest.max(v.length());
@@ -10448,13 +12545,38 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
     }
     let (rise, off, speed, lost) = XENIA_WRECK;
     eprintln!(
-        "wreck-blast-check: rose {top:.1} m at {top_at:.2} s (360 {rise}), landed {} m off (360 {off}), top speed {fastest:.1} m/s (360 {speed}); she lost {:.1} (360 {lost}) and moved {:.1} m",
+        "wreck-blast-check: came down (first step after its peak within {WRECK_LAND_HEIGHT} m of where it stood, as Xenia's band) {} m off at {} s; first touch {} m off, at rest {} m off (360 lands {:?})",
+        came_down.map_or("never".to_owned(), |(d, _)| format!("{d:.1}")),
+        came_down.map_or("never".to_owned(), |(_, t)| format!("{t:.2}")),
+        first_touch.map_or("never".to_owned(), |d| format!("{d:.1}")),
+        landed.map_or("never".to_owned(), |d| format!("{d:.1}")),
+        XENIA_WRECK_LANDS
+    );
+    eprintln!(
+        "wreck-blast-check: rose {top:.1} m at {top_at:.2} s (360 {rise}), landed {} m off (360 {off}), top speed in 0.5 s {fastest:.1} m/s (360 the step after its explosions {speed}); she lost {:.1} (360 {lost}) and moved {:.1} m",
         landed.map_or("never".to_owned(), |d| format!("{d:.1}")),
         hp - least,
         her(game)
             .zip(her_from)
             .map_or(0.0, |(a, b)| a.with_y(0.0).distance(b.with_y(0.0)))
     );
+    // Judged per frame (the port's frame is one step, `tick`), its gravity
+    // undone over the frame: the 360's death frame is its launch, then its
+    // explosions' level-only pushes, then the frame's substeps of gravity
+    // (docs/fidelity/physics-frame.md).
+    eprintln!(
+        "wreck-blast-check: judged per frame of {tick:.4} s; launched {:.3}",
+        game.combat.launched.unwrap_or(Vec3::NAN)
+    );
+    let flew = wreck_flight_verdict(
+        &flight,
+        top,
+        came_down.map(|(d, _)| d),
+        game.combat.launched,
+    );
+    for line in &flew.lines {
+        eprintln!("wreck-blast-check: {line}");
+    }
     let away = at.unwrap_or(5.9);
     let lost = hp - least;
     let fired = &game.combat.part_blasts_fired;
@@ -10468,6 +12590,10 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
         .find(|(d, _)| (d - away).abs() < 0.01)
         .map(|&(_, h)| h);
     match want {
+        _ if !flew.fails.is_empty() => eprintln!(
+            "wreck-blast-check: FAIL its flight: {}",
+            flew.fails.join("; ")
+        ),
         _ if !missing.is_empty() => eprintln!(
             "wreck-blast-check: FAIL the {} set off {fired:08x?}, not {}",
             game.scene.vehicles[i].spec.label,
@@ -10477,13 +12603,143 @@ fn wreck_blast_check(game: &mut Game, tick: f32, at: Option<f32>) {
             "wreck-blast-check: FAIL {away} m is none of Xenia's distances (2.9, 3.21, 3.8, 5.8, 5.9, 6.42)"
         ),
         Some(h) if (lost - h).abs() <= h * WRECK_HIT_SLACK => {
-            eprintln!("wreck-blast-check: PASS she lost {lost:.1} at {away} m (Xenia {h})")
+            eprintln!(
+                "wreck-blast-check: PASS it flew as Xenia's and she lost {lost:.1} at {away} m (Xenia {h})"
+            )
         }
         Some(h) => eprintln!(
             "wreck-blast-check: FAIL she lost {lost:.1} at {away} m, Xenia {h} (within {:.0}% asked)",
             WRECK_HIT_SLACK * 100.0
         ),
     }
+}
+
+/// What `--wreck-blast-check` makes of a wreck's flight: its lines and
+/// why it fails, if it does.
+struct FlightVerdict {
+    lines: Vec<String>,
+    fails: Vec<String>,
+}
+
+/// Judges a wreck's flight against Xenia's (phys3-6, phys8a): `flight`
+/// is its speed each step from the death step on, `(time, velocity)`;
+/// `top` its highest rise, `landed` how far off it came down and
+/// `launch` its speed as launched. The port's frame steps physics first,
+/// then the actions, so its death sample is the launch alone and the
+/// next carries that step's gravity, ground contact and its explosions.
+/// The launch's change within [`LAUNCH_SLACK`] of [`XENIA_LAUNCH`] (its
+/// speed before is under 0.1 m/s while it stands); the next step's
+/// change level only (its up change gravity's alone, less
+/// [`WRECK_NEXT_CONTACT`] to more by [`WRECK_NEXT_UP_SLACK`], its level
+/// change at least [`WRECK_NEXT_LEAST_LEVEL`], its whole speed within
+/// [`NEXT_SPEED_SLACK`] of [`XENIA_NEXT_SPEED`]); `landed` as Xenia's
+/// band measures it ([`WRECK_LAND_HEIGHT`]); after that a fall fitted within
+/// [`WRECK_G_SLACK`] of [`XENIA_WRECK_G`] while it rises; its rise within
+/// [`XENIA_WRECK_PEAK`] and its landing within [`XENIA_WRECK_LANDS`].
+fn wreck_flight_verdict(
+    flight: &[(f32, m2_math::glam::Vec3)],
+    top: f32,
+    landed: Option<f32>,
+    launch: Option<m2_math::glam::Vec3>,
+) -> FlightVerdict {
+    let mut lines = Vec::new();
+    let mut fails = Vec::new();
+    let within = |x: f32, (lo, hi): (f32, f32)| (lo..=hi).contains(&x);
+    let Some(&(_, death)) = flight.first() else {
+        fails.push("it never was wrecked".to_owned());
+        return FlightVerdict { lines, fails };
+    };
+    // Its launch, all at once in the death frame (phys8a): the death
+    // sample is it, gravity not yet (the port's frame steps physics, then
+    // runs the launch). Its change: the speed it had (held still, under
+    // 0.1 m/s) taken off by no more than that.
+    let launched = launch.unwrap_or(death);
+    lines.push(format!(
+        "death step {death:.3}, launched {launched:.3} |{:.3}| (360's change |{XENIA_LAUNCH}|)",
+        launched.length()
+    ));
+    if (launched.length() - XENIA_LAUNCH).abs() > LAUNCH_SLACK {
+        fails.push(format!(
+            "death step launched |{:.3}|, not |{XENIA_LAUNCH}| (10 + 2 square to it)",
+            launched.length()
+        ));
+    }
+    match launch {
+        // The death step carries the launch alone (q728p: the explosions
+        // landed in it too, z 1.94 -> 7.50).
+        Some(l) if (death - l).length() > 0.05 => fails.push(format!(
+            "death step {death:.3} carries more than its launch {l:.3}: the explosions landed in it, not the step after"
+        )),
+        Some(_) => {}
+        None => fails.push("no launch logged".to_owned()),
+    }
+    // Its explosions, the step after (phys8a: the frame after the death
+    // frame, deferred): level only, beside that step's gravity and what
+    // the ground under it takes.
+    match flight.get(1) {
+        Some(&(t1, next)) => {
+            let dt = t1 - flight[0].0;
+            let change = next - death;
+            let level = change.with_y(0.0).length();
+            let gravity = -XENIA_WRECK_G * dt;
+            let up = change.y;
+            lines.push(format!(
+                "next step's explosions: change {change:.3}, level {level:.2}, up {up:.3} (gravity alone {gravity:.3}); |v| {:.2} (360 {XENIA_NEXT_SPEED} +/- {NEXT_SPEED_SLACK})",
+                next.length()
+            ));
+            if (next.length() - XENIA_NEXT_SPEED).abs() > NEXT_SPEED_SLACK {
+                fails.push(format!(
+                    "|v| {:.2} the step after its explosions, not {XENIA_NEXT_SPEED} +/- {NEXT_SPEED_SLACK}",
+                    next.length()
+                ));
+            }
+            if up > gravity + WRECK_NEXT_UP_SLACK
+                || up < gravity - WRECK_NEXT_CONTACT
+                || level < WRECK_NEXT_LEAST_LEVEL
+            {
+                fails.push(format!(
+                    "the next step's explosions not level only (level {level:.2}, up {up:.3} against gravity's {gravity:.3})"
+                ));
+            }
+        }
+        None => fails.push("no step after the death step".to_owned()),
+    }
+    // The fall while it rises, from the frame after the death frame.
+    let rising: Vec<(f32, f32)> = flight
+        .iter()
+        .skip(1)
+        .take_while(|(_, v)| v.y > 0.0)
+        .map(|&(t, v)| (t, v.y))
+        .collect();
+    match (rising.first(), rising.last()) {
+        (Some(&(t0, a)), Some(&(t1, b))) if t1 > t0 => {
+            let g = (a - b) / (t1 - t0);
+            lines.push(format!(
+                "falls at {g:.2} m/s/s while rising (360 {XENIA_WRECK_G})"
+            ));
+            if (g - XENIA_WRECK_G).abs() > WRECK_G_SLACK {
+                fails.push(format!("falls at {g:.2}, not {XENIA_WRECK_G}"));
+            }
+        }
+        _ => fails.push("no rise to fit its fall to".to_owned()),
+    }
+    lines.push(format!(
+        "rose {top:.2} m (360 {:?}), landed {} m off (360 {:?})",
+        XENIA_WRECK_PEAK,
+        landed.map_or("never".to_owned(), |d| format!("{d:.1}")),
+        XENIA_WRECK_LANDS
+    ));
+    if !within(top, XENIA_WRECK_PEAK) {
+        fails.push(format!("rose {top:.2}, not {:?}", XENIA_WRECK_PEAK));
+    }
+    if !landed.is_some_and(|d| within(d, XENIA_WRECK_LANDS)) {
+        fails.push(format!(
+            "landed {} off, not {:?}",
+            landed.map_or("never".to_owned(), |d| format!("{d:.1}")),
+            XENIA_WRECK_LANDS
+        ));
+    }
+    FlightVerdict { lines, fails }
 }
 
 /// Wrecks the vehicle she drives, as it goes, and logs how it comes to
@@ -11835,6 +14091,23 @@ struct Running {
     /// When to open the pause menu as Escape does (`--pause-at`): a test of
     /// pausing in play (the pause music).
     pause_at: Option<Instant>,
+    /// `--newgame-cover-check`'s frames, and when it gives up.
+    cover_check: Option<(cover::Check, Instant)>,
+    /// The new game was started for the check.
+    cover_check_started: bool,
+    /// `--new-game` or `--load-slot`, not yet done.
+    start: Option<flow::Start>,
+    /// `--launch-check`: what was asked, the hero play should start as
+    /// once known (the save's, read as it loads), and when it gives up.
+    launch_check: Option<LaunchCheck>,
+}
+
+/// `--launch-check`'s state.
+#[derive(Debug)]
+struct LaunchCheck {
+    start: flow::Start,
+    want: Option<Hero>,
+    limit: Instant,
 }
 
 struct App {
@@ -11886,6 +14159,12 @@ struct App {
     /// Seconds into play to load the player's own save (`--load-at`).
     load_at: Option<f32>,
     pause_at: Option<f32>,
+    /// `--newgame-cover-check`.
+    newgame_cover_check: bool,
+    /// `--new-game` or `--load-slot`.
+    start: Option<flow::Start>,
+    /// `--launch-check`.
+    launch_check: bool,
     /// The alpha started again (the pause menu's Quit, loading a save),
     /// which this one waits for once its window is closed.
     successor: Option<std::process::Child>,
@@ -11924,6 +14203,7 @@ impl App {
             WgpuBackend::for_window(window.clone(), size.width, size.height, w.vsync)?;
         let adapter = backend.adapter_summary();
         eprintln!("adapter: {adapter:?}");
+        warmup::start(&mut backend, false);
         backend.set_render_scale(w.render_scale);
         backend.set_light_shadows(cfg!(target_os = "android"));
         if w.render_scale < 1.0 {
@@ -12058,6 +14338,46 @@ impl App {
             pause_at: self
                 .pause_at
                 .map(|s| Instant::now() + Duration::from_secs_f32(s)),
+            cover_check: self.newgame_cover_check.then(|| {
+                eprintln!(
+                    "newgame-cover-check: New Game once the front end is up; PASS needs no world                      frame before the intro and her placed and standing when the cover drops"
+                );
+                let decoder = movie::ffmpeg();
+                eprintln!(
+                    "newgame-cover-check: movie decoder {}",
+                    decoder
+                        .as_ref()
+                        .map_or("none (a skipped intro passes, noted)".to_owned(), |p| {
+                            format!("{} (the intro must present a frame)", p.display())
+                        })
+                );
+                (
+                    cover::Check {
+                        decoder: decoder.is_some(),
+                        ..cover::Check::default()
+                    },
+                    Instant::now() + COVER_CHECK_LIMIT,
+                )
+            }),
+            cover_check_started: false,
+            launch_check: match (self.launch_check, self.start) {
+                (true, Some(start)) => {
+                    eprintln!(
+                        "launch-check: {start:?} once the front end is up; PASS needs play started from it as the hero asked"
+                    );
+                    Some(LaunchCheck {
+                        start,
+                        want: matches!(start, flow::Start::NewGame).then_some(self.config.hero),
+                        limit: Instant::now() + LAUNCH_CHECK_LIMIT,
+                    })
+                }
+                (true, None) => {
+                    eprintln!("launch-check: FAIL needs --new-game or --load-slot");
+                    errlog::exit(1);
+                }
+                _ => None,
+            },
+            start: self.start.take(),
         };
         running.apply_options(&self.config);
         Ok(running)
@@ -12161,10 +14481,79 @@ impl Running {
             self.lag -= TICK;
             spans::time("ticks", || self.tick(config, event_loop));
         }
+        // The new game's cover is updated once a frame, as the 360's
+        // Loading and WaitForStreaming count their updates ([`cover`]).
+        if let Some(flow) = self.flow.as_mut().filter(|f| f.cover.covered()) {
+            let inputs = cover::Inputs {
+                busy: self.game.streaming_busy(),
+                scripts: self
+                    .mission
+                    .as_ref()
+                    .is_some_and(mission::MissionLink::running),
+                standing: self.game.standing(),
+                placements: self.game.placements,
+                pipelines_left: warmup::pending(),
+            };
+            if let Some(line) = flow.cover.tick(inputs, dt as f32) {
+                eprintln!("{line}");
+            }
+        }
+        if let Some(check) = &self.launch_check {
+            let playing = self
+                .flow
+                .as_ref()
+                .is_some_and(|f| f.stage == flow::Stage::Game);
+            let hero = self.game.scene.hero;
+            match check.want {
+                Some(want) if playing && hero == want => {
+                    eprintln!(
+                        "launch-check: PASS {:?}: play started as {hero}",
+                        check.start
+                    );
+                    errlog::exit(0);
+                }
+                Some(want) if playing => {
+                    eprintln!(
+                        "launch-check: FAIL {:?}: play started as {hero}, not {want}",
+                        check.start
+                    );
+                    errlog::exit(1);
+                }
+                _ if now >= check.limit => {
+                    eprintln!(
+                        "launch-check: FAIL {:?}: play had not started from it after {} s",
+                        check.start,
+                        LAUNCH_CHECK_LIMIT.as_secs()
+                    );
+                    errlog::exit(1);
+                }
+                _ => {}
+            }
+        }
+        if let Some((check, limit)) = &self.cover_check
+            && (check.done() || now >= *limit)
+        {
+            let (ok, line) = check.verdict();
+            eprintln!("newgame-cover-check: {line}");
+            errlog::exit(if ok { 0 } else { 1 });
+        }
         self.keep_mouse();
         let vsync = config.window.vsync;
         let input = self.egui.take_egui_input(&self.window);
+        let frame_dt = dt as f32;
         if let Some(flow) = self.flow.as_mut().filter(|f| f.covers()) {
+            flow.cover.frame(frame_dt);
+            if let (Some((check, _)), true) = (&mut self.cover_check, self.cover_check_started) {
+                // The flow's own screen (black, the movie) is opaque.
+                let line = check.frame(
+                    &flow.cover,
+                    true,
+                    false,
+                    flow.cover.placed,
+                    self.game.standing(),
+                );
+                eprintln!("{line}");
+            }
             let output = self.hud.build_screen(input, |ui| flow.paint(ui));
             self.platform_output(output);
             let (w, h) = self.backend.size();
@@ -12238,6 +14627,16 @@ impl Running {
         if self.pad.touch.used {
             info.touch = Some(self.pad.touch.picture());
         }
+        // The new game's cover: black and the loading screen, from the
+        // first frame after New Game ([`cover`]).
+        let (covered, placed) = self
+            .flow
+            .as_ref()
+            .map_or((false, false), |f| (f.cover.covered(), f.cover.placed));
+        if covered {
+            info.loading = true;
+        }
+        self.hud.blackout = covered;
         let (action, output) = spans::time("hud", || self.hud.build(input, &info, config));
         self.platform_output(output);
         if let Some(news) = self
@@ -12321,13 +14720,29 @@ impl Running {
             None => {}
         }
         let (w, h) = self.backend.size();
-        render(
+        // Under the cover the world is drawn only once she is placed (so
+        // its pipelines are built under the cover), never shown.
+        let world = !covered || placed;
+        render_frame(
             &mut self.backend,
             &mut self.game,
             config.camera.fov,
             view_aspect(&config.window, w, h),
             Some(&mut self.hud),
+            world,
         )?;
+        if let (Some((check, _)), true) = (&mut self.cover_check, self.cover_check_started)
+            && let Some(flow) = &self.flow
+        {
+            let line = check.frame(
+                &flow.cover,
+                world,
+                world && !covered,
+                flow.cover.placed,
+                self.game.standing(),
+            );
+            eprintln!("{line}");
+        }
         self.fps.1 += 1;
         let elapsed = now - self.fps.0;
         if elapsed >= Duration::from_secs(1) {
@@ -12550,6 +14965,12 @@ impl Running {
     }
 
     fn open_menu(&mut self) {
+        // As the 360's pause screen opens it hands the engine the time
+        // played, last contract and percent its saves are stamped with
+        // (`_GuiInternal.SetFlashPauseMenu`, 0x82322D50).
+        if let Some(m) = &mut self.mission {
+            m.stamp_pause();
+        }
         self.hud.menu = true;
         self.keep_mouse();
         self.input.clear();
@@ -12801,6 +15222,10 @@ impl Running {
             }
         };
         let hero = s.hero.unwrap_or(config.hero);
+        if let Some(check) = &mut self.launch_check {
+            eprintln!("launch-check: the save is read ({})", path.display());
+            check.want = Some(hero);
+        }
         config.hero = hero;
         if hero != self.game.scene.hero {
             eprintln!("hero: playing as {hero}");
@@ -12890,7 +15315,7 @@ impl Running {
             }
             Ok(mut s) => {
                 let pmc = s.pmc.take();
-                self.game.load(s);
+                self.game.reset_for_load();
                 if let (Some(pmc), Some(m)) = (pmc, &mut self.mission) {
                     m.restore(&pmc);
                 }
@@ -12985,6 +15410,32 @@ impl Running {
             flow.window(display::current(&self.window));
             if let Ok(mut mixer) = self.audio.out.mixer.lock() {
                 flow.tick(self.mission.as_mut(), &mut mixer);
+            }
+            // `--newgame-cover-check`: New Game as soon as the front end
+            // is up (past the boot movies).
+            if self.cover_check.is_some() && !self.cover_check_started && flow.at_front_end() {
+                self.cover_check_started = true;
+                if let Ok(mut mixer) = self.audio.out.mixer.lock() {
+                    flow.start_new_game(&mut mixer);
+                }
+            }
+            // The launcher's Play: New Game or Load Game as soon as the
+            // front end is up.
+            if flow.at_front_end()
+                && let Some(start) = self.start.take()
+                && let Ok(mut mixer) = self.audio.out.mixer.lock()
+            {
+                flow.start(start, &mut mixer);
+            }
+            if let Some(how) = flow.take_intro_started()
+                && let Some((check, _)) = &mut self.cover_check
+            {
+                check.intro(how);
+            }
+            if flow.cover.covered() {
+                // The cover stands in for the arrival screen of the
+                // scripts' first move of her.
+                self.game.arrival = None;
             }
             let news = flow.take_news();
             // The hero picked in the front end, before the scripts start;
@@ -13623,6 +16074,228 @@ impl ApplicationHandler for App {
 mod tests {
     use super::*;
 
+    /// `--save-check-no-world`'s verdict: the saved place first, then
+    /// any start.
+    #[test]
+    fn the_load_check_names_where_she_landed() {
+        assert_eq!(
+            LoadVerdict::from_gaps(0.0, &[4600.0]),
+            LoadVerdict::Restored
+        );
+        assert_eq!(
+            LoadVerdict::from_gaps(4600.0, &[3.0, 80.0]),
+            LoadVerdict::ResetToStart
+        );
+        assert_eq!(
+            LoadVerdict::from_gaps(4600.0, &[80.0]),
+            LoadVerdict::Elsewhere
+        );
+        assert_eq!(LoadVerdict::from_gaps(50.0, &[]).name(), "ELSEWHERE");
+        assert_eq!(
+            CheckNote::path(std::path::Path::new("d/m2-alpha-save20.sav")),
+            std::path::Path::new("d/m2-alpha-save20.check.txt")
+        );
+        let note = CheckNote {
+            start: [-1728.8, -36.2, 2070.3],
+            saved: CheckState {
+                position: [450.0, 12.5, -1950.0],
+                hp: 50.0,
+                max_hp: 100.0,
+                rifle: [23, 90],
+                rifle_full: 30,
+                grenades: 3,
+                weapon: String::new(),
+            },
+            played: 41,
+        };
+        assert_eq!(CheckNote::from_text(&note.to_text()), Some(note));
+        assert_eq!(CheckNote::from_text("start 1 2\n"), None);
+    }
+
+    // A flight like Xenia's phys8a passes: launched (-2.623, 9.707,
+    // 1.583) at once, |10.20|; the next step its explosions push it level
+    // only, beside gravity and the ground's 0.19; then it falls at 9. A
+    // launch without the +2 (|10.0|) fails, as do explosions that lift it
+    // or none at all.
+    #[test]
+    fn a_wreck_flight_like_xenias_passes_and_an_unfallen_one_fails() {
+        use m2_math::glam::Vec3;
+        let dt = 1.0 / 60.0;
+        let launched = Vec3::new(-2.6233, 9.7074, 1.5834);
+        let next = launched + Vec3::new(-2.416, -9.0 * dt - 0.19, -5.610);
+        let mut flight = vec![(dt, launched), (2.0 * dt, next)];
+        let mut v = next;
+        for k in 3..40 {
+            v.y -= 9.0 * dt;
+            flight.push((k as f32 * dt, v));
+        }
+        let ok = wreck_flight_verdict(&flight, 5.1, Some(13.0), Some(launched));
+        assert!(ok.fails.is_empty(), "{:?}", ok.fails);
+        let short = launched.normalize() * 10.0;
+        let mut plain = flight.clone();
+        plain[0].1 = short;
+        let bad = wreck_flight_verdict(&plain, 5.1, Some(13.0), Some(short));
+        assert!(
+            bad.fails.iter().any(|f| f.starts_with("death step")),
+            "{:?}",
+            bad.fails
+        );
+        let mut lifted = flight.clone();
+        lifted[1].1.y += 1.0;
+        let lift = wreck_flight_verdict(&lifted, 5.1, Some(13.0), Some(launched));
+        assert!(
+            lift.fails.iter().any(|f| f.contains("not level only")),
+            "{:?}",
+            lift.fails
+        );
+        // A speed the step after its explosions far from phys8a's 11.66
+        // (the differenced 17.5 the old band took).
+        let mut fast = flight.clone();
+        fast[1].1 += Vec3::new(-3.0, 0.0, -3.5);
+        let quick = wreck_flight_verdict(&fast, 5.1, Some(13.0), Some(launched));
+        assert!(
+            quick
+                .fails
+                .iter()
+                .any(|f| f.contains("the step after its explosions")),
+            "{:?}",
+            quick.fails
+        );
+        // The explosions in the death step with the launch (q728p).
+        let mut early = flight.clone();
+        early[0].1 += Vec3::new(0.0, 0.0, 5.563);
+        let same = wreck_flight_verdict(&early, 5.1, Some(13.0), Some(launched));
+        assert!(
+            same.fails
+                .iter()
+                .any(|f| f.contains("carries more than its launch")),
+            "{:?}",
+            same.fails
+        );
+        let mut still = flight.clone();
+        still[1].1 = launched - Vec3::Y * 9.0 * dt;
+        let none = wreck_flight_verdict(&still, 5.1, Some(13.0), Some(launched));
+        assert!(
+            none.fails.iter().any(|f| f.contains("not level only")),
+            "{:?}",
+            none.fails
+        );
+        assert!(!wreck_flight_verdict(&[], 0.0, None, None).fails.is_empty());
+    }
+
+    // A parked car passes asleep within its time to sleep and still; one
+    // never asleep, asleep late or moving fails, as does none watched.
+    #[test]
+    fn the_parked_car_sleep_check_wants_each_asleep_soon_and_still() {
+        use m2_math::glam::Vec3;
+        let w = |asleep: Option<f32>, moved: f32| ParkedWatch {
+            index: 0,
+            label: "Phoenix".into(),
+            placed: 1.0,
+            asleep: asleep.map(|t| (t, Vec3::ZERO)),
+            moved,
+            awake_after: false,
+        };
+        assert!(parked_sleep_verdict(&[w(Some(1.0), 0.0), w(Some(3.3), 0.04)]).is_ok());
+        assert!(parked_sleep_verdict(&[w(None, 0.0)]).is_err());
+        assert!(parked_sleep_verdict(&[w(Some(3.5), 0.0)]).is_err());
+        assert!(parked_sleep_verdict(&[w(Some(1.0), 0.06)]).is_err());
+        assert!(parked_sleep_verdict(&[]).is_err());
+    }
+
+    // The wreck's rise band holds the rise of Xenia's own launch (up
+    // 9.813 m/s at the 360's gravity of 9), and no more than to two places.
+    #[test]
+    fn the_wreck_rise_band_holds_xenias_own_launch() {
+        let rise = 9.813_f32 * 9.813 / (2.0 * 9.0);
+        assert!(rise > 5.3 && rise <= XENIA_WRECK_PEAK.1, "{rise}");
+        assert!(XENIA_WRECK_PEAK.1 - rise < 0.01);
+    }
+
+    // The parked truck's crates pass when all stay aboard, none fell
+    // before, and none moved past Xenia's 0.50 m.
+    #[test]
+    fn the_parked_cargo_check_passes_only_when_all_stay_near_where_loaded() {
+        let end = [(1, 0.3, true), (2, 0.5, true)];
+        let most = [(1, 0.31), (2, 0.5)];
+        assert!(cargo_settle_verdict(&end, &[(1, 0.31), (2, 0.52)], 0).is_err());
+        assert!(cargo_settle_verdict(&end, &most, 0).is_ok());
+        assert!(cargo_settle_verdict(&end, &most, 1).is_err());
+        assert!(cargo_settle_verdict(&[(1, 1.4, false)], &[(1, 1.4)], 0).is_err());
+        assert!(cargo_settle_verdict(&end, &[(1, 0.31), (2, 0.8)], 0).is_err());
+        assert!(cargo_settle_verdict(&[], &[], 0).is_err());
+    }
+
+    // Crates off before the check began are not judged: only those aboard
+    // at its start (q680 1555b736: 0x11d39d fell 17 s before, as the truck
+    // settled where it was parked, and was counted as off standing).
+    #[test]
+    fn crates_off_before_the_cargo_check_are_not_judged() {
+        use m2_math::glam::Vec3;
+        let crates = vec![
+            (0x11d39d, Vec3::new(-1.3, -0.4, 0.4), false),
+            (0x11d39e, Vec3::ZERO, true),
+            (0x11d397, Vec3::X, true),
+        ];
+        let (aboard, before) = cargo_split_start(crates);
+        assert_eq!(before, vec![0x11d39d]);
+        assert_eq!(aboard.len(), 2);
+        assert!(aboard.iter().all(|c| c.2));
+    }
+
+    // The truck is put upright where it is moved, whatever tilt it stood
+    // with: its hull's bottom corners level over level ground (q680
+    // 5e4483a5: kept, a 10-degree roll read -0.10..0.36 m), its origin its
+    // ride height over the ground, its heading the cleared one.
+    #[test]
+    fn a_moved_cargo_truck_stands_upright_on_its_wheels() {
+        use m2_math::glam::{Mat4, Quat, Vec3};
+        let tilted = Mat4::from_rotation_translation(
+            Quat::from_rotation_y(0.3) * Quat::from_rotation_z(0.18),
+            Vec3::new(5.0, 2.0, 5.0),
+        );
+        let target = cargo_upright(
+            Vec3::new(40.0, 9.0, -20.0),
+            -31.34,
+            0.47,
+            -std::f32::consts::FRAC_PI_4,
+            1,
+        );
+        assert!((target.y_axis.truncate() - Vec3::Y).length() < 1e-5);
+        assert!((target.w_axis.y - (-31.34 + 0.47)).abs() < 1e-5);
+        let f = target.transform_vector3(Vec3::Z);
+        assert!(f.x.atan2(f.z).abs() < 1e-5, "heading {}", f.x.atan2(f.z));
+        let (lo, hi) = (Vec3::new(-1.2, 0.1, -3.0), Vec3::new(1.2, 2.5, 3.0));
+        let ys: Vec<f32> = [(lo.x, lo.z), (hi.x, lo.z), (lo.x, hi.z), (hi.x, hi.z)]
+            .iter()
+            .map(|&(x, z)| target.transform_point3(Vec3::new(x, lo.y, z)).y)
+            .collect();
+        assert!(ys.iter().all(|y| (y - ys[0]).abs() < 1e-4), "{ys:?}");
+        // What the old move did: its tilt carried over.
+        let kept = (Mat4::from_translation(Vec3::new(40.0, 0.0, -20.0)) * tilted)
+            .transform_point3(Vec3::new(lo.x, lo.y, lo.z))
+            .y
+            - (Mat4::from_translation(Vec3::new(40.0, 0.0, -20.0)) * tilted)
+                .transform_point3(Vec3::new(hi.x, lo.y, lo.z))
+                .y;
+        assert!(kept.abs() > 0.3, "{kept}");
+    }
+
+    // q680 6d991f6e's drive fails as not on its wheels: no wheel down,
+    // -24.6 m/s standing, 93 degrees on its straight; its hull 2.1-2.4 m
+    // under the ground it read. A real drive's numbers pass.
+    #[test]
+    fn a_cargo_drive_off_its_wheels_or_in_the_ground_fails() {
+        assert!(cargo_sane("standing", 24.6, 3.0, 0.0).is_err());
+        assert!(cargo_sane("straight", 11.0, 93.0, 0.0).is_err());
+        assert!(cargo_sane("standing", 0.1, 3.0, 2.9).is_err());
+        assert!(cargo_sane("straight", 11.2, 4.0, 0.0).is_ok());
+        assert!(cargo_sane("hard turn", 9.0, 120.0, 0.1).is_ok());
+        assert!(cargo_hull_over_ground(&[-2.12, -1.66, -2.38, -1.91]).is_err());
+        assert!(cargo_hull_over_ground(&[0.35, 0.38, 0.31, 0.33]).is_ok());
+        assert!(cargo_hull_over_ground(&[-0.1, 0.2, 0.0, 0.1]).is_ok());
+    }
+
     // A boat may drop and tilt as it settles (the 360's moored boats
     // dropped up to 2.33 m, boat1) but not move level more than a few
     // centimetres, nor capsize.
@@ -13636,6 +16309,17 @@ mod tests {
         assert!(boat_settled(dropped, authored, 7f32.to_radians().cos()).is_ok());
         assert!(boat_settled(dropped, authored, 0.2).is_err());
         assert!(boat_settled(Vec3::new(10.3, -34.0, 5.0), authored, 0.99).is_err());
+    }
+
+    // The M1A2 with its turret and gun each a hundredth of its 32,000 kg
+    // chassis (0x82273E48): 18 + 9 x 32000/32640 = 26.82, Xenia tank3b's
+    // 26.83 (all three bodies, -0.4471 a 1/60 s step); with its records'
+    // 14,132 kg it was 24.25.
+    #[test]
+    fn an_m1a2_falls_as_xenia_measured_with_its_hinged_parts_sized() {
+        let fall = joined_tank_fall(2.0, 2.0, 32_000.0, 640.0);
+        assert!((fall - XENIA_M1A2_FALL).abs() < 0.05, "{fall}");
+        assert!((joined_tank_fall(2.0, 2.0, 32_000.0, 14_132.0) - 24.25).abs() < 0.05);
     }
 
     // A scaled tank's airborne fall by the code: 18 for all its bodies,
@@ -13671,6 +16355,13 @@ mod tests {
     }
 
     #[test]
+    fn the_cargo_check_tables_the_median_and_most_shift() {
+        assert_eq!(median_and_most(&mut [0.5, 0.1, 2.0]), (0.5, 2.0));
+        assert_eq!(median_and_most(&mut [0.3, 0.1]), (0.3, 0.3));
+        assert_eq!(median_and_most(&mut []), (0.0, 0.0));
+    }
+
+    #[test]
     fn autoplay_retries_a_failed_contract_only_with_a_retry_save_and_not_forever() {
         assert!(retry_or_continue(true, 0));
         assert!(retry_or_continue(true, AUTOPLAY_RETRIES - 1));
@@ -13703,6 +16394,45 @@ mod tests {
         assert_eq!(
             screenshot_only_ignored(&args(&["--mission", "--mission-shots", "5"])),
             ["--mission-shots"]
+        );
+    }
+
+    #[test]
+    fn the_pipelines_check_passes_only_when_the_first_frame_made_some() {
+        // No frame drawn: FAIL.
+        assert!(!PipelineFrames::default().verdict().0);
+        // The first frame made none (a warm cache would): FAIL, even if a
+        // later frame made some.
+        let mut f = PipelineFrames::default();
+        f.note(0, 0.0);
+        f.note(3, 40.0);
+        let (ok, line) = f.verdict();
+        assert!(!ok);
+        assert!(line.starts_with("FAIL the first frame made none"), "{line}");
+        // The first frame made some: PASS, and the costliest frame named.
+        let mut f = PipelineFrames::default();
+        f.note(12, 3400.0);
+        f.note(0, 0.0);
+        f.note(2, 4000.0);
+        let (ok, line) = f.verdict();
+        assert!(ok);
+        assert_eq!(
+            line,
+            "PASS the first frame made +12 in 3400 ms; 3 frames, 2 made pipelines, the most +2 in 4000 ms"
+        );
+    }
+
+    #[test]
+    fn the_pipelines_check_is_read_offscreen_only() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(
+            parse_args(&args(&["--pipelines-check"]))
+                .unwrap()
+                .pipelines_check
+        );
+        assert_eq!(
+            screenshot_only_ignored(&args(&["--mission", "--pipelines-check"])),
+            ["--pipelines-check"]
         );
     }
 
@@ -13795,6 +16525,17 @@ mod tests {
         assert_eq!(
             args_front_end(args),
             ["--size", "1280x720", "--to-front-end"]
+        );
+        // The launcher's Play is done once: Quit doesn't load it again.
+        let args = ["--load-slot", "3", "--new-game", "--size", "1280x720"].map(String::from);
+        assert_eq!(
+            args_front_end(args),
+            ["--size", "1280x720", "--to-front-end"]
+        );
+        let args = ["--alpha", "--load-slot", "3", "--new-game"].map(String::from);
+        assert_eq!(
+            args_loading(args, std::path::Path::new("new.toml")),
+            ["--alpha", "--load", "new.toml"]
         );
         assert_eq!(args_front_end(Vec::new()), ["--to-front-end"]);
     }
@@ -13956,8 +16697,13 @@ fn ditch_check(game: &mut Game, tick: f32) {
 /// to come to [`joined_tank_fall`]'s, m/s².
 const SCALED_TANK_SLACK: f32 = 0.5;
 
-/// A scaled tank's airborne fall, m/s², by the 360 code (not yet
-/// measured: Xenia's tank3): every one of its object's moving bodies,
+/// The M1A2's airborne fall in Xenia tank3b, m/s²: all three of its bodies
+/// (chassis, turret, gun) -0.4471 m/s a 1/60 s step.
+const XENIA_M1A2_FALL: f32 = 26.83;
+
+/// A scaled tank's airborne fall, m/s², by the 360 code (measured: Xenia
+/// tank3b's M1A2, [`XENIA_M1A2_FALL`], with its turret and gun sized as
+/// the code sizes them, `Physics`' `hinge_body`): every one of its object's moving bodies,
 /// chassis, turret and gun, is pulled at `scale` x the world's 9.0 by
 /// its gravity action (0x821831B0 gives each one, 0x82180778); and every
 /// step, with no gate on being airborne, `_TankPhysics`' step
@@ -14100,8 +16846,20 @@ fn vehicle_gravity_check(
         vehicle_gravity_scale(scale),
         WORLD_GRAVITY * vehicle_gravity_scale(scale)
     );
-    if (fall - want_fall).abs() <= slack {
+    // The M1A2 against Xenia's own measure too (tank3b).
+    let m1a2 = spec.label.starts_with("M1A2");
+    if m1a2 {
+        eprintln!(
+            "vehicle-gravity-check: Xenia tank3b's M1A2 fell at {XENIA_M1A2_FALL} (all three bodies); this one {fall:.2}"
+        );
+    }
+    let xenia_ok = !m1a2 || (fall - XENIA_M1A2_FALL).abs() <= slack;
+    if (fall - want_fall).abs() <= slack && xenia_ok {
         eprintln!("vehicle-gravity-check: PASS");
+    } else if !xenia_ok {
+        eprintln!(
+            "vehicle-gravity-check: FAIL it falls at {fall:.2}, not Xenia's {XENIA_M1A2_FALL} +- {slack}"
+        );
     } else {
         eprintln!("vehicle-gravity-check: FAIL it falls at {fall:.2}, not {want_fall} +- {slack}");
     }
@@ -15451,6 +18209,45 @@ mod disguise_check_tests {
     #[test]
     fn the_disguise_check_passes() {
         assert!(super::disguise_check());
+    }
+}
+
+#[cfg(test)]
+mod cargo_verdict_tests {
+    use super::cargo_verdict;
+
+    // Xenia's run eg2 passes; crates that never move, or fall off driving
+    // straight, fail.
+    #[test]
+    fn xenias_crates_pass_and_frozen_or_spilled_ones_fail() {
+        let xenia = [
+            ("standing", 0.0, 0.01, 0, 19),
+            ("straight", 0.33, 0.52, 0, 19),
+            ("hard turn", 0.54, 1.80, 3, 19),
+            ("braking", 0.70, 2.36, 3, 19),
+            ("standing after", 0.68, 2.68, 3, 19),
+        ];
+        assert_eq!(cargo_verdict(&xenia), Ok(()));
+        // Block 2: they settle as physics starts (up to 0.47 m in the
+        // truck's frame) and slide from the first pull-away, 4 of 19 off
+        // in the hard turn: passes, however far they slid.
+        let block2 = [
+            ("standing", 0.3, 0.47, 0, 19),
+            ("straight", 0.4, 0.9, 0, 19),
+            ("hard turn", 0.6, 2.0, 4, 19),
+            ("braking", 0.7, 2.2, 4, 19),
+            ("standing after", 0.7, 2.2, 4, 19),
+        ];
+        assert_eq!(cargo_verdict(&block2), Ok(()));
+        let mut spilled = xenia;
+        spilled[1] = ("straight", 0.3, 0.5, 2, 19);
+        assert!(cargo_verdict(&spilled).is_err());
+        let mut braked = block2;
+        braked[3] = ("braking", 0.7, 2.2, 6, 19);
+        assert!(cargo_verdict(&braked).is_err());
+        let mut emptied = block2;
+        emptied[4] = ("standing after", 0.7, 2.2, 12, 19);
+        assert!(cargo_verdict(&emptied).is_err());
     }
 }
 
