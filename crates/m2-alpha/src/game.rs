@@ -5893,13 +5893,11 @@ pub(crate) fn place(
         if !floor {
             return false;
         }
-        let id = physics.add_vehicle_turned(&v.spec, at, turn.normalize());
-        // Added asleep, as the 360's layer loader adds it (its bodies added
-        // with activation 0, 0x82165958; Xenia settle7: a fresh parked
-        // Phoenix asleep from its first sample), until its driver, a push
-        // or something awake touching it wakes it.
-        physics.sleep_vehicle(id);
-        v.id = Some(id);
+        // Stepped from add (Xenia parkedcar1: all six freshly streamed
+        // parked cars simulated from add, then asleep 0.87 to 2.75 s
+        // later). A measurement branch: the first wheel step's mode is
+        // not settled here.
+        v.id = Some(physics.add_vehicle_turned(&v.spec, at, turn.normalize()));
         return true;
     }
     // As the scripts said: there, upright at its yaw, once any ground
