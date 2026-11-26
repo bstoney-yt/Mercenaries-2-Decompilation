@@ -1591,7 +1591,7 @@ const SUSPENSION: f32 = 0.3;
 fn preloads(spec: &VehicleSpec, strength: impl Fn(bool) -> f32, mass_z: f32) -> Vec<f32> {
     let axle = |front: bool| {
         let z: Vec<f32> = spec
-            .wheels
+            .ground_wheels()
             .iter()
             .filter(|w| w.steers == front)
             .map(|w| w.centre.z)
@@ -1608,7 +1608,7 @@ fn preloads(spec: &VehicleSpec, strength: impl Fn(bool) -> f32, mass_z: f32) -> 
     } else {
         0.5
     };
-    spec.wheels
+    spec.ground_wheels()
         .iter()
         .map(|w| {
             let (share, n) = if w.steers {
@@ -4548,7 +4548,18 @@ impl Physics {
                 .map(|v| v.controller.chassis)
                 .filter(|c| self.world.bodies.get(*c).is_some_and(|b| b.is_sleeping()))
                 .collect();
-            for c in beds {
+            // And the goods already asleep: the 360 builds a batch over
+            // several updates within its rebuild's budget (0x82152780;
+            // Xenia settle8: 7 crates, then 3 a tenth of a second later), each
+            // added inactive into the one island that stays asleep; the
+            // new one's first contacts with them would wake both in Rapier.
+            let asleep_goods: Vec<r::RigidBodyHandle> = self
+                .cargo_bodies
+                .iter()
+                .copied()
+                .filter(|c| self.world.bodies.get(*c).is_some_and(|b| b.is_sleeping()))
+                .collect();
+            for c in beds.into_iter().chain(asleep_goods) {
                 match self.cargo_sleep.iter_mut().find(|e| e.0 == c) {
                     Some(e) => e.1 = CARGO_SETTLE_STEPS,
                     None => self.cargo_sleep.push((c, CARGO_SETTLE_STEPS)),
@@ -5150,11 +5161,11 @@ impl Physics {
             Some(b) => {
                 let springs = spec.tuning.springs.unwrap_or(Springs::DEFAULT);
                 let mid = spec
-                    .wheels
+                    .ground_wheels()
                     .iter()
                     .map(|w| w.centre + Vec3::Y * springs.axle(w.steers).3)
                     .sum::<Vec3>()
-                    / spec.wheels.len() as f32;
+                    / spec.ground_wheels().len() as f32;
                 mid + Vec3::from(b.centre_of_mass) - centre
             }
             None => match spec.chassis.as_ref().filter(|_| chassis.is_some()) {
@@ -5373,9 +5384,10 @@ impl Physics {
         // every car down so, 0x8219EE14, and balances a bike after).
         let gravity_factor = springs.map_or(1.0, |s| s.gravity_factor);
         let preload = preloads(spec, |_| SPRING, centre.z);
-        let mut tops = Vec::with_capacity(spec.wheels.len());
+        let mut tops = Vec::with_capacity(spec.ground_wheels().len());
         let mut dampers = Vec::new();
-        for (w, &preload) in spec.wheels.iter().zip(&preload) {
+        // Its springs at its template's wheels ([`VehicleSpec::ground_wheels`]).
+        for (w, &preload) in spec.ground_wheels().iter().zip(&preload) {
             // A tank driven as the 360 code drives it springs itself
             // ([`drive_tracks`]): Rapier only casts each point's ray, from
             // its squeeze up from the bottom of its track (its hardpoint)
@@ -5525,7 +5537,7 @@ impl Physics {
             controller,
             bed: false,
             mass: m,
-            steers: spec.wheels.iter().map(|w| w.steers).collect(),
+            steers: spec.ground_wheels().iter().map(|w| w.steers).collect(),
             tops,
             tyres,
             axles: Axle::standing(&tyres),
@@ -10601,6 +10613,7 @@ mod tests {
             damage: None,
             chassis: None,
             shapes: Default::default(),
+            spring_wheels: None,
             material: None,
             path_unseen: Default::default(),
             turret_shapes: Default::default(),
@@ -12823,6 +12836,69 @@ mod tests {
         }
         let k = asleep_at.expect("never slept");
         assert!(k > 30, "slept after only {k} steps");
+    }
+
+    // A trailer's springs go where its template's `_CarWheel`s say (the
+    // 360 builds its wheels from them, 0x8219B5A0): the Fuel Trailer's are
+    // its two landing legs (nodes at 0.14 m, front) and one of its two
+    // axles (back), not the model's four wheels; a car whose records name
+    // its own wheels keeps them.
+    #[test]
+    fn springs_go_where_the_templates_car_wheels_say() {
+        let mut spec = car();
+        spec.node_names = vec![0x10, 0x11, 0x12, 0x13];
+        spec.rest = vec![
+            Mat4::from_translation(Vec3::new(-0.54, 0.14, -3.0)),
+            Mat4::from_translation(Vec3::new(-0.76, 0.59, -10.3)),
+            Mat4::from_translation(Vec3::new(0.76, 0.59, -10.3)),
+            Mat4::from_translation(Vec3::new(0.38, 0.14, -3.0)),
+        ];
+        let records = [
+            crate::tuning::CarWheel {
+                node: 0x10,
+                back: false,
+            },
+            crate::tuning::CarWheel {
+                node: 0x11,
+                back: true,
+            },
+            crate::tuning::CarWheel {
+                node: 0x12,
+                back: true,
+            },
+            crate::tuning::CarWheel {
+                node: 0x13,
+                back: false,
+            },
+        ];
+        let s = spec.clone().with_car_wheels(&records);
+        let w = s.ground_wheels();
+        assert_eq!(w.len(), 4);
+        assert!(w[0].steers && !w[1].steers && !w[2].steers && w[3].steers);
+        assert!((w[0].centre.y - 0.14).abs() < 1e-6);
+        assert!((w[1].centre - Vec3::new(-0.76, 0.59, -10.3)).length() < 1e-6);
+        // Its drawn wheels stay the model's.
+        assert_eq!(s.wheels, spec.wheels);
+        // Records naming its own wheels: no change.
+        let mut own = spec.clone();
+        own.node_names = (0..own.wheels.len() as u32).collect();
+        own.rest = own
+            .wheels
+            .iter()
+            .map(|w| Mat4::from_translation(w.centre))
+            .collect();
+        let same: Vec<crate::tuning::CarWheel> = own
+            .wheels
+            .iter()
+            .enumerate()
+            .map(|(i, w)| crate::tuning::CarWheel {
+                node: i as u32,
+                back: !w.steers,
+            })
+            .collect();
+        assert!(own.with_car_wheels(&same).spring_wheels.is_none());
+        // None: no change.
+        assert!(spec.with_car_wheels(&[]).spring_wheels.is_none());
     }
 
     // The push is never a pull: a spring stretching fast enough that its

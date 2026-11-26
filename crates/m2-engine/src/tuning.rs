@@ -2940,3 +2940,40 @@ mod tests {
         close(b.slowing(false, 20.0, 0.0, 0.0, 1.0, 0.0), 1.5);
     }
 }
+
+/// One of a car's `_CarWheel` records: the node its wheel is at and whether
+/// it is on the back axle. The 360 code builds a car's wheels from these
+/// alone (0x8219B5A0 walks the object's wheel store 0x83651D2C, one wheel
+/// each through 0x8219EF90): the spring top is that node's place raised by
+/// its axle's squeeze length, and the record's +0x10 picks the axle (0 the
+/// front's fields, else the back's). A trailer's front "wheels" are its
+/// landing legs, its second axle no wheel at all (Xenia wheels2: the Fuel
+/// Trailer's two legs' springs at -0.28 m long at contact, its one axle's at
+/// 0.32).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CarWheel {
+    /// The node's name hash (field 0xF0AD2D6E, +0x0).
+    pub node: u32,
+    /// On the back axle (field 0xFA8F0BBF, +0x10, not 0).
+    pub back: bool,
+}
+
+/// Every template's `_CarWheel` records, by template id, in record order.
+pub fn car_wheels(db: &Layer<'_>) -> HashMap<u32, Vec<CarWheel>> {
+    let t = Table::new(db, "_CarWheel");
+    t.templates()
+        .map(|id| {
+            let wheels = t
+                .of_template(id)
+                .iter()
+                .filter_map(|r| {
+                    Some(CarWheel {
+                        node: t.word(r, 0xf0ad_2d6e)?,
+                        back: t.word(r, 0xfa8f_0bbf)? != 0,
+                    })
+                })
+                .collect();
+            (id, wheels)
+        })
+        .collect()
+}

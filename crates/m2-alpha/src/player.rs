@@ -2348,6 +2348,7 @@ mod tests {
             damage: None,
             chassis: None,
             shapes: Default::default(),
+            spring_wheels: None,
             material: None,
             path_unseen: Default::default(),
             turret_shapes: Default::default(),

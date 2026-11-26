@@ -538,6 +538,11 @@ impl Props {
         std::mem::take(&mut self.fallen)
     }
 
+    /// The template of shown prop `entity`.
+    pub fn template_of(&self, entity: u32) -> Option<u32> {
+        self.shown.get(&entity).map(|p| p.template)
+    }
+
     /// The model of shown prop `entity`, and where it stands.
     pub fn placed(&self, entity: u32) -> Option<(u32, Vec3)> {
         self.shown.get(&entity).map(|p| (p.model, p.position))
@@ -3183,6 +3188,45 @@ mod tests {
             // At most the one step Rapier runs a body just added awake
             // (a step of gravity, g dt² = 2.7 mm), not pushed apart.
             assert!((at - p).length() < 5e-3, "pushed from {p} to {at}");
+        }
+    }
+
+    // The same goods built over several updates, as the rebuild's budget
+    // splits a batch (0x82152780; Xenia settle8: 7, then 3 a tenth of a
+    // second later): those already asleep are not woken and pushed apart by
+    // the new ones' first contacts.
+    #[test]
+    fn overlapping_goods_loaded_over_several_updates_stay_put() {
+        let mut physics = crate::npc::tests::ground();
+        let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.4), 50.0);
+        let places = [
+            Vec3::new(0.0, 0.41, 0.0),
+            Vec3::new(0.35, 0.41, 0.0),
+            Vec3::new(0.0, 0.41, 0.45),
+            Vec3::new(0.3, 0.61, 0.3),
+        ];
+        let mut crates = Vec::new();
+        for &p in &places {
+            crates.push(physics.add_cargo(&piece, Mat4::from_translation(p)));
+            // The next update's build comes 6 steps on.
+            for _ in 0..6 {
+                physics.step(1.0 / 60.0);
+            }
+        }
+        for _ in 0..120 {
+            physics.step(1.0 / 60.0);
+        }
+        for (c, p) in crates.iter().zip(places) {
+            assert_eq!(physics.debris_asleep(*c), Some(true), "awake at {p}");
+            let at = physics.debris_place(*c).unwrap().w_axis.truncate();
+            // Not pushed apart: across, as good as still; down, at most a
+            // step of gravity for each later add Rapier wakes it for (three
+            // here, 2.7 mm each).
+            assert!(
+                (at - p).with_y(0.0).length() < 1e-3,
+                "pushed from {p} to {at}"
+            );
+            assert!((at.y - p.y).abs() < 9e-3, "dropped from {p} to {at}");
         }
     }
 

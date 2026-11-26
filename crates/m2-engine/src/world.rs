@@ -339,6 +339,8 @@ pub struct Templates {
     pub winches: HashMap<u32, crate::winch::WinchParams>,
     /// Each template's `ConnectPoint`s, by id ([`crate::winch`]).
     pub connect_points: HashMap<u32, Vec<crate::winch::ConnectPoint>>,
+    /// Each template's `_CarWheel`s, by id ([`crate::tuning::car_wheels`]).
+    pub car_wheels: HashMap<u32, Vec<crate::tuning::CarWheel>>,
     /// The emitter each `EffectModel` template draws as a model, by its
     /// name hash.
     pub effect_models: HashMap<u32, crate::vehicle_parts::ModelEmitter>,
@@ -819,6 +821,23 @@ impl Templates {
             })
     }
 
+    /// The `_CarWheel`s of template `name` (an object's own), else of the
+    /// lowest id of `model`'s templates that have them.
+    pub fn car_wheels_for(&self, name: &str, model: u32) -> &[crate::tuning::CarWheel] {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.car_wheels.get(id))
+            .or_else(|| {
+                self.infos
+                    .iter()
+                    .filter(|(id, t)| t.model == Some(model) && self.car_wheels.contains_key(id))
+                    .map(|(&id, _)| id)
+                    .min()
+                    .and_then(|id| self.car_wheels.get(&id))
+            })
+            .map_or(&[], Vec::as_slice)
+    }
+
     /// The `ConnectPoint`s of template `name` (an object's own), else of
     /// the lowest id of `model`'s templates that have them.
     pub fn connect_points_for(&self, name: &str, model: u32) -> &[crate::winch::ConnectPoint] {
@@ -1200,6 +1219,7 @@ impl Templates {
             exhausts: crate::vehicle_parts::read(&db),
             winches: crate::winch::read(&db),
             connect_points: crate::winch::connect_points(&db),
+            car_wheels: crate::tuning::car_wheels(&db),
             effect_models: crate::vehicle_parts::effect_models(&db)
                 .into_iter()
                 .filter_map(|(name, model, emitter, fx)| {

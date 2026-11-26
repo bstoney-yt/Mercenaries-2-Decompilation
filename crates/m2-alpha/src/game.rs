@@ -2251,6 +2251,12 @@ impl Game {
                 dt,
             );
             run_over_pickups(world, &mut self.scene.flights, &self.scene.vehicles);
+            // Where she is, for the goods' hibernation (`knock_loose`).
+            let hero = self
+                .scene
+                .player
+                .as_ref()
+                .map_or(self.camera.position, |p| p.character.position);
             let knocked = knock_loose(
                 world,
                 &mut self.scene.props,
@@ -2258,6 +2264,7 @@ impl Game {
                 (&beds, &shapes, &mut self.beds_told),
                 &mut self.destruction,
                 self.scene.install.as_ref(),
+                hero,
             );
             // Its vertical velocity a moment after each knock, against
             // just before (a kick up shows here).
@@ -4851,6 +4858,7 @@ fn knock_loose(
     (beds, shapes, told): (&[Option<Vec3>], &[BedShape], &mut HashSet<usize>),
     destruction: &mut Destruction,
     install: Option<&Install>,
+    hero: Vec3,
 ) -> Vec<(m2_engine::VehicleId, String, f32)> {
     let mut knocked = Vec::new();
     let mut met = Vec::new();
@@ -4865,23 +4873,7 @@ fn knock_loose(
         // as soon as they are placed, standing or not: the scripts count
         // the goods on the bed from then on (PirCon002 counted none, and
         // gave up, while the truck stood with its jugs still the layer's).
-        //
-        // Not while it is still settling from its placing: a vehicle is
-        // stepped from add and its springs' first step throws it (the
-        // 360's no-ground first wheel step, `Damper` in m2-engine), and
-        // goods loaded then are thrown off its bed (#769 cargo-settle:
-        // 0x11d39d off). The 360's goods meet their truck asleep: Xenia
-        // settle7/8, the El Grande's first sample +2.18 up, asleep by 2.02
-        // to 2.42 s, its crates' bodies in its island only at 18.18 s.
-        // INFERRED, not 360-backed: this gate reproduces the 360's ORDER
-        // (goods meet a settled truck), not its CAUSE. The 360's crates
-        // become bodies at 18.2 and 21.8 s (settle7/8, two batches, in both
-        // runs), 16 s after the truck sleeps, by a trigger not yet read
-        // (the hibernation grid, the mission script or the rebuild queue).
-        // #769 must not merge until that trigger is traced.
-        let settled = world.physics.vehicle_asleep(id);
-        if let (true, Some(_), Some(b), Some(place)) =
-            (settled, v.guid, bed, world.physics.vehicle_transform(id))
+        if let (Some(_), Some(b), Some(place)) = (v.guid, bed, world.physics.vehicle_transform(id))
         {
             let standing = Crasher {
                 place,
@@ -4937,7 +4929,25 @@ fn knock_loose(
                 }
             }
             for e in near {
-                if !props.is_cargo(e)
+                // A good comes out of hibernation, and gets its bodies, only
+                // once she is within 1.2 x its template's `HibernationControl`
+                // `Distance` (100 m without one), flat, as every hibernating
+                // object does on the 360 (0x8225AE18 / 0x8225B5B8; research
+                // notes section 26). Xenia cargo1: the El Grande's crates
+                // OilCon020_Carbine_b (Distance 100) got bodies with her 119
+                // to 121 m away, the _global_gunboxA ones (65) at 76 to 78 m,
+                // the truck (250) at 240 m. The wake's per-frame budget
+                // (0x82BD21A4, 1000 and +300) is not ported.
+                let distance = props
+                    .template_of(e)
+                    .and_then(|t| world.index.template_db.hibernation.get(&t).copied())
+                    .unwrap_or(m2_engine::population::HIBERNATION_DEFAULT);
+                let awake = props.placed(e).is_some_and(|(_, at)| {
+                    (at - hero).with_y(0.0).length()
+                        <= distance * m2_engine::population::HIBERNATION_WAKE
+                });
+                if awake
+                    && !props.is_cargo(e)
                     && on_bed(props, &standing, *b, e)
                     && props.load(&mut world.physics, e, (index, id), shape)
                 {
