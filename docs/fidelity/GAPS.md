@@ -596,8 +596,9 @@ P2
    which is also recovered data (`crates/m2-engine/src/surface.rs:1`). We
    haven't found where the runtime's friction and restitution per
    surface or per class come from.
+   Terrain cells' `PHY2` meshes carry a flags word of 10 on all 3,983,915 of their triangles (the 400 cells): no surface either.
 2. **Ours:** A model's shapes take the surface of most of its solid drawn
-   area (`surface.rs:7` to `:11`, inferred). That surface only picks
+   area (`surface.rs:7` to `:11`, inferred). A terrain cell collides by its own `PHY2` mesh (the 360's ground, Xenia sub2), and each `PHY2` triangle takes the material of its nearest drawn ground triangle: **invented**. That surface only picks
    impact effects and sounds. Friction is set per use: 0.6 for chassis
    and turret (`crates/m2-engine/src/physics.rs:1826`, `:1835`), 0.9 for
    wrecks (`WRECK_FRICTION`, `:952`) and dropped bodies (`:2711`), and
