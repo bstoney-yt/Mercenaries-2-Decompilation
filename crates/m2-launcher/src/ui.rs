@@ -30,6 +30,7 @@ use crate::text::{Fonts, GameFont};
 use crate::update::{self, Found, Standing};
 use crate::{Args, Paths};
 
+mod bug_report;
 mod build_picker;
 mod contracts;
 mod whats_new;
@@ -155,6 +156,8 @@ pub struct App {
     /// The latest release's game program downloading for the build picker
     /// ([`build_picker`]): its tag and program, once done.
     build_dl: Option<Receiver<Result<(String, PathBuf), String>>>,
+    /// The Options page's bug report part ([`bug_report`]).
+    bug: bug_report::BugReport,
 }
 
 impl std::fmt::Debug for App {
@@ -240,6 +243,7 @@ impl App {
             started: Instant::now(),
             size_from_monitor,
             build_dl: None,
+            bug: Default::default(),
         }
     }
 
@@ -2127,6 +2131,9 @@ impl App {
                     FAINT,
                     "Changes are kept at once, in m2-launcher.toml beside the launcher.",
                 );
+                heading(ui, "BUG REPORT");
+                self.bug
+                    .section(ui, &self.paths.saves, &self.paths.dir, &self.settings);
             });
         // Updates, below the rest (their own child: they need all of self).
         let below = Rect::from_min_max(pos2(inner.left(), inner.bottom() - 170.0), inner.max);

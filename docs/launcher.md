@@ -107,7 +107,6 @@ without play time, contract or percent.
 Each fits as a sidebar page or a tab:
 
 - **Mods:** a mod manager for `m2-modapi`.
-- **Bug report:** bundles `last-run.log` and the build's details.
 - **Gallery:** the game's movies and music, from the install.
 
 ## What's New
@@ -152,3 +151,22 @@ Builds are never deleted. Before an update replaces `update\previous\`, the
 build there is copied into `builds\`; old builds pile up there until
 someone deletes them by hand. Labels are the release tags and build dates:
 our own text. Everything here is invented: the game had no such picker.
+
+## Bug reports
+
+Options, **BUG REPORT**:
+
+- **Preview** lists what a report holds.
+- **Make bug report** writes `bug-report-<time>.zip` to
+  `%LOCALAPPDATA%\m2-alpha\Reports` (`M2_REPORTS` overrides) and opens
+  that folder. The zip holds `build-info.txt` (version, commit, build date,
+  OS, the GPU the game's log names), the end of the game's `last-run.log`
+  (up to 2 MB) and the launcher's settings, each redacted: the home folder
+  and any `\Users\<name>` or `/home/<name>` path part, the machine's name,
+  IPv4 addresses and token-shaped values are replaced. Saves and game files
+  are never taken.
+- **Copy GitHub issue text** puts a short template on the clipboard: the
+  build's details and prompts, no log and no paths.
+
+Nothing is uploaded; the player attaches the zip if they want to.
+Everything here is invented.
