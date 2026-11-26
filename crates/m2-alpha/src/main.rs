@@ -2156,6 +2156,7 @@ pub struct Showcase {
 /// Frames timed before a screenshot.
 const FRAMES_TIMED: u32 = 60;
 
+#[allow(clippy::too_many_arguments)]
 fn build_scene(
     backend: &mut dyn RenderBackend,
     install: Option<&Install>,
