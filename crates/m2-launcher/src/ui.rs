@@ -30,6 +30,12 @@ use crate::text::{Fonts, GameFont};
 use crate::update::{self, Found, Standing};
 use crate::{Args, Paths};
 
+mod bug_report;
+mod build_picker;
+mod contracts;
+mod gallery_page;
+mod whats_new;
+
 const BG: Color32 = Color32::from_rgb(0x26, 0x26, 0x26);
 const SIDEBAR: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x1a);
 const SIDEBAR_HOVER: Color32 = Color32::from_rgb(0x2c, 0x2c, 0x2c);
@@ -58,6 +64,9 @@ pub enum Tab {
     Saves,
     Stats,
     Achievements,
+    Contracts,
+    WhatsNew,
+    Gallery,
     Options,
 }
 
@@ -143,6 +152,16 @@ pub struct App {
     save_stats: Vec<(u32, Result<SaveStats, String>)>,
     shot: Option<Shot>,
     started: Instant,
+    /// No settings file yet: the window size is set from the monitor's
+    /// once egui knows it ([`launch::monitor_size`]).
+    size_from_monitor: bool,
+    /// The latest release's game program downloading for the build picker
+    /// ([`build_picker`]): its tag and program, once done.
+    build_dl: Option<Receiver<Result<(String, PathBuf), String>>>,
+    /// The Options page's bug report part ([`bug_report`]).
+    bug: bug_report::BugReport,
+    /// The Gallery tab ([`gallery_page`]).
+    gallery: gallery_page::GalleryPage,
 }
 
 impl std::fmt::Debug for App {
@@ -162,6 +181,7 @@ impl App {
         style.visuals.selection.bg_fill = GREEN;
         cc.egui_ctx.set_global_style(style);
 
+        let size_from_monitor = !paths.settings.exists();
         let settings = Settings::read(&paths.settings);
         let game_settings = GameSettings::read(&paths.game_settings);
         let (install, pass_install) =
@@ -225,6 +245,10 @@ impl App {
                 asked: false,
             }),
             started: Instant::now(),
+            size_from_monitor,
+            build_dl: None,
+            bug: Default::default(),
+            gallery: Default::default(),
         }
     }
 
@@ -298,7 +322,12 @@ impl App {
             self.status = Some(("The game is already running.".to_owned(), true));
             return;
         }
-        let game = launch::game_path(&self.settings, &self.paths.dir);
+        // The build picked on the Play tab ([`build_picker`]), else the
+        // installed one; a pinned build no longer here says so.
+        let (picked, note) = self.picked_game();
+        let game = picked
+            .clone()
+            .unwrap_or_else(|| launch::game_path(&self.settings, &self.paths.dir));
         let install = self
             .pass_install
             .then(|| self.install.as_ref().map(|i| i.root.clone()))
@@ -306,7 +335,11 @@ impl App {
             .or_else(|| self.install_arg.clone());
         let args = launch::args(&self.settings, install.as_deref(), &start);
         eprintln!("launcher: {} {}", game.display(), args.join(" "));
-        match launch::spawn(&game, &args) {
+        let spawned = match &picked {
+            Some(_) => crate::builds::spawn(&game, &args, &self.paths.dir),
+            None => launch::spawn(&game, &args),
+        };
+        match spawned {
             Ok(child) => {
                 self.game = Some(watch(
                     child,
@@ -314,7 +347,10 @@ impl App {
                     ctx.clone(),
                     Arc::clone(&self.exit_after_game),
                 ));
-                self.status = Some(("Starting the game...".to_owned(), false));
+                self.status = Some((
+                    note.unwrap_or_else(|| "Starting the game...".to_owned()),
+                    false,
+                ));
                 if !self.settings.keep_open {
                     // Out of sight, but here to count the session.
                     self.exit_after_game.store(true, Ordering::SeqCst);
@@ -444,7 +480,7 @@ impl App {
         self.fonts.text(
             &p,
             Role::Heading,
-            pos2(icon.right() + 12.0, item.center().y + 1.0),
+            pos2(icon.right() + 12.0, item.center().y - 1.0),
             Align2::LEFT_BOTTOM,
             19.0,
             TEXT,
@@ -453,7 +489,7 @@ impl App {
         self.fonts.text(
             &p,
             Role::Body,
-            pos2(icon.right() + 12.0, item.center().y + 2.0),
+            pos2(icon.right() + 12.0, item.center().y + 4.0),
             Align2::LEFT_TOP,
             14.0,
             DIM,
@@ -472,7 +508,7 @@ impl App {
             "COMING SOON",
         );
         y += 24.0;
-        for (i, name) in ["What's New", "Mods", "Gallery"].into_iter().enumerate() {
+        for (i, name) in ["Mods"].into_iter().enumerate() {
             let item =
                 Rect::from_min_size(pos2(rect.left() + 8.0, y), vec2(rect.width() - 16.0, 40.0));
             let r = ui.interact(item, Id::new(("side-soon", i)), Sense::hover());
@@ -559,8 +595,10 @@ impl App {
             (Some(Tab::Saves), "SAVES"),
             (Some(Tab::Stats), "STATS"),
             (Some(Tab::Achievements), "ACHIEVEMENTS"),
+            (Some(Tab::Contracts), "CONTRACTS"),
             (Some(Tab::Options), "OPTIONS"),
-            (None, "PATCH NOTES"),
+            (Some(Tab::WhatsNew), "WHAT'S NEW"),
+            (Some(Tab::Gallery), "GALLERY"),
         ];
         for (i, (tab, name)) in tabs.into_iter().enumerate() {
             let w = self.fonts.width(&p, Role::Heading, 19.0, name);
@@ -604,6 +642,7 @@ impl App {
         let hero = Rect::from_min_max(rect.min, pos2(rect.right(), rect.bottom() - BAR_H));
         let bar = Rect::from_min_max(pos2(rect.left(), hero.bottom()), rect.max);
         let p = ui.painter_at(rect);
+        let picker_hero = hero;
 
         // The banner.
         let banners = self.banners();
@@ -857,6 +896,7 @@ impl App {
         if self.picker_open {
             self.picker_list(ui, picker);
         }
+        self.build_chip(ui, picker_hero);
     }
 
     /// The picker's lines for `pick`: title, detail, whose.
@@ -1726,6 +1766,11 @@ impl App {
         let Some(found) = self.upd_found.clone() else {
             return;
         };
+        // The build kept for rolling back is about to be replaced: keep a
+        // copy for the build picker first ([`crate::builds`]).
+        if let Err(e) = crate::builds::keep_previous(&self.program_dir) {
+            eprintln!("launcher: keeping the previous build: {e}");
+        }
         let dir = self.program_dir.clone();
         self.upd_note = Some((
             format!("Downloading build {}...", found.manifest.short()),
@@ -2092,6 +2137,9 @@ impl App {
                     FAINT,
                     "Changes are kept at once, in m2-launcher.toml beside the launcher.",
                 );
+                heading(ui, "BUG REPORT");
+                self.bug
+                    .section(ui, &self.paths.saves, &self.paths.dir, &self.settings);
             });
         // Updates, below the rest (their own child: they need all of self).
         let below = Rect::from_min_max(pos2(inner.left(), inner.bottom() - 170.0), inner.max);
@@ -2186,8 +2234,20 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if self.size_from_monitor
+            && let Some(points) = ctx.input(|i| i.viewport().monitor_size)
+        {
+            self.size_from_monitor = false;
+            let ppp = ctx
+                .input(|i| i.viewport().native_pixels_per_point)
+                .unwrap_or(1.0);
+            let (w, h) = launch::monitor_size((points.x, points.y), ppp);
+            self.settings.width = w;
+            self.settings.height = h;
+        }
         self.poll(&ctx);
         self.poll_updates(&ctx);
+        self.poll_build_download();
         if self.scanned.elapsed() > Duration::from_secs(5) {
             self.rescan();
         }
@@ -2227,10 +2287,16 @@ impl eframe::App for App {
             Tab::Saves => self.saves_tab(ui, body),
             Tab::Stats => self.stats_tab(ui, body),
             Tab::Achievements => self.achievements_tab(ui, body),
+            Tab::Contracts => self.contracts_tab(ui, body),
+            Tab::WhatsNew => self.whats_new_tab(ui, body),
+            Tab::Gallery => self.gallery_tab(ui, body),
             Tab::Options => self.options_tab(ui, body),
         }
         if self.tab != Tab::Play {
             self.picker_open = false;
+        }
+        if self.tab != Tab::Gallery {
+            self.gallery_left();
         }
         self.screenshot(&ctx);
     }

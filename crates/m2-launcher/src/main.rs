@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! m2-launcher [--dir <game folder>] [--install <dir>]
-//!             [--screenshot <out.png>] [--tab play|saves|stats|achievements|options]
+//!             [--screenshot <out.png>] [--tab play|saves|stats|achievements|contracts|whatsnew|gallery|options]
 //! ```
 //!
 //! `--dir` is where `m2-alpha` and its saves are (default: the launcher's
@@ -29,7 +29,11 @@
 
 mod achievements;
 mod assets;
+mod builds;
+mod gallery;
+mod gallery_movies;
 mod launch;
+mod report;
 mod save_stats;
 mod saves;
 mod stats;
@@ -112,13 +116,18 @@ fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
                     "saves" => ui::Tab::Saves,
                     "stats" => ui::Tab::Stats,
                     "achievements" => ui::Tab::Achievements,
+                    "contracts" => ui::Tab::Contracts,
+                    "whatsnew" => ui::Tab::WhatsNew,
+                    "gallery" => ui::Tab::Gallery,
                     "options" => ui::Tab::Options,
-                    v => bail!("--tab {v}: expected play, saves, stats, achievements or options"),
+                    v => bail!(
+                        "--tab {v}: expected play, saves, stats, achievements, contracts, whatsnew, gallery or options"
+                    ),
                 }
             }
             "-h" | "--help" => {
                 println!(
-                    "m2-launcher [--dir <game folder>] [--install <dir>] [--screenshot <out.png>] [--tab play|saves|stats|achievements|options]"
+                    "m2-launcher [--dir <game folder>] [--install <dir>] [--screenshot <out.png>] [--tab play|saves|stats|achievements|contracts|whatsnew|gallery|options]"
                 );
                 std::process::exit(0);
             }
@@ -205,6 +214,8 @@ mod tests {
         assert_eq!(a.tab, ui::Tab::Saves);
         let a = parse(["--tab", "stats"].map(String::from).to_vec()).unwrap();
         assert_eq!(a.tab, ui::Tab::Stats);
+        let a = parse(["--tab", "contracts"].map(String::from).to_vec()).unwrap();
+        assert_eq!(a.tab, ui::Tab::Contracts);
         assert!(parse(["--tab".to_owned(), "mods".to_owned()]).is_err());
         assert!(parse(["--what".to_owned()]).is_err());
     }

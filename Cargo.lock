@@ -2691,10 +2691,12 @@ name = "m2-launcher"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cpal",
  "eframe",
  "egui",
  "m2-assets",
  "m2-engine",
+ "m2-tracker",
  "miniz_oxide 0.9.1",
  "png",
  "serde",
@@ -2793,6 +2795,15 @@ version = "0.1.0"
 dependencies = [
  "m2-layout",
  "windows 0.61.3",
+]
+
+[[package]]
+name = "m2-tracker"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]

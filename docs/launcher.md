@@ -15,7 +15,7 @@ points of interest). Nothing from the game is committed or cached on disk.
 ## Layout
 
 - **Sidebar:** who is playing, the game (Mercenaries 2), the pages still
-  to come (What's New, Mods, Gallery) and Settings.
+  to come (Mods, Gallery) and Settings.
 - **Header:** the game's name and the tabs: Play, Saves, Stats,
   Achievements, Options, and Patch Notes (to come).
 - **Play:** the banner (steps on every 12 s; arrows and dots step it by
@@ -106,8 +106,106 @@ without play time, contract or percent.
 
 Each fits as a sidebar page or a tab:
 
-- **What's New / Patch Notes:** the merged pull requests' playtest notes.
-- **Play builds:** pick main or a test build to start.
 - **Mods:** a mod manager for `m2-modapi`.
-- **Bug report:** bundles `last-run.log` and the build's details.
 - **Gallery:** the game's movies and music, from the install.
+
+## What's New
+
+The **WHAT'S NEW** tab (sidebar and header) lists the merged pull requests,
+newest first, by the day they were merged: number, title and a one-line
+summary. It reads `docs/changelog.toml`, built into the launcher, so it works
+offline. That file is made from the pull requests' public titles and
+descriptions by `tools/changelog/changelog.py` (`gh pr list`; attribution
+lines, headings, check details, paths, links and the names given in
+`CHANGELOG_PRIVATE` are left out). Regenerate it before a release:
+
+```powershell
+$env:CHANGELOG_PRIVATE = '<names to leave out>'; python -I tools\changelog\changelog.py
+```
+
+## Window size on a first run
+
+With no settings file yet, the game's window size starts at the primary
+monitor's size in pixels (even, at least 640x360) instead of a fixed
+1920x1080; once the settings are saved the chosen size is kept
+(invented: the game's own launcher had no such default).
+
+## Picking the build to play
+
+A chip at the top right of the Play tab's banner names the build Play
+starts (`BUILD  <tag> - <date>`). Its list offers:
+
+- the build installed beside the launcher (the default);
+- the build kept for rolling back (`update\previous\`);
+- every build kept under `builds\<tag>\` beside the launcher, newest first;
+- the latest release, when it is none of these. Picking it downloads its
+  `m2-alpha.exe` into `builds\<tag>\`, checked against the release's
+  manifest (size and SHA-256). The launcher itself is not replaced.
+
+The pick is pinned in the launcher's settings (`build = "<tag>"`). A kept
+build runs from the launcher's folder, so it reads the same settings and
+saves. If a pinned build's program is no longer there, Play starts the
+installed build and the status line says so.
+
+Builds are never deleted. Before an update replaces `update\previous\`, the
+build there is copied into `builds\`; old builds pile up there until
+someone deletes them by hand. Labels are the release tags and build dates:
+our own text. Everything here is invented: the game had no such picker.
+
+## Bug reports
+
+Options, **BUG REPORT**:
+
+- **Preview** lists what a report holds.
+- **Make bug report** writes `bug-report-<time>.zip` to
+  `%LOCALAPPDATA%\m2-alpha\Reports` (`M2_REPORTS` overrides) and opens
+  that folder. The zip holds `build-info.txt` (version, commit, build date,
+  OS, the GPU the game's log names), the end of the game's `last-run.log`
+  (up to 2 MB) and the launcher's settings, each redacted: the home folder
+  and any `\Users\<name>` or `/home/<name>` path part, the machine's name,
+  IPv4 addresses and token-shaped values are replaced. Saves and game files
+  are never taken.
+- **Copy GitHub issue text** puts a short template on the clipboard: the
+  build's details and prompts, no log and no paths.
+
+Nothing is uploaded; the player attaches the zip if they want to.
+Everything here is invented.
+
+## Gallery: music
+
+The **GALLERY** tab lists every piece of the game's score. It is read from
+the player's own install when the tab first opens (on a thread), and
+nothing is extracted, cached or committed.
+
+- **The list** (from samples): the `music` cue table in `vz.wad` says
+  which stream of `data\Audios\music.pws` each record plays; each stream
+  is one row (140 on the install checked), with its length.
+- **Names** (from samples): cue names are the install's script strings
+  starting `mu_`, matched by hash (95 of the 140 named). Rows are grouped
+  by side, with our own readable label (**invented**: `mu_fac_an_explore_01`
+  reads "Allied Nations: explore 1") and the raw cue name beside it. A
+  stream with no known name shows as "Track <n>" (invented).
+- **Playing:** click a row to play, again to stop; leaving the tab stops
+  it. It is decoded with `m2-assets`' own Xbox ADPCM decoder and played on
+  the default output through `cpal` (Windows): no ffmpeg needed.
+- **Locks:** saves keep no record of music heard, so every piece is shown
+  unlocked and the page says so.
+
+## Gallery: cut-scenes
+
+The Gallery's **CUT-SCENES** switch lists every movie in the install's
+`data\Movies` with its length from its Bink header (45 files on the
+install checked), grouped as cut-scenes, front end and logos.
+
+- **Labels** (**invented**): `01_AOA_J` reads "Cut-scene 1 (AOA), Jennifer"
+  (the last letter is the hero: C, J or M); the front end's and the logos'
+  movies have our own names. The file name shows beside each.
+- **Playing:** click a row; the movie plays in the page through a local
+  `ffmpeg` (`M2_FFMPEG`, beside the launcher, or the `PATH`, as `m2-alpha`
+  finds it), its tracks mixed as `m2-alpha` mixes them. Click or Escape
+  stops it; leaving the tab stops it. Without ffmpeg the page says so and
+  music still plays.
+- **Locks:** saves keep no record of cut-scenes seen, so all are shown
+  unlocked and the page says so.
+
+Nothing is extracted or written: frames and sound come through pipes.

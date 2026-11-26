@@ -17,12 +17,17 @@ eframe = { version = "0.36", default-features = false, features = ["wgpu", "defa
 egui.workspace = true
 m2-assets.workspace = true
 m2-engine.workspace = true
+m2-tracker = { path = "../m2-tracker" }
 miniz_oxide.workspace = true
 png = "0.18"
 serde.workspace = true
 serde_json = "1"
 sha2 = "0.11"
 toml.workspace = true
+
+# The gallery's music output (as m2-alpha's, Windows only).
+[target.'cfg(windows)'.dependencies]
+cpal = "0.18"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
