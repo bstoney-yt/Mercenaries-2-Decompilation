@@ -2694,6 +2694,7 @@ dependencies = [
  "egui",
  "m2-assets",
  "m2-engine",
+ "miniz_oxide 0.9.1",
  "png",
  "serde",
  "toml",

@@ -3,10 +3,14 @@
 //! (Play, Saves, Options) over the page. Play is the banner picture over
 //! the bar with the save picker, the Play button and who is playing;
 //! Saves lists the slots with Play, Copy and Delete and starts new games;
-//! Options keeps the window and folders. Colours and sizes are invented.
+//! Stats shows what each save says of the play and, apart and marked so,
+//! what the launcher itself counted; Options keeps the window and
+//! folders. Colours and sizes are invented.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -17,7 +21,9 @@ use egui::{
 
 use crate::assets::{self, Loaded, Role};
 use crate::launch::{self, GameSettings, Settings, Start};
+use crate::save_stats::{self, Attitude, PlayedFrom, SaveStats};
 use crate::saves::{self, Slot};
+use crate::stats::{self, LauncherStats};
 use crate::text::{Fonts, GameFont};
 use crate::{Args, Paths};
 
@@ -47,6 +53,7 @@ pub enum Tab {
     #[default]
     Play,
     Saves,
+    Stats,
     Options,
 }
 
@@ -101,7 +108,16 @@ pub struct App {
     picker_open: bool,
     confirm_delete: Option<u32>,
     status: Option<(String, bool)>,
-    child: Option<std::process::Child>,
+    /// The game the launcher started: its exit, once it has (the waiting
+    /// thread counts the session first).
+    game: Option<Receiver<Result<std::process::ExitStatus, String>>>,
+    /// Close the launcher once the game exits (the window is hidden till
+    /// then).
+    exit_after_game: Arc<AtomicBool>,
+    /// The launcher's own play stats ([`stats`]).
+    launcher_stats: LauncherStats,
+    /// Each slot's stats, as of the last scan.
+    save_stats: Vec<(u32, Result<SaveStats, String>)>,
     shot: Option<Shot>,
     started: Instant,
 }
@@ -139,6 +155,8 @@ impl App {
             rx
         });
         let slots = saves::scan(&paths.saves);
+        let launcher_stats = LauncherStats::read(&paths.stats);
+        let save_stats = read_save_stats(&slots);
         let pick = slots
             .iter()
             .find(|s| s.problem.is_none())
@@ -162,7 +180,10 @@ impl App {
             picker_open: false,
             confirm_delete: None,
             status: None,
-            child: None,
+            game: None,
+            exit_after_game: Arc::new(AtomicBool::new(false)),
+            launcher_stats,
+            save_stats,
             shot: args.screenshot.map(|path| Shot {
                 path,
                 settled: 0,
@@ -223,6 +244,7 @@ impl App {
 
     fn rescan(&mut self) {
         self.slots = saves::scan(&self.paths.saves);
+        self.save_stats = read_save_stats(&self.slots);
         self.scanned = Instant::now();
         if let Pick::Slot(n) = self.pick
             && !self.slots.iter().any(|s| s.number == n)
@@ -236,9 +258,7 @@ impl App {
     }
 
     fn play(&mut self, ctx: &egui::Context, start: Start) {
-        if let Some(c) = &mut self.child
-            && matches!(c.try_wait(), Ok(None))
-        {
+        if self.game.is_some() {
             self.status = Some(("The game is already running.".to_owned(), true));
             return;
         }
@@ -252,10 +272,17 @@ impl App {
         eprintln!("launcher: {} {}", game.display(), args.join(" "));
         match launch::spawn(&game, &args) {
             Ok(child) => {
-                self.child = Some(child);
+                self.game = Some(watch(
+                    child,
+                    self.paths.stats.clone(),
+                    ctx.clone(),
+                    Arc::clone(&self.exit_after_game),
+                ));
                 self.status = Some(("Starting the game...".to_owned(), false));
                 if !self.settings.keep_open {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    // Out of sight, but here to count the session.
+                    self.exit_after_game.store(true, Ordering::SeqCst);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 }
             }
             Err(e) => self.status = Some((format!("Could not start the game: {e}"), true)),
@@ -497,6 +524,7 @@ impl App {
         let tabs = [
             (Some(Tab::Play), "PLAY"),
             (Some(Tab::Saves), "SAVES"),
+            (Some(Tab::Stats), "STATS"),
             (Some(Tab::Options), "OPTIONS"),
             (None, "PATCH NOTES"),
         ];
@@ -1134,6 +1162,286 @@ impl App {
         }
     }
 
+    /// A figure: its label small over its value.
+    fn figure(&self, p: &Painter, at: Pos2, label: &str, value: &str, colour: Color32) {
+        self.fonts
+            .text(p, Role::Heading, at, Align2::LEFT_TOP, 13.0, FAINT, label);
+        self.fonts.text(
+            p,
+            Role::BodyBold,
+            at + vec2(0.0, 18.0),
+            Align2::LEFT_TOP,
+            19.0,
+            colour,
+            value,
+        );
+    }
+
+    fn stats_tab(&mut self, ui: &mut Ui, rect: Rect) {
+        let p = ui.painter_at(rect);
+        p.rect_filled(rect, 0.0, BG);
+        let now = SystemTime::now();
+
+        // What the launcher counted itself, apart and marked so.
+        let own = Rect::from_min_size(
+            pos2(rect.left() + PAD, rect.top() + 20.0),
+            vec2(rect.width() - 2.0 * PAD, 112.0),
+        );
+        p.rect_filled(own, 6.0, BAR);
+        p.rect_stroke(own, 6.0, Stroke::new(1.0, LINE), StrokeKind::Inside);
+        self.fonts.text(
+            &p,
+            Role::Heading,
+            own.left_top() + vec2(18.0, 14.0),
+            Align2::LEFT_TOP,
+            20.0,
+            TEXT,
+            "ALL SAVES",
+        );
+        let tag = "LAUNCHER-TRACKED - counted by this launcher, not read from any save";
+        let tw = self.fonts.width(&p, Role::Body, 13.0, tag) + 20.0;
+        let chip = Rect::from_min_size(
+            pos2(own.right() - 18.0 - tw, own.top() + 12.0),
+            vec2(tw, 24.0),
+        );
+        p.rect_filled(chip, 12.0, Color32::from_rgb(0x30, 0x30, 0x30));
+        self.fonts.text(
+            &p,
+            Role::Body,
+            chip.center(),
+            Align2::CENTER_CENTER,
+            13.0,
+            WARN,
+            tag,
+        );
+        let s = &self.launcher_stats;
+        let last = s
+            .last_played_at()
+            .map_or("Never".to_owned(), |t| saves::ago(now, t));
+        let running = if self.game.is_some() {
+            " (running now)"
+        } else {
+            ""
+        };
+        let figures = [
+            ("TOTAL PLAY TIME", stats::duration_text(s.total_seconds)),
+            ("SESSIONS", s.sessions.to_string()),
+            ("LONGEST SESSION", stats::duration_text(s.longest_seconds)),
+            ("LAST PLAYED", format!("{last}{running}")),
+        ];
+        let col = (own.width() - 36.0) / 4.0;
+        for (i, (label, value)) in figures.iter().enumerate() {
+            self.figure(
+                &p,
+                pos2(own.left() + 18.0 + col * i as f32, own.top() + 54.0),
+                label,
+                value,
+                TEXT,
+            );
+        }
+
+        // Each save, as its record and the scripts' data say.
+        let head = pos2(rect.left() + PAD, own.bottom() + 24.0);
+        self.fonts.text(
+            &p,
+            Role::Heading,
+            head,
+            Align2::LEFT_TOP,
+            20.0,
+            TEXT,
+            "EACH SAVE",
+        );
+        self.fonts.text(
+            &p,
+            Role::Body,
+            pos2(rect.right() - PAD, head.y + 4.0),
+            Align2::RIGHT_TOP,
+            13.0,
+            FAINT,
+            "From the save: its record and the scripts' save data",
+        );
+        let list = Rect::from_min_max(
+            pos2(rect.left() + PAD, head.y + 36.0),
+            pos2(rect.right() - PAD, rect.bottom() - 12.0),
+        );
+        p.hline(list.x_range(), list.top() - 4.0, Stroke::new(1.0, LINE));
+        if self.slots.is_empty() {
+            self.fonts.text(
+                &p,
+                Role::Body,
+                pos2(list.center().x, list.top() + 60.0),
+                Align2::CENTER_CENTER,
+                18.0,
+                DIM,
+                "No saves yet: their stats show up here.",
+            );
+            return;
+        }
+        let slots = self.slots.clone();
+        let mut child = ui.new_child(UiBuilder::new().max_rect(list));
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(&mut child, |ui| {
+                for slot in &slots {
+                    let (row, _) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 118.0), Sense::hover());
+                    let p = ui.painter().clone();
+                    let badge =
+                        Rect::from_min_size(row.left_top() + vec2(13.0, 14.0), vec2(46.0, 46.0));
+                    p.rect_filled(badge, 6.0, hero_colour(slot.hero.as_deref()));
+                    let initial = slot
+                        .hero
+                        .as_deref()
+                        .and_then(|h| h.chars().next())
+                        .map_or("?".to_owned(), |c| c.to_uppercase().to_string());
+                    self.fonts.text(
+                        &p,
+                        Role::Heading,
+                        badge.center(),
+                        Align2::CENTER_CENTER,
+                        26.0,
+                        TEXT,
+                        &initial,
+                    );
+                    let x0 = badge.right() + 16.0;
+                    self.fonts.text(
+                        &p,
+                        Role::Heading,
+                        pos2(x0, badge.top()),
+                        Align2::LEFT_TOP,
+                        19.0,
+                        TEXT,
+                        &slot.title().to_uppercase(),
+                    );
+                    self.fonts.text(
+                        &p,
+                        Role::Body,
+                        pos2(x0, badge.top() + 26.0),
+                        Align2::LEFT_TOP,
+                        14.0,
+                        DIM,
+                        slot.hero
+                            .as_deref()
+                            .map_or("Unknown mercenary", saves::hero_name),
+                    );
+                    let stats = self
+                        .save_stats
+                        .iter()
+                        .find(|(n, _)| *n == slot.number)
+                        .map(|(_, s)| s);
+                    let fx = x0 + 190.0;
+                    match stats {
+                        Some(Ok(st)) => self.save_row(&p, row, fx, st),
+                        Some(Err(why)) => {
+                            self.fonts.text(
+                                &p,
+                                Role::Body,
+                                pos2(fx, badge.top() + 6.0),
+                                Align2::LEFT_TOP,
+                                15.0,
+                                WARN,
+                                &format!("No stats: {why}"),
+                            );
+                        }
+                        None => {}
+                    }
+                    p.hline(
+                        row.x_range(),
+                        row.bottom(),
+                        Stroke::new(1.0, Color32::from_rgb(0x30, 0x30, 0x30)),
+                    );
+                }
+            });
+    }
+
+    /// One save's figures and standing, from `x` along `row`.
+    fn save_row(&self, p: &Painter, row: Rect, x: f32, st: &SaveStats) {
+        let played = st.played.map_or("-".to_owned(), |s| {
+            let t = stats::duration_text(u64::from(s));
+            match st.played_from {
+                PlayedFrom::Record => t,
+                PlayedFrom::Scripts => format!("{t}*"),
+            }
+        });
+        let figures = [
+            ("TIME PLAYED", played),
+            (
+                "COMPLETE",
+                st.percent.map_or("-".to_owned(), |p| format!("{p}%")),
+            ),
+            ("CASH", saves::money(f64::from(st.cash))),
+            ("FUEL", st.fuel.to_string()),
+            (
+                "CONTRACTS DONE",
+                st.contracts.map_or("-".to_owned(), |c| c.to_string()),
+            ),
+        ];
+        let col = ((row.right() - x - 8.0) / figures.len() as f32).max(110.0);
+        for (i, (label, value)) in figures.iter().enumerate() {
+            self.figure(
+                p,
+                pos2(x + col * i as f32, row.top() + 12.0),
+                label,
+                value,
+                TEXT,
+            );
+        }
+        // The factions' standing with her PMC.
+        let y = row.top() + 72.0;
+        let mut cx = x;
+        if st.standing.is_empty() {
+            let why = st.problem.as_deref().unwrap_or("not in this save");
+            let note = format!("Faction standing: {why}");
+            self.fonts.text(
+                p,
+                Role::Body,
+                pos2(cx, y + 4.0),
+                Align2::LEFT_TOP,
+                14.0,
+                FAINT,
+                &note,
+            );
+        }
+        for &(abbrev, relation) in &st.standing {
+            let name = save_stats::FACTIONS
+                .iter()
+                .find(|(a, _)| *a == abbrev)
+                .map_or(abbrev, |(_, n)| n);
+            let att = Attitude::of(relation);
+            let [r, g, b] = att.rgb();
+            let text = format!("{name}  {} {}", att.label(), relation.round() as i64);
+            let w = self.fonts.width(p, Role::Body, 14.0, &text) + 30.0;
+            let chip = Rect::from_min_size(pos2(cx, y), vec2(w, 28.0));
+            p.rect_filled(chip, 14.0, Color32::from_rgb(0x30, 0x30, 0x30));
+            p.circle_filled(
+                pos2(chip.left() + 13.0, chip.center().y),
+                4.5,
+                Color32::from_rgb(r, g, b),
+            );
+            self.fonts.text(
+                p,
+                Role::Body,
+                pos2(chip.left() + 23.0, chip.center().y),
+                Align2::LEFT_CENTER,
+                14.0,
+                TEXT,
+                &text,
+            );
+            cx += w + 8.0;
+        }
+        if st.played_from == PlayedFrom::Scripts {
+            self.fonts.text(
+                p,
+                Role::Body,
+                pos2(row.right() - 8.0, row.bottom() - 6.0),
+                Align2::RIGHT_BOTTOM,
+                12.0,
+                FAINT,
+                "* the record says 0:00:00 (saved without the pause menu): the scripts' own clock",
+            );
+        }
+    }
+
     fn options_tab(&mut self, ui: &mut Ui, rect: Rect) {
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 0.0, BG);
@@ -1363,19 +1671,27 @@ impl eframe::App for App {
         if self.scanned.elapsed() > Duration::from_secs(5) {
             self.rescan();
         }
-        if let Some(c) = &mut self.child
-            && let Ok(Some(status)) = c.try_wait()
+        if let Some(rx) = &self.game
+            && let Ok(status) = rx.try_recv()
         {
-            self.child = None;
+            self.game = None;
+            self.launcher_stats = LauncherStats::read(&self.paths.stats);
             self.rescan();
-            self.status = Some((
-                if status.success() {
-                    "The game has closed.".to_owned()
-                } else {
-                    format!("The game stopped ({status}). Its log is last-run.log beside it.")
-                },
-                !status.success(),
-            ));
+            self.status = Some(match status {
+                Ok(s) if s.success() => ("The game has closed.".to_owned(), false),
+                Ok(s) => (
+                    format!("The game stopped ({s}). Its log is last-run.log beside it."),
+                    true,
+                ),
+                Err(e) => (format!("Lost track of the game: {e}"), true),
+            });
+        }
+        // Closing the window while the game runs hides it instead, so the
+        // session is still counted when the game exits.
+        if self.game.is_some() && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.exit_after_game.store(true, Ordering::SeqCst);
         }
         let full = ui.max_rect();
         ui.painter().rect_filled(full, 0.0, BG);
@@ -1388,6 +1704,7 @@ impl eframe::App for App {
         match self.tab {
             Tab::Play => self.play_tab(ui, body),
             Tab::Saves => self.saves_tab(ui, body),
+            Tab::Stats => self.stats_tab(ui, body),
             Tab::Options => self.options_tab(ui, body),
         }
         if self.tab != Tab::Play {
@@ -1395,6 +1712,57 @@ impl eframe::App for App {
         }
         self.screenshot(&ctx);
     }
+}
+
+/// Waits for the game the launcher started, on a thread of its own: counts
+/// the session in the launcher's stats file when it exits, then hands back
+/// how it ended. If the launcher should close then, it does (and, should
+/// its hidden window not get the close, ends the process a moment later).
+fn watch(
+    mut child: std::process::Child,
+    stats_path: PathBuf,
+    ctx: egui::Context,
+    exit_after: Arc<AtomicBool>,
+) -> Receiver<Result<std::process::ExitStatus, String>> {
+    let start = SystemTime::now();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let status = child.wait().map_err(|e| e.to_string());
+        if let Err(e) = stats::record_session(&stats_path, start, SystemTime::now()) {
+            eprintln!("launcher: could not write {}: {e}", stats_path.display());
+        }
+        let _ = tx.send(status);
+        ctx.request_repaint();
+        if exit_after.load(Ordering::SeqCst) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            std::thread::sleep(Duration::from_secs(5));
+            std::process::exit(0);
+        }
+    });
+    rx
+}
+
+/// Each slot's stats: a record's from [`save_stats::from_record`]; an old
+/// TOML save has only its cash and fuel.
+fn read_save_stats(slots: &[Slot]) -> Vec<(u32, Result<SaveStats, String>)> {
+    slots
+        .iter()
+        .map(|s| {
+            let stats = if s.path.extension().is_some_and(|e| e == "sav") {
+                std::fs::read(&s.path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| save_stats::from_record(&b))
+            } else {
+                Ok(SaveStats {
+                    cash: s.cash.max(0.0) as u32,
+                    fuel: s.fuel as i32,
+                    problem: Some("an old save: no record".to_owned()),
+                    ..SaveStats::default()
+                })
+            };
+            (s.number, stats)
+        })
+        .collect()
 }
 
 // ---- shapes ----
