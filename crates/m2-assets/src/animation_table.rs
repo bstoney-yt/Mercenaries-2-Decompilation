@@ -537,6 +537,32 @@ pub fn action_handle(actions: &AnimationTable, stance: &str, action: &str) -> Op
     )
 }
 
+/// As [`handle_clip`], but a handle no row of the on-foot table gives
+/// plays the table's stand-in clip ([`NO_ANIMATION`]) where it `fits`.
+///
+/// From the 360 code: the pick (82801508) starts from the stand-in, and
+/// the player's bind (82801650) falls back to it when the row's clip is
+/// not there. So an action with no clip of its own, such as `Upright`
+/// `KnockDown` (no stance and action row of its own: the catch-all
+/// handle 74a3b540, which no on-foot row gives), plays the stand-in. Its
+/// `Complete` then comes as the stand-in ends (82420A00).
+pub fn handle_clip_or_stand_in(
+    table: &AnimationTable,
+    handle: u32,
+    who: (u32, u32),
+    equipment: u32,
+    fits: impl Fn(u32) -> bool,
+) -> Option<CharacterClip> {
+    handle_clip(table, handle, who, equipment, &fits).or_else(|| {
+        fits(NO_ANIMATION).then_some(CharacterClip {
+            clip: NO_ANIMATION,
+            handle,
+            row: 0,
+            by: Precedence::Handle,
+        })
+    })
+}
+
 /// As [`handle_clip`] with something in use: its equipment class
 /// (`in_use`: [`GRENADE`] for a throw, whose rows name it in
 /// `InUseEquipmentClass`), as the 360's query fills that cell in
@@ -1048,8 +1074,15 @@ mod tests {
         // Mattias has no row of his own here, and Chris's outscores
         // anyone's: nothing but the stand-in.
         assert_eq!(pick("mattias", pistol), Some((NO_ANIMATION, Handle)));
-        // A handle no row gives: nothing.
+        // A handle no row gives: nothing; as the 360's player binds it,
+        // the stand-in.
         assert_eq!(handle_clip(&t, 0x1234, (hero, 1), RIFLE, |_| true), None);
+        let stand_in = handle_clip_or_stand_in(&t, 0x1234, (hero, 1), RIFLE, |_| true);
+        assert_eq!(stand_in.map(|p| p.clip), Some(NO_ANIMATION));
+        // One that does keeps its own clip.
+        let own = handle_clip_or_stand_in(&t, PICKUP, (0, 0), pistol, |_| true);
+        assert_eq!(own.map(|p| p.clip), Some(0x9874_62fc));
+        assert!(handle_clip_or_stand_in(&t, 0x1234, (hero, 1), RIFLE, |_| false).is_none());
         // A template that leaves its set 0 asks for anyone's.
         let blank = handle_clip(&t, PICKUP, (0, 0), pistol, |_| true);
         assert_eq!(blank.map(|p| p.clip), Some(0x9874_62fc));

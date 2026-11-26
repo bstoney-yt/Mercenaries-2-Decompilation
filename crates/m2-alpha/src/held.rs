@@ -496,7 +496,11 @@ pub fn resolve(
             .map(|i| by_action(i.name(), table::RIFLE)),
         pickup: by_action("PickupWeapon", table::RIFLE),
         run_stop: by_action(m2_engine::on_foot::RUN_STOP_ACTION, table::RIFLE),
-        knockdown: by_action("KnockDown", table::RIFLE),
+        // `KnockDown` has no row of its own: it plays the stand-in
+        // (0.3 s), whose end completes it (82801650, 82420A00).
+        knockdown: table::action_handle(actions, "Upright", "KnockDown")
+            .and_then(|h| table::handle_clip_or_stand_in(t, h, who, table::RIFLE, fits))
+            .and_then(|p| index(p.clip)),
         // The carry's rows name no class and no one.
         carrying: hero_action::CARRY_GAITS.map(|h| {
             let p = table::handle_clip(t, h, who, table::RIFLE, fits)?;
