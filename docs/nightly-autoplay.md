@@ -62,7 +62,7 @@ tooling heuristic, changeable by option):
 | `error` | m2-alpha's own `Error:` exit (code 1) |
 | `hang` | no log output for 300 s of wall time: the process is stopped |
 | `contract-cancelled` | the scripts cancelled (failed) the contract (`autoplay: contract cancelled`): when, how often, whether she was racing, and how each fanfare was answered |
-| `retry-failed` | Retry was taken on the fail fanfare, but autoplay's next contract state is none: the contract went back on offer instead of restarting |
+| `retry-failed` | Retry was taken on the fail fanfare, autoplay went to no contract, and no contract came back within 30 s of play (the retry save's reload behind the loading screen takes about 5 s): the contract went back on offer instead of restarting. A run cut off inside those 30 s is not judged |
 | `stuck` | no objective or mission-state change for 600 s of play; checked live each minute, and the run stopped |
 | `fell-through` | autoplay's own `fell through` line, her position not a number, or a logged height under -150 m |
 | `fps-cliff` | 3 `pace:` lines in a row over 50 ms a tick (offscreen; healthy is about 10) or under 15 fps (windowed) |

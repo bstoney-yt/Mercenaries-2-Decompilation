@@ -765,7 +765,7 @@ fn a_cancel_and_a_retry_that_put_it_back_on_offer_are_named() {
     let r = &a.failures[1];
     assert_eq!(r.at, Some(82.6));
     assert!(
-        r.detail.contains("by 82.8 s she was on no contract"),
+        r.detail.contains("on no contract from 82.8 s"),
         "{}",
         r.detail
     );
@@ -808,4 +808,50 @@ fn stuck_before_a_cancel_still_files() {
         },
     ];
     assert_eq!(issue_kinds(&fs), vec![Kind::ContractCancelled, Kind::Stuck]);
+}
+
+/// The nightly trial2's shape: Retry, autoplay on no contract while the
+/// retry save reloads behind the loading screen, then the contract back
+/// 5.4 s later and the race again. Not a failed Retry.
+#[test]
+fn a_retry_that_reloads_behind_the_loading_screen_is_not_failed() {
+    let mut s = String::from("autoplay 4.6 s: on contract Some((\"PirCon001\", 45))\n");
+    s += "autoplay 15.8 s: objectives [\"A\", \"Race (0/30)\"]\n";
+    s += "autoplay 47.0 s: racing to checkpoint5\n";
+    s += "autoplay: contract cancelled (1 so far) after 47.4 s of play\n";
+    s += "autoplay 47.4 s: objectives [\"A\"]\n";
+    s += "autoplay: she takes Retry on the failed contract's fanfare (HUD call 642, retry 1)\n";
+    s += "autoplay 50.4 s: on contract None\n";
+    s += "loading screen: Start { covered: false } at 50.5 s\n";
+    s += "loading screen: FadeOut at 54.6 s\n";
+    s += "autoplay 55.8 s: on contract Some((\"PirCon001\", 45))\n";
+    s += "autoplay 56.0 s: objectives [\"A\", \"Race (0/30)\"]\n";
+    for t in (60..200).step_by(20) {
+        s += &format!(
+            "autoplay {t}.0 s: objectives [\"A\", \"Race ({}/30)\"]\n",
+            t / 20
+        );
+    }
+    let wall = Exit {
+        code: None,
+        killed: Some(Killed::Wall),
+        wall_seconds: 2700.0,
+    };
+    let a = analyse(&s, &wall, &th());
+    let kinds: Vec<Kind> = a.failures.iter().map(|f| f.kind).collect();
+    assert!(!kinds.contains(&Kind::RetryFailed), "{:?}", a.failures);
+    assert!(kinds.contains(&Kind::ContractCancelled));
+    // Cut off before the grace is up (the window closing): not judged.
+    let cut: String = s.lines().take(7).map(|l| format!("{l}\n")).collect();
+    let deadline = Exit {
+        code: None,
+        killed: Some(Killed::Deadline),
+        wall_seconds: 60.0,
+    };
+    let a = analyse(&cut, &deadline, &th());
+    assert!(
+        a.failures.iter().all(|f| f.kind != Kind::RetryFailed),
+        "{:?}",
+        a.failures
+    );
 }

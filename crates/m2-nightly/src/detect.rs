@@ -10,6 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use m2_runsum::{Config, Summary, summarize};
 
+/// Seconds of play a Retry has to bring the contract back (the retry
+/// save's reload: about 5 s in the nightly trial) before it counts as
+/// failed. Invented, with room to spare.
+pub const RETRY_GRACE: f64 = 30.0;
+
 /// What broke. The order is the order of precedence when one cause
 /// explains another (see [`issue_kinds`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -471,20 +476,29 @@ pub fn analyse(log: &str, exit: &Exit, th: &Thresholds) -> Analysis {
             ),
         });
     }
+    // A Retry reloads the retry save: autoplay is briefly on no contract
+    // while the loading screen is up (trial2: none at 50.4 s, the contract
+    // back at 55.8 s), so a Retry only failed when no contract comes back
+    // within RETRY_GRACE seconds of play after it, and the run went on
+    // that long.
     let failed_retry = retries.iter().find_map(|&r| {
-        summary
+        let after: Vec<_> = summary
             .contract_states
             .iter()
-            .find(|e| e.t >= r)
-            .filter(|e| e.what == "none")
-            .map(|e| (r, e.t))
+            .filter(|e| e.t >= r)
+            .collect();
+        let none = after.iter().find(|e| e.what == "none")?.t;
+        let back = after
+            .iter()
+            .any(|e| e.what != "none" && e.t <= r + RETRY_GRACE);
+        (!back && summary.last_time >= r + RETRY_GRACE).then_some((r, none))
     });
     if let Some((r, none)) = failed_retry {
         failures.push(Failure {
             kind: Kind::RetryFailed,
             at: Some(r),
             detail: format!(
-                "took Retry at {r:.1} s of play, but by {none:.1} s she was on no contract: it was put back on offer, not restarted"
+                "took Retry at {r:.1} s of play, but she was on no contract from {none:.1} s and none came back within {RETRY_GRACE:.0} s: it was put back on offer, not restarted"
             ),
         });
     }
