@@ -1,0 +1,18 @@
+[package]
+name = "m2-nightly"
+description = "Nightly autoplay runner: plays each contract with m2-alpha, flags breakage, files issues."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+m2-assets.workspace = true
+m2-runsum = { path = "../m2-runsum" }
+serde.workspace = true
+serde_json = "1"
+
+[lints]
+workspace = true
