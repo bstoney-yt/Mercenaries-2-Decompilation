@@ -877,6 +877,12 @@ pub struct Springs {
     pub extra: f32,
     /// Its weight on the ground, of its plain weight (`GravityFactor`).
     pub gravity_factor: f32,
+    /// Each axle's wheel radius, metres (`FrontWheelRadius`,
+    /// `RearWheelRadius`): what the 360's wheel ray is cast with
+    /// (0x8219EF90 keeps it at the wheel's +0x108, 0x8219F510 casts L + it),
+    /// not the model's wheel. 0 without one: the model's is used
+    /// (inferred).
+    pub radius: (f32, f32),
 }
 
 impl Springs {
@@ -888,6 +894,7 @@ impl Springs {
         squeeze: (0.2, 0.2),
         extra: 0.0,
         gravity_factor: 2.0,
+        radius: (0.0, 0.0),
     };
 
     /// One axle's (front, the steering one, or back) strength, damp,
@@ -907,6 +914,13 @@ impl Springs {
     /// An axle's spring's unloaded length, metres.
     pub fn length(&self, front: bool) -> f32 {
         self.axle(front).2
+    }
+
+    /// The radius an axle's wheel ray is cast with: the template's, else
+    /// `model`'s wheel.
+    pub fn wheel_radius(&self, front: bool, model: f32) -> f32 {
+        let r = if front { self.radius.0 } else { self.radius.1 };
+        if r > 0.0 { r } else { model }
     }
 }
 
@@ -2148,6 +2162,7 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         ),
                         extra: f("ExtraInvisibleSpringLength", d.extra).max(0.0),
                         gravity_factor: f("GravityFactor", d.gravity_factor),
+                        radius: length("FrontWheelRadius", "RearWheelRadius", d.radius),
                     })
                 })(),
                 tyres: (|| {

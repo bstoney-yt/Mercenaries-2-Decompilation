@@ -1868,6 +1868,9 @@ struct VehicleBody {
     hinge: Option<TurretHinge>,
     /// Held where it is ([`Physics::hold_vehicle`]): its body fixed.
     held: bool,
+    /// Each wheel's damper as the 360's wheel step runs it ([`Damper`]),
+    /// in wheel order; empty for a tank.
+    dampers: Vec<Damper>,
     /// How its body goes to sleep when it keeps still ([`Rest`]): a car's
     /// or a tank's (`None` for a boat or a helicopter, which never sleep
     /// here).
@@ -3045,6 +3048,88 @@ fn driven_rpm(
         .sum()
 }
 
+/// One wheel's spring as the 360's wheel step (0x8219F510) runs it, with
+/// what its set-up (0x8219EF90) gives it: its strength `k` and damp `c`
+/// (per kilogram, [`Springs`]), its unloaded length `length` (L = Extra +
+/// Exp + Cmp, the wheel's +0xF0) and its length at the last step `prev`
+/// (the wheel's +0x08 times L).
+///
+/// From the 360 code: the set-up starts `prev` at the spring's squeeze
+/// length Cmp (+0x08 = Cmp / L; L if L <= 0), not at the length the wheel
+/// really has. Each step the ray gives the length now, `cur` = t x (L + r)
+/// - r with r the template's wheel radius ([`Springs::wheel_radius`]),
+/// not clamped below 0; the stretching speed is (cur - prev) / dt; the
+/// push is mass x (k x (L - cur) - c x speed) (0x8219F6D4), applied only
+/// when above 0 (0x8219F6DC) as the impulse push x dt (0x8219F714); then
+/// `prev` = cur (0x8219F798). So the first step a wheel is run, if its
+/// ground stands closer than Cmp, the damping reads a fast squeeze and
+/// kicks it up by c x (Cmp - cur) per wheel: the Fuel and Box Trailers'
+/// hop in Xenia trailers3/4 (v_y +2.20 and +2.23), none for the Austin cab
+/// (its ground is at Cmp) or the Phoenix.
+///
+/// Inferred: the push is along the contact's normal (the 360's is VMX),
+/// and 0x8262C120 gives the body's mass. Rapier pushes the spring part
+/// (`k x (L - cur)`, at least 0) itself; [`damp_wheels`] adds the rest.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Damper {
+    k: f32,
+    c: f32,
+    length: f32,
+    prev: f32,
+}
+
+impl Damper {
+    /// As the 360's set-up leaves it: `prev` at the squeeze length.
+    fn new(k: f32, c: f32, length: f32, squeeze: f32) -> Self {
+        Self {
+            k,
+            c,
+            length,
+            prev: if length > 0.0 { squeeze } else { length },
+        }
+    }
+
+    /// One step with the spring `cur` long (`None` off the ground): the
+    /// push per kilogram the 360 gives it (at least 0; m/s² once times
+    /// the mass), and the spring part of it alone (at least 0), Rapier's.
+    fn step(&mut self, cur: Option<f32>, dt: f32) -> (f32, f32) {
+        let Some(cur) = cur else {
+            self.prev = self.length;
+            return (0.0, 0.0);
+        };
+        let speed = (cur - self.prev) / dt.max(1e-6);
+        self.prev = cur;
+        let spring = self.k * (self.length - cur);
+        ((spring - self.c * speed).max(0.0), spring.max(0.0))
+    }
+}
+
+/// Runs each wheel's [`Damper`] after Rapier has cast and sprung it: the
+/// difference between the 360's whole push and Rapier's spring part, as
+/// an impulse along the contact's normal at the contact.
+fn damp_wheels(v: &mut VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
+    if v.dampers.is_empty() {
+        return;
+    }
+    let Some(body) = bodies.get_mut(v.controller.chassis) else {
+        return;
+    };
+    let mass = body.mass();
+    for (w, d) in v.controller.wheels().iter().zip(&mut v.dampers) {
+        let ray = w.raycast_info();
+        let cur = ray.is_in_contact.then_some(ray.suspension_length);
+        let (push, spring) = d.step(cur, dt);
+        let extra = (push - spring) * mass * dt;
+        if extra != 0.0 {
+            body.apply_impulse_at_point(
+                vector(vec3(ray.contact_normal_ws) * extra),
+                ray.contact_point_ws,
+                true,
+            );
+        }
+    }
+}
+
 /// Works out how well a wheeled vehicle stands on the ground under it
 /// ([`Tyres::footing`], from the lean of its wheels' contacts' mean
 /// normal) and takes that share of the level part off each spring's push
@@ -3979,6 +4064,7 @@ impl Physics {
             );
             v.controller.update_vehicle(dt, queries);
             if !v.wrecked {
+                damp_wheels(v, &mut w.bodies, dt);
                 stand(v, &mut w.bodies, dt);
                 if let Some(tank) = &mut v.tank {
                     run_tracks(tank, &v.controller, &mut w.bodies, dt);
@@ -5246,6 +5332,7 @@ impl Physics {
         let gravity_factor = springs.map_or(1.0, |s| s.gravity_factor);
         let preload = preloads(spec, |_| SPRING, centre.z);
         let mut tops = Vec::with_capacity(spec.wheels.len());
+        let mut dampers = Vec::new();
         for (w, &preload) in spec.wheels.iter().zip(&preload) {
             // A tank driven as the 360 code drives it springs itself
             // ([`drive_tracks`]): Rapier only casts each point's ray, from
@@ -5274,10 +5361,14 @@ impl Physics {
                 );
                 continue;
             }
+            let radius = springs.map_or(w.radius, |s| s.wheel_radius(w.steers, w.radius));
             let (stiffness, (squeezed, stretched), rest, top, travel) = match springs {
                 Some(s) => {
                     let (k, c, length, top) = s.axle(w.steers);
-                    (k, (c, c), length, top, length + w.radius)
+                    // Its damping is the 360's own ([`Damper`]), not
+                    // Rapier's: none here.
+                    dampers.push(Damper::new(k, c, length, top));
+                    (k, (0.0, 0.0), length, top, length + radius)
                 }
                 // A tank's are invented: longer than SUSPENSION by what
                 // its share of the weight squeezes them, so standing it
@@ -5303,7 +5394,7 @@ impl Physics {
                 // Forward = up x axle = +z.
                 -r::Vector::X,
                 rest,
-                w.radius,
+                radius,
                 &tuning,
             );
         }
@@ -5419,6 +5510,7 @@ impl Physics {
             turret: (turret_colliders, spec.turret_mount()),
             hinge,
             held: false,
+            dampers,
             rest: (hull.is_none() && rotor.is_none()).then(Rest::default),
             before: Vec3::ZERO,
             spin_before: Vec3::ZERO,
@@ -10667,6 +10759,7 @@ mod tests {
         squeeze: (0.1, 0.1),
         extra: 0.05,
         gravity_factor: 1.7,
+        radius: (0.0, 0.0),
     };
     /// Its engine and gearbox, its record's.
     const OFFROAD_ENGINE: EngineTuning = EngineTuning {
@@ -12588,11 +12681,79 @@ mod tests {
         assert!((h.range(1.0, 0.0, 0.0) - 0.92).abs() < 1e-6);
     }
 
+    /// The 360's first-step vertical velocity change for a vehicle whose
+    /// wheels' springs are `cur` long at its first step (each with its
+    /// axle's k, c, L and Cmp), with a gravity factor `f`: each wheel's
+    /// [`Damper`] push (started at Cmp) over one step, less its weight.
+    fn first_kick(wheels: &[(f32, f32, f32, f32, f32)], f: f32) -> f32 {
+        let dt = 1.0 / 60.0;
+        let push: f32 = wheels
+            .iter()
+            .map(|&(k, c, length, squeeze, cur)| {
+                Damper::new(k, c, length, squeeze).step(Some(cur), dt).0
+            })
+            .sum();
+        (push - (WORLD_GRAVITY + (f - 1.0) * GRAVITY_360)) * dt
+    }
+
+    // The 360's wheel step starts each spring's last length at its squeeze
+    // (0x8219EF90), so a wheel whose ground stands closer than that on its
+    // first step reads a fast squeeze and its damping kicks it up. The
+    // installed templates at their authored poses (springs as cast with
+    // the template's wheel radius): the Fuel Trailer's front axle (k 4.5,
+    // c 2.0, L 0.70, Cmp 0.30) -0.016 m long, its rear (15, 3.0, 0.55,
+    // 0.30) 0.156: about 2.1 m/s up, Xenia trailers3 +2.20; the Box
+    // Trailer's (front 4.5, 1.7, 0.70, 0.30 at -0.125; rear 15, 3.0, 0.60,
+    // 0.30 at 0.172) about 2.2, Xenia +2.23; the Austin cab's six (15, 2.0,
+    // 0.315, 0.115 at 0.119) none, Xenia none; the Phoenix's (25, 1.0,
+    // 0.35, 0.20 at 0.177, 0.139, 0.249, 0.227; gravity factor 1.7) about
+    // nothing, Xenia none.
+    #[test]
+    fn a_wheel_whose_ground_is_nearer_than_its_squeeze_kicks_on_its_first_step() {
+        let pair = |w: (f32, f32, f32, f32, f32)| [w, w];
+        let fuel: Vec<_> = pair((4.5, 2.0, 0.70, 0.30, -0.016))
+            .into_iter()
+            .chain(pair((15.0, 3.0, 0.55, 0.30, 0.156)))
+            .collect();
+        let v = first_kick(&fuel, 2.0);
+        assert!((v - 2.12).abs() < 0.05, "fuel trailer {v}");
+        let boxed: Vec<_> = pair((4.5, 1.7, 0.70, 0.30, -0.125))
+            .into_iter()
+            .chain(pair((15.0, 3.0, 0.60, 0.30, 0.172)))
+            .collect();
+        let v = first_kick(&boxed, 2.0);
+        assert!((v - 2.23).abs() < 0.05, "box trailer {v}");
+        let cab = [(15.0, 2.0, 0.315, 0.115, 0.119); 6];
+        assert!(first_kick(&cab, 2.0) < 0.0, "the cab");
+        let phoenix: Vec<_> = [0.177, 0.139, 0.249, 0.227]
+            .iter()
+            .map(|&cur| (25.0, 1.0, 0.35, 0.20, cur))
+            .collect();
+        let v = first_kick(&phoenix, 1.7);
+        assert!(v.abs() < 0.02, "phoenix {v}");
+    }
+
+    // The push is never a pull: a spring stretching fast enough that its
+    // damping outweighs it gives nothing (0x8219F6DC); off the ground it
+    // gives nothing and next touches as from its whole length.
+    #[test]
+    fn a_wheel_push_is_never_a_pull() {
+        let mut d = Damper::new(25.0, 3.0, 0.35, 0.20);
+        assert_eq!(d.prev, 0.20);
+        let (push, spring) = d.step(Some(0.34), 1.0 / 60.0);
+        assert_eq!(push, 0.0);
+        assert!(spring > 0.0);
+        assert_eq!(d.prev, 0.34);
+        assert_eq!(d.step(None, 1.0 / 60.0), (0.0, 0.0));
+        assert_eq!(d.prev, 0.35);
+        assert_eq!(Damper::new(25.0, 3.0, 0.0, 0.2).prev, 0.0);
+    }
+
     // Its springs hang as the 360 code hangs them: from their squeeze
     // above the model's wheels, as long as their lengths together. In the
     // air its wheels drop their stretch and the extra length below the
     // model's; standing on four of strength k with a gravity factor f,
-    // they are squeezed f g / 4k on average (the back pair more, carrying
+    // they are squeezed (g + (f - 1) 10) / 4k on average (the back pair more, carrying
     // more of the weight), so its wheels sit that much higher, and the
     // chassis that much less above its model's height.
     #[test]
@@ -12606,6 +12767,7 @@ mod tests {
                 squeeze: (0.15, 0.15),
                 extra: 0.05,
                 gravity_factor: f,
+                radius: (0.0, 0.0),
             };
             spec.tuning.springs = Some(springs);
             let mut p = Physics::new();
@@ -12618,12 +12780,15 @@ mod tests {
             for _ in 0..300 {
                 p.step(DT);
             }
-            let want = f * WORLD_GRAVITY / (4.0 * k);
+            // The world's gravity, and the 360's extra weight (f - 1) x its
+            // gravity of 10 (0x8219EE14, [`GRAVITY_360`]) on the springs.
+            let want = (WORLD_GRAVITY + (f - 1.0) * GRAVITY_360) / (4.0 * k);
             let sag = p.vehicle_suspension(id);
             let mean = sag.iter().sum::<f32>() / 4.0;
-            // Within 5%: Rapier's springs settle 2 to 4% short of what
-            // k c = f g says.
-            assert!((mean - want).abs() < 0.05 * want, "{k}: {sag:?} {want}");
+            // Within 1%: with the 360's own damper ([`Damper`]) the springs
+            // settle where they carry that weight (Rapier's damper had them
+            // 2 to 4% short).
+            assert!((mean - want).abs() < 0.01 * want, "{k}: {sag:?} {want}");
             assert!(sag[2] > sag[0], "{k}: {sag:?}");
             let lift = p.vehicle_wheel_lift(id);
             let mean_lift = lift.iter().sum::<f32>() / 4.0;
