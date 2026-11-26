@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! m2-launcher [--dir <game folder>] [--install <dir>]
-//!             [--screenshot <out.png>] [--tab play|saves|stats|achievements|contracts|whatsnew|options]
+//!             [--screenshot <out.png>] [--tab play|saves|stats|achievements|contracts|whatsnew|gallery|options]
 //! ```
 //!
 //! `--dir` is where `m2-alpha` and its saves are (default: the launcher's
@@ -30,6 +30,7 @@
 mod achievements;
 mod assets;
 mod builds;
+mod gallery;
 mod launch;
 mod report;
 mod save_stats;
@@ -116,15 +117,16 @@ fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
                     "achievements" => ui::Tab::Achievements,
                     "contracts" => ui::Tab::Contracts,
                     "whatsnew" => ui::Tab::WhatsNew,
+                    "gallery" => ui::Tab::Gallery,
                     "options" => ui::Tab::Options,
                     v => bail!(
-                        "--tab {v}: expected play, saves, stats, achievements, contracts, whatsnew or options"
+                        "--tab {v}: expected play, saves, stats, achievements, contracts, whatsnew, gallery or options"
                     ),
                 }
             }
             "-h" | "--help" => {
                 println!(
-                    "m2-launcher [--dir <game folder>] [--install <dir>] [--screenshot <out.png>] [--tab play|saves|stats|achievements|contracts|whatsnew|options]"
+                    "m2-launcher [--dir <game folder>] [--install <dir>] [--screenshot <out.png>] [--tab play|saves|stats|achievements|contracts|whatsnew|gallery|options]"
                 );
                 std::process::exit(0);
             }

@@ -170,3 +170,25 @@ Options, **BUG REPORT**:
 
 Nothing is uploaded; the player attaches the zip if they want to.
 Everything here is invented.
+
+## Gallery: music
+
+The **GALLERY** tab lists every piece of the game's score. It is read from
+the player's own install when the tab first opens (on a thread), and
+nothing is extracted, cached or committed.
+
+- **The list** (from samples): the `music` cue table in `vz.wad` says
+  which stream of `data\Audios\music.pws` each record plays; each stream
+  is one row (140 on the install checked), with its length.
+- **Names** (from samples): cue names are the install's script strings
+  starting `mu_`, matched by hash (95 of the 140 named). Rows are grouped
+  by side, with our own readable label (**invented**: `mu_fac_an_explore_01`
+  reads "Allied Nations: explore 1") and the raw cue name beside it. A
+  stream with no known name shows as "Track <n>" (invented).
+- **Playing:** click a row to play, again to stop; leaving the tab stops
+  it. It is decoded with `m2-assets`' own Xbox ADPCM decoder and played on
+  the default output through `cpal` (Windows): no ffmpeg needed.
+- **Locks:** saves keep no record of music heard, so every piece is shown
+  unlocked and the page says so.
+
+Cut-scenes come in a following change (see `docs/gallery.md`).

@@ -33,6 +33,7 @@ use crate::{Args, Paths};
 mod bug_report;
 mod build_picker;
 mod contracts;
+mod gallery_page;
 mod whats_new;
 
 const BG: Color32 = Color32::from_rgb(0x26, 0x26, 0x26);
@@ -65,6 +66,7 @@ pub enum Tab {
     Achievements,
     Contracts,
     WhatsNew,
+    Gallery,
     Options,
 }
 
@@ -158,6 +160,8 @@ pub struct App {
     build_dl: Option<Receiver<Result<(String, PathBuf), String>>>,
     /// The Options page's bug report part ([`bug_report`]).
     bug: bug_report::BugReport,
+    /// The Gallery tab ([`gallery_page`]).
+    gallery: gallery_page::GalleryPage,
 }
 
 impl std::fmt::Debug for App {
@@ -244,6 +248,7 @@ impl App {
             size_from_monitor,
             build_dl: None,
             bug: Default::default(),
+            gallery: Default::default(),
         }
     }
 
@@ -503,7 +508,7 @@ impl App {
             "COMING SOON",
         );
         y += 24.0;
-        for (i, name) in ["Mods", "Gallery"].into_iter().enumerate() {
+        for (i, name) in ["Mods"].into_iter().enumerate() {
             let item =
                 Rect::from_min_size(pos2(rect.left() + 8.0, y), vec2(rect.width() - 16.0, 40.0));
             let r = ui.interact(item, Id::new(("side-soon", i)), Sense::hover());
@@ -593,6 +598,7 @@ impl App {
             (Some(Tab::Contracts), "CONTRACTS"),
             (Some(Tab::Options), "OPTIONS"),
             (Some(Tab::WhatsNew), "WHAT'S NEW"),
+            (Some(Tab::Gallery), "GALLERY"),
         ];
         for (i, (tab, name)) in tabs.into_iter().enumerate() {
             let w = self.fonts.width(&p, Role::Heading, 19.0, name);
@@ -2283,10 +2289,14 @@ impl eframe::App for App {
             Tab::Achievements => self.achievements_tab(ui, body),
             Tab::Contracts => self.contracts_tab(ui, body),
             Tab::WhatsNew => self.whats_new_tab(ui, body),
+            Tab::Gallery => self.gallery_tab(ui, body),
             Tab::Options => self.options_tab(ui, body),
         }
         if self.tab != Tab::Play {
             self.picker_open = false;
+        }
+        if self.tab != Tab::Gallery {
+            self.gallery_left();
         }
         self.screenshot(&ctx);
     }

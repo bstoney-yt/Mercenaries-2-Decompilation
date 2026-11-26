@@ -2691,6 +2691,7 @@ name = "m2-launcher"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cpal",
  "eframe",
  "egui",
  "m2-assets",
