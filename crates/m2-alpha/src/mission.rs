@@ -6105,6 +6105,19 @@ impl Fleet {
             game.scripts_seated = true;
         }
         for (g, at, turn, given) in as_authored {
+            // Its first steps logged as an island vehicle's are (the
+            // contract's El Grande against Xenia p769b), log only.
+            if let Some(id) = game
+                .scene
+                .vehicles
+                .iter()
+                .find(|v| v.guid == Some(g))
+                .and_then(|v| v.id)
+                && let Some(m) = physics.vehicle_transform(id)
+                && !game.just_placed.iter().any(|w| w.id == id)
+            {
+                game.just_placed.push(crate::game::Watched::new(g, id, m));
+            }
             if given {
                 game.given_guids.insert(g, (at, turn));
             } else {

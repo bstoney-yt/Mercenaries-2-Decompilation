@@ -153,7 +153,7 @@ pub struct Game {
     /// The island's vehicles placed and still watched: entity, body,
     /// where it was put and how, and how many steps logged so far
     /// ([`Game::log_first_steps`]).
-    just_placed: Vec<Watched>,
+    pub(crate) just_placed: Vec<Watched>,
     /// The scripts' (mission) vehicles placed as authored (their layer
     /// entity's `Transform`), by guid: where and turned how
     /// (`--parked-settle-check`).
@@ -843,18 +843,7 @@ impl Game {
                 if let Some(id) = v.id
                     && let Some(m) = world.physics.vehicle_transform(id)
                 {
-                    let (_, turn, put) = m.to_scale_rotation_translation();
-                    self.just_placed.push(Watched {
-                        entity,
-                        id,
-                        put,
-                        turn,
-                        n: 0,
-                        crossed: 0,
-                        last: put,
-                        still: 0.0,
-                        moved: false,
-                    });
+                    self.just_placed.push(Watched::new(entity, id, m));
                 }
             }
         }
@@ -5860,10 +5849,29 @@ const WATCH_REST: f32 = 1.0;
 const WATCH_LONGEST: f32 = 60.0;
 
 /// One island vehicle [`Game::log_first_steps`] watches.
+impl Watched {
+    /// Watched from where vehicle `id` (layer entity or guid `entity`) was
+    /// just put, `m`.
+    pub(crate) fn new(entity: u32, id: m2_engine::VehicleId, m: Mat4) -> Self {
+        let (_, turn, put) = m.to_scale_rotation_translation();
+        Self {
+            entity,
+            id,
+            put,
+            turn,
+            n: 0,
+            crossed: 0,
+            last: put,
+            still: 0.0,
+            moved: false,
+        }
+    }
+}
+
 #[derive(Debug)]
-struct Watched {
+pub(crate) struct Watched {
     entity: u32,
-    id: m2_engine::VehicleId,
+    pub(crate) id: m2_engine::VehicleId,
     /// Where and how it was put.
     put: Vec3,
     turn: Quat,
