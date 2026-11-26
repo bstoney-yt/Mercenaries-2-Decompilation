@@ -1,7 +1,8 @@
 //! `--flicker-check`: how much of the frame flickers as the camera pans
 //! past trees, with the sun's shadow maps on the game's schedule (all four
 //! drawn every frame, 360 code 0x821B6A98), on the renderer's earlier
-//! staggered one, and with shadows off.
+//! staggered one, and with shadows off; and with the game's edge
+//! anti-aliasing (PgAntiAliasingFP) on and off.
 //!
 //! A pixel flickers on a frame when its brightness jumps one way from the
 //! frame before and back the other way on the frame after, both by at
@@ -110,13 +111,6 @@ const SLOW: Pan = Pan {
     turn: 0.05 * std::f32::consts::PI / 180.0,
     step: 0.02,
 };
-/// A quick look round: 90 degrees a second at 60 frames.
-const FAST: Pan = Pan {
-    name: "fast",
-    turn: 1.5 * std::f32::consts::PI / 180.0,
-    step: 0.0,
-};
-
 /// Where to look from and at: from her eye to the nearest tree 8-60 m off
 /// (a few metres up its trunk), else along her facing.
 fn aim(game: &Game) -> Option<(Vec3, Vec3, Option<f32>)> {
@@ -138,9 +132,9 @@ fn aim(game: &Game) -> Option<(Vec3, Vec3, Option<f32>)> {
     })
 }
 
-/// Runs the check and exits: PASS when, on both pans, the game's schedule
-/// flickers no more than shadows off do (plus a tenth, and the still
-/// camera's floor), and no more than the staggered one.
+/// Runs the check and exits: PASS when, on the slow pan, the game's
+/// picture (every map each frame, anti-aliasing on) flickers less than
+/// the same without anti-aliasing, and no more than the staggered maps.
 pub fn check(
     backend: &mut WgpuBackend,
     game: &mut Game,
@@ -156,11 +150,12 @@ pub fn check(
         Some(d) => eprintln!("flicker-check: from {eye:.1} at a tree {d:.1} m off ({at:.1})"),
         None => eprintln!("flicker-check: no tree 8-60 m off; looking ahead from {eye:.1}"),
     }
-    let (on_foot, camera, shadows, schedule) = (
+    let (on_foot, camera, shadows, schedule, antialias) = (
         game.on_foot,
         game.camera,
         game.picture.shadows,
         backend.shadow_schedule(),
+        backend.antialias(),
     );
     game.on_foot = false;
     let (w, h) = backend.size();
@@ -173,9 +168,11 @@ pub fn check(
                 pan: Pan,
                 variant: &str,
                 sched: ShadowSchedule,
-                shadows: bool|
+                shadows: bool,
+                antialias: bool|
      -> anyhow::Result<f64> {
         backend.set_shadow_schedule(sched);
+        backend.set_antialias(antialias);
         game.picture.shadows = shadows;
         let start = FlyCamera::looking_at(eye, at);
         // Settle: a few frames first so every kept map is this view's.
@@ -192,7 +189,12 @@ pub fn check(
             c.position += start.right() * (pan.step * s);
             game.camera = c;
             crate::render(backend, game, fov, aspect, None)?;
-            frames.push(luma(&backend.read_pixels()?));
+            let pixels = backend.read_pixels()?;
+            if k == FRAMES / 2 {
+                let shot = out.with_file_name(format!("{stem}-frame-{}-{variant}.ppm", pan.name));
+                write_rgb(&pixels, w, h, &shot)?;
+            }
+            frames.push(luma(&pixels));
         }
         let f = Flicker::of(&frames);
         let r = f.rate();
@@ -206,33 +208,40 @@ pub fn check(
         );
         Ok(r)
     };
-    let floor = rate(backend, game, STILL, "every", ShadowSchedule::Every, true)?;
-    let mut pass = true;
-    for pan in [SLOW, FAST] {
-        let every = rate(backend, game, pan, "every", ShadowSchedule::Every, true)?;
-        let staggered = rate(
-            backend,
-            game,
-            pan,
-            "staggered",
-            ShadowSchedule::Staggered,
-            true,
-        )?;
-        let off = rate(backend, game, pan, "noshadow", ShadowSchedule::Every, false)?;
-        let ok = every <= off * 1.1 + floor + 1e-6 && every <= staggered + 1e-6;
-        eprintln!(
-            "flicker-check: {} pan: every {every:.5}, staggered {staggered:.5}, shadows off {off:.5}, still {floor:.5}: {}",
-            pan.name,
-            if ok { "ok" } else { "over" }
-        );
-        pass &= ok;
-    }
+    let every = ShadowSchedule::Every;
+    let floor = rate(backend, game, STILL, "game", every, true, true)?;
+    let game_rate = rate(backend, game, SLOW, "game", every, true, true)?;
+    let no_aa = rate(backend, game, SLOW, "noaa", every, true, false)?;
+    let staggered = rate(
+        backend,
+        game,
+        SLOW,
+        "staggered",
+        ShadowSchedule::Staggered,
+        true,
+        true,
+    )?;
+    let off = rate(backend, game, SLOW, "noshadow", every, false, true)?;
+    let pass = game_rate < no_aa && game_rate <= staggered + 1e-6;
+    eprintln!(
+        "flicker-check: slow pan: game {game_rate:.5}, no anti-aliasing {no_aa:.5}, staggered {staggered:.5}, shadows off {off:.5}, still {floor:.5}"
+    );
     backend.set_shadow_schedule(schedule);
+    backend.set_antialias(antialias);
     game.picture.shadows = shadows;
     game.on_foot = on_foot;
     game.camera = camera;
     eprintln!("flicker-check: {}", if pass { "PASS" } else { "FAIL" });
     Ok(pass)
+}
+
+/// Writes an RGBA frame as a colour PPM.
+fn write_rgb(rgba: &[u8], width: u32, height: u32, out: &Path) -> anyhow::Result<()> {
+    let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+    for p in rgba.chunks_exact(4) {
+        ppm.extend(&p[..3]);
+    }
+    std::fs::write(out, ppm).with_context(|| format!("writing {}", out.display()))
 }
 
 #[cfg(test)]

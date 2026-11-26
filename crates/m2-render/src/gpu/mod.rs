@@ -1899,6 +1899,17 @@ impl WgpuBackend {
         self.shadow_schedule = schedule;
     }
 
+    /// Runs the 360's anti-aliasing pass or not (on by default, as the
+    /// game).
+    pub fn set_antialias(&mut self, on: bool) {
+        self.post.set_antialias(on);
+    }
+
+    /// Whether the anti-aliasing pass runs.
+    pub fn antialias(&self) -> bool {
+        self.post.antialias()
+    }
+
     /// The shadow cascades' schedule now.
     pub fn shadow_schedule(&self) -> ShadowSchedule {
         self.shadow_schedule
@@ -2850,6 +2861,7 @@ impl WgpuBackend {
                 })
         };
         self.post.set_projection(&view.projection);
+        self.post.set_near_far(view.near, view.far);
         self.post.set_view_projection(view.projection * view.view);
         // The screen overlay: its texture, and the view it is laid out by.
         if let Some(o) = l.screen_overlay
