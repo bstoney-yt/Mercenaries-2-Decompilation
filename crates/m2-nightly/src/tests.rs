@@ -694,3 +694,118 @@ fn dry_run_posts_nothing_and_says_what_it_would() {
         "{log:?}"
     );
 }
+
+// ---- cancels and Retries -----------------------------------------------------
+
+/// A race cancelled by its timer, Retry taken, and the contract put back
+/// on offer instead of restarted (the shape of the nightly trial's run).
+fn cancelled_log(retry_restarts: bool) -> String {
+    let mut s = String::from("autoplay 4.6 s: on contract Some((\"PirCon001\", 1))\n");
+    s += "autoplay 15.8 s: objectives [\"A\", \"Race (0/30)\"]\n";
+    for (i, t) in [18.2, 20.9, 25.1, 38.0, 46.6, 61.7, 66.6]
+        .iter()
+        .enumerate()
+    {
+        s += &format!(
+            "autoplay {t:.1} s: objectives [\"A\", \"Race ({}/30)\"]\n",
+            i + 1
+        );
+        s += &format!("autoplay {t:.1} s: racing to checkpoint{i}\n");
+    }
+    s += "autoplay 79.8 s: racing, something solid ahead: round it\n";
+    s += "mission: contract cancelled (1 so far)\n";
+    s += "autoplay: contract cancelled (1 so far) after 79.8 s of play\n";
+    s += "autoplay 79.8 s: objectives [\"A\"]\n";
+    s += "autoplay 82.6 s: at [1.0, -36.0, 1.0], in a boat\n";
+    s += "autoplay: she takes Retry on the failed contract's fanfare (HUD call 734, retry 1)\n";
+    if retry_restarts {
+        s += "autoplay 85.0 s: objectives [\"A\", \"Race (0/30)\"]\n";
+        s += "autoplay 90.0 s: objectives [\"A\", \"Race (1/30)\"]\n";
+        s += "autoplay: contract 1 completed after 400.0 s of play\n";
+        s += "autoplay: 401.0 s played, 0 hops;\n";
+    } else {
+        s += "autoplay 82.8 s: on contract None\n";
+        for t in (90..710).step_by(15) {
+            s += &format!("autoplay {t}.0 s: at [5.0, -36.0, 5.0], on foot\n");
+        }
+    }
+    s
+}
+
+#[test]
+fn a_cancel_and_a_retry_that_put_it_back_on_offer_are_named() {
+    let a = analyse(
+        &cancelled_log(false),
+        &Exit {
+            code: None,
+            killed: Some(Killed::Stuck),
+            wall_seconds: 600.0,
+        },
+        &th(),
+    );
+    let kinds: Vec<Kind> = a.failures.iter().map(|f| f.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            Kind::ContractCancelled,
+            Kind::RetryFailed,
+            Kind::Stuck,
+            Kind::NotCompleted
+        ]
+    );
+    let c = &a.failures[0];
+    assert_eq!(c.at, Some(79.8));
+    assert!(
+        c.detail
+            .contains("1 time(s), at 79.8 s of play, the first while racing"),
+        "{}",
+        c.detail
+    );
+    assert!(c.detail.contains("1 Retry and 0 Continue"), "{}", c.detail);
+    let r = &a.failures[1];
+    assert_eq!(r.at, Some(82.6));
+    assert!(
+        r.detail.contains("by 82.8 s she was on no contract"),
+        "{}",
+        r.detail
+    );
+    // The stuck stretch after it is the cancel's doing: no issue of its own.
+    assert_eq!(
+        issue_kinds(&a.failures),
+        vec![Kind::RetryFailed, Kind::ContractCancelled]
+    );
+    assert_eq!(Kind::from_name("retry-failed"), Some(Kind::RetryFailed));
+    assert_eq!(
+        Kind::from_name("contract-cancelled"),
+        Some(Kind::ContractCancelled)
+    );
+}
+
+#[test]
+fn a_retry_that_restarts_and_completes_is_a_pass() {
+    let a = analyse(&cancelled_log(true), &clean(), &th());
+    assert!(a.completed);
+    assert_eq!(a.failures, vec![]);
+}
+
+#[test]
+fn stuck_before_a_cancel_still_files() {
+    let fs = vec![
+        Failure {
+            kind: Kind::Stuck,
+            at: Some(100.0),
+            detail: String::new(),
+        },
+        Failure {
+            kind: Kind::ContractCancelled,
+            at: Some(900.0),
+            detail: String::new(),
+        },
+        Failure {
+            kind: Kind::NotCompleted,
+            at: None,
+            detail: String::new(),
+        },
+    ];
+    assert_eq!(issue_kinds(&fs), vec![Kind::ContractCancelled, Kind::Stuck]);
+}

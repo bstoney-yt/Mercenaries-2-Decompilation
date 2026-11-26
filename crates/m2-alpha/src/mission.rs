@@ -1802,10 +1802,9 @@ impl MissionLink {
     /// it closes (its script `vz_da6af53d`, line 979 on: her
     /// invincibility for the fanfare off, `MrxHqManager.UnlockAllHq`),
     /// then its callback, which for a contract's, a mission's or a wager's
-    /// fanfare is handed `bRetry` after its own data ([`FANFARE_ANSWER`];
-    /// from the scripts: the fanfare widget's delete, which reads the
-    /// flash's answer "false" as Retry). A Retry has the scripts load the
-    /// retry save (`Pg.LoadGame("retry")`).
+    /// fanfare is handed the widget's `CustomData.bRetry` after its own
+    /// data ([`FANFARE_ANSWER`]: `false` for a Retry, from the scripts).
+    /// A Retry has the scripts load the retry save (`Pg.LoadGame("retry")`).
     pub fn answer_fanfare(&mut self, seq: u64, retry: bool) {
         let State::Running(m) = &mut self.state else {
             return;
@@ -5913,8 +5912,19 @@ fn hud_calls(lua: &mlua::Lua) -> Vec<HudCall> {
 /// callback has not been called.
 /// Calls a fanfare's callback `t` as the fanfare widget's delete does
 /// (from the scripts: the HUD's fanfare script, `_DeleteFanfareWidget`'s
-/// target): `fCallback(unpack(tCallbackData))`, with `bRetry` added after
-/// the data for a fanfare of `sType` "contract", "mission" or "wager".
+/// target): `fCallback(unpack(tCallbackData))`, with the widget's
+/// `CustomData.bRetry` added after the data for a fanfare of `sType`
+/// "contract", "mission" or "wager".
+///
+/// That field reads the other way round from its name (from the scripts):
+/// the HUD's `_EndFanfare` sets it `false` for the flash's answer "true"
+/// (Retry) and `true` for "false" (closed: the co-op client's
+/// `NetClientCloseFanfare`, where Retry is never offered, answers
+/// "false"), and the contract's callback (`MrxTaskContract`, its line
+/// 476 on) takes `not` it, and its retry allowance, as `Cancel`'s
+/// `bRetry`. So a Retry hands `false` here. Handing `true` (round 4's
+/// reading) made every Retry a Continue: the contract went back on offer
+/// and the retry save was never loaded (the nightly trial's PirCon001).
 const FANFARE_ANSWER: &str = "(function(t, bRetry)
     if type(t) ~= 'table' or type(t.fCallback) ~= 'function' then return end
     local a = {}
@@ -5922,7 +5932,7 @@ const FANFARE_ANSWER: &str = "(function(t, bRetry)
         for i = 1, table.getn(t.tCallbackData) do a[i] = t.tCallbackData[i] end
     end
     if t.sType == 'contract' or t.sType == 'mission' or t.sType == 'wager' then
-        a[table.getn(a) + 1] = bRetry
+        a[table.getn(a) + 1] = not bRetry
     end
     t.fCallback(unpack(a))
 end)";
@@ -10418,8 +10428,9 @@ mod tests {
     }
 
     // The fail fanfare's answer reaches a contract's callback as the
-    // fanfare widget's delete hands it: `bRetry` after the callback's own
-    // data, only for a contract's, a mission's or a wager's fanfare.
+    // fanfare widget's delete hands it: its `CustomData.bRetry` (false for
+    // a Retry) after the callback's own data, only for a contract's, a
+    // mission's or a wager's fanfare.
     #[test]
     fn the_fanfare_answer_hands_a_contract_its_retry() {
         let lua = mlua::Lua::new();
@@ -10456,10 +10467,34 @@ mod tests {
         assert_eq!(
             got,
             [
-                ("mission".to_owned(), Some(true)),
                 ("mission".to_owned(), Some(false)),
+                ("mission".to_owned(), Some(true)),
                 ("other".to_owned(), None),
             ]
+        );
+        // ...and the contract's own callback (`MrxTaskContract`'s, as its
+        // line 476 on reads it: `not` the answer, with retries allowed)
+        // then cancels with `bRetry` true for a Retry.
+        lua.load(
+            r#"
+            cancelled = {}
+            local bAllowRetry = true
+            function contract_cb(b)
+                if b ~= nil then b = not b end
+                b = bAllowRetry and b
+                cancelled[table.getn(cancelled) + 1] = b
+            end
+            "#,
+        )
+        .exec()
+        .unwrap();
+        answer("{ sType = 'contract', fCallback = contract_cb }", true);
+        answer("{ sType = 'contract', fCallback = contract_cb }", false);
+        let cancelled: Vec<bool> = lua.load("return cancelled").eval().unwrap();
+        assert_eq!(
+            cancelled,
+            [true, false],
+            "Retry cancels with bRetry, Continue without"
         );
     }
 

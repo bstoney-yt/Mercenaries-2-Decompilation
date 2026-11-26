@@ -61,15 +61,20 @@ tooling heuristic, changeable by option):
 | `crash` | any other abnormal exit code (access violation, stack overflow, abort...) |
 | `error` | m2-alpha's own `Error:` exit (code 1) |
 | `hang` | no log output for 300 s of wall time: the process is stopped |
+| `contract-cancelled` | the scripts cancelled (failed) the contract (`autoplay: contract cancelled`): when, how often, whether she was racing, and how each fanfare was answered |
+| `retry-failed` | Retry was taken on the fail fanfare, but autoplay's next contract state is none: the contract went back on offer instead of restarting |
 | `stuck` | no objective or mission-state change for 600 s of play; checked live each minute, and the run stopped |
 | `fell-through` | autoplay's own `fell through` line, her position not a number, or a logged height under -150 m |
 | `fps-cliff` | 3 `pace:` lines in a row over 50 ms a tick (offscreen; healthy is about 10) or under 15 fps (windowed) |
 | `timeout` | past the 2700 s wall limit: the process is stopped |
 | `not-completed` | ended without the contract completed, nothing above explaining it |
 
-One cause stands for the others it explains: a `panic`, `hang` or `stuck`
-run files no `not-completed` issue as well. An `fps-cliff` always files its
-own.
+One cause stands for the others it explains: a `panic`, `hang`,
+`contract-cancelled`, `retry-failed` or `stuck` run files no
+`not-completed` issue as well, and a stuck stretch that began after the
+contract was cancelled files under the cancel, not as `stuck`. An
+`fps-cliff` always files its own. A cancel in a run that still completes
+(a Retry that worked) is not a failure.
 
 **GPU yield.** The runner holds `C:\Claude\scratch\gpu.lock` (JSON: pid,
 start, purpose) for the night, and takes over a lock whose pid is gone or
