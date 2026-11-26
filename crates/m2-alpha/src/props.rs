@@ -34,10 +34,6 @@ use m2_render::{DrawQueue, RenderBackend};
 /// prop).
 const CARGO_KG: f32 = 50.0;
 
-/// How far over the bed's floor goods sunk in it start, metres (invented:
-/// a hair, for the solver).
-const BED_CLEAR: f32 = 0.02;
-
 /// A prop riding loose on a vehicle's load bed ([`Props::load`]).
 #[derive(Clone, Copy, Debug)]
 struct Riding {
@@ -804,17 +800,15 @@ impl Props {
     /// ([`Physics::add_bed`]) and slides, tips and falls off as the
     /// vehicle turns, brakes and hits (as the game's goods do: OilCon020's
     /// guns are lost off a driven pickup). Its standing collision goes.
-    /// It starts clear of `bed` (the vehicle's own collision, its space),
-    /// lifted out of the floor where it stood sunk in it (a layer's goods
-    /// stand a little in the bed as the truck settles on its springs, and
-    /// would drop through it). False unless both are in play and it has a
-    /// collision box.
+    /// It starts at its authored place, asleep, as the 360's goods do
+    /// (Xenia p769a), even where that is in the bed (the truck settled
+    /// under its authored goods). False unless both are in play and it has
+    /// a collision box.
     pub fn load(
         &mut self,
         physics: &mut Physics,
         entity: u32,
         (index, id): (usize, m2_engine::VehicleId),
-        bed: Option<&CollisionShape>,
     ) -> bool {
         // A body of its own from the start (the goods came in before the
         // vehicle): its bodies give way to its ride.
@@ -856,26 +850,19 @@ impl Props {
         if let Some(m) = collision.material {
             piece.material = m;
         }
-        let mut at = Mat4::from_rotation_translation(p.rotation, p.position);
-        if let (Some(bed), Some(place)) = (bed, physics.vehicle_transform(id)) {
-            let local = place.inverse() * at;
-            let (lo, _) = box_around(local, bounds);
-            let lift = bed.lift_onto(box_around(local, bounds), BED_CLEAR);
-            if lift > 0.0 {
-                at = place * Mat4::from_translation(Vec3::Y * lift) * local;
-            }
-            // Where it starts, in the vehicle's frame: its box's bottom
-            // against the bed's floor under it (the floor is BED_CLEAR
-            // under the bottom once lifted).
-            let floor = if lift > 0.0 {
-                format!("bed floor {:.2}", lo.y + lift - BED_CLEAR)
-            } else {
-                "on or over the bed already".to_owned()
-            };
+        // At its authored place and turn, as the 360 adds it: Xenia p769a,
+        // every one of OilCon020's 20 crates got its body exactly where it
+        // was authored (to 1e-4 m, at rest), though the El Grande under
+        // them had settled (-0.20, +0.18, +0.03) m from its own authored
+        // place first. They lie in the bed's collision so, asleep, until
+        // something awake touches them.
+        let at = Mat4::from_rotation_translation(p.rotation, p.position);
+        if let Some(place) = physics.vehicle_transform(id) {
+            let (lo, _) = box_around(place.inverse() * at, bounds);
             eprintln!(
-                "cargo: {entity:#x} loaded: lifted {lift:.2} m, its bottom {:.2} -> {:.2} m up the vehicle ({floor})",
+                "cargo: {entity:#x} loaded at its authored place, its bottom {:.2} m up the vehicle (asleep {})",
                 lo.y,
-                lo.y + lift
+                physics.vehicle_asleep(id)
             );
         }
         let template = p.template;
@@ -929,6 +916,11 @@ impl Props {
             .collect();
         out.sort_by_key(|c| c.0);
         out
+    }
+
+    /// How many goods ride vehicles. Log only.
+    pub fn cargo_count(&self) -> usize {
+        self.cargo.len()
     }
 
     /// Each of vehicle `index`'s goods (vehicle `id`): its offset from

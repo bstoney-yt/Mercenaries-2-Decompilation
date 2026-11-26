@@ -143,6 +143,9 @@ pub struct Game {
     /// The scripts' vehicles whose load bed's goods were logged (taken up,
     /// or what stood near and why not), by index.
     beds_told: HashSet<usize>,
+    /// Log only: the goods loaded so far and how many frames more each
+    /// frame's sleep is logged after the last load ([`CARGO_WAKE_LOG`]).
+    cargo_watch: (usize, u32),
     /// The helicopters' winches ([`crate::winches`]).
     pub winches: crate::winches::Winches,
     /// Layer entities of the island's vehicles asked for so far.
@@ -587,6 +590,7 @@ impl Game {
             beds: HashMap::new(),
             bed_shapes: HashMap::new(),
             beds_told: HashSet::new(),
+            cargo_watch: (0, 0),
             winches: Default::default(),
             fetched: HashSet::new(),
             authored: HashMap::new(),
@@ -2022,12 +2026,6 @@ impl Game {
             .iter()
             .map(|v| self.beds.get(&v.spec.model).copied().flatten())
             .collect();
-        let shapes: Vec<BedShape> = self
-            .scene
-            .vehicles
-            .iter()
-            .map(|v| self.bed_shapes.get(&v.spec.model).cloned().flatten())
-            .collect();
         let focus = self.focus();
         // Vehicles under the water long enough sink.
         self.sink(dt);
@@ -2250,11 +2248,45 @@ impl Game {
                 world,
                 &mut self.scene.props,
                 &self.scene.vehicles,
-                (&beds, &shapes, &mut self.beds_told),
+                (&beds, &mut self.beds_told),
                 &mut self.destruction,
                 self.scene.install.as_ref(),
                 hero,
             );
+            // Log only: for a while after goods are loaded, each frame,
+            // whether their vehicle and they sleep (what wakes a load).
+            let loaded = self.scene.props.cargo_count();
+            if loaded != self.cargo_watch.0 {
+                self.cargo_watch = (loaded, CARGO_WAKE_LOG);
+            }
+            if self.cargo_watch.1 > 0 {
+                self.cargo_watch.1 -= 1;
+                for (i, v) in self.scene.vehicles.iter().enumerate() {
+                    let Some(id) = v.id.filter(|_| self.scene.props.carrying(i)) else {
+                        continue;
+                    };
+                    let awake: Vec<String> = self
+                        .scene
+                        .props
+                        .cargo_states(&world.physics, i, id)
+                        .into_iter()
+                        .filter(|c| c.2 == Some(false))
+                        .map(|(e, d, _)| format!("{e:#x} {:.3}", d.length()))
+                        .collect();
+                    eprintln!(
+                        "cargo-wake: frame {} after the last load: the {} {}, {} of its goods awake [{}]",
+                        CARGO_WAKE_LOG - self.cargo_watch.1,
+                        v.spec.label,
+                        if world.physics.vehicle_asleep(id) {
+                            "asleep"
+                        } else {
+                            "awake"
+                        },
+                        awake.len(),
+                        awake.join("; ")
+                    );
+                }
+            }
             // Its vertical velocity a moment after each knock, against
             // just before (a kick up shows here).
             self.kicks.extend(
@@ -4567,6 +4599,10 @@ type Carrier = ((usize, m2_engine::VehicleId), Vec3);
 /// A vehicle model's own collision, which its load bed's goods lie on.
 type BedShape = Option<std::sync::Arc<m2_engine::CollisionShape>>;
 
+/// How many frames after goods are loaded `cargo-wake:` lines are
+/// logged (log only).
+const CARGO_WAKE_LOG: u32 = 90;
+
 /// The node of a vehicle model that is its load bed (the scripts count
 /// the goods on it there: PirCon002's `GetHardpointPosition(truck,
 /// "HP_Truckbed")`).
@@ -4844,7 +4880,7 @@ fn knock_loose(
     world: &mut World,
     props: &mut Props,
     vehicles: &[ParkedVehicle],
-    (beds, shapes, told): (&[Option<Vec3>], &[BedShape], &mut HashSet<usize>),
+    (beds, told): (&[Option<Vec3>], &mut HashSet<usize>),
     destruction: &mut Destruction,
     install: Option<&Install>,
     hero: Vec3,
@@ -4857,7 +4893,6 @@ fn knock_loose(
         .enumerate()
     {
         let Some(id) = v.id else { continue };
-        let shape = shapes.get(index).and_then(|s| s.as_deref());
         // The scripts' vehicles with a load bed take up what stands on it
         // as soon as they are placed, standing or not: the scripts count
         // the goods on the bed from then on (PirCon002 counted none, and
@@ -4935,10 +4970,15 @@ fn knock_loose(
                     (at - hero).with_y(0.0).length()
                         <= distance * m2_engine::population::HIBERNATION_WAKE
                 });
+                // And only once the vehicle under it sleeps: Xenia p769a,
+                // the El Grande asleep at 265.6 s, its crates' first
+                // physics from 281.3 s (the 360's gate itself is not
+                // traced: inferred from that order).
                 if awake
                     && !props.is_cargo(e)
+                    && world.physics.vehicle_asleep(id)
                     && on_bed(props, &standing, *b, e)
-                    && props.load(&mut world.physics, e, (index, id), shape)
+                    && props.load(&mut world.physics, e, (index, id))
                 {
                     eprintln!("cargo: {e:#x} rides on the {}", v.spec.label);
                 }
@@ -5087,8 +5127,7 @@ fn run_into(
         StaticKey::Entity(e) if props.is_cargo(e) => false,
         StaticKey::Entity(e) => match carrier {
             Some((carrier, bed))
-                if on_bed(props, vehicle, bed, e)
-                    && props.load(&mut world.physics, e, carrier, None) =>
+                if on_bed(props, vehicle, bed, e) && props.load(&mut world.physics, e, carrier) =>
             {
                 eprintln!("cargo: {e:#x} rides on the {label}");
                 false
