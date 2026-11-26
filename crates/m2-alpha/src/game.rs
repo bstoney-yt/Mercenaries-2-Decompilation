@@ -4873,9 +4873,12 @@ fn knock_loose(
         // 0x11d39d off). The 360's goods meet their truck asleep: Xenia
         // settle7/8, the El Grande's first sample +2.18 up, asleep by 2.02
         // to 2.42 s, its crates' bodies in its island only at 18.18 s.
-        // Inferred from that order (what makes the 360's crates bodies at
-        // 18 s is not read): goods are taken up once their vehicle is
-        // asleep.
+        // INFERRED, not 360-backed: this gate reproduces the 360's ORDER
+        // (goods meet a settled truck), not its CAUSE. The 360's crates
+        // become bodies at 18.2 and 21.8 s (settle7/8, two batches, in both
+        // runs), 16 s after the truck sleeps, by a trigger not yet read
+        // (the hibernation grid, the mission script or the rebuild queue).
+        // #769 must not merge until that trigger is traced.
         let settled = world.physics.vehicle_asleep(id);
         if let (true, Some(_), Some(b), Some(place)) =
             (settled, v.guid, bed, world.physics.vehicle_transform(id))
