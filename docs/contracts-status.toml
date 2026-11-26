@@ -1,0 +1,378 @@
+# Which contracts play through in this build: docs/contract-tracker.md.
+# Statuses: playable, playable-with-gaps, not-yet, unknown. Our own text only.
+
+updated = "2026-11-26"
+
+[[contract]]
+id = "VzaCon001"
+status = "playable-with-gaps"
+note = "The story autoplay completes it (game-check runs, 2026-11-17). The test bot still waits away from the supply crate before opening it (pathing)."
+issues = [649, 635, 698]
+evidence = "autoplay"
+checked = "2026-11-17"
+
+[[contract]]
+id = "PmcCon001"
+status = "playable-with-gaps"
+note = "The story autoplay completes it after VzaCon001 (known-bugs list, 2026-11-18); its hops were not recorded. Not yet re-run by the nightly."
+issues = [698]
+evidence = "autoplay"
+checked = "2026-11-18"
+
+[[contract]]
+id = "PmcCon002"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "PmcCon003"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "PmcCon004"
+status = "unknown"
+note = "No recorded run yet; it depends on the helicopter climb (docs/fidelity/GAPS.md)."
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "PmcCon013"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "PmcCon015"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "PmcCon016"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "PmcCon018"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "PmcCon031"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "PmcCon032"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "PmcCon033"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "PmcCon034"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "MecCon001"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "JetCon001"
+status = "not-yet"
+note = "Autoplay ended without completing it in the contract sweeps of 2026-11-09 and 2026-11-10."
+issues = []
+evidence = "autoplay"
+checked = "2026-11-10"
+
+[[contract]]
+id = "OilCon001"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "OilCon002"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "OilCon003"
+status = "playable"
+note = "Autoplay completed it in 547 s of play with no hops (contract sweep, 2026-11-07). Not re-run since."
+issues = []
+evidence = "autoplay"
+checked = "2026-11-07"
+
+[[contract]]
+id = "OilCon005"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "OilCon020"
+status = "playable-with-gaps"
+note = "Completes only when the test bot hops the El Grande forward: its gun crates jammed under the bed. #776 keeps the loaded goods in place; not yet re-run."
+issues = [680, 776, 698]
+evidence = "autoplay"
+checked = "2026-11-18"
+
+[[contract]]
+id = "OilCon021"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "OilCon050"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "OilCon051"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "OilCon052"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "GurCon001"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "GurCon002"
+status = "not-yet"
+note = "Autoplay ended without completing it in the contract sweeps of 2026-11-09 and 2026-11-10."
+issues = []
+evidence = "autoplay"
+checked = "2026-11-10"
+
+[[contract]]
+id = "GurCon003"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "GurCon005"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "GurCon050"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "GurCon052"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "GurCon053"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "PirCon001"
+status = "unknown"
+note = "No recorded run yet; its jetski race depends on boat handling (docs/fidelity/GAPS.md)."
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "PirCon002"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "PirCon003"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "PirCon004"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "PirCon051"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "PirCon052"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "AllCon001"
+status = "not-yet"
+note = "Autoplay completed it once (2026-11-08), but the sweeps of 2026-11-09 and 2026-11-10 ended without completing it."
+issues = []
+evidence = "autoplay"
+checked = "2026-11-10"
+
+[[contract]]
+id = "AllCon002"
+status = "unknown"
+note = "No recorded run yet; its boat stages depend on boat handling (docs/fidelity/GAPS.md)."
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "AllCon003"
+status = "not-yet"
+note = "The test bot stalls at the AA guns (a test-bot gap, not necessarily a game bug); the support gunship does not fire its salvos yet."
+issues = [688, 631, 698]
+evidence = "autoplay"
+checked = "2026-11-18"
+
+[[contract]]
+id = "AllCon008"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "AllCon050"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "AllCon052"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "AllCon053"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "ChiCon001"
+status = "not-yet"
+note = "Autoplay did not complete it in the 2026-11-09 and 2026-11-10 sweeps (wall limit, then idle)."
+issues = []
+evidence = "autoplay"
+checked = "2026-11-10"
+
+[[contract]]
+id = "ChiCon002"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "ChiCon003"
+status = "not-yet"
+note = "Autoplay ended without completing it in the contract sweeps of 2026-11-09 and 2026-11-10."
+issues = []
+evidence = "autoplay"
+checked = "2026-11-10"
+
+[[contract]]
+id = "ChiCon008"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "ChiCon009"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "ChiCon050"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "ChiCon051"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
+
+[[contract]]
+id = "ChiCon053"
+status = "unknown"
+note = ""
+issues = []
+evidence = "none"
