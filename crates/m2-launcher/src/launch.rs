@@ -72,6 +72,9 @@ pub struct Settings {
     pub install: Option<PathBuf>,
     /// The game's program, if not `m2-alpha` beside the launcher.
     pub game: Option<PathBuf>,
+    /// Download and swap in a new build when the launcher opens
+    /// ([`crate::update`]).
+    pub auto_update: bool,
 }
 
 impl Default for Settings {
@@ -85,6 +88,7 @@ impl Default for Settings {
             hero: "jennifer".to_owned(),
             install: None,
             game: None,
+            auto_update: false,
         }
     }
 }

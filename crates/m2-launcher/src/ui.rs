@@ -27,6 +27,7 @@ use crate::save_stats::{self, Attitude, PlayedFrom, SaveStats};
 use crate::saves::{self, Slot};
 use crate::stats::{self, LauncherStats};
 use crate::text::{Fonts, GameFont};
+use crate::update::{self, Found, Standing};
 use crate::{Args, Paths};
 
 const BG: Color32 = Color32::from_rgb(0x26, 0x26, 0x26);
@@ -123,6 +124,21 @@ pub struct App {
     achievements: Vec<Entry>,
     /// The save the Achievements page shows them for.
     ach_slot: Option<u32>,
+    /// The folder the launcher's program is in: where updates go.
+    program_dir: PathBuf,
+    /// Looking for the latest build.
+    upd_check: Option<Receiver<Result<Option<Found>, String>>>,
+    /// Downloading and swapping one in.
+    upd_run: Option<Receiver<Result<Vec<String>, String>>>,
+    /// The latest build found.
+    upd_found: Option<Found>,
+    /// What the last update step said, and whether it went wrong.
+    upd_note: Option<(String, bool)>,
+    /// The launcher's own program was replaced: the new one runs from a
+    /// restart.
+    restart_needed: bool,
+    /// Whether the check on opening has been started.
+    upd_started: bool,
     /// Each slot's stats, as of the last scan.
     save_stats: Vec<(u32, Result<SaveStats, String>)>,
     shot: Option<Shot>,
@@ -193,6 +209,16 @@ impl App {
             save_stats,
             achievements: Vec::new(),
             ach_slot: None,
+            program_dir: std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(std::path::Path::to_path_buf))
+                .unwrap_or_else(|| PathBuf::from(".")),
+            upd_check: None,
+            upd_run: None,
+            upd_found: None,
+            upd_note: None,
+            restart_needed: false,
+            upd_started: false,
             shot: args.screenshot.map(|path| Shot {
                 path,
                 settled: 0,
@@ -1664,11 +1690,267 @@ impl App {
             });
     }
 
+    // ---- updates ----
+
+    /// Starts looking for the latest build (only in a released build:
+    /// one that knows its repository).
+    fn start_check(&mut self, ctx: &egui::Context) {
+        if update::RELEASE_REPO.is_none() || self.upd_check.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(update::check());
+            ctx.request_repaint();
+        });
+        self.upd_check = Some(rx);
+    }
+
+    fn standing(&self) -> Option<Standing> {
+        self.upd_found
+            .as_ref()
+            .map(|f| update::standing(update::BUILD_SHA, &f.manifest))
+    }
+
+    /// Downloads the latest build and swaps it in (not while the game
+    /// runs: its program would be in use).
+    fn start_update(&mut self, ctx: &egui::Context) {
+        if self.upd_run.is_some() {
+            return;
+        }
+        if self.game.is_some() {
+            self.upd_note = Some(("Close the game first, then update.".to_owned(), true));
+            return;
+        }
+        let Some(found) = self.upd_found.clone() else {
+            return;
+        };
+        let dir = self.program_dir.clone();
+        self.upd_note = Some((
+            format!("Downloading build {}...", found.manifest.short()),
+            false,
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(update::update(&dir, &found));
+            ctx.request_repaint();
+        });
+        self.upd_run = Some(rx);
+    }
+
+    fn rollback(&mut self) {
+        if self.game.is_some() {
+            self.upd_note = Some(("Close the game first, then roll back.".to_owned(), true));
+            return;
+        }
+        self.upd_note = Some(
+            match update::rollback(&self.program_dir, update::BUILD_SHA) {
+                Ok((m, names)) => {
+                    if names.iter().any(|n| n == "m2-launcher.exe") {
+                        self.restart_needed = true;
+                    }
+                    (format!("Rolled back to build {}.", m.short()), false)
+                }
+                Err(e) => (format!("Could not roll back: {e}"), true),
+            },
+        );
+    }
+
+    /// Starts the launcher's program again (the new one) and closes this.
+    fn restart(&mut self, ctx: &egui::Context) {
+        let exe = self
+            .program_dir
+            .join(format!("m2-launcher{}", std::env::consts::EXE_SUFFIX));
+        match std::process::Command::new(&exe)
+            .args(std::env::args().skip(1))
+            .spawn()
+        {
+            Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(e) => {
+                self.upd_note = Some((format!("Could not restart {}: {e}", exe.display()), true));
+            }
+        }
+    }
+
+    /// Takes in what the update threads said.
+    fn poll_updates(&mut self, ctx: &egui::Context) {
+        if !self.upd_started {
+            self.upd_started = true;
+            if self.shot.is_none() {
+                self.start_check(ctx);
+            }
+        }
+        if let Some(rx) = &self.upd_check
+            && let Ok(r) = rx.try_recv()
+        {
+            self.upd_check = None;
+            match r {
+                Ok(found) => {
+                    self.upd_found = found;
+                    if self.standing() == Some(Standing::Behind) && self.settings.auto_update {
+                        self.start_update(ctx);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("launcher: update check: {e}");
+                    self.upd_note =
+                        Some(("Could not check for updates (offline?).".to_owned(), true));
+                }
+            }
+        }
+        if let Some(rx) = &self.upd_run
+            && let Ok(r) = rx.try_recv()
+        {
+            self.upd_run = None;
+            self.upd_note = Some(match r {
+                Ok(names) => {
+                    if names.iter().any(|n| n == "m2-launcher.exe") {
+                        self.restart_needed = true;
+                    }
+                    let tag = self
+                        .upd_found
+                        .as_ref()
+                        .map_or(String::new(), |f| f.manifest.short().to_owned());
+                    (
+                        if self.restart_needed {
+                            format!("Updated to build {tag}. Restart the launcher to finish.")
+                        } else {
+                            format!("Updated to build {tag}.")
+                        },
+                        false,
+                    )
+                }
+                Err(e) => (format!("Update failed, nothing changed: {e}"), true),
+            });
+        }
+    }
+
+    /// The header's corner: an update waiting, or a restart.
+    fn update_corner(&mut self, ui: &mut Ui, rect: Rect) {
+        let ctx = ui.ctx().clone();
+        let label = if self.restart_needed {
+            "RESTART TO UPDATE"
+        } else if self.upd_run.is_some() {
+            "UPDATING..."
+        } else if matches!(self.standing(), Some(Standing::Behind | Standing::Unknown)) {
+            "UPDATE AVAILABLE"
+        } else {
+            return;
+        };
+        let p = ui.painter_at(rect);
+        let w = self.fonts.width(&p, Role::Heading, 15.0, label) + 28.0;
+        let b = Rect::from_min_size(
+            pos2(rect.right() - PAD - w, rect.top() + 14.0),
+            vec2(w, 32.0),
+        );
+        let r = ui.interact(b, Id::new("update-corner"), Sense::click());
+        p.rect_filled(b, 4.0, if r.hovered() { GREEN_HOVER } else { GREEN });
+        self.fonts.text(
+            &p,
+            Role::Heading,
+            b.center(),
+            Align2::CENTER_CENTER,
+            15.0,
+            TEXT,
+            label,
+        );
+        if r.clicked() {
+            if self.restart_needed {
+                self.restart(&ctx);
+            } else if self.upd_run.is_none() {
+                self.start_update(&ctx);
+            }
+        }
+    }
+
+    /// The Options tab's Updates part.
+    fn updates_options(&mut self, ui: &mut Ui) -> bool {
+        let ctx = ui.ctx().clone();
+        let changed = ui
+            .checkbox(
+                &mut self.settings.auto_update,
+                "Update automatically when the launcher opens",
+            )
+            .changed();
+        let this = update::BUILD_SHA.map_or("a local build (not from a release)".to_owned(), |s| {
+            format!("build {}", update::short(s))
+        });
+        let latest = match (&self.upd_found, self.upd_check.is_some()) {
+            (_, true) => "checking...".to_owned(),
+            (Some(f), _) => format!(
+                "{} ({}){}",
+                f.manifest.tag,
+                f.manifest.short(),
+                match self.standing() {
+                    Some(Standing::UpToDate) => ", which this is",
+                    _ => "",
+                }
+            ),
+            (None, _) if update::RELEASE_REPO.is_none() => {
+                "not checked: a local build has no releases to look in".to_owned()
+            }
+            (None, _) => "none found".to_owned(),
+        };
+        egui::Grid::new("updates")
+            .num_columns(2)
+            .spacing([24.0, 12.0])
+            .show(ui, |ui| {
+                ui.label("This is");
+                ui.colored_label(DIM, this);
+                ui.end_row();
+                ui.label("Latest");
+                ui.colored_label(DIM, latest);
+                ui.end_row();
+                if let Some(prev) = update::previous(&self.program_dir) {
+                    ui.label("Kept");
+                    ui.colored_label(DIM, format!("build {} (to roll back to)", prev.short()));
+                    ui.end_row();
+                }
+            });
+        ui.horizontal(|ui| {
+            if update::RELEASE_REPO.is_some() && ui.button("Check now").clicked() {
+                self.start_check(&ctx);
+            }
+            let can_update = self.upd_run.is_none()
+                && matches!(self.standing(), Some(Standing::Behind | Standing::Unknown));
+            if ui
+                .add_enabled(can_update, egui::Button::new("Update"))
+                .clicked()
+            {
+                self.start_update(&ctx);
+            }
+            if ui
+                .add_enabled(
+                    update::previous(&self.program_dir).is_some() && self.upd_run.is_none(),
+                    egui::Button::new("Roll back"),
+                )
+                .clicked()
+            {
+                self.rollback();
+            }
+            if self.restart_needed && ui.button("Restart the launcher").clicked() {
+                self.restart(&ctx);
+            }
+        });
+        if let Some((note, bad)) = &self.upd_note {
+            ui.colored_label(if *bad { WARN } else { DIM }, note);
+        }
+        ui.colored_label(
+            FAINT,
+            "Updates replace only m2-alpha.exe and m2-launcher.exe; saves and settings are never touched.",
+        );
+        changed
+    }
+
     fn options_tab(&mut self, ui: &mut Ui, rect: Rect) {
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 0.0, BG);
         let inner = rect.shrink2(vec2(PAD + 8.0, 20.0));
-        let mut child = ui.new_child(UiBuilder::new().max_rect(inner));
+        // The Updates part keeps the bottom of the page.
+        let top = Rect::from_min_max(inner.min, pos2(inner.right(), inner.bottom() - 180.0));
+        let mut child = ui.new_child(UiBuilder::new().max_rect(top));
         let mut changed = false;
         let fonts = &self.fonts;
         let heading = |ui: &mut Ui, text: &str| {
@@ -1811,6 +2093,21 @@ impl App {
                     "Changes are kept at once, in m2-launcher.toml beside the launcher.",
                 );
             });
+        // Updates, below the rest (their own child: they need all of self).
+        let below = Rect::from_min_max(pos2(inner.left(), inner.bottom() - 170.0), inner.max);
+        let mut up = ui.new_child(UiBuilder::new().max_rect(below));
+        up.spacing_mut().item_spacing = vec2(10.0, 8.0);
+        self.fonts.text(
+            up.painter(),
+            Role::Heading,
+            below.left_top() + vec2(0.0, 4.0),
+            Align2::LEFT_TOP,
+            21.0,
+            TEXT,
+            "UPDATES",
+        );
+        up.add_space(34.0);
+        changed |= self.updates_options(&mut up);
         if changed {
             let install_changed = {
                 let (i, pass) = crate::find_install(
@@ -1890,6 +2187,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
+        self.poll_updates(&ctx);
         if self.scanned.elapsed() > Duration::from_secs(5) {
             self.rescan();
         }
@@ -1923,6 +2221,7 @@ impl eframe::App for App {
         let body = Rect::from_min_max(pos2(main.left(), header.bottom()), main.max);
         self.sidebar(ui, side);
         self.header(ui, header);
+        self.update_corner(ui, header);
         match self.tab {
             Tab::Play => self.play_tab(ui, body),
             Tab::Saves => self.saves_tab(ui, body),

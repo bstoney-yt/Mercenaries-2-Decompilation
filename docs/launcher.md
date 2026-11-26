@@ -52,6 +52,30 @@ points of interest). Nothing from the game is committed or cached on disk.
   the EA and Pandemic movies, keeping the launcher open, and the install,
   program and save folders. Kept in `m2-launcher.toml` beside it.
 
+## Updates
+
+Each merge to `main` is published by `.github/workflows/release.yml` as a
+pre-release `build-<date>-<sha7>`: `m2-alpha.exe`, `m2-launcher.exe`
+(windowed), `manifest.toml` (the commit, and each file's size and
+SHA-256) and `SHA256SUMS`. Nothing else: both programs read the game's
+files from the install, and the workflow refuses an embedded icon or any
+other file. Pre-releases leave the beta's `releases/latest` link alone,
+and old ones stay up.
+
+A launcher built by that workflow knows its commit and the repository.
+On open it asks the public GitHub API for the releases (one request, no
+sign-in, a 10 s limit; offline it just says so) and shows **Update
+available** in the header when the newest build is another commit.
+Update (or **Update automatically when the launcher opens** in Options,
+off by default) downloads the files into `update\staged\`, checks each
+against the manifest, moves the current ones to `update\previous\` and the
+new ones into place. The running launcher is renamed aside like the rest
+(Windows lets a running program be renamed, not overwritten), and the new
+one runs from **Restart**. **Roll back** swaps `update\previous\` back
+(and again, to go forward). Only those two programs are ever moved: the
+saves and settings beside them are not touched. A local `cargo build`
+knows neither, so it never checks.
+
 ## Starting the game
 
 Play runs `m2-alpha` in its own folder with `--size`, `--display`,
