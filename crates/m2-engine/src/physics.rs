@@ -5770,24 +5770,26 @@ impl Physics {
                 let on = v.steers.iter().filter(|&&s| s == front).count();
                 on as f32 / v.steers.len().max(1) as f32
             };
+            // Nobody at the wheel: its axles as the 360's for no input (no
+            // throttle, brake or steer), not a hold. The port's invented
+            // parked hold (`HANDBRAKE` / `HOLD` against the motion) is gone
+            // for a wheeled vehicle: no brake or hold of an empty car is
+            // found in the 360 code, and against Xenia sub1 it threw the
+            // dock's trailers back on their kick (-0.15 m/s at step 2,
+            // against the 360's -0.036; the Fuel Trailer at rest 0.75 m off,
+            // the 360's 0.50; the Box Trailer 0.005 off, the 360's 0.25),
+            // where without it they come to 0.33 and 0.22 m.
+            let _ = share;
             let axle = |front: bool| {
-                if controls.parked {
-                    let hard = if speed.abs() > PARKED_FAST {
-                        HOLD
-                    } else {
-                        HANDBRAKE
-                    };
-                    Axle {
-                        along: hard * share(front),
-                        across: t.grip(front, fast, 0.0, 0.0, 0.0),
-                        hold: true,
-                    }
+                let (open, pressed, held, steer) = if controls.parked {
+                    (0.0, 0.0, 0.0, 0.0)
                 } else {
-                    Axle {
-                        along: t.slowing(front, speed, open, pressed, held, steer),
-                        across: t.grip(front, fast, pressed, held, steer),
-                        hold: false,
-                    }
+                    (open, pressed, held, steer)
+                };
+                Axle {
+                    along: t.slowing(front, speed, open, pressed, held, steer),
+                    across: t.grip(front, fast, pressed, held, steer),
+                    hold: false,
                 }
             };
             [axle(true), axle(false)]
@@ -6777,6 +6779,32 @@ impl Physics {
     }
 
     /// A vehicle's velocity, m/s.
+    /// Each of a vehicle's springs this step: its length (L less its
+    /// squeeze, metres; below 0 when its ground stands above the wheel's
+    /// centre), whether the 360's step gave it ground, and its push
+    /// (Rapier's spring and the 360's damping, N s). Log only.
+    pub fn vehicle_spring_steps(&self, id: VehicleId) -> Vec<(f32, bool, f32)> {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return Vec::new();
+        };
+        v.controller
+            .wheels()
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                let ray = w.raycast_info();
+                let d = v.dampers.get(i);
+                let push = w.wheel_suspension_force.min(w.max_suspension_force) / 60.0
+                    + d.map_or(0.0, |d| d.extra);
+                (
+                    ray.suspension_length,
+                    d.map_or(ray.is_in_contact, |d| d.grounded),
+                    push,
+                )
+            })
+            .collect()
+    }
+
     pub fn vehicle_velocity(&self, id: VehicleId) -> Vec3 {
         self.vehicles
             .get(id.0)
@@ -13044,6 +13072,80 @@ mod tests {
         let v = p.vehicle_velocity(id);
         assert!(v.y > 4.0, "no kick: {v}");
         assert!(v.x.abs() < 0.05, "thrown across the slope: {v}");
+    }
+
+    // A parked trailer (nobody at the wheel) on its legs and one axle, as
+    // the game builds the Fuel Trailer (its `_CarWheel` springs, its
+    // template's springs and tyres): its first-step kick pitches it, and
+    // with no hold of an empty car (none is found in the 360 code) its
+    // axles' tyres take only the 360's no-input slowing. Xenia sub1: v_x
+    // -0.036 along its length just after the kick; the port's invented
+    // parked hold made it -0.15.
+    #[test]
+    fn a_parked_trailers_kick_is_not_turned_into_a_slide() {
+        let mut spec = car();
+        spec.tuning.springs = Some(Springs {
+            strength: (4.5, 15.0),
+            damping: (2.0, 3.0),
+            stretch: (0.4, 0.25),
+            squeeze: (0.3, 0.3),
+            extra: 0.0,
+            gravity_factor: 2.0,
+            radius: (0.71, 0.57),
+        });
+        spec.tuning.tyres = Some(crate::tuning::Tyres {
+            rolling: (0.5, 0.5),
+            brake: (3.0, 2.0),
+            emergency: (0.1, 0.1),
+            side: (1.0, 1.0),
+            ..crate::tuning::Tyres::DEFAULT
+        });
+        let rear = spec
+            .wheels
+            .iter()
+            .map(|w| w.centre.z)
+            .fold(f32::MAX, f32::min);
+        let front = spec
+            .wheels
+            .iter()
+            .map(|w| w.centre.z)
+            .fold(f32::MIN, f32::max);
+        let r = spec.wheels[0].radius;
+        let at = |x: f32, y: f32, z: f32, steers: bool| crate::vehicle::WheelSpec {
+            centre: Vec3::new(x, y, z),
+            radius: r,
+            width: 0.3,
+            steers,
+        };
+        spec.spring_wheels = Some(
+            vec![
+                at(-0.54, 0.14, front, true),
+                at(-0.76, 0.59, rear, false),
+                at(0.76, 0.59, rear, false),
+                at(0.38, 0.14, front, true),
+            ]
+            .into(),
+        );
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let id = p.add_vehicle(&spec, Vec3::ZERO, 0.0);
+        let parked = VehicleControls {
+            parked: true,
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            p.drive(id, parked);
+            p.step(DT);
+        }
+        let v = p.vehicle_velocity(id);
+        assert!(v.y > 4.0, "no kick: {v}");
+        assert!(v.z.abs() < 0.08, "thrown along its length: {v}");
     }
 
     // The push is never a pull: a spring stretching fast enough that its

@@ -5712,6 +5712,24 @@ impl Game {
                     physics.vehicle_asleep(id)
                 );
             }
+            // A watched vehicle's springs, step by step, its first 60 steps:
+            // each spring's length, ground and push, and its body's v and w
+            // (to set against Xenia sub1's per-frame W+0x08, v and w).
+            if FIRST_STEPS_WATCHED.contains(&w.entity) && n <= 60 {
+                let springs: Vec<String> = physics
+                    .vehicle_spring_steps(id)
+                    .iter()
+                    .map(|(cur, down, push)| {
+                        format!("{cur:+.3}{} {push:.0}", if *down { "" } else { " off" })
+                    })
+                    .collect();
+                eprintln!(
+                    "springs: island vehicle {:#x} {label} step {n}: v {v:.3} w {:.3}; [{}]",
+                    w.entity,
+                    physics.vehicle_spin(id),
+                    springs.join("; ")
+                );
+            }
             if !FIRST_STEPS_WATCHED.contains(&w.entity) {
                 // Logged through its first contact (step 3), then let go.
                 if n < 3 {
