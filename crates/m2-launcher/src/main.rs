@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! m2-launcher [--dir <game folder>] [--install <dir>]
-//!             [--screenshot <out.png>] [--tab play|saves|options]
+//!             [--screenshot <out.png>] [--tab play|saves|stats|options]
 //! ```
 //!
 //! `--dir` is where `m2-alpha` and its saves are (default: the launcher's
@@ -22,7 +22,9 @@
 
 mod assets;
 mod launch;
+mod save_stats;
 mod saves;
+mod stats;
 mod text;
 mod ui;
 
@@ -45,6 +47,8 @@ pub struct Paths {
     pub saves: PathBuf,
     /// The game's settings file.
     pub game_settings: PathBuf,
+    /// The launcher's own play stats ([`stats::STATS_FILE`]).
+    pub stats: PathBuf,
 }
 
 impl Paths {
@@ -69,6 +73,7 @@ impl Paths {
         Self {
             dir: dir.to_path_buf(),
             settings: dir.join(SETTINGS_FILE),
+            stats: dir.join(stats::STATS_FILE),
             saves,
             game_settings,
         }
@@ -96,13 +101,14 @@ fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
                 out.tab = match value()?.as_str() {
                     "play" => ui::Tab::Play,
                     "saves" => ui::Tab::Saves,
+                    "stats" => ui::Tab::Stats,
                     "options" => ui::Tab::Options,
-                    v => bail!("--tab {v}: expected play, saves or options"),
+                    v => bail!("--tab {v}: expected play, saves, stats or options"),
                 }
             }
             "-h" | "--help" => {
                 println!(
-                    "m2-launcher [--dir <game folder>] [--install <dir>] [--screenshot <out.png>] [--tab play|saves|options]"
+                    "m2-launcher [--dir <game folder>] [--install <dir>] [--screenshot <out.png>] [--tab play|saves|stats|options]"
                 );
                 std::process::exit(0);
             }
@@ -171,6 +177,8 @@ mod tests {
         assert_eq!(a.dir, Some(PathBuf::from("x")));
         assert_eq!(a.screenshot, Some(PathBuf::from("s.png")));
         assert_eq!(a.tab, ui::Tab::Saves);
+        let a = parse(["--tab", "stats"].map(String::from).to_vec()).unwrap();
+        assert_eq!(a.tab, ui::Tab::Stats);
         assert!(parse(["--tab".to_owned(), "mods".to_owned()]).is_err());
         assert!(parse(["--what".to_owned()]).is_err());
     }
@@ -183,6 +191,7 @@ mod tests {
         let p = Paths::new(&d);
         assert_eq!(p.saves, d);
         assert_eq!(p.settings, d.join("m2-launcher.toml"));
+        assert_eq!(p.stats, d.join("m2-launcher-stats.toml"));
         std::fs::write(d.join(GAME_SETTINGS_FILE), "").unwrap();
         assert_eq!(Paths::new(&d).saves, d);
         let _ = std::fs::remove_dir_all(&d);

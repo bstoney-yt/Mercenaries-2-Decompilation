@@ -16,8 +16,8 @@ points of interest). Nothing from the game is committed or cached on disk.
 
 - **Sidebar:** who is playing, the game (Mercenaries 2), the pages still
   to come (What's New, Achievements, Mods, Gallery) and Settings.
-- **Header:** the game's name and the tabs: Play, Saves, Options, and
-  Patch Notes (to come).
+- **Header:** the game's name and the tabs: Play, Saves, Stats, Options,
+  and Patch Notes (to come).
 - **Play:** the banner (steps on every 12 s; arrows and dots step it by
   hand) over the bar: the save picker on the left (Continue with the
   newest save, any other save, or a new game), Play in the middle, and
@@ -26,6 +26,17 @@ points of interest). Nothing from the game is committed or cached on disk.
   autosave and saves 1 to 20) with who, cash, fuel and when it was last
   written, and Play, Copy (into the first free slot) and Delete (asks
   once).
+- **Stats:** two parts, kept apart. **All saves** (marked
+  *launcher-tracked*): the total time the game ran, the sessions, the
+  longest one and when it was last played, which the launcher counts
+  itself in `m2-launcher-stats.toml` beside it (a session runs from Play
+  to the game's exit; closing the launcher meanwhile only hides it, so
+  the session is still counted). **Each save**: its time played, percent
+  done, cash and fuel from the 360 record, and from the scripts' save data
+  packed in it the contracts finished and each faction's standing with the
+  PMC (Hostile, Neutral or Friendly, as the game's scripts grade it). A
+  record stamped 0:00:00 (saved without the pause menu opening, which the
+  360 never does) shows the scripts' own clock instead, marked `*`.
 - **Options:** the game window (size, windowed or fullscreen), skipping
   the EA and Pandemic movies, keeping the launcher open, and the install,
   program and save folders. Kept in `m2-launcher.toml` beside it.
