@@ -30,6 +30,8 @@ use crate::text::{Fonts, GameFont};
 use crate::update::{self, Found, Standing};
 use crate::{Args, Paths};
 
+mod contracts;
+
 const BG: Color32 = Color32::from_rgb(0x26, 0x26, 0x26);
 const SIDEBAR: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x1a);
 const SIDEBAR_HOVER: Color32 = Color32::from_rgb(0x2c, 0x2c, 0x2c);
@@ -58,6 +60,7 @@ pub enum Tab {
     Saves,
     Stats,
     Achievements,
+    Contracts,
     Options,
 }
 
@@ -559,6 +562,7 @@ impl App {
             (Some(Tab::Saves), "SAVES"),
             (Some(Tab::Stats), "STATS"),
             (Some(Tab::Achievements), "ACHIEVEMENTS"),
+            (Some(Tab::Contracts), "CONTRACTS"),
             (Some(Tab::Options), "OPTIONS"),
             (None, "PATCH NOTES"),
         ];
@@ -2227,6 +2231,7 @@ impl eframe::App for App {
             Tab::Saves => self.saves_tab(ui, body),
             Tab::Stats => self.stats_tab(ui, body),
             Tab::Achievements => self.achievements_tab(ui, body),
+            Tab::Contracts => self.contracts_tab(ui, body),
             Tab::Options => self.options_tab(ui, body),
         }
         if self.tab != Tab::Play {
