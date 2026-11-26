@@ -1418,6 +1418,8 @@ const FACE_KEPT: u64 = 600;
 
 #[derive(Debug)]
 pub struct Scene {
+    /// Photo mode hides her body ([`crate::photo`]); nothing else reads it.
+    pub hide_player: bool,
     /// People's faces on the GPU, by the person's own number, with the
     /// frame each was last drawn in: freed once they have not been drawn
     /// for a while ([`FACE_KEPT`]).
@@ -2320,6 +2322,7 @@ impl Scene {
         let ground = ground(backend, &mut materials)?;
         let effects = Effects::new(backend, &mut materials)?;
         Ok(Self {
+            hide_player: false,
             ruins: Default::default(),
             faces: HashMap::new(),
             hero_face: Default::default(),
@@ -3801,6 +3804,7 @@ impl Scene {
             v.model.draw_posed(backend, queue, at, &nodes, &[])?;
         }
         if let Some(player) = &self.player
+            && !self.hide_player
             && player.landed
             && (player.driving.is_none() || player.seated)
             && player.binoculars.is_none()

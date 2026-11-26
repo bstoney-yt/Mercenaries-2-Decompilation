@@ -135,6 +135,17 @@ pub enum Action {
     LookDown,
     LookLeft,
     LookRight,
+    /// Photo mode ([`crate::photo`], invented: the 360 has none): enter
+    /// or leave it, save a picture, roll the camera, show the game's HUD,
+    /// hide her, and the base flying speed up or down.
+    PhotoMode,
+    PhotoShot,
+    PhotoRollLeft,
+    PhotoRollRight,
+    PhotoHud,
+    PhotoHidePlayer,
+    PhotoFaster,
+    PhotoSlower,
 }
 
 /// How fast the look keys turn the view, mouse counts a second: as the
@@ -245,6 +256,16 @@ impl Default for Bindings {
             (PadX, vec![k(KeyR)]),
             (PadB, vec![k(KeyF)]),
             (SwitchWeapon, vec![k(Tab), m(WheelUp), m(WheelDown)]),
+            // Photo mode's (invented; shared keys only act while it is on,
+            // when play does not read them).
+            (PhotoMode, vec![k(F10)]),
+            (PhotoShot, vec![k(F12)]),
+            (PhotoRollLeft, vec![k(KeyQ)]),
+            (PhotoRollRight, vec![k(KeyE)]),
+            (PhotoHud, vec![k(KeyH)]),
+            (PhotoHidePlayer, vec![k(KeyP)]),
+            (PhotoFaster, vec![k(Equal)]),
+            (PhotoSlower, vec![k(Minus)]),
         ]))
     }
 }
@@ -564,6 +585,12 @@ impl Input {
             || self.stick_pushes.contains(&action)
     }
 
+    /// Forgets every press not yet taken (photo mode: none is left over
+    /// for play when it ends).
+    pub fn clear_pressed(&mut self) {
+        self.pressed.clear();
+    }
+
     /// True once per key press.
     pub fn take_pressed(&mut self, action: Action) -> bool {
         self.pressed.remove(&action)
@@ -777,6 +804,14 @@ mod tests {
                             | Action::PadA
                             | Action::PadX
                             | Action::PadB
+                            // Photo mode's: read only while it is on, when
+                            // play reads no key.
+                            | Action::PhotoRollLeft
+                            | Action::PhotoRollRight
+                            | Action::PhotoHud
+                            | Action::PhotoHidePlayer
+                            | Action::PhotoFaster
+                            | Action::PhotoSlower
                     );
                 assert!(fine, "{action:?} on {c:?}, which the PC game gives {pc:?}");
             }

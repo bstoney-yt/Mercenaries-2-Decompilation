@@ -104,6 +104,7 @@ mod particles;
 mod path_hints;
 mod paths;
 mod pause;
+mod photo;
 mod pickup_marker;
 mod placed;
 mod player;
@@ -739,6 +740,12 @@ struct Options {
     /// Switch the smarter enemy soldiers on (the settings'
     /// `[enhanced.smarter_ai] enabled`).
     smarter_ai: bool,
+    /// Photo mode on F10 (the settings' `[enhanced] photo_mode`; invented,
+    /// [`photo`]).
+    photo_mode: bool,
+    /// `--photo-check`: with `--screenshot` on foot, photo mode entered,
+    /// flown and pictured, and left ([`photo::check`]); PASS/FAIL.
+    photo_check: bool,
     /// With `--screenshot`: bring down the mission's gates as the bomb
     /// does, logging where their pieces go ([`gates_for_screenshot`]).
     gates: bool,
@@ -1329,6 +1336,8 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--autoplay" => o.autoplay = true,
             "--smarter-ai" => o.smarter_ai = true,
+            "--photo-mode" => o.photo_mode = true,
+            "--photo-check" => o.photo_check = true,
             "--hurt" => o.hurt = Some(value()?.parse().context("--hurt expects health")?),
             "--pickup-event-check" => {
                 o.pickup_event_check = true;
@@ -1446,7 +1455,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
     }
     // Launched plainly (only where the game is, the window and settings
     // named): the whole game, as `--alpha`.
-    const PLAIN: [&str; 22] = [
+    const PLAIN: [&str; 23] = [
         "--install",
         "--config",
         "--size",
@@ -1457,6 +1466,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
         "--no-boot",
         "--to-front-end",
         "--smarter-ai",
+        "--photo-mode",
         "--dev",
         "--skip-mode-off",
         "--skip-mode-on",
@@ -1979,6 +1989,7 @@ fn run(
         config.world.sea_level = sea;
     }
     config.enhanced.smarter_ai.enabled |= options.smarter_ai;
+    config.enhanced.photo_mode |= options.photo_mode;
     if options.write_config {
         print!("{}", config.to_toml());
         return Ok(());
@@ -3719,6 +3730,8 @@ fn screenshot(
         stagger_check(&mut game);
     } else if options.disguise_check {
         disguise_check();
+    } else if options.photo_check && game.on_foot && game.scene.player.is_some() {
+        photo::check(&mut backend, &mut game, fov, aspect, out);
     } else if options.shuffle_test && game.on_foot && game.scene.player.is_some() {
         shuffle_test(&mut game);
     } else if options.fight && game.on_foot && game.scene.player.is_some() {
@@ -14439,6 +14452,43 @@ impl Running {
     /// is captured: egui shows it again whenever its own pointer icon
     /// changes, as it does on the window's first frames and each time the
     /// pointer comes back in.
+    /// Photo mode's picture asked for: the frame about to be drawn is
+    /// copied as it is shown ([`photo`]).
+    fn photo_request(&mut self) {
+        if let Some(p) = &mut self.game.photo
+            && p.shot_pending
+            && !self.backend.request_capture()
+        {
+            p.shot_pending = false;
+            eprintln!("photo mode: this window's frames can't be copied: no picture");
+        }
+    }
+
+    /// Photo mode's picture, once its frame is copied: saved as a PNG under
+    /// the user's data folder ([`photo::screenshot_dir`]).
+    fn photo_save(&mut self) {
+        let Some(p) = self.game.photo.as_mut().filter(|p| p.shot_pending) else {
+            return;
+        };
+        let Some((w, h, rgba)) = self.backend.take_capture() else {
+            return;
+        };
+        p.shot_pending = false;
+        p.shots += 1;
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let path =
+            photo::screenshot_dir(|k| std::env::var(k).ok()).join(photo::shot_name(unix, p.shots));
+        match photo::write_png(&path, w, h, &rgba) {
+            Ok(()) => {
+                eprintln!("photo mode: saved {} ({w}x{h})", path.display());
+                p.saved = Some((path, 0.0));
+            }
+            Err(e) => eprintln!("photo mode: {e:#}"),
+        }
+    }
+
     fn platform_output(&mut self, mut output: egui::PlatformOutput) {
         if self.mouse_look {
             output.cursor_icon = egui::CursorIcon::None;
@@ -14550,6 +14600,32 @@ impl Running {
                 Some(&mut self.hud),
             );
         }
+        // Photo mode with the game's HUD hidden: its help alone over the
+        // world (none in a picture being taken).
+        if let Some(lines) = self
+            .game
+            .photo
+            .as_ref()
+            .filter(|p| p.hide_hud)
+            .map(photo::PhotoMode::overlay_lines)
+        {
+            let output = self
+                .hud
+                .build_screen(input, |ui| photo::paint_overlay(ui, &lines));
+            self.platform_output(output);
+            self.photo_request();
+            let (w, h) = self.backend.size();
+            render(
+                &mut self.backend,
+                &mut self.game,
+                config.camera.fov,
+                view_aspect(&config.window, w, h),
+                Some(&mut self.hud),
+            )?;
+            self.photo_save();
+            return Ok(());
+        }
+        self.photo_request();
         let (w, h) = self.backend.size();
         let mut info = hud_info(
             &self.game,
@@ -14716,6 +14792,7 @@ impl Running {
             Some(&mut self.hud),
             world,
         )?;
+        self.photo_save();
         if let (Some((check, _)), true) = (&mut self.cover_check, self.cover_check_started)
             && let Some(flow) = &self.flow
         {
@@ -15473,10 +15550,12 @@ impl Running {
         if (self.input.take_pressed(Action::Cheats) || typed) && !self.hud.menu {
             self.show_cheats();
         }
-        if self.hud.menu != self.sound_held {
-            // Paused, the world's sounds, the dialogue and the music playing
-            // wait with the world; the menu's own sounds and music play.
-            self.sound_held = self.hud.menu;
+        let hold = self.hud.menu || self.game.photo.is_some();
+        if hold != self.sound_held {
+            // Paused (or in photo mode), the world's sounds, the dialogue
+            // and the music playing wait with the world; the menu's own
+            // sounds and music play.
+            self.sound_held = hold;
             self.audio.out.with(|m| {
                 if self.sound_held {
                     use m2_engine::Category::{Chatter, Music, Vo, World};
@@ -15488,6 +15567,40 @@ impl Running {
         }
         if self.hud.menu {
             // Paused: the world waits.
+            let (ear, facing) = self.game.listener();
+            self.audio.update(ear, facing);
+            return;
+        }
+        // Photo mode ([`photo`]; invented, off unless the settings'
+        // `[enhanced] photo_mode` or `--photo-mode` turn it on): F10 in
+        // and out. While it is on the world waits as for the pause menu:
+        // nothing below ticks.
+        if self.input.take_pressed(Action::PhotoMode) && config.enhanced.photo_mode {
+            if self.game.photo.take().is_some() {
+                self.game.scene.hide_player = false;
+                eprintln!("photo mode: off, back to play");
+            } else {
+                let (w, h) = self.backend.size();
+                let view = self
+                    .game
+                    .view(config.camera.fov, view_aspect(&config.window, w, h));
+                self.game.photo = Some(photo::PhotoMode::enter(&view, config.camera.fov));
+                eprintln!(
+                    "photo mode: on at {:.1}; pictures go to {}",
+                    view.eye(),
+                    photo::screenshot_dir(|k| std::env::var(k).ok()).display()
+                );
+            }
+        }
+        if let Some(p) = &mut self.game.photo {
+            let c = photo::Controls::read(
+                &mut self.input,
+                config.camera.mouse_sensitivity,
+                config.camera.invert_y,
+                self.mouse_look,
+            );
+            p.step(&mut self.input, c, TICK.as_secs_f32());
+            self.game.scene.hide_player = p.hide_player;
             let (ear, facing) = self.game.listener();
             self.audio.update(ear, facing);
             return;

@@ -430,6 +430,17 @@ m2-alpha [options]
                          game's own particle effects (to compare)
   --no-fx                no fire or smoke drawn at all (to measure what
                          they cover)
+  --photo-mode           photo mode on F10 (not the original game's: the 360
+                         has none; settings [enhanced] photo_mode): the world
+                         holds still while a free camera flies (W A S D,
+                         Space/C, mouse, Shift/Ctrl, wheel field of view, Q/E
+                         roll, R level, +/- speed), H the game's HUD, P hides
+                         her, F1 help, F12 saves a PNG to
+                         %LOCALAPPDATA%\m2-alpha\Screenshots (M2_SCREENSHOTS)
+  --photo-check          check: with --screenshot on foot, photo mode entered,
+                         flown 3 s and pictured (<out>-photo.png), then left:
+                         PASS when the picture is saved, she and the game's
+                         camera held still and the view comes back the same
   --smarter-ai           the enhanced, smarter enemy soldiers (not the
                          original game's; settings [enhanced.smarter_ai])
   --autoplay             with --mission --screenshot: she plays the contract

@@ -38,6 +38,9 @@ pub struct EnhancedConfig {
     /// 2026-11-14), though the 360's cue is authored that quiet on
     /// throttle, so the default is [`SEMI_ENGINE_GAIN`].
     pub semi_engine_gain: f32,
+    /// Photo mode on F10 ([`crate::photo`]; not the game's: the 360 has
+    /// none). Off by default.
+    pub photo_mode: bool,
 }
 
 /// [`EnhancedConfig::semi_engine_gain`]'s default: the owner's twice as
@@ -50,6 +53,7 @@ impl Default for EnhancedConfig {
             smarter_ai: Default::default(),
             shop: ShopCheat::default(),
             semi_engine_gain: SEMI_ENGINE_GAIN,
+            photo_mode: false,
         }
     }
 }
