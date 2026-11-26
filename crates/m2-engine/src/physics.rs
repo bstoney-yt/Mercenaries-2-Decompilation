@@ -1157,26 +1157,52 @@ impl CollisionShape {
 
     /// How far up goods filling the box `lo`..`hi` (this shape's space,
     /// a vehicle's bed) go to stand `clear` over the bed's floor, 0 if
-    /// they stand on it or over it already. Goods sunk in it (the floor
-    /// under their top) come up to the floor under their middle; goods
+    /// they stand on it or over it already. The floor is the surface under
+    /// their middle with room over it for them: from the highest surface
+    /// under their top (or, wholly under the bed, the lowest over them),
+    /// up past any with another surface over it closer than they are tall.
+    /// Goods sunk in it come up to the floor under their middle; goods
     /// wholly under it (authored 0.9 to 1.3 m under the El Grande's bed:
-    /// OilCon020's guns) come up onto the floor over them: the bed's
-    /// surface over their bottom, taken from as far over that as they
-    /// are tall (invented: the port's own correction, the 360's
-    /// attachment is not traced).
+    /// OilCon020's guns) come up onto the floor over them; goods put in
+    /// the gap between a bed's chassis rails and its floor plate (the El
+    /// Grande's: rails' top 0.545 m, plate 0.712 to 0.747 m up, model
+    /// space; OilCon020's guns 0.44 to 0.58 m up as put) come up onto the
+    /// plate, not onto the rails under it, where they would stand inside
+    /// the plate. Invented: the port's own correction, the 360's
+    /// attachment is not traced; from Xenia eg2, the 360's crates stand
+    /// 0.74 to 1.12 m up its frame, on the plate.
     pub fn lift_onto(&self, (lo, hi): (Vec3, Vec3), clear: f32) -> f32 {
         let (x, z) = ((lo.x + hi.x) * 0.5, (lo.z + hi.z) * 0.5);
-        if let Some(floor) = self.floor_under(x, hi.y, z) {
-            return (floor + clear - lo.y).max(0.0);
-        }
-        let up = r::Ray::new(vector(Vec3::new(x, lo.y, z)), vector(Vec3::Y));
-        let Some(toi) = self.shape.cast_local_ray(&up, 100.0, true) else {
+        let tall = hi.y - lo.y;
+        let ups = self.surfaces_at(x, z);
+        let Some(mut k) =
+            ups.iter()
+                .rposition(|&y| y <= hi.y)
+                .or(if ups.is_empty() { None } else { Some(0) })
+        else {
             return 0.0;
         };
-        let under = lo.y + toi;
-        self.floor_under(x, under + (hi.y - lo.y) + 0.05, z)
-            .filter(|&f| f >= under - 1e-3)
-            .map_or(0.0, |floor| (floor + clear - lo.y).max(0.0))
+        while k + 1 < ups.len() && ups[k + 1] - ups[k] < tall {
+            k += 1;
+        }
+        (ups[k] + clear - lo.y).max(0.0)
+    }
+
+    /// The heights of its surfaces straight through `(x, z)` (its own
+    /// space), lowest first.
+    fn surfaces_at(&self, x: f32, z: f32) -> Vec<f32> {
+        let (_, top) = self.bounds();
+        let mut from = top.y + 1.0;
+        let mut ys = Vec::new();
+        while ys.len() < 64 {
+            let Some(y) = self.floor_under(x, from, z) else {
+                break;
+            };
+            ys.push(y);
+            from = y - 1e-4;
+        }
+        ys.reverse();
+        ys
     }
 
     /// The box the shape fills, in its own space.
@@ -10553,6 +10579,39 @@ mod tests {
         assert!((bed.lift_onto(crate_at(0.17), 0.02) - 1.1).abs() < 1e-3);
         let aside = (Vec3::new(3.0, 0.0, 0.0), Vec3::new(3.5, 0.5, 0.5));
         assert_eq!(bed.lift_onto(aside, 0.02), 0.0);
+    }
+
+    #[test]
+    fn goods_put_between_a_beds_rails_and_its_plate_come_up_onto_the_plate() {
+        // The El Grande's bed as its PHY2 has it (model space): chassis
+        // rails' top 0.545 m up, the floor plate 0.712 to 0.747 m up.
+        let quad = |y: f32, base: u32| {
+            (
+                [
+                    Vec3::new(-1.0, y, -2.5),
+                    Vec3::new(1.0, y, -2.5),
+                    Vec3::new(1.0, y, 0.0),
+                    Vec3::new(-1.0, y, 0.0),
+                ],
+                [[base, base + 2, base + 1], [base, base + 3, base + 2]],
+            )
+        };
+        let (mut vertices, mut triangles) = (Vec::new(), Vec::new());
+        for (k, y) in [0.343, 0.545, 0.712, 0.747].into_iter().enumerate() {
+            let (v, t) = quad(y, 4 * k as u32);
+            vertices.extend(v);
+            triangles.extend(t);
+        }
+        let bed = CollisionShape::mesh(&vertices, &triangles).unwrap();
+        // OilCon020's gun 0x11D397 as put: 0.455 to 0.653 m up, under the
+        // plate. Before: onto the rails (0.565 m, inside the plate).
+        let gun = (Vec3::new(0.3, 0.455, -1.6), Vec3::new(0.5, 0.653, -1.4));
+        assert!((bed.lift_onto(gun, 0.02) - (0.767 - 0.455)).abs() < 1e-3);
+        // A crate sunk in the plate comes up onto it; one on it stays.
+        let sunk = (Vec3::new(0.5, 0.529, -0.5), Vec3::new(0.8, 0.792, -0.3));
+        assert!((bed.lift_onto(sunk, 0.02) - (0.767 - 0.529)).abs() < 1e-3);
+        let on = (Vec3::new(0.5, 0.786, -0.5), Vec3::new(0.8, 1.049, -0.3));
+        assert_eq!(bed.lift_onto(on, 0.02), 0.0);
     }
 
     #[test]
