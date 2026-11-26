@@ -29,6 +29,7 @@ pub mod anim;
 pub mod assets;
 pub mod atmosphere;
 pub mod audio;
+pub mod bink;
 pub mod blend;
 pub mod boat_attack;
 pub mod camera_blend;

@@ -191,4 +191,21 @@ nothing is extracted, cached or committed.
 - **Locks:** saves keep no record of music heard, so every piece is shown
   unlocked and the page says so.
 
-Cut-scenes come in a following change (see `docs/gallery.md`).
+## Gallery: cut-scenes
+
+The Gallery's **CUT-SCENES** switch lists every movie in the install's
+`data\Movies` with its length from its Bink header (45 files on the
+install checked), grouped as cut-scenes, front end and logos.
+
+- **Labels** (**invented**): `01_AOA_J` reads "Cut-scene 1 (AOA), Jennifer"
+  (the last letter is the hero: C, J or M); the front end's and the logos'
+  movies have our own names. The file name shows beside each.
+- **Playing:** click a row; the movie plays in the page through a local
+  `ffmpeg` (`M2_FFMPEG`, beside the launcher, or the `PATH`, as `m2-alpha`
+  finds it), its tracks mixed as `m2-alpha` mixes them. Click or Escape
+  stops it; leaving the tab stops it. Without ffmpeg the page says so and
+  music still plays.
+- **Locks:** saves keep no record of cut-scenes seen, so all are shown
+  unlocked and the page says so.
+
+Nothing is extracted or written: frames and sound come through pipes.

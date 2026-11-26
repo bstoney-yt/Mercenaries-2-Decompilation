@@ -31,6 +31,7 @@ mod achievements;
 mod assets;
 mod builds;
 mod gallery;
+mod gallery_movies;
 mod launch;
 mod report;
 mod save_stats;
