@@ -426,6 +426,17 @@ pub fn check() -> Result<Option<Found>, String> {
     Ok(Some(Found { manifest, release }))
 }
 
+/// One of `found`'s files, downloaded (not checked: the caller checks it
+/// against the manifest).
+pub fn fetch_release_file(found: &Found, name: &str) -> Result<Vec<u8>, String> {
+    allowed(name)?;
+    let url = found
+        .release
+        .asset_url(name)
+        .ok_or_else(|| format!("{name}: not in the release"))?;
+    curl(url, 600)
+}
+
 /// Downloads and swaps in `found` beside the launcher in `dir`.
 pub fn update(dir: &Path, found: &Found) -> Result<Vec<String>, String> {
     stage(dir, &found.manifest, &mut |f| {

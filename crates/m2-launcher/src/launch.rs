@@ -75,6 +75,9 @@ pub struct Settings {
     /// Download and swap in a new build when the launcher opens
     /// ([`crate::update`]).
     pub auto_update: bool,
+    /// The build Play starts, pinned on the Play tab: a build's tag
+    /// ([`crate::builds`]); `None` for the installed one.
+    pub build: Option<String>,
 }
 
 impl Default for Settings {
@@ -89,6 +92,7 @@ impl Default for Settings {
             install: None,
             game: None,
             auto_update: false,
+            build: None,
         }
     }
 }
