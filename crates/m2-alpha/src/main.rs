@@ -10691,6 +10691,31 @@ fn cargo_settle_check(game: &mut Game, tick: f32) {
                 "cargo-settle-check: {:.0} s: the {label} at {at:.2}, {off} off",
                 k as f32 * tick
             );
+            // Log only: whether the truck and each crate are asleep, and
+            // each crate's offset from where it was loaded (the truck's
+            // frame): what wakes the load.
+            if let Some(w) = game.scene.world.as_ref() {
+                let states: Vec<String> = game
+                    .scene
+                    .props
+                    .cargo_states(&w.physics, i, id)
+                    .into_iter()
+                    .map(|(e, d, asleep)| {
+                        let z = match asleep {
+                            Some(true) => "asleep",
+                            Some(false) => "awake",
+                            None => "gone",
+                        };
+                        format!("{e:#x} {z} {:+.3},{:+.3},{:+.3}", d.x, d.y, d.z)
+                    })
+                    .collect();
+                eprintln!(
+                    "cargo-settle-check: {:.0} s: the {label} {}; on its bed: {}",
+                    k as f32 * tick,
+                    if w.physics.vehicle_asleep(id) { "asleep" } else { "awake" },
+                    states.join("; ")
+                );
+            }
         }
     }
     let end = read(game);

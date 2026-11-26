@@ -931,6 +931,34 @@ impl Props {
         out
     }
 
+    /// Each of vehicle `index`'s goods (vehicle `id`): its offset from
+    /// where it was loaded, in the vehicle's frame, and whether its body is
+    /// asleep (`None` without one). By entity. Log only.
+    pub fn cargo_states(
+        &self,
+        physics: &Physics,
+        index: usize,
+        id: m2_engine::VehicleId,
+    ) -> Vec<(u32, Vec3, Option<bool>)> {
+        let Some(place) = physics.vehicle_transform(id) else {
+            return Vec::new();
+        };
+        let inv = place.inverse();
+        let mut out: Vec<(u32, Vec3, Option<bool>)> = self
+            .cargo
+            .iter()
+            .filter(|(_, r)| r.vehicle == index)
+            .filter_map(|(&e, r)| {
+                let at = physics.debris_place(r.piece)?;
+                let now = (inv * at).w_axis.truncate();
+                let then = r.loaded?.w_axis.truncate();
+                Some((e, now - then, physics.debris_asleep(r.piece)))
+            })
+            .collect();
+        out.sort_by_key(|c| c.0);
+        out
+    }
+
     /// Moves what is aboard vehicle `index` with it as it is put down
     /// elsewhere: from where it was, `from`, to `to` (the autoplay's hop,
     /// which lifts a stuck vehicle out; the goods go with it at rest).
