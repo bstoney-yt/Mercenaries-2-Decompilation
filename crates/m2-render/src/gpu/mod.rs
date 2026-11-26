@@ -706,7 +706,8 @@ struct MaterialUniforms {
     tex: [u32; 4],
     /// Its ground layers' places.
     layer_tex: [u32; 4],
-    /// x: its base map's sampler (0: repeating, 1: clamped).
+    /// x: its base map's sampler (0: repeating, 1: clamped), y: its
+    /// base map's mip LOD bias (f32 bits).
     samp: [u32; 4],
 }
 
@@ -1372,7 +1373,10 @@ impl WgpuBackend {
                 mag_filter: wgpu::FilterMode::Linear,
                 min_filter: wgpu::FilterMode::Linear,
                 mipmap_filter: wgpu::MipmapFilterMode::Linear,
-                anisotropy_clamp: 8,
+                // The 360 filters textures linearly with linear mips and
+                // no anisotropy (0x82203958 asks for it only on header
+                // flag 0x80, which no texture sets).
+                anisotropy_clamp: 1,
                 ..Default::default()
             })
         });
@@ -1669,7 +1673,7 @@ impl WgpuBackend {
             ],
             tex: [textures[0], textures[1], textures[2], textures[3]],
             layer_tex: [textures[4], textures[5], textures[6], textures[7]],
-            samp: [u32::from(desc.clamp), 0, 0, 0],
+            samp: [u32::from(desc.clamp), desc.lod_bias.to_bits(), 0, 0],
         }
     }
 
@@ -3845,12 +3849,14 @@ mod material_slot_tests {
         assert!(material_stride(256) >= std::mem::size_of::<MaterialUniforms>() as u64);
         let desc = MaterialDesc {
             clamp: true,
+            lod_bias: -1.0,
             ..MaterialDesc::default()
         };
         let r = WgpuBackend::material_uniforms(&desc, [1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(r.tex, [1, 2, 3, 4]);
         assert_eq!(r.layer_tex, [5, 6, 7, 8]);
         assert_eq!(r.samp[0], 1);
+        assert_eq!(f32::from_bits(r.samp[1]), -1.0);
         let r = WgpuBackend::material_uniforms(&MaterialDesc::default(), [0; 8]);
         assert_eq!((r.tex, r.samp[0]), ([0; 4], 0));
     }

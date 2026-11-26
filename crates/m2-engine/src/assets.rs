@@ -150,6 +150,9 @@ pub struct DecodedTexture {
     /// Holds data rather than colour (normal and specular maps): upload it
     /// without sRGB decoding. Set by whoever knows what it is used for.
     pub linear: bool,
+    /// The mip LOD bias its header gives (`INFO` 0x12), which the 360's
+    /// per-texture sampler setup (0x82203958) puts in the fetch constant.
+    pub lod_bias: f32,
 }
 
 /// The tier (`_Q<n>`) a streamed block belongs to.
@@ -327,6 +330,7 @@ impl<R: Read + Seek> AssetSource<R> {
         let err = |source| AssetError::Texture { hash, source };
         let tex = Texture::parse(&base).map_err(err)?;
         let format = tex.info.format;
+        let lod_bias = tex.info.lod_bias;
         let has_alpha = matches!(
             format,
             PixelFormat::Dxt3 | PixelFormat::Dxt5 | PixelFormat::A8R8G8B8
@@ -369,6 +373,7 @@ impl<R: Read + Seek> AssetSource<R> {
             mips,
             alpha,
             linear: false,
+            lod_bias,
         })
     }
 }

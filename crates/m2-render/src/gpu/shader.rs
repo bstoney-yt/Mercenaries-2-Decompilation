@@ -224,9 +224,16 @@ struct Material {
     tex: vec4<u32>,
     // Its ground layers' places in `maps`
     layer_tex: vec4<u32>,
-    // x: its base map's sampler in `samplers` (0: repeating, 1: clamped)
+    // x: its base map's sampler in `samplers` (0: repeating, 1: clamped),
+    // y: its base map's mip LOD bias (f32 bits)
     samp: vec4<u32>,
 };
+
+// The material's base map at `uv`, with the texture's own mip LOD bias as
+// the 360 puts it in the fetch constant (0x82203958).
+fn base_sample(uv: vec2<f32>) -> vec4<f32> {
+    return textureSampleBias(maps[material.tex.x], samplers[material.samp.x], uv, bitcast<f32>(material.samp.y));
+}
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var shadow_map: texture_depth_2d_array;
@@ -755,7 +762,7 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
     // Water's map is its foam, drifting over world space.
     let drift = vec2<f32>(0.021, 0.013) * frame.view_dir.w;
     let base_uv = select(v.uv, v.world_pos.xz * 0.15 + drift, water);
-    let base_texel = textureSample(maps[material.tex.x], samplers[material.samp.x], base_uv);
+    let base_texel = base_sample(base_uv);
     var base = select(base_texel, vec4<f32>(1.0), water) * vec4<f32>(material.color.rgb, surface_opacity(v));
     let ao = material.params.z > 0.5 && !ground;
     if ao {
@@ -1033,7 +1040,7 @@ fn fs_glow(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
     let s = surface(v, front);
     var rgb = pow(max(s.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
     if material.params.y < 0.5 && material.params.z > 0.5 {
-        let t = textureSample(maps[material.tex.x], samplers[material.samp.x], v.uv);
+        let t = base_sample(v.uv);
         rgb = srgb_encode(t.rgb) * material.color.rgb * v.color.rgb * v.tint.rgb;
     }
     if material.params.w > 0.5 {
@@ -1064,7 +1071,7 @@ fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
 // out as they cut themselves.
 @fragment
 fn fs_shadow(v: Varyings) {
-    var a = textureSample(maps[material.tex.x], samplers[material.samp.x], v.uv).a * surface_opacity(v);
+    var a = base_sample(v.uv).a * surface_opacity(v);
     if material.params.z > 0.5 && material.maps.w < 0.5 {
         a = a * v.color.a;
     }
