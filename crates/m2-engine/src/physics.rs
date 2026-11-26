@@ -3057,7 +3057,7 @@ fn driven_rpm(
 /// From the 360 code: the set-up starts `prev` at the spring's squeeze
 /// length Cmp (+0x08 = Cmp / L; L if L <= 0), not at the length the wheel
 /// really has. Each step the ray gives the length now, `cur` = t x (L + r)
-/// - r with r the template's wheel radius ([`Springs::wheel_radius`]),
+/// less r, with r the template's wheel radius ([`Springs::wheel_radius`]),
 /// not clamped below 0; the stretching speed is (cur - prev) / dt; the
 /// push is mass x (k x (L - cur) - c x speed) (0x8219F6D4), applied only
 /// when above 0 (0x8219F6DC) as the impulse push x dt (0x8219F714); then
