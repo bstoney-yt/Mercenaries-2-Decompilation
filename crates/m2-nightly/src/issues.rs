@@ -125,6 +125,12 @@ fn meaning(kind: Kind) -> &'static str {
         Kind::Error => "m2-alpha stopped on an error of its own.",
         Kind::Hang => "m2-alpha stopped writing its log: the process hung and was stopped.",
         Kind::FellThrough => "The hero fell through the world (or her position was lost).",
+        Kind::RetryFailed => {
+            "Retry was taken on the failed contract's fanfare, but the contract did not start again."
+        }
+        Kind::ContractCancelled => {
+            "The mission scripts cancelled (failed) the contract during the run."
+        }
         Kind::Stuck => {
             "The contract's objectives and mission state stopped changing: autoplay is stuck."
         }
