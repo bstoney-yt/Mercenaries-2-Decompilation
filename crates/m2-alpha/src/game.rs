@@ -4974,10 +4974,18 @@ fn knock_loose(
                 // the El Grande asleep at 265.6 s, its crates' first
                 // physics from 281.3 s (the 360's gate itself is not
                 // traced: inferred from that order).
+                if props.is_cargo(e) || !on_bed(props, &standing, *b, e) {
+                    continue;
+                }
+                // Until then it has no collision ([`Props::hold_on_bed`]).
+                if props.hold_on_bed(&mut world.physics, e) {
+                    eprintln!(
+                        "cargo: {e:#x} held on the {}'s bed without collision until loaded",
+                        v.spec.label
+                    );
+                }
                 if awake
-                    && !props.is_cargo(e)
                     && world.physics.vehicle_asleep(id)
-                    && on_bed(props, &standing, *b, e)
                     && props.load(&mut world.physics, e, (index, id))
                 {
                     eprintln!("cargo: {e:#x} rides on the {}", v.spec.label);

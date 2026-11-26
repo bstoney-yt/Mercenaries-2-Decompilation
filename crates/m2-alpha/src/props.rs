@@ -224,6 +224,11 @@ pub struct Props {
     /// collision, as on the 360 (the paradrop plane, whose jumpers are
     /// made inside it: q618g, 7 of 16 stood on it at 123 m).
     bodiless: HashSet<u32>,
+    /// Goods standing on a scripts' vehicle's load bed, not loaded yet
+    /// ([`Props::hold_on_bed`]): no collision of their own until they are
+    /// (Xenia p769a: OilCon020's crates had no body until their first
+    /// physics, after the El Grande under them slept).
+    held: HashSet<u32>,
     /// Those a vehicle broke some parts of, a part at a time (a hedge's
     /// sections, a gate's leaf): which parts, and the nodes that hides.
     parts_down: HashMap<u32, PartsDown>,
@@ -617,6 +622,7 @@ impl Props {
         stands(e)
             && !p.wrecked
             && !self.bodiless.contains(&e)
+            && !self.held.contains(&e)
             && !self.knocked.contains_key(&e)
             && !self.swings.contains_key(&e)
     }
@@ -794,6 +800,21 @@ impl Props {
         mass.is_some() && self.fling(physics, entity, velocity, spin)
     }
 
+    /// Holds `entity`, standing on a scripts' vehicle's load bed, without
+    /// collision of its own until it is loaded ([`load`](Self::load)): the
+    /// vehicle settles and sleeps under it rather than against it. From
+    /// Xenia p769a: the El Grande slept at 265.6 s with its 20 crates
+    /// standing in its bed, and they had no body until their first
+    /// physics from 281.3 s. Whether a hibernating object has collision on
+    /// the 360 is otherwise not traced. True if newly held.
+    pub fn hold_on_bed(&mut self, physics: &mut Physics, entity: u32) -> bool {
+        if self.cargo.contains_key(&entity) || !self.held.insert(entity) {
+            return false;
+        }
+        physics.remove_static(StaticKey::Entity(entity));
+        true
+    }
+
     /// Puts `entity` loose on the load bed of vehicle `index` (placed as
     /// `id`) where it stands, moving with it: a body of its own, its
     /// model's collision box, that lies on the bed's own shapes
@@ -866,6 +887,7 @@ impl Props {
             );
         }
         let template = p.template;
+        self.held.remove(&entity);
         physics.remove_static(StaticKey::Entity(entity));
         // Asleep, at rest, until something awake touches it
         // ([`Physics::add_cargo`]).
@@ -2153,6 +2175,7 @@ impl Props {
                 && !self.knocked.contains_key(&e)
                 && !self.swings.contains_key(&e)
                 && !self.cargo.contains_key(&e)
+                && !self.held.contains(&e)
             {
                 self.make_body(physics, e);
                 continue;
@@ -3130,6 +3153,42 @@ mod tests {
     }
     use super::*;
     use m2_engine::{CollisionShape, LoosePiece};
+
+    /// Goods standing on a scripts' vehicle's bed have no collision of
+    /// their own until loaded (Xenia p769a: the El Grande slept with its
+    /// crates standing in its bed, which had no bodies yet): held, their
+    /// standing collision goes and the rebuild doesn't put it back.
+    #[test]
+    fn goods_held_on_a_bed_have_no_collision_until_loaded() {
+        let mut physics = Physics::new();
+        let mut props = Props::default();
+        let prop = Prop {
+            model: 7,
+            position: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            wrecked: false,
+            template: 0,
+            named: false,
+            preset: Default::default(),
+        };
+        props.shown.insert(0x1225f9, prop.clone());
+        let shape = CollisionShape::cuboid(Vec3::ONE);
+        physics.add_static(
+            StaticKey::Entity(0x1225f9),
+            &shape,
+            Vec3::ZERO,
+            Quat::IDENTITY,
+        );
+        assert!(props.walled(0x1225f9, &prop));
+        assert!(props.hold_on_bed(&mut physics, 0x1225f9));
+        assert!(!physics.has_static(StaticKey::Entity(0x1225f9)));
+        assert!(
+            !props.walled(0x1225f9, &prop),
+            "the rebuild would put it back"
+        );
+        // Held once.
+        assert!(!props.hold_on_bed(&mut physics, 0x1225f9));
+    }
 
     // Goods are added asleep and at rest (the 360's add, activation 0,
     // 0x82165958), and wake once something awake touches them: a moving
