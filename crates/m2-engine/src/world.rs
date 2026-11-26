@@ -2930,6 +2930,93 @@ impl TerrainMesh {
             .collect()
     }
 
+    /// Its collision from its cell's `PHY2` mesh shapes (each at its
+    /// `shape_place`, in the cell's space), each triangle made of what its
+    /// nearest drawn ground triangle is: the `PHY2` triangles carry no
+    /// surface of their own (their flags word is 10 on all 3,983,915 of the
+    /// 400 cells'). INVENTED: the nearest-ground material. `None` without
+    /// a mesh shape.
+    fn collision_of(&self, phy: &m2_assets::physics::Physics) -> Option<CollisionShape> {
+        let mut vertices: Vec<Vec3> = Vec::new();
+        let mut triangles: Vec<[u32; 3]> = Vec::new();
+        for (k, shape) in phy.shapes.iter().enumerate() {
+            if !matches!(shape.geometry, m2_assets::physics::Geometry::Mesh { .. }) {
+                continue;
+            }
+            let (v, t) = shape.geometry.triangles(shape.radius);
+            let (at, turn) = phy
+                .shape_place(k)
+                .map_or((Vec3::ZERO, Quat::IDENTITY), |(a, r)| {
+                    (Vec3::from(a), Quat::from_array(r))
+                });
+            let base = vertices.len() as u32;
+            vertices.extend(v.into_iter().map(|p| seamless(turn * Vec3::from(p) + at)));
+            triangles.extend(
+                t.into_iter()
+                    .map(|t| [t[0] + base, t[1] + base, t[2] + base]),
+            );
+        }
+        if triangles.is_empty() {
+            return None;
+        }
+        let surfaces = self.nearest_ground_surfaces(&vertices, &triangles);
+        CollisionShape::mesh_of(&vertices, &triangles, &surfaces)
+    }
+
+    /// For each of `triangles` (of `vertices`, in this mesh's space), the
+    /// surface (`made_of`) of the drawn ground triangle whose centre is
+    /// nearest its own, level (0 with no ground).
+    fn nearest_ground_surfaces(&self, vertices: &[Vec3], triangles: &[[u32; 3]]) -> Vec<u32> {
+        const BUCKET: f32 = 4.0;
+        let ground = self.positions();
+        let n = self.indices.len() / 3;
+        let mut made = vec![0u32; n];
+        for &(first, count, s) in &self.ranges {
+            let m = self.made_of.get(s).copied().unwrap_or(0);
+            let (a, b) = ((first / 3) as usize, ((first + count) / 3) as usize);
+            if let Some(run) = made.get_mut(a..b.min(n)) {
+                run.fill(m);
+            }
+        }
+        let key = |p: Vec3| ((p.x / BUCKET).floor() as i32, (p.z / BUCKET).floor() as i32);
+        let mut grid: HashMap<(i32, i32), Vec<(Vec3, u32)>> = HashMap::new();
+        for (k, t) in self.indices.chunks_exact(3).enumerate() {
+            let c = t
+                .iter()
+                .filter_map(|&i| ground.get(i as usize))
+                .sum::<Vec3>()
+                / 3.0;
+            grid.entry(key(c)).or_default().push((c, made[k]));
+        }
+        triangles
+            .iter()
+            .map(|t| {
+                let c = t.iter().map(|&i| vertices[i as usize]).sum::<Vec3>() / 3.0;
+                let (kx, kz) = key(c);
+                let mut best: Option<(f32, u32)> = None;
+                for r in 0i32..4 {
+                    for dx in -r..=r {
+                        for dz in -r..=r {
+                            if dx.abs().max(dz.abs()) != r {
+                                continue;
+                            }
+                            for &(g, m) in grid.get(&(kx + dx, kz + dz)).into_iter().flatten() {
+                                let d = (g - c).with_y(0.0).length_squared();
+                                if best.is_none_or(|b| d < b.0) {
+                                    best = Some((d, m));
+                                }
+                            }
+                        }
+                    }
+                    if best.is_some() {
+                        break;
+                    }
+                }
+                best.map_or(0, |b| b.1)
+            })
+            .collect()
+    }
+
     fn build_collision(&mut self) {
         let triangles: Vec<[u32; 3]> = self
             .indices
@@ -3231,6 +3318,27 @@ fn cell_surface(m: &TerrainMaterial) -> TerrainSurface {
     }
 }
 
+/// A terrain cell's half width, metres (cells are 400 m square).
+const CELL_HALF: f32 = 200.0;
+
+/// `p` (in a cell's space) with an edge coordinate put exactly on the
+/// cell's edge: a cell's PHY2 vertices are quantised to its bounds of
+/// +-199.99998 m, which leaves a 0.04 mm seam between neighbouring cells
+/// that a ray straight down on the boundary falls through (#801: a drive
+/// check spawned on x = 2800 never landed; a dinghy on z = -400 was
+/// pushed along the seam). Invented: the 360's handling of the seam isn't
+/// read.
+fn seamless(p: Vec3) -> Vec3 {
+    let snap = |v: f32| {
+        if (v.abs() - CELL_HALF).abs() < 1e-3 {
+            CELL_HALF.copysign(v)
+        } else {
+            v
+        }
+    };
+    Vec3::new(snap(p.x), p.y, snap(p.z))
+}
+
 /// Reads and decodes terrain cell `hash` centred at `centre`.
 pub fn terrain_cell<R: Read + Seek>(
     source: &mut AssetSource<R>,
@@ -3290,6 +3398,18 @@ pub fn terrain_cell<R: Read + Seek>(
     }
     mesh.finish(buckets);
     mesh.build_collision();
+    // Its collision is its own `PHY2`'s, where it has one (all 400 cells
+    // do): the 360 stands vehicles on that mesh, not the drawn ground
+    // (Xenia sub2: the El Grande's four wheel contacts at OilCon020 are on
+    // cell B57346DA's PHY2 to 1-8 mm, and 0.11-0.15 m above its GEOM).
+    if let Some(phy) = m2_assets::Ucfx::parse(&data)
+        .ok()
+        .and_then(|u| u.top_level(*b"PHY2").map(<[u8]>::to_vec))
+        .and_then(|d| m2_assets::physics::Physics::parse(&d).ok())
+        && let Some(collision) = mesh.collision_of(&phy)
+    {
+        mesh.collision = Some(collision);
+    }
     Ok(mesh)
 }
 
@@ -3651,6 +3771,115 @@ mod tests {
         mesh.finish(buckets);
         assert_eq!(mesh.flipped, 1);
         assert_eq!(mesh.indices, vec![0, 1, 2, 0, 2, 3, 0, 2, 3]);
+    }
+
+    // A cell collides by its own PHY2 mesh where it has one, not its drawn
+    // ground: here the PHY2 stands 0.12 m over the drawn ground (as cell
+    // B57346DA's does under OilCon020's El Grande, Xenia sub2), and each of
+    // its triangles takes its nearest ground triangle's material (INVENTED:
+    // the PHY2 triangles carry none).
+    #[test]
+    fn a_cell_collides_by_its_own_phy2_mesh() {
+        let mut mesh = TerrainMesh::empty(Vec3::ZERO);
+        mesh.surfaces.push(TerrainSurface::Ground {
+            colour_map: None,
+            detail_map: None,
+            layers: Vec::new(),
+        });
+        for (x, z) in [(0.0f32, 0.0f32), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)] {
+            for f in [x, 2.0, z, 0.0, 1.0, 0.0, 0.0, 0.0] {
+                mesh.vertices.extend(f.to_le_bytes());
+            }
+            mesh.vertices.extend([255, 0, 0, 0]);
+            mesh.vertices.extend([0u8; 16]);
+        }
+        mesh.indices.extend([0, 1, 2, 0, 2, 3]);
+        mesh.ranges = vec![(0, 6, 0)];
+        let dirt = m2_assets::name_hash("TERRAIN_DIRT");
+        mesh.made_of = vec![dirt];
+        mesh.build_collision();
+        let shape = m2_assets::physics::Shape {
+            radius: 0.0,
+            geometry: m2_assets::physics::Geometry::Mesh {
+                vertices: vec![
+                    [0.0, 2.12, 0.0],
+                    [4.0, 2.12, 0.0],
+                    [4.0, 2.12, 4.0],
+                    [0.0, 2.12, 4.0],
+                ],
+                triangles: vec![[0, 2, 1], [0, 3, 2]],
+                flags: vec![10, 10],
+            },
+            part: 0,
+            record: [0; 26],
+        };
+        let phy = m2_assets::physics::Physics {
+            version: 0,
+            model: 0,
+            unk_0x14: [0; 3],
+            parts: Vec::new(),
+            bodies: Vec::new(),
+            shapes: vec![shape],
+            constraints: Vec::new(),
+        };
+        let collision = mesh.collision_of(&phy).expect("a PHY2 mesh");
+        assert!(
+            collision.surfaces.iter().all(|&(_, m)| m == dirt),
+            "{:?}",
+            collision.surfaces
+        );
+        let mut physics = crate::Physics::new();
+        physics.add_static(
+            crate::physics::StaticKey::Cell(1),
+            &collision,
+            Vec3::ZERO,
+            Quat::IDENTITY,
+        );
+        physics.step(1.0 / 60.0);
+        let from = Vec3::new(2.0, 5.0, 1.5);
+        let (d, _) = physics.cast_ray(from, Vec3::NEG_Y, 10.0).expect("ground");
+        assert!((from.y - d - 2.12).abs() < 1e-3, "ground at {}", from.y - d);
+        // Two neighbouring cells' PHY2 meshes, quantised to +-199.99998 m,
+        // meet without a seam: a ray straight down on their boundary hits.
+        let edge = |x0: f32, x1: f32| m2_assets::physics::Shape {
+            geometry: m2_assets::physics::Geometry::Mesh {
+                vertices: vec![
+                    [x0, 0.0, -5.0],
+                    [x1, 0.0, -5.0],
+                    [x1, 0.0, 5.0],
+                    [x0, 0.0, 5.0],
+                ],
+                triangles: vec![[0, 2, 1], [0, 3, 2]],
+                flags: vec![10, 10],
+            },
+            ..phy.shapes[0].clone()
+        };
+        let mut seam = crate::Physics::new();
+        for (k, (x0, x1, at)) in [(-10.0, 199.99998, 0.0), (-199.99998, 10.0, 400.0)]
+            .into_iter()
+            .enumerate()
+        {
+            let one = m2_assets::physics::Physics {
+                shapes: vec![edge(x0, x1)],
+                ..phy.clone()
+            };
+            let c = mesh.collision_of(&one).expect("mesh");
+            seam.add_static(
+                crate::physics::StaticKey::Cell(k as u32),
+                &c,
+                Vec3::new(at, 0.0, 0.0),
+                Quat::IDENTITY,
+            );
+        }
+        seam.step(1.0 / 60.0);
+        let hit = seam.cast_ray(Vec3::new(200.0, 5.0, 0.0), Vec3::NEG_Y, 10.0);
+        assert!(hit.is_some(), "a ray on the cells' boundary fell through");
+        // Without a mesh shape, none (the drawn ground stays).
+        let empty = m2_assets::physics::Physics {
+            shapes: Vec::new(),
+            ..phy
+        };
+        assert!(mesh.collision_of(&empty).is_none());
     }
 
     #[test]

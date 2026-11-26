@@ -16057,6 +16057,27 @@ impl ApplicationHandler for App {
 
 #[cfg(test)]
 mod tests {
+    // The dock-side Dinghy is judged by its 360 rest on the bank: its drop,
+    // its tilt and the way it tilts, and where it rests level.
+    #[test]
+    fn the_dinghy_is_judged_by_its_360_rest() {
+        use m2_math::glam::Vec3;
+        let authored = Vec3::new(2719.971, -33.299, -399.1224);
+        let rest = Vec3::new(2719.989, -34.3372, -399.1161);
+        let up = Vec3::from(super::DINGHY_UP).normalize();
+        assert!(super::dinghy_settled(rest, up, authored, 0.0).is_ok());
+        // Level, as a floating boat would rest: fails the tilt.
+        assert!(super::dinghy_settled(rest, Vec3::Y, authored, 0.0).is_err());
+        // Tilted the other way: fails the up's direction.
+        let other = Vec3::new(-up.x, up.y, up.z);
+        assert!(super::dinghy_settled(rest, other, authored, 0.0).is_err());
+        // 6 cm off the 360's rest level, or not dropped: fails.
+        assert!(super::dinghy_settled(rest + Vec3::X * 0.06, up, authored, 0.0).is_err());
+        assert!(super::dinghy_settled(authored, up, authored, 0.0).is_err());
+        // Still moving: fails.
+        assert!(super::dinghy_settled(rest, up, authored, 0.2).is_err());
+    }
+
     use super::*;
 
     /// `--save-check-no-world`'s verdict: the saved place first, then
@@ -17470,6 +17491,49 @@ fn settle_touch_name(world: &m2_engine::World, key: Option<m2_engine::StaticKey>
 /// allowed; level movement must stay within a few centimetres.
 const BOAT_SETTLE: (f32, f32) = (0.05, 0.5);
 
+/// The dock-side Dinghy 0xD5FBF's rest on the 360 (Xenia dinghy1,
+/// 2026-11-26): it falls from its authored pose onto the bank, not into
+/// the water, and lands rigidly: dropped 1.038 m, moved (0.0179, 0.0063)
+/// level, its up (0.1333, 0.99106, 0.00596), 7.7 degrees off vertical.
+const DINGHY: u32 = 0x000d_5fbf;
+const DINGHY_DROP: f32 = 1.038;
+const DINGHY_LEVEL_MOVE: (f32, f32) = (0.0179, 0.0063);
+const DINGHY_UP: [f32; 3] = [0.1333, 0.99106, 0.00596];
+/// How far the Dinghy may rest from [`DINGHY`]'s 360 rest: metres of
+/// drop, degrees of tilt, degrees between the two ups, metres level from
+/// the 360's rest place. INVENTED.
+const DINGHY_WITHIN: (f32, f32, f32, f32) = (0.05, 2.0, 3.0, 0.05);
+
+/// The Dinghy judged by its 360 rest ([`DINGHY`]): at `now`, up `up`
+/// (unit), authored at `authored`, moving at `speed`. Its drop, tilt and
+/// up error as a line, `Err` when it fails.
+fn dinghy_settled(
+    now: m2_math::glam::Vec3,
+    up: m2_math::glam::Vec3,
+    authored: m2_math::glam::Vec3,
+    speed: f32,
+) -> Result<String, String> {
+    use m2_math::glam::Vec3;
+    let (drop_within, tilt_within, up_within, level_within) = DINGHY_WITHIN;
+    let target_up = Vec3::from(DINGHY_UP).normalize();
+    let drop = authored.y - now.y;
+    let tilt = up.y.clamp(-1.0, 1.0).acos().to_degrees();
+    let target_tilt = target_up.y.acos().to_degrees();
+    let up_off = up.angle_between(target_up).to_degrees();
+    let rest = authored + Vec3::new(DINGHY_LEVEL_MOVE.0, 0.0, DINGHY_LEVEL_MOVE.1);
+    let level = now.with_y(0.0).distance(rest.with_y(0.0));
+    let off = (now - rest).with_y(0.0);
+    let line = format!(
+        "dropped {drop:.3} m (360 {DINGHY_DROP:.3}), tilted {tilt:.1} deg (360 {target_tilt:.1}), up {up:.3} {up_off:.1} deg off the 360's, {level:.3} m level from the 360's rest, {speed:.3} m/s; at {now:.4}, off the 360's rest by {off:.4}"
+    );
+    let ok = (drop - DINGHY_DROP).abs() <= drop_within
+        && (tilt - target_tilt).abs() <= tilt_within
+        && up_off <= up_within
+        && level <= level_within
+        && speed < SETTLE_MOST.2;
+    if ok { Ok(line) } else { Err(line) }
+}
+
 /// A boat judged by [`BOAT_SETTLE`]: at `now`, authored at `authored`,
 /// `up` its up axis's height. It may drop and tilt as it settles; it must
 /// stay where it was authored, level, and not capsize.
@@ -17664,6 +17728,35 @@ fn parked_settle_check(
             // A boat floats where the water puts it (`game::place`: level,
             // at its float depth), not at its authored height or tilt: it
             // is judged by its own rule.
+            // The dock-side Dinghy by its 360 rest on the bank ([`DINGHY`]).
+            if entity == DINGHY {
+                let still = mark.map_or(speed, |p| now_at.distance(p) / SETTLE_STILL_OVER);
+                let up_axis = m.transform_vector3(Vec3::Y).normalize_or_zero();
+                // And that offset in its own frame (log only).
+                let rest = *at + Vec3::new(DINGHY_LEVEL_MOVE.0, 0.0, DINGHY_LEVEL_MOVE.1);
+                let off = (now_at - rest).with_y(0.0);
+                let ahead = m.transform_vector3(Vec3::Z).with_y(0.0).normalize_or_zero();
+                let side = m.transform_vector3(Vec3::X).with_y(0.0).normalize_or_zero();
+                eprintln!(
+                    "parked-settle-check: {entity:#x} {label}: off the 360's rest {:+.3} m along its hull, {:+.3} m across",
+                    off.dot(ahead),
+                    off.dot(side)
+                );
+                match dinghy_settled(now_at, up_axis, *at, still) {
+                    Ok(line) => {
+                        eprintln!(
+                            "parked-settle-check: {entity:#x} {label} (by its 360 rest): {line}: kept"
+                        );
+                        passed += 1;
+                    }
+                    Err(line) => {
+                        let line = format!("{entity:#x} {label} (by its 360 rest): {line}");
+                        eprintln!("parked-settle-check: off: {line}");
+                        failed.push(line);
+                    }
+                }
+                continue;
+            }
             if v.spec.is_boat() {
                 // Its offset split, level and down (boat1: the 360's drops
                 // were 0.67-2.33 m, its level movement under 1 cm).
