@@ -106,7 +106,6 @@ without play time, contract or percent.
 
 Each fits as a sidebar page or a tab:
 
-- **Play builds:** pick main or a test build to start.
 - **Mods:** a mod manager for `m2-modapi`.
 - **Bug report:** bundles `last-run.log` and the build's details.
 - **Gallery:** the game's movies and music, from the install.
@@ -131,3 +130,25 @@ With no settings file yet, the game's window size starts at the primary
 monitor's size in pixels (even, at least 640x360) instead of a fixed
 1920x1080; once the settings are saved the chosen size is kept
 (invented: the game's own launcher had no such default).
+
+## Picking the build to play
+
+A chip at the top right of the Play tab's banner names the build Play
+starts (`BUILD  <tag> - <date>`). Its list offers:
+
+- the build installed beside the launcher (the default);
+- the build kept for rolling back (`update\previous\`);
+- every build kept under `builds\<tag>\` beside the launcher, newest first;
+- the latest release, when it is none of these. Picking it downloads its
+  `m2-alpha.exe` into `builds\<tag>\`, checked against the release's
+  manifest (size and SHA-256). The launcher itself is not replaced.
+
+The pick is pinned in the launcher's settings (`build = "<tag>"`). A kept
+build runs from the launcher's folder, so it reads the same settings and
+saves. If a pinned build's program is no longer there, Play starts the
+installed build and the status line says so.
+
+Builds are never deleted. Before an update replaces `update\previous\`, the
+build there is copied into `builds\`; old builds pile up there until
+someone deletes them by hand. Labels are the release tags and build dates:
+our own text. Everything here is invented: the game had no such picker.

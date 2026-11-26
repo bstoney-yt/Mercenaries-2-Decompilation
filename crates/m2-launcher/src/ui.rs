@@ -30,6 +30,7 @@ use crate::text::{Fonts, GameFont};
 use crate::update::{self, Found, Standing};
 use crate::{Args, Paths};
 
+mod build_picker;
 mod contracts;
 mod whats_new;
 
@@ -151,6 +152,9 @@ pub struct App {
     /// No settings file yet: the window size is set from the monitor's
     /// once egui knows it ([`launch::monitor_size`]).
     size_from_monitor: bool,
+    /// The latest release's game program downloading for the build picker
+    /// ([`build_picker`]): its tag and program, once done.
+    build_dl: Option<Receiver<Result<(String, PathBuf), String>>>,
 }
 
 impl std::fmt::Debug for App {
@@ -235,6 +239,7 @@ impl App {
             }),
             started: Instant::now(),
             size_from_monitor,
+            build_dl: None,
         }
     }
 
@@ -308,7 +313,12 @@ impl App {
             self.status = Some(("The game is already running.".to_owned(), true));
             return;
         }
-        let game = launch::game_path(&self.settings, &self.paths.dir);
+        // The build picked on the Play tab ([`build_picker`]), else the
+        // installed one; a pinned build no longer here says so.
+        let (picked, note) = self.picked_game();
+        let game = picked
+            .clone()
+            .unwrap_or_else(|| launch::game_path(&self.settings, &self.paths.dir));
         let install = self
             .pass_install
             .then(|| self.install.as_ref().map(|i| i.root.clone()))
@@ -316,7 +326,11 @@ impl App {
             .or_else(|| self.install_arg.clone());
         let args = launch::args(&self.settings, install.as_deref(), &start);
         eprintln!("launcher: {} {}", game.display(), args.join(" "));
-        match launch::spawn(&game, &args) {
+        let spawned = match &picked {
+            Some(_) => crate::builds::spawn(&game, &args, &self.paths.dir),
+            None => launch::spawn(&game, &args),
+        };
+        match spawned {
             Ok(child) => {
                 self.game = Some(watch(
                     child,
@@ -324,7 +338,10 @@ impl App {
                     ctx.clone(),
                     Arc::clone(&self.exit_after_game),
                 ));
-                self.status = Some(("Starting the game...".to_owned(), false));
+                self.status = Some((
+                    note.unwrap_or_else(|| "Starting the game...".to_owned()),
+                    false,
+                ));
                 if !self.settings.keep_open {
                     // Out of sight, but here to count the session.
                     self.exit_after_game.store(true, Ordering::SeqCst);
@@ -615,6 +632,7 @@ impl App {
         let hero = Rect::from_min_max(rect.min, pos2(rect.right(), rect.bottom() - BAR_H));
         let bar = Rect::from_min_max(pos2(rect.left(), hero.bottom()), rect.max);
         let p = ui.painter_at(rect);
+        let picker_hero = hero;
 
         // The banner.
         let banners = self.banners();
@@ -868,6 +886,7 @@ impl App {
         if self.picker_open {
             self.picker_list(ui, picker);
         }
+        self.build_chip(ui, picker_hero);
     }
 
     /// The picker's lines for `pick`: title, detail, whose.
@@ -1737,6 +1756,11 @@ impl App {
         let Some(found) = self.upd_found.clone() else {
             return;
         };
+        // The build kept for rolling back is about to be replaced: keep a
+        // copy for the build picker first ([`crate::builds`]).
+        if let Err(e) = crate::builds::keep_previous(&self.program_dir) {
+            eprintln!("launcher: keeping the previous build: {e}");
+        }
         let dir = self.program_dir.clone();
         self.upd_note = Some((
             format!("Downloading build {}...", found.manifest.short()),
@@ -2210,6 +2234,7 @@ impl eframe::App for App {
         }
         self.poll(&ctx);
         self.poll_updates(&ctx);
+        self.poll_build_download();
         if self.scanned.elapsed() > Duration::from_secs(5) {
             self.rescan();
         }

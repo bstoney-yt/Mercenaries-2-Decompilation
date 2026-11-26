@@ -29,6 +29,7 @@
 
 mod achievements;
 mod assets;
+mod builds;
 mod launch;
 mod save_stats;
 mod saves;
