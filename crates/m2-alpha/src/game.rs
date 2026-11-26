@@ -5840,7 +5840,18 @@ pub(crate) enum Put {
 /// The island vehicles [`Game::log_first_steps`] watches after they are
 /// placed (#766's B, C and E spots: the Phoenix, the Van (Green) and the
 /// M151 that left their authored places after their first second).
-const FIRST_STEPS_WATCHED: [u32; 3] = [0x10_d5d8, 0x12_b8fc, 0x13_3ba2];
+const FIRST_STEPS_WATCHED: [u32; 7] = [
+    0x10_d5d8,
+    0x12_b8fc,
+    0x13_3ba2,
+    // The Fuel and Box Trailers by AllCon003's dock (#769: the Fuel
+    // Trailers ease 0.78 m back along their length after their kick, the
+    // Box Trailers not).
+    0xf_0309,
+    0xf_030b,
+    0x1000_1ea5,
+    0x1000_1ea6,
+];
 /// The speeds whose first passing is logged, m/s.
 const WATCH_SPEEDS: [f32; 2] = [0.5, 2.0];
 /// Still this long, s, after moving: rested, the watch ends.
