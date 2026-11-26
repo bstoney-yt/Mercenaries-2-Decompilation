@@ -17,6 +17,13 @@
 //! `--dir` is where `m2-alpha` and its saves are (default: the launcher's
 //! own folder). `--screenshot` waits for the install's fonts and pictures,
 //! writes the window to a PNG and closes (`--tab` picks the tab shown).
+//!
+//! ```text
+//! m2-launcher --write-manifest <folder> <tag> <commit> <built>
+//! ```
+//!
+//! is the release workflow's: it writes `manifest.toml` and `SHA256SUMS`
+//! for the programs in the folder ([`update::FILES`]) and exits.
 
 #![cfg_attr(feature = "windowed", windows_subsystem = "windows")]
 
@@ -28,6 +35,7 @@ mod saves;
 mod stats;
 mod text;
 mod ui;
+mod update;
 
 use std::path::{Path, PathBuf};
 
@@ -137,8 +145,24 @@ pub fn find_install(
     (Install::detect(), false)
 }
 
+/// `--write-manifest <folder> <tag> <commit> <built>`.
+fn write_manifest(rest: &[String]) -> anyhow::Result<()> {
+    let [folder, tag, sha, built] = rest else {
+        bail!("--write-manifest <folder> <tag> <commit> <built>");
+    };
+    let folder = Path::new(folder);
+    let m = update::manifest_for(folder, tag, sha, built).map_err(anyhow::Error::msg)?;
+    std::fs::write(folder.join(update::MANIFEST), m.to_text())?;
+    std::fs::write(folder.join("SHA256SUMS"), update::sums_text(&m))?;
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
-    let args = parse(std::env::args().skip(1))?;
+    let all: Vec<String> = std::env::args().skip(1).collect();
+    if all.first().map(String::as_str) == Some("--write-manifest") {
+        return write_manifest(&all[1..]);
+    }
+    let args = parse(all)?;
     let dir = match &args.dir {
         Some(d) => d.clone(),
         None => std::env::current_exe()
