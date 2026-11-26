@@ -1,0 +1,96 @@
+name: Play build release
+
+# Publishes each merge to main as a play build the launcher updates from:
+# a pre-release tagged build-<commit date>-<sha7> holding m2-alpha.exe,
+# m2-launcher.exe (both built windowed), manifest.toml (the commit, tag,
+# date, and each file's size and SHA-256) and SHA256SUMS. Pre-releases
+# leave the beta's releases/latest link alone; old ones are kept, for
+# rolling back. See docs/launcher.md, "Updates".
+#
+# Our code only: both programs read every game file (fonts, art, data)
+# from the player's own install at run time, and neither embeds an icon or
+# any other resource. The pack step refuses anything else.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: play-build-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish the play build
+    runs-on: [self-hosted, Windows, X64, m2-pc]
+    env:
+      CARGO_TERM_COLOR: always
+      # Built into the launcher: its own commit, and where to look for
+      # newer builds (crates/m2-launcher/src/update.rs).
+      M2_BUILD_SHA: ${{ github.sha }}
+      M2_RELEASE_REPO: ${{ github.repository }}
+      # A lock file that game checks on the runner's machine hold while they
+      # use the GPU (a repository variable; unset, only the game's process
+      # is waited for).
+      M2_GPU_LOCK: ${{ vars.M2_GPU_LOCK }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      # As in beta.yml, the steps run in cmd (the runner's account may not
+      # run PowerShell scripts), and each line exits on failure.
+      - name: No embedded resources
+        shell: cmd
+        run: |
+          for %%c in (m2-alpha m2-launcher) do if exist crates\%%c\build.rs (echo crates\%%c\build.rs would embed resources & exit /b 1)
+          git ls-files "*.ico" "*.rc" "*.res" > target-resources.txt || exit /b 1
+          for %%s in (target-resources.txt) do if %%~zs gtr 0 (type target-resources.txt & echo icon or resource files are in the repository & exit /b 1)
+          del target-resources.txt
+      # Waits, up to 30 minutes, while a game check or the nightly run is
+      # going on the machine (the GPU lock file exists, or an m2-alpha.exe
+      # process runs), so the release build does not compete with it; then
+      # fails, saying why. ping is the sleep: timeout.exe needs a console.
+      - name: Wait for the machine to be free
+        shell: cmd
+        run: |
+          set /a N=0
+          :again
+          set BUSY=
+          if defined M2_GPU_LOCK if exist "%M2_GPU_LOCK%" set BUSY=the GPU lock %M2_GPU_LOCK% exists
+          tasklist /fi "imagename eq m2-alpha.exe" /nh 2>nul | find /i "m2-alpha.exe" >nul && set BUSY=m2-alpha.exe is running
+          if not defined BUSY (echo the machine is free & exit /b 0)
+          if %N% geq 60 (echo still busy after 30 minutes: %BUSY% & exit /b 1)
+          echo waiting: %BUSY%
+          set /a N+=1
+          ping -n 31 127.0.0.1 >nul
+          goto again
+      - name: Build
+        shell: cmd
+        run: cargo build --release --target i686-pc-windows-msvc -p m2-alpha -p m2-launcher --features m2-alpha/windowed,m2-launcher/windowed || exit /b 1
+      - name: Pack
+        shell: cmd
+        run: |
+          set OUT=target\play-build
+          if exist %OUT% rmdir /s /q %OUT% || exit /b 1
+          mkdir %OUT% || exit /b 1
+          copy /y target\i686-pc-windows-msvc\release\m2-alpha.exe %OUT%\ || exit /b 1
+          copy /y target\i686-pc-windows-msvc\release\m2-launcher.exe %OUT%\ || exit /b 1
+          for /f %%d in ('git log -1 --format^=%%cd --date^=format:%%Y%%m%%d') do set DAY=%%d
+          for /f %%d in ('git log -1 --format^=%%cI') do set BUILT=%%d
+          set TAG=build-%DAY%-%GITHUB_SHA:~0,7%
+          start "" /wait %OUT%\m2-launcher.exe --write-manifest %OUT% %TAG% %GITHUB_SHA% %BUILT% || exit /b 1
+          if not exist %OUT%\manifest.toml (echo no manifest & exit /b 1)
+          for %%f in (%OUT%\*) do (
+            if /i not "%%~nxf"=="m2-alpha.exe" if /i not "%%~nxf"=="m2-launcher.exe" if /i not "%%~nxf"=="manifest.toml" if /i not "%%~nxf"=="SHA256SUMS" (echo %%~nxf is not ours to publish & exit /b 1)
+          )
+          type %OUT%\manifest.toml
+          >> %GITHUB_ENV% echo TAG=%TAG%
+      - name: Publish
+        shell: cmd
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "%TAG%" --repo ${{ github.repository }} > nul 2>&1 && (echo %TAG% is out already & exit /b 0)
+          gh release create "%TAG%" target\play-build\m2-alpha.exe target\play-build\m2-launcher.exe target\play-build\manifest.toml target\play-build\SHA256SUMS --repo ${{ github.repository }} --target ${{ github.sha }} --prerelease --title "Play build %TAG%" --notes "Built from ${{ github.sha }}. Needs your own install of Mercenaries 2 (PC). The launcher updates itself from these; to install by hand, put both programs in one folder and run m2-launcher.exe." || exit /b 1

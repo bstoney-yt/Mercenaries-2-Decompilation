@@ -15,9 +15,9 @@ points of interest). Nothing from the game is committed or cached on disk.
 ## Layout
 
 - **Sidebar:** who is playing, the game (Mercenaries 2), the pages still
-  to come (What's New, Achievements, Mods, Gallery) and Settings.
-- **Header:** the game's name and the tabs: Play, Saves, Stats, Options,
-  and Patch Notes (to come).
+  to come (What's New, Mods, Gallery) and Settings.
+- **Header:** the game's name and the tabs: Play, Saves, Stats,
+  Achievements, Options, and Patch Notes (to come).
 - **Play:** the banner (steps on every 12 s; arrows and dots step it by
   hand) over the bar: the save picker on the left (Continue with the
   newest save, any other save, or a new game), Play in the middle, and
@@ -37,9 +37,44 @@ points of interest). Nothing from the game is committed or cached on disk.
   PMC (Hostile, Neutral or Friendly, as the game's scripts grade it). A
   record stamped 0:00:00 (saved without the pause menu opening, which the
   360 never does) shows the scripts' own clock instead, marked `*`.
+- **Achievements:** the game's single-player achievements (36), read at
+  start from the scripts' own list in the install (`MrxAchievements`), for
+  the save picked at the top. The 360 keeps earned achievements in the
+  player's profile, not in saves, so a save can show only those whose
+  condition it keeps: the five faction ones (standing at 100), the first
+  contract's, the PMC hunting contracts' and the resource counters'. Each
+  of those reads Earned or Not yet (in this save); the rest read Not
+  tracked, with why. The names and gamerscore are the 360's, from public
+  achievement lists matched to the ids by hand (the PC install has none);
+  two ids that match no listed achievement keep their id's words. Each
+  line of what earns it is the launcher's own wording.
 - **Options:** the game window (size, windowed or fullscreen), skipping
   the EA and Pandemic movies, keeping the launcher open, and the install,
   program and save folders. Kept in `m2-launcher.toml` beside it.
+
+## Updates
+
+Each merge to `main` is published by `.github/workflows/release.yml` as a
+pre-release `build-<date>-<sha7>`: `m2-alpha.exe`, `m2-launcher.exe`
+(windowed), `manifest.toml` (the commit, and each file's size and
+SHA-256) and `SHA256SUMS`. Nothing else: both programs read the game's
+files from the install, and the workflow refuses an embedded icon or any
+other file. Pre-releases leave the beta's `releases/latest` link alone,
+and old ones stay up.
+
+A launcher built by that workflow knows its commit and the repository.
+On open it asks the public GitHub API for the releases (one request, no
+sign-in, a 10 s limit; offline it just says so) and shows **Update
+available** in the header when the newest build is another commit.
+Update (or **Update automatically when the launcher opens** in Options,
+off by default) downloads the files into `update\staged\`, checks each
+against the manifest, moves the current ones to `update\previous\` and the
+new ones into place. The running launcher is renamed aside like the rest
+(Windows lets a running program be renamed, not overwritten), and the new
+one runs from **Restart**. **Roll back** swaps `update\previous\` back
+(and again, to go forward). Only those two programs are ever moved: the
+saves and settings beside them are not touched. A local `cargo build`
+knows neither, so it never checks.
 
 ## Starting the game
 
@@ -76,5 +111,3 @@ Each fits as a sidebar page or a tab:
 - **Mods:** a mod manager for `m2-modapi`.
 - **Bug report:** bundles `last-run.log` and the build's details.
 - **Gallery:** the game's movies and music, from the install.
-- **Achievements:** the game's single-player achievements, from its own
-  list.

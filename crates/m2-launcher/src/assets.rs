@@ -144,6 +144,9 @@ pub struct Loaded {
     pub fonts: Vec<(Role, Font, Rgba)>,
     /// Pictures by their [`Art::hash`].
     pub art: Vec<(u32, Rgba)>,
+    /// The scripts' achievement list ([`crate::achievements::read_list`]),
+    /// multiplayer ones included.
+    pub achievements: Vec<crate::achievements::Entry>,
     /// What was found and what wasn't, for the log.
     pub log: Vec<String>,
 }
@@ -181,6 +184,20 @@ pub fn load(data: &Path) -> Loaded {
                 .log
                 .push(format!("font {role:?}: none of {movies:?} found")),
         }
+    }
+
+    let script = sources.iter_mut().find_map(|(_, s)| {
+        s.asset(crate::achievements::SCRIPT, m2_assets::lua::SCRIPT_TYPE)
+            .ok()
+    });
+    match script.map(|a| m2_assets::lua::Chunk::from_asset(&a)) {
+        Some(Ok(chunk)) => {
+            out.achievements = crate::achievements::read_list(&chunk);
+            out.log
+                .push(format!("achievements: {} listed", out.achievements.len()));
+        }
+        Some(Err(e)) => out.log.push(format!("achievements: {e}")),
+        None => out.log.push("achievements: script not found".to_owned()),
     }
 
     for art in BANNER.iter().chain([&CHARACTERS, &BILL_HEAD, &SKULL]) {

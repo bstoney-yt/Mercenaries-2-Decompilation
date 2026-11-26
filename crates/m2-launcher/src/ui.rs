@@ -4,7 +4,8 @@
 //! the bar with the save picker, the Play button and who is playing;
 //! Saves lists the slots with Play, Copy and Delete and starts new games;
 //! Stats shows what each save says of the play and, apart and marked so,
-//! what the launcher itself counted; Options keeps the window and
+//! what the launcher itself counted; Achievements lists the game's
+//! single-player achievements and which a save shows earned; Options keeps the window and
 //! folders. Colours and sizes are invented.
 
 use std::collections::HashMap;
@@ -19,12 +20,14 @@ use egui::{
     TextureHandle, TextureOptions, Ui, UiBuilder, pos2, vec2,
 };
 
+use crate::achievements::{self, Entry, State};
 use crate::assets::{self, Loaded, Role};
 use crate::launch::{self, GameSettings, Settings, Start};
 use crate::save_stats::{self, Attitude, PlayedFrom, SaveStats};
 use crate::saves::{self, Slot};
 use crate::stats::{self, LauncherStats};
 use crate::text::{Fonts, GameFont};
+use crate::update::{self, Found, Standing};
 use crate::{Args, Paths};
 
 const BG: Color32 = Color32::from_rgb(0x26, 0x26, 0x26);
@@ -54,6 +57,7 @@ pub enum Tab {
     Play,
     Saves,
     Stats,
+    Achievements,
     Options,
 }
 
@@ -116,6 +120,25 @@ pub struct App {
     exit_after_game: Arc<AtomicBool>,
     /// The launcher's own play stats ([`stats`]).
     launcher_stats: LauncherStats,
+    /// The game's single-player achievements, from the install.
+    achievements: Vec<Entry>,
+    /// The save the Achievements page shows them for.
+    ach_slot: Option<u32>,
+    /// The folder the launcher's program is in: where updates go.
+    program_dir: PathBuf,
+    /// Looking for the latest build.
+    upd_check: Option<Receiver<Result<Option<Found>, String>>>,
+    /// Downloading and swapping one in.
+    upd_run: Option<Receiver<Result<Vec<String>, String>>>,
+    /// The latest build found.
+    upd_found: Option<Found>,
+    /// What the last update step said, and whether it went wrong.
+    upd_note: Option<(String, bool)>,
+    /// The launcher's own program was replaced: the new one runs from a
+    /// restart.
+    restart_needed: bool,
+    /// Whether the check on opening has been started.
+    upd_started: bool,
     /// Each slot's stats, as of the last scan.
     save_stats: Vec<(u32, Result<SaveStats, String>)>,
     shot: Option<Shot>,
@@ -184,6 +207,18 @@ impl App {
             exit_after_game: Arc::new(AtomicBool::new(false)),
             launcher_stats,
             save_stats,
+            achievements: Vec::new(),
+            ach_slot: None,
+            program_dir: std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(std::path::Path::to_path_buf))
+                .unwrap_or_else(|| PathBuf::from(".")),
+            upd_check: None,
+            upd_run: None,
+            upd_found: None,
+            upd_note: None,
+            restart_needed: false,
+            upd_started: false,
             shot: args.screenshot.map(|path| Shot {
                 path,
                 settled: 0,
@@ -201,6 +236,7 @@ impl App {
         for line in &loaded.log {
             eprintln!("launcher: {line}");
         }
+        self.achievements = achievements::single_player(loaded.achievements);
         let upload = |name: String, rgba: &assets::Rgba| {
             ctx.load_texture(
                 name,
@@ -436,10 +472,7 @@ impl App {
             "COMING SOON",
         );
         y += 24.0;
-        for (i, name) in ["What's New", "Achievements", "Mods", "Gallery"]
-            .into_iter()
-            .enumerate()
-        {
+        for (i, name) in ["What's New", "Mods", "Gallery"].into_iter().enumerate() {
             let item =
                 Rect::from_min_size(pos2(rect.left() + 8.0, y), vec2(rect.width() - 16.0, 40.0));
             let r = ui.interact(item, Id::new(("side-soon", i)), Sense::hover());
@@ -525,6 +558,7 @@ impl App {
             (Some(Tab::Play), "PLAY"),
             (Some(Tab::Saves), "SAVES"),
             (Some(Tab::Stats), "STATS"),
+            (Some(Tab::Achievements), "ACHIEVEMENTS"),
             (Some(Tab::Options), "OPTIONS"),
             (None, "PATCH NOTES"),
         ];
@@ -1442,11 +1476,481 @@ impl App {
         }
     }
 
+    fn achievements_tab(&mut self, ui: &mut Ui, rect: Rect) {
+        let p = ui.painter_at(rect);
+        p.rect_filled(rect, 0.0, BG);
+        // Which save the list is shown for: chips along the top.
+        let top = pos2(rect.left() + PAD, rect.top() + 20.0);
+        self.fonts.text(
+            &p,
+            Role::Body,
+            pos2(top.x, top.y + 17.0),
+            Align2::LEFT_CENTER,
+            15.0,
+            DIM,
+            "As shown by",
+        );
+        let mut x = top.x + 100.0;
+        let slots = self.slots.clone();
+        if !slots.iter().any(|s| Some(s.number) == self.ach_slot) {
+            self.ach_slot = slots.first().map(|s| s.number);
+        }
+        for s in &slots {
+            let name = s.title();
+            let w = self.fonts.width(&p, Role::BodyBold, 15.0, &name) + 26.0;
+            if x + w > rect.right() - PAD {
+                break;
+            }
+            let chip = Rect::from_min_size(pos2(x, top.y + 2.0), vec2(w, 30.0));
+            let r = ui.interact(chip, Id::new(("ach-save", s.number)), Sense::click());
+            let on = self.ach_slot == Some(s.number);
+            p.rect_filled(
+                chip,
+                15.0,
+                if on {
+                    hero_colour(s.hero.as_deref())
+                } else if r.hovered() {
+                    SIDEBAR_SELECTED
+                } else {
+                    Color32::from_rgb(0x30, 0x30, 0x30)
+                },
+            );
+            self.fonts.text(
+                &p,
+                Role::BodyBold,
+                chip.center(),
+                Align2::CENTER_CENTER,
+                15.0,
+                if on { TEXT } else { DIM },
+                &name,
+            );
+            if r.clicked() {
+                self.ach_slot = Some(s.number);
+            }
+            x += w + 8.0;
+        }
+        if slots.is_empty() {
+            self.fonts.text(
+                &p,
+                Role::Body,
+                pos2(x, top.y + 17.0),
+                Align2::LEFT_CENTER,
+                15.0,
+                FAINT,
+                "no save yet",
+            );
+        }
+        let earned: Option<Vec<&'static str>> = self.ach_slot.and_then(|n| {
+            self.save_stats
+                .iter()
+                .find(|(m, _)| *m == n)
+                .and_then(|(_, s)| s.as_ref().ok())
+                .and_then(|s| s.earned.clone())
+        });
+
+        let list = Rect::from_min_max(
+            pos2(rect.left() + PAD, top.y + 52.0),
+            pos2(rect.right() - PAD, rect.bottom() - 12.0),
+        );
+        let count = self.achievements.len();
+        let tracked = self
+            .achievements
+            .iter()
+            .filter(|e| achievements::rule(&e.id).is_some())
+            .count();
+        let got = self
+            .achievements
+            .iter()
+            .filter(|e| achievements::state(&e.id, earned.as_deref()) == State::Earned)
+            .count();
+        self.fonts.text(
+            &p,
+            Role::Body,
+            pos2(list.right(), top.y + 17.0),
+            Align2::RIGHT_CENTER,
+            13.0,
+            FAINT,
+            &format!(
+                "{got} earned of the {tracked} a save can show  -  {count} single-player in all"
+            ),
+        );
+        p.hline(list.x_range(), list.top() - 4.0, Stroke::new(1.0, LINE));
+        if self.achievements.is_empty() {
+            let why = if self.loading.is_some() {
+                "Reading the game's achievement list from the install..."
+            } else {
+                "The achievement list is read from the game's install, and none was found."
+            };
+            self.fonts.text(
+                &p,
+                Role::Body,
+                pos2(list.center().x, list.top() + 60.0),
+                Align2::CENTER_CENTER,
+                18.0,
+                DIM,
+                why,
+            );
+            return;
+        }
+        let entries = self.achievements.clone();
+        let mut child = ui.new_child(UiBuilder::new().max_rect(list));
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(&mut child, |ui| {
+                for e in &entries {
+                    let (row, r) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 58.0), Sense::hover());
+                    let p = ui.painter().clone();
+                    if r.hovered() {
+                        p.rect_filled(row, 4.0, Color32::from_rgb(0x2e, 0x2e, 0x2e));
+                    }
+                    let state = achievements::state(&e.id, earned.as_deref());
+                    let (mark, colour, label) = match state {
+                        State::Earned => (GREEN, TEXT, "EARNED"),
+                        State::NotYet => (Color32::from_rgb(0x44, 0x44, 0x44), DIM, "NOT YET"),
+                        State::NotTracked => {
+                            (Color32::from_rgb(0x30, 0x30, 0x30), FAINT, "NOT TRACKED")
+                        }
+                    };
+                    let badge = Rect::from_center_size(
+                        pos2(row.left() + 28.0, row.center().y),
+                        vec2(34.0, 34.0),
+                    );
+                    p.rect_filled(badge, 17.0, mark);
+                    if state == State::Earned {
+                        chevron(&p, badge.center(), 9.0, TEXT);
+                    }
+                    let mut name = e.title().to_uppercase();
+                    if e.required > 1 {
+                        name = format!("{name}  (x{})", e.required);
+                    }
+                    self.fonts.text(
+                        &p,
+                        Role::Heading,
+                        pos2(badge.right() + 14.0, row.center().y - 1.0),
+                        Align2::LEFT_BOTTOM,
+                        18.0,
+                        colour,
+                        &name,
+                    );
+                    let how = match achievements::rule(&e.id) {
+                        Some((_, how)) => how,
+                        None => achievements::untracked_reason(&e.id, e.required),
+                    };
+                    let official = achievements::official(&e.id);
+                    let line = match official {
+                        Some(o) => format!("{}  -  {how}", o.about),
+                        None => format!("Not matched to the 360's list  -  {how}"),
+                    };
+                    self.fonts.text(
+                        &p,
+                        Role::Body,
+                        pos2(badge.right() + 14.0, row.center().y + 3.0),
+                        Align2::LEFT_TOP,
+                        14.0,
+                        DIM,
+                        &line,
+                    );
+                    let w = self.fonts.width(&p, Role::Heading, 13.0, label) + 22.0;
+                    let pill = Rect::from_min_size(
+                        pos2(row.right() - 10.0 - w, row.center().y - 12.0),
+                        vec2(w, 24.0),
+                    );
+                    if let Some(o) = official {
+                        self.fonts.text(
+                            &p,
+                            Role::BodyBold,
+                            pos2(pill.left() - 14.0, row.center().y),
+                            Align2::RIGHT_CENTER,
+                            16.0,
+                            colour,
+                            &format!("{}G", o.score),
+                        );
+                    }
+                    if state == State::Earned {
+                        p.rect_filled(pill, 12.0, GREEN);
+                    } else {
+                        p.rect_stroke(pill, 12.0, Stroke::new(1.0, colour), StrokeKind::Inside);
+                    }
+                    self.fonts.text(
+                        &p,
+                        Role::Heading,
+                        pill.center(),
+                        Align2::CENTER_CENTER,
+                        13.0,
+                        colour,
+                        label,
+                    );
+                    p.hline(
+                        row.x_range(),
+                        row.bottom(),
+                        Stroke::new(1.0, Color32::from_rgb(0x30, 0x30, 0x30)),
+                    );
+                }
+            });
+    }
+
+    // ---- updates ----
+
+    /// Starts looking for the latest build (only in a released build:
+    /// one that knows its repository).
+    fn start_check(&mut self, ctx: &egui::Context) {
+        if update::RELEASE_REPO.is_none() || self.upd_check.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(update::check());
+            ctx.request_repaint();
+        });
+        self.upd_check = Some(rx);
+    }
+
+    fn standing(&self) -> Option<Standing> {
+        self.upd_found
+            .as_ref()
+            .map(|f| update::standing(update::BUILD_SHA, &f.manifest))
+    }
+
+    /// Downloads the latest build and swaps it in (not while the game
+    /// runs: its program would be in use).
+    fn start_update(&mut self, ctx: &egui::Context) {
+        if self.upd_run.is_some() {
+            return;
+        }
+        if self.game.is_some() {
+            self.upd_note = Some(("Close the game first, then update.".to_owned(), true));
+            return;
+        }
+        let Some(found) = self.upd_found.clone() else {
+            return;
+        };
+        let dir = self.program_dir.clone();
+        self.upd_note = Some((
+            format!("Downloading build {}...", found.manifest.short()),
+            false,
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(update::update(&dir, &found));
+            ctx.request_repaint();
+        });
+        self.upd_run = Some(rx);
+    }
+
+    fn rollback(&mut self) {
+        if self.game.is_some() {
+            self.upd_note = Some(("Close the game first, then roll back.".to_owned(), true));
+            return;
+        }
+        self.upd_note = Some(
+            match update::rollback(&self.program_dir, update::BUILD_SHA) {
+                Ok((m, names)) => {
+                    if names.iter().any(|n| n == "m2-launcher.exe") {
+                        self.restart_needed = true;
+                    }
+                    (format!("Rolled back to build {}.", m.short()), false)
+                }
+                Err(e) => (format!("Could not roll back: {e}"), true),
+            },
+        );
+    }
+
+    /// Starts the launcher's program again (the new one) and closes this.
+    fn restart(&mut self, ctx: &egui::Context) {
+        let exe = self
+            .program_dir
+            .join(format!("m2-launcher{}", std::env::consts::EXE_SUFFIX));
+        match std::process::Command::new(&exe)
+            .args(std::env::args().skip(1))
+            .spawn()
+        {
+            Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(e) => {
+                self.upd_note = Some((format!("Could not restart {}: {e}", exe.display()), true));
+            }
+        }
+    }
+
+    /// Takes in what the update threads said.
+    fn poll_updates(&mut self, ctx: &egui::Context) {
+        if !self.upd_started {
+            self.upd_started = true;
+            if self.shot.is_none() {
+                self.start_check(ctx);
+            }
+        }
+        if let Some(rx) = &self.upd_check
+            && let Ok(r) = rx.try_recv()
+        {
+            self.upd_check = None;
+            match r {
+                Ok(found) => {
+                    self.upd_found = found;
+                    if self.standing() == Some(Standing::Behind) && self.settings.auto_update {
+                        self.start_update(ctx);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("launcher: update check: {e}");
+                    self.upd_note =
+                        Some(("Could not check for updates (offline?).".to_owned(), true));
+                }
+            }
+        }
+        if let Some(rx) = &self.upd_run
+            && let Ok(r) = rx.try_recv()
+        {
+            self.upd_run = None;
+            self.upd_note = Some(match r {
+                Ok(names) => {
+                    if names.iter().any(|n| n == "m2-launcher.exe") {
+                        self.restart_needed = true;
+                    }
+                    let tag = self
+                        .upd_found
+                        .as_ref()
+                        .map_or(String::new(), |f| f.manifest.short().to_owned());
+                    (
+                        if self.restart_needed {
+                            format!("Updated to build {tag}. Restart the launcher to finish.")
+                        } else {
+                            format!("Updated to build {tag}.")
+                        },
+                        false,
+                    )
+                }
+                Err(e) => (format!("Update failed, nothing changed: {e}"), true),
+            });
+        }
+    }
+
+    /// The header's corner: an update waiting, or a restart.
+    fn update_corner(&mut self, ui: &mut Ui, rect: Rect) {
+        let ctx = ui.ctx().clone();
+        let label = if self.restart_needed {
+            "RESTART TO UPDATE"
+        } else if self.upd_run.is_some() {
+            "UPDATING..."
+        } else if matches!(self.standing(), Some(Standing::Behind | Standing::Unknown)) {
+            "UPDATE AVAILABLE"
+        } else {
+            return;
+        };
+        let p = ui.painter_at(rect);
+        let w = self.fonts.width(&p, Role::Heading, 15.0, label) + 28.0;
+        let b = Rect::from_min_size(
+            pos2(rect.right() - PAD - w, rect.top() + 14.0),
+            vec2(w, 32.0),
+        );
+        let r = ui.interact(b, Id::new("update-corner"), Sense::click());
+        p.rect_filled(b, 4.0, if r.hovered() { GREEN_HOVER } else { GREEN });
+        self.fonts.text(
+            &p,
+            Role::Heading,
+            b.center(),
+            Align2::CENTER_CENTER,
+            15.0,
+            TEXT,
+            label,
+        );
+        if r.clicked() {
+            if self.restart_needed {
+                self.restart(&ctx);
+            } else if self.upd_run.is_none() {
+                self.start_update(&ctx);
+            }
+        }
+    }
+
+    /// The Options tab's Updates part.
+    fn updates_options(&mut self, ui: &mut Ui) -> bool {
+        let ctx = ui.ctx().clone();
+        let changed = ui
+            .checkbox(
+                &mut self.settings.auto_update,
+                "Update automatically when the launcher opens",
+            )
+            .changed();
+        let this = update::BUILD_SHA.map_or("a local build (not from a release)".to_owned(), |s| {
+            format!("build {}", update::short(s))
+        });
+        let latest = match (&self.upd_found, self.upd_check.is_some()) {
+            (_, true) => "checking...".to_owned(),
+            (Some(f), _) => format!(
+                "{} ({}){}",
+                f.manifest.tag,
+                f.manifest.short(),
+                match self.standing() {
+                    Some(Standing::UpToDate) => ", which this is",
+                    _ => "",
+                }
+            ),
+            (None, _) if update::RELEASE_REPO.is_none() => {
+                "not checked: a local build has no releases to look in".to_owned()
+            }
+            (None, _) => "none found".to_owned(),
+        };
+        egui::Grid::new("updates")
+            .num_columns(2)
+            .spacing([24.0, 12.0])
+            .show(ui, |ui| {
+                ui.label("This is");
+                ui.colored_label(DIM, this);
+                ui.end_row();
+                ui.label("Latest");
+                ui.colored_label(DIM, latest);
+                ui.end_row();
+                if let Some(prev) = update::previous(&self.program_dir) {
+                    ui.label("Kept");
+                    ui.colored_label(DIM, format!("build {} (to roll back to)", prev.short()));
+                    ui.end_row();
+                }
+            });
+        ui.horizontal(|ui| {
+            if update::RELEASE_REPO.is_some() && ui.button("Check now").clicked() {
+                self.start_check(&ctx);
+            }
+            let can_update = self.upd_run.is_none()
+                && matches!(self.standing(), Some(Standing::Behind | Standing::Unknown));
+            if ui
+                .add_enabled(can_update, egui::Button::new("Update"))
+                .clicked()
+            {
+                self.start_update(&ctx);
+            }
+            if ui
+                .add_enabled(
+                    update::previous(&self.program_dir).is_some() && self.upd_run.is_none(),
+                    egui::Button::new("Roll back"),
+                )
+                .clicked()
+            {
+                self.rollback();
+            }
+            if self.restart_needed && ui.button("Restart the launcher").clicked() {
+                self.restart(&ctx);
+            }
+        });
+        if let Some((note, bad)) = &self.upd_note {
+            ui.colored_label(if *bad { WARN } else { DIM }, note);
+        }
+        ui.colored_label(
+            FAINT,
+            "Updates replace only m2-alpha.exe and m2-launcher.exe; saves and settings are never touched.",
+        );
+        changed
+    }
+
     fn options_tab(&mut self, ui: &mut Ui, rect: Rect) {
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 0.0, BG);
         let inner = rect.shrink2(vec2(PAD + 8.0, 20.0));
-        let mut child = ui.new_child(UiBuilder::new().max_rect(inner));
+        // The Updates part keeps the bottom of the page.
+        let top = Rect::from_min_max(inner.min, pos2(inner.right(), inner.bottom() - 180.0));
+        let mut child = ui.new_child(UiBuilder::new().max_rect(top));
         let mut changed = false;
         let fonts = &self.fonts;
         let heading = |ui: &mut Ui, text: &str| {
@@ -1589,6 +2093,21 @@ impl App {
                     "Changes are kept at once, in m2-launcher.toml beside the launcher.",
                 );
             });
+        // Updates, below the rest (their own child: they need all of self).
+        let below = Rect::from_min_max(pos2(inner.left(), inner.bottom() - 170.0), inner.max);
+        let mut up = ui.new_child(UiBuilder::new().max_rect(below));
+        up.spacing_mut().item_spacing = vec2(10.0, 8.0);
+        self.fonts.text(
+            up.painter(),
+            Role::Heading,
+            below.left_top() + vec2(0.0, 4.0),
+            Align2::LEFT_TOP,
+            21.0,
+            TEXT,
+            "UPDATES",
+        );
+        up.add_space(34.0);
+        changed |= self.updates_options(&mut up);
         if changed {
             let install_changed = {
                 let (i, pass) = crate::find_install(
@@ -1668,6 +2187,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
+        self.poll_updates(&ctx);
         if self.scanned.elapsed() > Duration::from_secs(5) {
             self.rescan();
         }
@@ -1701,10 +2221,12 @@ impl eframe::App for App {
         let body = Rect::from_min_max(pos2(main.left(), header.bottom()), main.max);
         self.sidebar(ui, side);
         self.header(ui, header);
+        self.update_corner(ui, header);
         match self.tab {
             Tab::Play => self.play_tab(ui, body),
             Tab::Saves => self.saves_tab(ui, body),
             Tab::Stats => self.stats_tab(ui, body),
+            Tab::Achievements => self.achievements_tab(ui, body),
             Tab::Options => self.options_tab(ui, body),
         }
         if self.tab != Tab::Play {

@@ -376,6 +376,10 @@ pub struct SaveStats {
     pub contracts: Option<u32>,
     /// Each of [`FACTIONS`]' relation to the PMC, where the save has it.
     pub standing: Vec<(&'static str, f64)>,
+    /// The achievements the save shows earned
+    /// ([`crate::achievements::earned`]); none if its save data could not
+    /// be read.
+    pub earned: Option<Vec<&'static str>>,
     /// Why the scripts' save data could not be read, if it could not.
     pub problem: Option<String>,
 }
@@ -460,6 +464,7 @@ fn read_text(text: &str, out: &mut SaveStats) -> Result<(), String> {
                 .map(|n| (f, n))
         })
         .collect();
+    out.earned = Some(crate::achievements::earned(&save));
     Ok(())
 }
 
