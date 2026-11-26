@@ -3099,6 +3099,10 @@ struct Damper {
     /// wheel down (0x8219C338 counts the wheels whose contact timer the
     /// step just set to 0.4).
     grounded: bool,
+    /// The impulse [`damp_wheels`] gave this step along the contact's
+    /// normal (beyond Rapier's spring), N s: [`stand`] takes its level part
+    /// off with Rapier's.
+    extra: f32,
 }
 
 impl Damper {
@@ -3111,6 +3115,7 @@ impl Damper {
             prev: if length > 0.0 { squeeze } else { length },
             ready: false,
             grounded: false,
+            extra: 0.0,
         }
     }
 
@@ -3156,6 +3161,7 @@ fn damp_wheels(v: &mut VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
         };
         let _ = spring;
         let extra = (push - rapier) * mass * dt;
+        d.extra = extra;
         if extra != 0.0 {
             body.apply_impulse_at_point(
                 vector(vec3(ray.contact_normal_ws) * extra),
@@ -3200,12 +3206,17 @@ fn stand(v: &mut VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
     let Some(body) = bodies.get_mut(v.controller.chassis) else {
         return;
     };
-    for w in wheels {
+    for (i, w) in wheels.iter().enumerate() {
         let ray = w.raycast_info();
         if !ray.is_in_contact {
             continue;
         }
-        let push = w.wheel_suspension_force.min(w.max_suspension_force) * dt;
+        // Rapier's spring and the 360's damping ([`damp_wheels`]): the
+        // whole push, whose level part comes off by the footing (a damper's
+        // first-step kick on a 2-degree slope otherwise threw the dock's
+        // trailers 0.15 m/s sideways, q769j).
+        let damped = v.dampers.get(i).map_or(0.0, |d| d.extra);
+        let push = w.wheel_suspension_force.min(w.max_suspension_force) * dt + damped;
         let normal = vec3(ray.contact_normal_ws);
         let level = normal.with_y(0.0) * push * v.footing;
         body.apply_impulse_at_point(vector(-level), ray.contact_point_ws, true);
@@ -12973,6 +12984,66 @@ mod tests {
                 .any(|t| t.starts_with(&format!("vehicle {}", b.0))),
             "{told:?}"
         );
+    }
+
+    // On gentle ground a wheel's whole push, its damping's first-step kick
+    // too, is straight up (the level part off by the footing, 0x8219E020 /
+    // 0x8219C27C): a trailer kicked on its legs on a 2-degree slope is not
+    // thrown sideways (q769j: the dock's four trailers got -0.15 m/s across
+    // the slope at their kick, the Fuel Trailers ending 0.78 m off).
+    #[test]
+    fn a_first_step_kick_on_a_gentle_slope_goes_straight_up() {
+        let mut spec = car();
+        spec.tuning.springs = Some(Springs {
+            strength: (4.5, 15.0),
+            damping: (2.0, 3.0),
+            stretch: (0.4, 0.25),
+            squeeze: (0.3, 0.3),
+            extra: 0.0,
+            gravity_factor: 2.0,
+            radius: (0.71, 0.57),
+        });
+        let rear = spec
+            .wheels
+            .iter()
+            .map(|w| w.centre.z)
+            .fold(f32::MAX, f32::min);
+        let front = spec
+            .wheels
+            .iter()
+            .map(|w| w.centre.z)
+            .fold(f32::MIN, f32::max);
+        let r = spec.wheels[0].radius;
+        let at = |x: f32, y: f32, z: f32, steers: bool| crate::vehicle::WheelSpec {
+            centre: Vec3::new(x, y, z),
+            radius: r,
+            width: 0.3,
+            steers,
+        };
+        spec.spring_wheels = Some(
+            vec![
+                at(-0.54, 0.14, front, true),
+                at(-0.76, 0.59, rear, false),
+                at(0.76, 0.59, rear, false),
+                at(0.38, 0.14, front, true),
+            ]
+            .into(),
+        );
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
+        let tilt = Quat::from_rotation_z(2f32.to_radians());
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            tilt * Vec3::new(0.0, -1.0, 0.0),
+            tilt,
+        );
+        let id = p.add_vehicle_turned(&spec, Vec3::ZERO, tilt);
+        p.step(DT);
+        p.step(DT);
+        let v = p.vehicle_velocity(id);
+        assert!(v.y > 4.0, "no kick: {v}");
+        assert!(v.x.abs() < 0.05, "thrown across the slope: {v}");
     }
 
     // The push is never a pull: a spring stretching fast enough that its
