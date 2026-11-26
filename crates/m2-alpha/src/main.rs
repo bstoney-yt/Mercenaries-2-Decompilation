@@ -10712,7 +10712,11 @@ fn cargo_settle_check(game: &mut Game, tick: f32) {
                 eprintln!(
                     "cargo-settle-check: {:.0} s: the {label} {}; on its bed: {}",
                     k as f32 * tick,
-                    if w.physics.vehicle_asleep(id) { "asleep" } else { "awake" },
+                    if w.physics.vehicle_asleep(id) {
+                        "asleep"
+                    } else {
+                        "awake"
+                    },
                     states.join("; ")
                 );
             }
