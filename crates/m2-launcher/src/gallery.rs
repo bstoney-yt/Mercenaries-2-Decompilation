@@ -307,65 +307,67 @@ pub fn convert(
     out
 }
 
+/// Plays interleaved 16-bit `samples` (`channels` at `rate`) once on the
+/// default output; the stream and the sound's length come back. Dropped,
+/// the stream stops.
+#[cfg(windows)]
+pub fn output(samples: &[i16], channels: u16, rate: u32) -> Result<(cpal::Stream, f32), String> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    let device = cpal::default_host()
+        .default_output_device()
+        .ok_or("no sound output device")?;
+    let supported = device.default_output_config().map_err(|e| e.to_string())?;
+    let format = supported.sample_format();
+    let config: cpal::StreamConfig = supported.into();
+    let pcm = std::sync::Arc::new(convert(
+        samples,
+        channels,
+        rate,
+        config.channels,
+        config.sample_rate,
+    ));
+    let seconds = samples.len() as f32 / f32::from(channels.max(1)) / rate.max(1) as f32;
+    let mut at = 0usize;
+    let error = |e| eprintln!("gallery: sound: {e}");
+    let s = match format {
+        cpal::SampleFormat::F32 => device.build_output_stream::<f32, _, _>(
+            config,
+            move |data, _| {
+                for d in data.iter_mut() {
+                    *d = pcm.get(at).copied().unwrap_or(0.0);
+                    at += 1;
+                }
+            },
+            error,
+            None,
+        ),
+        cpal::SampleFormat::I16 => device.build_output_stream::<i16, _, _>(
+            config,
+            move |data, _| {
+                for d in data.iter_mut() {
+                    *d = (pcm.get(at).copied().unwrap_or(0.0) * 32767.0) as i16;
+                    at += 1;
+                }
+            },
+            error,
+            None,
+        ),
+        other => return Err(format!("unsupported sample format {other:?}")),
+    }
+    .map_err(|e| e.to_string())?;
+    s.play().map_err(|e| e.to_string())?;
+    Ok((s, seconds))
+}
+
 impl Player {
     /// Decodes stream `stream` and starts it on the default output.
     #[cfg(windows)]
     pub fn start(music: &Music, stream: usize) -> Result<Self, String> {
-        use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
         let buffer = music
             .streams
             .decode(&music.streams.music, stream)
             .map_err(|e| e.to_string())?;
-        let device = cpal::default_host()
-            .default_output_device()
-            .ok_or("no sound output device")?;
-        let supported = device.default_output_config().map_err(|e| e.to_string())?;
-        let format = supported.sample_format();
-        let config: cpal::StreamConfig = supported.into();
-        let pcm = convert(
-            &buffer.samples,
-            buffer.channels,
-            buffer.rate,
-            config.channels,
-            config.sample_rate,
-        );
-        let seconds = buffer.frames() as f32 / buffer.rate.max(1) as f32;
-        let pcm = std::sync::Arc::new(pcm);
-        let mut at = 0usize;
-        let error = |e| eprintln!("gallery: sound: {e}");
-        let s = match format {
-            cpal::SampleFormat::F32 => {
-                let pcm = pcm.clone();
-                device.build_output_stream::<f32, _, _>(
-                    config,
-                    move |data, _| {
-                        for d in data.iter_mut() {
-                            *d = pcm.get(at).copied().unwrap_or(0.0);
-                            at += 1;
-                        }
-                    },
-                    error,
-                    None,
-                )
-            }
-            cpal::SampleFormat::I16 => {
-                let pcm = pcm.clone();
-                device.build_output_stream::<i16, _, _>(
-                    config,
-                    move |data, _| {
-                        for d in data.iter_mut() {
-                            *d = (pcm.get(at).copied().unwrap_or(0.0) * 32767.0) as i16;
-                            at += 1;
-                        }
-                    },
-                    error,
-                    None,
-                )
-            }
-            other => return Err(format!("unsupported sample format {other:?}")),
-        }
-        .map_err(|e| e.to_string())?;
-        s.play().map_err(|e| e.to_string())?;
+        let (s, seconds) = output(&buffer.samples, buffer.channels, buffer.rate)?;
         Ok(Self {
             _stream: s,
             stream,
