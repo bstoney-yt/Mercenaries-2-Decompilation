@@ -3171,7 +3171,7 @@ mod tests {
             named: false,
             preset: Default::default(),
         };
-        props.shown.insert(0x1225f9, prop.clone());
+        props.shown.insert(0x1225f9, prop);
         let shape = CollisionShape::cuboid(Vec3::ONE);
         physics.add_static(
             StaticKey::Entity(0x1225f9),
