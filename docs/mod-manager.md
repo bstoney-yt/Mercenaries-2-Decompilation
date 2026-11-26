@@ -77,9 +77,20 @@ texture cache). Models, sounds and movies come later.
 5. The launcher's Mods page, reading and writing `mods.toml`.
 6. Save hash and co-op match.
 
+## Decisions
+
+- **Where mods live (2026-11-26, Brendan):** beside the game, in `mods\`
+  next to `m2-alpha` and the launcher, not under `%LOCALAPPDATA%`.
+  Consequence: the game's folder may not be writable (for example under
+  `Program Files`), so installing, removing or reordering a mod can fail.
+  The launcher checks it can write `mods\` (and `mods.toml`) before
+  changing anything. If it can't, it changes nothing and says why in plain
+  words: the folder is read-only, and the player can move the game to a
+  writable folder or give it write access. The game itself only reads
+  `mods\`, so it is unaffected.
+
 ## Open questions for review
 
-- Is `mods\` beside the game right, or `%LOCALAPPDATA%\m2-alpha\mods` (where photo mode's pictures go)?
 - Should script overrides replace whole modules only, or also allow adding functions to a module?
 - Should co-op refuse mismatched sets, or warn and play on?
 - Is `game` (the build range) needed in version 1, or is the mod's own version enough?
