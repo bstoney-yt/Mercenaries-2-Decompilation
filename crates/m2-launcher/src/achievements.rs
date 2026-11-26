@@ -11,9 +11,12 @@
 //!   [`SCRIPT`]): one `{sName, nRequiredCount}` per achievement, in the
 //!   order the page keeps. [`read_list`] reads it from the script's
 //!   bytecode as the launcher starts; the ids are the scripts' own.
-//! - Multiplayer, left out: `ACHIEVEMENT_PLAY_COOP`, and
-//!   `ACHIEVEMENT_DAMAGE_INC`, which `MrxAchievements.ProcessSupportEvent`
-//!   counts only while `Net.IsActive()` (co-op), in `tSupportUsedInCoop`.
+//! - Multiplayer, left out: `ACHIEVEMENT_PLAY_COOP`; `ACHIEVEMENT_DAMAGE_INC`,
+//!   which `MrxAchievements.ProcessSupportEvent` counts only while
+//!   `Net.IsActive()` (co-op), in `tSupportUsedInCoop`; and, **from the
+//!   public lists** (co-op or online in their descriptions),
+//!   `WHEELS_OF_STEEL` (its grant goes to the race's `_uWinner`),
+//!   `NOTHIN_BUT_GOODTIME` and `EVERYBODY_WANTSSOME`.
 //! - Earned in a save ([`RULES`]), each where its grant is:
 //!   - The five faction ones: `MrxFactionManager.SetRelation(faction,
 //!     "Pmc", n)` (script `b2cec5f5`) grants the faction's
@@ -46,8 +49,19 @@
 //! "not yet in this save", never "locked": it may have been earned in
 //! another save.
 //!
-//! **Invented**: the titles (the ids' words, capitalised) and each
-//! line's wording of the condition.
+//! **From public achievement lists** ([`OFFICIAL`]): the 360's titles
+//! and gamerscore, matched to the scripts' ids by hand (the ids are close
+//! to the titles: `BURNOUT` is Eat the Heat, `HELLOHURRAY` Hello, Hooray).
+//! Sources: worthplaying.com's list of 2008-08-09 (the non-secret ones)
+//! and vandal.elespanol.com's full list (all 40, 1000G), which agree on
+//! every title and score both have. The two faction lists also agree with
+//! the scripts' `sMaxRelationAchievement` table. 40 achievements against
+//! the scripts' 41 ids: `FIND_ALL_LANDMARKS` and `TECHNO_VIKING` are left
+//! unmatched (one is likely Aces High, 50G, "capture every objective"; the
+//! other may have been cut), and keep their id-based titles.
+//!
+//! **Invented**: each line's wording of what earns it ([`Official::about`]
+//! and [`RULES`]), and the id-based titles of the two unmatched ids.
 
 use m2_assets::lua::{Chunk, Constant, Function, Instruction};
 
@@ -60,7 +74,13 @@ pub const SCRIPT: u32 = 0x0fcc_e0ec;
 const PREFIX: &str = "ACHIEVEMENT_";
 
 /// The multiplayer ones, left off the page.
-pub const MULTIPLAYER: [&str; 2] = ["ACHIEVEMENT_PLAY_COOP", "ACHIEVEMENT_DAMAGE_INC"];
+pub const MULTIPLAYER: [&str; 5] = [
+    "ACHIEVEMENT_PLAY_COOP",
+    "ACHIEVEMENT_DAMAGE_INC",
+    "ACHIEVEMENT_WHEELS_OF_STEEL",
+    "ACHIEVEMENT_NOTHIN_BUT_GOODTIME",
+    "ACHIEVEMENT_EVERYBODY_WANTSSOME",
+];
 
 /// One achievement of the scripts' list.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,10 +91,278 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// The id's words, capitalised: `ACHIEVEMENT_WILD_ONE` is "Wild One".
+    /// The 360's title, else the id's words, capitalised
+    /// (`ACHIEVEMENT_FOO_BAR` is "Foo Bar").
     pub fn title(&self) -> String {
-        title(&self.id)
+        official(&self.id).map_or_else(|| title(&self.id), |o| o.title.to_owned())
     }
+}
+
+/// An achievement's name and gamerscore as the 360 shows them, with a line
+/// of what earns it in the launcher's own words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Official {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub score: u32,
+    /// What earns it (the launcher's wording, from the public lists and
+    /// what the scripts check).
+    pub about: &'static str,
+}
+
+const fn o(id: &'static str, title: &'static str, score: u32, about: &'static str) -> Official {
+    Official {
+        id,
+        title,
+        score,
+        about,
+    }
+}
+
+/// The 360's titles and gamerscore for the scripts' ids (**from public
+/// achievement lists**, matched to the ids by hand: see the module docs).
+/// The ids not here (`FIND_ALL_LANDMARKS`, `TECHNO_VIKING`) could not be
+/// matched for sure and keep their id-based titles.
+pub const OFFICIAL: [Official; 39] = [
+    o(
+        "ACHIEVEMENT_MILLIONAIRE",
+        "Tattooed Millionaire",
+        25,
+        "Make your first million",
+    ),
+    o(
+        "ACHIEVEMENT_PLAY_COOP",
+        "Partners in Crime",
+        50,
+        "Play co-op",
+    ),
+    o(
+        "ACHIEVEMENT_PIPELINE",
+        "Pipeline",
+        20,
+        "Take every outpost for one faction",
+    ),
+    o(
+        "ACHIEVEMENT_BURNOUT",
+        "Eat the Heat",
+        10,
+        "Spin the wheels on the spot",
+    ),
+    o(
+        "ACHIEVEMENT_SCHOOLS_OUT",
+        "School's Out",
+        20,
+        "Get through the opening contract's training",
+    ),
+    o(
+        "ACHIEVEMENT_RAGE",
+        "The Rage",
+        20,
+        "Finish the contract that frees Carmona",
+    ),
+    o(
+        "ACHIEVEMENT_HELLOHURRAY",
+        "Hello, Hooray",
+        50,
+        "Set up the PMC",
+    ),
+    o(
+        "ACHIEVEMENT_WILD_ONE",
+        "Wild One",
+        20,
+        "Bring Ewan on board",
+    ),
+    o(
+        "ACHIEVEMENT_RIDE_DRAGON",
+        "Ride the Dragon",
+        10,
+        "Take the tank from the village",
+    ),
+    o(
+        "ACHIEVEMENT_ARMAGGEDON",
+        "Armaggedon It",
+        20,
+        "Bring down 20 buildings",
+    ),
+    o(
+        "ACHIEVEMENT_SHOOTTHRILL",
+        "Shoot to Thrill",
+        20,
+        "Score 25 headshots",
+    ),
+    o(
+        "ACHIEVEMENT_DAMAGE_INC",
+        "Damage, Inc.",
+        50,
+        "Call 20 air strikes in co-op",
+    ),
+    o(
+        "ACHIEVEMENT_NO_COMPROMISE",
+        "No Compromise, No Regrets",
+        20,
+        "Take part in the fight for Caracas",
+    ),
+    o(
+        "ACHIEVEMENT_RUNNING_WITH_DEVIL",
+        "Runnin' with the Devil",
+        20,
+        "Deal with Blanco",
+    ),
+    o(
+        "ACHIEVEMENT_BETTER_RUN",
+        "You Better Run",
+        20,
+        "Deal with Carmona",
+    ),
+    o(
+        "ACHIEVEMENT_ANALOG_KID",
+        "The Analog Kid",
+        20,
+        "Bring Misha on board",
+    ),
+    o(
+        "ACHIEVEMENT_OIL_AND_GAZ",
+        "Oil and Gasoline",
+        20,
+        "Bring Eva on board",
+    ),
+    o(
+        "ACHIEVEMENT_HERO_AND_MADMAN",
+        "The Hero and the Madman",
+        50,
+        "Finish the story",
+    ),
+    o(
+        "ACHIEVEMENT_HAIL_AND_KILL",
+        "Hail and Kill",
+        20,
+        "Wreck 50 things in melee",
+    ),
+    o(
+        "ACHIEVEMENT_HOLY_SMOKE",
+        "Holy Smoke",
+        20,
+        "Wreck 50 things with grenades",
+    ),
+    o(
+        "ACHIEVEMENT_LITTLE_SAVAGE",
+        "Little Savage",
+        20,
+        "Wreck 50 things with rockets",
+    ),
+    o(
+        "ACHIEVEMENT_BALLS_TO_THE_WALL",
+        "Balls to the Wall",
+        20,
+        "Beat the winch challenge",
+    ),
+    o(
+        "ACHIEVEMENT_GONE_SHOOTIN",
+        "Gone Shootin'",
+        20,
+        "Finish one of Fiona's hunting contracts",
+    ),
+    o(
+        "ACHIEVEMENT_HEAVY_METAL_THUNDER",
+        "Heavy Metal Thunder",
+        10,
+        "Steal 10 vehicles",
+    ),
+    o(
+        "ACHIEVEMENT_QUICK_OR_DEAD",
+        "Be Quick or Be Dead",
+        10,
+        "Snipe 50 drivers",
+    ),
+    o(
+        "ACHIEVEMENT_STAND_UP_AND_SHOUT",
+        "Stand Up and Shout",
+        10,
+        "Allied Nations' standing at its best",
+    ),
+    o(
+        "ACHIEVEMENT_FOREVER_FREE",
+        "Forever Free",
+        10,
+        "UPLA's standing at its best",
+    ),
+    o(
+        "ACHIEVEMENT_ISLAND_DOMINATION",
+        "Island of Domination",
+        10,
+        "The Pirates' standing at its best",
+    ),
+    o(
+        "ACHIEVEMENT_LONGING_FOR_FIRE",
+        "Longing for Fire",
+        10,
+        "China's standing at its best",
+    ),
+    o(
+        "ACHIEVEMENT_DIRTY_DEEDS",
+        "Dirty Deeds",
+        10,
+        "Universal Petroleum's standing at its best",
+    ),
+    o(
+        "ACHIEVEMENT_NO_MORE_MR_NICE_GUY",
+        "No More Mr. Nice Guy",
+        10,
+        "Have every faction hostile at once",
+    ),
+    o(
+        "ACHIEVEMENT_JUSTICE_FOR_ALL",
+        "...And Justice for All",
+        50,
+        "Verify every high-value target",
+    ),
+    o(
+        "ACHIEVEMENT_DIGITAL_MAN",
+        "Digital Man",
+        20,
+        "Unlock everything in the shops",
+    ),
+    o(
+        "ACHIEVEMENT_BURN_THE_SKY",
+        "We'll Burn the Sky",
+        50,
+        "Open every landing zone",
+    ),
+    o(
+        "ACHIEVEMENT_HIGHWAY_TO_HELL",
+        "Highway to Hell",
+        10,
+        "Finish three different races",
+    ),
+    o(
+        "ACHIEVEMENT_WHEELS_OF_STEEL",
+        "Wheels of Steel",
+        50,
+        "Win a co-op race",
+    ),
+    o(
+        "ACHIEVEMENT_NOTHIN_BUT_GOODTIME",
+        "Nothin' But a Good Time",
+        50,
+        "Wreck 200 things from a gunner's seat in co-op",
+    ),
+    o(
+        "ACHIEVEMENT_EVERYBODY_WANTSSOME",
+        "Everybody Wants Some!!",
+        50,
+        "Play online with someone who has it",
+    ),
+    o(
+        "ACHIEVEMENT_BILLIONAIRE",
+        "Billion Dollar Babies",
+        25,
+        "Make a billion",
+    ),
+];
+
+/// The 360's name and score for `id`, where it is known.
+pub fn official(id: &str) -> Option<&'static Official> {
+    OFFICIAL.iter().find(|o| o.id == id)
 }
 
 pub fn title(id: &str) -> String {
@@ -347,6 +635,22 @@ mod tests {
         let sp = single_player(list);
         assert_eq!(sp.len(), 1);
         assert_eq!(sp[0].title(), "Wild One");
+        assert_eq!(
+            Entry {
+                id: "ACHIEVEMENT_BURNOUT".into(),
+                required: 1
+            }
+            .title(),
+            "Eat the Heat"
+        );
+        assert_eq!(
+            Entry {
+                id: "ACHIEVEMENT_TECHNO_VIKING".into(),
+                required: 1
+            }
+            .title(),
+            "Techno Viking"
+        );
     }
 
     #[test]
@@ -396,6 +700,23 @@ mod tests {
         // No flag, or false, is not earned.
         let bare = parse(r#"{["bResourceCountersEnabled"]=false,}"#).unwrap();
         assert!(earned(&bare).is_empty());
+    }
+
+    #[test]
+    fn the_official_list_adds_up() {
+        // 39 matched of the 360's 40 (Aces High, 50G, unmatched): 950G.
+        assert_eq!(OFFICIAL.iter().map(|o| o.score).sum::<u32>(), 950);
+        let mut ids: Vec<_> = OFFICIAL.iter().map(|o| o.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), OFFICIAL.len());
+        for m in MULTIPLAYER {
+            assert!(official(m).is_some(), "{m}");
+        }
+        for (id, ..) in RULES {
+            assert!(official(id).is_some(), "{id}");
+        }
+        assert!(official("ACHIEVEMENT_FIND_ALL_LANDMARKS").is_none());
     }
 
     #[test]

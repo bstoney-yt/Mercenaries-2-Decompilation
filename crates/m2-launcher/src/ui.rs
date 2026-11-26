@@ -1607,9 +1607,14 @@ impl App {
                         colour,
                         &name,
                     );
-                    let line = match achievements::rule(&e.id) {
+                    let how = match achievements::rule(&e.id) {
                         Some((_, how)) => how,
                         None => achievements::untracked_reason(&e.id, e.required),
+                    };
+                    let official = achievements::official(&e.id);
+                    let line = match official {
+                        Some(o) => format!("{}  -  {how}", o.about),
+                        None => format!("Not matched to the 360's list  -  {how}"),
                     };
                     self.fonts.text(
                         &p,
@@ -1618,13 +1623,24 @@ impl App {
                         Align2::LEFT_TOP,
                         14.0,
                         DIM,
-                        line,
+                        &line,
                     );
                     let w = self.fonts.width(&p, Role::Heading, 13.0, label) + 22.0;
                     let pill = Rect::from_min_size(
                         pos2(row.right() - 10.0 - w, row.center().y - 12.0),
                         vec2(w, 24.0),
                     );
+                    if let Some(o) = official {
+                        self.fonts.text(
+                            &p,
+                            Role::BodyBold,
+                            pos2(pill.left() - 14.0, row.center().y),
+                            Align2::RIGHT_CENTER,
+                            16.0,
+                            colour,
+                            &format!("{}G", o.score),
+                        );
+                    }
                     if state == State::Earned {
                         p.rect_filled(pill, 12.0, GREEN);
                     } else {
