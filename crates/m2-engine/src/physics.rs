@@ -3067,15 +3067,38 @@ fn driven_rpm(
 /// hop in Xenia trailers3/4 (v_y +2.20 and +2.23), none for the Austin cab
 /// (its ground is at Cmp) or the Phoenix.
 ///
+/// A wheel finds ground only once its contact count (the wheel's +0x34)
+/// is above 0 (0x8219F62C); else the step pushes nothing and sets `prev`
+/// to L (0x8219F798 with L). The set-up zeroes the count (0x8219F224), and
+/// it is raised and lowered by an overlap listener (+1 at 0x82198EE8, -1 at
+/// 0x82198EF8: its +0x18), which the world's step feeds. So a vehicle's
+/// first wheel step, before any world step since it was added, finds no
+/// ground, and the next one kicks by c x (L - cur) per wheel: Xenia
+/// parkedcar1's Phoenix (-0.15, then +0.475; this gives +0.46), trailers3's
+/// Box Trailer (+5.29) and 0xF030B (+5.11). Inferred, not read: that
+/// the count is the wheel phantom's overlaps from the world's broad phase,
+/// so that one world step must run first; when the 360 builds a vehicle
+/// before a world step in its frame, its first wheel step has its ground
+/// (prev = Cmp: trailers4's +2.20 and +2.23), which the port, adding
+/// vehicles between steps, never does ([`Damper::ready`]).
+///
 /// Inferred: the push is along the contact's normal (the 360's is VMX),
 /// and 0x8262C120 gives the body's mass. Rapier pushes the spring part
-/// (`k x (L - cur)`, at least 0) itself; [`damp_wheels`] adds the rest.
+/// (`k x (L - cur)`, at least 0) itself; [`damp_wheels`] adds the rest
+/// (or takes Rapier's back on a step with no ground of the 360's).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Damper {
     k: f32,
     c: f32,
     length: f32,
     prev: f32,
+    /// Its contact count is up: a world step has run since its vehicle
+    /// was added.
+    ready: bool,
+    /// It had ground of the 360's this step: what the car step counts as a
+    /// wheel down (0x8219C338 counts the wheels whose contact timer the
+    /// step just set to 0.4).
+    grounded: bool,
 }
 
 impl Damper {
@@ -3086,6 +3109,8 @@ impl Damper {
             c,
             length,
             prev: if length > 0.0 { squeeze } else { length },
+            ready: false,
+            grounded: false,
         }
     }
 
@@ -3093,10 +3118,14 @@ impl Damper {
     /// push per kilogram the 360 gives it (at least 0; m/s² once times
     /// the mass), and the spring part of it alone (at least 0), Rapier's.
     fn step(&mut self, cur: Option<f32>, dt: f32) -> (f32, f32) {
-        let Some(cur) = cur else {
+        // No ground of the 360's on its first step ([`Damper::ready`]).
+        let ready = std::mem::replace(&mut self.ready, true);
+        let Some(cur) = cur.filter(|_| ready) else {
             self.prev = self.length;
+            self.grounded = false;
             return (0.0, 0.0);
         };
+        self.grounded = true;
         let speed = (cur - self.prev) / dt.max(1e-6);
         self.prev = cur;
         let spring = self.k * (self.length - cur);
@@ -3119,7 +3148,14 @@ fn damp_wheels(v: &mut VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
         let ray = w.raycast_info();
         let cur = ray.is_in_contact.then_some(ray.suspension_length);
         let (push, spring) = d.step(cur, dt);
-        let extra = (push - spring) * mass * dt;
+        // Rapier pushed its spring part already (none off the ground).
+        let rapier = if cur.is_some() {
+            (d.k * (d.length - ray.suspension_length)).max(0.0)
+        } else {
+            0.0
+        };
+        let _ = spring;
+        let extra = (push - rapier) * mass * dt;
         if extra != 0.0 {
             body.apply_impulse_at_point(
                 vector(vec3(ray.contact_normal_ws) * extra),
@@ -4090,11 +4126,17 @@ impl Physics {
             // template's `GravityFactor` less one of its weight more
             // (from the 360 code, at 0x8219EE14, by its gravity of 10 m/s²,
             // [`GRAVITY_360`]).
+            // A wheel is down when the 360's step gave it ground
+            // ([`Damper::grounded`]: none on its first step).
             let wheels = v.controller.wheels();
-            let down = wheels
-                .iter()
-                .filter(|w| w.raycast_info().is_in_contact)
-                .count();
+            let down = if v.dampers.is_empty() {
+                wheels
+                    .iter()
+                    .filter(|w| w.raycast_info().is_in_contact)
+                    .count()
+            } else {
+                v.dampers.iter().filter(|d| d.grounded).count()
+            };
             if !v.wrecked && v.gravity_factor != 1.0 && down * 2 > wheels.len() {
                 let pull = (v.gravity_factor - 1.0) * v.mass * GRAVITY_360 * dt;
                 if let Some(b) = w.bodies.get_mut(v.controller.chassis) {
@@ -11477,7 +11519,10 @@ mod tests {
         let tilt = Quat::from_rotation_z(-30f32.to_radians());
         p.add_static(StaticKey::Cell(1), &shape, Vec3::ZERO, tilt);
         p.step(DT);
-        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.3, 0.0), 0.0);
+        // Put on the slope as a parked car is, turned to it (not level with
+        // its uphill wheels sunk in it: their springs' first step would
+        // throw it, as the 360's first wheel step does, [`Damper`]).
+        let id = p.add_vehicle_turned(&car(), tilt * Vec3::new(0.0, 0.3, 0.0), tilt);
         for _ in 0..240 {
             p.drive(
                 id,
@@ -12687,50 +12732,62 @@ mod tests {
     /// [`Damper`] push (started at Cmp) over one step, less its weight.
     fn first_kick(wheels: &[(f32, f32, f32, f32, f32)], f: f32) -> f32 {
         let dt = 1.0 / 60.0;
-        let push: f32 = wheels
+        let weight = WORLD_GRAVITY + (f - 1.0) * GRAVITY_360;
+        let mut dampers: Vec<Damper> = wheels
             .iter()
-            .map(|&(k, c, length, squeeze, cur)| {
-                Damper::new(k, c, length, squeeze).step(Some(cur), dt).0
-            })
+            .map(|&(k, c, length, squeeze, _)| Damper::new(k, c, length, squeeze))
+            .collect();
+        // Its first step: no ground (pushes nothing, and no wheel down, so
+        // no extra weight either: Xenia parkedcar1's Phoenix -0.150).
+        let mut v = 0.0;
+        for (d, w) in dampers.iter_mut().zip(wheels) {
+            assert_eq!(d.step(Some(w.4), dt).0, 0.0);
+            assert!(!d.grounded);
+        }
+        v -= WORLD_GRAVITY * dt;
+        // Its second: each spring from its whole length to where it is.
+        let push: f32 = dampers
+            .iter_mut()
+            .zip(wheels)
+            .map(|(d, w)| d.step(Some(w.4), dt).0)
             .sum();
-        (push - (WORLD_GRAVITY + (f - 1.0) * GRAVITY_360)) * dt
+        v + (push - weight) * dt
     }
 
-    // The 360's wheel step starts each spring's last length at its squeeze
-    // (0x8219EF90), so a wheel whose ground stands closer than that on its
-    // first step reads a fast squeeze and its damping kicks it up. The
-    // installed templates at their authored poses (springs as cast with
-    // the template's wheel radius): the Fuel Trailer's front axle (k 4.5,
-    // c 2.0, L 0.70, Cmp 0.30) -0.016 m long, its rear (15, 3.0, 0.55,
-    // 0.30) 0.156: about 2.1 m/s up, Xenia trailers3 +2.20; the Box
-    // Trailer's (front 4.5, 1.7, 0.70, 0.30 at -0.125; rear 15, 3.0, 0.60,
-    // 0.30 at 0.172) about 2.2, Xenia +2.23; the Austin cab's six (15, 2.0,
-    // 0.315, 0.115 at 0.119) none, Xenia none; the Phoenix's (25, 1.0,
-    // 0.35, 0.20 at 0.177, 0.139, 0.249, 0.227; gravity factor 1.7) about
-    // nothing, Xenia none.
+    // A vehicle's first wheel step finds no ground (its contact count is
+    // 0 until a world step has run, 0x8219F62C), so its springs start the
+    // next one from their whole length and their damping kicks it up by c x
+    // (L - cur) per wheel. The installed templates at their authored poses
+    // (springs as cast with the template's wheel radius): the Phoenix's
+    // (25, 1.0, 0.35, 0.20 at 0.177, 0.139, 0.249, 0.227; gravity factor
+    // 1.7) +0.46 m/s, Xenia parkedcar1 +0.475; the Fuel Trailer's (front
+    // 4.5, 2.0, 0.70, 0.30 at -0.016; rear 15, 3.0, 0.55, 0.30 at 0.156)
+    // about 5.1, Xenia trailers3/4 0xF030B +5.11; the Box Trailer's (front
+    // 4.5, 1.7, 0.70, 0.30 at -0.125; rear 15, 3.0, 0.60, 0.30 at 0.172)
+    // about 5.2, Xenia trailers3 +5.29. (Not the Austin cab: at the port's
+    // squeeze, 0.205 on all six, this gives it +2.3, where Xenia's cabs land
+    // from a fall without a kick; open, see #769.)
     #[test]
-    fn a_wheel_whose_ground_is_nearer_than_its_squeeze_kicks_on_its_first_step() {
+    fn a_vehicles_springs_kick_on_its_first_step_with_ground() {
         let pair = |w: (f32, f32, f32, f32, f32)| [w, w];
-        let fuel: Vec<_> = pair((4.5, 2.0, 0.70, 0.30, -0.016))
-            .into_iter()
-            .chain(pair((15.0, 3.0, 0.55, 0.30, 0.156)))
-            .collect();
-        let v = first_kick(&fuel, 2.0);
-        assert!((v - 2.12).abs() < 0.05, "fuel trailer {v}");
-        let boxed: Vec<_> = pair((4.5, 1.7, 0.70, 0.30, -0.125))
-            .into_iter()
-            .chain(pair((15.0, 3.0, 0.60, 0.30, 0.172)))
-            .collect();
-        let v = first_kick(&boxed, 2.0);
-        assert!((v - 2.23).abs() < 0.05, "box trailer {v}");
-        let cab = [(15.0, 2.0, 0.315, 0.115, 0.119); 6];
-        assert!(first_kick(&cab, 2.0) < 0.0, "the cab");
         let phoenix: Vec<_> = [0.177, 0.139, 0.249, 0.227]
             .iter()
             .map(|&cur| (25.0, 1.0, 0.35, 0.20, cur))
             .collect();
         let v = first_kick(&phoenix, 1.7);
-        assert!(v.abs() < 0.02, "phoenix {v}");
+        assert!((v - 0.46).abs() < 0.03, "phoenix {v}");
+        let fuel: Vec<_> = pair((4.5, 2.0, 0.70, 0.30, -0.016))
+            .into_iter()
+            .chain(pair((15.0, 3.0, 0.55, 0.30, 0.156)))
+            .collect();
+        let v = first_kick(&fuel, 2.0);
+        assert!((v - 5.11).abs() < 0.2, "fuel trailer {v}");
+        let boxed: Vec<_> = pair((4.5, 1.7, 0.70, 0.30, -0.125))
+            .into_iter()
+            .chain(pair((15.0, 3.0, 0.60, 0.30, 0.172)))
+            .collect();
+        let v = first_kick(&boxed, 2.0);
+        assert!((v - 5.29).abs() < 0.2, "box trailer {v}");
     }
 
     // The push is never a pull: a spring stretching fast enough that its
@@ -12740,6 +12797,7 @@ mod tests {
     fn a_wheel_push_is_never_a_pull() {
         let mut d = Damper::new(25.0, 3.0, 0.35, 0.20);
         assert_eq!(d.prev, 0.20);
+        d.ready = true;
         let (push, spring) = d.step(Some(0.34), 1.0 / 60.0);
         assert_eq!(push, 0.0);
         assert!(spring > 0.0);

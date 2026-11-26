@@ -5684,6 +5684,17 @@ impl Game {
                     touching()
                 );
             }
+            // Its springs' first kick, step by step: the 360's first wheel
+            // step finds no ground, the second kicks (Xenia parkedcar1:
+            // -0.15, then the kick).
+            if (2..=3).contains(&n) {
+                eprintln!(
+                    "first steps: island vehicle {:#x} {label}: step {n} v_y {:+.3} (first wheel step without ground: the 360's L mode), asleep {}",
+                    w.entity,
+                    v.y,
+                    physics.vehicle_asleep(id)
+                );
+            }
             if !FIRST_STEPS_WATCHED.contains(&w.entity) {
                 continue;
             }
@@ -5835,7 +5846,7 @@ struct Watched {
 /// (0x8218CAA8: 0x82185FE0 -> vfunc +0x128) with nothing reading the
 /// ground. The layers author them at rest (survey of 1397 state-layer
 /// and 35 static cars and tanks: 871 within 5 cm of the wheels' rest on
-/// the terrain). It is added asleep ([`Physics::sleep_vehicle`]). It
+/// the terrain). It is stepped from add (Xenia parkedcar1). It
 /// waits until there is something under it within
 /// [`AUTHORED_FLOOR`] (its deck or bridge loaded, not only the terrain far
 /// below): invented, the 360 makes it with its layer.
@@ -5893,13 +5904,13 @@ pub(crate) fn place(
         if !floor {
             return false;
         }
-        let id = physics.add_vehicle_turned(&v.spec, at, turn.normalize());
-        // Added asleep, as the 360's layer loader adds it (its bodies added
-        // with activation 0, 0x82165958; Xenia settle7: a fresh parked
-        // Phoenix asleep from its first sample), until its driver, a push
-        // or something awake touching it wakes it.
-        physics.sleep_vehicle(id);
-        v.id = Some(id);
+        // Stepped from the first step after it is added, then asleep by the
+        // 360's check once still ([`Physics::vehicle_asleep`]): Xenia
+        // parkedcar1, all six freshly streamed parked cars simulated from
+        // add (their springs' first kick, v_y +0.48 to +1.46) and asleep
+        // 0.87 to 2.75 s later. Goods, unlike vehicles, are added asleep
+        // ([`Physics::add_cargo`]).
+        v.id = Some(physics.add_vehicle_turned(&v.spec, at, turn.normalize()));
         return true;
     }
     // As the scripts said: there, upright at its yaw, once any ground
