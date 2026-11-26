@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! m2-launcher [--dir <game folder>] [--install <dir>]
-//!             [--screenshot <out.png>] [--tab play|saves|stats|options]
+//!             [--screenshot <out.png>] [--tab play|saves|stats|achievements|options]
 //! ```
 //!
 //! `--dir` is where `m2-alpha` and its saves are (default: the launcher's
@@ -20,6 +20,7 @@
 
 #![cfg_attr(feature = "windowed", windows_subsystem = "windows")]
 
+mod achievements;
 mod assets;
 mod launch;
 mod save_stats;
@@ -102,13 +103,14 @@ fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
                     "play" => ui::Tab::Play,
                     "saves" => ui::Tab::Saves,
                     "stats" => ui::Tab::Stats,
+                    "achievements" => ui::Tab::Achievements,
                     "options" => ui::Tab::Options,
-                    v => bail!("--tab {v}: expected play, saves, stats or options"),
+                    v => bail!("--tab {v}: expected play, saves, stats, achievements or options"),
                 }
             }
             "-h" | "--help" => {
                 println!(
-                    "m2-launcher [--dir <game folder>] [--install <dir>] [--screenshot <out.png>] [--tab play|saves|stats|options]"
+                    "m2-launcher [--dir <game folder>] [--install <dir>] [--screenshot <out.png>] [--tab play|saves|stats|achievements|options]"
                 );
                 std::process::exit(0);
             }

@@ -15,9 +15,9 @@ points of interest). Nothing from the game is committed or cached on disk.
 ## Layout
 
 - **Sidebar:** who is playing, the game (Mercenaries 2), the pages still
-  to come (What's New, Achievements, Mods, Gallery) and Settings.
-- **Header:** the game's name and the tabs: Play, Saves, Stats, Options,
-  and Patch Notes (to come).
+  to come (What's New, Mods, Gallery) and Settings.
+- **Header:** the game's name and the tabs: Play, Saves, Stats,
+  Achievements, Options, and Patch Notes (to come).
 - **Play:** the banner (steps on every 12 s; arrows and dots step it by
   hand) over the bar: the save picker on the left (Continue with the
   newest save, any other save, or a new game), Play in the middle, and
@@ -37,6 +37,15 @@ points of interest). Nothing from the game is committed or cached on disk.
   PMC (Hostile, Neutral or Friendly, as the game's scripts grade it). A
   record stamped 0:00:00 (saved without the pause menu opening, which the
   360 never does) shows the scripts' own clock instead, marked `*`.
+- **Achievements:** the game's single-player achievements (39), read at
+  start from the scripts' own list in the install (`MrxAchievements`), for
+  the save picked at the top. The 360 keeps earned achievements in the
+  player's profile, not in saves, so a save can show only those whose
+  condition it keeps: the five faction ones (standing at 100), the first
+  contract's, the PMC hunting contracts' and the resource counters'. Each
+  of those reads Earned or Not yet (in this save); the rest read Not
+  tracked, with why. Titles are the ids' words; the game's own names and
+  descriptions are not in the PC install.
 - **Options:** the game window (size, windowed or fullscreen), skipping
   the EA and Pandemic movies, keeping the launcher open, and the install,
   program and save folders. Kept in `m2-launcher.toml` beside it.
@@ -76,5 +85,3 @@ Each fits as a sidebar page or a tab:
 - **Mods:** a mod manager for `m2-modapi`.
 - **Bug report:** bundles `last-run.log` and the build's details.
 - **Gallery:** the game's movies and music, from the install.
-- **Achievements:** the game's single-player achievements, from its own
-  list.
