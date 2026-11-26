@@ -2950,7 +2950,7 @@ impl TerrainMesh {
                     (Vec3::from(a), Quat::from_array(r))
                 });
             let base = vertices.len() as u32;
-            vertices.extend(v.into_iter().map(|p| turn * Vec3::from(p) + at));
+            vertices.extend(v.into_iter().map(|p| seamless(turn * Vec3::from(p) + at)));
             triangles.extend(
                 t.into_iter()
                     .map(|t| [t[0] + base, t[1] + base, t[2] + base]),
@@ -3316,6 +3316,27 @@ fn cell_surface(m: &TerrainMaterial) -> TerrainSurface {
         }
         None => TerrainSurface::Surface(m.material.clone()),
     }
+}
+
+/// A terrain cell's half width, metres (cells are 400 m square).
+const CELL_HALF: f32 = 200.0;
+
+/// `p` (in a cell's space) with an edge coordinate put exactly on the
+/// cell's edge: a cell's PHY2 vertices are quantised to its bounds of
+/// +-199.99998 m, which leaves a 0.04 mm seam between neighbouring cells
+/// that a ray straight down on the boundary falls through (#801: a drive
+/// check spawned on x = 2800 never landed; a dinghy on z = -400 was
+/// pushed along the seam). Invented: the 360's handling of the seam isn't
+/// read.
+fn seamless(p: Vec3) -> Vec3 {
+    let snap = |v: f32| {
+        if (v.abs() - CELL_HALF).abs() < 1e-3 {
+            CELL_HALF.copysign(v)
+        } else {
+            v
+        }
+    };
+    Vec3::new(snap(p.x), p.y, snap(p.z))
 }
 
 /// Reads and decodes terrain cell `hash` centred at `centre`.
@@ -3818,6 +3839,41 @@ mod tests {
         let from = Vec3::new(2.0, 5.0, 1.5);
         let (d, _) = physics.cast_ray(from, Vec3::NEG_Y, 10.0).expect("ground");
         assert!((from.y - d - 2.12).abs() < 1e-3, "ground at {}", from.y - d);
+        // Two neighbouring cells' PHY2 meshes, quantised to +-199.99998 m,
+        // meet without a seam: a ray straight down on their boundary hits.
+        let edge = |x0: f32, x1: f32| m2_assets::physics::Shape {
+            geometry: m2_assets::physics::Geometry::Mesh {
+                vertices: vec![
+                    [x0, 0.0, -5.0],
+                    [x1, 0.0, -5.0],
+                    [x1, 0.0, 5.0],
+                    [x0, 0.0, 5.0],
+                ],
+                triangles: vec![[0, 2, 1], [0, 3, 2]],
+                flags: vec![10, 10],
+            },
+            ..phy.shapes[0].clone()
+        };
+        let mut seam = crate::Physics::new();
+        for (k, (x0, x1, at)) in [(-10.0, 199.99998, 0.0), (-199.99998, 10.0, 400.0)]
+            .into_iter()
+            .enumerate()
+        {
+            let one = m2_assets::physics::Physics {
+                shapes: vec![edge(x0, x1)],
+                ..phy.clone()
+            };
+            let c = mesh.collision_of(&one).expect("mesh");
+            seam.add_static(
+                crate::physics::StaticKey::Cell(k as u32),
+                &c,
+                Vec3::new(at, 0.0, 0.0),
+                Quat::IDENTITY,
+            );
+        }
+        seam.step(1.0 / 60.0);
+        let hit = seam.cast_ray(Vec3::new(200.0, 5.0, 0.0), Vec3::NEG_Y, 10.0);
+        assert!(hit.is_some(), "a ray on the cells' boundary fell through");
         // Without a mesh shape, none (the drawn ground stays).
         let empty = m2_assets::physics::Physics {
             shapes: Vec::new(),
