@@ -93,6 +93,18 @@ impl Default for Settings {
     }
 }
 
+/// The window size a first run starts with: the primary monitor's, in
+/// pixels (`points` times `pixels_per_point`), even, and no smaller than
+/// the smallest size offered. Invented: the game's own launcher had no
+/// such default.
+pub fn monitor_size(points: (f32, f32), pixels_per_point: f32) -> (u32, u32) {
+    let px = |v: f32, least: u32| {
+        let v = (v * pixels_per_point.max(0.1)).round().max(0.0) as u32;
+        (v - v % 2).max(least)
+    };
+    (px(points.0, 640), px(points.1, 360))
+}
+
 impl Settings {
     pub fn read(path: &Path) -> Self {
         std::fs::read_to_string(path)
@@ -242,6 +254,12 @@ mod tests {
         };
         let text = toml::to_string_pretty(&s).unwrap();
         assert_eq!(toml::from_str::<Settings>(&text).unwrap(), s);
+        // A first run's size follows the monitor, in pixels.
+        assert_eq!(monitor_size((1920.0, 1080.0), 1.0), (1920, 1080));
+        assert_eq!(monitor_size((1280.0, 720.0), 2.0), (2560, 1440));
+        assert_eq!(monitor_size((1366.5, 767.4), 1.0), (1366, 766));
+        assert_eq!(monitor_size((800.0, 600.0), 1.0), (800, 600));
+        assert_eq!(monitor_size((0.0, 0.0), 1.0), (640, 360));
         let partial: Settings = toml::from_str("width = 1280\nheight = 720\n").unwrap();
         assert_eq!((partial.width, partial.display), (1280, Display::Windowed));
     }

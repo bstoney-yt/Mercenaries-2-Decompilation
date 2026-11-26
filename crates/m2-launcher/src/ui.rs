@@ -31,6 +31,7 @@ use crate::update::{self, Found, Standing};
 use crate::{Args, Paths};
 
 mod contracts;
+mod whats_new;
 
 const BG: Color32 = Color32::from_rgb(0x26, 0x26, 0x26);
 const SIDEBAR: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x1a);
@@ -61,6 +62,7 @@ pub enum Tab {
     Stats,
     Achievements,
     Contracts,
+    WhatsNew,
     Options,
 }
 
@@ -146,6 +148,9 @@ pub struct App {
     save_stats: Vec<(u32, Result<SaveStats, String>)>,
     shot: Option<Shot>,
     started: Instant,
+    /// No settings file yet: the window size is set from the monitor's
+    /// once egui knows it ([`launch::monitor_size`]).
+    size_from_monitor: bool,
 }
 
 impl std::fmt::Debug for App {
@@ -165,6 +170,7 @@ impl App {
         style.visuals.selection.bg_fill = GREEN;
         cc.egui_ctx.set_global_style(style);
 
+        let size_from_monitor = !paths.settings.exists();
         let settings = Settings::read(&paths.settings);
         let game_settings = GameSettings::read(&paths.game_settings);
         let (install, pass_install) =
@@ -228,6 +234,7 @@ impl App {
                 asked: false,
             }),
             started: Instant::now(),
+            size_from_monitor,
         }
     }
 
@@ -447,7 +454,7 @@ impl App {
         self.fonts.text(
             &p,
             Role::Heading,
-            pos2(icon.right() + 12.0, item.center().y + 1.0),
+            pos2(icon.right() + 12.0, item.center().y - 1.0),
             Align2::LEFT_BOTTOM,
             19.0,
             TEXT,
@@ -456,7 +463,7 @@ impl App {
         self.fonts.text(
             &p,
             Role::Body,
-            pos2(icon.right() + 12.0, item.center().y + 2.0),
+            pos2(icon.right() + 12.0, item.center().y + 4.0),
             Align2::LEFT_TOP,
             14.0,
             DIM,
@@ -475,7 +482,7 @@ impl App {
             "COMING SOON",
         );
         y += 24.0;
-        for (i, name) in ["What's New", "Mods", "Gallery"].into_iter().enumerate() {
+        for (i, name) in ["Mods", "Gallery"].into_iter().enumerate() {
             let item =
                 Rect::from_min_size(pos2(rect.left() + 8.0, y), vec2(rect.width() - 16.0, 40.0));
             let r = ui.interact(item, Id::new(("side-soon", i)), Sense::hover());
@@ -564,7 +571,7 @@ impl App {
             (Some(Tab::Achievements), "ACHIEVEMENTS"),
             (Some(Tab::Contracts), "CONTRACTS"),
             (Some(Tab::Options), "OPTIONS"),
-            (None, "PATCH NOTES"),
+            (Some(Tab::WhatsNew), "WHAT'S NEW"),
         ];
         for (i, (tab, name)) in tabs.into_iter().enumerate() {
             let w = self.fonts.width(&p, Role::Heading, 19.0, name);
@@ -2190,6 +2197,17 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if self.size_from_monitor
+            && let Some(points) = ctx.input(|i| i.viewport().monitor_size)
+        {
+            self.size_from_monitor = false;
+            let ppp = ctx
+                .input(|i| i.viewport().native_pixels_per_point)
+                .unwrap_or(1.0);
+            let (w, h) = launch::monitor_size((points.x, points.y), ppp);
+            self.settings.width = w;
+            self.settings.height = h;
+        }
         self.poll(&ctx);
         self.poll_updates(&ctx);
         if self.scanned.elapsed() > Duration::from_secs(5) {
@@ -2232,6 +2250,7 @@ impl eframe::App for App {
             Tab::Stats => self.stats_tab(ui, body),
             Tab::Achievements => self.achievements_tab(ui, body),
             Tab::Contracts => self.contracts_tab(ui, body),
+            Tab::WhatsNew => self.whats_new_tab(ui, body),
             Tab::Options => self.options_tab(ui, body),
         }
         if self.tab != Tab::Play {
