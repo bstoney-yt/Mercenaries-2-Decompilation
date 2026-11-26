@@ -2164,11 +2164,13 @@ fn build_scene(
     sea_level: f32,
     mission: bool,
     hero: Hero,
+    park: bool,
 ) -> anyhow::Result<Game> {
     let mut scene = Scene::new(backend)?;
     scene.hero = hero;
-    // The catalogue's vehicles are no mission's.
-    scene.park = !mission;
+    // The catalogue's vehicles are no mission's, nor a check's of the
+    // game's own placings (`park`).
+    scene.park = park && !mission;
     if double_sided {
         scene.materials.set_double_sided(backend, true)?;
     }
@@ -3443,6 +3445,9 @@ fn screenshot(
         config.world.sea_level,
         options.mission,
         config.hero,
+        // Not by a check of how the layers' vehicles stand: the
+        // catalogue's are the port's own (q769h: two landed on trailers).
+        !options.parked_settle_check,
     )?;
     start_startup(
         &mut game,
@@ -5429,6 +5434,7 @@ fn front_end_offscreen(
         config.world.sea_level,
         false,
         config.hero,
+        true,
     )?;
     let mut hud = ui::Hud::new();
     let mut shell = gamehud::GameHud::start_shell(install);
@@ -14243,6 +14249,7 @@ impl App {
             self.config.world.sea_level,
             self.mission,
             self.config.hero,
+            true,
         )?;
         start_startup(
             &mut game,
