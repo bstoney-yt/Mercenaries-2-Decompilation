@@ -219,8 +219,10 @@ pub struct Props {
     /// are pulled that many times the world's gravity
     /// ([`Physics::set_debris_gravity`]).
     pub gravity_scales: HashMap<u32, f32>,
-    /// Shown since their model came in, their collision not yet up.
-    unwalled: HashSet<u32>,
+    /// Shown since their model came in, their collision (or body) not yet
+    /// up: built in order within the rebuild's budget each update
+    /// ([`BuildQueue`]).
+    unwalled: BuildQueue,
     /// Put up by the scripts from a template with no physics component
     /// ([`m2_engine::durability::physical`]): drawn, but with no
     /// collision, as on the 360 (the paradrop plane, whose jumpers are
@@ -357,6 +359,54 @@ struct Near {
 
 /// How long uploading loaded models may take a frame (at least one is).
 const UPLOAD_BUDGET: Duration = Duration::from_millis(4);
+
+/// The rebuild's time each update ([`BuildQueue`]): from the 360 code, 0.01 s
+/// (0x820B7AE0, read in 0x82152780).
+const REBUILD_BUDGET: Duration = Duration::from_millis(10);
+
+/// The objects waiting for their collision or body, as the 360's object
+/// rebuild queue runs them (0x82152780, from the physics manager's update
+/// 0x82152B68):
+/// - in the order they were queued (first in, first built);
+/// - before each build the time since the loop began, by the time base
+///   (TBLr over 0x82E80668's rate), is checked against 0.01 s (0x820B7AE0),
+///   and once over it the loop stops (so at least one builds each update);
+/// - what is left stays queued, in order, for the next update.
+///
+/// The port measures with the wall clock ([`Instant`]). INFERRED: its build
+/// costs differ from the 360's, so where a batch splits differs.
+#[derive(Debug, Default)]
+pub(crate) struct BuildQueue {
+    order: std::collections::VecDeque<u32>,
+    queued: HashSet<u32>,
+}
+
+impl BuildQueue {
+    /// Queues `e` (once).
+    pub(crate) fn insert(&mut self, e: u32) -> bool {
+        let new = self.queued.insert(e);
+        if new {
+            self.order.push_back(e);
+        }
+        new
+    }
+
+    /// Whether `e` waits.
+    pub(crate) fn contains(&self, e: &u32) -> bool {
+        self.queued.contains(e)
+    }
+
+    /// The next to build, if `elapsed` since this update's loop began is
+    /// not over `budget` (checked before each build, 0x82152780).
+    pub(crate) fn next_within(&mut self, budget: Duration, elapsed: Duration) -> Option<u32> {
+        if elapsed > budget {
+            return None;
+        }
+        let e = self.order.pop_front()?;
+        self.queued.remove(&e);
+        Some(e)
+    }
+}
 
 /// Threads decoding models.
 const LOADERS: usize = 3;
@@ -765,6 +815,11 @@ impl Props {
         // vehicle): its bodies give way to its ride.
         if self.as_body.contains(&entity) {
             self.drop_bodies(physics, entity);
+        }
+        // Not before the rebuild has built it ([`BuildQueue`]): the 360's
+        // goods are bodies only once their object is built (0x82182848).
+        if self.unwalled.contains(&entity) {
+            return false;
         }
         let Some(p) = self.shown.get(&entity) else {
             return false;
@@ -2044,8 +2099,10 @@ impl Props {
             self.swings.remove(&e);
             self.unwalled.insert(e);
         }
-        // Those shown since their model came in: their collision.
-        for e in std::mem::take(&mut self.unwalled) {
+        // Those shown since their model came in: their collision, in the
+        // order they came, within the rebuild's budget ([`BuildQueue`]).
+        let started = Instant::now();
+        while let Some(e) = self.unwalled.next_within(REBUILD_BUDGET, started.elapsed()) {
             let Some(p) = self.shown.get(&e) else {
                 continue;
             };
@@ -2111,7 +2168,7 @@ impl Props {
         {
             let (hash, cpu) = self.decoded.swap_remove(i);
             self.asked.remove(&hash);
-            self.upload(backend, materials, source, physics, hash, cpu)?;
+            self.upload(backend, materials, source, hash, cpu)?;
             if started.elapsed() > UPLOAD_BUDGET {
                 break;
             }
@@ -2191,14 +2248,13 @@ impl Props {
         near
     }
 
-    /// Uploads model `hash`, loaded (or not), and gives the props using it
-    /// their collision.
+    /// Uploads model `hash`, loaded (or not), and queues the props using it
+    /// for their collision ([`BuildQueue`]).
     fn upload(
         &mut self,
         backend: &mut dyn RenderBackend,
         materials: &mut MaterialCache,
         source: &mut AssetSource<BufReader<File>>,
-        physics: &mut Physics,
         hash: u32,
         cpu: Result<(CpuModel, Vec<u32>, Option<GateModel>), String>,
     ) -> anyhow::Result<()> {
@@ -2228,6 +2284,7 @@ impl Props {
         if reach.is_finite() {
             self.widest = self.widest.max(reach);
         }
+        let mut queued = Vec::new();
         if let Some(shape) = &cpu.collision {
             let mut through = Vec::new();
             for (&e, p) in self.shown.iter().filter(|(_, p)| p.model == hash) {
@@ -2239,16 +2296,12 @@ impl Props {
                 }
                 // As at every other place its collision goes up
                 // ([`walled`](Self::walled)): q618h, the paradrop plane's
-                // model coming in after it was shown put its collision up
-                // here, bodiless or not.
+                // model coming in after it was shown put its collision up,
+                // bodiless or not. Queued for the rebuild ([`BuildQueue`]),
+                // as the 360 builds an object once its model's physics is
+                // in (0x82182848), not at once.
                 if self.walled(e, p) {
-                    physics.add_static_as(
-                        StaticKey::Entity(e),
-                        shape,
-                        p.position,
-                        p.rotation,
-                        p.preset,
-                    );
+                    queued.push(e);
                 }
             }
             if !through.is_empty() {
@@ -2290,6 +2343,9 @@ impl Props {
                 gate,
             }),
         );
+        for e in queued {
+            self.unwalled.insert(e);
+        }
         Ok(())
     }
 
@@ -3053,6 +3109,51 @@ mod tests {
     // Goods are added asleep and at rest (the 360's add, activation 0,
     // 0x82165958), and wake once something awake touches them: a moving
     // truck's bed, here a body dropped onto them.
+    // The rebuild builds in the order queued, checking its 0.01 s before
+    // each build (0x82152780): a batch over the budget is split across
+    // updates, the rest kept in order for the next; one under it builds in
+    // one update; at least one builds each update.
+    #[test]
+    fn the_rebuild_builds_in_order_within_its_budget() {
+        let mut q = BuildQueue::default();
+        for e in [5, 3, 9, 3, 7] {
+            q.insert(e);
+        }
+        // Each build "costs" 4 ms of a 10 ms budget: three this update.
+        let mut spent = Duration::ZERO;
+        let mut first = Vec::new();
+        while let Some(e) = q.next_within(REBUILD_BUDGET, spent) {
+            first.push(e);
+            spent += Duration::from_millis(4);
+        }
+        assert_eq!(first, vec![5, 3, 9], "in order, split by the budget");
+        assert!(q.contains(&7));
+        // The next update: the leftovers, in order.
+        let mut spent = Duration::ZERO;
+        let mut second = Vec::new();
+        while let Some(e) = q.next_within(REBUILD_BUDGET, spent) {
+            second.push(e);
+            spent += Duration::from_millis(4);
+        }
+        assert_eq!(second, vec![7]);
+        // Under the budget: all in one update.
+        for e in [1, 2] {
+            q.insert(e);
+        }
+        let all: Vec<u32> =
+            std::iter::from_fn(|| q.next_within(REBUILD_BUDGET, Duration::ZERO)).collect();
+        assert_eq!(all, vec![1, 2]);
+        // Even a long first build: one each update.
+        q.insert(4);
+        q.insert(6);
+        assert_eq!(q.next_within(REBUILD_BUDGET, Duration::ZERO), Some(4));
+        assert_eq!(
+            q.next_within(REBUILD_BUDGET, Duration::from_millis(30)),
+            None
+        );
+        assert!(q.contains(&6));
+    }
+
     // Goods loaded where their records overlap (0.3-0.5 m, as the El
     // Grande's do) go back to sleep together after the step they were
     // added at, at rest, and are not pushed apart (Xenia settle8: one
