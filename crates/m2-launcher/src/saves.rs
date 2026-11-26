@@ -18,8 +18,9 @@
 //! the play time shown as `%d:%02d:%02d`.
 //!
 //! **Invented**: the file names and slot numbers (`m2-alpha`'s `save.rs`
-//! and pause menu), and the `.world.toml` beside each record (the port's
-//! own, copied and deleted with it). Saves of the port's older TOML
+//! and pause menu). Nothing else goes with a record: the `.world.toml`
+//! that builds from #781 to #783 wrote beside it is not copied, and a
+//! stale one is deleted with its slot. Saves of the port's older TOML
 //! format (`m2-alpha-save<n>.toml`) are still listed, with no play time,
 //! contract or percent (they had none).
 
@@ -38,11 +39,12 @@ pub const RECORD_SIZE: u32 = 0x3458;
 /// The owner's id `m2-alpha` writes (`save_record::OWNER`, invented).
 pub const OWNER: u32 = 0;
 
-/// The extensions of a slot's files: the record, the port's world file
-/// beside it, and the old TOML save.
+/// The extensions of a slot's files: the record, the old TOML save, and
+/// the stale world file earlier builds wrote beside the record (deleted
+/// with the slot, never copied).
 const RECORD: &str = "sav";
-const WORLD: &str = "world.toml";
 const LEGACY: &str = "toml";
+const STALE_WORLD: &str = "world.toml";
 
 /// Slot `n`'s file name, without its extension.
 fn stem(n: u32) -> String {
@@ -59,16 +61,17 @@ fn file_name(n: u32) -> String {
     format!("{}.{RECORD}", stem(n))
 }
 
-/// Slot `n`'s files in `dir`: the record, its world file, the old save.
+/// Slot `n`'s files in `dir`: the record, the old save, the stale world
+/// file.
 fn files(dir: &Path, n: u32) -> [PathBuf; 3] {
     let s = stem(n);
-    [RECORD, WORLD, LEGACY].map(|e| dir.join(format!("{s}.{e}")))
+    [RECORD, LEGACY, STALE_WORLD].map(|e| dir.join(format!("{s}.{e}")))
 }
 
 /// The file slot `n` in `dir` holds its save in: the record, else an old
 /// TOML save.
 fn save_file(dir: &Path, n: u32) -> Option<PathBuf> {
-    let [record, _, legacy] = files(dir, n);
+    let [record, legacy, _] = files(dir, n);
     [record, legacy].into_iter().find(|p| p.is_file())
 }
 
@@ -232,7 +235,8 @@ pub fn free_slot(dir: &Path) -> Option<u32> {
 pub fn copy(dir: &Path, from: u32) -> Result<u32, String> {
     let to = free_slot(dir).ok_or("every slot is full")?;
     save_file(dir, from).ok_or("that slot is empty")?;
-    for (a, b) in files(dir, from).into_iter().zip(files(dir, to)) {
+    // The record or old save; a stale world file stays behind.
+    for (a, b) in files(dir, from).into_iter().zip(files(dir, to)).take(2) {
         if a.is_file() {
             std::fs::copy(a, b).map_err(|e| e.to_string())?;
         }
@@ -422,7 +426,9 @@ stock = []
             std::fs::write(d.join(format!("{}.world.toml", stem(n))), "version = 1\n").unwrap();
         }
         assert_eq!(copy(&d, 0), Ok(3));
-        assert!(d.join("m2-alpha-save3.world.toml").is_file());
+        // A stale world file is not copied, and goes with its slot.
+        assert!(!d.join("m2-alpha-save3.world.toml").exists());
+        std::fs::write(d.join("m2-alpha-save3.world.toml"), "version = 1\n").unwrap();
         assert_eq!(copy(&d, 1), Ok(5));
         assert_eq!(scan(&d).len(), 6);
         delete(&d, 3).unwrap();

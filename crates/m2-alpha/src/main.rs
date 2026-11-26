@@ -168,8 +168,8 @@ const LAUNCH_CHECK_LIMIT: Duration = Duration::from_secs(240);
 /// Seconds of play before `--save-check` saves (invented: the island and
 /// the scripts' first steps are in by then).
 const SAVE_CHECK_AFTER: f32 = 20.0;
-/// How near the saved place `--save-check-no-world` wants her for the
-/// world file's place to be dropped, metres (invented).
+/// How near a start `--load-check` wants her (or the saved place for
+/// it to count as restored), metres (invented).
 const WORLD_CHECK_METRES: f32 = 10.0;
 /// Longest real time a single frame may advance the simulation by, so a
 /// stall (dragging the window, a breakpoint) doesn't fast-forward the game.
@@ -557,16 +557,16 @@ struct Options {
     /// that pause-menu slot in the 360's record layout, read back and its
     /// fields compared with what was saved; PASS or FAIL, and the run ends.
     save_check: Option<u32>,
-    /// `--save-check-no-world`: with `--load <save> --screenshot
-    /// --mission`, the save loads the 360's way (its record alone, the
-    /// invented world file left out); [`SAVE_CHECK_AFTER`] seconds in,
-    /// where she is, her health and weapons are logged against what the
-    /// world file had and against the starts; the verdict is the finding.
-    save_check_no_world: bool,
+    /// `--load-check` (`--save-check-no-world` still names it): with
+    /// `--load <save> --screenshot --mission`, [`SAVE_CHECK_AFTER`] seconds
+    /// into the load her place, health, rifle rounds and the scripts' clock
+    /// are compared with run A's note ([`CheckNote`]); PASS when she is
+    /// back at a start, at full health and ammo, the story data back.
+    load_check: bool,
     /// `--save-check-move`: with `--save-check`, she is first sent over
     /// [`MOVE_CHECK_METRES`] from where play began, hurt and re-armed
-    /// ([`move_check`]), and the start kept beside the save for
-    /// `--save-check-no-world`.
+    /// ([`move_check`]); what was saved and the start are kept beside the
+    /// save ([`CheckNote`]) for `--load-check`.
     save_check_move: bool,
     /// The file `--load` read.
     load_path: Option<PathBuf>,
@@ -1397,7 +1397,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--pause-at" => o.pause_at = Some(value()?.parse()?),
             "--new-game" => o.start = Some(flow::Start::NewGame),
             "--launch-check" => o.launch_check = true,
-            "--save-check-no-world" => o.save_check_no_world = true,
+            "--load-check" | "--save-check-no-world" => o.load_check = true,
             "--save-check-move" => o.save_check_move = true,
             "--save-check" => {
                 let n: u32 = value()?
@@ -2429,22 +2429,20 @@ fn write_save(game: &Game, mission: Option<&mission::MissionLink>, path: &std::p
     }
 }
 
-/// What `--save-check-no-world` found: where a load of the record alone
-/// left her.
+/// Where a load left her (`--load-check`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WorldVerdict {
-    /// Within [`WORLD_CHECK_METRES`] of where she was saved: the scripts
-    /// put her back, and the world file's place can go.
+enum LoadVerdict {
+    /// Within [`WORLD_CHECK_METRES`] of where she was saved.
     Restored,
-    /// Within it of the start (where run A's play began, or where this
-    /// run's began), not of the saved place: the 360's load leaves her
-    /// at the start, and the world file is what brings her back.
+    /// Within it of a start (where run A's play began, or this run's), not
+    /// of the saved place: the 360's load, which leaves her place to the
+    /// scripts' start.
     ResetToStart,
     /// Near neither.
     Elsewhere,
 }
 
-impl WorldVerdict {
+impl LoadVerdict {
     /// From her distances to the saved place and to the starts known.
     fn from_gaps(saved: f32, starts: &[f32]) -> Self {
         if saved <= WORLD_CHECK_METRES {
@@ -2458,111 +2456,208 @@ impl WorldVerdict {
 
     fn name(self) -> &'static str {
         match self {
-            Self::Restored => "PASS_RESTORED",
+            Self::Restored => "RESTORED",
             Self::ResetToStart => "RESET_TO_START",
             Self::Elsewhere => "ELSEWHERE",
         }
     }
 }
 
-/// Where `--save-check-move` keeps the place run A's play began, beside
-/// the save (`m2-alpha-save<n>.start.txt`: `x y z`; invented, for the
-/// check only).
-fn check_start_path(save: &std::path::Path) -> std::path::PathBuf {
-    let name = save
-        .file_name()
-        .map_or(String::new(), |n| n.to_string_lossy().into_owned());
-    let stem = name.split('.').next().unwrap_or("save").to_owned();
-    save.with_file_name(format!("{stem}.start.txt"))
+/// Her state as the load checks compare it.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct CheckState {
+    position: [f32; 3],
+    hp: f32,
+    max_hp: f32,
+    /// The rifle's rounds in its clip and stored, and a full clip.
+    rifle: [u32; 2],
+    rifle_full: u32,
+    grenades: u32,
+    weapon: String,
 }
 
-fn read_check_start(save: &std::path::Path) -> Option<[f32; 3]> {
-    let text = std::fs::read_to_string(check_start_path(save)).ok()?;
-    let v: Vec<f32> = text
-        .split_whitespace()
-        .filter_map(|w| w.parse().ok())
-        .collect();
-    (v.len() == 3).then(|| [v[0], v[1], v[2]])
+impl CheckState {
+    fn of(game: &Game) -> Option<Self> {
+        let p = game.scene.player.as_ref()?;
+        let c = &game.combat;
+        Some(Self {
+            position: p.character.position.to_array(),
+            hp: c.hp,
+            max_hp: c.max_hp,
+            rifle: [c.rifle_rounds.clip, c.rifle_rounds.stored],
+            rifle_full: c.rifle.clip,
+            grenades: c.grenades,
+            weapon: format!("{:?}", c.weapon),
+        })
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "{:?}, health {:.0} of {:.0}, {} up, rifle {:?} (full clip {}), grenades {}",
+            self.position,
+            self.hp,
+            self.max_hp,
+            self.weapon,
+            self.rifle,
+            self.rifle_full,
+            self.grenades
+        )
+    }
 }
 
-/// `--save-check-no-world`: where she is after a load of the record
-/// alone (the 360's path), against what the save's world file had (her
-/// place, health, weapons, rounds) and against the starts: where run A's
-/// play began (`start`, from `--save-check-move`) and where this run's
-/// did (`own_start`). The verdict ([`WorldVerdict`]) is the finding;
-/// FAIL only when there was nothing to compare.
-fn world_check(
+/// What run A (`--save-check-move`) keeps beside the save for run B
+/// (`m2-alpha-save<n>.check.txt`; invented, for the checks only): where
+/// play began, her state as saved, and the seconds played the record has.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct CheckNote {
+    start: [f32; 3],
+    saved: CheckState,
+    played: u32,
+}
+
+impl CheckNote {
+    fn path(save: &std::path::Path) -> std::path::PathBuf {
+        let name = save
+            .file_name()
+            .map_or(String::new(), |n| n.to_string_lossy().into_owned());
+        let stem = name.split('.').next().unwrap_or("save").to_owned();
+        save.with_file_name(format!("{stem}.check.txt"))
+    }
+
+    fn to_text(&self) -> String {
+        let [x, y, z] = self.start;
+        let [a, b, c] = self.saved.position;
+        format!(
+            "start {x} {y} {z}\nsaved {a} {b} {c}\nhp {} {}\nrifle {} {} {}\ngrenades {}\nplayed {}\n",
+            self.saved.hp,
+            self.saved.max_hp,
+            self.saved.rifle[0],
+            self.saved.rifle[1],
+            self.saved.rifle_full,
+            self.saved.grenades,
+            self.played
+        )
+    }
+
+    fn from_text(text: &str) -> Option<Self> {
+        let mut n = Self::default();
+        for line in text.lines() {
+            let mut w = line.split_whitespace();
+            let key = w.next()?;
+            let v: Vec<f32> = w.filter_map(|x| x.parse().ok()).collect();
+            match (key, v.as_slice()) {
+                ("start", [x, y, z]) => n.start = [*x, *y, *z],
+                ("saved", [x, y, z]) => n.saved.position = [*x, *y, *z],
+                ("hp", [h, m]) => (n.saved.hp, n.saved.max_hp) = (*h, *m),
+                ("rifle", [c, s, f]) => {
+                    n.saved.rifle = [*c as u32, *s as u32];
+                    n.saved.rifle_full = *f as u32;
+                }
+                ("grenades", [g]) => n.saved.grenades = *g as u32,
+                ("played", [p]) => n.played = *p as u32,
+                _ => return None,
+            }
+        }
+        Some(n)
+    }
+}
+
+/// `--load-check` (or `--save-check-no-world`): where she is after a load
+/// (now always the 360's way: the record and the scripts' `LoadSingleton`),
+/// against run A's note ([`CheckNote`]) and where this run began
+/// (`own_start`): place, health, rifle rounds, and the scripts' own clock
+/// (whether their save data came back). PASS when the load did what the
+/// 360's does: she is at a start ([`LoadVerdict::ResetToStart`]), at full
+/// health with a full rifle clip, and the scripts' clock carried on from
+/// the record's play time.
+fn load_check(
     game: &Game,
-    saved: Option<&save::WorldRef>,
-    start: Option<[f32; 3]>,
+    link: &mut mission::MissionLink,
+    note: Option<&CheckNote>,
     own_start: Option<[f32; 3]>,
 ) -> bool {
     use m2_math::glam::Vec3;
-    let Some(was) = saved.and_then(|w| w.player.as_ref()) else {
-        eprintln!("save-world-check: FAIL: the save had no world file to compare with");
+    let Some(note) = note else {
+        eprintln!(
+            "load-check: FAIL: no check note beside the save (run A with --save-check-move first)"
+        );
         return false;
     };
-    let Some(now) = game.save().and_then(|s| s.player) else {
-        eprintln!("save-world-check: FAIL: she is not on the island");
+    let Some(now) = CheckState::of(game) else {
+        eprintln!("load-check: FAIL: she is not on the island");
         return false;
     };
     let here = Vec3::from(now.position);
     let gap = |to: [f32; 3]| here.distance(Vec3::from(to));
     let level = |to: [f32; 3]| (here - Vec3::from(to)).with_y(0.0).length();
-    eprintln!(
-        "save-world-check: place: now {:?}, saved {:?}: {:.1} m apart ({:.1} m level)",
-        now.position,
-        was.position,
-        gap(was.position),
-        level(was.position)
-    );
+    eprintln!("load-check: now: {}", now.summary());
+    eprintln!("load-check: saved: {}", note.saved.summary());
     let mut starts = Vec::new();
-    for (what, at) in [("run A's start", start), ("this run's start", own_start)] {
+    for (what, at, start) in [
+        ("the saved place", Some(note.saved.position), false),
+        ("run A's start", Some(note.start), true),
+        ("this run's start", own_start, true),
+    ] {
         match at {
             Some(at) => {
                 eprintln!(
-                    "save-world-check: place vs {what} {at:?}: {:.1} m apart ({:.1} m level)",
+                    "load-check: place vs {what} {at:?}: {:.1} m apart ({:.1} m level)",
                     gap(at),
                     level(at)
                 );
-                starts.push(gap(at));
+                if start {
+                    starts.push(gap(at));
+                }
             }
-            None => eprintln!("save-world-check: place vs {what}: not known"),
+            None => eprintln!("load-check: place vs {what}: not known"),
         }
     }
+    let verdict = LoadVerdict::from_gaps(gap(note.saved.position), &starts);
+    let full_health = (now.hp - now.max_hp).abs() < 0.5;
+    let full_clip = now.rifle[0] == now.rifle_full;
+    let clock = link.stamp_pause().map_or(0, |s| s.played.max(0.0) as u32);
+    let story = clock >= note.played;
+    let mut ok = verdict == LoadVerdict::ResetToStart;
+    for (what, good, said) in [
+        (
+            "health full",
+            full_health,
+            format!(
+                "{:.0} of {:.0} (saved {:.0})",
+                now.hp, now.max_hp, note.saved.hp
+            ),
+        ),
+        (
+            "rifle clip full",
+            full_clip,
+            format!("{:?} (saved {:?})", now.rifle, note.saved.rifle),
+        ),
+        (
+            "story data restored",
+            story,
+            format!(
+                "the scripts' clock {clock} s, the record's {} s",
+                note.played
+            ),
+        ),
+    ] {
+        eprintln!(
+            "load-check: {} {what}: {said}",
+            if good { "ok  " } else { "BAD " }
+        );
+        ok &= good;
+    }
     eprintln!(
-        "save-world-check: health: now {:.0}, saved {:.0} ({})",
-        now.hp,
-        was.hp,
-        if (now.hp - was.hp).abs() < 0.5 {
-            "same"
-        } else {
-            "differs"
-        }
-    );
-    let weapons = |p: &save::PlayerSave| {
-        format!(
-            "{} up, guns {:?}, rifle {:?}, launcher {:?}, grenades {}, explosives {:?}",
-            p.weapon, p.guns, p.rifle, p.launcher, p.grenades, p.explosives
-        )
-    };
-    let (wn, ww) = (weapons(&now), weapons(was));
-    eprintln!("save-world-check: weapons now: {wn}");
-    eprintln!(
-        "save-world-check: weapons saved: {ww} ({})",
-        if wn == ww { "same" } else { "differs" }
-    );
-    let verdict = WorldVerdict::from_gaps(gap(was.position), &starts);
-    eprintln!(
-        "save-world-check: {} ({:.1} m from the saved place; {WORLD_CHECK_METRES} m or less counts)",
+        "load-check: {} ({:.1} m from the saved place; {WORLD_CHECK_METRES} m counts)",
         verdict.name(),
-        gap(was.position)
+        gap(note.saved.position)
     );
-    true
+    eprintln!("load-check: {}", if ok { "PASS" } else { "FAIL" });
+    ok
 }
 
 /// `--save-check-move`'s preparation for run A: where play began, when
-/// she was sent away, and whether she has been hurt and re-armed.
+/// she was sent away.
 #[derive(Debug, Default)]
 struct MoveCheck {
     start: Option<[f32; 3]>,
@@ -2582,8 +2677,9 @@ const MOVE_CHECK_METRES: f32 = 100.0;
 /// town ([`scene::DEFAULT_SPAWN`], land; from the boat start about 4.6
 /// km), and once she has landed there hurts her to half health, spends
 /// rifle rounds and a grenade and puts her second weapon up. `Some`
-/// when it is time to save (whether the preparation held), else `None`.
-fn move_check(game: &mut Game, check: &mut MoveCheck, t: f32, slot: u32) -> Option<bool> {
+/// when it is time to save (whether the preparation held), with the note
+/// for run B (its played time filled in once saved), else `None`.
+fn move_check(game: &mut Game, check: &mut MoveCheck, t: f32) -> Option<(bool, CheckNote)> {
     use m2_math::glam::Vec3;
     if t < MOVE_CHECK_AT {
         return None;
@@ -2599,11 +2695,6 @@ fn move_check(game: &mut Game, check: &mut MoveCheck, t: f32, slot: u32) -> Opti
         game.on_foot = true;
         check.sent_at = Some(t);
         eprintln!("save-check-move: play began at {start:?}; sent to ({x:.0}, {z:.0}) on foot");
-        let path = check_start_path(&pause_save_path(slot));
-        let line = format!("{} {} {}\n", start[0], start[1], start[2]);
-        if let Err(e) = std::fs::write(&path, line) {
-            eprintln!("save-check-move: could not keep the start: {e}");
-        }
         return None;
     };
     let landed = game
@@ -2614,14 +2705,14 @@ fn move_check(game: &mut Game, check: &mut MoveCheck, t: f32, slot: u32) -> Opti
     if !landed {
         if t - sent > MOVE_CHECK_LAND_LIMIT {
             eprintln!("save-check-move: FAIL: she had not landed {MOVE_CHECK_LAND_LIMIT} s after");
-            return Some(false);
+            return Some((false, CheckNote::default()));
         }
         return None;
     }
     if t - sent < MOVE_CHECK_SETTLE {
         return None;
     }
-    let before = game.save().and_then(|s| s.player)?;
+    let before = CheckState::of(game)?;
     let c = &mut game.combat;
     c.hp = (c.max_hp * 0.5).round().max(1.0);
     c.rifle_rounds.clip = c.rifle_rounds.clip.saturating_sub(7);
@@ -2629,16 +2720,13 @@ fn move_check(game: &mut Game, check: &mut MoveCheck, t: f32, slot: u32) -> Opti
     if let Some(w) = c.second {
         c.weapon = w;
     }
-    let after = game.save().and_then(|s| s.player)?;
+    let after = CheckState::of(game)?;
     let start = check.start.unwrap_or_default();
     let away = Vec3::from(after.position).distance(Vec3::from(start));
+    eprintln!("save-check-move: before: {}", before.summary());
     eprintln!(
-        "save-check-move: before: {:?}, health {:.0}, {} up, rifle {:?}, grenades {}",
-        before.position, before.hp, before.weapon, before.rifle, before.grenades
-    );
-    eprintln!(
-        "save-check-move: saving: {:?} ({away:.0} m from the start), health {:.0}, {} up, rifle {:?}, launcher {:?}, grenades {}",
-        after.position, after.hp, after.weapon, after.rifle, after.launcher, after.grenades
+        "save-check-move: saving: {} ({away:.0} m from the start)",
+        after.summary()
     );
     let moved = away > MOVE_CHECK_METRES;
     let hurt = (after.hp - before.hp).abs() >= 0.5;
@@ -2655,7 +2743,14 @@ fn move_check(game: &mut Game, check: &mut MoveCheck, t: f32, slot: u32) -> Opti
             if ok { "ok  " } else { "BAD " }
         );
     }
-    Some(moved && hurt && armed)
+    Some((
+        moved && hurt && armed,
+        CheckNote {
+            start,
+            saved: after,
+            played: 0,
+        },
+    ))
 }
 
 /// `--save-check`: saves the game to pause-menu slot `slot`, reads the
@@ -2760,13 +2855,14 @@ fn save_check(game: &Game, link: &mission::MissionLink, slot: u32) -> bool {
             now.saturating_sub(back.info.saved_at)
         ),
     );
+    let world = path.with_extension(save::STALE_WORLD_EXT);
     check(
-        "world file (invented)",
-        back.player.is_some(),
+        "the record alone (no world file)",
+        !world.exists(),
         format!(
-            "{} vehicles, {} killed",
-            back.vehicles.len(),
-            back.killed.len()
+            "{} {}",
+            world.display(),
+            if world.exists() { "there" } else { "absent" }
         ),
     );
     eprintln!("save-check: {}", if ok { "PASS" } else { "FAIL" });
@@ -3590,9 +3686,10 @@ fn screenshot(
             aspect,
             out,
         )?);
-    } else if let Some(s) = &options.load {
-        // Without the scripts only the world's part loads.
-        game.load(s.clone());
+    } else if options.load.is_some() {
+        // Without the scripts only the world's reset of the 360's load
+        // (0x8230C740) is done: the rest is the scripts'.
+        game.reset_for_load();
     }
     if let Some(path) = &options.save_to {
         write_save(&game, link.as_ref(), path);
@@ -5722,26 +5819,11 @@ fn mission_for_screenshot(
     out: &std::path::Path,
 ) -> anyhow::Result<mission::MissionLink> {
     let tick = TICK.as_secs_f32();
-    // `--save-check-no-world`: the save loads the 360's way, its record
-    // alone; what its world file had is kept to compare with.
-    let mut load = options.load.clone();
-    let world_ref = match (&mut load, options.save_check_no_world) {
-        (Some(s), true) => Some(save::strip_world(s)),
-        _ => None,
-    };
-    if options.save_check_no_world {
-        match &world_ref {
-            Some(w) => eprintln!(
-                "save-world-check: loading the record alone; its world file had her at {:?}, {} vehicles, {} killed",
-                w.player.as_ref().map(|p| p.position),
-                w.vehicles,
-                w.killed
-            ),
-            None => eprintln!("save-world-check: FAIL needs --load <save>"),
-        }
+    if options.load_check && options.load.is_none() {
+        eprintln!("load-check: FAIL needs --load <save>");
     }
     let mut link = mission::MissionLink::start(install, options.mission_drivers.clone())
-        .with_save(load)
+        .with_save(options.load.clone())
         .with_support(options.support.clone())
         .with_movies(options.movies)
         .with_skip_mode_off(options.skip_mode_off)
@@ -6483,27 +6565,41 @@ fn mission_for_screenshot(
         // `--save-check-move`: she is sent away, hurt and re-armed first;
         // the save waits for it.
         let prepared = match (options.save_check, options.save_check_move) {
-            (Some(slot), true) => move_check(game, &mut move_prep, i as f32 * tick, slot),
-            (Some(_), false) => (i as f32 * tick >= SAVE_CHECK_AFTER).then_some(true),
+            (Some(_), true) => move_check(game, &mut move_prep, i as f32 * tick),
+            (Some(_), false) => {
+                (i as f32 * tick >= SAVE_CHECK_AFTER).then(|| (true, CheckNote::default()))
+            }
             _ => None,
         };
-        if let (Some(slot), Some(ready)) = (options.save_check, prepared) {
+        if let (Some(slot), Some((ready, mut note))) = (options.save_check, prepared) {
             // Saved from the pause menu, as the 360 saves: the pause
             // screen opening stamps the progress first.
             link.stamp_pause();
             let saved = save_check(game, &link, slot);
+            if options.save_check_move {
+                // For run B: what was saved, and where play began.
+                let path = pause_save_path(slot);
+                note.played = save::SaveGame::read(&path).map_or(0, |s| s.info.played);
+                if let Err(e) = std::fs::write(CheckNote::path(&path), note.to_text()) {
+                    eprintln!("save-check-move: could not keep the check note: {e}");
+                }
+            }
             errlog::exit(if ready && saved { 0 } else { 1 });
         }
-        if options.save_check_no_world && own_start.is_none() {
+        if options.load_check && own_start.is_none() {
             own_start = game
                 .scene
                 .player
                 .as_ref()
                 .map(|p| p.character.position.to_array());
         }
-        if options.save_check_no_world && i as f32 * tick >= SAVE_CHECK_AFTER {
-            let start = options.load_path.as_deref().and_then(read_check_start);
-            errlog::exit(if world_check(game, world_ref.as_ref(), start, own_start) {
+        if options.load_check && i as f32 * tick >= SAVE_CHECK_AFTER {
+            let note = options
+                .load_path
+                .as_deref()
+                .and_then(|p| std::fs::read_to_string(CheckNote::path(p)).ok())
+                .and_then(|t| CheckNote::from_text(&t));
+            errlog::exit(if load_check(game, &mut link, note.as_ref(), own_start) {
                 0
             } else {
                 1
@@ -15204,7 +15300,7 @@ impl Running {
             }
             Ok(mut s) => {
                 let pmc = s.pmc.take();
-                self.game.load(s);
+                self.game.reset_for_load();
                 if let (Some(pmc), Some(m)) = (pmc, &mut self.mission) {
                     m.restore(&pmc);
                 }
@@ -15966,24 +16062,39 @@ mod tests {
     /// `--save-check-no-world`'s verdict: the saved place first, then
     /// any start.
     #[test]
-    fn the_world_check_names_where_she_landed() {
+    fn the_load_check_names_where_she_landed() {
         assert_eq!(
-            WorldVerdict::from_gaps(0.0, &[4600.0]),
-            WorldVerdict::Restored
+            LoadVerdict::from_gaps(0.0, &[4600.0]),
+            LoadVerdict::Restored
         );
         assert_eq!(
-            WorldVerdict::from_gaps(4600.0, &[3.0, 80.0]),
-            WorldVerdict::ResetToStart
+            LoadVerdict::from_gaps(4600.0, &[3.0, 80.0]),
+            LoadVerdict::ResetToStart
         );
         assert_eq!(
-            WorldVerdict::from_gaps(4600.0, &[80.0]),
-            WorldVerdict::Elsewhere
+            LoadVerdict::from_gaps(4600.0, &[80.0]),
+            LoadVerdict::Elsewhere
         );
-        assert_eq!(WorldVerdict::from_gaps(50.0, &[]).name(), "ELSEWHERE");
+        assert_eq!(LoadVerdict::from_gaps(50.0, &[]).name(), "ELSEWHERE");
         assert_eq!(
-            check_start_path(std::path::Path::new("d/m2-alpha-save20.sav")),
-            std::path::Path::new("d/m2-alpha-save20.start.txt")
+            CheckNote::path(std::path::Path::new("d/m2-alpha-save20.sav")),
+            std::path::Path::new("d/m2-alpha-save20.check.txt")
         );
+        let note = CheckNote {
+            start: [-1728.8, -36.2, 2070.3],
+            saved: CheckState {
+                position: [450.0, 12.5, -1950.0],
+                hp: 50.0,
+                max_hp: 100.0,
+                rifle: [23, 90],
+                rifle_full: 30,
+                grenades: 3,
+                weapon: String::new(),
+            },
+            played: 41,
+        };
+        assert_eq!(CheckNote::from_text(&note.to_text()), Some(note));
+        assert_eq!(CheckNote::from_text("start 1 2\n"), None);
     }
 
     // A flight like Xenia's phys8a passes: launched (-2.623, 9.707,

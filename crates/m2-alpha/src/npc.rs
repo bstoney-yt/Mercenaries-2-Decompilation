@@ -6565,6 +6565,7 @@ impl People {
 
     /// Starts over with these soldiers dead and nobody about (they come
     /// back round the player on the next tick).
+    #[cfg(test)]
     pub fn reset(&mut self, killed: impl IntoIterator<Item = u32>) {
         self.npcs.clear();
         self.active.clear();
