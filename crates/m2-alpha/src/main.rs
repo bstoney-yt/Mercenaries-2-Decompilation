@@ -622,6 +622,13 @@ struct Options {
     /// `--cargo-check`: Xenia's El Grande drive with its crates aboard
     /// ([`cargo_check`]): each crate's shift, phase by phase.
     cargo_check: bool,
+    /// `--cargo-settle-check`: the contract's loaded truck left parked
+    /// ([`cargo_settle_check`]).
+    cargo_settle_check: bool,
+    /// `--parked-car-sleeps-check`: the parked cars and tanks the layers
+    /// put out at the mission's start go to sleep and stay put
+    /// ([`ParkedSleep`]).
+    parked_car_sleeps_check: bool,
     /// `--prop-bodies-check`: props that come loose whole as bodies of
     /// their own from the start (gap P7, [`prop_bodies_check`]).
     prop_bodies_check: bool,
@@ -1082,6 +1089,14 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--swim-check" => o.swim_check = true,
             "--cargo-check" => {
                 o.cargo_check = true;
+                o.mission = true;
+            }
+            "--cargo-settle-check" => {
+                o.cargo_settle_check = true;
+                o.mission = true;
+            }
+            "--parked-car-sleeps-check" => {
+                o.parked_car_sleeps_check = true;
                 o.mission = true;
             }
             "--prop-bodies-check" => {
@@ -5891,7 +5906,9 @@ fn mission_for_screenshot(
     let mut death_check = options.death_check.then(DeathCheck::default);
     // Seconds she has been where --props-check hits the props.
     let mut props_ready = 0.0;
-    let mut cargo_wait = options.cargo_check.then(CargoWait::default);
+    let mut cargo_wait =
+        (options.cargo_check || options.cargo_settle_check).then(CargoWait::default);
+    let mut parked_sleep = options.parked_car_sleeps_check.then(ParkedSleep::default);
     let mut shop_check = options.shop_check.clone().map(shopcheck::ShopCheck::new);
     let mut cheat_check = options.cheat_check.then(cheats::Check::default);
     let mut context = ContextCheck::default();
@@ -6519,7 +6536,18 @@ fn mission_for_screenshot(
                 1.0,
             )
         {
-            cargo_check(game, tick);
+            if options.cargo_settle_check {
+                cargo_settle_check(game, tick);
+            } else {
+                cargo_check(game, tick);
+            }
+            break;
+        }
+        // With --parked-car-sleeps-check, the layers' parked cars and tanks
+        // are watched from when each is placed; then the run ends.
+        if let Some(w) = &mut parked_sleep
+            && w.tick(game, tick)
+        {
             break;
         }
         // With --props-check, every placed prop is hit once she has been
@@ -10455,6 +10483,306 @@ fn cargo_split_start(
     (aboard, off.into_iter().map(|c| c.0).collect())
 }
 
+/// How long `--cargo-settle-check` watches the parked truck, seconds:
+/// Xenia settle3's window (20 s from the truck's first record).
+const CARGO_SETTLE_WATCH: f32 = 20.0;
+/// The most a crate may have moved on the bed from where it was loaded,
+/// in the truck's frame, metres, judged by its place (its origin, as
+/// Xenia settle3 read each crate's record position): settle3's 21 crates
+/// moved 0.24 to 0.50 m (load-time depenetration, 0x11D3A0 the most).
+const CARGO_SETTLE_MOST: f32 = 0.50;
+
+/// `--cargo-settle-check` (it turns on `--mission`; start it with
+/// `--skip-to OilCon020`): once the contract's truck has its cargo aboard
+/// (as `--cargo-check` waits for it), the truck is left where it was
+/// parked, nobody driving, for [`CARGO_SETTLE_WATCH`] s more. Logs each
+/// crate's move on the bed from where it was loaded (the truck's frame)
+/// and whether it is aboard, each second the truck's place, and at the
+/// end each crate's line. `PASS` when every crate is aboard, none came off
+/// before the watch began, and none moved more than
+/// [`CARGO_SETTLE_MOST`] (Xenia settle3: none off, 0.24-0.50 m); else
+/// `FAIL` with which.
+fn cargo_settle_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::Vec3;
+    let vehicles = &game.scene.vehicles;
+    let Some(i) = (0..vehicles.len()).find(|&i| {
+        vehicles[i].id.is_some() && !vehicles[i].wrecked && game.scene.props.carrying(i)
+    }) else {
+        eprintln!("cargo-settle-check: FAIL no vehicle with cargo aboard");
+        return;
+    };
+    let Some(id) = game.scene.vehicles[i].id else {
+        return;
+    };
+    let label = game.scene.vehicles[i].spec.label.clone();
+    let read = |game: &Game| {
+        game.scene
+            .world
+            .as_ref()
+            .map(|w| game.scene.props.cargo_from_loaded(&w.physics, i, id))
+            .unwrap_or_default()
+    };
+    let start = read(game);
+    let before = start.iter().filter(|c| !c.2).count();
+    eprintln!(
+        "cargo-settle-check: the {label} parked with {} crates loaded, {before} already off",
+        start.len()
+    );
+    let mut most: Vec<(u32, f32)> = start.iter().map(|c| (c.0, c.1)).collect();
+    let steps = (CARGO_SETTLE_WATCH / tick) as u32;
+    let every = (1.0 / tick).round().max(1.0) as u32;
+    for k in 1..=steps {
+        game.step(crate::player::Intent::default(), tick);
+        for (e, d, _) in read(game) {
+            if let Some(m) = most.iter_mut().find(|m| m.0 == e) {
+                m.1 = m.1.max(d);
+            }
+        }
+        if k % every == 0 {
+            let at = game
+                .scene
+                .world
+                .as_ref()
+                .and_then(|w| w.physics.vehicle_transform(id))
+                .map_or(Vec3::NAN, |m| m.w_axis.truncate());
+            let off = read(game).iter().filter(|c| !c.2).count();
+            eprintln!(
+                "cargo-settle-check: {:.0} s: the {label} at {at:.2}, {off} off",
+                k as f32 * tick
+            );
+        }
+    }
+    let end = read(game);
+    for (e, d, aboard) in &end {
+        let m = most.iter().find(|m| m.0 == *e).map_or(*d, |m| m.1);
+        eprintln!(
+            "cargo-settle-check: {e:#x} moved {d:.2} m on the bed from where it was loaded (most {m:.2}){}",
+            if *aboard { "" } else { ", OFF" }
+        );
+    }
+    match cargo_settle_verdict(&end, &most, before) {
+        Ok(()) => eprintln!(
+            "cargo-settle-check: PASS all {} crates aboard the parked {label} for {CARGO_SETTLE_WATCH} s, none off before, most moved {:.2} m",
+            end.len(),
+            most.iter().map(|m| m.1).fold(0.0f32, f32::max)
+        ),
+        Err(why) => eprintln!("cargo-settle-check: FAIL {why}"),
+    }
+}
+
+/// `--cargo-settle-check`'s verdict: every crate aboard at the end
+/// (`end`), none off before the watch began (`before`), and none moved
+/// more than [`CARGO_SETTLE_MOST`] from where it was loaded (`most`).
+fn cargo_settle_verdict(
+    end: &[(u32, f32, bool)],
+    most: &[(u32, f32)],
+    before: usize,
+) -> Result<(), String> {
+    if end.is_empty() {
+        return Err("no crates loaded".into());
+    }
+    if before > 0 {
+        return Err(format!("{before} already off before the watch began"));
+    }
+    let off: Vec<String> = end
+        .iter()
+        .filter(|c| !c.2)
+        .map(|c| format!("{:#x}", c.0))
+        .collect();
+    if !off.is_empty() {
+        return Err(format!(
+            "{} came off the parked truck: {}",
+            off.len(),
+            off.join(", ")
+        ));
+    }
+    let far: Vec<String> = most
+        .iter()
+        .filter(|m| m.1 > CARGO_SETTLE_MOST)
+        .map(|m| format!("{:#x} {:.2} m", m.0, m.1))
+        .collect();
+    if !far.is_empty() {
+        return Err(format!(
+            "moved more than {CARGO_SETTLE_MOST} m on the bed: {}",
+            far.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// How long after it is placed `--parked-car-sleeps-check` gives a parked
+/// car or tank to be asleep, seconds: the 360's time to sleep for a body
+/// that keeps still, 6 checks 0.2 s apart (0x824CE9C8; the world's
+/// `highFrequencyDeactivationPeriod`, 0x820AA278) and one period more for
+/// the first check (1.4 s), plus a second for one dropped onto its wheels
+/// to settle (invented). A layer's car is added asleep, at 0 s.
+const PARKED_SLEEP_BY: f32 = 2.4;
+/// The most a parked car or tank may move from where it fell asleep while
+/// `--parked-car-sleeps-check` watches it, metres: the 360's reference
+/// distance (0.02 m, 0x820AA278) plus 3 cm for its springs (invented).
+const PARKED_SLEEP_MOVE: f32 = 0.05;
+/// How long `--parked-car-sleeps-check` watches, seconds from the first
+/// parked vehicle placed.
+const PARKED_SLEEP_WATCH: f32 = 20.0;
+/// The most parked vehicles it watches (the first placed).
+const PARKED_SLEEP_MOST: usize = 12;
+
+/// One parked vehicle `--parked-car-sleeps-check` watches: when it was
+/// placed (s), when and where it first fell asleep, and the most it has
+/// moved from there.
+#[derive(Clone, Debug)]
+struct ParkedWatch {
+    index: usize,
+    label: String,
+    placed: f32,
+    asleep: Option<(f32, m2_math::glam::Vec3)>,
+    moved: f32,
+    awake_after: bool,
+}
+
+/// `--parked-car-sleeps-check` (it turns on `--mission`): every parked car
+/// and tank a layer put out (one with a layer guid, no crew, not a boat or
+/// a helicopter, nobody driving it), up to [`PARKED_SLEEP_MOST`], is
+/// watched from when it is placed for [`PARKED_SLEEP_WATCH`] s from the
+/// first. `PASS` when each was asleep within [`PARKED_SLEEP_BY`] s of being
+/// placed and moved no more than [`PARKED_SLEEP_MOVE`] from where it fell
+/// asleep; else `FAIL` with which.
+#[derive(Default)]
+struct ParkedSleep {
+    t: f32,
+    first: Option<f32>,
+    watched: Vec<ParkedWatch>,
+}
+
+impl ParkedSleep {
+    /// One step: true once it has judged.
+    fn tick(&mut self, game: &Game, dt: f32) -> bool {
+        self.t += dt;
+        let Some(physics) = game.scene.world.as_ref().map(|w| &w.physics) else {
+            return false;
+        };
+        let driven = game.scene.player.as_ref().and_then(|p| p.driving);
+        for (i, v) in game.scene.vehicles.iter().enumerate() {
+            let Some(id) = v.id else { continue };
+            if self.watched.len() >= PARKED_SLEEP_MOST
+                || self.watched.iter().any(|w| w.index == i)
+                || v.wrecked
+                || v.guid.is_none()
+                || !v.crew.is_empty()
+                || v.spec.is_boat()
+                || v.spec.is_helicopter()
+                || driven == Some(i)
+                || physics.vehicle_transform(id).is_none()
+            {
+                continue;
+            }
+            eprintln!(
+                "parked-car-sleeps-check: the {} ({:#x}) placed at {:.2} s",
+                v.spec.label,
+                v.guid.unwrap_or(0),
+                self.t
+            );
+            self.first.get_or_insert(self.t);
+            self.watched.push(ParkedWatch {
+                index: i,
+                label: v.spec.label.clone(),
+                placed: self.t,
+                asleep: None,
+                moved: 0.0,
+                awake_after: false,
+            });
+        }
+        for w in &mut self.watched {
+            let Some(id) = game.scene.vehicles.get(w.index).and_then(|v| v.id) else {
+                continue;
+            };
+            let Some(at) = physics.vehicle_transform(id).map(|m| m.w_axis.truncate()) else {
+                continue;
+            };
+            let asleep = physics.vehicle_asleep(id);
+            match w.asleep {
+                None if asleep => {
+                    eprintln!(
+                        "parked-car-sleeps-check: the {} asleep {:.2} s after it was placed",
+                        w.label,
+                        self.t - w.placed
+                    );
+                    w.asleep = Some((self.t, at));
+                }
+                Some((_, from)) => {
+                    w.moved = w.moved.max(at.distance(from));
+                    if !asleep && !w.awake_after {
+                        w.awake_after = true;
+                        eprintln!(
+                            "parked-car-sleeps-check: the {} woke at {:.2} s",
+                            w.label, self.t
+                        );
+                    }
+                }
+                None => {}
+            }
+        }
+        let Some(first) = self.first else {
+            if self.t > 60.0 {
+                eprintln!("parked-car-sleeps-check: FAIL no parked car or tank placed in 60 s");
+                return true;
+            }
+            return false;
+        };
+        if self.t - first < PARKED_SLEEP_WATCH {
+            return false;
+        }
+        for w in &self.watched {
+            eprintln!(
+                "parked-car-sleeps-check: the {}: {}, moved {:.3} m{}",
+                w.label,
+                w.asleep
+                    .map_or("never asleep".to_string(), |(t, _)| format!(
+                        "asleep {:.2} s after placed",
+                        t - w.placed
+                    )),
+                w.moved,
+                if w.awake_after { ", woke again" } else { "" }
+            );
+        }
+        match parked_sleep_verdict(&self.watched) {
+            Ok(()) => eprintln!(
+                "parked-car-sleeps-check: PASS all {} asleep within {PARKED_SLEEP_BY} s and within {PARKED_SLEEP_MOVE} m for {PARKED_SLEEP_WATCH} s",
+                self.watched.len()
+            ),
+            Err(why) => eprintln!("parked-car-sleeps-check: FAIL {why}"),
+        }
+        true
+    }
+}
+
+/// `--parked-car-sleeps-check`'s verdict on what it watched.
+fn parked_sleep_verdict(watched: &[ParkedWatch]) -> Result<(), String> {
+    if watched.is_empty() {
+        return Err("no parked car or tank watched".into());
+    }
+    let mut bad = Vec::new();
+    for w in watched {
+        match w.asleep {
+            None => bad.push(format!("the {} never slept", w.label)),
+            Some((t, _)) if t - w.placed > PARKED_SLEEP_BY => bad.push(format!(
+                "the {} slept {:.2} s after placed",
+                w.label,
+                t - w.placed
+            )),
+            Some(_) if w.moved > PARKED_SLEEP_MOVE => {
+                bad.push(format!("the {} moved {:.3} m", w.label, w.moved));
+            }
+            Some(_) => {}
+        }
+    }
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        Err(bad.join(", "))
+    }
+}
+
 /// How many steps after the move `--cargo-check` logs one by one.
 const CARGO_FIRST_STEPS: u32 = 10;
 
@@ -11838,8 +12166,12 @@ const WRECK_LAND_HEIGHT: f32 = 0.6;
 /// 23.7 ms gap), which no body speed in phys8a reaches.
 const XENIA_NEXT_SPEED: f32 = 11.66;
 const NEXT_SPEED_SLACK: f32 = 1.5;
-/// Its highest rise and where it lands, metres (phys3-6).
-const XENIA_WRECK_PEAK: (f32, f32) = (4.9, 5.3);
+/// Its highest rise and where it lands, metres (phys3-6). The rise's top
+/// holds Xenia's own launch (changed 2026-11-25): its up speed 9.813 m/s
+/// at the 360's gravity of 9 rises 9.813² / (2 x 9) = 5.3497 m, which
+/// Xenia prints rounded as "5.3"; 5.35, inclusive, is the least two-place
+/// value that holds it (was 5.3).
+const XENIA_WRECK_PEAK: (f32, f32) = (4.9, 5.35);
 const XENIA_WRECK_LANDS: (f32, f32) = (11.0, 15.6);
 /// The step after: its blasts' change, level only (up topped away, as
 /// 0x8215BF38 tops it; phys8a: they land a frame after the launch, as
@@ -15723,6 +16055,49 @@ mod tests {
             none.fails
         );
         assert!(!wreck_flight_verdict(&[], 0.0, None, None).fails.is_empty());
+    }
+
+    // A parked car passes asleep within its time to sleep and still; one
+    // never asleep, asleep late or moving fails, as does none watched.
+    #[test]
+    fn the_parked_car_sleep_check_wants_each_asleep_soon_and_still() {
+        use m2_math::glam::Vec3;
+        let w = |asleep: Option<f32>, moved: f32| ParkedWatch {
+            index: 0,
+            label: "Phoenix".into(),
+            placed: 1.0,
+            asleep: asleep.map(|t| (t, Vec3::ZERO)),
+            moved,
+            awake_after: false,
+        };
+        assert!(parked_sleep_verdict(&[w(Some(1.0), 0.0), w(Some(3.3), 0.04)]).is_ok());
+        assert!(parked_sleep_verdict(&[w(None, 0.0)]).is_err());
+        assert!(parked_sleep_verdict(&[w(Some(3.5), 0.0)]).is_err());
+        assert!(parked_sleep_verdict(&[w(Some(1.0), 0.06)]).is_err());
+        assert!(parked_sleep_verdict(&[]).is_err());
+    }
+
+    // The wreck's rise band holds the rise of Xenia's own launch (up
+    // 9.813 m/s at the 360's gravity of 9), and no more than to two places.
+    #[test]
+    fn the_wreck_rise_band_holds_xenias_own_launch() {
+        let rise = 9.813_f32 * 9.813 / (2.0 * 9.0);
+        assert!(rise > 5.3 && rise <= XENIA_WRECK_PEAK.1, "{rise}");
+        assert!(XENIA_WRECK_PEAK.1 - rise < 0.01);
+    }
+
+    // The parked truck's crates pass when all stay aboard, none fell
+    // before, and none moved past Xenia's 0.50 m.
+    #[test]
+    fn the_parked_cargo_check_passes_only_when_all_stay_near_where_loaded() {
+        let end = [(1, 0.3, true), (2, 0.5, true)];
+        let most = [(1, 0.31), (2, 0.5)];
+        assert!(cargo_settle_verdict(&end, &[(1, 0.31), (2, 0.52)], 0).is_err());
+        assert!(cargo_settle_verdict(&end, &most, 0).is_ok());
+        assert!(cargo_settle_verdict(&end, &most, 1).is_err());
+        assert!(cargo_settle_verdict(&[(1, 1.4, false)], &[(1, 1.4)], 0).is_err());
+        assert!(cargo_settle_verdict(&end, &[(1, 0.31), (2, 0.8)], 0).is_err());
+        assert!(cargo_settle_verdict(&[], &[], 0).is_err());
     }
 
     // Crates off before the check began are not judged: only those aboard

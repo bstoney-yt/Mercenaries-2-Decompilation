@@ -50,6 +50,9 @@ struct Riding {
     bounds: (Vec3, Vec3),
     /// Still on the bed, as last seen ([`Props::carry`]).
     aboard: bool,
+    /// Where it was loaded, in the vehicle's frame (for
+    /// [`Props::cargo_from_loaded`]).
+    loaded: Option<Mat4>,
 }
 
 /// One shown.
@@ -816,12 +819,16 @@ impl Props {
             );
         }
         let template = p.template;
-        let velocity = physics.vehicle_velocity(id);
         physics.remove_static(StaticKey::Entity(entity));
-        let piece = physics.add_cargo(&piece, at, velocity);
+        // Asleep, at rest, until something awake touches it
+        // ([`Physics::add_cargo`]).
+        let piece = physics.add_cargo(&piece, at);
         if let Some(&g) = self.gravity_scales.get(&template) {
             physics.set_debris_gravity(piece, g);
         }
+        let loaded = physics
+            .vehicle_transform(id)
+            .map(|place| place.inverse() * at);
         self.cargo.insert(
             entity,
             Riding {
@@ -829,9 +836,39 @@ impl Props {
                 piece,
                 bounds,
                 aboard: true,
+                loaded,
             },
         );
         true
+    }
+
+    /// Each prop loaded on vehicle `index` (placed as `id`): how far its
+    /// place (its origin, what the 360's object record holds: Xenia
+    /// settle3 measured that) now is from where it was loaded, in the
+    /// vehicle's frame (metres), and whether it is still aboard.
+    pub fn cargo_from_loaded(
+        &self,
+        physics: &Physics,
+        index: usize,
+        id: m2_engine::VehicleId,
+    ) -> Vec<(u32, f32, bool)> {
+        let Some(place) = physics.vehicle_transform(id) else {
+            return Vec::new();
+        };
+        let inv = place.inverse();
+        let mut out: Vec<(u32, f32, bool)> = self
+            .cargo
+            .iter()
+            .filter(|(_, r)| r.vehicle == index)
+            .filter_map(|(&e, r)| {
+                let at = physics.debris_place(r.piece)?;
+                let now = (inv * at).w_axis.truncate();
+                let then = r.loaded?.w_axis.truncate();
+                Some((e, now.distance(then), r.aboard))
+            })
+            .collect();
+        out.sort_by_key(|c| c.0);
+        out
     }
 
     /// Moves what is aboard vehicle `index` with it as it is put down
@@ -3013,6 +3050,83 @@ mod tests {
     use super::*;
     use m2_engine::{CollisionShape, LoosePiece};
 
+    // Goods are added asleep and at rest (the 360's add, activation 0,
+    // 0x82165958), and wake once something awake touches them: a moving
+    // truck's bed, here a body dropped onto them.
+    // Goods loaded where their records overlap (0.3-0.5 m, as the El
+    // Grande's do) go back to sleep together after the step they were
+    // added at, at rest, and are not pushed apart (Xenia settle8: one
+    // island asleep throughout, velocity 0); within the batch, Rapier's
+    // wake of a body just added keeps none awake.
+    #[test]
+    fn overlapping_goods_loaded_together_stay_asleep_and_put() {
+        let mut physics = crate::npc::tests::ground();
+        let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.4), 50.0);
+        let places = [
+            Vec3::new(0.0, 0.41, 0.0),
+            Vec3::new(0.35, 0.41, 0.0),
+            Vec3::new(0.0, 0.41, 0.45),
+            Vec3::new(0.3, 0.61, 0.3),
+        ];
+        let crates: Vec<_> = places
+            .iter()
+            .map(|&p| physics.add_cargo(&piece, Mat4::from_translation(p)))
+            .collect();
+        for _ in 0..120 {
+            physics.step(1.0 / 60.0);
+        }
+        for (c, p) in crates.iter().zip(places) {
+            assert_eq!(physics.debris_asleep(*c), Some(true), "awake at {p}");
+            assert_eq!(physics.debris_velocity(*c).map(|v| v.0), Some(Vec3::ZERO));
+            let at = physics.debris_place(*c).unwrap().w_axis.truncate();
+            // At most the one step Rapier runs a body just added awake
+            // (a step of gravity, g dt² = 2.7 mm), not pushed apart.
+            assert!((at - p).length() < 5e-3, "pushed from {p} to {at}");
+        }
+    }
+
+    #[test]
+    fn loaded_goods_start_asleep_and_wake_when_touched() {
+        let mut physics = crate::npc::tests::ground();
+        let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.3), 50.0);
+        let at = Mat4::from_translation(Vec3::new(0.0, 0.31, 0.0));
+        let crate_ = physics.add_cargo(&piece, at);
+        assert_eq!(physics.debris_asleep(crate_), Some(true));
+        assert_eq!(
+            physics.debris_velocity(crate_).map(|v| v.0),
+            Some(Vec3::ZERO)
+        );
+        for _ in 0..30 {
+            physics.step(1.0 / 60.0);
+        }
+        assert_eq!(
+            physics.debris_asleep(crate_),
+            Some(true),
+            "nothing touched it"
+        );
+        let place = physics.debris_place(crate_).unwrap().w_axis.truncate();
+        // Rapier steps a body whose collider was just added once before it
+        // sleeps again ([`Physics::add_cargo`]): a few millimetres at most.
+        assert!((place - at.w_axis.truncate()).length() < 0.01, "{place}");
+        // An awake body dropped on it wakes it.
+        let ball = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.2), 20.0);
+        let falling = physics.add_prop_body(
+            &ball,
+            Mat4::from_translation(Vec3::new(0.0, 1.5, 0.0)),
+            false,
+        );
+        let mut woke = false;
+        for _ in 0..120 {
+            physics.step(1.0 / 60.0);
+            if physics.debris_asleep(crate_) == Some(false) {
+                woke = true;
+                break;
+            }
+        }
+        assert!(woke, "touched by an awake body, it wakes");
+        let _ = falling;
+    }
+
     // What rides a truck is read from its body as it is now: moved 40 m
     // (as `--cargo-check` moves the truck and its crates), the shown
     // place is where it was until the props follow (q680, 3d99c9b7: the
@@ -3024,7 +3138,7 @@ mod tests {
         let mut props = Props::default();
         let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.5), 50.0);
         let at = Mat4::from_translation(Vec3::new(0.0, 100.0, 0.0));
-        let body = physics.add_cargo(&piece, at, Vec3::ZERO);
+        let body = physics.add_cargo(&piece, at);
         props.shown.insert(
             9,
             Prop {
@@ -3045,6 +3159,7 @@ mod tests {
                 piece: body,
                 bounds,
                 aboard: true,
+                loaded: None,
             },
         );
         let moved = Mat4::from_translation(Vec3::new(40.0, 0.0, 0.0));
