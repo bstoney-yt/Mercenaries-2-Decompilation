@@ -87,6 +87,8 @@ def check_case(case: dict, base: Path = HERE) -> dict:
         raise CaseError("case: size must be even")
     if not (0.1 <= float(c["slowmo"]) <= 10):
         raise CaseError("case: slowmo must be 0.1-10 (2 = half speed)")
+    if not (0 < float(c.get("gif", {}).get("max_mb", 8.0)) <= 100):
+        raise CaseError("case: gif.max_mb must be 0-100")
     o, x = c["ours"], c["xenia"]
     o.setdefault("offset", 0.0)
     x.setdefault("offset", 0.0)
@@ -270,7 +272,7 @@ def compose(case: dict, ours: Path, xenia: Path, ours_start: float, xenia_start:
         inputs.reverse()
         starts.reverse()
         names.reverse()
-    w, h = (int(v) for v in case["size"].split("x"))
+    h = int(case["size"].split("x")[1])
     bar = max(h // 8, 24)
     cap = text_file(out, "caption.txt", case["caption"])
     graph = ";".join([
@@ -287,24 +289,102 @@ def compose(case: dict, ours: Path, xenia: Path, ours_start: float, xenia_start:
         "-an", "-c:v", "libx264", "-crf", "20", "-preset", "medium", "-pix_fmt", "yuv420p",
         "-movflags", "+faststart", str(mp4)])
     gif = out / "side-by-side.gif"
-    ff(["-i", str(mp4), "-vf",
-        f"fps=12,scale={min(2 * w, 960)}:-2:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse",
-        str(gif)])
+    gif_info = make_gif(mp4, gif, case)
     thumb = out / "thumb.png"
     mid = float(case["duration"]) * float(case["slowmo"]) / 2
     ff(["-ss", f"{mid:.3f}", "-i", str(mp4), "-frames:v", "1", str(thumb)])
+    d = float(case["duration"])
+    sources = {
+        "ours": describe_source(ours, o0, d),
+        "xenia": describe_source(xenia, x0, d),
+    }
     meta = {"case": case["name"], "ours": str(ours), "xenia": str(xenia),
             "ours_start": o0, "xenia_start": x0, "swap": case["swap"],
             "fps": case["fps"], "size": case["size"], "slowmo": case["slowmo"],
-            "duration": case["duration"]}
+            "duration": case["duration"], "sources": sources, "gif": gif_info}
     (out / "compose.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    (out / "notes.md").write_text(notes(case), encoding="utf-8")
+    (out / "notes.md").write_text(notes(case, sources), encoding="utf-8")
     return meta
 
 
-def notes(case: dict) -> str:
-    """The release-notes snippet: caption, the fix, and where the clip's
-    link goes once Brendan has uploaded it (nothing is uploaded here)."""
+def clip_seconds(clip: Path) -> float:
+    """A clip's duration from ffmpeg's header line (0 if unknown)."""
+    p = subprocess.run([FFMPEG, "-hide_banner", "-i", str(clip)], capture_output=True, text=True, check=False)
+    m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", p.stderr)
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else 0.0
+
+
+def clip_fps(clip: Path) -> float | None:
+    p = subprocess.run([FFMPEG, "-hide_banner", "-i", str(clip)], capture_output=True, text=True, check=False)
+    m = re.search(r"([\d.]+) fps", p.stderr)
+    return float(m.group(1)) if m else None
+
+
+def describe_source(clip: Path, start: float, duration: float) -> dict:
+    """Where a side's pictures came from and how many a second it really
+    has over the clip's window: a clip made from timed stills
+    ([`frames_to_clip`], which leaves its `.frames.txt` list beside it) is
+    screenshots at their own rate; anything else counts as live video at
+    its stream rate."""
+    lst = Path(clip).with_suffix(".frames.txt")
+    if lst.exists():
+        t, times = 0.0, []
+        for line in lst.read_text(encoding="utf-8").splitlines():
+            if line.startswith("duration "):
+                times.append(t)
+                t += float(line.split()[1])
+        lo, hi = max(start, 0.0), start + duration
+        n = sum(1 for x in times if lo <= x < hi)
+        return {"source": "screenshots", "fps": round(n / duration, 1) if duration > 0 else 0.0}
+    return {"source": "video", "fps": clip_fps(clip)}
+
+
+# The GIF's tries, smallest last: (frames a second, width).
+GIF_LADDER = [(12, 960), (10, 800), (10, 640), (8, 640), (8, 480), (6, 480), (5, 400), (5, 320)]
+
+
+def gif_once(mp4: Path, gif: Path, fps: int, width: int, start: float, seconds: float | None) -> int:
+    cut = ["-ss", f"{start:.3f}"] + (["-t", f"{seconds:.3f}"] if seconds else [])
+    vf = (
+        f"fps={fps},scale={width}:-2:flags=lanczos,split[a][b];[a]palettegen=max_colors=128:stats_mode=diff[p];"
+        f"[b][p]paletteuse=dither=bayer:bayer_scale=4:diff_mode=rectangle"
+    )
+    ff([*cut, "-i", str(mp4), "-vf", vf, "-loop", "0", str(gif)])
+    return gif.stat().st_size
+
+
+def make_gif(mp4: Path, gif: Path, case: dict) -> dict:
+    """The GIF under the case's `gif.max_mb` (default 8): frame rate and
+    width step down the ladder (never wider than the clip), then, if even
+    the smallest is too big, a shorter excerpt from the clip's middle. The
+    MP4 is always whole."""
+    g = case.get("gif", {})
+    cap = float(g.get("max_mb", 8.0)) * 1024 * 1024
+    full_w = 2 * int(case["size"].split("x")[0])
+    total = clip_seconds(mp4)
+    tries = [(f, min(w, full_w)) for f, w in GIF_LADDER]
+    tries = list(dict.fromkeys(tries))
+    size = 0
+    for fps, width in tries:
+        size = gif_once(mp4, gif, fps, width, 0.0, None)
+        if size <= cap:
+            return {"fps": fps, "width": width, "bytes": size, "excerpt": None}
+    fps, width = tries[-1]
+    seconds = total
+    while seconds > 2.0:
+        seconds = max(seconds * min(0.9, cap / size), 2.0)
+        start = max((total - seconds) / 2, 0.0)
+        size = gif_once(mp4, gif, fps, width, start, seconds)
+        if size <= cap:
+            break
+    return {"fps": fps, "width": width, "bytes": size, "excerpt": [round(start, 2), round(seconds, 2)]}
+
+
+def notes(case: dict, sources: dict | None = None) -> str:
+    """The release-notes snippet: caption, the fix, where the clip's link
+    goes once Brendan has uploaded it (nothing is uploaded here), and, with
+    the clip's `sources`, how each side was captured: screenshots are said
+    as such, with how many a second each side really has."""
     fix = case.get("fix", "")
     left, right = (case["labels"][1], case["labels"][0]) if case["swap"] else tuple(case["labels"])
     lines = [f"### {case['caption']}", ""]
@@ -314,6 +394,15 @@ def notes(case: dict) -> str:
         lines += [f"Fixed in {fix}.", ""]
     lines.append(f"[Side by side: {left} (left), {right} (right; the Xbox 360 game in Xenia)](CLIP_LINK)"
                  if right == "Xenia" else f"[Side by side: {left} (left), {right} (right)](CLIP_LINK)")
+    if sources:
+        parts = []
+        for key, label in (("ours", case["labels"][0]), ("xenia", case["labels"][1])):
+            s = sources.get(key) or {}
+            fps = s.get("fps")
+            rate = f"about {fps:g} a second" if fps else "rate unknown"
+            what = "still screenshots, not live video" if s.get("source") == "screenshots" else "live video"
+            parts.append(f"{label}: {what}, {rate}")
+        lines += ["", "_Capture: " + "; ".join(parts) + "._"]
     lines += ["", f"<!-- clip: side-by-side.mp4 of case {case['name']}; replace CLIP_LINK after uploading -->", ""]
     return "\n".join(lines)
 
@@ -521,6 +610,8 @@ def cmd_compose(a) -> int:
         case["xenia"]["offset"] = a.xenia_offset
     if a.slowmo is not None:
         case["slowmo"] = a.slowmo
+    if a.gif_max_mb is not None:
+        case["gif"] = {**case.get("gif", {}), "max_mb": a.gif_max_mb}
     out = Path(a.out) if a.out else Path(a.ours).parent / f"{case['name']}-compose"
     ours = Path(a.ours)
     if ours.is_dir():
@@ -555,6 +646,7 @@ def main(argv=None) -> int:
     m.add_argument("--xenia-offset", type=float)
     m.add_argument("--slowmo", type=float)
     m.add_argument("--frames-fps", type=float, default=10.0, help="rate of a --ours frames folder")
+    m.add_argument("--gif-max-mb", type=float, help="cap the GIF at this many MB (default: the case's, else 8)")
     n = sub.add_parser("notes", help="print the release-notes snippet")
     n.add_argument("case")
     k = sub.add_parser("check", help="check a case file")

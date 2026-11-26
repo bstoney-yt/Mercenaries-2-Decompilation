@@ -274,5 +274,76 @@ class ComposeSmoke(unittest.TestCase):
             self.assertTrue((d / "o" / "side-by-side.mp4").exists())
 
 
+def lavfi_noise(path: Path, seconds: float = 6, size: str = "320x240"):
+    """Moving noise: a GIF of it is large, to make the cap work."""
+    subprocess.run(
+        [clips.FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+         "-i", f"testsrc2=s={size}:r=30:d={seconds}", "-vf", "noise=alls=60:allf=t,format=yuv420p",
+         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "10", str(path)],
+        check=True)
+
+
+@unittest.skipUnless(HAVE_FFMPEG, "needs the local ffmpeg (M2_FFMPEG)")
+class GifCapAndSources(unittest.TestCase):
+    def test_the_gif_stays_under_its_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            a, b = d / "a.mp4", d / "b.mp4"
+            lavfi_noise(a)
+            lavfi_noise(b)
+            c = case(duration=5, size="320x240", gif={"max_mb": 0.4})
+            meta = clips.compose(c, a, b, 0, 0, d / "out")
+            gif = d / "out" / "side-by-side.gif"
+            self.assertLessEqual(gif.stat().st_size, 0.4 * 1024 * 1024)
+            g = meta["gif"]
+            self.assertEqual(g["bytes"], gif.stat().st_size)
+            # It had to step down from the first try.
+            self.assertTrue((g["fps"], g["width"]) != (12, 640) or g["excerpt"], g)
+            # The MP4 is whole either way.
+            self.assertGreater(clips.clip_seconds(d / "out" / "side-by-side.mp4"), 4.5)
+
+    def test_a_tight_cap_cuts_an_excerpt(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            a = d / "a.mp4"
+            lavfi_noise(a)
+            c = case(duration=5, size="320x240", gif={"max_mb": 0.05})
+            meta = clips.compose(c, a, a, 0, 0, d / "out")
+            g = meta["gif"]
+            self.assertIsNotNone(g["excerpt"], g)
+            self.assertLess(g["excerpt"][1], 5.0)
+            self.assertEqual((g["fps"], g["width"]), clips.GIF_LADDER[-1])
+
+    def test_sources_say_screenshots_and_their_rate(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            frames = []
+            for i in range(10):  # one a second, as Xenia's route shots
+                p = d / f"s{i}.ppm"
+                p.write_bytes(b"P6\n16 16\n255\n" + bytes([i * 20]) * 768)
+                frames.append((100.0 + i, p))
+            shots = d / "xenia-frames.mp4"
+            clips.frames_to_clip(frames, shots, 30)
+            live = d / "ours.mp4"
+            lavfi_flash(live, 0.0, seconds=10)
+            s = clips.describe_source(shots, 2.0, 5.0)
+            self.assertEqual(s, {"source": "screenshots", "fps": 1.0})
+            v = clips.describe_source(live, 0.0, 5.0)
+            self.assertEqual(v["source"], "video")
+            self.assertEqual(v["fps"], 30.0)
+            meta = clips.compose(case(duration=5), live, shots, 0, 2.0, d / "out")
+            self.assertEqual(meta["sources"]["xenia"]["source"], "screenshots")
+            n = (d / "out" / "notes.md").read_text(encoding="utf-8")
+            self.assertIn("Xenia: still screenshots, not live video, about 1 a second", n)
+            self.assertIn("Ours: live video, about 30 a second", n)
+
+    def test_notes_without_sources_say_nothing_of_capture(self):
+        self.assertNotIn("Capture", clips.notes(case()))
+
+    def test_bad_gif_cap(self):
+        with self.assertRaises(clips.CaseError):
+            case(gif={"max_mb": 0})
+
+
 if __name__ == "__main__":
     unittest.main()

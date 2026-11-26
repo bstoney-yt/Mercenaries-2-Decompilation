@@ -51,6 +51,7 @@ Brendan decides what is posted. Case files and routes hold no game data.
 | `fps`, `size` | the clip's rate and each half's size (even numbers); both sides are scaled and padded to it |
 | `slowmo` | 2 plays at half speed |
 | `swap` | Xenia on the left (default: Ours left) |
+| `gif.max_mb` | the GIF's size cap, MB (default 8; `compose --gif-max-mb`) |
 | `xenia.routes` | `xc.py` route files, run one after another (`routes/` or beside the case) |
 | `xenia.start` | the shared start event on Xenia's side: `mark:<label>` (a route `mark`), `shot:<name>`, or `t:<seconds>` |
 | `xenia.capture` | `video`: record Xenia's window with ffmpeg (`gdigrab`) while the route plays; `frames`: the route's own screenshots |
@@ -84,7 +85,23 @@ python -I clips.py compose cases\crash-toss.json --ours <ours.mp4|frames dir> --
 `capture` writes `<out>\<case>\`: `xenia\` (route log, window recording or
 shots), `ours\` (`m2-command.txt`, `m2.err`, `ours-frames.mp4`),
 `side-by-side.mp4` (H.264, labelled, caption bar), `side-by-side.gif`,
-`thumb.png`, `notes.md` and `compose.json` (the starts used, to recompose).
+`thumb.png`, `notes.md` and `compose.json` (the starts used, to recompose,
+each side's capture and the GIF's settings).
+
+**The GIF** is kept under `gif.max_mb` (8 MB by default, so it can be
+posted): it tries 12 frames a second at up to 960 px wide, then steps the
+rate and width down (10/800, 10/640, 8/640, 8/480, 6/480, 5/400, 5/320),
+with a 128-colour palette and ordered dithering; if even the smallest is too
+big it keeps a shorter excerpt from the middle of the clip
+(`compose.json`'s `gif.excerpt`: start and seconds). The MP4 is always the
+whole clip. The trial's airdrop clip: 40.8 MB before, 7.2 MB now (8
+frames a second, 640 px wide, whole).
+
+**How each side was captured** goes in `notes.md` and `compose.json`: a
+side made from still pictures (the route's screenshots, or m2-alpha's
+`--mission-shots`) says "still screenshots, not live video" with how many
+a second it really has over the clip (Xenia's fallback about 1, ours about
+10); a window recording says "live video" at its rate.
 m2-alpha's frames are written to `C:\Claude\scratch\clips-tmp` (a local
 disk) and deleted once they are a clip.
 
