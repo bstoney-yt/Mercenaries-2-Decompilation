@@ -4668,9 +4668,14 @@ impl Combat {
         f.player.ragdoll = Some(id);
         f.player.down = true;
         f.player.aiming = false;
-        eprintln!("knockdown: she is down for {seconds:.1} s");
+        let entering = match (f.player.moves.knockdown, &f.player.model) {
+            (Some(c), Some((_, rig))) => rig.clips.get(c).map_or(0.0, |c| c.clip.header.duration),
+            _ => 0.0,
+        };
+        eprintln!("knockdown: she is down for {seconds:.1} s, after a {entering:.2} s KnockDown");
         self.knocked = Some(KnockedHer {
             seconds,
+            entering,
             ..KnockedHer::default()
         });
     }
@@ -8089,8 +8094,12 @@ pub const HER_PLAYER_RECORD: bool = true;
 /// and, her body being limp (kind 0xC), it has lain still over 0.5 s or
 /// been limp over 19 s, kept as for the people by the limp body's update
 /// 0x82190470 ([`crate::npc::LimpTimers`]: still is the body staying
-/// within 0.1 m of where it settled). Inferred: her time counts from the
-/// knockdown (the fall's own moment is not separated). She
+/// within 0.1 m of where it settled). Her time down counts in
+/// `KnockedDown` `Idle` only: 0x8225CAE0 compares it with the time spent
+/// in that state, which `Upright` `KnockDown` leads to as it completes
+/// (Xenia: `KnockedDown` from 0.33-0.36 s after the ragdoll goes limp;
+/// the limp timers count from the limp itself). Inferred: `KnockDown`
+/// completes as her rig's `KnockDown` clip ends ([`Self::entering`]). She
 /// rises where the body lay, into her rig's `KnockedDown` `Getup` clip
 /// (the on-foot tables' handle ade601a9, clip 0xAEB6C9BD; from samples),
 /// as the people do.
@@ -8099,6 +8108,9 @@ pub struct KnockedHer {
     pub seconds: f32,
     pub down_for: f32,
     pub body: crate::npc::LimpTimers,
+    /// Seconds of `Upright` `KnockDown` left before she is in
+    /// `KnockedDown` `Idle` and her time down starts to count.
+    pub entering: f32,
     /// Getting up: seconds of the get-up clip left.
     pub rising: Option<f32>,
 }
@@ -8107,13 +8119,16 @@ impl KnockedHer {
     /// A step of `dt` with her limp body's root at `at` (None: not
     /// known).
     pub fn step(&mut self, at: Option<Vec3>, dt: f32) {
-        self.down_for += dt;
+        let falling = self.entering.min(dt).max(0.0);
+        self.entering -= falling;
+        self.down_for += dt - falling;
         self.body.step(at, dt);
     }
 
-    /// Whether she gets up now (0x8225CAE0).
+    /// Whether she gets up now (0x8225CAE0): in `KnockedDown` `Idle`,
+    /// down longer than her time down, and her body at rest.
     pub fn stands(&self) -> bool {
-        self.down_for > self.seconds && self.body.settled()
+        self.entering <= 0.0 && self.down_for > self.seconds && self.body.settled()
     }
 }
 
@@ -8366,6 +8381,28 @@ pub fn survival_check() -> bool {
 mod tests {
     /// Knocked down for 5 s, she stands once that is past and her body
     /// has lain still half a second; tumbling, not before 19 s limp.
+    #[test]
+    fn her_time_down_counts_from_knocked_down_not_the_fall() {
+        use super::KnockedHer;
+        // 0.35 s of `KnockDown` first, then 1 s down: lying still all
+        // along, she stands after 1.35 s, not 1.
+        let mut k = KnockedHer {
+            seconds: 1.0,
+            entering: 0.35,
+            ..KnockedHer::default()
+        };
+        let mut t = 0.0f32;
+        while !k.stands() && t < 5.0 {
+            k.step(Some(Vec3::ZERO), 0.05);
+            t += 0.05;
+        }
+        // 1.35 s, to the step (1.0 s of time down from 0.35 s in).
+        assert!(t > 1.3 && t < 1.42, "{t} {k:?}");
+        // The still timer counts from the limp itself: 0.5 s still is met
+        // before the time down, which decides.
+        assert!(k.body.still > 1.25, "{k:?}");
+    }
+
     #[test]
     fn she_gets_up_after_her_time_down_once_still() {
         use super::KnockedHer;
