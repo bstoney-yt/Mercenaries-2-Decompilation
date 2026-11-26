@@ -165,6 +165,7 @@ cargo run --release -p m2-assets --example gltf -- view dumps/jen.glb --world du
 | [`m2-hook`](crates/m2-hook) | Symbol tables and the per-function original/Rust switch |
 | [`m2-oracle`](crates/m2-oracle) | Differential tests against original functions (opt-in) |
 | [`m2-runsum`](crates/m2-runsum) | Summarizes an autoplay run from its log |
+| [`m2-nightly`](crates/m2-nightly) | Nightly autoplay of every contract: flags breaks, files issues ([docs](docs/nightly-autoplay.md)) |
 | [`m2-loader`](crates/m2-loader) | The original in-process DLL approach (parked) |
 
 [`symbols/`](symbols) tracks every identified function: name, address, signature and
