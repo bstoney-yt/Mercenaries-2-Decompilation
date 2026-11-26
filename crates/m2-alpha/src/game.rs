@@ -4865,7 +4865,20 @@ fn knock_loose(
         // as soon as they are placed, standing or not: the scripts count
         // the goods on the bed from then on (PirCon002 counted none, and
         // gave up, while the truck stood with its jugs still the layer's).
-        if let (Some(_), Some(b), Some(place)) = (v.guid, bed, world.physics.vehicle_transform(id))
+        //
+        // Not while it is still settling from its placing: a vehicle is
+        // stepped from add and its springs' first step throws it (the
+        // 360's no-ground first wheel step, `Damper` in m2-engine), and
+        // goods loaded then are thrown off its bed (#769 cargo-settle:
+        // 0x11d39d off). The 360's goods meet their truck asleep: Xenia
+        // settle7/8, the El Grande's first sample +2.18 up, asleep by 2.02
+        // to 2.42 s, its crates' bodies in its island only at 18.18 s.
+        // Inferred from that order (what makes the 360's crates bodies at
+        // 18 s is not read): goods are taken up once their vehicle is
+        // asleep.
+        let settled = world.physics.vehicle_asleep(id);
+        if let (true, Some(_), Some(b), Some(place)) =
+            (settled, v.guid, bed, world.physics.vehicle_transform(id))
         {
             let standing = Crasher {
                 place,
@@ -5696,6 +5709,10 @@ impl Game {
                 );
             }
             if !FIRST_STEPS_WATCHED.contains(&w.entity) {
+                // Logged through its first contact (step 3), then let go.
+                if n < 3 {
+                    keep.push(w);
+                }
                 continue;
             }
             let speed = v.length();

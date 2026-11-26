@@ -12790,6 +12790,41 @@ mod tests {
         assert!((v - 5.29).abs() < 0.2, "box trailer {v}");
     }
 
+    // A vehicle is stepped from add (Xenia parkedcar1): its first steps
+    // it is awake, kicked by its springs' first contact; once still it
+    // sleeps, and only then does the game take up goods onto its bed
+    // (m2-alpha, settle7/8's order: the El Grande asleep before its crates
+    // are bodies).
+    #[test]
+    fn a_vehicle_added_is_awake_until_it_has_settled() {
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, car().ride_height(), 0.0), 0.0);
+        p.step(DT);
+        assert!(!p.vehicle_asleep(id), "asleep on its first step");
+        let parked = VehicleControls {
+            parked: true,
+            ..Default::default()
+        };
+        let mut asleep_at = None;
+        for k in 0..600 {
+            p.drive(id, parked);
+            p.step(DT);
+            if p.vehicle_asleep(id) {
+                asleep_at = Some(k);
+                break;
+            }
+        }
+        let k = asleep_at.expect("never slept");
+        assert!(k > 30, "slept after only {k} steps");
+    }
+
     // The push is never a pull: a spring stretching fast enough that its
     // damping outweighs it gives nothing (0x8219F6DC); off the ground it
     // gives nothing and next touches as from its whole length.
