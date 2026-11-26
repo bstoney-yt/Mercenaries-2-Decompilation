@@ -63,7 +63,27 @@ Steps 1 and 2 are pure code, and step 4 has a launcher-screenshot check.
 Steps 3 and 5 need a person's ears and eyes, or a game-check thread's
 offscreen run.
 
-## Open questions for review
+## Decisions (2026-11-26)
+
+Brendan left the four questions below to the project; these are the
+answers it chose.
+
+1. **List everything.** Every cut-scene and every music cue is listed.
+   Those the current save hasn't seen are shown greyed and locked, read
+   from the save data the launcher already reads. Where a save has no
+   seen-flag for an item, it is shown unlocked, with a note saying so.
+2. **Movies play inside the launcher's viewport.** Movies need a local
+   ffmpeg; without one, the page says so plainly and still plays music.
+3. **Readable names.** Real game strings read from the install at run
+   time are used where they exist. Otherwise a name of our own is shown,
+   falling back to the raw file or cue name. Every name of our own, and
+   the fallback, is marked as invented.
+4. **Music plays without ffmpeg,** through the native Xbox ADPCM decoder
+   in `m2-assets`.
+
+The build ships in two PRs: music first, then movies.
+
+## Open questions (answered above)
 
 - Should everything be listed, or only what a save has seen (cut-scenes
   of finished contracts, factions met)? The second needs the save's
