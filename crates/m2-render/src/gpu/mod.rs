@@ -39,6 +39,7 @@ use crate::key::MaterialId;
 use crate::texture::{BlendMode, MaterialDesc, TextureDesc, TextureFormat, TextureHandle};
 
 pub use ::wgpu;
+pub use shadow::Schedule as ShadowSchedule;
 
 /// Bytes of a draw's uniforms: its world matrix, then the first palette
 /// matrix and the palette length, then the same for its instances, then
@@ -803,9 +804,9 @@ pub struct WgpuBackend {
     /// it): the world and its post passes draw that much smaller and are
     /// stretched to the window ([`set_render_scale`](Self::set_render_scale)).
     scale: f32,
-    /// The shadow cascades redrawn on the phone's lighter schedule
-    /// ([`shadow::refreshes_lightly`]).
-    light_shadows: bool,
+    /// Which shadow cascades are drawn again each frame ([`ShadowSchedule`]):
+    /// all four, as the game, unless a phone's lighter schedule is set.
+    shadow_schedule: ShadowSchedule,
     depth: DepthTargets,
     scene_layout: wgpu::BindGroupLayout,
 
@@ -1414,7 +1415,7 @@ impl WgpuBackend {
             width,
             height,
             scale: 1.0,
-            light_shadows: false,
+            shadow_schedule: ShadowSchedule::Every,
             depth,
             scene_layout,
             draw_layout,
@@ -1883,10 +1884,24 @@ impl WgpuBackend {
     }
 
     /// Redraws the far shadow cascades less often (`light`), as a phone
-    /// needs: under two shadow passes a frame for 2.75
+    /// needs: under two shadow passes a frame for the game's four
     /// ([`shadow::refreshes_lightly`]).
     pub fn set_light_shadows(&mut self, light: bool) {
-        self.light_shadows = light;
+        self.shadow_schedule = if light {
+            ShadowSchedule::Light
+        } else {
+            ShadowSchedule::Every
+        };
+    }
+
+    /// Which shadow cascades are drawn again each frame.
+    pub fn set_shadow_schedule(&mut self, schedule: ShadowSchedule) {
+        self.shadow_schedule = schedule;
+    }
+
+    /// The shadow cascades' schedule now.
+    pub fn shadow_schedule(&self) -> ShadowSchedule {
+        self.shadow_schedule
     }
 
     /// The world's drawing size: the window's at the render scale.
@@ -2587,18 +2602,13 @@ impl WgpuBackend {
             l.shadow_direction.unwrap_or(l.sun_direction),
             l.shadow_distance,
         );
-        // Far cascades are redrawn every few frames only, each keeping the
-        // matrix it was drawn with meanwhile: they cost as much as the near
-        // ones and change little.
+        // Every cascade is drawn again each frame, as the game's are; on
+        // a lighter schedule (a phone's) the far ones only every few
+        // frames, each keeping the matrix it was drawn with meanwhile.
         let mut refresh = [true; shadow::CASCADES];
         if let (Some(c), Some(old)) = (&mut cascades, self.cascades.get()) {
             for (i, fresh) in refresh.iter_mut().enumerate() {
-                let due = if self.light_shadows {
-                    shadow::refreshes_lightly(i, self.frames)
-                } else {
-                    shadow::refreshes(i, self.frames)
-                };
-                if !due {
+                if !self.shadow_schedule.due(i, self.frames) {
                     c.keep(&old, i);
                     *fresh = false;
                 }

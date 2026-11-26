@@ -72,6 +72,7 @@ mod drop_zones;
 mod drops;
 mod entrance_marker;
 mod errlog;
+mod flicker;
 mod flights;
 mod flow;
 mod frametimes;
@@ -333,6 +334,10 @@ struct Options {
     /// With `--screenshot` on foot: take the picture close up from behind
     /// her, to see what hangs on her back.
     behind: bool,
+    /// `--flicker-check`: with `--screenshot` on foot, pan past the
+    /// nearest tree and measure flicker ([`flicker::check`]); exits 0 on a
+    /// PASS, 1 on a FAIL.
+    flicker_check: bool,
     /// With `--screenshot` on foot: give her this weapon in the
     /// launcher's place without taking it up (`--slung gl`: the crate's
     /// grenade launcher on her back while the carbine is up).
@@ -1239,6 +1244,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--switch" => o.switch = true,
             "--pickup" => o.pickup = true,
             "--closeup" => o.closeup = true,
+            "--flicker-check" => o.flicker_check = true,
             "--pda" => o.pda = true,
             "--pda-zoom" => {
                 o.pda_zoom = value()?.parse().context("--pda-zoom expects a number")?;
@@ -1515,6 +1521,7 @@ const SCREENSHOT_ONLY: &[&str] = &[
     "--mission-shots",
     "--pipelines-check",
     "--pipeline-warm-check",
+    "--flicker-check",
 ];
 
 /// Those of [`SCREENSHOT_ONLY`] given without `--screenshot`, in the order
@@ -4124,6 +4131,10 @@ fn screenshot(
         for line in describe_slung(&game) {
             eprintln!("behind: {line}");
         }
+    }
+    if options.flicker_check {
+        let ok = flicker::check(&mut backend, &mut game, fov, aspect, out)?;
+        errlog::exit(if ok { 0 } else { 1 });
     }
     if let (Some(reach), Some(link)) = (options.mission_look, &link) {
         look_at_marker(&mut backend, &mut game, link, reach, fov, aspect)?;
@@ -16368,6 +16379,20 @@ mod tests {
         let o = parse_args(&args(&["--autoplay-avoid", "OilCon020,PmcCon031"])).unwrap();
         assert_eq!(o.autoplay_avoid, ["OilCon020", "PmcCon031"]);
         assert!(parse_args(&args(&[])).unwrap().autoplay_avoid.is_empty());
+    }
+
+    #[test]
+    fn the_flicker_check_is_an_offscreen_flag() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(
+            parse_args(&args(&["--flicker-check"]))
+                .unwrap()
+                .flicker_check
+        );
+        assert_eq!(
+            screenshot_only_ignored(&args(&["--flicker-check"])),
+            ["--flicker-check"]
+        );
     }
 
     #[test]

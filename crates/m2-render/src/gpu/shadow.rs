@@ -7,11 +7,20 @@
 //! moved in whole texels so it doesn't shimmer as the camera moves. The
 //! slice distances, map size and biases are this renderer's choices.
 //!
+//! All four maps are drawn again every frame, as the game draws them: its
+//! frame's shadow pass (360 code, 0x821B6A98, after `CollectShadowCasters`)
+//! runs the casters into each of the four slices in turn, every frame
+//! ([`Schedule::Every`]). Keeping the far maps for a few frames
+//! ([`Schedule::Staggered`], this renderer's earlier saving) let a turning
+//! camera's view run past a kept map's edge, where shadows came and went
+//! from one frame to the next.
+//!
 //! # Provenance
 //!
 //! Clean-room: standard cascaded shadow mapping, written against glam and
-//! wgpu; only the cascade count and the quarter-strength highlight rule
-//! come from the game's shader constants.
+//! wgpu; the cascade count, the quarter-strength highlight rule (the
+//! game's shader constants) and redrawing every map each frame (the 360
+//! code) are the game's.
 
 use m2_math::glam::{Mat4, Vec3, Vec4};
 
@@ -125,9 +134,33 @@ impl Cascades {
     }
 }
 
+/// Which cascades are drawn again on a frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Schedule {
+    /// All four, every frame, as the game does (360 code, 0x821B6A98).
+    #[default]
+    Every,
+    /// [`refreshes`]: this renderer's earlier saving, kept to compare.
+    Staggered,
+    /// [`refreshes_lightly`]: a phone's.
+    Light,
+}
+
+impl Schedule {
+    /// Whether cascade `i` is drawn again on frame `frame`.
+    pub fn due(self, i: usize, frame: u64) -> bool {
+        match self {
+            Self::Every => true,
+            Self::Staggered => refreshes(i, frame),
+            Self::Light => refreshes_lightly(i, frame),
+        }
+    }
+}
+
 /// Whether cascade `i` is redrawn on frame `frame`: the near two every
 /// frame, the third every other frame, the last every fourth (never on the
-/// same frame as the third).
+/// same frame as the third). Invented (a saving): the game redraws all
+/// four every frame ([`Schedule::Every`]).
 pub fn refreshes(i: usize, frame: u64) -> bool {
     match i {
         0 | 1 => true,
@@ -222,6 +255,25 @@ mod tests {
             assert!(far <= 1, "frame {f}");
             assert!(refreshes_lightly(0, f));
         }
+    }
+
+    #[test]
+    fn the_game_draws_every_cascade_every_frame() {
+        // 0x821B6A98: four slices, each drawn, every frame.
+        assert_eq!(Schedule::default(), Schedule::Every);
+        for f in 0..16u64 {
+            assert!((0..CASCADES).all(|i| Schedule::Every.due(i, f)));
+        }
+        // The earlier saving skipped some, which the comparison keeps.
+        assert!((0..8u64).any(|f| !Schedule::Staggered.due(3, f)));
+        assert_eq!(
+            (0..8u64)
+                .map(|f| Schedule::Light.due(1, f))
+                .collect::<Vec<_>>(),
+            (0..8u64)
+                .map(|f| refreshes_lightly(1, f))
+                .collect::<Vec<_>>()
+        );
     }
 
     fn view() -> View {

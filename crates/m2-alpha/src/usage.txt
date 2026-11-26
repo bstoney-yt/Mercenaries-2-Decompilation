@@ -224,6 +224,11 @@ m2-alpha [options]
                          play does and logs which it found
   --closeup              with --screenshot on foot: the picture from close by
                          her right side, to see her hands
+  --flicker-check        check: with --screenshot on foot, pan past the
+                         nearest tree on the game's shadow schedule, the
+                         old staggered one and shadows off; lists how much
+                         of the frame flickers in each and writes where
+                         (<out>-flicker-<pan>-<variant>.ppm); PASS or FAIL
   --pda                  with --screenshot: the picture with her PDA open
   --binoculars <zoom>    with --screenshot: the picture through her
                          binoculars at zoom 1..7, their screen up
