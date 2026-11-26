@@ -1,0 +1,26 @@
+{
+  "name": "airdrop-vzacon001",
+  "fix": "#715",
+  "caption": "The first contract's weapon crate comes down by helicopter as on the 360",
+  "summary": "VzaCon001, on the beach after the boat: the scripts' first supply delivery.",
+  "start_state": "VzaCon001 from a new game: boat ride, beach, 'Wait for weapon delivery'",
+  "duration": 30,
+  "fps": 30,
+  "size": "640x360",
+  "slowmo": 1.0,
+  "xenia": {
+    "routes": ["vzacon001-boat.txt", "case-a-airdrop.txt"],
+    "start": "mark:objective: wait for weapon delivery",
+    "frames": "drop",
+    "capture": "video",
+    "args": ["--headless=true"],
+    "offset": 0.0
+  },
+  "ours": {
+    "args": ["--hero", "mattias", "--mission", "--autoplay", "--mission-seconds", "95"],
+    "shots": {"from": 25, "to": 75, "fps": 10},
+    "start": "log:autoplay ([\\d.]+) s: objectives \\[\"Wait for weapon delivery\"\\]",
+    "wall": 900,
+    "offset": 0.0
+  }
+}

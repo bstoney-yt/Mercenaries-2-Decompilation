@@ -13,6 +13,7 @@ audio and logs are written only to the output folder you name.
 | `m2-capture.ps1` | The same wait, then `m2-alpha --screenshot` (offscreen, `WGPU_BACKEND=dx12`) with your arguments, frames to `<case>\m2\`. |
 | `xmem.py` | Reads Xenia's guest memory from outside (read-only `ReadProcessMemory`; guest address A is host `0x100000000 + A`, big endian). `scan x y z` finds float triplets near a point; `Tracker` and `MatrixTracker` follow a vehicle for `track`/`goto`. |
 | `sheet.py` | Pairs `<case>\xenia\*.png` with `<case>\m2\*` in name order into `sheet.png` (Xenia left, m2-alpha right), plus `metrics.md` (luma, RGB, saturation, contrast, edge density, top/bottom luma per frame). |
+| `clips.py` | Side-by-side clips, one case file per fix (`cases/`): captures both sides (GPU slot), lines them up and composes a labelled MP4, GIF and release-notes snippet; `compose` works from two existing clips. See `docs/side-by-side-clips.md`. |
 | `routes/` | Route files: `vzacon001-boat.txt` (boot to the first contract's speedboat) and the case routes. |
 
 ## Setup (once)

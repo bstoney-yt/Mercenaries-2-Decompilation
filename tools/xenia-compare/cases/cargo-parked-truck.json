@@ -1,0 +1,23 @@
+{
+  "name": "cargo-parked-truck",
+  "fix": "#776",
+  "caption": "A loaded truck's crates stay put on its bed while it stands parked",
+  "summary": "OilCon020's El Grande with its goods aboard, got into and left standing.",
+  "start_state": "OilCon020 by the mission skip; the loaded El Grande parked where the contract puts it",
+  "duration": 20,
+  "fps": 30,
+  "size": "640x360",
+  "xenia": {
+    "routes": ["clip-oilcon020-truck.txt"],
+    "start": "mark:in truck",
+    "frames": "parked",
+    "capture": "video"
+  },
+  "ours": {
+    "args": ["--mission", "--skip-to", "OilCon020", "--autoplay", "--mission-seconds", "200"],
+    "shots": {"from": 0, "to": 180, "fps": 5},
+    "start": "log:autoplay ([\\d.]+) s: taking ",
+    "wall": 1200,
+    "offset": 0.0
+  }
+}
