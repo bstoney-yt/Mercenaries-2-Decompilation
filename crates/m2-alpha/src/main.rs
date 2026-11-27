@@ -3802,6 +3802,9 @@ fn screenshot(
         let mut knocked: Option<usize> = None;
         // `--swim-ashore`: how long she has swum.
         let mut swum = 0.0f32;
+        // `--swim-ashore`: her first turn for the shore (heading, tick),
+        // logged each frame until she faces it.
+        let mut turn_to: Option<(f32, usize)> = None;
         let knock_tick = options
             .knock_nearest
             .map(|(s, how)| ((s * 60.0).round() as usize, how));
@@ -4013,6 +4016,9 @@ fn screenshot(
                     match npc::shore(&w.physics, at, p.character.radius) {
                         Some(s) => {
                             let face = (s.x - at.x).atan2(s.z - at.z);
+                            if turn_to.is_none() {
+                                turn_to = Some((face, i));
+                            }
                             p.yaw = face;
                             eprintln!(
                                 "swim-ashore: {swum:.0} s in, turning to the shore at {s:.1}, {:.1} m off",
@@ -4034,6 +4040,28 @@ fn screenshot(
             // Her gun's lens and scope as she aims (as play does).
             game.aim_lens(&mut intent, 0, tick);
             game.step(intent, tick);
+            // `--swim-ashore`: her heading each frame of that first turn,
+            // to time it (`swim-turn:` lines), until within a degree.
+            if let (Some((face, from)), Some(p)) = (turn_to, game.scene.player.as_ref())
+                && from != usize::MAX
+            {
+                let off = (p.facing - face + std::f32::consts::PI)
+                    .rem_euclid(std::f32::consts::TAU)
+                    - std::f32::consts::PI;
+                eprintln!(
+                    "swim-turn: {:.3} s heading {:.1} deg, {:.1} deg off the shore",
+                    (i - from) as f32 * tick,
+                    p.facing.to_degrees(),
+                    off.to_degrees()
+                );
+                if off.abs() < 1f32.to_radians() {
+                    eprintln!(
+                        "swim-turn: faced the shore in {:.3} s",
+                        (i - from) as f32 * tick
+                    );
+                    turn_to = Some((face, usize::MAX));
+                }
+            }
             // With `--walk-seconds`, where she is each second: how deep the
             // sea is over her feet, and whether she swims.
             if options.walk_seconds.is_some()
