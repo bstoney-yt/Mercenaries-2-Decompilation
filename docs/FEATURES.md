@@ -59,7 +59,7 @@ and a feature counts as done when the scripts get what they ask for.
 |---|---|---|
 | Rifles, launchers, grenades, C4, mines | done | `combat.rs`, `mines.rs` (#634) |
 | Ammunition pickups and munitions laptops | done | #660, #755 |
-| Homing missiles and locks | partial | Lock shape and proximity burst invented (#698) |
+| Homing missiles and locks | partial | The lock, its cone and score, soldiers' locks on her vehicle (an AI's named target and 60 degree cone), the missile's steering and the warnings are the 360's (`homing.rs`); the known-bugs note that soldiers never lock is out of date. The cone measures her vehicle to its box in #820. Still invented: which target point the distance is taken to, the line of sight, and the warning cues |
 | Mounted guns and vehicle gunner seats | partial | Seat cameras in open #705, #713, #718 |
 | Projectile flight (gravity, noise) | partial | Gravity merged (#714, #715); FlightNoise in open #719; guidance law: GAPS P6 |
 | Explosions: damage, push, rays | partial | Push on vehicles from the 360 (#728, #768); rays for all targets in open #758, #761 |
