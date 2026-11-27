@@ -2195,6 +2195,14 @@ pub struct Combat {
     pub pilot_shots: Vec<crate::gunships::Shot>,
     pub pilot_view: Option<(Vec3, Vec3)>,
     pilot_guns: std::collections::HashMap<(usize, usize), PilotGun>,
+    /// Each vehicle weapon's cone past its `ScatterMin` (by vehicle, seat
+    /// and weapon) and when it last fired, on [`Combat::clock`]: every
+    /// gun's rounds widen and settle its cone as hers do (0x82283A10,
+    /// 0x8227F7A8), settled here as it next fires.
+    mount_blooms:
+        std::collections::HashMap<(usize, usize, usize), (m2_engine::weapons::Bloom, f32)>,
+    /// Seconds of fighting so far.
+    clock: f32,
     /// Rounds those guns fired (pilots' and gunners'), and seconds to
     /// the next log line of them.
     pilot_rounds: [u32; 2],
@@ -2600,6 +2608,8 @@ impl Default for Combat {
             pilot_shots: Vec::new(),
             pilot_view: None,
             pilot_guns: std::collections::HashMap::new(),
+            mount_blooms: std::collections::HashMap::new(),
+            clock: 0.0,
             pilot_rounds: [0; 2],
             pilot_dry: 0,
             pilot_log: 0.0,
@@ -3855,6 +3865,7 @@ impl Combat {
             self.drop_bomb(f, i);
         }
         self.fire_held = trigger.fire;
+        self.clock += dt;
         self.track_lock(f, dt);
         self.wire_hers(f);
         // Changing the clip, she lowers the rifle.
@@ -5420,9 +5431,32 @@ impl Combat {
         }
         let ammo = w.ammo;
         self.firing = ammo.template;
+        // From the 360 code: a vehicle's gun fires through the same shot
+        // loop as hers (0x82283A10), so each round strays from its aim
+        // within the weapon's own cone as it stands, which the round then
+        // widens and which settles between shots (0x822838B0, 0x8227F7A8;
+        // [`m2_engine::weapons::stray_360`]). Its trigger counts as held
+        // between rounds no more than two gaps apart (inferred).
+        let feel = w.feel;
+        let now = self.clock;
+        let (mut bloom, last) = self
+            .mount_blooms
+            .get(&(i, seat_ix, priority))
+            .copied()
+            .unwrap_or((m2_engine::weapons::Bloom::default(), f32::NEG_INFINITY));
+        let since = (now - last).min(60.0);
+        bloom.settle(&feel, since, gap, since <= 2.0 * gap, false);
+        let mut stray = |c: &mut Self| {
+            let cone = feel.cone(bloom.added);
+            bloom.shot(&feel);
+            let (a, b) = (c.random(), c.random());
+            m2_engine::weapons::stray_360(aim, cone, feel.center_bias(), a, b)
+        };
+        let one = stray(self);
         match w.flight() {
             m2_engine::weapons::Flight::Round => {
-                for _ in 0..w.pellets.max(1) {
+                for k in 0..w.pellets.max(1) {
+                    let aim = if k == 0 { one } else { stray(self) };
                     let hit = cast_shot(f.physics, f.people, from, aim, MG_RANGE, None, Some(id));
                     let to = hit.map_or(from + aim * MG_RANGE, |h| from + aim * h.0);
                     self.effect(Effect::Tracer { from, to }, 0.07);
@@ -5479,6 +5513,7 @@ impl Combat {
                 let speed = ammo.velocity.max(1.0);
                 let velocity = lob_velocity(from, goal, speed, m2_engine::physics::GRAVITY)
                     .unwrap_or(aim * speed);
+                let velocity = Quat::from_rotation_arc(aim, one) * velocity;
                 self.projectiles.push(Projectile::Round {
                     at: from,
                     velocity,
@@ -5509,7 +5544,7 @@ impl Combat {
                 };
                 self.projectiles.push(Projectile::Rocket {
                     at: from,
-                    velocity: aim * ammo.velocity.max(1.0),
+                    velocity: one * ammo.velocity.max(1.0),
                     flown: 0.0,
                     shell: false,
                     owner: Some(id),
@@ -5534,6 +5569,8 @@ impl Combat {
                 });
             }
         }
+        self.mount_blooms
+            .insert((i, seat_ix, priority), (bloom, now));
         alarm(f.people, from);
         Some(gap)
     }
@@ -5547,7 +5584,7 @@ impl Combat {
     /// `WeaponHint` range, at the turret's speeds and within its arc, and
     /// fires once he is inside its arc and tilt, in the bursts its `WeaponHint`
     /// gives soldiers ([`gunner_burst`]), each round strayed in the
-    /// weapon's `ScatterMin` cone.
+    /// weapon's own cone ([`Combat::fire_mount`]).
     ///
     /// Provenance: from the 360 code, an AI rider's attack behaviour
     /// (`TurretAttack`, 0x822B7C10, registered by name at 0x822B5638) is
@@ -5605,7 +5642,6 @@ impl Combat {
             };
             let hint = m.weapon.hint;
             let (near, far) = hint.map_or((0.0, GUNNER_RANGE), |h| (h.min_range, h.range));
-            let cone = m.weapon.feel.cone(0.0);
             let gap = m.weapon.gap();
             let size = m2_engine::weapons::AiClip::size(m);
             let Some(at) = foes
@@ -5638,17 +5674,8 @@ impl Combat {
                 continue;
             }
             let to = at - centre;
-            let dir = m2_engine::weapons::stray_in_cone(
-                to.normalize_or(Vec3::Z),
-                cone,
-                self.random(),
-                self.random(),
-            );
             let close = to.length() < m2_engine::weapons::FireHint::CLOSE;
-            if self
-                .fire_mount(f, i, seat, 0, Some(centre + dir * to.length()))
-                .is_some()
-            {
+            if self.fire_mount(f, i, seat, 0, Some(at)).is_some() {
                 self.gunner_clips[k].shot(size);
                 let (wait, burst) = gunner_burst(hint, gap, close, self.gunner_burst[k]);
                 self.gunner_wait[k] = wait;
@@ -5739,7 +5766,6 @@ impl Combat {
                 let guided = m.weapon.ammo.homing;
                 let skip = v.id;
                 let (near, far) = hint.map_or((0.0, GUNNER_RANGE), |h| (h.min_range, h.range));
-                let cone = m.weapon.feel.cone(0.0);
                 let gap = m.weapon.gap();
                 let size = m2_engine::weapons::AiClip::size(m);
                 let aim_ai = m.weapon.aim_ai;
@@ -5888,13 +5914,9 @@ impl Combat {
                     eprintln!("homing: a crew's gun locked on her vehicle fires");
                 }
                 let to = at - centre;
-                let (a, b) = (self.random(), self.random());
-                let dir = m2_engine::weapons::stray_in_cone(to.normalize_or(Vec3::Z), cone, a, b);
                 let close = to.length() < m2_engine::weapons::FireHint::CLOSE;
                 self.crew_firing = true;
-                let fired = self
-                    .fire_mount(f, i, seat, 0, Some(centre + dir * to.length()))
-                    .is_some();
+                let fired = self.fire_mount(f, i, seat, 0, Some(at)).is_some();
                 self.crew_firing = false;
                 if fired {
                     f.people.war_tally.0 += 1;
@@ -5910,7 +5932,7 @@ impl Combat {
 
     /// AI pilots' guns ([`pilot_shots`](Self::pilot_shots)): each fires
     /// its first mount's weapon at the point its pilot asks, each round
-    /// strayed in its `ScatterMin` cone, as her gunners' rounds are
+    /// strayed in its own cone ([`Combat::fire_mount`]), as her gunners' rounds are
     /// ([`gunners_fire`](Self::gunners_fire)). From the 360 code: a
     /// pilot's `HeliAttack` fires through its seat's weapon at the
     /// target's lead (0x822B0578, 0x822AE598), in the cycles of the AI's
@@ -5960,7 +5982,6 @@ impl Combat {
             else {
                 continue;
             };
-            let cone = m.weapon.feel.cone(0.0);
             let hint = m.weapon.hint;
             let size = m2_engine::weapons::AiClip::size(m);
             let Some(from) =
@@ -6008,16 +6029,7 @@ impl Combat {
                     from, s.at, l.velocity, l.watched, true, s.at, l.speed, l.gravity,
                 )
             });
-            let to = at - from;
-            let dir = m2_engine::weapons::stray_in_cone(
-                to.normalize_or(Vec3::Z),
-                cone,
-                self.random(),
-                self.random(),
-            );
-            if let Some(gap) =
-                self.fire_mount(f, i, s.seat, s.priority, Some(from + dir * to.length()))
-            {
+            if let Some(gap) = self.fire_mount(f, i, s.seat, s.priority, Some(at)) {
                 let g = self.pilot_guns.entry((i, s.seat)).or_default();
                 g.wait = gap;
                 if let Some(c) = g.clips.get_mut(s.priority) {
