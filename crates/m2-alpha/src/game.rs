@@ -7855,6 +7855,17 @@ fn serve_cover_untimed(world: &m2_engine::World, people: &mut crate::npc::People
         n.cover_ask = None;
         n.cover_claim = found.map(|(_, object, _)| (object, 0.0));
         n.cover_kind = found.map_or(0, |(_, _, kind)| kind);
+        // The spot's actions (0x822CCBD0's fill): its side, inferred as the
+        // way its lean point lies from it, facing the threat (to his left:
+        // the test 0x822ED520 taken as true).
+        n.cover_clips = picked.map_or([0; 3], |(at, k)| {
+            let f = (threat - at).with_y(0.0).normalize_or(Vec3::Z);
+            let left_axis = Vec3::new(-f.z, 0.0, f.x);
+            let left = cands[k]
+                .lean
+                .is_some_and(|l| (l - at).with_y(0.0).dot(left_axis) > 0.0);
+            m2_engine::ai_mover::spot_clips(n.cover_kind, left)
+        });
         let found = found.map(|(at, _, _)| at);
         n.cover_spot = found;
         if let Some(at) = found {

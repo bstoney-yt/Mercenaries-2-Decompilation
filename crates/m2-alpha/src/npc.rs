@@ -381,6 +381,18 @@ pub struct PersonKind {
     pub motion: Option<m2_engine::on_foot::HumanMotion>,
 }
 
+/// The cover stance a fighter's way into cover led to, which his
+/// `ExitCover` is played in (the human state table).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoverStance {
+    /// `UprightCoverLeft`.
+    Left,
+    /// `UprightCoverRight`.
+    Right,
+    /// `CrouchCover`.
+    Kneel,
+}
+
 /// What a person is doing.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Brain {
@@ -473,6 +485,8 @@ pub struct FightClips {
     /// The idles of the mover's other two stances, `Crouched` and `Prone`
     /// ([`m2_engine::ai_mover::Stance`]).
     pub stances: [Option<usize>; 2],
+    /// The cover actions' clips ([`Self::cover_clip`]).
+    pub cover: [Option<usize>; 10],
 }
 
 /// The clips of the 14 directions a person dies in on foot
@@ -848,6 +862,10 @@ impl FightClips {
                 .map(|(s, a)| Self::by_action(rig, s, a)),
             stances: [("Crouched", "Idle"), ("Prone", "Idle")]
                 .map(|(s, a)| Self::by_action(rig, s, a)),
+            cover: std::array::from_fn(|k| {
+                let (s, a) = Self::ACTION_KEYS[4 + k];
+                Self::by_action(rig, s, a)
+            }),
         }
     }
 
@@ -857,12 +875,47 @@ impl FightClips {
     /// them; their hashes are [`m2_engine::ai_mover::Side::action`]) and
     /// the idles of the stances its `crouch` and `GoProne` messages lead to
     /// (the human state table: `Crouched`, `Prone`).
-    pub const ACTION_KEYS: [(&'static str, &'static str); 4] = [
+    pub const ACTION_KEYS: [(&'static str, &'static str); 14] = [
         ("Upright", "SidestepLeft"),
         ("Upright", "SidestepRight"),
         ("Crouched", "Idle"),
         ("Prone", "Idle"),
+        ("Upright", "EnterCoverLeft"),
+        ("Upright", "EnterCoverRight"),
+        ("Upright", "EnterCoverLeftInPlace"),
+        ("Upright", "EnterCoverRightInPlace"),
+        ("Upright", "EnterCoverKneel"),
+        ("UprightCoverLeft", "ExitCover"),
+        ("UprightCoverRight", "ExitCover"),
+        ("CrouchCover", "ExitCover"),
+        ("Upright", "DiveLeft"),
+        ("Upright", "DiveRight"),
     ];
+
+    /// The cover actions a spot gives ([`m2_engine::ai_mover::spot_clips`]),
+    /// in [`Self::ACTION_KEYS`] from its fifth: `ExitCover` by the cover
+    /// stance its way in led to (`EnterCoverLeft*` to `UprightCoverLeft`,
+    /// `*Right*` to `UprightCoverRight`, `EnterCoverKneel` to
+    /// `CrouchCover`).
+    pub fn cover_clip(&self, action: u32, stance: CoverStance) -> Option<usize> {
+        use m2_engine::ai_mover as m;
+        let k = match action {
+            m::ENTER_COVER_LEFT => 0,
+            m::ENTER_COVER_RIGHT => 1,
+            m::ENTER_COVER_LEFT_IN_PLACE => 2,
+            m::ENTER_COVER_RIGHT_IN_PLACE => 3,
+            m::ENTER_COVER_KNEEL => 4,
+            m::EXIT_COVER => match stance {
+                CoverStance::Left => 5,
+                CoverStance::Right => 6,
+                CoverStance::Kneel => 7,
+            },
+            m::DIVE_LEFT => 8,
+            m::DIVE_RIGHT => 9,
+            _ => return None,
+        };
+        self.cover[k]
+    }
 
     /// How a rig keeps an action's clip: stance and action together (an
     /// action's name is not unique across stances).
@@ -1488,6 +1541,12 @@ pub struct Npc {
     pub cover_ask: Option<Vec3>,
     pub cover_spot: Option<Vec3>,
     pub cover_kind: u8,
+    /// Its actions ([`m2_engine::ai_mover::spot_clips`], from the cover
+    /// service), the cover stance his way in led to, and seconds of a
+    /// cover clip left to play.
+    pub cover_clips: [u32; 3],
+    cover_stance: CoverStance,
+    cover_clip: f32,
     /// The cover object his spot is on and how long he has been heading
     /// there, for his claim ([`People::renew_cover_claims`]).
     pub cover_claim: Option<(u32, f32)>,
@@ -1856,6 +1915,9 @@ impl Npc {
             cover_ask: None,
             cover_spot: None,
             cover_kind: 0,
+            cover_clips: [0; 3],
+            cover_stance: CoverStance::Left,
+            cover_clip: 0.0,
             cover_claim: None,
             cover_retry: 0.0,
             motion: m2_engine::on_foot::HumanMotion::default(),
@@ -3157,7 +3219,7 @@ impl Npc {
                 has_shot: seen && distance <= self.fire_hint().range,
                 out_of_area: self.anchor.is_some_and(|a| a.outside(goal)),
                 busy: self.striking > 0.0,
-                one_shot: self.step.is_some(),
+                one_shot: self.step.is_some() || self.cover_clip > 0.0,
                 // Not traced: the area's flags (+0xC bits 3, 4) and mind
                 // +0x70F bit 3 taken as clear.
                 may_crouch: true,
@@ -3169,6 +3231,7 @@ impl Npc {
                 spot: self.cover_spot.map(|at| Spot {
                     at,
                     animation: self.cover_kind,
+                    clips: self.cover_clips,
                 }),
                 // The cover service answers every ask before his next tick
                 // (`serve_cover`); one still out (none served it) counts
@@ -3209,6 +3272,32 @@ impl Npc {
             if let Some(pause) = out.grenade_pause {
                 self.grenade_pause = pause;
                 self.grenade_pause_set = Some(pause);
+            }
+            self.cover_clip = (self.cover_clip - dt).max(0.0);
+            if let Some(action) = out.play {
+                // A cover action of the spot's (or a Popup spot's
+                // `ExitCover`): its clip once, a one-shot while it runs
+                // (0x822C04A0 lists every one). The way in sets the cover
+                // stance its `ExitCover` is in.
+                use m2_engine::ai_mover as m;
+                self.cover_stance = match action {
+                    m::ENTER_COVER_LEFT | m::ENTER_COVER_LEFT_IN_PLACE => CoverStance::Left,
+                    m::ENTER_COVER_RIGHT | m::ENTER_COVER_RIGHT_IN_PLACE => CoverStance::Right,
+                    m::ENTER_COVER_KNEEL => CoverStance::Kneel,
+                    _ => self.cover_stance,
+                };
+                let played = clips.cover_clip(action, self.cover_stance).map(|c| {
+                    self.rig.animator.set_upper(None);
+                    self.rig.animator.play_once(c);
+                    self.rig.animator.seek(0.0);
+                    self.rig.clips[c].info.duration
+                });
+                eprintln!(
+                    "people: {:08x} cover action {action:08x} ({})",
+                    self.spawn.unwrap_or(u32::MAX),
+                    played.map_or("no clip".to_owned(), |d| format!("clip {d:.2} s"))
+                );
+                self.cover_clip = played.unwrap_or(0.0);
             }
             if let Some(at) = out.throw {
                 eprintln!(
