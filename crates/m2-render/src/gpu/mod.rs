@@ -707,7 +707,7 @@ struct MaterialUniforms {
     /// Its ground layers' places.
     layer_tex: [u32; 4],
     /// x: its base map's sampler ([`sampler_index`]), y: its base map's
-    /// mip LOD bias (f32 bits).
+    /// mip LOD bias (f32 bits), z: the material's own `clamp`.
     samp: [u32; 4],
 }
 
@@ -757,6 +757,16 @@ fn maps_layout_entries() -> [wgpu::BindGroupLayoutEntry; 2] {
             count: std::num::NonZeroU32::new(SAMPLERS as u32),
         },
     ]
+}
+
+/// A material record as the GPU gets it: as built, or (`earlier`) naming
+/// the earlier samplers' repeating or clamped one and no LOD bias.
+fn sampled(mut r: MaterialUniforms, earlier: bool) -> MaterialUniforms {
+    if earlier {
+        r.samp[0] = if r.samp[2] != 0 { 3 } else { 0 };
+        r.samp[1] = 0.0f32.to_bits();
+    }
+    r
 }
 
 /// A 2D float texture binding visible to the fragment stage.
@@ -874,6 +884,10 @@ pub struct WgpuBackend {
     draw_group: wgpu::BindGroup,
     /// By [`sampler_index`].
     samplers: [wgpu::Sampler; SAMPLERS],
+    /// The renderer's sampling before the 360's, to compare against
+    /// ([`set_earlier_sampling`](Self::set_earlier_sampling)).
+    earlier_samplers: [wgpu::Sampler; SAMPLERS],
+    earlier_sampling: bool,
     white: wgpu::TextureView,
     /// Every material's record ([`Materials`]).
     material_records: Materials,
@@ -1432,6 +1446,27 @@ impl WgpuBackend {
                 ..Default::default()
             })
         });
+        // The renderer's sampling before the 360's (`set_earlier_sampling`):
+        // linear, 8x anisotropic, clamped only on a material's own `clamp`
+        // (its records then name 0 or 3).
+        let earlier_samplers: [wgpu::Sampler; SAMPLERS] = std::array::from_fn(|i| {
+            let mode = if i & 3 == 3 {
+                wgpu::AddressMode::ClampToEdge
+            } else {
+                repeat
+            };
+            device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("base (earlier)"),
+                address_mode_u: mode,
+                address_mode_v: mode,
+                address_mode_w: mode,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::MipmapFilterMode::Linear,
+                anisotropy_clamp: 8,
+                ..Default::default()
+            })
+        });
         let white = device
             .create_texture_with_data(
                 &queue,
@@ -1486,6 +1521,8 @@ impl WgpuBackend {
             slot_buffer,
             draw_group,
             samplers,
+            earlier_samplers,
+            earlier_sampling: false,
             white,
             shaders: HashMap::new(),
             layouts: Layouts::default(),
@@ -1725,7 +1762,12 @@ impl WgpuBackend {
             ],
             tex: [textures[0], textures[1], textures[2], textures[3]],
             layer_tex: [textures[4], textures[5], textures[6], textures[7]],
-            samp: [sampler_index(desc), desc.lod_bias.to_bits(), 0, 0],
+            samp: [
+                sampler_index(desc),
+                desc.lod_bias.to_bits(),
+                u32::from(desc.clamp),
+                0,
+            ],
         }
     }
 
@@ -1801,6 +1843,7 @@ impl WgpuBackend {
     /// Writes material place `slot`'s record, growing the buffer if it
     /// has no room.
     fn write_material(&mut self, slot: u32, record: MaterialUniforms) {
+        let earlier = self.earlier_sampling;
         let m = &mut self.material_records;
         let slot = slot as usize;
         if slot >= m.records.len() {
@@ -1816,14 +1859,14 @@ impl WgpuBackend {
             for (i, r) in m.records.iter().enumerate() {
                 let at = i * m.stride as usize;
                 bytes[at..at + std::mem::size_of::<MaterialUniforms>()]
-                    .copy_from_slice(bytemuck::bytes_of(r));
+                    .copy_from_slice(bytemuck::bytes_of(&sampled(*r, earlier)));
             }
             self.queue.write_buffer(&m.buffer, 0, &bytes);
         } else {
             self.queue.write_buffer(
                 &m.buffer,
                 slot as u64 * m.stride,
-                bytemuck::bytes_of(&record),
+                bytemuck::bytes_of(&sampled(record, earlier)),
             );
         }
     }
@@ -1954,6 +1997,30 @@ impl WgpuBackend {
     /// Which shadow cascades are drawn again each frame.
     pub fn set_shadow_schedule(&mut self, schedule: ShadowSchedule) {
         self.shadow_schedule = schedule;
+    }
+
+    /// Samples textures as the renderer did before the 360's sampler
+    /// state (8x anisotropic, no LOD bias, clamped only on a material's own
+    /// `clamp`) or as the 360 does (the default), to compare the two.
+    pub fn set_earlier_sampling(&mut self, on: bool) {
+        if on == self.earlier_sampling {
+            return;
+        }
+        self.earlier_sampling = on;
+        self.texture_slots.changed = true;
+        let m = &self.material_records;
+        let mut bytes = vec![0u8; m.records.len() * m.stride as usize];
+        for (i, r) in m.records.iter().enumerate() {
+            let at = i * m.stride as usize;
+            bytes[at..at + std::mem::size_of::<MaterialUniforms>()]
+                .copy_from_slice(bytemuck::bytes_of(&sampled(*r, on)));
+        }
+        self.queue.write_buffer(&m.buffer, 0, &bytes);
+    }
+
+    /// Whether textures are sampled the earlier way.
+    pub fn earlier_sampling(&self) -> bool {
+        self.earlier_sampling
     }
 
     /// Runs the 360's anti-aliasing pass or not (on by default, as the
@@ -3651,7 +3718,11 @@ impl WgpuBackend {
                 &self.device,
                 &self.maps_layout,
                 &self.texture_slots.views(),
-                &self.samplers,
+                if self.earlier_sampling {
+                    &self.earlier_samplers
+                } else {
+                    &self.samplers
+                },
             );
         }
         let size = self.size();
@@ -3937,6 +4008,21 @@ mod material_slot_tests {
         assert_eq!(r.layer_tex, [5, 6, 7, 8]);
         assert_eq!(r.samp[0], 3);
         assert_eq!(f32::from_bits(r.samp[1]), -1.0);
+        // The earlier sampling: the clamped sampler, no bias.
+        let e = sampled(r, true);
+        assert_eq!((e.samp[0], f32::from_bits(e.samp[1])), (3, 0.0));
+        let flagged = WgpuBackend::material_uniforms(
+            &MaterialDesc {
+                texture_flags: 0x47,
+                lod_bias: 1.0,
+                ..MaterialDesc::default()
+            },
+            [0; 8],
+        );
+        assert_eq!(flagged.samp[0], 11);
+        let e = sampled(flagged, true);
+        assert_eq!((e.samp[0], f32::from_bits(e.samp[1])), (0, 0.0));
+        assert_eq!(sampled(flagged, false).samp, flagged.samp);
         let r = WgpuBackend::material_uniforms(&MaterialDesc::default(), [0; 8]);
         assert_eq!((r.tex, r.samp[0]), ([0; 4], 0));
     }

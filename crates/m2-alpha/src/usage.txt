@@ -225,7 +225,8 @@ m2-alpha [options]
   --closeup              with --screenshot on foot: the picture from close by
                          her right side, to see her hands
   --flicker-check        check: with --screenshot on foot, pan past the
-                         nearest tree as the game draws it, without its
+                         nearest tree in sight as the game draws it, with
+                         the earlier texture sampling, without its
                          edge anti-aliasing, with the old staggered shadow
                          maps and with shadows off; lists how much of the
                          frame flickers in each and writes where

@@ -143,15 +143,19 @@ fn aim(game: &Game) -> Option<(Vec3, Vec3, Option<f32>)> {
     })
 }
 
+/// How much more than with the earlier sampling the game's picture may
+/// flicker (this check's choice, invented).
+const EARLIER_MARGIN: f64 = 1.1;
+
 /// Height of a tree's crown above its base, and how far short of it the
 /// sight line may be blocked (both this check's choice, invented).
 const CROWN: f32 = 4.0;
 const SIGHT_SLACK: f32 = 3.0;
 
 /// Runs the check and exits: PASS when a tree is in sight and, on the
-/// slow pan at it, the game's picture (every map each frame, anti-aliasing
-/// on) flickers less than the same without anti-aliasing, and no more than
-/// with the staggered maps.
+/// slow pan at it, the game's picture flickers no more than a tenth over
+/// the same picture with the renderer's earlier texture sampling (8x
+/// anisotropic, no LOD bias), drawn from the same view in the same run.
 pub fn check(
     backend: &mut WgpuBackend,
     game: &mut Game,
@@ -169,12 +173,13 @@ pub fn check(
             eprintln!("flicker-check: no tree in sight 8-60 m off; looking ahead from {eye:.1}")
         }
     }
-    let (on_foot, camera, shadows, schedule, antialias) = (
+    let (on_foot, camera, shadows, schedule, antialias, earlier) = (
         game.on_foot,
         game.camera,
         game.picture.shadows,
         backend.shadow_schedule(),
         backend.antialias(),
+        backend.earlier_sampling(),
     );
     game.on_foot = false;
     let (w, h) = backend.size();
@@ -241,10 +246,14 @@ pub fn check(
         true,
     )?;
     let off = rate(backend, game, SLOW, "noshadow", every, false, true)?;
-    let pass = tree.is_some() && game_rate < no_aa && game_rate <= staggered + 1e-6;
+    backend.set_earlier_sampling(true);
+    let main = rate(backend, game, SLOW, "earlier", every, true, true)?;
+    backend.set_earlier_sampling(false);
+    let pass = tree.is_some() && game_rate <= main * EARLIER_MARGIN + 1e-6;
     eprintln!(
-        "flicker-check: slow pan: game {game_rate:.5}, no anti-aliasing {no_aa:.5}, staggered {staggered:.5}, shadows off {off:.5}, still {floor:.5}"
+        "flicker-check: slow pan: game {game_rate:.5}, earlier sampling {main:.5}, no anti-aliasing {no_aa:.5}, staggered {staggered:.5}, shadows off {off:.5}, still {floor:.5}"
     );
+    backend.set_earlier_sampling(earlier);
     backend.set_shadow_schedule(schedule);
     backend.set_antialias(antialias);
     game.picture.shadows = shadows;
