@@ -830,6 +830,7 @@ impl Rig {
     pub fn for_character(
         &self,
         on_foot: &m2_assets::animation_table::AnimationTable,
+        actions: Option<&m2_assets::animation_table::AnimationTable>,
         who: (u32, u32),
         class: u32,
     ) -> Self {
@@ -853,6 +854,19 @@ impl Rig {
         for key in keys {
             if let Some(p) = pick(key).filter(|p| p.clip != key) {
                 theirs.insert(key, p.clip);
+            }
+        }
+        // The actions the people play by name ([`npc::FightClips::ACTION_KEYS`]):
+        // the stance and action table's handle, the on-foot table's clip
+        // for them; kept by the action's hash.
+        if let Some(actions) = actions {
+            use m2_assets::animation_table::{action_handle, handle_clip};
+            for (stance, action) in npc::FightClips::ACTION_KEYS {
+                if let Some(p) = action_handle(actions, stance, action)
+                    .and_then(|h| handle_clip(on_foot, h, who, class, |c| index(c).is_some()))
+                {
+                    theirs.insert(m2_assets::name_hash(action), p.clip);
+                }
             }
         }
         let mut rig = self.clone();
@@ -1474,8 +1488,10 @@ pub struct Scene {
     /// everyone's clips give ([`Rig::shared`]). Made once: switching hero
     /// leaves the people be.
     people_rig: Option<Rig>,
-    /// The on-foot table the people's clips are picked from.
+    /// The on-foot table the people's clips are picked from, and the
+    /// stance and action table that gives their actions' handles.
     on_foot: Option<m2_assets::animation_table::AnimationTable>,
+    stance_actions: Option<m2_assets::animation_table::AnimationTable>,
     /// Online co-op: the other player's hero ([`Scene::load_puppet`]).
     pub puppet: Option<crate::puppet::Puppet>,
     /// Drivable vehicles near the spawn.
@@ -2343,6 +2359,7 @@ impl Scene {
             outfit: None,
             people_rig: None,
             on_foot: None,
+            stance_actions: None,
             puppet: None,
             vehicles: Vec::new(),
             park: true,
@@ -2685,6 +2702,10 @@ impl Scene {
             use m2_assets::animation_table::{self as table, AnimationTable};
             self.on_foot = source
                 .asset(table::CHARACTER_ANIMATIONS, table::ANIMATION_TABLE_TYPE)
+                .ok()
+                .and_then(|a| AnimationTable::parse(&a).ok());
+            self.stance_actions = source
+                .asset(table::ACTIONS, table::ANIMATION_TABLE_TYPE)
                 .ok()
                 .and_then(|a| AnimationTable::parse(&a).ok());
         }
@@ -3376,7 +3397,7 @@ impl Scene {
                     let Some(table) = &self.on_foot else {
                         return rig.for_skeleton(skeleton);
                     };
-                    let theirs = rig.for_character(table, who, held);
+                    let theirs = rig.for_character(table, self.stance_actions.as_ref(), who, held);
                     let gait = |g| {
                         theirs
                             .gait_clip(g)
