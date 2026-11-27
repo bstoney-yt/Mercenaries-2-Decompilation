@@ -200,10 +200,10 @@ const FLEE_TIME: f32 = 6.0;
 /// How far a runner who meets a wall looks along it each way, metres.
 const CLEAR: f32 = 6.0;
 /// A soldier fires within
-/// his gun's `FireRange` once facing within `FIRE_ARC` radians of them
-/// (`FIRE_RANGE` for one with no gun: the "Assault Rifle"'s).
+/// his gun's `FireRange` once facing within its arc of them
+/// ([`Npc::fire_arc`]; `FIRE_RANGE` for one with no gun: the "Assault
+/// Rifle"'s).
 const FIRE_RANGE: f32 = 70.0;
-const FIRE_ARC: f32 = 0.3;
 /// He aims (the aim pose, turned onto her) only while she is within this
 /// of the way he faces, radians (60 degrees; invented, playtest 8).
 const AIM_ARC: f32 = 1.05;
@@ -3261,7 +3261,7 @@ impl Npc {
         // pause since the last is out.
         if let Some(l) = self.launcher.filter(|_| self.weapon == Some(1)) {
             if seen
-                && off < FIRE_ARC
+                && off < self.fire_arc()
                 && self.launcher_wait <= 0.0
                 && distance < l.hint.range
                 && distance >= l.hint.min_range
@@ -3283,7 +3283,7 @@ impl Npc {
         } else if seen
             && self.weapon == Some(0)
             && self.cooldown <= 0.0
-            && off < FIRE_ARC
+            && off < self.fire_arc()
             && distance < hint.range
             && distance >= hint.min_range
         {
@@ -3390,6 +3390,13 @@ impl Npc {
     /// Rifle"'s ([`STAND_IN`]).
     fn fire_hint(&self) -> FireHint {
         self.gun.and_then(|g| g.hint).unwrap_or(STAND_IN)
+    }
+
+    /// How far off his facing he fires, radians: his gun's
+    /// `MaxAimAngleAi` as the 360 keeps it ([`m2_engine::weapons::ai_hand_arc`]),
+    /// its registered 15 degrees with no gun read.
+    fn fire_arc(&self) -> f32 {
+        m2_engine::weapons::ai_hand_arc(self.gun.map_or(15f32.to_radians(), |g| g.aim_ai))
     }
 
     /// His `Accuracy`, as the smarter soldiers have it when on.
@@ -8097,6 +8104,7 @@ pub(crate) mod tests {
             damage_key: None,
             hint: None,
             pellets: 1,
+            aim_ai: 15f32.to_radians(),
         };
         people.add_kind(kind("Carmona", true));
         people.add_kind(PersonKind {
@@ -8456,6 +8464,7 @@ pub(crate) mod tests {
             damage_key: None,
             hint: None,
             pellets: 1,
+            aim_ai: 15f32.to_radians(),
         }
     }
 

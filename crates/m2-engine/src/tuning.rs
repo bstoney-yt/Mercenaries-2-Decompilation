@@ -1877,6 +1877,10 @@ pub struct HandGun {
     pub hint: Option<crate::weapons::FireHint>,
     /// Rounds a shot (`iBulletsPerShot`: the shotgun's 10, else 1).
     pub pellets: u32,
+    /// `MaxAimAngleAi`, radians (15 degrees when the record gives none):
+    /// how far off a soldier's facing he fires it
+    /// ([`crate::weapons::ai_hand_arc`]).
+    pub aim_ai: f32,
 }
 
 impl HandGun {
@@ -1893,6 +1897,7 @@ impl HandGun {
             damage_key: w.ammo.key,
             hint: w.hint,
             pellets: w.pellets,
+            aim_ai: w.aim_ai,
         }
     }
 }
@@ -1932,6 +1937,10 @@ pub fn hand_guns(db: &Layer<'_>) -> HashMap<u32, HandGun> {
                         .word(r, name_hash("iBulletsPerShot"))
                         .map_or(1, |c| c & 0xff)
                         .max(1),
+                    aim_ai: weapon
+                        .float(r, name_hash("MaxAimAngleAi"))
+                        .unwrap_or(15.0)
+                        .to_radians(),
                 },
             ))
         })

@@ -396,6 +396,20 @@ pub fn ai_aim_cosine(aim_ai: f32) -> f32 {
     if aim_ai == 0.0 { 0.0 } else { aim_ai.cos() }
 }
 
+/// How far off his facing a soldier fires a hand-held gun, radians, for
+/// its [`WeaponSpec::aim_ai`]: from the 360 code, the weapon's build
+/// (0x823F8D90) keeps cos(`MaxAimAngleAi`), or 0.98 (0x82DE8B2C) for a
+/// hand-held weapon whose angle is 0, and the fire controller (0x822C95D8)
+/// gives verdict 6 (off its arc, no shot) when the way to the target is
+/// no closer to his facing than that cosine.
+pub fn ai_hand_arc(aim_ai: f32) -> f32 {
+    if aim_ai == 0.0 {
+        0.98f32.acos()
+    } else {
+        aim_ai
+    }
+}
+
 /// How much wider than its arc and tilt an AI's turret weapon may fire,
 /// radians, for its weapon's [`WeaponSpec::aim_ai`]: from the 360 code,
 /// 0x822EF8C8 widens the turret's limits, kept in degrees, by
@@ -1702,6 +1716,9 @@ mod tests {
         assert!((ai_aim_cosine(deg15) - 0.965_926).abs() < 1e-5);
         assert_eq!(ai_aim_cosine(0.0), 0.0);
         assert!((ai_turret_margin(deg15) - 0.261_799f32.to_radians()).abs() < 1e-7);
+        // A hand-held gun: its 15 degrees, or acos 0.98 (11.5) for 0.
+        assert_eq!(ai_hand_arc(deg15), deg15);
+        assert!((ai_hand_arc(0.0).to_degrees() - 11.48).abs() < 0.01);
     }
 
     #[test]
