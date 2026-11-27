@@ -4692,10 +4692,7 @@ impl Combat {
         f.player.ragdoll = Some(id);
         f.player.down = true;
         f.player.aiming = false;
-        let entering = match (f.player.moves.knockdown, &f.player.model) {
-            (Some(c), Some((_, rig))) => rig.clips.get(c).map_or(0.0, |c| c.clip.header.duration),
-            _ => 0.0,
-        };
+        let entering = KNOCKDOWN_ENTER;
         eprintln!("knockdown: she is down for {seconds:.1} s, after a {entering:.2} s KnockDown");
         self.knocked = Some(KnockedHer {
             seconds,
@@ -8122,11 +8119,21 @@ pub const HER_PLAYER_RECORD: bool = true;
 /// `KnockedDown` `Idle` only: 0x8225CAE0 compares it with the time spent
 /// in that state, which `Upright` `KnockDown` leads to as it completes
 /// (Xenia: `KnockedDown` from 0.33-0.36 s after the ragdoll goes limp;
-/// the limp timers count from the limp itself). Inferred: `KnockDown`
-/// completes as her rig's `KnockDown` clip ends ([`Self::entering`]). She
+/// the limp timers count from the limp itself). `KnockDown` completes
+/// [`KNOCKDOWN_ENTER`] after the limp starts ([`Self::entering`]), not as
+/// her rig's 1.0 s `KnockDown` clip ends. She
 /// rises where the body lay, into her rig's `KnockedDown` `Getup` clip
 /// (the on-foot tables' handle ade601a9, clip 0xAEB6C9BD; from samples),
 /// as the people do.
+/// Seconds from her ragdoll going limp to `KnockedDown` (her time down
+/// counting from then): from Xenia (the get-up runs getupa, getupb,
+/// getupc: `KnockedDown` 0x35365D24 0.33 to 0.36 s after the limp's
+/// mode `FULL` starts). What ends `Upright` `KnockDown` that soon is not
+/// traced in the 360 code; it is not the `KnockDown` clip (0xBE25DC0C,
+/// 1.0 s), which the port waited for, making her get-up some 0.7 s late
+/// (the port's 3.1 to 4.5 s down to idle against Xenia's 2.3 to 3.6 s).
+pub const KNOCKDOWN_ENTER: f32 = 0.33;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct KnockedHer {
     pub seconds: f32,
@@ -8443,6 +8450,9 @@ mod tests {
         }
         // 1.35 s, to the step (1.0 s of time down from 0.35 s in).
         assert!(t > 1.3 && t < 1.42, "{t} {k:?}");
+        // As Xenia has it: `KnockedDown` a third of a second in, well
+        // before her 1 s `KnockDown` clip would end.
+        const { assert!(KNOCKDOWN_ENTER > 0.3 && KNOCKDOWN_ENTER < 0.37) };
         // The still timer counts from the limp itself: 0.5 s still is met
         // before the time down, which decides.
         assert!(k.body.still > 1.25, "{k:?}");
