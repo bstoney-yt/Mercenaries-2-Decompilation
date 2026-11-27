@@ -2001,6 +2001,32 @@ impl Game {
                 );
                 self.winches.add(id, p, found.unwrap_or(Vec3::ZERO));
             }
+            // A delivery's helicopter flown by its AI pilot has its template's
+            // winch too, paid out: the delivery scripts put it out
+            // (`Object.SetWinchState` `deployed`) and hang the cargo on it
+            // (`Object.AttachCargoToWinch`) before `Ai.Deliver` (from the
+            // scripts: the support and contract deliveries' modules).
+            for (id, model, label) in self.scene.flights.winch_bodies() {
+                if !self.winches.unseen(id) {
+                    continue;
+                }
+                let Some(p) = world.index.template_db.winch_for(&label, model) else {
+                    continue;
+                };
+                let found = p.bone.and_then(|bone| {
+                    crate::hijack::nodes(source, model)
+                        .into_iter()
+                        .find(|(n, _)| *n == bone)
+                        .map(|(_, at)| at)
+                });
+                eprintln!(
+                    "winch: the delivery's {label} has one, {} m of cable; deployed",
+                    p.length
+                );
+                self.winches.add(id, p, found.unwrap_or(Vec3::ZERO));
+                self.winches
+                    .set_state(id, m2_engine::winch::WinchState::Deployed);
+            }
         }
         // What a magnet might take, gathered only while one could: each
         // vehicle with its `ConnectPoint`s' nodes.
@@ -2017,6 +2043,7 @@ impl Game {
                 eprintln!("winch: {carrier:?}'s magnet took {taken:?}");
             }
         }
+        self.hang_deliveries_on_cables();
         // Each one's own collision goes on it for the goods on its bed.
         if let Some(world) = &mut self.scene.world {
             for v in &self.scene.vehicles {
@@ -4541,6 +4568,71 @@ impl Game {
 
     /// The vehicles in play as a winch's cargo ([`crate::winches::Cargo`]):
     /// each one's `ConnectPoint`s with their nodes' places on its model.
+    /// A delivery's vehicles on its helicopter's cable: each one not yet on
+    /// it is made a body where it hangs and hooked once the cable is out
+    /// (taken off again if the hook fails, to try the next frame); the
+    /// winches whose pilot let go let go of theirs; and where the cabled
+    /// ones hang is read back for the flights.
+    ///
+    /// From the 360 code, as [`crate::winches`] has the winch: the cargo
+    /// hooks at its `ConnectPoint` nearest the hook (0x82195C30, only with
+    /// the cable out), and letting go (0x82195FF8) leaves it a free body.
+    /// The let-go comes when the delivery's pilot lets go over the drop
+    /// point ([`m2_engine::heli_pilot::HeliPilot::deliver`]); that the
+    /// delivery task's let-go message reaches the winch this way is
+    /// inferred.
+    fn hang_deliveries_on_cables(&mut self) {
+        let Some(world) = self.scene.world.as_mut() else {
+            return;
+        };
+        for body in self.scene.flights.take_detaches() {
+            self.winches.detach(&mut world.physics, body);
+            eprintln!("winch: the delivery's {body:?} lets its cargo go");
+        }
+        let bodies: Vec<m2_engine::VehicleId> = self
+            .scene
+            .flights
+            .winch_bodies()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .filter(|&id| self.winches.state(id) == Some(m2_engine::winch::WinchState::Deployed))
+            .collect();
+        for heli in bodies {
+            for (guid, at, turn) in self.scene.flights.uncabled(heli, &self.scene.vehicles) {
+                let Some(i) = self
+                    .scene
+                    .vehicles
+                    .iter()
+                    .position(|v| v.guid == Some(guid) && v.id.is_none())
+                else {
+                    continue;
+                };
+                let Some(world) = self.scene.world.as_mut() else {
+                    return;
+                };
+                let id = world
+                    .physics
+                    .add_vehicle_turned(&self.scene.vehicles[i].spec, at, turn);
+                self.scene.vehicles[i].id = Some(id);
+                let cargo = self.winch_cargo().into_iter().find(|c| c.id == id);
+                let Some(world) = self.scene.world.as_mut() else {
+                    return;
+                };
+                let hooked =
+                    cargo.is_some_and(|c| self.winches.attach(&mut world.physics, heli, &c));
+                if hooked {
+                    eprintln!("winch: the delivery's {guid:#x} hangs on its cable at {at:.1}");
+                    self.scene.flights.cabled(guid, id);
+                } else {
+                    world.physics.remove_vehicle(id);
+                    self.scene.vehicles[i].id = None;
+                }
+            }
+        }
+        if let Some(world) = self.scene.world.as_ref() {
+            self.scene.flights.set_cable_places(&world.physics);
+        }
+    }
     pub fn winch_cargo(&mut self) -> Vec<crate::winches::Cargo> {
         let (Some(source), Some(world)) = (self.scene.source.as_mut(), self.scene.world.as_ref())
         else {

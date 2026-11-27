@@ -5,8 +5,14 @@
 //! show (the jeep is dropped about 3 m and bounces on its wheels).
 //!
 //! The scripts only hear of the arrival
-//! ([`Mission::arrived`](m2_game::mission::Mission::arrived)); the flight
-//! itself (speed, heights, the cable, how long it hovers) is invented.
+//! ([`Mission::arrived`](m2_game::mission::Mission::arrived)). Once its
+//! helicopter's model has loaded, the flight is the 360's: its AI pilot
+//! flies the task `HeliDeliver` ([`HeliPilot::deliver`]), and a vehicle it
+//! carries hangs on the helicopter's own winch cable, its template's `Winch`
+//! paid out ([`crate::winches`], `Game::hang_deliveries_on_cables`), let
+//! go when the pilot lets go. Before the model loads, and for a crate (the
+//! cable hooks vehicles only), the old invented flight and rigid hang below
+//! stand in.
 
 use std::collections::HashMap;
 
@@ -303,6 +309,15 @@ pub struct Flights {
     gone_copters: Vec<VehicleId>,
     /// Bodies of pickups taken or gone, to take out of the physics.
     gone_bodies: Vec<DebrisId>,
+    /// Vehicle loads hooked on their helicopter's own winch cable
+    /// ([`crate::winches`]), by the load's guid: their body.
+    cabled: HashMap<u32, VehicleId>,
+    /// Where each cabled load is and how it is turned, as the physics last
+    /// had it ([`set_cable_places`](Self::set_cable_places)).
+    cable_at: HashMap<u32, (Vec3, Quat)>,
+    /// Helicopters whose winch is to let its cargo go: their pilot let go
+    /// over the drop point ([`take_detaches`](Self::take_detaches)).
+    detach: Vec<VehicleId>,
 }
 
 impl std::fmt::Debug for Flights {
@@ -842,6 +857,63 @@ impl Flights {
             .collect()
     }
 
+    /// The deliveries flown by their AI pilot, still carrying: each one's
+    /// body, and its model and label, for its template's `Winch`.
+    pub fn winch_bodies(&self) -> Vec<(VehicleId, u32, String)> {
+        self.flights
+            .iter()
+            .filter(|f| !f.released)
+            .filter_map(|f| {
+                let (body, model) = (f.body?, f.model?);
+                let label = self.specs.get(&model)?.label.clone();
+                Some((body, model, label))
+            })
+            .collect()
+    }
+
+    /// The vehicles helicopter `body` carries that aren't on its cable
+    /// yet: each one's guid and where it hangs now (origin, turn).
+    pub fn uncabled(&self, body: VehicleId, vehicles: &[ParkedVehicle]) -> Vec<(u32, Vec3, Quat)> {
+        self.flights
+            .iter()
+            .filter(|f| f.body == Some(body) && !f.released)
+            .flat_map(|f| {
+                f.loads
+                    .iter()
+                    .filter(|l| l.model.is_none() && !self.cabled.contains_key(&l.guid))
+                    .map(move |l| {
+                        let (at, turn) = self.hanging(f, l, vehicles);
+                        (l.guid, at, turn)
+                    })
+            })
+            .collect()
+    }
+
+    /// Load `guid` now hangs on its helicopter's cable as body `id`.
+    pub fn cabled(&mut self, guid: u32, id: VehicleId) {
+        self.cabled.insert(guid, id);
+    }
+
+    /// Where the cabled loads are, from the physics: they hang, are
+    /// drawn and are told to the scripts where their bodies are.
+    pub fn set_cable_places(&mut self, physics: &Physics) {
+        self.cable_at = self
+            .cabled
+            .iter()
+            .filter_map(|(&g, &id)| {
+                let (_, turn, at) = physics
+                    .vehicle_transform(id)?
+                    .to_scale_rotation_translation();
+                Some((g, (at, turn)))
+            })
+            .collect();
+    }
+
+    /// The helicopters whose winch is to let go now (their pilot let go
+    /// over the drop point), since the last call.
+    pub fn take_detaches(&mut self) -> Vec<VehicleId> {
+        std::mem::take(&mut self.detach)
+    }
     /// The helicopters in the air, to be heard: each one's guid, where it
     /// is and its sound bank, if its template names one.
     pub fn sounding(&self) -> Vec<(u32, Vec3, Option<u32>)> {
@@ -881,8 +953,9 @@ impl Flights {
     /// ahead, or (sent home) round things to home; a landing (`HeliLand`)
     /// by [`HeliPilot::land_near`], up again by [`HeliPilot::take_off`]
     /// once sent home. Returns
-    /// whether it flew it. Its load hangs as before (invented: the 360's
-    /// winch is untraced), and neither weighs on it.
+    /// whether it flew it. A vehicle load hangs on its winch cable once
+    /// hooked ([`Flights::cabled`]); a crate hangs as before (invented),
+    /// and it doesn't weigh on the pilot's sums.
     fn pilot(
         &mut self,
         i: usize,
@@ -1016,6 +1089,75 @@ impl Flights {
         true
     }
 
+    /// Puts down what each release let go of: a crate falls from where it
+    /// hung, a vehicle is made a body there, one on its helicopter's cable
+    /// is left to its winch ([`take_detaches`](Self::take_detaches)).
+    fn let_go(
+        &mut self,
+        releases: &mut [Release],
+        physics: &mut Physics,
+        vehicles: &mut [ParkedVehicle],
+    ) {
+        for r in releases.iter_mut() {
+            let Some(f) = self.flights.iter().find(|f| f.pilot == r.pilot) else {
+                continue;
+            };
+            let body = f.body;
+            let hung: Vec<(Load, Vec3, Quat, f32)> = f
+                .loads
+                .iter()
+                .map(|l| {
+                    let (at, turn) = self.hanging(f, l, vehicles);
+                    (l.clone(), at, turn, f.yaw)
+                })
+                .collect();
+            for (l, at, turn, yaw) in hung {
+                eprintln!(
+                    "delivery: {} lets go of {} ({}) at {at:.1}, {:.1} m over the drop point {:.1}",
+                    r.pilot,
+                    l.guid,
+                    if l.model.is_some() {
+                        "a crate"
+                    } else {
+                        "a vehicle"
+                    },
+                    at.y - r.to.y,
+                    r.to
+                );
+                match l.model {
+                    Some(model) => self.crates.push(Crate {
+                        guid: l.guid,
+                        model,
+                        at,
+                        yaw,
+                        falling: Some(0.0),
+                        hp: CRATE_HP,
+                        broken: false,
+                        leaves: l.leaves,
+                    }),
+                    // On its helicopter's cable: its winch lets it go
+                    // ([`take_detaches`](Self::take_detaches)), and it
+                    // falls as the body it already is.
+                    None if self.cabled.contains_key(&l.guid) => {
+                        self.cabled.remove(&l.guid);
+                        self.cable_at.remove(&l.guid);
+                        self.detach.extend(body);
+                        r.dropped.push(l.guid);
+                    }
+                    None => {
+                        if let Some(v) = vehicles
+                            .iter_mut()
+                            .find(|v| v.guid == Some(l.guid) && v.id.is_none())
+                        {
+                            v.id = Some(physics.add_vehicle_turned(&v.spec, at, turn));
+                            r.dropped.push(l.guid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn step(
         &mut self,
         dt: f32,
@@ -1138,54 +1280,7 @@ impl Flights {
             f.lean += (lean - f.lean) * (3.0 * dt).min(1.0);
         }
         // Let go: they fall from where they hang.
-        for r in &mut releases {
-            let Some(f) = self.flights.iter().find(|f| f.pilot == r.pilot) else {
-                continue;
-            };
-            let hung: Vec<(Load, Vec3, Quat, f32)> = f
-                .loads
-                .iter()
-                .map(|l| {
-                    let (at, turn) = self.hanging(f, l, vehicles);
-                    (l.clone(), at, turn, f.yaw)
-                })
-                .collect();
-            for (l, at, turn, yaw) in hung {
-                eprintln!(
-                    "delivery: {} lets go of {} ({}) at {at:.1}, {:.1} m over the drop point {:.1}",
-                    r.pilot,
-                    l.guid,
-                    if l.model.is_some() {
-                        "a crate"
-                    } else {
-                        "a vehicle"
-                    },
-                    at.y - r.to.y,
-                    r.to
-                );
-                match l.model {
-                    Some(model) => self.crates.push(Crate {
-                        guid: l.guid,
-                        model,
-                        at,
-                        yaw,
-                        falling: Some(0.0),
-                        hp: CRATE_HP,
-                        broken: false,
-                        leaves: l.leaves,
-                    }),
-                    None => {
-                        if let Some(v) = vehicles
-                            .iter_mut()
-                            .find(|v| v.guid == Some(l.guid) && v.id.is_none())
-                        {
-                            v.id = Some(physics.add_vehicle_turned(&v.spec, at, turn));
-                            r.dropped.push(l.guid);
-                        }
-                    }
-                }
-            }
-        }
+        self.let_go(&mut releases, physics, vehicles);
         for c in &mut self.crates {
             let Some(speed) = &mut c.falling else {
                 continue;
@@ -1275,7 +1370,11 @@ impl Flights {
                         let Some(i) = vehicles.iter().position(|v| v.guid == Some(l.guid)) else {
                             continue;
                         };
-                        hung.push((i, place));
+                        // One on its helicopter's cable is a body of its
+                        // own, drawn with the scene's vehicles.
+                        if !self.cabled.contains_key(&l.guid) {
+                            hung.push((i, place));
+                        }
                         vehicles[i].model.bounds.1.y
                     }
                 };
@@ -1346,6 +1445,9 @@ impl Flights {
     /// Where load `l` hangs (its origin) and how it is turned: level, as
     /// the helicopter heads, its top [`CABLE`] below the hook.
     fn hanging(&self, f: &Flight, l: &Load, vehicles: &[ParkedVehicle]) -> (Vec3, Quat) {
+        if let Some(&placed) = self.cable_at.get(&l.guid) {
+            return placed;
+        }
         let turn = Quat::from_rotation_y(f.yaw);
         let hook = self.body(f).transform_point3(self.hook(f));
         let (lo, hi) = self
@@ -1472,6 +1574,96 @@ mod tests {
         model: None,
         bank: None,
     };
+
+    /// A plain box of a vehicle, for its physics id.
+    fn box_spec() -> VehicleSpec {
+        let hull = (Vec3::new(-1.0, 0.0, -2.2), Vec3::new(1.0, 1.5, 2.2));
+        VehicleSpec {
+            model: 1,
+            kind: "car".into(),
+            label: "test".into(),
+            node_names: Vec::new(),
+            armed: Vec::new(),
+            wheels: Vec::new(),
+            bounds: hull,
+            seat: None,
+            door: None,
+            seating: None,
+            entrances: Vec::new(),
+            tracked: false,
+            road_wheels: Vec::new(),
+            rest: Vec::new(),
+            node_wheel: Vec::new(),
+            node_rolls: Vec::new(),
+            mass: 1400.0,
+            turret: Vec::new(),
+            pivot: None,
+            muzzle: None,
+            gun: Vec::new(),
+            gun_pivot: None,
+            muzzle_on_gun: false,
+            elevation: (0.0, 0.0),
+            hull,
+            turret_box: None,
+            rotors: Vec::new(),
+            tilts: Vec::new(),
+            bomb_bay: None,
+            node_parents: Vec::new(),
+            aimers: Vec::new(),
+            damage: None,
+            chassis: None,
+            shapes: Default::default(),
+            spring_wheels: None,
+            material: None,
+            path_unseen: Default::default(),
+            turret_shapes: Default::default(),
+            turret_mass: None,
+            gun_body: None,
+            wreck: None,
+            tuning: Default::default(),
+        }
+    }
+
+    // A vehicle on its helicopter's cable hangs where its body is, not
+    // rigidly under the hook; let go, it is the winch's to drop, and the
+    // scripts still hear it was dropped.
+    #[test]
+    fn a_cabled_load_hangs_where_its_body_is_and_goes_to_its_winch() {
+        let mut physics = Physics::new();
+        let mut flights = Flights::default();
+        let to = Vec3::new(0.0, 0.0, 120.0);
+        let load = Load {
+            guid: 3,
+            model: None,
+            leaves: Vec::new(),
+        };
+        flights.start(COPTER, vec![load], Vec3::new(0.0, 60.0, 0.0), to);
+        let body = physics.add_vehicle(&box_spec(), Vec3::new(0.0, 60.0, 0.0), 0.0);
+        flights.flights[0].body = Some(body);
+        let cargo = physics.add_vehicle(&box_spec(), Vec3::new(0.0, 30.0, 0.0), 0.0);
+        flights.cabled(3, cargo);
+        let placed = (Vec3::new(1.0, 30.0, 2.0), Quat::IDENTITY);
+        flights.cable_at.insert(3, placed);
+        let at = flights
+            .places(&[])
+            .into_iter()
+            .find(|p| p.0 == 3)
+            .map(|p| p.1);
+        assert_eq!(at, Some(placed.0));
+        assert_eq!(flights.uncabled(body, &[]), Vec::new());
+        // Its pilot lets go (the AI path's release, as `pilot` makes it).
+        let f = &mut flights.flights[0];
+        f.released = true;
+        let mut releases = vec![Release {
+            pilot: 2,
+            to,
+            dropped: Vec::new(),
+        }];
+        flights.let_go(&mut releases, &mut physics, &mut []);
+        assert_eq!(releases[0].dropped, vec![3]);
+        assert_eq!(flights.take_detaches(), vec![body]);
+        assert!(flights.cabled.is_empty());
+    }
 
     #[test]
     fn a_delivery_flies_in_lets_go_over_the_drop_point_and_leaves() {
