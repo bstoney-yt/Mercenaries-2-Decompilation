@@ -859,6 +859,15 @@ impl Rig {
         // The actions the people play by name ([`npc::FightClips::ACTION_KEYS`]):
         // the stance and action table's handle, the on-foot table's clip
         // for them; kept by the action's hash.
+        // The `Crouched` locomotion's handles, kept by the handle
+        // ([`npc::FightClips::CROUCH_HANDLES`]).
+        for h in npc::FightClips::CROUCH_HANDLES {
+            if let Some(p) = m2_assets::animation_table::handle_clip(on_foot, h, who, class, |c| {
+                index(c).is_some()
+            }) {
+                theirs.insert(h, p.clip);
+            }
+        }
         if let Some(actions) = actions {
             use m2_assets::animation_table::{action_handle, handle_clip};
             for (stance, action) in npc::FightClips::ACTION_KEYS {

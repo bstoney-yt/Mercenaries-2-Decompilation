@@ -489,6 +489,9 @@ pub struct FightClips {
     pub cover: [Option<usize>; 10],
     /// `Prone` `FireWeapon` (a full-body loop, handle a94e2676).
     pub prone_fire: Option<usize>,
+    /// The `Crouched` stance's locomotion ([`Self::CROUCH_HANDLES`]):
+    /// standing, walking, and its upper-body `FireWeapon` over them.
+    pub crouch: [Option<usize>; 3],
     /// The cover stances' idles, by [`CoverStance`]: `UprightCoverLeft`,
     /// `UprightCoverRight` and `CrouchCover` `Idle` (full-body loops).
     pub cover_idles: [Option<usize>; 3],
@@ -872,6 +875,10 @@ impl FightClips {
                 Self::by_action(rig, s, a)
             }),
             prone_fire: Self::by_action(rig, "Prone", "FireWeapon"),
+            crouch: Self::CROUCH_HANDLES.map(|h| {
+                let clip = *rig.theirs.get(&h)?;
+                rig.clips.iter().position(|c| c.hash == clip)
+            }),
             cover_idles: [
                 Self::by_action(rig, "UprightCoverLeft", "Idle"),
                 Self::by_action(rig, "UprightCoverRight", "Idle"),
@@ -931,6 +938,15 @@ impl FightClips {
         };
         self.cover[k]
     }
+
+    /// The `Crouched` stance's locomotion node (built by 0x8280EC68, the
+    /// `Upright` node's class with its own gait list at 0x82B4DBC0): its
+    /// standing `Crouch_Idle` (d491dd44) and `Crouch_Walk_Forward`
+    /// (5e7adcc3), the one gait its pick (0x8280ECF8) ever gives; and
+    /// `Crouched` `FireWeapon`'s upper-body handle (a79a368c), played
+    /// over them (the stance and action table: `ActionMask` `UpperBody`,
+    /// `LocomotionMask` db9c23dc). A rig keeps their clips by the handle.
+    pub const CROUCH_HANDLES: [u32; 3] = [0xd491_dd44, 0x5e7a_dcc3, 0xa79a_368c];
 
     /// How a rig keeps an action's clip: stance and action together (an
     /// action's name is not unique across stances).
@@ -3547,9 +3563,17 @@ impl Npc {
                 CoverStance::Kneel => 2,
             }]
         };
+        let crouched = self.mover.is_some_and(|m| m.stance == MoverStance::Crouch)
+            && !holding_cover
+            && shuffling.is_none();
+        let crouch_base = if gait == Gait::Idle {
+            clips.crouch[0]
+        } else {
+            clips.crouch[1]
+        };
         let low = match self.mover.map(|m| m.stance) {
             _ if holding_cover && cover_idle.is_some() => cover_idle,
-            Some(MoverStance::Crouch) => clips.stances[0],
+            Some(MoverStance::Crouch) => None,
             Some(MoverStance::Low) if self.burst > 0 => clips.prone_fire.or(clips.stances[1]),
             Some(MoverStance::Low) => clips.stances[1],
             _ => None,
@@ -3557,6 +3581,16 @@ impl Npc {
         .filter(|_| gait == Gait::Idle && shuffling.is_none());
         if self.striking <= 0.0 {
             match (shuffling, low) {
+                // Crouched: the stance's locomotion, its `FireWeapon` over
+                // the upper body while a burst is on.
+                _ if crouched && crouch_base.is_some() => {
+                    if let Some(c) = crouch_base {
+                        self.rig.play_gait(c);
+                    }
+                    let fire = clips.crouch[2].filter(|_| self.burst > 0);
+                    let upper = fire.zip(self.rig.upper.clone());
+                    self.rig.animator.set_upper(upper);
+                }
                 (_, Some(c)) => {
                     self.rig.animator.set_upper(None);
                     self.rig.play_gait(c);
@@ -9391,6 +9425,16 @@ pub(crate) mod tests {
             FightClips::action_key("Crouched", "Idle"),
             FightClips::action_key("Prone", "Idle")
         );
+        // The Crouched locomotion node's handles, by their names' hashes.
+        assert_eq!(
+            FightClips::CROUCH_HANDLES[0],
+            m2_assets::name_hash("Crouch_Idle")
+        );
+        assert_eq!(
+            FightClips::CROUCH_HANDLES[1],
+            m2_assets::name_hash("Crouch_Walk_Forward")
+        );
+        assert_eq!(FightClips::find(&rig()).crouch, [None; 3]);
         assert_eq!(
             m2_engine::ai_mover::Side::Left.action(),
             FightClips::SIDESTEP_LEFT
