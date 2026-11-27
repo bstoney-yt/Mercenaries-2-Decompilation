@@ -463,6 +463,11 @@ pub struct FightClips {
     pub knocked: Option<usize>,
     pub getup: Option<usize>,
     pub subdued: Option<usize>,
+    /// The combat mover's side-steps, left and right
+    /// ([`m2_engine::ai_mover::Side`]): the clips of `Upright`
+    /// `SidestepLeft` and `SidestepRight` for them, by both tables
+    /// ([`Self::ACTION_KEYS`], [`crate::scene::Rig::for_character`]).
+    pub side_steps: [Option<usize>; 2],
 }
 
 /// The clips of the 14 directions a person dies in on foot
@@ -834,8 +839,21 @@ impl FightClips {
             knocked: find(Self::KNOCKED),
             getup: find(Self::GETUP),
             subdued: find(Self::SUBDUED),
+            side_steps: [Self::SIDESTEP_LEFT, Self::SIDESTEP_RIGHT].map(|a| {
+                let clip = *rig.theirs.get(&a)?;
+                rig.clips.iter().position(|c| c.hash == clip)
+            }),
         }
     }
+
+    /// The actions whose clips a person's rig keeps by the action's hash
+    /// ([`crate::scene::Rig::for_character`]), stance and action: the
+    /// combat mover's side-steps (0x822C7730 posts them; their hashes are
+    /// [`m2_engine::ai_mover::Side::action`]).
+    pub const ACTION_KEYS: [(&'static str, &'static str); 2] =
+        [("Upright", "SidestepLeft"), ("Upright", "SidestepRight")];
+    pub const SIDESTEP_LEFT: u32 = 0x9424_7d15;
+    pub const SIDESTEP_RIGHT: u32 = 0x0c69_7af4;
 
     /// When in `clip` a throw lets go of the grenade (its
     /// `releasegrenade` event), if it has one.
@@ -1293,6 +1311,9 @@ pub struct Npc {
     /// In a fight, the 360's combat mover ([`m2_engine::ai_mover`]); and
     /// a side-step under way: where to and for how much longer.
     mover: Option<Mover>,
+    /// The side-step's walk, m/s, while its clip plays (none: his
+    /// `CombatSpeed`).
+    step_speed: Option<f32>,
     /// Heard, not seen: the 360's investigation of the noise.
     investigate: Option<Investigate>,
     step: Option<(Vec3, f32)>,
@@ -1771,6 +1792,7 @@ impl Npc {
             unseen: 0.0,
             look: 0.0,
             mover: None,
+            step_speed: None,
             investigate: None,
             step: None,
             throws: None,
@@ -3095,7 +3117,7 @@ impl Npc {
                 // Inferred: a ray from his chest for each of the 360's two
                 // swept probes (0x8215A770).
                 let from = self.chest();
-                [Side::Right, Side::Left].map(|side| {
+                [Side::Left, Side::Right].map(|side| {
                     let way = side_point(at, side_axis, side) - at;
                     physics
                         .cast_ray(from, way.normalize_or_zero(), PROBE)
@@ -3172,15 +3194,35 @@ impl Npc {
                 self.throws = Some(at);
             }
             if let Some(side) = out.side_step {
-                // Invented: the side-step action's clip is not wired, so he
-                // steps the probe's 2 m at his `CombatSpeed`.
+                // The side-step's action (`Upright` `SidestepLeft` or
+                // `SidestepRight`, [`FightClips::side_steps`]): its clip
+                // plays once, and while it does he is in a one-shot
+                // (0x822C04A0). His people's clips have their root motion
+                // taken off, so the step's way is walked over the clip's
+                // length: the probe's 2 m (inferred: the clip's own reach
+                // is not read). With no clip, the walk alone at his
+                // `CombatSpeed` (invented).
                 let target = side_point(at, side_axis, side);
+                let index = match side {
+                    Side::Left => 0,
+                    Side::Right => 1,
+                };
+                let clip = clips.side_steps[index].map(|c| {
+                    self.rig.animator.set_upper(None);
+                    self.rig.animator.play_once(c);
+                    self.rig.animator.seek(0.0);
+                    self.rig.clips[c].info.duration
+                });
                 eprintln!(
-                    "people: {:08x} side-steps {side:?}",
-                    self.spawn.unwrap_or(u32::MAX)
+                    "people: {:08x} side-steps {side:?} ({})",
+                    self.spawn.unwrap_or(u32::MAX),
+                    clip.map_or("no clip: walked".to_owned(), |d| format!("clip {d:.2} s"))
                 );
-                let fast = self.push(self.ai.combat_speed).max(0.1);
-                self.step = Some((target, PROBE / fast + 0.5));
+                let time = clip
+                    .filter(|&d| d > 0.1)
+                    .unwrap_or_else(|| PROBE / self.push(self.ai.combat_speed).max(0.1) + 0.5);
+                self.step = Some((target, time));
+                self.step_speed = clip.map(|_| PROBE / time);
             }
             if smart.enabled && smart.flank && standing && seen && dest.distance(at) < 1e-3 {
                 // Smarter (the alpha's own): his own side of her, by his
@@ -3199,7 +3241,10 @@ impl Npc {
                 if *left <= 0.0 || (target - at).with_y(0.0).length() < 0.3 {
                     self.step = None;
                 } else {
-                    wanted = self.steer_to(target, self.push(self.ai.combat_speed), dt);
+                    let speed = self
+                        .step_speed
+                        .unwrap_or_else(|| self.push(self.ai.combat_speed));
+                    wanted = self.steer_to(target, speed, dt);
                 }
             } else if (dest - at).with_y(0.0).length() > MOVER_THERE {
                 wanted = self.steer_to(dest, self.push(speed), dt);
@@ -9162,6 +9207,34 @@ pub(crate) mod tests {
             hid.throws = None;
         }
         assert!(throws(&mut hid, &wall, her, &mut rng).is_empty());
+    }
+
+    #[test]
+    fn the_side_steps_play_the_clips_the_tables_give_their_actions() {
+        // `Upright` `SidestepLeft` / `SidestepRight`: the rig keeps their
+        // clips by the action's hash (`Rig::for_character`).
+        // A clip the rig doesn't have is no slot.
+        let mut r = rig();
+        let mut theirs = (*r.theirs).clone();
+        theirs.insert(FightClips::SIDESTEP_LEFT, 0x1234_5678);
+        r.theirs = std::sync::Arc::new(theirs);
+        assert_eq!(FightClips::find(&r).side_steps, [None, None]);
+        assert_eq!(
+            m2_engine::ai_mover::Side::Left.action(),
+            FightClips::SIDESTEP_LEFT
+        );
+        assert_eq!(
+            m2_engine::ai_mover::Side::Right.action(),
+            FightClips::SIDESTEP_RIGHT
+        );
+        assert_eq!(
+            m2_assets::name_hash("SidestepLeft"),
+            FightClips::SIDESTEP_LEFT
+        );
+        assert_eq!(
+            m2_assets::name_hash("SidestepRight"),
+            FightClips::SIDESTEP_RIGHT
+        );
     }
 
     #[test]

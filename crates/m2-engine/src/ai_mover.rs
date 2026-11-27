@@ -46,7 +46,8 @@
 //! which `HumanCombat` does not reach; they fall back to deciding.
 //!
 //! Inferred: the third stance (hash 0x5A86B86B) is lying; the side
-//! probes' axis (0x82855ED8) is his right. The callout's speech and the
+//! probes' axis (0x82855ED8) is his left (the first probe plays
+//! `SidestepLeft`). The callout's speech and the
 //! side-step actions' clips and the throw are the caller's to play.
 //! Invented: the cover clips' times ([`LEAN`], [`DIVING`]), as the
 //! spot's clips are not wired.
@@ -93,18 +94,20 @@ pub enum Stance {
 /// A side of the fighter, for the side-step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
-    /// Along his side axis (inferred: his right); action 0x94247D15.
-    Right,
-    /// Against it; action 0x0C697AF4.
+    /// Along his side axis (0x82855ED8), the first probe: `Upright`
+    /// `SidestepLeft` (0x94247D15, the human state table), so that axis
+    /// is his left.
     Left,
+    /// Against it, the second probe: `SidestepRight` (0x0C697AF4).
+    Right,
 }
 
 impl Side {
     /// The action the side-step plays (mind +0xC once started).
     pub fn action(self) -> u32 {
         match self {
-            Side::Right => 0x9424_7d15,
-            Side::Left => 0x0c69_7af4,
+            Side::Left => 0x9424_7d15,
+            Side::Right => 0x0c69_7af4,
         }
     }
 }
@@ -142,7 +145,7 @@ pub struct Sense {
     /// His `CombatSpeed` (mind +0x9A8) and `PursueSpeed` (+0x9A4).
     pub combat_speed: f32,
     pub pursue_speed: f32,
-    /// The side-step's probes, right and left, once asked for
+    /// The side-step's probes, left (along the side axis) and right, once asked for
     /// ([`Mover::probing`]): whether each came back clear.
     pub sides: Option<[bool; 2]>,
     /// The spot the cover service granted him and still holds for him
@@ -327,8 +330,8 @@ impl Mover {
     /// The side being stepped to, while its action runs.
     pub fn side_stepping(&self) -> Option<Side> {
         match (self.current.state, self.side, self.started) {
-            (State::SideStep, 1, true) => Some(Side::Right),
-            (State::SideStep, 2, true) => Some(Side::Left),
+            (State::SideStep, 1, true) => Some(Side::Left),
+            (State::SideStep, 2, true) => Some(Side::Right),
             _ => None,
         }
     }
@@ -693,9 +696,9 @@ impl Mover {
             self.side_wait = 10.0 + rand() * 15.0;
             self.t9c = 0.0;
             out.side_step = Some(if self.side == 1 {
-                Side::Right
-            } else {
                 Side::Left
+            } else {
+                Side::Right
             });
             return;
         }
@@ -710,12 +713,12 @@ impl Mover {
 /// action's clip (invented: its root motion is not wired).
 pub fn side_point(at: Vec3, forward: Vec3, side: Side) -> Vec3 {
     let f = Vec2::new(forward.x, forward.z).normalize_or(Vec2::Y);
-    let right = Vec3::new(-f.y, 0.0, f.x);
+    let left = Vec3::new(-f.y, 0.0, f.x);
     let sign = match side {
-        Side::Right => 1.0,
-        Side::Left => -1.0,
+        Side::Left => 1.0,
+        Side::Right => -1.0,
     };
-    at + right * (PROBE * sign)
+    at + left * (PROBE * sign)
 }
 
 #[cfg(test)]
@@ -808,13 +811,15 @@ mod tests {
         run(&mut m, &s, 0.3, 0.5);
         assert_eq!(m.state(), State::SideStep);
         assert!(m.probing());
-        // Both sides clear, rand 0.7: the left; the next waits 20.5 s.
+        // Both sides clear, rand 0.7: the second, the right; the next
+        // waits 20.5 s.
         let s2 = Sense {
             sides: Some([true, true]),
             ..s
         };
         let o = run(&mut m, &s2, 0.2, 0.7);
-        assert_eq!(o.side_step, Some(Side::Left));
+        assert_eq!(o.side_step, Some(Side::Right));
+        assert_eq!(Side::Right.action(), 0x0c69_7af4);
         assert!((m.side_wait - 20.5).abs() < 0.2);
         // Its action over and a second gone: back to fighting standing.
         run(&mut m, &s2, 1.2, 0.7);
@@ -1038,9 +1043,9 @@ mod tests {
 
     #[test]
     fn side_point_is_two_metres_to_his_right_or_left() {
-        let p = side_point(Vec3::ZERO, Vec3::Z, Side::Right);
-        assert!((p - Vec3::new(-2.0, 0.0, 0.0)).length() < 1e-5);
         let p = side_point(Vec3::ZERO, Vec3::Z, Side::Left);
+        assert!((p - Vec3::new(-2.0, 0.0, 0.0)).length() < 1e-5);
+        let p = side_point(Vec3::ZERO, Vec3::Z, Side::Right);
         assert!((p - Vec3::new(2.0, 0.0, 0.0)).length() < 1e-5);
     }
 }
