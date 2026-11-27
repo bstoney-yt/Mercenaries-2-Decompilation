@@ -30,7 +30,7 @@
 //! zooms ([`Action::ZoomIn`], [`Action::ZoomOut`]) and Tab steps the zoom
 //! up and round, in place of switching weapons; the view switch is bound
 //! but does nothing yet (the alpha has one camera); the alpha's own keys (the
-//! seats Y, C4 X, the shop H, music M, the mouse's release F2, the
+//! counters Y in a vehicle, C4 X, the shop H, music M, the mouse's release F2, the
 //! developer's F3 to F9, among them the cheat menu's F7) sit on keys the
 //! table leaves free. The hijack's face buttons stay on I K J L beside the
 //! look (the PC game's are not known).
@@ -76,8 +76,10 @@ pub enum Action {
     Explosive,
     /// Set off the C4 she has placed.
     Detonate,
-    /// Move to the next seat of the vehicle she rides (the driver's, the
-    /// gunner's).
+    /// In a vehicle: show all the HUD's counters (the 360 pad's d-pad up
+    /// and down there, `ShowAllCounters`). It moves her to no other seat:
+    /// the 360 has no key for that (its vehicle input 0x8242E7A0 sends
+    /// only an exit on Y).
     Seat,
     /// A melee bash with what she holds (also the middle mouse button,
     /// once the mouse is captured): opens a supply crate.

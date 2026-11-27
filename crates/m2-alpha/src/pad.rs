@@ -47,9 +47,7 @@
 //! [`Action::Reset`], which stays on the keys).
 //! Invented where the alpha has a thing the layout doesn't: LT raises the
 //! weapon as well on foot ([`Action::Aim`], as crouch does on the keys);
-//! the d-pad's right sets off C4 on foot ([`Action::Detonate`]); the
-//! d-pad's up and down move to the next seat in a vehicle
-//! ([`Action::Seat`], as the helicopter's `Seat Menu`); L3 latches sprint
+//! the d-pad's right sets off C4 on foot ([`Action::Detonate`]); L3 latches sprint
 //! until the stick comes back to rest; the left stick under half way
 //! walks ([`Action::Walk`]); the right stick turns at up to [`LOOK_RATE`]
 //! mouse counts a second, squared for fine aim.
@@ -881,6 +879,25 @@ mod tests {
         PadState {
             buttons,
             ..PadState::default()
+        }
+    }
+
+    #[test]
+    fn in_a_vehicle_y_only_gets_out_and_the_d_pad_shows_the_counters() {
+        // The 360's vehicle input (0x8242E7A0): Y (the action button)
+        // sends an exit only; the d-pad's up and down send
+        // `ShowAllCounters`. No button moves her to another seat.
+        for layout in [DRIVING, TANK, HELICOPTER] {
+            let on = |b: Button| -> Vec<Action> {
+                layout
+                    .iter()
+                    .filter(|&&(x, _)| x == b)
+                    .map(|&(_, a)| a)
+                    .collect()
+            };
+            assert_eq!(on(Button::Y), [Action::Use]);
+            assert_eq!(on(Button::DpadUp), [Action::Seat]);
+            assert_eq!(on(Button::DpadDown), [Action::Seat]);
         }
     }
 

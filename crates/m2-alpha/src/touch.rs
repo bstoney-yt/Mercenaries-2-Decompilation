@@ -79,7 +79,7 @@ pub const KEYS: [Key; 16] = [
 /// The buttons while she drives (the on-foot ones hide): the pad's driving
 /// layout ([`crate::pad`]): gas and reverse (A, X), the handbrake (the left
 /// trigger), fire (the right), get out (Y), switch gun (RB), right an
-/// overturned vehicle (R3), the next seat (the d-pad's up), the horn (B:
+/// overturned vehicle (R3), the HUD's counters (the d-pad's up), the horn (B:
 /// the car layout's `B call allies`, the texts' `[honk]`), the PDA and
 /// pause. The stick steers.
 pub const CAR_KEYS: [Key; 11] = [

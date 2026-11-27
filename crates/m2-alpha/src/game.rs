@@ -1342,34 +1342,6 @@ impl Game {
                 if self.ride.is_some_and(|(i, _)| player.driving != Some(i)) {
                     self.ride = None;
                 }
-                // The seat key: over her seat's link to a free one.
-                if intent.trigger.seat
-                    && let Some(i) = player.driving
-                    && let Some(v) = scene.vehicles.get(i)
-                    && v.spec.seating.is_some()
-                {
-                    let from = self.ride.map(|(_, s)| s);
-                    match crate::ride::transfer(crate::ride::Ride::of(v), from) {
-                        Some(to) => {
-                            // Over by the clip, from the seat she leaves.
-                            if v.spec.seating.is_some() {
-                                self.boarding =
-                                    Some(crate::boarding::Boarding::transfer(i, from, to));
-                            }
-                            self.ride = Some((i, to));
-                            self.combat.seat = crate::ride::armed_index(
-                                crate::ride::Ride::of(v),
-                                Some(to),
-                                &combat::armed_seats(v),
-                            );
-                            eprintln!(
-                                "seat: she moves over to {to:08x} ({:?})",
-                                crate::ride::Ride::of(v).role(Some(to))
-                            );
-                        }
-                        None => eprintln!("seat: no free seat linked to hers"),
-                    }
-                }
                 // On a ladder the climb takes the stick, and the use and
                 // jump keys let go.
                 let climbing = self.climb.is_some();
@@ -2693,16 +2665,11 @@ impl Game {
                     self.combat.ammo_shown += 1;
                 }
                 let manning = self.combat.manned.is_some() && !field.player.swimming();
-                let mut trigger = if field.player.weapons_away() && !manning {
+                let trigger = if field.player.weapons_away() && !manning {
                     intent.trigger.weapons_away()
                 } else {
                     intent.trigger
                 };
-                // The seat key moved her over her seat's links already.
-                let seated = field.player.driving.and_then(|i| field.vehicles.get(i));
-                if seated.is_some_and(|v| v.spec.seating.is_some()) {
-                    trigger.seat = false;
-                }
                 self.combat.step(&mut field, trigger, dt);
             });
             crate::spans::time("on foot: vehicles hit her", || {
@@ -3099,8 +3066,10 @@ impl Game {
             _ => None,
         };
         // The d-pad's up or down, whatever else it does here (the
-        // support's on foot, the seats in a vehicle), also asks all the
-        // HUD's counters up ([`crate::gamehud::SHOW_ALL_COUNTERS`]).
+        // support's on foot), also asks all the HUD's counters up
+        // ([`crate::gamehud::SHOW_ALL_COUNTERS`]); in a vehicle that is all
+        // it does (the 360's vehicle input 0x8242E7A0 sends
+        // `ShowAllCounters` on either and moves her to no other seat).
         if intent.trigger.support || intent.trigger.support_down || intent.trigger.seat {
             self.combat.counters_shown += 1;
         }
