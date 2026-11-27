@@ -18,6 +18,7 @@ per-item exception only when the original data or code proves it.
 | [ROADMAP.md](ROADMAP.md) | Subsystem inventory (what exists, what is known, evidence, gaps, validation, complexity, dependencies) and the recommended order |
 | [GAPS.md](GAPS.md) | The fidelity-gap tracker: one record per gap, prioritized |
 | [physics-frame.md](physics-frame.md) | The 360's physics frame: 1-3 substeps of dt/n, actions before them, deferred impulses |
+| [combat-mover.md](combat-mover.md) | The 360's combat mover: `HumanCombat`'s move block, its 18 states, transitions and constants |
 
 The audit behind both files was made from the code on `main` at `de7ea9d`
 and the project's notes. It was done without the PC: nothing here was
