@@ -2313,6 +2313,9 @@ pub struct MannedTurret {
     pub aimer: m2_engine::vehicle::Aimer,
     pub rest: Vec<Mat4>,
     pub aim: (f32, f32),
+    /// Its weapon's hardpoint node (index into the model's nodes) and the
+    /// gun's place (position, rotation), for [`hardpoint`](Self::hardpoint).
+    pub hardpoint: Option<(usize, Vec3, Quat)>,
 }
 
 impl MannedTurret {
@@ -2322,6 +2325,23 @@ impl MannedTurret {
     pub fn step(&mut self, want: Vec3, facing: f32, dt: f32) -> Vec<Mat4> {
         self.aim = self.aimer.step(self.aim, turret_angles(want, facing), dt);
         self.aimer.pose(&self.rest, self.aim.0, self.aim.1)
+    }
+
+    /// Its weapon's hardpoint node as the turret stands now (world): the
+    /// node at rest, turned and tilted with the turret's bones.
+    ///
+    /// From the 360 code: a shot starts at the hardpoint node "as it
+    /// stands" (`0x8227F698` takes it from the object's posed model via
+    /// `0x8241E538`), so a gun that has turned fires from its turned
+    /// barrel. PmcCon033's M101A1 (11-27 check of #809): its hardpoint
+    /// `b1486ef3` read at rest stayed 4 m north of the gun while she aimed
+    /// south-west, and every ray to a target went back through the gun
+    /// itself (Entity 1295079, 0.12 m in).
+    pub fn hardpoint(&self) -> Option<Vec3> {
+        let (i, at, rotation) = self.hardpoint?;
+        let rest = self.rest.get(i)?;
+        let posed = self.aimer.transform(i, self.aim.0, self.aim.1) * *rest;
+        Some(at + rotation * posed.w_axis.truncate())
     }
 }
 
@@ -2357,9 +2377,23 @@ impl Manned {
     /// from the pivot. From samples: the two models' nodes. Inferred:
     /// the weapon turns about its hardpoint, as a vehicle's gun about its
     /// mount.
+    ///
+    /// From the 360 code: a shot starts at the transform `0x8227F698`
+    /// builds for the shot loop (`0x82283A10`): the node named by the
+    /// weapon's hardpoint (its word +0x34) on its object's model
+    /// (`0x8241E538`), as it stands; only without that node, the object's
+    /// own transform (`0x823F8370`). There is no forward offset and no
+    /// clearance cast; the round is spawned there (`0x82297C00`, through
+    /// the game's spawner `0x82409B38`). So with a hardpoint and no weapon
+    /// muzzle node (PmcCon033's M101A1: its hardpoint `b1486ef3` is the
+    /// muzzle node of its own model, 4.14 m out and 1.28 m up), the round
+    /// starts at the hardpoint itself.
     pub fn muzzle(&self, aim: Vec3) -> Vec3 {
+        // The hardpoint as its turret has turned it, where the gun has one.
+        let turned = self.turret.as_ref().and_then(MannedTurret::hardpoint);
         match self.barrel {
             Some((mount, muzzle)) => {
+                let mount = turned.unwrap_or(mount);
                 mount + Quat::from_rotation_arc(Vec3::Z, aim.normalize_or(Vec3::Z)) * muzzle
             }
             None => self.pivot + aim * MANNED_MUZZLE,
@@ -8759,6 +8793,7 @@ mod tests {
             rest: skeleton.model_matrices(&skeleton.rest_pose()),
             aimer,
             aim: (0.0, 0.0),
+            hardpoint: None,
         };
         let west = -std::f32::consts::FRAC_PI_2;
         // Placed facing west (-x); she looks north (+z), well up: that is
@@ -8800,6 +8835,83 @@ mod tests {
         };
         assert_eq!(f.total(), 16);
         assert_eq!(Fired::default().total(), 0);
+    }
+
+    /// PmcCon033's M101A1: its hardpoint node on the turning bone, 4 m
+    /// ahead of the gun at rest, goes round with the turret; at rest it is
+    /// where the model has it.
+    #[test]
+    fn a_turned_guns_hardpoint_turns_with_it() {
+        use m2_engine::anim::{Local, Skeleton};
+        let at = |t: Vec3| Local {
+            translation: t,
+            rotation: Quat::IDENTITY,
+            scale: Vec3::ONE,
+        };
+        // Root, yaw bone, pitch bone, the hardpoint 4 m ahead and 1.28 m up
+        // of the pitch bone.
+        let skeleton = Skeleton {
+            name_hashes: vec![1, 0x7707_65e4, 0xcc0e_3f83, 0xb148_6ef3],
+            parents: vec![None, Some(0), Some(1), Some(2)],
+            rest: vec![
+                at(Vec3::ZERO),
+                at(Vec3::ZERO),
+                at(Vec3::new(0.0, 1.28, 0.0)),
+                at(Vec3::new(0.0, 0.0, 4.14)),
+            ],
+            inverse_bind: vec![Mat4::IDENTITY; 4],
+        };
+        let record = m2_engine::seats::TurretRecord {
+            name: 0x0121_2327,
+            bone_yaw: Some(0x7707_65e4),
+            bone_pitch: Some(0xcc0e_3f83),
+            yaw: (-std::f32::consts::PI, std::f32::consts::PI),
+            yaw_speed: 0.17453292,
+            pitch: (-0.17453292, 1.2217305),
+            pitch_speed: 0.17453292,
+        };
+        let aimer = m2_engine::vehicle::Aimer::of_skeleton(record, &skeleton).unwrap();
+        let place = Vec3::new(2753.5, -14.0, -742.0);
+        let mut t = MannedTurret {
+            rest: skeleton.model_matrices(&skeleton.rest_pose()),
+            aimer,
+            aim: (0.0, 0.0),
+            hardpoint: Some((3, place, Quat::IDENTITY)),
+        };
+        let rest = t.hardpoint().unwrap();
+        assert!(
+            rest.distance(place + Vec3::new(0.0, 1.28, 4.14)) < 1e-3,
+            "{rest}"
+        );
+        // Turned half round: the hardpoint is 4.14 m the other way.
+        t.aim = (std::f32::consts::PI, 0.0);
+        let back = t.hardpoint().unwrap();
+        assert!((back.z - (place.z - 4.14)).abs() < 1e-3, "{back}");
+        assert!((back.y - (place.y + 1.28)).abs() < 1e-3);
+        // The 11-27 diagnostic run: laid along her seat camera, which looks
+        // down 0.5 rad, the barrel sits at its -10 degree limit; laid on
+        // the shot's way (-109.4 degrees round, +0.9 up) it gets there.
+        let dir = |yaw: f32, pitch: f32| {
+            Vec3::new(
+                yaw.sin() * pitch.cos(),
+                pitch.sin(),
+                yaw.cos() * pitch.cos(),
+            )
+        };
+        let (yaw, up) = ((-109.42421f32).to_radians(), 0.908687f32.to_radians());
+        t.aim = (0.0, 0.0);
+        for _ in 0..200 {
+            t.step(dir(yaw, -0.5), 0.0, 0.1);
+        }
+        assert!((t.aim.1.to_degrees() + 10.0).abs() < 1e-3, "{:?}", t.aim);
+        for _ in 0..200 {
+            t.step(dir(yaw, up), 0.0, 0.1);
+        }
+        assert!(
+            (t.aim.0 - yaw).abs() < 1e-3 && (t.aim.1 - up).abs() < 1e-3,
+            "{:?}",
+            t.aim
+        );
     }
 
     use crate::npc::tests::{ground, rig};

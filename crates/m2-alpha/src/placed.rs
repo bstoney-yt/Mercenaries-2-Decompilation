@@ -100,7 +100,8 @@ fn yaw_of(rotation: Quat) -> f32 {
 /// `PhysicalLink`'s hardpoint on its own model, placed as its prop stands
 /// (world), and its weapon model's `Muzzle` node from that model's origin.
 /// From samples: both nodes (PmcCon031's launchers' hardpoint stands over
-/// their sandbags, the muzzle out along the weapon's +z).
+/// their sandbags, the muzzle out along the weapon's +z). A weapon without
+/// a muzzle node gives a zero offset.
 pub fn barrel<R: std::io::Read + std::io::Seek>(
     source: Option<&mut m2_engine::AssetSource<R>>,
     props: &Props,
@@ -123,7 +124,13 @@ pub fn barrel<R: std::io::Read + std::io::Seek>(
          muzzle {muzzle:?}",
         m.entity, m.model, m.hardpoint, m.weapon.model
     );
-    Some((p.position + p.rotation * mount?, muzzle?))
+    // No weapon muzzle node (the M101A1 has no weapon model; its hardpoint
+    // is its own model's muzzle node): the round starts at the hardpoint,
+    // as the 360's shot origin (0x8227F698) takes the named node itself.
+    Some((
+        p.position + p.rotation * mount?,
+        muzzle.unwrap_or(Vec3::ZERO),
+    ))
 }
 
 /// Where she gets on an emplaced gun and where she mans it, from its
@@ -181,6 +188,7 @@ pub fn seat_points<R: std::io::Read + std::io::Seek>(
 /// the model can't be read or has neither of the record's bones.
 pub fn turret<R: std::io::Read + std::io::Seek>(
     source: Option<&mut m2_engine::AssetSource<R>>,
+    props: &Props,
     m: &Manned,
     record: m2_engine::seats::TurretRecord,
 ) -> Option<crate::combat::MannedTurret> {
@@ -188,10 +196,26 @@ pub fn turret<R: std::io::Read + std::io::Seek>(
     let parsed = data.parse().ok()?;
     let skeleton = m2_engine::Skeleton::from_nodes(&parsed.nodes);
     let aimer = m2_engine::vehicle::Aimer::of_skeleton(record, &skeleton)?;
+    // Its weapon's hardpoint node, posed with the turret
+    // ([`crate::combat::MannedTurret::hardpoint`]).
+    let hardpoint = parsed
+        .nodes
+        .iter()
+        .position(|n| n.name_hash == m.hardpoint)
+        .zip(props.get(m.entity))
+        .map(|(i, (p, _))| (i, p.position, p.rotation));
+    eprintln!(
+        "placed: emplaced gun {:#x}: turret yaw bone {:x?} pitch bone {:x?}, hardpoint node {:?}",
+        m.entity,
+        record.bone_yaw,
+        record.bone_pitch,
+        hardpoint.map(|h| h.0)
+    );
     Some(crate::combat::MannedTurret {
         aimer,
         rest: skeleton.model_matrices(&skeleton.rest_pose()),
         aim: (0.0, 0.0),
+        hardpoint,
     })
 }
 
