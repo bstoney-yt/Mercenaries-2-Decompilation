@@ -44,6 +44,7 @@
 use std::collections::{HashMap, HashSet};
 
 use m2_engine::ai_anchor::{ANCHORING_SPAWNER, Anchor, SPAWNER_RADIUS};
+use m2_engine::ai_investigate::{Do as InvestigateDo, Investigate, Sense as InvestigateSense};
 use m2_engine::ai_mover::{Mover, PROBE, Sense, Side, Spot, State as MoverState, side_point};
 use m2_engine::population::SpawnerSlot;
 use m2_engine::stagger::{Direction, Stagger};
@@ -217,10 +218,11 @@ const HELD_SIGHT: f32 = 1.5;
 /// From how high he sees (his head), and how often he looks, seconds.
 const EYE: f32 = 1.6;
 const LOOK_EVERY: f32 = 0.2;
-/// Seconds a soldier hunts without sight of her before calming down
-/// (invented: the 360's combat mover has no such timer; round (d) of the
-/// mover port replaces it).
-const GIVE_UP: f32 = 20.0;
+/// Seconds a soldier fights on without sight of her before calming down:
+/// his record of her outlives its last update this long, and once it is
+/// freed `HumanCombat` fails (0x822B3130 with no record; the lifetime is
+/// [`m2_engine::ai_sense::RECORD_LIFETIME`], 0x822D51E8).
+const GIVE_UP: f32 = m2_engine::ai_sense::RECORD_LIFETIME;
 /// A person's re-path (0x822BF7A8 -> 0x822BF5E0 -> 0x822BF400): a new way
 /// is searched for when the goal moved more than `REPATH_K` x his squared
 /// flat distance to it plus `REPATH_ADD` (squared, x/z) from the goal the
@@ -1291,6 +1293,8 @@ pub struct Npc {
     /// In a fight, the 360's combat mover ([`m2_engine::ai_mover`]); and
     /// a side-step under way: where to and for how much longer.
     mover: Option<Mover>,
+    /// Heard, not seen: the 360's investigation of the noise.
+    investigate: Option<Investigate>,
     step: Option<(Vec3, f32)>,
     /// Set by a tick when a soldier throws a grenade, at where; the
     /// fight lobs it.
@@ -1767,6 +1771,7 @@ impl Npc {
             unseen: 0.0,
             look: 0.0,
             mover: None,
+            investigate: None,
             step: None,
             throws: None,
             outfit: Vec::new(),
@@ -2960,7 +2965,7 @@ impl Npc {
         self.unseen += dt;
         // Heard or hit without seeing her: he goes to the noise.
         let goal = self.last_seen.unwrap_or(threat);
-        if self.unseen > GIVE_UP + self.remember {
+        if self.unseen > GIVE_UP {
             return false;
         }
         let smart = self.smart;
@@ -3022,7 +3027,56 @@ impl Npc {
             }
             None => false,
         };
-        if hiding || covered {
+        // Heard or hit, never seen: the 360's `HumanInvestigate`
+        // ([`m2_engine::ai_investigate`]): he turns to the noise, looks
+        // about, walks to it at most 10 s (no further than 0.6 of his
+        // anchor), calls out, and is done. Inferred: that a soldier who
+        // hears her without a sighting investigates (the request's poster
+        // is not traced), and that every soldier's area point is set (an
+        // unanchored one walks the 10 s).
+        if self.last_seen.is_some() {
+            self.investigate = None;
+        }
+        let investigating = self.last_seen.is_none() && !hiding && !covered;
+        if investigating {
+            let inv = self
+                .investigate
+                .get_or_insert_with(|| Investigate::start(true));
+            let mut off = (to.x.atan2(to.z) - self.facing).rem_euclid(std::f32::consts::TAU);
+            if off > std::f32::consts::PI {
+                off = std::f32::consts::TAU - off;
+            }
+            let anchor = self.anchor.filter(Anchor::holds);
+            let sense = InvestigateSense {
+                dt,
+                off,
+                has_area: true,
+                beyond_share: anchor.is_some_and(|a| {
+                    (at - a.at).with_y(0.0).length()
+                        > a.radius * m2_engine::ai_investigate::AREA_SHARE
+                }),
+                target: threat,
+            };
+            match inv.step(&sense) {
+                InvestigateDo::Stand => {}
+                InvestigateDo::Look => {
+                    eprintln!("people: {:08x} looks about", self.spawn.unwrap_or(u32::MAX));
+                }
+                InvestigateDo::Walk(to) => {
+                    wanted = self.steer_to(to, self.push(1.0), dt);
+                }
+                InvestigateDo::Done { callout } => {
+                    eprintln!(
+                        "people: {:08x} done investigating{}",
+                        self.spawn.unwrap_or(u32::MAX),
+                        if callout { " (calls out)" } else { "" }
+                    );
+                    self.investigate = None;
+                    return false;
+                }
+            }
+        }
+        if hiding || covered || investigating {
             self.mover = None;
             self.step = None;
         } else {
@@ -3509,6 +3563,7 @@ impl Npc {
         self.last_seen = None;
         self.unseen = 0.0;
         self.mover = None;
+        self.investigate = None;
         self.step = None;
         self.route = Route::default();
         self.cover = None;
@@ -9107,6 +9162,53 @@ pub(crate) mod tests {
             hid.throws = None;
         }
         assert!(throws(&mut hid, &wall, her, &mut rng).is_empty());
+    }
+
+    #[test]
+    fn a_soldier_who_only_heard_her_investigates_then_calms_down() {
+        // `HumanInvestigate` (0x822B49C8): turn, look about after 2 s,
+        // walk to the noise 2 s later for at most 10 s, done.
+        let mut wall = ground();
+        let shape = CollisionShape::mesh(
+            &[
+                Vec3::new(-5.0, 0.0, -12.0),
+                Vec3::new(5.0, 0.0, -12.0),
+                Vec3::new(5.0, 4.0, -12.0),
+                Vec3::new(-5.0, 4.0, -12.0),
+            ],
+            &[[0, 1, 2], [0, 2, 3], [0, 2, 1], [0, 3, 2]],
+        )
+        .unwrap();
+        wall.add_static(StaticKey::Cell(2), &shape, Vec3::ZERO, Quat::IDENTITY);
+        wall.step(1.0 / 60.0);
+        let mut rng = Rng::default();
+        let dt = 1.0 / 60.0;
+        let post = Brain::Post { facing: 0.0 };
+        let mut n = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, post, Some(1));
+        n.update(&wall, &mut rng, None, dt);
+        n.alert = true;
+        let her = Some(Vec3::new(0.0, 1.2, -30.0));
+        let start = n.character.position;
+        for _ in 0..60 * 3 {
+            n.update(&wall, &mut rng, her, dt);
+        }
+        assert!(n.last_seen.is_none(), "behind the wall");
+        assert!(n.investigate.is_some());
+        assert!(
+            (n.character.position - start).with_y(0.0).length() < 0.3,
+            "turning, looking"
+        );
+        for _ in 0..60 * 3 {
+            n.update(&wall, &mut rng, her, dt);
+        }
+        assert!(
+            n.character.position.z < start.z - 0.5,
+            "walking to the noise"
+        );
+        for _ in 0..60 * 10 {
+            n.update(&wall, &mut rng, her, dt);
+        }
+        assert!(!n.alert, "done, calm again");
     }
 
     #[test]
