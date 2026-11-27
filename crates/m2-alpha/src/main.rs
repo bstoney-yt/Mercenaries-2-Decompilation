@@ -6153,8 +6153,9 @@ fn mission_for_screenshot(
                 );
                 if keep.len() != a.keep.len() {
                     eprintln!(
-                        "autoplay: kept within {} region(s) the scripts watch her leave",
-                        keep.len()
+                        "autoplay: kept within {} region(s) the scripts watch her leave: {:x?}",
+                        keep.len(),
+                        keep.iter().map(|k| k.guid).collect::<Vec<_>>()
                     );
                 }
                 a.keep = keep;

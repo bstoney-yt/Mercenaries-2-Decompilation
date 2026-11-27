@@ -915,14 +915,22 @@ fn within(keep: &[Keep], at: Vec3) -> bool {
     keep.is_empty() || keep.iter().any(|k| k.holds(at))
 }
 
-/// Where she steps to when she stands outside every region in `keep`: the
-/// nearest one's middle (at her height); `None` inside one, or with none
-/// kept.
-pub fn step_in_point(keep: &[Keep], here: Vec3) -> Option<Vec3> {
-    if keep.is_empty() || keep.iter().any(|k| k.holds(here)) {
+/// Where she steps to: outside every region in `keep`, the nearest one's
+/// middle (at her height); with her fire locked by the scripts
+/// (`locked`), the nearest kept region she is outside of, though others
+/// hold her (PmcCon032, the 11-27 check of #815: kept within 3-4 regions
+/// at once, the contract's wide ones holding her, her fire locked and the
+/// gallery border 4 m off; she never stepped in). `None` when nothing is to
+/// be stepped into.
+pub fn step_in_point(keep: &[Keep], here: Vec3, locked: bool) -> Option<Vec3> {
+    if keep.is_empty() {
         return None;
     }
-    let k = keep.iter().min_by(|a, b| {
+    let inside_all_needed = !locked;
+    if inside_all_needed && keep.iter().any(|k| k.holds(here)) {
+        return None;
+    }
+    let k = keep.iter().filter(|k| !k.holds(here)).min_by(|a, b| {
         let d = |k: &Keep| Vec3::new(k.centre[0], here.y, k.centre[1]).distance(here);
         d(a).total_cmp(&d(b))
     })?;
@@ -1854,7 +1862,8 @@ impl Autoplay {
         if let Some(p) = game.scene.player.as_ref()
             && p.driving.is_none()
             && game.combat.manned.is_none()
-            && let Some(inside) = step_in_point(&self.keep, p.character.position)
+            && let Some(inside) =
+                step_in_point(&self.keep, p.character.position, game.combat.fire_lock)
         {
             if self.step_in_said.is_none_or(|t| self.clock - t > 10.0) {
                 self.step_in_said = Some(self.clock);
@@ -7922,13 +7931,43 @@ mod tests {
         };
         let out = Vec3::new(2757.2, -14.0, -751.5);
         assert_eq!(
-            step_in_point(std::slice::from_ref(&border), out),
+            step_in_point(std::slice::from_ref(&border), out, false),
             Some(Vec3::new(2753.4, -14.0, -753.1))
         );
         let inside = Vec3::new(2753.6, -14.0, -753.0);
         assert!(border.holds(inside));
-        assert_eq!(step_in_point(std::slice::from_ref(&border), inside), None);
-        assert_eq!(step_in_point(&[], out), None);
+        assert_eq!(
+            step_in_point(std::slice::from_ref(&border), inside, false),
+            None
+        );
+        assert_eq!(step_in_point(&[], out, false), None);
+        // The 11-27 log's shape: the contract's wide region holds her too.
+        let wide = Keep {
+            guid: 0x12d300,
+            region: m2_assets::region::Region {
+                flags: 0,
+                unk_0x04: 0,
+                corners: vec![
+                    [-200.0, -200.0],
+                    [200.0, -200.0],
+                    [200.0, 200.0],
+                    [-200.0, 200.0],
+                ],
+            },
+            centre: [2750.0, -750.0],
+            yaw: 0.0,
+        };
+        let both = [wide, border];
+        assert!(both[0].holds(out) && !both[1].holds(out));
+        // Fire free: held by the wide one, nothing to step into.
+        assert_eq!(step_in_point(&both, out, false), None);
+        // Fire locked: into the border she is outside of.
+        assert_eq!(
+            step_in_point(&both, out, true),
+            Some(Vec3::new(2753.4, -14.0, -753.1))
+        );
+        // Inside both, locked or not: nowhere.
+        assert_eq!(step_in_point(&both, inside, true), None);
     }
 
     /// PmcCon018: kept within its boundary, a goal beyond it is brought
