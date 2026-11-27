@@ -9406,6 +9406,15 @@ mod tests {
         assert_eq!(frame_steps(0.02).0, 2);
         assert_eq!(frame_steps(0.04).0, 3);
         assert_eq!(frame_steps(0.2).0, 3);
+        // Xenia's phys7b-d frames: 0.0472 s and 0.0342 s, three substeps
+        // of a third each; 0.100 s, held to three.
+        let (n, each) = frame_steps(0.047);
+        assert_eq!(n, 3);
+        assert!((each - 0.047 / 3.0).abs() < 1e-7);
+        assert_eq!(frame_steps(0.0342).0, 3);
+        let (n, each) = frame_steps(0.1);
+        assert_eq!(n, 3);
+        assert!((each - 0.1 / 3.0).abs() < 1e-7);
         // A frame of 1/30 s moves a falling body as two steps of 1/60 do.
         let fall = |frame: bool| {
             let mut p = Physics::new();
