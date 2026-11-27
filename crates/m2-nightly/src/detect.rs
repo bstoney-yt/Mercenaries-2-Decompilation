@@ -10,6 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use m2_runsum::{Config, Summary, summarize};
 
+/// Seconds of play a Retry has to bring the contract back (the retry
+/// save's reload: about 5 s in the nightly trial) before it counts as
+/// failed. Invented, with room to spare.
+pub const RETRY_GRACE: f64 = 30.0;
+
 /// What broke. The order is the order of precedence when one cause
 /// explains another (see [`issue_kinds`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -27,6 +32,12 @@ pub enum Kind {
     /// The hero fell through the world: autoplay's own `fell through` line,
     /// her position not a number, or a logged height under the floor.
     FellThrough,
+    /// The failed contract's fanfare was answered with Retry, but the
+    /// contract did not start again (autoplay's next state is no contract).
+    RetryFailed,
+    /// The scripts cancelled (failed) the contract: a race's timer ran
+    /// out, a target lost, she died... (autoplay's contract cancelled).
+    ContractCancelled,
     /// The contract's objectives and mission state stayed the same for a
     /// long stretch of play.
     Stuck,
@@ -41,12 +52,14 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 9] = [
+    pub const ALL: [Kind; 11] = [
         Kind::Panic,
         Kind::Crash,
         Kind::Error,
         Kind::Hang,
         Kind::FellThrough,
+        Kind::RetryFailed,
+        Kind::ContractCancelled,
         Kind::Stuck,
         Kind::FpsCliff,
         Kind::Timeout,
@@ -61,6 +74,8 @@ impl Kind {
             Kind::Error => "error",
             Kind::Hang => "hang",
             Kind::FellThrough => "fell-through",
+            Kind::RetryFailed => "retry-failed",
+            Kind::ContractCancelled => "contract-cancelled",
             Kind::Stuck => "stuck",
             Kind::FpsCliff => "fps-cliff",
             Kind::Timeout => "timeout",
@@ -76,7 +91,14 @@ impl Kind {
     fn explains_incomplete(self) -> bool {
         matches!(
             self,
-            Kind::Panic | Kind::Crash | Kind::Error | Kind::Hang | Kind::FellThrough | Kind::Stuck
+            Kind::Panic
+                | Kind::Crash
+                | Kind::Error
+                | Kind::Hang
+                | Kind::FellThrough
+                | Kind::RetryFailed
+                | Kind::ContractCancelled
+                | Kind::Stuck
         )
     }
 }
@@ -300,10 +322,34 @@ pub fn analyse(log: &str, exit: &Exit, th: &Thresholds) -> Analysis {
     let mut lost: Option<f64> = None;
     let mut lowest: Option<(f64, f64)> = None;
     let mut paces: Vec<Pace> = Vec::new();
+    // Cancels (time, whether she was racing just before), Retries and
+    // Continues taken on their fanfares (times), the last racing line.
+    let mut cancels: Vec<(f64, bool)> = Vec::new();
+    let mut retries: Vec<f64> = Vec::new();
+    let mut continues = 0usize;
+    let mut last_racing: Option<f64> = None;
     for line in log.lines() {
         let line = line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("autoplay: contract cancelled (") {
+            let t = between(rest, " after ", " s of play")
+                .and_then(|n| n.parse::<f64>().ok())
+                .unwrap_or(clock);
+            cancels.push((t, last_racing.is_some_and(|r| t - r <= 5.0)));
+            continue;
+        }
+        if line.starts_with("autoplay: she takes Retry") {
+            retries.push(clock);
+            continue;
+        }
+        if line.starts_with("autoplay: she takes Continue") {
+            continues += 1;
+            continue;
+        }
         if let Some((t, body)) = autoplay_line(line) {
             clock = t;
+            if body.starts_with("racing") {
+                last_racing = Some(t);
+            }
             let at = body
                 .strip_prefix("at [")
                 .or_else(|| body.strip_prefix("fell through at ["));
@@ -410,8 +456,54 @@ pub fn analyse(log: &str, exit: &Exit, th: &Thresholds) -> Analysis {
         });
     }
 
-    // Stuck: nothing moved on for too long.
     let completed = !summary.completed.is_empty();
+
+    // The contract cancelled, and what came of the Retries taken on it:
+    // a Retry that works starts the contract again (autoplay goes back on
+    // it); one whose next contract state is none put it back on offer.
+    if !completed && let Some(&(t, racing)) = cancels.first() {
+        let times: Vec<String> = cancels.iter().map(|(t, _)| format!("{t:.1}")).collect();
+        failures.push(Failure {
+            kind: Kind::ContractCancelled,
+            at: Some(t),
+            detail: format!(
+                "the scripts cancelled the contract {} time(s), at {} s of play{}; answered with {} Retry and {} Continue",
+                cancels.len(),
+                times.join(", "),
+                if racing { ", the first while racing" } else { "" },
+                retries.len(),
+                continues
+            ),
+        });
+    }
+    // A Retry reloads the retry save: autoplay is briefly on no contract
+    // while the loading screen is up (trial2: none at 50.4 s, the contract
+    // back at 55.8 s), so a Retry only failed when no contract comes back
+    // within RETRY_GRACE seconds of play after it, and the run went on
+    // that long.
+    let failed_retry = retries.iter().find_map(|&r| {
+        let after: Vec<_> = summary
+            .contract_states
+            .iter()
+            .filter(|e| e.t >= r)
+            .collect();
+        let none = after.iter().find(|e| e.what == "none")?.t;
+        let back = after
+            .iter()
+            .any(|e| e.what != "none" && e.t <= r + RETRY_GRACE);
+        (!back && summary.last_time >= r + RETRY_GRACE).then_some((r, none))
+    });
+    if let Some((r, none)) = failed_retry {
+        failures.push(Failure {
+            kind: Kind::RetryFailed,
+            at: Some(r),
+            detail: format!(
+                "took Retry at {r:.1} s of play, but she was on no contract from {none:.1} s and none came back within {RETRY_GRACE:.0} s: it was put back on offer, not restarted"
+            ),
+        });
+    }
+
+    // Stuck: nothing moved on for too long.
     let gap = longest_gap(&summary, summary.last_time);
     if gap.0 >= th.stuck_seconds {
         failures.push(Failure {
@@ -514,8 +606,16 @@ pub fn analyse(log: &str, exit: &Exit, th: &Thresholds) -> Analysis {
 /// The kinds worth an issue each: a cause that explains a contract not
 /// completing (a panic, a hang, being stuck...) stands for it, so
 /// `not-completed` and `timeout` are dropped then; `timeout` stands for
-/// `not-completed` too. FPS cliffs always stand on their own.
+/// `not-completed` too. A stretch stuck that began at or after the
+/// contract was cancelled is that cancel's doing, so `stuck` is dropped
+/// then. FPS cliffs always stand on their own.
 pub fn issue_kinds(failures: &[Failure]) -> Vec<Kind> {
+    let first = |k: Kind| failures.iter().find(|f| f.kind == k).and_then(|f| f.at);
+    let cancelled = first(Kind::ContractCancelled).or(first(Kind::RetryFailed));
+    let stuck_after_cancel = matches!(
+        (cancelled, first(Kind::Stuck)),
+        (Some(c), Some(s)) if s >= c
+    );
     let mut kinds: Vec<Kind> = failures.iter().map(|f| f.kind).collect();
     kinds.sort();
     kinds.dedup();
@@ -524,6 +624,7 @@ pub fn issue_kinds(failures: &[Failure]) -> Vec<Kind> {
     kinds.retain(|k| match k {
         Kind::NotCompleted => !explained && !timed_out,
         Kind::Timeout => !explained,
+        Kind::Stuck => !stuck_after_cancel,
         _ => true,
     });
     kinds
