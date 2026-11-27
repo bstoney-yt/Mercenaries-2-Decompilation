@@ -672,6 +672,126 @@ impl RunStop {
     }
 }
 
+/// Swimming, as the 360's human physics object swims a person: the
+/// player and the people alike, since both run it (0x82176F38).
+///
+/// From the 360 code:
+/// - The ground and in-air states (0x82171330, 0x82171270) switch to
+///   swimming when the water stands at least half the standing capsule
+///   over the feet: `feet + 0.5 x height <= water` (the half height kept
+///   at the character input's +8, 0x821778F4). See [`enters_water`].
+/// - The swimming state leaves the water once its shape is held more
+///   than the capsule's radius over the surface, on the ground: the
+///   state's +0xc is the template's `ProxyCapsuleRadius` (the
+///   constructor's `stfs f30,0xc` at 0x821777FC), tested against the
+///   position at 0x8217160C..0x82171630. See [`leaves_water`].
+/// - Each step the swimming state's velocity (0x82171634..0x821716FC)
+///   goes half way to the stick's way times the full swimming speed
+///   across, and half way to the gap to the surface, held within that
+///   speed, up and down. See [`swim_velocity`].
+/// - The full swimming speed is the larger of `SwimRunSpeed` and
+///   `SwimSprintSpeed` (the `fsel` at 0x82177830, stored at +0x25c and
+///   handed to both swimming states). See [`swim_full`].
+/// - The person turns in the water as on the ground: the step
+///   (0x8217A2D0) runs the steer and turn (0x8217BDE0, 0x8217BB60) in
+///   every state, and the turn takes [`AIR_TURN`] only in Havok's
+///   in-air state (2), the template's `MaxRotationSpeed` otherwise. See
+///   [`swim_turn_max`].
+pub mod swim {
+    use m2_math::glam::{Vec2, Vec3};
+
+    /// Whether a person whose feet are at `feet` with a standing capsule
+    /// `height` tall is out of their depth in water whose surface is at
+    /// `water`.
+    pub fn enters_water(feet: f32, height: f32, water: f32) -> bool {
+        feet + 0.5 * height <= water
+    }
+
+    /// Whether a swimming person at `at` (the swim shape's bottom) with a
+    /// capsule of `radius`, `grounded` or not, stands out of the water.
+    pub fn leaves_water(grounded: bool, at: f32, radius: f32, water: f32) -> bool {
+        grounded && at - radius > water
+    }
+
+    /// The full swimming speed, m/s, from `SwimRunSpeed` and
+    /// `SwimSprintSpeed` (the sprint is -1 when there is none).
+    pub fn swim_full(run: f32, sprint: f32) -> f32 {
+        run.max(sprint)
+    }
+
+    /// A swimming person's velocity after one step: `have` the velocity
+    /// now, `way` where the stick points (across, its length the stick's
+    /// share), `full` the full swimming speed, `at` the swim shape's
+    /// bottom and `water` the surface.
+    pub fn swim_velocity(have: Vec3, way: Vec2, full: f32, at: f32, water: f32) -> Vec3 {
+        let rise = (water - at).clamp(-full, full);
+        Vec3::new(
+            0.5 * have.x + 0.5 * way.x * full,
+            0.5 * have.y + 0.5 * rise,
+            0.5 * have.z + 0.5 * way.y * full,
+        )
+    }
+
+    /// The most a swimming person turns, rad/s: their template's
+    /// `MaxRotationSpeed` (degrees a second), as on the ground.
+    pub fn swim_turn_max(max_rotation: f32) -> f32 {
+        max_rotation.to_radians()
+    }
+}
+
+#[cfg(test)]
+mod swim_tests {
+    use super::swim::*;
+    use super::{TURN_ACCEL, Turn};
+    use m2_math::glam::{Vec2, Vec3};
+
+    #[test]
+    fn a_person_swims_with_the_water_half_their_height_over_their_feet() {
+        assert!(!enters_water(0.0, 1.8, 0.89));
+        assert!(enters_water(0.0, 1.8, 0.9));
+        assert!(enters_water(-2.0, 1.8, 0.0));
+    }
+
+    #[test]
+    fn they_stand_once_held_more_than_their_radius_over_the_water() {
+        assert!(!leaves_water(true, 0.4, 0.4, 0.0));
+        assert!(leaves_water(true, 0.41, 0.4, 0.0));
+        // Not in the air: only standing on something.
+        assert!(!leaves_water(false, 1.0, 0.4, 0.0));
+    }
+
+    #[test]
+    fn the_full_swimming_speed_is_the_faster_of_run_and_sprint() {
+        assert_eq!(swim_full(3.0, 5.0), 5.0);
+        assert_eq!(swim_full(3.0, -1.0), 3.0);
+    }
+
+    #[test]
+    fn each_step_goes_half_way_to_the_stick_and_the_surface() {
+        let v = swim_velocity(Vec3::ZERO, Vec2::new(0.0, 1.0), 5.0, -1.0, 0.0);
+        assert_eq!(v, Vec3::new(0.0, 0.5, 2.5));
+        let v = swim_velocity(v, Vec2::new(0.0, 1.0), 5.0, -1.0, 0.0);
+        assert_eq!(v, Vec3::new(0.0, 0.75, 3.75));
+        // Far under, it rises no faster than the full speed asks.
+        let v = swim_velocity(Vec3::ZERO, Vec2::ZERO, 5.0, -20.0, 0.0);
+        assert_eq!(v.y, 2.5);
+    }
+
+    #[test]
+    fn she_turns_round_in_the_water_as_fast_as_on_the_ground() {
+        // Jennifer's 700 degrees a second at 50 rad/s² build-up: half a
+        // turn takes about 0.36 s at 60 steps a second.
+        let (mut turn, mut facing, mut steps) = (Turn::default(), 0.0, 0);
+        let max = swim_turn_max(700.0);
+        while (facing - std::f32::consts::PI).abs() > 1e-4 && steps < 600 {
+            facing = turn.step(facing, std::f32::consts::PI, TURN_ACCEL, max, 1.0 / 60.0);
+            steps += 1;
+        }
+        let t = steps as f32 / 60.0;
+        assert!((0.3..0.4).contains(&t), "{t}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

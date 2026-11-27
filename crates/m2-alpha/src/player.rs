@@ -51,25 +51,18 @@ const LAND_FADE: f32 = 0.1;
 /// Speeds (m/s) above which she takes off and lands on the run.
 const RUNNING_JUMP: f32 = 1.0;
 const RUNNING_LAND: f32 = 1.5;
-/// How fast she turns to face where she swims, radians per second
-/// (invented: on foot she turns as the 360 does, [`on_foot::Turn`]).
-const TURN_RATE: f32 = 10.0;
 /// When a state layer goes: how far under her feet her floor is looked
 /// for, and how near the floor after must be to the floor before for it
 /// to be the same one, metres. Invented.
 const FLOOR_LOOK: f32 = 60.0;
 const FLOOR_SAME: f32 = 0.25;
-/// Swimming. She swims where the water at her feet is at least half her
-/// capsule's height deep, metres: from the 360 code, the ground and
-/// in-air states (0x82171330, 0x82171270) switch to swimming when
-/// `feet + 0.5 x height <= water` (the half height kept at the
-/// character input's +8, 0x821778F4), 0.9 m for the 1.8 m capsule every
-/// hero and soldier has. She stands again where it is shallower than
-/// [`SWIM_STOP`] (invented: the 360 leaves the water once her swimming
-/// shape is pushed up more than its radius out of it, 0x821715F8, and that
-/// shape's place on her is not read, so the alpha floats her at
-/// [`SWIM_FLOAT`] and stands her up a little shallower than she starts,
-/// so the shore's slope doesn't flick her in and out).
+/// Water depths, metres, for finding water to swim in and shallows to
+/// make for: out of the depth of a 1.8 m capsule (half its height,
+/// [`on_foot::swim::enters_water`], the 360's rule, 0x82171330), and
+/// shallow enough to stand in (invented: a little under that). Who
+/// swims and who stands is the 360's rule on the person's own position
+/// ([`on_foot::swim`]); these only steer the test bot and the people's
+/// search for a shore, which the 360's swimming AI was not read for.
 pub const SWIM_START: f32 = 0.9;
 pub const SWIM_STOP: f32 = 0.85;
 /// How far her model's origin hangs under the surface while she swims
@@ -587,7 +580,9 @@ impl Player {
         match self.swim {
             // From the 360 code: in when the water is half her standing
             // capsule over her feet (0x82171330), not in a jump.
-            None if at.y + 0.5 * self.character.height <= water && self.leap == Leap::No => {
+            None if on_foot::swim::enters_water(at.y, self.character.height, water)
+                && self.leap == Leap::No =>
+            {
                 eprintln!("player: out of her depth ({depth:.1} m) at {at:.1}: she swims");
                 // The swim shape: a ball of her radius from her position up
                 // to 2r + 0.1 (shape 3, 0x82177340).
@@ -602,7 +597,14 @@ impl Player {
             }
             // Out when the ground holds the swim shape more than its
             // radius above the water (0x821715F8).
-            Some(s) if self.character.grounded && at.y - self.character.radius > water => {
+            Some(s)
+                if on_foot::swim::leaves_water(
+                    self.character.grounded,
+                    at.y,
+                    self.character.radius,
+                    water,
+                ) =>
+            {
                 eprintln!("player: in her depth ({depth:.1} m) at {at:.1}: she stands");
                 self.character.height = s.stand;
                 self.swim = None;
@@ -624,25 +626,33 @@ impl Player {
         // From the 360 code (0x821715F8): each step her velocity goes half
         // way to the stick's way times her full swimming speed, the larger
         // of her `SwimRunSpeed` and `SwimSprintSpeed` (0x82177830).
-        let _ = speed;
-        let have = Vec3::new(self.character.velocity.x, 0.0, self.character.velocity.z);
-        let wanted = have * 0.5 + direction * self.swim_full * 0.5;
         // Up or down, half way each step to the speed that would close the
         // gap to the water at that speed (clamped to it): she floats with
         // her position, the swim shape's bottom, at the surface.
-        let s = self.swim_full;
-        let vy = 0.5 * self.character.velocity.y + 0.5 * (water - at.y).clamp(-s, s);
+        let _ = speed;
+        let next = on_foot::swim::swim_velocity(
+            self.character.velocity,
+            Vec2::new(direction.x, direction.z),
+            self.swim_full,
+            at.y,
+            water,
+        );
+        let wanted = next.with_y(0.0);
         // move_character takes gravity off what it is given.
-        let v = vy + self.character.gravity * dt;
+        let v = next.y + self.character.gravity * dt;
         self.character.velocity.y = v;
         physics.move_character(&mut self.character, wanted, Some(v), dt);
+        // She turns as on the ground (0x8217BB60 in every state but
+        // Havok's in-air one): her template's `MaxRotationSpeed`, built
+        // up at the turn's usual rate.
         if direction.length_squared() > 0.01 {
             let target = direction.x.atan2(direction.z);
-            let mut turn = (target - self.facing).rem_euclid(std::f32::consts::TAU);
-            if turn > std::f32::consts::PI {
-                turn -= std::f32::consts::TAU;
-            }
-            self.facing += turn.clamp(-TURN_RATE * dt, TURN_RATE * dt);
+            let max = on_foot::swim::swim_turn_max(self.motion.max_rotation);
+            self.facing = self
+                .turn
+                .step(self.facing, target, on_foot::TURN_ACCEL, max, dt);
+        } else {
+            self.turn = Turn::default();
         }
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
         if let Some((_, rig)) = &mut self.model {
@@ -700,7 +710,7 @@ impl Player {
             clips: FightClips::default(),
             speeds: SPEEDS,
             swim_speeds: [SWIM_SPEEDS[0], SWIM_SPEEDS[1], SWIM_SPEEDS[2]],
-            swim_full: SWIM_SPEEDS[2].max(SWIM_SPEEDS[3]),
+            swim_full: on_foot::swim::swim_full(SWIM_SPEEDS[2], SWIM_SPEEDS[3]),
             motion: JENNIFER,
             turn: Turn::default(),
             run_stop: RunStop::default(),
