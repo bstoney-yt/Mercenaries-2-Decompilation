@@ -665,6 +665,9 @@ struct Options {
     /// `--object-sound-check`: her C4 put down in the mission, its
     /// object-attached beep logged ([`mission::ObjectSoundCheck`]).
     object_sound_check: bool,
+    /// `--credits-check`: in the mission, the scripts' end credits started
+    /// and followed to the front end ([`mission::CreditsCheck`]).
+    credits_check: bool,
     /// `--impact-check`: rounds struck into the ground round her, by
     /// surface ([`impact_check`]).
     impact_check: bool,
@@ -1144,6 +1147,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--mine-check" => {
                 o.mine_check = true;
+                o.mission = true;
+            }
+            "--credits-check" => {
+                o.credits_check = true;
                 o.mission = true;
             }
             "--object-sound-check" => {
@@ -5878,6 +5885,9 @@ fn mission_for_screenshot(
     }
     if options.sat_blip_check {
         link.sat_blip_check = Some(mission::SatBlipCheck::default());
+    }
+    if options.credits_check {
+        link.credits_check = Some(mission::CreditsCheck::default());
     }
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
