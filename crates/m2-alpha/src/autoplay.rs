@@ -1693,11 +1693,12 @@ impl Autoplay {
                 if may_strike(&self.no_strike, *target)
                     && ((sturdy(target) && !cannon) || (spent && !gun(at) && !cannon)))
             || matches!(self.goal, Some(Goal::Deliver(_)))
-            // Her weapons put away by the scripts, a strike on offer: what
-            // they score is struck (PmcCon018).
-            || (matches!(self.goal, Some(Goal::Blast { .. }))
-                && game.scene.player.as_ref().is_some_and(|p| p.weapons_away() && !p.swimming())
-                && strike_line(&game.support.entries()).is_some());
+            // Her weapons put away by the scripts, or her goal held outside
+            // her bounds, a strike on offer: what they score is struck
+            // (PmcCon018).
+            || (matches!(&self.goal, Some(Goal::Blast { target, .. })
+                    if self.death_watched.iter().any(|(g, _)| g == target))
+                && self.strike_scored(game));
         // A call she is no longer after is put away: the designator goes
         // with a weapon taken up (twice from the satellite's view).
         if !striking && (game.support.busy() || game.support.holding()) {
@@ -2119,10 +2120,10 @@ impl Autoplay {
         // airstrike challenge, PmcCon018: weapons off, two practice laser
         // strikes, points for the vehicles and barrels it spawns): the
         // thickest knot of what they wait to die, within her bounds.
-        if let Some(p) = game.scene.player.as_ref()
-            && p.weapons_away()
-            && !p.swimming()
-            && strike_line(&game.support.entries()).is_some()
+        // So too while her goal is held outside her bounds (the 11-27
+        // checks: its marker 106 m out, she stood at the edge 540 s with
+        // a practice laser in the menu and never called it).
+        if self.strike_scored(game)
             && let Some((target, at, n)) = strike_knot(&self.death_watched, &self.keep)
         {
             return Some((
@@ -6560,6 +6561,26 @@ fn strike_line(entries: &[Entry<'_>]) -> Option<usize> {
                     || s.key.to_ascii_lowercase().contains("laser"))
         }
     })
+}
+
+/// Seconds her goal is held outside her bounds before the scripts' scored
+/// objects are struck instead (invented).
+const HELD_FOR: f32 = 5.0;
+
+impl Autoplay {
+    /// Whether what the scripts score is to be struck now: a strike in
+    /// the menu, on foot or driving (not swimming), with her weapons put
+    /// away by the scripts or her goal held outside her bounds for
+    /// [`HELD_FOR`].
+    fn strike_scored(&self, game: &Game) -> bool {
+        let Some(p) = game.scene.player.as_ref() else {
+            return false;
+        };
+        let held = self.held_since.is_some_and(|t| self.clock - t > HELD_FOR);
+        !p.swimming()
+            && (p.weapons_away() || held)
+            && strike_line(&game.support.entries()).is_some()
+    }
 }
 
 /// A strike's reach for counting what it takes with it (metres; invented:
