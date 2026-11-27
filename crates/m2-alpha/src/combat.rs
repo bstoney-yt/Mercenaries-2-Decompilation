@@ -509,8 +509,14 @@ const GUNNER_RANGE: f32 = 120.0;
 /// whatever its `Hearing`. Here d is from where the shot was fired, which is
 /// never nearer than its line (the line isn't ported).
 const ALERT_RANGE: f32 = 120.0;
-/// Gunfire sends civilians this close running (invented).
-const PANIC_RANGE: f32 = 40.0;
+/// Gunfire startles those this close, metres: the same hearing pass
+/// (0x822FA410) posts message 0x87BE5457 to every mind that hears the shot
+/// louder than 0.5 (0x820D9EDC), that is within 30 m (`30 / (d + 30)`).
+/// Inferred: that civilians run on it (its handler is not traced).
+const PANIC_RANGE: f32 = 30.0;
+/// A blast sends civilians this close running (invented: the blasts'
+/// startle is not traced).
+const BLAST_PANIC_RANGE: f32 = 40.0;
 /// A shot's loudness to a mind (0x822FA410), for [`ALERT_RANGE`].
 #[cfg(test)]
 fn shot_loudness(d: f32) -> f32 {
@@ -8203,7 +8209,7 @@ fn alarm_within(people: &mut People, at: Vec3, audibility: f32) {
         if n.soldier && !n.ai.flags.pacifist && d < audibility * n.ai.hearing {
             n.alert = true;
         }
-        if !n.soldier && d < PANIC_RANGE {
+        if !n.soldier && d < BLAST_PANIC_RANGE {
             n.panic(at);
         }
     }
@@ -10919,6 +10925,24 @@ mod tests {
         assert!((shot_loudness(0.0) - 1.0).abs() < 1e-6);
         assert!(shot_loudness(119.0) > 0.0);
         assert_eq!(shot_loudness(121.0), 0.0);
+        // Louder than a half, it startles (0x87BE5457): within 30 m.
+        assert!(shot_loudness(PANIC_RANGE - 0.1) > 0.5);
+        assert!(shot_loudness(PANIC_RANGE + 0.1) < 0.5);
+    }
+
+    #[test]
+    fn gunfire_sends_civilians_within_30_m_running() {
+        let mut people = People::default();
+        for (k, d) in [(1, 25.0), (2, 35.0)] {
+            let post = crate::npc::Brain::Post { facing: 0.0 };
+            let at = Vec3::new(d, 0.0, 0.0);
+            let mut n = crate::npc::Npc::new(0, &crate::npc::tests::rig(), at, 0.0, post, Some(k));
+            n.soldier = false;
+            people.npcs.push(n);
+        }
+        alarm(&mut people, Vec3::ZERO);
+        assert!(people.npcs[0].flees(), "25 m: startled");
+        assert!(!people.npcs[1].flees(), "35 m: not");
     }
 
     #[test]
