@@ -622,13 +622,15 @@ pub const MAX_GRENADES: u32 = 9;
 /// supply crate's 100 health: one blow opens it), and seconds before she
 /// can bash or fire again. People are reached, hurt and shoved as the 360
 /// does instead ([`m2_engine::melee`]).
-/// Invented, from the playthroughs: the reach and arc for the world and
-/// vehicles. What a blow deals is the 360's: the damage table's
-/// `MeleeBash` cell of the row of what it strikes, as it is
-/// (0x8222B2E8), for people ([`m2_engine::melee`]) and the world alike
-/// ([`MELEE_ROUND`]).
-const BASH_REACH: f32 = 1.8;
-const BASH_ARC: f32 = 0.5;
+/// What a blow reaches is the 360's for everything: the bash's box
+/// ([`m2_engine::melee::HIGH`] or `LOW`, 0x8222AFE8's query), people,
+/// vehicles and the world alike; what it deals is the damage table's
+/// `MeleeBash` cell of the row of what it strikes, as it is (0x8222B2E8,
+/// [`MELEE_ROUND`]). Inferred: the box's query against the world taken as
+/// a ray along its middle, out to its far edge ([`box_reach`]).
+fn box_reach(b: &m2_engine::melee::BashBox) -> f32 {
+    b.middle.z + b.size.z * 0.5
+}
 /// A vehicle whose up axis leans further than this from straight up
 /// (its cosine) lies on its side or roof, for a blow to right (invented).
 const OVERTURNED_UP: f32 = 0.5;
@@ -638,11 +640,20 @@ fn overturned(up: Vec3) -> bool {
     up.y < OVERTURNED_UP
 }
 
-/// Whether her blow from `feet`, facing `ahead`, reaches a vehicle with its
-/// middle at `middle` and about `half` metres from its middle to its side.
-fn within_bash(feet: Vec3, ahead: Vec3, middle: Vec3, half: f32) -> bool {
-    let to = (middle - feet).with_y(0.0);
-    to.length() <= BASH_REACH + half && to.normalize_or_zero().dot(ahead) >= BASH_ARC
+/// Whether her blow's box `b` from `feet`, facing `facing`, reaches a
+/// vehicle with its middle at `middle`, about `half` metres from its middle
+/// to its side: as the box reaches a person ([`m2_engine::melee::reaches`]),
+/// the vehicle taken as upright round it, `2 x half` tall from below its
+/// middle.
+fn within_bash(
+    b: &m2_engine::melee::BashBox,
+    feet: Vec3,
+    facing: f32,
+    middle: Vec3,
+    half: f32,
+) -> bool {
+    let base = middle - Vec3::Y * half;
+    m2_engine::melee::reaches(b, feet, facing, base, half, 2.0 * half)
 }
 /// What a person takes of a blow without a damage table (invented: with
 /// one, the blow is their row's `MeleeBash` cell itself).
@@ -668,9 +679,6 @@ fn body_height(n: &crate::npc::Npc) -> f32 {
 /// the damage table here (the alpha's own: their 100 health, one blow).
 const BASH_BREAK: f32 = 100.0;
 const BASH_GAP: f32 = 0.8;
-/// Heights of a blow over her feet, high and low, metres.
-const BASH_HIGH: f32 = 1.2;
-const BASH_LOW: f32 = 0.45;
 /// The `MaxForce` the blasts without a template (the alpha's own and the
 /// scripted bombs) throw people with: that of most of the game's
 /// explosions (`fx_Explosion_Large`, `Explosion (Small)`, ...: 300).
@@ -6766,19 +6774,16 @@ impl Combat {
         }
         let facing = f.player.facing;
         let ahead = Vec3::new(facing.sin(), 0.0, facing.cos());
-        let in_box = |b: &melee::BashBox, ray: f32| {
+        let in_box = |b: &melee::BashBox| {
             f.people.npcs.iter().filter(|n| n.alive).any(|n| {
                 let (at, r) = (n.character.position, n.character.radius);
                 melee::reaches(b, feet, facing, at, r, body_height(n))
             }) || f
                 .physics
-                .cast_ray(feet + Vec3::Y * ray, ahead, BASH_REACH)
+                .cast_ray(feet + Vec3::Y * b.middle.y, ahead, box_reach(b))
                 .is_some()
         };
-        let (high, low) = (
-            in_box(&melee::HIGH, BASH_HIGH),
-            in_box(&melee::LOW, BASH_LOW),
-        );
+        let (high, low) = (in_box(&melee::HIGH), in_box(&melee::LOW));
         melee::goes_low(high, low)
     }
 
@@ -6791,8 +6796,8 @@ impl Combat {
         let feet = f.player.character.position;
         let facing = f.player.facing;
         let ahead = Vec3::new(facing.sin(), 0.0, facing.cos());
-        let from = feet + Vec3::Y * if low { BASH_LOW } else { BASH_HIGH };
         let reach = if low { melee::LOW } else { melee::HIGH };
+        let from = feet + Vec3::Y * reach.middle.y;
         // The shove pushes from her position raised by the box's height.
         let pushed_from = feet + Vec3::Y * reach.push_height;
         let mut landed = 0;
@@ -6847,13 +6852,15 @@ impl Combat {
             let (lo, hi) = v.model.bounds;
             let middle = m.transform_point3((lo + hi) * 0.5);
             let up = m.transform_vector3(Vec3::Y).normalize_or_zero();
-            if within_bash(feet, ahead, middle, (hi - lo).max_element() * 0.5) && overturned(up) {
+            if within_bash(&reach, feet, facing, middle, (hi - lo).max_element() * 0.5)
+                && overturned(up)
+            {
                 f.physics.right_vehicle(id);
                 eprintln!("bash: she rights {} (up {:.2})", v.spec.label, up.y);
                 break;
             }
         }
-        if let Some((t, _, key)) = f.physics.cast_ray_keyed(from, ahead, BASH_REACH) {
+        if let Some((t, _, key)) = f.physics.cast_ray_keyed(from, ahead, box_reach(&reach)) {
             self.struck.push(Strike {
                 at: from + ahead * t,
                 damage: BASH_BREAK,
@@ -8767,12 +8774,14 @@ mod tests {
         assert!(!overturned(Vec3::new(0.5, 0.86, 0.0)));
         assert!(overturned(Vec3::X));
         assert!(overturned(-Vec3::Y));
-        // A jeep 1 m wide lying 2.5 m ahead of her is in reach; behind her
-        // or 5 m off it isn't.
-        let (feet, ahead) = (Vec3::ZERO, Vec3::Z);
-        assert!(within_bash(feet, ahead, Vec3::new(0.0, 0.5, 2.5), 1.0));
-        assert!(!within_bash(feet, ahead, Vec3::new(0.0, 0.5, -2.5), 1.0));
-        assert!(!within_bash(feet, ahead, Vec3::new(0.0, 0.5, 5.0), 1.0));
+        // A jeep 1 m from its middle to its side lying 2 m ahead of her is
+        // in the low box (its far edge 1.3 m out); behind her or 2.5 m off
+        // it isn't.
+        let (feet, b) = (Vec3::ZERO, &m2_engine::melee::LOW);
+        assert!((box_reach(b) - 1.3).abs() < 1e-6);
+        assert!(within_bash(b, feet, 0.0, Vec3::new(0.0, 0.5, 2.0), 1.0));
+        assert!(!within_bash(b, feet, 0.0, Vec3::new(0.0, 0.5, -2.0), 1.0));
+        assert!(!within_bash(b, feet, 0.0, Vec3::new(0.0, 0.5, 3.0), 1.0));
     }
 
     #[test]
