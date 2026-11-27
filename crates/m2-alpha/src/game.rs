@@ -1446,7 +1446,18 @@ impl Game {
                             if let Some(t) = p.turret {
                                 m.yaw = t.yaw;
                                 m.pitch = t.pitch;
-                                m.turret = crate::placed::turret(scene.source.as_mut(), &m, t);
+                                m.turret = crate::placed::turret(
+                                    scene.source.as_mut(),
+                                    &scene.props,
+                                    &m,
+                                    t,
+                                );
+                                if m.turret.is_none() {
+                                    eprintln!(
+                                        "placed: emplaced gun {:#x}: its turret's bones are not on its model: it doesn't turn",
+                                        m.entity
+                                    );
+                                }
                             }
                             m.seat = Some(p.seat);
                             m.seat_link = Some(p.seat_link);
@@ -1865,10 +1876,27 @@ impl Game {
                         } else {
                             player.update(physics, intent, dt);
                         }
+                        // Laid on what her crosshair is on, from the gun's
+                        // pivot, as a vehicle's turret is laid on it
+                        // (`aim_toward` with `Combat::aim_point`), not along
+                        // her camera's line: the M101A1's seat camera looks
+                        // down 0.5-0.85 rad, and turned with it the barrel
+                        // sat at its -10 degree limit while its shot asked
+                        // for +0.5..+0.9 (PmcCon033, the 11-27 diagnostic
+                        // run of #809: its 4 m barrel into the sandbags).
+                        let goal = self
+                            .combat
+                            .manned
+                            .as_ref()
+                            .filter(|m| m.turret.is_some())
+                            .map(|_| Combat::aim_point(physics, &scene.people, player, None));
                         if let Some(m) = &mut self.combat.manned
                             && let Some(t) = &mut m.turret
                         {
-                            let nodes = t.step(player.camera_forward(), m.facing, dt);
+                            let want = goal
+                                .map(|g| (g - m.pivot).normalize_or(player.camera_forward()))
+                                .unwrap_or_else(|| player.camera_forward());
+                            let nodes = t.step(want, m.facing, dt);
                             scene.props.set_turned(m.entity, Some(nodes));
                         }
                         if waiting && player.landed && std::mem::take(&mut player.floor_landed) {

@@ -4118,9 +4118,28 @@ impl Autoplay {
                     .cast_ray_keyed(from, dir, MUZZLE_CLEAR)
                     .map(|(t, _, key)| (key, from, dir, t))
             });
+            // And how the gun stands: the turret's yaw and pitch now and
+            // those the shot's way asks for (degrees), its hardpoint at rest
+            // and as turned, and its pivot, to tell a turret still turning
+            // (or posed wrong) from cover in the way.
+            let stance = game.combat.manned.as_ref().map(|m| {
+                let want = crate::combat::turret_angles(launch_dir(m, at), m.facing);
+                (
+                    m.turret
+                        .as_ref()
+                        .map(|t| (t.aim.0.to_degrees(), t.aim.1.to_degrees())),
+                    (want.0.to_degrees(), want.1.to_degrees()),
+                    m.barrel.map(|b| b.0),
+                    m.turret
+                        .as_ref()
+                        .and_then(crate::combat::MannedTurret::hardpoint),
+                    m.pivot,
+                )
+            });
             eprintln!(
                 "autoplay {:.1} s: something by the gun is in the way of {target:#x} ({what:?}): \
-                 another for {KEEP_PASS:.0} s",
+                 another for {KEEP_PASS:.0} s; gun (turret aim, wanted, hardpoint at rest, \
+                 turned, pivot) {stance:?}",
                 self.clock
             );
             self.passed.push((target, self.clock + KEEP_PASS));
@@ -8197,6 +8216,29 @@ mod tests {
         );
         assert_eq!(got, 1);
         assert_eq!(short_strikes(&[], eye, statue), 0);
+    }
+
+    /// The 11-26 nightly's guns: a shot starts at the weapon's hardpoint
+    /// node, no offset added (the 360's 0x8227F698); without a hardpoint,
+    /// the pivot fallback.
+    #[test]
+    fn rounds_start_at_the_weapons_hardpoint() {
+        use crate::combat::MANNED_MUZZLE;
+        let aim = Vec3::new(-0.8, 0.0, -0.6);
+        let mut g = gun(100.0, 9.8);
+        g.pivot = Vec3::new(0.0, 1.1, 0.0);
+        // No hardpoint known: from the pivot, as before.
+        assert!(g.muzzle(aim).distance(g.pivot + aim * MANNED_MUZZLE) < 1e-4);
+        // PmcCon033's M101A1: its hardpoint is its muzzle node, no weapon
+        // model: the round starts there, whatever the aim.
+        let mount = Vec3::new(0.0, 1.28, 4.14);
+        g.barrel = Some((mount, Vec3::ZERO));
+        assert!(g.muzzle(aim).distance(mount) < 1e-4);
+        assert!(g.muzzle(Vec3::Z).distance(mount) < 1e-4);
+        // A weapon with a muzzle node: the node, turned with the aim.
+        let node = Vec3::new(0.0, 0.22, 1.35);
+        g.barrel = Some((mount, node));
+        assert!(g.muzzle(Vec3::Z).distance(mount + node) < 1e-4);
     }
 
     #[test]
