@@ -487,6 +487,11 @@ pub struct FightClips {
     pub stances: [Option<usize>; 2],
     /// The cover actions' clips ([`Self::cover_clip`]).
     pub cover: [Option<usize>; 10],
+    /// `Prone` `FireWeapon` (a full-body loop, handle a94e2676).
+    pub prone_fire: Option<usize>,
+    /// The cover stances' idles, by [`CoverStance`]: `UprightCoverLeft`,
+    /// `UprightCoverRight` and `CrouchCover` `Idle` (full-body loops).
+    pub cover_idles: [Option<usize>; 3],
 }
 
 /// The clips of the 14 directions a person dies in on foot
@@ -866,6 +871,12 @@ impl FightClips {
                 let (s, a) = Self::ACTION_KEYS[4 + k];
                 Self::by_action(rig, s, a)
             }),
+            prone_fire: Self::by_action(rig, "Prone", "FireWeapon"),
+            cover_idles: [
+                Self::by_action(rig, "UprightCoverLeft", "Idle"),
+                Self::by_action(rig, "UprightCoverRight", "Idle"),
+                Self::by_action(rig, "CrouchCover", "Idle"),
+            ],
         }
     }
 
@@ -875,7 +886,7 @@ impl FightClips {
     /// them; their hashes are [`m2_engine::ai_mover::Side::action`]) and
     /// the idles of the stances its `crouch` and `GoProne` messages lead to
     /// (the human state table: `Crouched`, `Prone`).
-    pub const ACTION_KEYS: [(&'static str, &'static str); 14] = [
+    pub const ACTION_KEYS: [(&'static str, &'static str); 18] = [
         ("Upright", "SidestepLeft"),
         ("Upright", "SidestepRight"),
         ("Crouched", "Idle"),
@@ -890,6 +901,10 @@ impl FightClips {
         ("CrouchCover", "ExitCover"),
         ("Upright", "DiveLeft"),
         ("Upright", "DiveRight"),
+        ("Prone", "FireWeapon"),
+        ("UprightCoverLeft", "Idle"),
+        ("UprightCoverRight", "Idle"),
+        ("CrouchCover", "Idle"),
     ];
 
     /// The cover actions a spot gives ([`m2_engine::ai_mover::spot_clips`]),
@@ -3513,8 +3528,29 @@ impl Npc {
         // it, its stance's idle (the human state table's `Crouched` and
         // `Prone` `Idle`). Moving, upright (inferred: the crouched and
         // prone moves are not wired).
+        // `Crouched` `Idle` is the locomotion's (its handle `None`, the
+        // crouched locomotion mask db9c23dc, not ported), so crouching
+        // shows only where a table gives it a clip. Prone, firing, its
+        // `FireWeapon` loop. Holding cover (at the spot, or down at a
+        // Popup spot) between its clips, the cover stance's `Idle`.
+        let holding_cover = self.cover_clip <= 0.0
+            && self.mover.is_some_and(|m| {
+                m.state() == MoverState::AtSpot
+                    || (m.state() == MoverState::Popup && m.stance == MoverStance::Crouch)
+            });
+        let cover_idle = if self.mover.is_some_and(|m| m.state() == MoverState::Popup) {
+            clips.cover_idles[2]
+        } else {
+            clips.cover_idles[match self.cover_stance {
+                CoverStance::Left => 0,
+                CoverStance::Right => 1,
+                CoverStance::Kneel => 2,
+            }]
+        };
         let low = match self.mover.map(|m| m.stance) {
+            _ if holding_cover && cover_idle.is_some() => cover_idle,
             Some(MoverStance::Crouch) => clips.stances[0],
+            Some(MoverStance::Low) if self.burst > 0 => clips.prone_fire.or(clips.stances[1]),
             Some(MoverStance::Low) => clips.stances[1],
             _ => None,
         }
