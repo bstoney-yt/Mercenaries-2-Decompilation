@@ -580,6 +580,10 @@ struct Options {
     /// there, and log each second whether he swims (`npc-swim:` lines).
     /// For testing.
     npc_swim: Option<f32>,
+    /// With `--gait` on the island: once she has swum this many seconds,
+    /// she turns for the nearest shore she can stand on and swims there
+    /// (`swim-ashore:` lines). For testing.
+    swim_ashore: Option<f32>,
     /// With `--mission --after-contract`: this many seconds after the
     /// contract, take the pause menu's Medevac (if the scripts allow it).
     medevac: Option<f32>,
@@ -1438,6 +1442,9 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--contracts" => {
                 o.contracts = value()?.parse().context("--contracts expects a count")?
+            }
+            "--swim-ashore" => {
+                o.swim_ashore = Some(value()?.parse().context("--swim-ashore expects seconds")?)
             }
             "--npc-swim" => {
                 o.npc_swim = Some(value()?.parse().context("--npc-swim expects metres")?)
@@ -3793,6 +3800,11 @@ fn screenshot(
         let (mut swimmer, mut swim_gave_up): (Option<u32>, bool) = (None, false);
         // `--knock-nearest`: the person picked (index into the people).
         let mut knocked: Option<usize> = None;
+        // `--swim-ashore`: how long she has swum.
+        let mut swum = 0.0f32;
+        // `--swim-ashore`: her first turn for the shore (heading, tick),
+        // logged each frame until she faces it.
+        let mut turn_to: Option<(f32, usize)> = None;
         let knock_tick = options
             .knock_nearest
             .map(|(s, how)| ((s * 60.0).round() as usize, how));
@@ -3992,6 +4004,33 @@ fn screenshot(
             {
                 eprintln!("--pickup: she has no pickup clip, or is busy");
             }
+            // `--swim-ashore`: after so long in the water, each second she
+            // turns for the nearest shore she can stand on.
+            if let (Some(after), Some(p)) = (options.swim_ashore, game.scene.player.as_mut()) {
+                swum = if p.swimming() { swum + tick } else { 0.0 };
+                if swum >= after
+                    && i % 60 == 0
+                    && let Some(w) = game.scene.world.as_ref()
+                {
+                    let at = p.character.position;
+                    match npc::shore(&w.physics, at, p.character.radius) {
+                        Some(s) => {
+                            let face = (s.x - at.x).atan2(s.z - at.z);
+                            if turn_to.is_none() {
+                                turn_to = Some((face, i));
+                            }
+                            p.yaw = face;
+                            eprintln!(
+                                "swim-ashore: {swum:.0} s in, turning to the shore at {s:.1}, {:.1} m off",
+                                (s - at).with_y(0.0).length()
+                            );
+                        }
+                        None => {
+                            eprintln!("swim-ashore: {swum:.0} s in, no shore found from {at:.1}")
+                        }
+                    }
+                }
+            }
             let mut intent = Intent {
                 jump,
                 hold_jump: jump,
@@ -4001,6 +4040,28 @@ fn screenshot(
             // Her gun's lens and scope as she aims (as play does).
             game.aim_lens(&mut intent, 0, tick);
             game.step(intent, tick);
+            // `--swim-ashore`: her heading each frame of that first turn,
+            // to time it (`swim-turn:` lines), until within a degree.
+            if let (Some((face, from)), Some(p)) = (turn_to, game.scene.player.as_ref())
+                && from != usize::MAX
+            {
+                let off = (p.facing - face + std::f32::consts::PI)
+                    .rem_euclid(std::f32::consts::TAU)
+                    - std::f32::consts::PI;
+                eprintln!(
+                    "swim-turn: {:.3} s heading {:.1} deg, {:.1} deg off the shore",
+                    (i - from) as f32 * tick,
+                    p.facing.to_degrees(),
+                    off.to_degrees()
+                );
+                if off.abs() < 1f32.to_radians() {
+                    eprintln!(
+                        "swim-turn: faced the shore in {:.3} s",
+                        (i - from) as f32 * tick
+                    );
+                    turn_to = Some((face, usize::MAX));
+                }
+            }
             // With `--walk-seconds`, where she is each second: how deep the
             // sea is over her feet, and whether she swims.
             if options.walk_seconds.is_some()
@@ -4008,12 +4069,19 @@ fn screenshot(
                 && let (Some(p), Some(w)) = (&game.scene.player, &game.scene.world)
             {
                 let at = p.character.position;
+                let body = p.model_matrix().w_axis.y;
                 eprintln!(
-                    "walk: {:.0} s at {at:.1}, sea {} over her feet, {}",
+                    "walk: {:.0} s at {at:.1}, sea {} over her feet, model origin {}, {}",
                     (i + 1) as f32 / 60.0,
                     w.physics
                         .water()
                         .map_or("none".to_owned(), |s| format!("{:.2} m", s - at.y)),
+                    w.physics
+                        .water_at(at.x, at.z)
+                        .map_or("-".to_owned(), |s| format!(
+                            "{:.2} m under the surface",
+                            s - body
+                        )),
                     if p.swimming() {
                         "swimming"
                     } else {
@@ -4049,7 +4117,7 @@ fn screenshot(
                     .current()
                     .map_or(0, |(c, _)| n.rig.clips[c].hash);
                 eprintln!(
-                    "npc-swim: {:.0} s {:08x} at {at:.2}, water {} over his feet, ground {} under the surface, {}, clip {clip:08x}, {:.1} m from her",
+                    "npc-swim: {:.0} s {:08x} at {at:.2}, water {} over his feet, ground {} under the surface, model origin {}, shore {:?}, {}, clip {clip:08x}, {:.1} m from her",
                     (i + 1) as f32 / 60.0,
                     n.spawn.unwrap_or(0),
                     water.map_or("none".to_owned(), |s| format!("{:.2} m", s - at.y)),
@@ -4057,6 +4125,11 @@ fn screenshot(
                         (Some(s), Some(g)) => format!("{:.2} m", s - g),
                         _ => "-".to_owned(),
                     },
+                    water.map_or("-".to_owned(), |s| format!(
+                        "{:.2} m under the surface",
+                        s - n.model_matrix().w_axis.y
+                    )),
+                    n.swim.and_then(|s| s.shore),
                     if n.swimming() {
                         "swimming"
                     } else {

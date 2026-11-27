@@ -2827,7 +2827,7 @@ impl Scene {
             motion.max_rotation
         );
         let swim_speeds = [swim[0], swim[1], swim[2]];
-        let swim_full = swim[2].max(swim[3]);
+        let swim_full = m2_engine::on_foot::swim::swim_full(swim[2], swim[3]);
         // The weapons already loaded were held by the last body's
         // skeleton.
         if let Some((_, rig)) = &mut model {
@@ -3401,7 +3401,7 @@ impl Scene {
                 let swim = db
                     .filter(|_| named)
                     .and_then(|db| db.swim_speeds(&p.role))
-                    .map(|s| s[1]);
+                    .map(|s| (s[1], m2_engine::on_foot::swim::swim_full(s[2], s[3])));
                 match template {
                     Some(rig) => {
                         eprintln!(

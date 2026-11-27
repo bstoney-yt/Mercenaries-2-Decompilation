@@ -21,9 +21,9 @@ available, (6) Correction, (7) Verification and (8) Risk.
 | Id | Gap | Class | Pri | PC check |
 |---|---|---|---|---|
 | [A1](#a1) | One fixed crossfade for every animation change | Animation/movement | P1 | Data, Ghidra, footage |
-| [A2](#a2) | Clip playback rate vs. ground speed uses an invented clamp; tables' time-scale limits unread | Animation/movement | P1 | Data, Ghidra |
-| [M1](#m1) | On-foot movement starts and stops instantly, with full air control | Animation/movement | P1 | Ghidra, footage |
-| [M2](#m2) | Walk, run and sprint speeds fitted to clip bands, not taken from the hero templates | Behavioral | P1 | Data, Ghidra |
+| [A2](#a2) | Clip playback rate vs. ground speed: closed, from the 360 (no clamp; table rate standing) | Animation/movement | Closed | - |
+| [M1](#m1) | On-foot starts, stops and air control: closed, from the 360 | Animation/movement | Closed | - |
+| [M2](#m2) | Walk, run and sprint speeds: closed, the templates' paces as the 360 picks them | Behavioral | Closed | - |
 | [P1](#p1) | Vehicle handling: Rapier ray-cast vehicle with invented response shapes over the templates' fields | Behavioral | P1 | Ghidra, footage |
 | [P2](#p2) | Explosion push on vehicles and people is a fixed invented velocity; `MaxForce` read but unused | Behavioral | P1 | Ghidra |
 | [U1](#u1) | Flash renderer: gradients drawn in their first color, no filters, only multiply blend | Visual | P1 | Data census, footage |
@@ -47,7 +47,7 @@ available, (6) Correction, (7) Verification and (8) Risk.
 | [P9](#p9) | A vehicle's first-step settle: the dock trailers ease back less than the 360's after their kick; an empty car's brakes not traced | Behavioral | P3 | Ghidra, Xenia |
 | [I1](#i1) | Layer `Anchor` component not ported: anchor distances and threat-release bits unread | Behavioral | P2 | Ghidra, data |
 | [U6](#u6) | Flash text: one color per field, no kerning, HTML reduced to `<font color>` | Visual | P3 | Data census |
-| [M4](#m4) | Swimming depths, float height, speed and stroke rate invented | Animation/movement | P3 | Footage, Ghidra |
+| [M4](#m4) | Swimming: entry, exit, velocity, float and turn from the 360; model sink, stroke rate and the people's shore pick invented | Animation/movement | P3 | Footage, Ghidra |
 
 Animation gaps A1 to A4 share one root cause. The game's animation tables
 hold transition, time-scale and layering data that our runtime does not
@@ -101,6 +101,8 @@ read yet. Investigate them together (roadmap stage F1).
    heroes and the soldier rigs before merging.
 
 ### A2
+
+**Closed 2026-11-27.** On `main` a moving gait plays at `moved / clip speed` with no clamp, and a standing clip plays at its on-foot table rate, both from the 360 code (`scene.rs` `gait_rate`: 0x82808468, 0x82809468, 0x8280F650, 0x82809D60). The record below is the 2026-10-26 audit, kept for its history. Still open: the entity number the table rates take (0, invented).
 
 **Playback rate vs. ground speed** · Animation/movement · P1
 
@@ -316,6 +318,8 @@ P2
 
 ### M1
 
+**Closed 2026-11-27.** On `main` the start build-up (0.06 s, 0x82179588), the turn build-up (0x8217BB60), the slide to a stop (0.25 s, crouched 0.666 s, crouched from a sprint 1.3 s, 0x8217CD20) and the in-air steering capped at `MaxAirSpeed` are from the 360 code (`m2-engine/src/on_foot.rs`). The record below is the 2026-10-26 audit, kept for its history.
+
 **Instant starts and stops, full air control** · Animation/movement · P1
 
 1. **Original:** *Unknown.* Footage would show whether the heroes ease
@@ -351,6 +355,8 @@ P2
    contract set after the change.
 
 ### M2
+
+**Closed 2026-11-27.** On `main` the paces are each template's `_HumanPhysics` walk, jog, run and sprint, picked at their midpoints as the 360 picks them (0x82179350, 0x8217D608; `on_foot::pace`). The record below is the 2026-10-26 audit, kept for its history.
 
 **Gait speeds** · Behavioral discrepancy · P1
 
@@ -404,6 +410,8 @@ P2
    camera's wall clearance afterwards.
 
 ### M4
+
+**Partly closed 2026-11-27.** From the 360 code, for the player and the people alike (`on_foot::swim`): out of their depth with the water half the standing capsule over the feet (0x82171330); standing once the ground holds the swim shape more than the capsule radius over the water (0x821715F8); each step's velocity half way to the stick times the full swimming speed, and half way to the gap to the surface (0x82171634..0x821716FC); the full speed is the larger of `SwimRunSpeed` and `SwimSprintSpeed` (0x82177830); and the turn in the water is the ground's, `MaxRotationSpeed` (0x8217BB60). Still invented: the model's sink under the surface (`SWIM_FLOAT`, 0.35 m), the stroke's rate while still and its rate to the speed (`swim_clip`), which point the people make for and their `SwimJogSpeed` pace there, and where a person put out of a boat starts. The record below is the 2026-10-26 audit.
 
 **Swimming** · Animation/movement · P3
 
@@ -943,4 +951,4 @@ Layer `Anchor` component (table 0x83653630, read by 0x823ED9D8 and applied by 0x
 
 ## Closed
 
-None yet.
+A2, M1 and M2 (2026-11-27): see their records, which keep the first audit below a closing note.
