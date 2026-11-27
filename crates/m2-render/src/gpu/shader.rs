@@ -761,7 +761,9 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
     if ao {
         base.a = base.a * v.color.a;
     }
-    if base.a < material.params.x {
+    // The 360's alpha test passes alpha above its reference only (func
+    // GREATER); a cutoff of 0 tests nothing.
+    if material.params.x > 0.0 && base.a <= material.params.x {
         discard;
     }
     var rgb = base.rgb;
@@ -1066,7 +1068,7 @@ fn fs_shadow(v: Varyings) {
     if material.params.z > 0.5 && material.maps.w < 0.5 {
         a = a * v.color.a;
     }
-    if a < material.params.x {
+    if material.params.x > 0.0 && a <= material.params.x {
         discard;
     }
 }

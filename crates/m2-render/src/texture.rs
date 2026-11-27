@@ -108,8 +108,8 @@ pub enum BlendMode {
     /// Writes colour and depth.
     #[default]
     Opaque,
-    /// Opaque, but pixels whose alpha is below `cutoff` are discarded
-    /// (foliage, fences).
+    /// Opaque, but pixels whose alpha is not above `cutoff` are discarded
+    /// (foliage, fences), as the 360's alpha test (func GREATER) does.
     Masked { cutoff: f32 },
     /// Alpha blended over the scene, depth-tested but not depth-written.
     /// Draw these back to front (the [`DrawQueue`](crate::DrawQueue) does).
