@@ -3045,8 +3045,7 @@ fn driven_rpm(
 /// `prev` = cur (0x8219F798). So the first step a wheel is run, if its
 /// ground stands closer than Cmp, the damping reads a fast squeeze and
 /// kicks it up by c x (Cmp - cur) per wheel: the Fuel and Box Trailers'
-/// hop in Xenia trailers3/4 (v_y +2.20 and +2.23), none for the Austin cab
-/// (its ground is at Cmp) or the Phoenix.
+/// hop in Xenia trailers3/4 (v_y +2.20 and +2.23), none for the Phoenix.
 ///
 /// A wheel finds ground only once its contact count (the wheel's +0x34)
 /// is above 0 (0x8219F62C); else the step pushes nothing and sets `prev`
@@ -12829,9 +12828,13 @@ mod tests {
     // 4.5, 2.0, 0.70, 0.30 at -0.016; rear 15, 3.0, 0.55, 0.30 at 0.156)
     // about 5.1, Xenia trailers3/4 0xF030B +5.11; the Box Trailer's (front
     // 4.5, 1.7, 0.70, 0.30 at -0.125; rear 15, 3.0, 0.60, 0.30 at 0.172)
-    // about 5.2, Xenia trailers3 +5.29. (Not the Austin cab: at the port's
-    // squeeze, 0.205 on all six, this gives it +2.3, where Xenia's cabs land
-    // from a fall without a kick; open, see #769.)
+    // about 5.2, Xenia trailers3 +5.29; the Austin (OC) cab's (15, 2.0,
+    // 0.315, 0.115 at 0.105 on all six, its authored pose on the dock's
+    // PHY2 cells; gravity factor 2.0) about 2.4, Xenia trailers3 0xF0305
+    // -0.15 then +2.409, its peak 0.17 m up about 0.15 s after it was added
+    // and back at its authored height by 0.45 s (engine-only: +2.396,
+    // 0.177 m, 0.150 s, 0.45 s). Xenia trailers2's cabs, first seen falling
+    // (-0.40 and -0.34), were read after their kick.
     #[test]
     fn a_vehicles_springs_kick_on_its_first_step_with_ground() {
         let pair = |w: (f32, f32, f32, f32, f32)| [w, w];
@@ -12853,6 +12856,9 @@ mod tests {
             .collect();
         let v = first_kick(&boxed, 2.0);
         assert!((v - 5.29).abs() < 0.2, "box trailer {v}");
+        let cab = vec![(15.0, 2.0, 0.315, 0.115, 0.105); 6];
+        let v = first_kick(&cab, 2.0);
+        assert!((v - 2.409).abs() < 0.1, "austin cab {v}");
     }
 
     // A vehicle is stepped from add (Xenia parkedcar1): its first steps
