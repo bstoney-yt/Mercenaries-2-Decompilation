@@ -7725,6 +7725,7 @@ mod tests {
             .exec()
             .unwrap();
         assert_eq!(events.exits_watched(&*world.borrow()), vec![70]);
+        assert_eq!(events.entries_watched(&*world.borrow()), vec![71]);
     }
 
     #[test]
