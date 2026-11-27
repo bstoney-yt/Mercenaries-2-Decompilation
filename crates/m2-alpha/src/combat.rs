@@ -4370,26 +4370,18 @@ impl Combat {
         });
     }
 
-    /// A soldier's grenade lobbed from over his head down onto `at` (as
-    /// hard as she throws), or as far as it goes that way.
+    /// A soldier's grenade thrown at `at` as the 360 throws one
+    /// ([`soldier_lob`]), or as far as it goes that way.
     fn npc_throw(&mut self, f: &mut Field<'_>, i: usize, at: Vec3) {
-        let n = &f.people.npcs[i];
-        let from = n.character.position + Vec3::Y * 1.8;
-        eprintln!("grenade: a soldier throws from {from:.1} at {at:.1}");
+        let feet = f.people.npcs[i].character.position;
+        // The aim's spread: a way across and how far out (two draws of the
+        // engine's generator, stream 1, 0x8215E110 and 0x8215E260).
+        let turn = self.knock_rng.unit() * std::f32::consts::TAU;
+        let r = self.knock_rng.unit();
+        let spread = Vec3::new(turn.sin(), 0.0, turn.cos()) * (r * THROW_SPREAD);
         let gravity = m2_engine::physics::GRAVITY;
-        // The low lob, else the high one where the low one would meet
-        // something on the way (the cover he throws from: playtest
-        // 2026-11-14's grenades went off at the throwers' feet, behind
-        // their cover, unseen), else the low one anyway.
-        let clear = |v: Vec3| arc_clear(f.physics, from, v, at, gravity);
-        let velocity = match lob_velocities(from, at, THROW, gravity) {
-            Some((low, high)) if !clear(low) && clear(high) => {
-                eprintln!("grenade: the low lob is blocked: thrown high");
-                high
-            }
-            Some((low, _)) => low,
-            None => farthest(at - from, THROW),
-        };
+        let (from, velocity) = soldier_lob(feet, at, spread, gravity);
+        eprintln!("grenade: a soldier throws from {from:.1} at {at:.1}");
         // The grenade template's blast (inferred: the same `Grenade` as
         // hers); without one read, the alpha's own blast.
         let blast = self
@@ -8052,30 +8044,51 @@ fn lob_velocities(from: Vec3, to: Vec3, speed: f32, gravity: f32) -> Option<(Vec
     ))
 }
 
-/// How near its mark, metres across, a lob may come down on something
-/// and still count as clear ([`arc_clear`]; invented).
-const ARC_NEAR: f32 = 3.0;
-
-/// Whether a round thrown from `from` at `velocity` under `gravity`
-/// flies on to within [`ARC_NEAR`] of `to` (across) before it meets
-/// anything solid, stepped a thirtieth of a second at a time for at most
-/// 4 s.
-fn arc_clear(physics: &Physics, from: Vec3, velocity: Vec3, to: Vec3, gravity: f32) -> bool {
-    const STEP: f32 = 1.0 / 30.0;
-    let (mut at, mut v) = (from, velocity);
-    for _ in 0..120 {
-        if (at - to).with_y(0.0).length() <= ARC_NEAR {
-            return true;
+/// A soldier's throw, as the 360's grenade gate solves it (0x822C6B78,
+/// its arcs from 0x822CB3D0): from his eye, [`THROW_EYE`] over his feet,
+/// at `15 + (d - 10) / 30 x 5` m/s for the target `d` metres off; aimed
+/// [`THROW_SHORT`] short of the target along the line to it unless the
+/// target is more than [`THROW_CLIMB`] above his eye, then moved by
+/// `spread` (up to [`THROW_SPREAD`] across). The low arc, unless the
+/// target is that far up and the high arc's flight is within
+/// [`THROW_HIGH_TIME`]. Nothing checks the way is clear: the 360's solve
+/// is the arc alone. Returns where it leaves his hand and its velocity.
+fn soldier_lob(feet: Vec3, target: Vec3, spread: Vec3, gravity: f32) -> (Vec3, Vec3) {
+    let eye = feet + Vec3::Y * THROW_EYE;
+    let to = target - eye;
+    let d = to.length();
+    let speed = (d - 10.0) * (1.0 / 30.0) * 5.0 + 15.0;
+    let climbs = to.y > THROW_CLIMB;
+    let aim = if climbs {
+        target
+    } else {
+        eye + to.normalize_or_zero() * (d - THROW_SHORT)
+    } + spread;
+    let velocity = match lob_velocities(eye, aim, speed, gravity) {
+        Some((low, high)) => {
+            let flat = (aim - eye).with_y(0.0).length();
+            let time = flat / high.with_y(0.0).length().max(1e-3);
+            if climbs && time <= THROW_HIGH_TIME {
+                high
+            } else {
+                low
+            }
         }
-        v.y -= gravity * STEP;
-        let step = v * STEP;
-        if physics.cast_ray(at, step, step.length()).is_some() {
-            return (at - to).with_y(0.0).length() <= ARC_NEAR;
-        }
-        at += step;
-    }
-    false
+        None => farthest(aim - eye, speed),
+    };
+    (eye, velocity)
 }
+
+/// The soldier's throw's numbers (0x822C6B78): his eye over his feet
+/// (0x820D2F68), how short of the target he aims (0x820C77A4), the climb
+/// past which he aims at it and may throw high (0x820B7B6C), the spread
+/// of the aim (0x820C77A4) and the high arc's longest flight, seconds
+/// (0x820C7A20).
+const THROW_EYE: f32 = 1.34;
+const THROW_SHORT: f32 = 2.0;
+const THROW_CLIMB: f32 = 4.0;
+const THROW_SPREAD: f32 = 2.0;
+const THROW_HIGH_TIME: f32 = 3.0;
 
 /// Whether her knockdowns take a player's time down
 /// ([`m2_engine::melee::PLAYER_KNOCKDOWN_SECONDS`], 0.5 s spread a fifth
@@ -9534,30 +9547,35 @@ mod tests {
     }
 
     #[test]
-    fn a_soldier_lobs_high_over_the_wall_in_front_of_him() {
+    fn a_soldier_throws_as_the_360_solves_it() {
         let gravity = m2_engine::physics::GRAVITY;
-        let mut physics = ground();
-        let (from, to) = (Vec3::new(0.0, 1.8, 0.0), Vec3::new(0.0, 0.0, 14.0));
-        let (low, high) = lob_velocities(from, to, THROW, gravity).unwrap();
-        assert!(high.y > low.y);
-        // Both land on the mark.
-        for v in [low, high] {
-            let t = (to.z - from.z) / v.z;
-            let y = from.y + v.y * t - 0.5 * gravity * t * t;
-            assert!(y.abs() < 1e-2, "{v:?} lands at {y}");
-        }
-        assert!(arc_clear(&physics, from, low, to, gravity));
-        // A wall 2.5 m high 1.5 m ahead of him: the low lob meets it,
-        // the high one clears it.
-        physics.add_static(
-            StaticKey::Object(9),
-            &m2_engine::CollisionShape::cuboid(Vec3::new(3.0, 1.25, 0.2)),
-            Vec3::new(0.0, 1.25, 1.5),
-            m2_math::glam::Quat::IDENTITY,
-        );
-        physics.step(1.0 / 60.0);
-        assert!(!arc_clear(&physics, from, low, to, gravity));
-        assert!(arc_clear(&physics, from, high, to, gravity));
+        let feet = Vec3::ZERO;
+        let land = |from: Vec3, v: Vec3, y: f32| {
+            // Where it comes down to height `y`.
+            let a = -0.5 * gravity;
+            let t = (-v.y - (v.y * v.y - 4.0 * a * (from.y - y)).sqrt()) / (2.0 * a);
+            from + v * t + Vec3::Y * (a * t * t)
+        };
+        // 22 m off on the flat: from his eye at 15 + 12/30 x 5 = 17 m/s,
+        // the low arc, 2 m short of her.
+        let her = Vec3::new(0.0, 0.0, 22.0);
+        let (from, v) = soldier_lob(feet, her, Vec3::ZERO, gravity);
+        assert_eq!(from, Vec3::Y * THROW_EYE);
+        // (The distance is from his eye: 22.04 m.)
+        assert!((v.length() - 17.0).abs() < 0.02, "{v:?}");
+        let to = her - from;
+        let aim = from + to.normalize() * (to.length() - THROW_SHORT);
+        assert!((land(from, v, aim.y) - aim).length() < 0.05);
+        let (_, high) = lob_velocities(from, aim, v.length(), gravity).unwrap();
+        assert!(v.y < high.y, "low arc on the flat");
+        // The spread moves the mark.
+        let (_, spread) = soldier_lob(feet, her, Vec3::X * 1.5, gravity);
+        assert!((land(from, spread, aim.y) - (aim + Vec3::X * 1.5)).length() < 0.05);
+        // 6 m up on a roof 12 m off: at her, and high if its flight is
+        // short enough.
+        let roof = Vec3::new(0.0, 7.5, 12.0);
+        let (_, up) = soldier_lob(feet, roof, Vec3::ZERO, gravity);
+        assert!((land(from, up, roof.y) - roof).length() < 0.05);
     }
 
     #[test]
