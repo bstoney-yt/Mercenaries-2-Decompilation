@@ -29,7 +29,7 @@ fn cone_after(feel: &Feel, gap: f32, n: usize) -> f32 {
     let mut bloom = Bloom::default();
     for _ in 1..n {
         bloom.shot(feel);
-        bloom.settle(feel, gap);
+        bloom.settle(feel, gap, gap, true, false);
     }
     feel.cone(bloom.added)
 }

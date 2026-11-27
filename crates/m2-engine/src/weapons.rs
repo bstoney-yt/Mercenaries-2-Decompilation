@@ -149,18 +149,57 @@ impl Feel {
         self.scatter[6]
     }
 
-    /// The cone its next round leaves in, degrees across, when its shots
-    /// so far have added `bloom` ([`Bloom::added`]): `ScatterMin` plus that,
-    /// no more than `ScatterMax`.
+    /// `CenterBias` (`WeaponScatter`'s second field): how the rounds draw
+    /// in on the aim ([`stray_360`]).
+    pub fn center_bias(&self) -> f32 {
+        self.scatter[1]
+    }
+
+    /// `ScatterAimModeMin` and `ScatterAimModeMax`: the cone's bounds
+    /// while she aims (the carbine's 1 to 1.5 beside 1 to 2).
+    pub fn aim_min(&self) -> f32 {
+        self.scatter[2]
+    }
+
+    pub fn aim_max(&self) -> f32 {
+        self.scatter[3]
+    }
+
+    /// The cone its next round leaves in, degrees, when its shots so far
+    /// have taken it `bloom` past `ScatterMin` ([`Bloom::added`]). From the
+    /// 360 code: the gun keeps the cone itself (its record's +0x48), set to
+    /// `ScatterMin` as it is built (0x823F8D90) and held in its bounds each
+    /// frame ([`Bloom::settle`]).
     pub fn cone(&self, bloom: f32) -> f32 {
-        let (lo, hi) = (self.scatter_min(), self.scatter_max());
-        (lo + bloom.max(0.0)).min(hi.max(lo))
+        self.scatter_min() + bloom
     }
 }
 
+/// The way a round of her gun goes for an aim along unit `aim` out of its
+/// cone `cone` degrees ([`Feel::cone`]) and `CenterBias` `bias`, given two
+/// uniform picks `a` and `b` in [-0.5, 0.5). From the 360 code (0x822838B0,
+/// each round): it tilts off the aim by `pow(u, bias + 1)` of the cone,
+/// the whole cone (degrees, not half of it), `u` the first pick in 0..1,
+/// and turns about the aim by the second times a full turn. A bias of 0
+/// spreads its rounds evenly over the angle out (more near the aim than
+/// over the area); the default 1 draws them in harder.
+pub fn stray_360(aim: Vec3, cone: f32, bias: f32, a: f32, b: f32) -> Vec3 {
+    let u = (a + 0.5).clamp(0.0, 1.0);
+    let tilt = u.powf(bias + 1.0) * cone.max(0.0).to_radians();
+    if tilt <= 0.0 {
+        return aim;
+    }
+    let side = aim.cross(Vec3::Y).normalize_or(Vec3::X);
+    let up = side.cross(aim).normalize_or(Vec3::Y);
+    let turn = (b + 0.5) * std::f32::consts::TAU;
+    let off = (side * turn.cos() + up * turn.sin()) * tilt.sin();
+    (aim * tilt.cos() + off).normalize_or(aim)
+}
+
 /// The way a round goes for an aim along unit `aim` out of a cone `cone`
-/// degrees across ([`Feel::cone`]), given two uniform picks `a` and `b`
-/// in [-0.5, 0.5): anywhere in the round cone, evenly over its area.
+/// degrees across, given two uniform picks `a` and `b` in [-0.5, 0.5):
+/// anywhere in the round cone, evenly over its area. For the guns not
+/// hers (soldiers', vehicles'); hers stray as the 360's do ([`stray_360`]).
 ///
 /// Provenance: that the cone is round and its rounds spread evenly over
 /// it is invented (the 360 code that strays a round was not read). Before
@@ -181,46 +220,52 @@ pub fn stray_in_cone(aim: Vec3, cone: f32, a: f32, b: f32) -> Vec3 {
     (aim + side * (r * turn.cos()) + up * (r * turn.sin())).normalize_or(aim)
 }
 
-/// What a gun's shots have added to its cone ([`Feel::cone`]): each
-/// shot `ScatterPerShot`, up to `ScatterMax`. Once the gun has gone
-/// [`Bloom::REST`] seconds without firing, the cone settles back to
-/// `ScatterMin`, in [`Bloom::SETTLE`] seconds from the most.
+/// What a gun's shots have taken its cone past `ScatterMin` ([`Feel::cone`]).
 ///
-/// Provenance: the three fields and their names are the template's (from
-/// samples); that they add up so is inferred from the names; when and how
-/// fast the cone settles is invented (the game's own rule is not decoded:
-/// the first field, once taken for a rate, is `LowSkillScatter`; none of
-/// the 31 components on the guns' templates names a settle rate among
-/// the fields named so far, gap round 13).
+/// From the 360 code: each round adds `ScatterPerShot` as it goes
+/// (0x822838B0, so a shotgun's ten add ten); every frame (0x8227F7A8) the
+/// cone falls by `ScatterPerShot` over the gun's gap between rounds
+/// (`60 / RateOfFire`, its record's +0x3C) times [`Bloom::SETTLE_HELD`]
+/// a second with the trigger held, else [`Bloom::SETTLE_FREE`], and is
+/// held between `ScatterMin` and `ScatterMax`, or `ScatterAimModeMin`
+/// and `ScatterAimModeMax` while she aims. There is no rest before it
+/// settles.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Bloom {
-    /// Degrees added to `ScatterMin`.
+    /// Degrees past `ScatterMin` (below it while aiming narrows it).
     pub added: f32,
-    /// Seconds since the last shot.
-    idle: f32,
 }
 
 impl Bloom {
-    /// Seconds without a shot before the cone settles (invented).
-    pub const REST: f32 = 0.25;
-    /// Seconds from `ScatterMax` back to `ScatterMin` (invented).
-    pub const SETTLE: f32 = 1.0;
+    /// The settle's multiplier with the trigger held and without
+    /// (0x8227F7A8: 0x820D9EDC and 0x820C77A4).
+    pub const SETTLE_HELD: f32 = 0.5;
+    pub const SETTLE_FREE: f32 = 2.0;
 
-    /// After a shot of a gun that feels as `feel`.
+    /// After a round of a gun that feels as `feel`.
     pub fn shot(&mut self, feel: &Feel) {
-        let room = (feel.scatter_max() - feel.scatter_min()).max(0.0);
-        self.added = (self.added + feel.scatter_per_shot().max(0.0)).min(room);
-        self.idle = 0.0;
+        self.added += feel.scatter_per_shot().max(0.0);
     }
 
-    /// After `dt` seconds.
-    pub fn settle(&mut self, feel: &Feel, dt: f32) {
-        self.idle += dt;
-        if self.idle < Self::REST {
-            return;
+    /// After `dt` seconds of a gun `gap` seconds between rounds, its
+    /// trigger `held` or not, her `aiming` or not.
+    pub fn settle(&mut self, feel: &Feel, dt: f32, gap: f32, held: bool, aiming: bool) {
+        let mut cone = feel.cone(self.added);
+        if gap > 1e-4 {
+            let rate = if held {
+                Self::SETTLE_HELD
+            } else {
+                Self::SETTLE_FREE
+            };
+            cone -= feel.scatter_per_shot() / gap * rate * dt;
         }
-        let room = (feel.scatter_max() - feel.scatter_min()).max(0.0);
-        self.added = (self.added - room * dt / Self::SETTLE).max(0.0);
+        let (lo, hi) = if aiming {
+            (feel.aim_min(), feel.aim_max())
+        } else {
+            (feel.scatter_min(), feel.scatter_max())
+        };
+        let cone = cone.min(hi).max(lo);
+        self.added = cone - feel.scatter_min();
     }
 }
 
@@ -1875,22 +1920,30 @@ mod tests {
         };
         let mut bloom = Bloom::default();
         assert_eq!(carbine.cone(bloom.added), 1.0);
-        // Held at 562 a minute: it grows, settling not while it fires.
+        // Held at 562 a minute (0.107 s a round): each round adds 0.2, the
+        // held settle takes 0.2 / 0.107 x 0.5 a second back: 0.1 a round.
+        let gap = 60.0 / 562.0;
         for _ in 0..3 {
             bloom.shot(&carbine);
-            bloom.settle(&carbine, 60.0 / 562.0);
+            bloom.settle(&carbine, gap, gap, true, false);
         }
-        assert!((carbine.cone(bloom.added) - 1.6).abs() < 1e-5);
-        for _ in 0..10 {
+        assert!((carbine.cone(bloom.added) - 1.3).abs() < 1e-4);
+        for _ in 0..30 {
+            bloom.shot(&carbine);
+            bloom.settle(&carbine, gap, gap, true, false);
+        }
+        assert!((carbine.cone(bloom.added) - 2.0).abs() < 1e-4);
+        // Let go: it falls at 0.2 / 0.107 x 2 = 3.75 a second, at once.
+        bloom.settle(&carbine, 0.1, gap, false, false);
+        assert!((carbine.cone(bloom.added) - 1.625).abs() < 1e-3);
+        bloom.settle(&carbine, 1.0, gap, false, false);
+        assert_eq!(carbine.cone(bloom.added), 1.0);
+        // Aiming, its cone is held within the aim mode's 1 to 1.5.
+        for _ in 0..30 {
             bloom.shot(&carbine);
         }
-        assert_eq!(carbine.cone(bloom.added), 2.0);
-        // Let go: after a rest it settles, from the most in a second.
-        bloom.settle(&carbine, Bloom::REST);
-        bloom.settle(&carbine, 0.25);
+        bloom.settle(&carbine, 0.0, gap, true, true);
         assert!((carbine.cone(bloom.added) - 1.5).abs() < 1e-5);
-        bloom.settle(&carbine, Bloom::SETTLE);
-        assert_eq!(carbine.cone(bloom.added), 1.0);
         // The sniper rifle: dead on first, 1 more a shot, at most 3.
         let sniper = Feel {
             scatter: [0.1, 0.0, 0.0, 2.0, 0.0, 3.0, 1.0],
@@ -1900,6 +1953,27 @@ mod tests {
         assert_eq!(sniper.cone(bloom.added), 0.0);
         bloom.shot(&sniper);
         assert_eq!(sniper.cone(bloom.added), 1.0);
+    }
+
+    // Her rounds tilt off the aim by pow(u, CenterBias + 1) of the whole
+    // cone (0x822838B0).
+    #[test]
+    fn her_rounds_stray_as_the_360_draws_them_in() {
+        let aim = Vec3::Z;
+        let off = |bias: f32, a: f32| {
+            stray_360(aim, 2.0, bias, a, 0.1)
+                .angle_between(aim)
+                .to_degrees()
+        };
+        // The rim: the whole cone, 2 degrees, not half of it.
+        assert!((off(0.0, 0.4999) - 2.0).abs() < 1e-2);
+        // Halfway: 1 degree with no bias, 0.5 with the default 1.
+        assert!((off(0.0, 0.0) - 1.0).abs() < 1e-3);
+        assert!((off(1.0, 0.0) - 0.5).abs() < 1e-3);
+        assert_eq!(stray_360(aim, 0.0, 1.0, 0.3, 0.2), aim);
+        assert_eq!(SCATTER_FIELDS[1], name_hash("CenterBias"));
+        assert_eq!(SCATTER_FIELDS[2], name_hash("ScatterAimModeMin"));
+        assert_eq!(SCATTER_FIELDS[3], name_hash("ScatterAimModeMax"));
     }
 
     // The gun banks' names hash to the banks the templates' `SoundEffect`

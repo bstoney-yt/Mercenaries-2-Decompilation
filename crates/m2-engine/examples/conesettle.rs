@@ -24,7 +24,7 @@ fn burst(feel: &Feel, gap: f32, n: usize) -> Bloom {
     let mut bloom = Bloom::default();
     for i in 0..n {
         if i > 0 {
-            bloom.settle(feel, gap);
+            bloom.settle(feel, gap, gap, true, false);
         }
         bloom.shot(feel);
     }
@@ -70,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut back = None;
         let mut t = 0.0;
         while t < 10.0 {
-            bloom.settle(f, step);
+            bloom.settle(f, step, gap, false, false);
             t += step;
             for mark in [0.25, 0.5, 1.0, 2.0] {
                 if (t - mark).abs() < step / 2.0 {

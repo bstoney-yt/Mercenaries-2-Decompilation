@@ -3655,7 +3655,8 @@ impl Combat {
         self.bomb_reload -= dt;
         self.aim_left -= dt;
         let feel = self.rifle.feel;
-        self.bloom.settle(&feel, dt);
+        self.bloom
+            .settle(&feel, dt, self.rifle.gap, trigger.fire, f.player.aiming);
         self.quiet += dt;
         self.motion_blur = self.survival_blur(dt);
 
@@ -4153,14 +4154,16 @@ impl Combat {
         // onto him (playtest 8: at range the cone alone left soldiers
         // nearly impossible to hit; the rifles' windows are widest far).
         let assist = self.rifle.assist;
-        let cone = self.rifle.feel.cone(self.bloom.added);
         let feel = self.rifle.feel;
-        self.bloom.shot(&feel);
         let mut killed = false;
         let mut first = None;
         for _ in 0..self.rifle.pellets.max(1) {
+            // Each round out of the cone as it stands, which it then
+            // widens (0x822838B0).
+            let cone = feel.cone(self.bloom.added);
+            self.bloom.shot(&feel);
             let (a, b) = (self.random(), self.random());
-            let dir = m2_engine::weapons::stray_in_cone(aim, cone, a, b);
+            let dir = m2_engine::weapons::stray_360(aim, cone, feel.center_bias(), a, b);
             let dir = assist.map_or(dir, |s| assisted_aim(&s, f.people, eye, dir, RIFLE_RANGE));
             let hit = cast_shot(f.physics, f.people, eye, dir, RIFLE_RANGE, None, None);
             let to = hit.map_or(eye + dir * RIFLE_RANGE, |h| eye + dir * h.0);
