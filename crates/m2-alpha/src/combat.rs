@@ -10387,6 +10387,7 @@ mod tests {
                 damage_key: None,
                 hint: None,
                 pellets,
+                aim_ai: 15f32.to_radians(),
             };
             let mut combat = Combat::default();
             combat.npc_shoot_at_for_test(
@@ -10477,6 +10478,7 @@ mod tests {
             damage_key: None,
             hint: None,
             pellets: 1,
+            aim_ai: 15f32.to_radians(),
         };
         assert_eq!(combat.npc_round(Some(gun)), 3.0);
         assert_eq!(combat.npc_round(None), NPC_DAMAGE);
@@ -10546,6 +10548,7 @@ mod tests {
             damage_key: Some(m2_assets::name_hash("Bullet")),
             hint: None,
             pellets: 1,
+            aim_ai: 15f32.to_radians(),
         };
         let rifle = Rifle::of("Bullpup Rifle", &bullpup);
         assert_eq!((rifle.model, rifle.clip, rifle.spare), ("bullpup", 30, 210));
