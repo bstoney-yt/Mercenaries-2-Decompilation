@@ -81,9 +81,11 @@ fn insert_collider(
 
 /// Two touching colliders' friction as Havok gives it: the square root of
 /// the product of theirs (its material default, as the 360's bodies keep it;
-/// Rapier's own rules have no such mean). A terrain at the rigid-body
-/// default 0.5 (0x82621820 +0x9C) under a wreck's 0.3 grips at 0.39, not
-/// the 0.3 the least of the two gave.
+/// Rapier's own rules have no such mean; from the 360 code, 0x82621398 on
+/// each new contact point: the root of the two bodies' +0x84 frictions, and
+/// likewise their +0x88 restitutions). A terrain cell at its `PHY2` body's
+/// 1.0 under a wreck's 0.3 grips at 0.55, not the 0.3 the least of the two
+/// gave. Restitution needs no mixing here: every body has none.
 ///
 /// It also drops a ragdoll limb's contacts with the triangles of a fixed
 /// model's shapes on layers the ragdoll's layer does not meet

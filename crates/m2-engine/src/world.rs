@@ -2981,6 +2981,17 @@ impl TerrainMesh {
     /// surface of their own (their flags word is 10 on all 3,983,915 of the
     /// 400 cells'). INVENTED: the nearest-ground material. `None` without
     /// a mesh shape.
+    ///
+    /// It slides as its `PHY2`'s first body says ([`BodyMaterial::of`]:
+    /// friction from record +0x3C, 1.0 on the cells sampled, and no bounce).
+    /// From the 360 code: a cell is a `TerrainObject` (store 0x83655EA4,
+    /// named at 0x823C02C0), whose actor (0x82402200 makes a
+    /// `PhysicsActorTerrainMesh`, class 0x820C9178) builds its physics
+    /// (slot +0x120, 0x821948C0) from the model's `PHY2` through the part
+    /// walk (0x8216C570, 0x8216BC08) and the body builder (0x8216A290),
+    /// which sets that friction and restitution 0.
+    ///
+    /// [`BodyMaterial::of`]: crate::physics::BodyMaterial::of
     fn collision_of(&self, phy: &m2_assets::physics::Physics) -> Option<CollisionShape> {
         let mut vertices: Vec<Vec3> = Vec::new();
         let mut triangles: Vec<[u32; 3]> = Vec::new();
@@ -3005,7 +3016,9 @@ impl TerrainMesh {
             return None;
         }
         let surfaces = self.nearest_ground_surfaces(&vertices, &triangles);
-        CollisionShape::mesh_of(&vertices, &triangles, &surfaces)
+        let mut collision = CollisionShape::mesh_of(&vertices, &triangles, &surfaces)?;
+        collision.material = phy.bodies.first().map(crate::physics::BodyMaterial::of);
+        Some(collision)
     }
 
     /// For each of `triangles` (of `vertices`, in this mesh's space), the
@@ -3908,6 +3921,27 @@ mod tests {
             "{:?}",
             collision.surfaces
         );
+        // No body: no material of its own.
+        assert_eq!(collision.material, None);
+        // Its fixed body's friction (record +0x3C, 1.0 on the cells), no
+        // bounce: as the 360's body builder gives a TerrainObject's.
+        let body = m2_assets::physics::Body {
+            inertia: [0.0; 9],
+            centre_of_mass: [0.0; 3],
+            mass: 0.0,
+            unk: [0.0, 1.0, 0.0, 0.8],
+            unk_words: [0; 8],
+        };
+        let bodied = m2_assets::physics::Physics {
+            bodies: vec![body],
+            ..phy.clone()
+        };
+        let material = mesh
+            .collision_of(&bodied)
+            .and_then(|c| c.material)
+            .expect("a material");
+        assert_eq!(material.friction, 1.0);
+        assert_eq!(material.restitution, 0.0);
         let mut physics = crate::Physics::new();
         physics.add_static(
             crate::physics::StaticKey::Cell(1),
