@@ -44,6 +44,7 @@
 use std::collections::{HashMap, HashSet};
 
 use m2_engine::ai_anchor::{ANCHORING_SPAWNER, Anchor, SPAWNER_RADIUS};
+use m2_engine::ai_mover::{Mover, PROBE, Sense, Side, State as MoverState, side_point};
 use m2_engine::population::SpawnerSlot;
 use m2_engine::stagger::{Direction, Stagger};
 use m2_engine::tuning::HandGun;
@@ -216,10 +217,10 @@ const HELD_SIGHT: f32 = 1.5;
 /// From how high he sees (his head), and how often he looks, seconds.
 const EYE: f32 = 1.6;
 const LOOK_EVERY: f32 = 0.2;
-/// Seconds a soldier hunts without sight of her before calming down, and
-/// how close to where he last saw her he goes (inferred).
+/// Seconds a soldier hunts without sight of her before calming down
+/// (invented: the 360's combat mover has no such timer; round (d) of the
+/// mover port replaces it).
 const GIVE_UP: f32 = 20.0;
-const CLOSE_ENOUGH: f32 = 2.0;
 /// A person's re-path (0x822BF7A8 -> 0x822BF5E0 -> 0x822BF400): a new way
 /// is searched for when the goal moved more than `REPATH_K` x his squared
 /// flat distance to it plus `REPATH_ADD` (squared, x/z) from the goal the
@@ -240,11 +241,9 @@ const SEARCH_HEIGHT: f32 = 1.5;
 /// nodes a frame between them, within `PATH_TIME`.
 const PATH_STEPS: u32 = 8;
 const PATH_TIME: std::time::Duration = std::time::Duration::from_micros(1500);
-/// Between steps about in a fight: seconds (at least, plus up to), how
-/// far a step goes, metres, and how close he pushes in to her (inferred).
-const STEP_GAP: (f32, f32) = (2.0, 3.0);
-const STEP: (f32, f32) = (3.0, 6.0);
-const PUSH_TO: f32 = 15.0;
+/// How near the combat mover's destination counts as there, metres: the
+/// attack step's 0.1 squared (0x822B3130 -> 0x822CB340, 0x820BB468).
+const MOVER_THERE: f32 = 0.316;
 /// They fire in bursts as their gun's `WeaponHint` has it
 /// ([`FireHint`]): rounds at its `RateOfFire` for `BurstOnLength`, then
 /// `BurstOffLength`'s pause (the close pair within [`FireHint::CLOSE`]),
@@ -1298,10 +1297,10 @@ pub struct Npc {
     unseen: f32,
     /// Seconds to the next look about.
     look: f32,
-    /// A step about in a fight: where to and for how much longer; and the
-    /// seconds to the next.
+    /// In a fight, the 360's combat mover ([`m2_engine::ai_mover`]); and
+    /// a side-step under way: where to and for how much longer.
+    mover: Option<Mover>,
     step: Option<(Vec3, f32)>,
-    step_wait: f32,
     /// Set by a tick when a soldier throws a grenade, at where; the
     /// fight lobs it.
     pub throws: Option<Vec3>,
@@ -1770,8 +1769,8 @@ impl Npc {
             last_seen: None,
             unseen: 0.0,
             look: 0.0,
+            mover: None,
             step: None,
-            step_wait: 0.0,
             throws: None,
             outfit: Vec::new(),
             grenade_wait: 0.0,
@@ -3042,55 +3041,95 @@ impl Npc {
             None => false,
         };
         if hiding || covered {
+            self.mover = None;
             self.step = None;
-        } else if !seen || distance > self.fire_hint().range {
-            self.step = None;
-            // Where he last saw her, and she isn't there: on towards the
-            // fight, where she is (invented: he hears it). Along his way
-            // there ([`Npc::steer_to`]): the 360 has no way round of its
-            // own for a chase (the port's side-flipping detour is gone).
-            let dest = if (goal - at).with_y(0.0).length() <= CLOSE_ENOUGH {
-                threat
-            } else {
-                goal
-            };
-            if (dest - at).with_y(0.0).length() > CLOSE_ENOUGH {
-                wanted = self.steer_to(dest, self.push(self.ai.pursue_speed), dt);
-            }
         } else {
-            self.step_wait -= dt;
-            if self.step.is_none() && self.step_wait <= 0.0 {
-                self.step_wait = STEP_GAP.0 + rng.range(0.0, STEP_GAP.1);
-                let toward = to.with_y(0.0).normalize_or(Vec3::Z);
-                let side = Vec3::new(toward.z, 0.0, -toward.x) * rng.range(-1.0, 1.0).signum();
-                let push = distance > PUSH_TO && rng.range(0.0, 1.0) < self.ai.offensive;
-                let way = if push { toward } else { side };
-                let mut length = rng.range(STEP.0, STEP.1);
-                let mut target = at + way * length;
-                if smart.enabled && smart.flank {
-                    // His own side of her, by his spawn: five ways round
-                    // from where he stands, 0 and +-40, +-80 degrees.
-                    let lane = self.spawn.unwrap_or(0).wrapping_mul(2_654_435_761) % 5;
-                    let angle = (lane as f32 - 2.0) * 40f32.to_radians();
-                    let from_her = Quat::from_rotation_y(angle) * -toward;
-                    let post = threat.with_y(at.y) + from_her * smart.flank_distance;
-                    let flat = (post - at).with_y(0.0);
-                    if flat.length() > 1.0 {
-                        length = flat.length().min(STEP.1 * 1.5);
-                        target = at + flat.normalize() * length;
-                    }
+            // The 360's combat mover (`HumanCombat`'s move block,
+            // [`m2_engine::ai_mover`]): it decides to stand, crouch or lie
+            // and fight, side-steps now and then, and without a shot for
+            // 2 s walks to where he last knew her to be, at his
+            // `PursueSpeed`, inside his area only. The attack step moves
+            // him to its destination at its speed (0x822B3130).
+            let mover = self
+                .mover
+                .get_or_insert_with(|| Mover::start(at, self.ai.combat_speed));
+            let side_axis = to.with_y(0.0).normalize_or(Vec3::Z);
+            let probing = mover.probing();
+            let sides = probing.then(|| {
+                // Inferred: a ray from his chest for each of the 360's two
+                // swept probes (0x8215A770).
+                let from = self.chest();
+                [Side::Right, Side::Left].map(|side| {
+                    let way = side_point(at, side_axis, side) - at;
+                    physics
+                        .cast_ray(from, way.normalize_or_zero(), PROBE)
+                        .is_none()
+                })
+            });
+            let sense = Sense {
+                dt,
+                at,
+                target: Some(goal),
+                ground_distance: (goal - at).with_y(0.0).length(),
+                has_shot: seen && distance <= self.fire_hint().range,
+                out_of_area: self.anchor.is_some_and(|a| a.outside(goal)),
+                busy: self.striking > 0.0,
+                one_shot: self.step.is_some(),
+                // Not traced: the area's flags (+0xC bits 3, 4) and mind
+                // +0x70F bit 3 taken as clear.
+                may_crouch: true,
+                may_lie: true,
+                held: false,
+                combat_speed: self.ai.combat_speed,
+                pursue_speed: self.ai.pursue_speed,
+                sides,
+            };
+            let mut roll = || rng.range(0.0, 1.0);
+            let Some(mover) = self.mover.as_mut() else {
+                unreachable!("set above")
+            };
+            let out = mover.tick(&sense, &mut roll);
+            let (mut dest, speed) = (mover.dest, mover.speed);
+            let standing = matches!(mover.state(), MoverState::Stand | MoverState::Crouch);
+            if out.callout {
+                eprintln!(
+                    "people: {:08x} closes in ({:08x})",
+                    self.spawn.unwrap_or(u32::MAX),
+                    m2_engine::ai_mover::CALLOUT
+                );
+            }
+            if let Some(side) = out.side_step {
+                // Invented: the side-step action's clip is not wired, so he
+                // steps the probe's 2 m at his `CombatSpeed`.
+                let target = side_point(at, side_axis, side);
+                eprintln!(
+                    "people: {:08x} side-steps {side:?}",
+                    self.spawn.unwrap_or(u32::MAX)
+                );
+                let fast = self.push(self.ai.combat_speed).max(0.1);
+                self.step = Some((target, PROBE / fast + 0.5));
+            }
+            if smart.enabled && smart.flank && standing && seen && dest.distance(at) < 1e-3 {
+                // Smarter (the alpha's own): his own side of her, by his
+                // spawn: five ways round, 0 and +-40, +-80 degrees.
+                let lane = self.spawn.unwrap_or(0).wrapping_mul(2_654_435_761) % 5;
+                let angle = (lane as f32 - 2.0) * 40f32.to_radians();
+                let post = threat.with_y(at.y)
+                    + Quat::from_rotation_y(angle) * -side_axis * smart.flank_distance;
+                if (post - at).with_y(0.0).length() > 1.0 {
+                    dest = post;
                 }
-                self.step = Some((target, length / (self.push(self.ai.combat_speed))));
             }
             if let Some((target, left)) = &mut self.step {
                 *left -= dt;
                 let target = *target;
-                let flat = (target - at).with_y(0.0);
-                if *left <= 0.0 || flat.length() < 0.5 {
+                if *left <= 0.0 || (target - at).with_y(0.0).length() < 0.3 {
                     self.step = None;
                 } else {
                     wanted = self.steer_to(target, self.push(self.ai.combat_speed), dt);
                 }
+            } else if (dest - at).with_y(0.0).length() > MOVER_THERE {
+                wanted = self.steer_to(dest, self.push(speed), dt);
             }
         }
         // Within reach of her, with nothing between: the 360's
@@ -3156,7 +3195,7 @@ impl Npc {
             } else if covered {
                 "to cover"
             } else if self.step.is_some() {
-                "stepping"
+                "side-stepping"
             } else if seen && distance < reach {
                 "close in"
             } else {
@@ -3405,7 +3444,7 @@ impl Npc {
         } else if self.unseen > LOOK_EVERY * 1.5 {
             "chasing"
         } else if self.step.is_some() {
-            "stepping"
+            "side-stepping"
         } else {
             "shooting"
         })
@@ -3450,6 +3489,7 @@ impl Npc {
         self.alert = false;
         self.last_seen = None;
         self.unseen = 0.0;
+        self.mover = None;
         self.step = None;
         self.route = Route::default();
         self.cover = None;
@@ -8937,12 +8977,30 @@ pub(crate) mod tests {
             calm.update(&physics, &mut rng, Some(Vec3::new(0.0, 1.2, 10.0)), dt);
         }
         assert!(!calm.alert);
-        // Gone past his sight: he runs (at his PursueSpeed) to where he
+        // Gone past his sight: the combat mover holds him 2 s without a
+        // shot (0x822C53F8), then he runs (at his PursueSpeed) to where he
         // last saw her, and doesn't fire.
         let far = Some(Vec3::new(0.0, 1.2, 90.0));
         soldier.fires = false;
-        let start = soldier.character.position;
         let mut shots = 0;
+        let held = soldier.character.position;
+        for _ in 0..115 {
+            soldier.update(&physics, &mut rng, far, dt);
+            shots += usize::from(std::mem::take(&mut soldier.fires));
+        }
+        assert_eq!(
+            soldier.mover.map(|m| m.state()),
+            Some(MoverState::Stand),
+            "fighting standing"
+        );
+        assert!(
+            (soldier.character.position - held).with_y(0.0).length() < 0.2,
+            "held before closing in"
+        );
+        for _ in 0..10 {
+            soldier.update(&physics, &mut rng, far, dt);
+        }
+        let start = soldier.character.position;
         for _ in 0..60 {
             soldier.update(&physics, &mut rng, far, dt);
             shots += usize::from(std::mem::take(&mut soldier.fires));
