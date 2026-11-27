@@ -405,6 +405,9 @@ struct TerrainGpu {
     /// First index, index count, material, and whether it blends.
     ranges: Vec<(u32, u32, MaterialId, bool)>,
     origin: Vec3,
+    /// The materials it holds, one hold each, given back when it goes
+    /// ([`World::free_terrain`]).
+    held: Vec<MaterialId>,
 }
 
 #[derive(Debug)]
@@ -1210,8 +1213,7 @@ impl World {
         for h in far {
             self.physics.remove_static(StaticKey::Cell(h));
             if let Some(Slot::Ready(t)) = self.cells.remove(&h) {
-                backend.destroy_vertex_buffer(t.vertex_buffer)?;
-                backend.destroy_index_buffer(t.index_buffer)?;
+                self.free_terrain(backend, materials, t)?;
             }
         }
         let mut requests: Vec<(f32, Request)> = wanted
@@ -1236,7 +1238,7 @@ impl World {
             .collect();
         for h in far {
             if let Some(Slot::Ready(clumps)) = self.scatter.remove(&h) {
-                destroy_clumps(backend, clumps)?;
+                self.free_clumps(backend, materials, clumps)?;
             }
         }
         requests.extend(
@@ -1302,6 +1304,49 @@ impl World {
                 .values()
                 .filter(|t| matches!(t, Slot::Loading))
                 .count();
+        Ok(())
+    }
+
+    /// Frees a cell's or tile's ground: its buffers, and its holds on its
+    /// materials, so materials and textures nothing else holds go too (the
+    /// loader sends those textures again when next asked).
+    fn free_terrain(
+        &mut self,
+        backend: &mut dyn RenderBackend,
+        materials: &mut MaterialCache,
+        t: TerrainGpu,
+    ) -> Result<(), BackendError> {
+        backend.destroy_vertex_buffer(t.vertex_buffer)?;
+        backend.destroy_index_buffer(t.index_buffer)?;
+        self.give_back(backend, materials, t.held)
+    }
+
+    /// Frees a cell's scatter: its buffers, and its holds on its materials.
+    fn free_clumps(
+        &mut self,
+        backend: &mut dyn RenderBackend,
+        materials: &mut MaterialCache,
+        clumps: Vec<ClumpGpu>,
+    ) -> Result<(), BackendError> {
+        let held = clumps.iter().map(|c| c.material).collect();
+        destroy_clumps(backend, clumps)?;
+        self.give_back(backend, materials, held)
+    }
+
+    /// Gives back one hold on each of `held` ([`MaterialCache::release`]).
+    fn give_back(
+        &mut self,
+        backend: &mut dyn RenderBackend,
+        materials: &mut MaterialCache,
+        held: Vec<MaterialId>,
+    ) -> Result<(), BackendError> {
+        let mut freed = Vec::new();
+        for id in held {
+            freed.extend(materials.release(backend, id)?);
+        }
+        if !freed.is_empty() {
+            self.loader.forget_textures(&freed);
+        }
         Ok(())
     }
 
@@ -1424,6 +1469,7 @@ impl World {
                     | Request::Model(h)
                     | Request::Scatter(h)) = request;
                     // A cell dropped while loading is not wanted any more.
+                    let mut unwanted = None;
                     match (table.get(&h), slot) {
                         (Some(Slot::Loading), slot) => {
                             if let (Request::Cell(_), Slot::Ready(_), Some((shape, origin))) =
@@ -1438,11 +1484,11 @@ impl World {
                             }
                             table.insert(h, slot);
                         }
-                        (_, Slot::Ready(t)) => {
-                            backend.destroy_vertex_buffer(t.vertex_buffer)?;
-                            backend.destroy_index_buffer(t.index_buffer)?;
-                        }
+                        (_, Slot::Ready(t)) => unwanted = Some(t),
                         _ => {}
+                    }
+                    if let Some(t) = unwanted {
+                        self.free_terrain(backend, materials, t)?;
                     }
                 }
                 Loaded::Model(hash, model) => {
@@ -1647,7 +1693,7 @@ impl World {
                     // Dropped while loading: not wanted any more.
                     match (self.scatter.get(&cell), slot) {
                         (Some(Slot::Loading), slot) => drop(self.scatter.insert(cell, slot)),
-                        (_, Slot::Ready(clumps)) => destroy_clumps(backend, clumps)?,
+                        (_, Slot::Ready(clumps)) => self.free_clumps(backend, materials, clumps)?,
                         _ => {}
                     }
                 }
@@ -1696,15 +1742,16 @@ impl World {
                 } => {
                     let key = ground_key(*colour_map, *detail_map, layers);
                     match self.terrain_materials.get(&key) {
-                        Some(&m) => m,
-                        None => {
-                            let m = materials.define(
+                        Some(&m) if materials.hold(m) => m,
+                        _ => {
+                            self.terrain_materials.remove(&key);
+                            let textures: Vec<u32> =
+                                surface.textures().iter().map(|&(t, _, _)| t).collect();
+                            let m = materials.define_held(
                                 backend,
                                 &ground_material(materials, *colour_map, *detail_map, layers),
+                                &textures,
                             )?;
-                            for (t, _, _) in surface.textures() {
-                                materials.pin(t);
-                            }
                             // Kept only once every texture is known.
                             let known = surface
                                 .textures()
@@ -1736,6 +1783,7 @@ impl World {
                 .map(|&(first, count, s)| (first, count, ids[s], materials.is_translucent(ids[s])))
                 .collect(),
             origin: mesh.origin,
+            held: ids,
         })
     }
 

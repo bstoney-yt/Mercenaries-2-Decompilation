@@ -495,6 +495,48 @@ impl MaterialCache {
         Ok(id)
     }
 
+    /// Defines `desc` as a material held once, as [`material`](Self::material)
+    /// holds one, also holding `textures`: [`release`](Self::release) frees
+    /// it, and each texture no material holds any more, once the last hold
+    /// ([`hold`](Self::hold)) is given back. For materials made outside a
+    /// model (the ground).
+    pub fn define_held(
+        &mut self,
+        backend: &mut dyn RenderBackend,
+        desc: &MaterialDesc,
+        textures: &[u32],
+    ) -> Result<MaterialId, BackendError> {
+        let id = self.define(backend, desc)?;
+        let mut held = Vec::with_capacity(textures.len());
+        for &t in textures {
+            if !held.contains(&t) {
+                held.push(t);
+                *self.texture_holds.entry(t).or_default() += 1;
+            }
+        }
+        self.held.insert(
+            id,
+            Held {
+                count: 1,
+                key: None,
+                textures: held,
+            },
+        );
+        Ok(id)
+    }
+
+    /// One more hold on held material `id` (see [`release`](Self::release)).
+    /// Returns whether it is held (and so still defined).
+    pub fn hold(&mut self, id: MaterialId) -> bool {
+        match self.held.get_mut(&id) {
+            Some(h) => {
+                h.count += 1;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Holds texture `hash` for good: one drawn by something other than a
     /// model material (the ground, the sea's foam), never freed by
     /// [`release`](Self::release).
@@ -2831,6 +2873,43 @@ mod tests {
         cache.pin(10);
         assert!(cache.release(&mut backend, again).unwrap().is_empty());
         assert!(cache.has_texture(10));
+    }
+
+    /// A material defined with its textures held (the ground) is freed,
+    /// with each texture nothing else holds, once its last hold is given
+    /// back; a pinned texture stays.
+    #[test]
+    fn held_definitions_free_their_textures() {
+        let mut backend = NullBackend::new();
+        let mut cache = MaterialCache::new();
+        let t = DecodedTexture {
+            width: 1,
+            height: 1,
+            mips: vec![vec![1, 2, 3, 255]],
+            alpha: false,
+            linear: false,
+            lod_bias: 0.0,
+            flags: 0,
+        };
+        for h in [20, 21, 22] {
+            cache.add_texture(&mut backend, h, Some(&t)).unwrap();
+        }
+        cache.pin(22);
+        let desc = MaterialDesc::default();
+        let g = cache
+            .define_held(&mut backend, &desc, &[20, 21, 21, 22])
+            .unwrap();
+        // A second cell takes the same ground.
+        assert!(cache.hold(g));
+        assert!(cache.release(&mut backend, g).unwrap().is_empty());
+        assert_eq!(backend.live_buffers().texture, 3);
+        let mut freed = cache.release(&mut backend, g).unwrap();
+        freed.sort_unstable();
+        assert_eq!(freed, vec![20, 21]);
+        assert_eq!(backend.live_buffers().texture, 1);
+        assert!(cache.has_texture(22));
+        // Gone, it is held no more.
+        assert!(!cache.hold(g));
     }
 
     #[test]
