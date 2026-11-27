@@ -4438,7 +4438,7 @@ fn depth_under(physics: &Physics, at: Vec3, water: f32) -> (f32, Option<f32>) {
 /// chest short of the last metre (by the first contract's river, one
 /// aimed through a bank's rocks swam 0.5 m/s against them). `None` if
 /// there is none within the last ring.
-fn shore(physics: &Physics, at: Vec3, radius: f32) -> Option<Vec3> {
+pub(crate) fn shore(physics: &Physics, at: Vec3, radius: f32) -> Option<Vec3> {
     SHORE_RINGS.iter().find_map(|&r| {
         (0..SHORE_WAYS).find_map(|k| {
             let a = k as f32 / SHORE_WAYS as f32 * std::f32::consts::TAU;

@@ -104,6 +104,9 @@ m2-alpha [options]
                          (default 3), logging each second where she is, how
                          deep the sea is over her feet and whether she swims
                          (walk lines)
+  --swim-ashore <s>      with --gait on the island: once she has swum this
+                         long, she turns each second for the nearest shore
+                         she can stand on (swim-ashore lines)
   --npc-swim <metres>    with --gait on the island: put the nearest soldier
                          this far ahead of her in the water at the start,
                          logging each second whether he swims (npc-swim
