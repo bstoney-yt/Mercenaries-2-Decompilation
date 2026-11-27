@@ -615,6 +615,24 @@ impl Events {
         out
     }
 
+    /// The objects pending `ObjectDeath` events wait to die (PmcCon018's
+    /// spawned vehicles and barrels, each adding to its points when it
+    /// does), for the autoplay to know what the scripts score.
+    pub fn deaths_watched(&self, world: &dyn World) -> Vec<u32> {
+        let s = self.store.borrow();
+        let mut out: Vec<u32> = s
+            .pending
+            .iter()
+            .filter(|p| p.kind == "ObjectDeath")
+            .filter_map(|p| s.live(p))
+            .flat_map(|h| objects(&h.params, 1, world))
+            .filter(|&g| !world.died(g))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// The regions pending `Boundary` events wait for something to leave
     /// (mode `"exit"`: PmcCon034's `PMCCon034OutOfBounds`, which cancels
     /// the contract), for the autoplay to keep her within.

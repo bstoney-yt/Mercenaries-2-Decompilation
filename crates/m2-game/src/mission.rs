@@ -2896,6 +2896,12 @@ end
         self.events.sight_watched(&*self.world.borrow())
     }
 
+    /// The objects the scripts wait to die
+    /// ([`crate::events::Events::deaths_watched`]).
+    pub fn deaths_watched(&self) -> Vec<u32> {
+        self.events.deaths_watched(&*self.world.borrow())
+    }
+
     /// The regions pending `Boundary` events wait for something to leave
     /// ([`crate::events::Events::exits_watched`]).
     pub fn exits_watched(&self) -> Vec<u32> {

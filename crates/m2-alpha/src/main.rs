@@ -6132,6 +6132,7 @@ fn mission_for_screenshot(
                     a.support_denied = true;
                 }
                 support_denials = denials;
+                a.death_watched = link.deaths_watched(game);
                 // The boundaries she is kept within, and one she has left
                 // while the scripts wait for her to come back into it (an
                 // out-of-bounds timer running: PmcCon018 cancels 10 s on).
