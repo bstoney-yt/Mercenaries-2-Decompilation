@@ -2383,12 +2383,24 @@ fn turret_clamp(dir: Vec3, facing: f32, yaw: (f32, f32), pitch: (f32, f32)) -> V
 /// Hurts kept for [`Combat::take_hurts`].
 const MAX_HURTS: usize = 16;
 
-/// Rifle shots, rockets and grenades the player has fired.
+/// Rifle shots, rockets, grenades, grenade launcher rounds and an
+/// emplaced gun's rounds the player has fired.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Fired {
     pub rifle: u32,
     pub rockets: u32,
     pub grenades: u32,
+    pub lobbed: u32,
+    pub manned: u32,
+}
+
+impl Fired {
+    /// Every round she has fired, whatever with (the tally counted her
+    /// rifle's alone: PmcCon032's 11-27 check fired the grenade launcher
+    /// and read 0 rounds to the end).
+    pub fn total(&self) -> u32 {
+        self.rifle + self.rockets + self.grenades + self.lobbed + self.manned
+    }
 }
 
 /// What the fighting has come to, for checking the balance against the
@@ -3971,6 +3983,7 @@ impl Combat {
             return;
         }
         m.rounds -= 1;
+        self.fired.manned += 1;
         let (gun, left) = (m.entity, m.rounds);
         let (_, dir) = Self::aim_ray(f.player);
         let aim = m.clamp(dir);
@@ -5203,6 +5216,7 @@ impl Combat {
         if !self.spend_launcher_round() {
             return;
         }
+        self.fired.lobbed += 1;
         self.aim_left = AIM_AFTER_SHOT * 2.0;
         let (eye, dir) = Self::aim_ray(f.player);
         let from = Self::muzzle(
@@ -8773,6 +8787,21 @@ mod tests {
             t.aim
         );
     }
+    /// The tally counts every round she fires, the launcher's and an
+    /// emplaced gun's among them.
+    #[test]
+    fn every_round_she_fires_is_counted() {
+        let f = Fired {
+            rifle: 3,
+            rockets: 1,
+            grenades: 2,
+            lobbed: 6,
+            manned: 4,
+        };
+        assert_eq!(f.total(), 16);
+        assert_eq!(Fired::default().total(), 0);
+    }
+
     use crate::npc::tests::{ground, rig};
     use crate::npc::{Brain, Npc};
 

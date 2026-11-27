@@ -881,10 +881,16 @@ impl Keep {
 /// nearest one's centre; inside one, a goal outside it is brought back
 /// along the way to [`KEEP_MARGIN`] inside its edge.
 pub fn keep_goal(keep: &[Keep], here: Vec3, goal: Vec3) -> Vec3 {
-    if keep.is_empty() || keep.iter().any(|k| k.holds(goal) && k.holds(here)) {
+    // Every region she stands in must hold the goal too: of nested ones
+    // (PmcCon032: the contract's wide region and the 2.65 m gallery border
+    // inside it), leaving the inner one is leaving one she is kept in (the
+    // 11-27 check of #815: she walked out of the border towards a statue
+    // 44 m off, her fire locked again, 13 times).
+    let standing: Vec<&Keep> = keep.iter().filter(|k| k.holds(here)).collect();
+    if keep.is_empty() || (!standing.is_empty() && standing.iter().all(|k| k.holds(goal))) {
         return goal;
     }
-    let Some(k) = keep.iter().find(|k| k.holds(here)) else {
+    let Some(k) = standing.into_iter().find(|k| !k.holds(goal)) else {
         // Outside: back to the nearest region's middle.
         let near = keep.iter().min_by(|a, b| {
             let d = |k: &Keep| Vec3::new(k.centre[0], here.y, k.centre[1]).distance(here);
@@ -4099,7 +4105,14 @@ impl Autoplay {
         let swimming_now = p.swimming();
         let d = at.distance(here);
         let lobbing = game.combat.second == Some(Weapon::GrenadeLauncher);
-        let (near, far) = if lobbing { LOB_RANGE } else { BLAST_RANGE };
+        let (near, far) = if lobbing {
+            (
+                LOB_RANGE.0,
+                lob_reach(&game.combat.gl).unwrap_or(LOB_RANGE.1),
+            )
+        } else {
+            BLAST_RANGE
+        };
         if self.blast_spot.is_some_and(|(t, _)| t != target) {
             self.blast_spot = None;
             self.tried.clear();
@@ -5798,7 +5811,7 @@ impl Autoplay {
         eprintln!(
             "autoplay tally {:.1} s: {}; {}; {}",
             self.clock,
-            game.combat.tally.line(game.combat.fired.rifle),
+            game.combat.tally.line(game.combat.fired.total()),
             game.scene.people.idle.line(),
             game.combat.shots_line()
         );
@@ -6629,6 +6642,20 @@ impl Autoplay {
             && (p.weapons_away() || held)
             && strike_line(&game.support.entries()).is_some()
     }
+}
+
+/// How far the grenade launcher `gl` reaches on level ground: its round's
+/// speed squared over gravity (its farthest arc, 45 degrees up, as the
+/// port fires a round that can't reach its goal: `combat::farthest`), plus
+/// its burst's radius. From samples: `GL Projectile` 20 m/s and its
+/// `Explosion (Grenade)`; `None` without its round.
+fn lob_reach(gl: &crate::combat::Rifle) -> Option<f32> {
+    let speed = gl.speed(0.0);
+    if speed <= 0.0 {
+        return None;
+    }
+    let radius = gl.blast().map_or(0.0, |b| b.radius);
+    Some(speed * speed / m2_engine::physics::GRAVITY + radius)
 }
 
 /// A strike's reach for counting what it takes with it (metres; invented:
@@ -7961,6 +7988,11 @@ mod tests {
         assert!(both[0].holds(out) && !both[1].holds(out));
         // Fire free: held by the wide one, nothing to step into.
         assert_eq!(step_in_point(&both, out, false), None);
+        // Standing in both, a goal 44 m off (PmcCon032's third statue) is
+        // kept inside the border, not walked to.
+        let statue = Vec3::new(2709.4, -11.7, -759.2);
+        let kept = keep_goal(&both, inside, statue);
+        assert!(both[1].holds(kept), "{kept}");
         // Fire locked: into the border she is outside of.
         assert_eq!(
             step_in_point(&both, out, true),
