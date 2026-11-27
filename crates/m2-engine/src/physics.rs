@@ -1819,6 +1819,10 @@ struct VehicleBody {
     tops: Vec<f32>,
     /// How its tyres hold it ([`Tyres`]; a tank's are Rapier's, invented).
     tyres: Option<Tyres>,
+    /// Each wheel's spring length last step, metres (its rest length
+    /// until it first touches): the 360's damping speed is the length's
+    /// change over the step ([`push_springs`]).
+    spring_was: Vec<f32>,
     /// What its driver asks of its front and back axles' tyres now
     /// ([`Physics::drive`]), which they push it with each step
     /// ([`push_axles`]).
@@ -3047,6 +3051,41 @@ fn driven_rpm(
         .sum()
 }
 
+/// A wheeled vehicle's springs push as the 360's wheel step pushes them
+/// (0x8219F6CC..0x8219F754): along the contact's normal, its mass x
+/// (strength x squeeze - damp x the spring's change of length over the
+/// step), only when that is over 0, with no cap. Rapier's controller
+/// pushes by its own reading of the springs (its strength times one
+/// over the contact normal's dot with the spring, clipped at 10, and
+/// its damping by the contact's speed along the normal, none at all past
+/// that clip); this tops its push up or takes it back to the 360's, at
+/// the point Rapier pushed, and leaves the 360's push for [`stand`].
+fn push_springs(v: &mut VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
+    if v.tyres.is_none() || dt <= 0.0 {
+        return;
+    }
+    let mass = v.mass;
+    let Some(body) = bodies.get_mut(v.controller.chassis) else {
+        return;
+    };
+    for (w, was) in v.controller.wheels_mut().iter_mut().zip(&mut v.spring_was) {
+        let ray = *w.raycast_info();
+        let length = ray.suspension_length;
+        let rate = (length - *was) / dt;
+        *was = length;
+        if !ray.is_in_contact {
+            continue;
+        }
+        let squeeze = w.suspension_rest_length - length;
+        let push =
+            (mass * (w.suspension_stiffness * squeeze - w.damping_compression * rate)).max(0.0);
+        let rapier = w.wheel_suspension_force.min(w.max_suspension_force);
+        let fix = ray.contact_normal_ws * ((push - rapier) * dt);
+        body.apply_impulse_at_point(fix, ray.contact_point_ws, true);
+        w.wheel_suspension_force = push;
+    }
+}
+
 /// Works out how well a wheeled vehicle stands on the ground under it
 /// ([`Tyres::footing`], from the lean of its wheels' contacts' mean
 /// normal) and takes that share of the level part off each spring's push
@@ -3981,6 +4020,7 @@ impl Physics {
             );
             v.controller.update_vehicle(dt, queries);
             if !v.wrecked {
+                push_springs(v, &mut w.bodies, dt);
                 stand(v, &mut w.bodies, dt);
                 if let Some(tank) = &mut v.tank {
                     run_tracks(tank, &v.controller, &mut w.bodies, dt);
@@ -5398,12 +5438,18 @@ impl Physics {
                 }
             }
         }
+        let spring_was = controller
+            .wheels()
+            .iter()
+            .map(|w| w.suspension_rest_length)
+            .collect();
         let id = VehicleId(self.vehicles.len());
         self.vehicles.push(Some(VehicleBody {
             controller,
             bed: false,
             mass: m,
             steers: spec.wheels.iter().map(|w| w.steers).collect(),
+            spring_was,
             tops,
             tyres,
             axles: Axle::standing(&tyres),
@@ -12652,12 +12698,14 @@ mod tests {
             for _ in 0..300 {
                 p.step(DT);
             }
-            let want = f * WORLD_GRAVITY / (4.0 * k);
+            // Its weight is the world's gravity and the gravity factor's
+            // extra pull, (f - 1) x the car code's own 10 (0x8219EE4C),
+            // held by four springs pushing k c each, per kilogram, as the
+            // 360 pushes them ([`push_springs`]): within 1%.
+            let want = (WORLD_GRAVITY + (f - 1.0) * GRAVITY_360) / (4.0 * k);
             let sag = p.vehicle_suspension(id);
             let mean = sag.iter().sum::<f32>() / 4.0;
-            // Within 5%: Rapier's springs settle 2 to 4% short of what
-            // k c = f g says.
-            assert!((mean - want).abs() < 0.05 * want, "{k}: {sag:?} {want}");
+            assert!((mean - want).abs() < 0.01 * want, "{k}: {sag:?} {want}");
             assert!(sag[2] > sag[0], "{k}: {sag:?}");
             let lift = p.vehicle_wheel_lift(id);
             let mean_lift = lift.iter().sum::<f32>() / 4.0;

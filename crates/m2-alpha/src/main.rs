@@ -227,6 +227,9 @@ struct Options {
     /// target once it is tracked (`--job-near <m>`, a test shortcut).
     job_near: Option<f32>,
     drive: bool,
+    /// With `--drive`: back up flat out instead of driving ahead, and
+    /// log the fastest it backs up (`drive: reverse`).
+    drive_reverse: bool,
     /// With `--screenshot` on foot: jump just before the picture.
     jump: bool,
     /// With `--screenshot` on foot: press jump ten times a second all the
@@ -915,6 +918,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--job-near" => o.job_near = Some(value()?.parse()?),
             "--drive" => o.drive = true,
+            "--drive-reverse" => {
+                o.drive = true;
+                o.drive_reverse = true;
+            }
             "--gunner" => o.gunner = true,
             "--jump" => o.jump = true,
             "--jump-spam" => o.jump_spam = true,
@@ -9232,6 +9239,7 @@ fn drive_for_screenshot(
         .iter()
         .map(|n| n.character.position)
         .collect();
+    let mut reverse_fastest = 0.0f32;
     for i in 0..240 {
         let steer = match (game.scene.world.as_ref(), driven(game)) {
             (Some(w), Some((id, hull))) if !ploughing => {
@@ -9239,11 +9247,22 @@ fn drive_for_screenshot(
             }
             _ => 0.0,
         };
+        // Backing up: straight back, the stick held down (the gearbox
+        // goes into reverse once she is all but still).
         let throttle = Intent {
-            movement: m2_math::glam::Vec2::new(steer, 1.0),
+            movement: if options.drive_reverse {
+                m2_math::glam::Vec2::NEG_Y
+            } else {
+                m2_math::glam::Vec2::new(steer, 1.0)
+            },
             ..Intent::default()
         };
         game.step(throttle, tick);
+        if options.drive_reverse
+            && let Some((_, speed)) = game.driving()
+        {
+            reverse_fastest = reverse_fastest.max(speed.abs());
+        }
         if let Some(h) = &mut seats {
             h.seat(game, tick);
         }
@@ -9296,6 +9315,12 @@ fn drive_for_screenshot(
             driven_now.is_some_and(|v| v.wrecked),
             ploughing,
         );
+        if options.drive_reverse {
+            eprintln!(
+                "drive: reverse fastest {reverse_fastest:.1} m/s ({:.0} km/h)",
+                reverse_fastest * 3.6
+            );
+        }
         match verdict {
             Ok(()) => eprintln!("drive: PASS"),
             Err(why) => eprintln!("drive: FAIL {why}"),
