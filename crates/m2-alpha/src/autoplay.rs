@@ -951,6 +951,30 @@ const STEP_IN_ARRIVE: f32 = 0.5;
 /// (metres; invented).
 const KEEP_MARGIN: f32 = 4.0;
 
+/// Whether she counts as at her perch `spot` from `here`: within
+/// [`PERCH_ARRIVE`] of it, or seeing the target already on the way, but
+/// not with her sight of it distrusted (her rounds struck short of it).
+fn at_perch(seen: bool, distrusted: bool, spot: Vec3, here: Vec3) -> bool {
+    (seen && !distrusted) || spot.with_y(0.0).distance(here.with_y(0.0)) < PERCH_ARRIVE
+}
+
+/// Rounds struck short of a target in a row before her eye's line to it is
+/// no longer trusted (invented).
+const SHORT_GIVE_UP: u32 = 5;
+
+/// How many of `struck` (this step's rounds and blows on the world) landed
+/// short of `target` on her side of it, as seen from `eye`: nearer her
+/// than half the way, and more than [`SHOT_SHORT`] from it. Invented: a
+/// strike that near her and that far from it is one of hers that met
+/// something in between.
+fn short_strikes(struck: &[crate::combat::Strike], eye: Vec3, target: Vec3) -> u32 {
+    let way = eye.distance(target);
+    struck
+        .iter()
+        .filter(|s| s.at.distance(eye) < way * 0.5 && s.at.distance(target) > SHOT_SHORT)
+        .count() as u32
+}
+
 /// A round of hers that would strike something this much short of the
 /// target (metres) has no clear shot at it (invented: more than a
 /// statue's depth).
@@ -1083,6 +1107,11 @@ pub struct Autoplay {
     rifle_kind: Option<u32>,
     /// The target whose shot she judges by her eye's line, not her aim's.
     trust_sight: Option<u32>,
+    /// A target whose shots from her eye's line struck short anyway: her
+    /// sight is not taken over her aim for it again ([`short_strikes`]).
+    distrust: Option<u32>,
+    /// Her rounds that struck short of the trusted target so far.
+    short_hits: u32,
     /// Whether her rifle, last aimed, had no clear shot (and nowhere on
     /// her level to see the target from).
     blocked_logged: bool,
@@ -3907,7 +3936,15 @@ impl Autoplay {
                     .world
                     .as_ref()
                     .filter(|_| self.perch_tried.len() < PERCH_TRIES)
-                    .and_then(|w| perch(&w.physics, at, here, &self.perch_tried, &self.keep));
+                    .and_then(|w| {
+                        perch(
+                            &w.physics,
+                            &target_points(game, target, at),
+                            here,
+                            &self.perch_tried,
+                            &self.keep,
+                        )
+                    });
                 eprintln!(
                     "autoplay {:.1} s: no clear shot at {target:#x} from {here:.1}: {}",
                     self.clock,
@@ -3944,7 +3981,12 @@ impl Autoplay {
                     .cast_ray(eye, dir, (len - SHOT_SHORT).max(0.0))
                     .is_none()
             });
-            let there = seen || spot.with_y(0.0).distance(here.with_y(0.0)) < PERCH_ARRIVE;
+            // Not where her sight is no longer trusted: from there her eye
+            // sees it but her rounds strike short (PmcCon034, the 11-27
+            // check of #812: "going to [2619.2, 21.7, -982.9]" 181 times,
+            // each at once counted as there because she saw the statue,
+            // and she never took the 3 m).
+            let there = at_perch(seen, self.distrust == Some(target), spot, here);
             if !there && self.clock - since < SPOT_GIVE_UP {
                 // Not `arrived` where she stood (walk would keep her there).
                 self.arrived = None;
@@ -3960,6 +4002,7 @@ impl Autoplay {
             // round 34: 122 spots on the MG platform in 150 s, each in
             // sight at once; the columns fall to her rounds from there).
             if seen
+                && self.distrust != Some(target)
                 && self
                     .perch_tried
                     .last()
@@ -3969,6 +4012,28 @@ impl Autoplay {
             }
             self.perch = None;
             self.steady = 0.0;
+        }
+        // Her sight taken over her aim, but her rounds strike short all the
+        // same (PmcCon034, the 11-26 nightly: 362 rounds into the roof she
+        // stood on, batch 0xd3c77, the statue 98 m off and 35 m below):
+        // that sight is not trusted again for this target, and she looks
+        // for another spot.
+        if self.trust_sight == Some(target) {
+            self.short_hits += short_strikes(&game.combat.struck, p.eye(), at);
+            if self.short_hits >= SHORT_GIVE_UP {
+                eprintln!(
+                    "autoplay {:.1} s: {} of her rounds struck short of {target:#x} from \
+                     [{:.1}, {:.1}, {:.1}]: her sight no longer trusted there",
+                    self.clock, self.short_hits, here.x, here.y, here.z
+                );
+                self.trust_sight = None;
+                self.distrust = Some(target);
+                self.perch_tried.push(here);
+                self.short_hits = 0;
+                self.steady = 0.0;
+            }
+        } else {
+            self.short_hits = 0;
         }
         // Only her time with a clear shot counts toward giving it up.
         let short = self.blocked_logged;
@@ -5920,11 +5985,12 @@ fn vantage(
 /// the one nearest the target.
 fn perch(
     physics: &Physics,
-    target: Vec3,
+    targets: &[Vec3],
     from: Vec3,
     tried: &[Vec3],
     keep: &[Keep],
 ) -> Option<Vec3> {
+    let target = *targets.first()?;
     // Her level's ground at (x, z), if there is some.
     let ground = |x: f32, z: f32| {
         let top = Vec3::new(x, from.y + PERCH_LEVEL + 0.5, z);
@@ -5958,9 +6024,15 @@ fn perch(
             {
                 continue;
             }
+            // Any part of it in sight from there (PmcCon034, the 11-27
+            // check of #812: from the HQ roof no spot saw the 19th
+            // statue's foot, the one point tried, for 590 s).
             let eye = spot + Vec3::Y * 1.6;
-            let (dir, len) = ((target - eye).normalize_or_zero(), target.distance(eye));
-            if physics.cast_ray(eye, dir, (len - 1.5).max(0.0)).is_some() {
+            let seen = targets.iter().any(|&t| {
+                let (dir, len) = ((t - eye).normalize_or_zero(), t.distance(eye));
+                physics.cast_ray(eye, dir, (len - 1.5).max(0.0)).is_none()
+            });
+            if !seen {
                 continue;
             }
             let cost = spot.distance(target);
@@ -6167,6 +6239,15 @@ fn crossing(game: &Game, i: usize, m: Mat4) -> Option<usize> {
 /// of the L300 she was to destroy from all her roof). `None` for none.
 fn visible_part(game: &Game, g: u32, at: Vec3, eye: Vec3) -> Option<Vec3> {
     let w = game.scene.world.as_ref()?;
+    target_points(game, g, at).into_iter().find(|&p| {
+        let (dir, len) = ((p - eye).normalize_or_zero(), p.distance(eye));
+        w.physics.cast_ray(eye, dir, (len - 1.5).max(0.0)).is_none()
+    })
+}
+
+/// Points of target `g` (a vehicle or a prop, standing at `at`) a shot may
+/// be aimed at: `at`, then its box's middle, sides and top.
+fn target_points(game: &Game, g: u32, at: Vec3) -> Vec<Vec3> {
     let placed = game
         .scene
         .vehicles
@@ -6181,10 +6262,7 @@ fn visible_part(game: &Game, g: u32, at: Vec3, eye: Vec3) -> Option<Vec3> {
             points.push(m.transform_point3(c + d * h));
         }
     }
-    points.into_iter().find(|&p| {
-        let (dir, len) = ((p - eye).normalize_or_zero(), p.distance(eye));
-        w.physics.cast_ray(eye, dir, (len - 1.5).max(0.0)).is_none()
-    })
+    points
 }
 
 fn vehicle_at(game: &Game, i: usize) -> Option<Mat4> {
@@ -7532,7 +7610,7 @@ mod tests {
             p.cast_ray(eye, dir, eye.distance(target) - 1.5).is_some(),
             "the roof hides it from its middle"
         );
-        let spot = perch(&p, target, from, &[], &[]).expect("somewhere on the roof");
+        let spot = perch(&p, &[target], from, &[], &[]).expect("somewhere on the roof");
         assert!(spot.z > 4.0 && spot.z < 10.0, "not by the edge: {spot}");
         assert!((spot.y - 20.0).abs() < 0.1, "not on the roof: {spot}");
         // Bounds that end short of where it can be seen from: nowhere.
@@ -7547,7 +7625,26 @@ mod tests {
             yaw: 0.0,
         };
         assert!(keep.holds(from) && !keep.holds(spot));
-        assert_eq!(perch(&p, target, from, &[], &[keep]), None);
+        assert_eq!(perch(&p, &[target], from, &[], &[keep]), None);
+        // Its foot hidden by a wall by it, its top above the wall in sight:
+        // a spot is found from its top (PmcCon034's 19th statue).
+        let wall = quad(
+            Vec3::new(-5.0, 0.0, 58.0),
+            Vec3::new(5.0, 0.0, 58.0),
+            Vec3::new(5.0, 3.0, 58.0),
+            Vec3::new(-5.0, 3.0, 58.0),
+        );
+        p.add_static(StaticKey::Cell(3), &wall, Vec3::ZERO, Quat::IDENTITY);
+        p.step(1.0 / 60.0);
+        let foot = Vec3::new(0.0, 0.5, 60.0);
+        let top = Vec3::new(0.0, 4.0, 60.0);
+        assert_eq!(
+            perch(&p, &[foot], from, &[], &[]),
+            None,
+            "its foot is hidden from everywhere"
+        );
+        let spot = perch(&p, &[foot, top], from, &[], &[]).expect("its top is seen");
+        assert!((spot.y - 20.0).abs() < 0.1, "{spot}");
     }
 
     // Ground under the sea (round 6's riverbed): no spot to fire from.
@@ -8062,6 +8159,44 @@ mod tests {
         assert_eq!(n, 3);
         assert!(spot.x > 90.0 && spot.x < 110.0);
         assert_eq!(strike_knot(&[], &[]), None);
+    }
+
+    /// PmcCon034's 11-27 check: 3 m from her spot, the statue in her
+    /// eye's sight but her sight distrusted, she isn't there yet; within
+    /// a metre, or trusted, she is.
+    #[test]
+    fn a_distrusted_sight_does_not_count_as_at_the_perch() {
+        let here = Vec3::new(2616.6, 22.1, -981.4);
+        let spot = Vec3::new(2619.2, 21.7, -982.9);
+        assert!(!at_perch(true, true, spot, here));
+        assert!(at_perch(true, false, spot, here));
+        assert!(!at_perch(false, false, spot, here));
+        assert!(at_perch(true, true, spot, spot + Vec3::X * 0.5));
+    }
+
+    /// PmcCon034: her rounds into the roof by her count as short; one on
+    /// the statue, or far from her, doesn't.
+    #[test]
+    fn rounds_on_her_own_roof_strike_short() {
+        let strike = |at: Vec3| crate::combat::Strike {
+            at,
+            damage: 10.0,
+            key: None,
+            round: 10.0,
+            kind: 0,
+        };
+        let eye = Vec3::new(2616.6, 23.8, -981.4);
+        let statue = Vec3::new(2687.0, -12.9, -1039.8);
+        let roof = Vec3::new(2621.0, 21.5, -985.0);
+        let near_it = statue + Vec3::new(1.0, 0.5, 0.0);
+        let far_off = Vec3::new(2900.0, 0.0, -700.0);
+        let got = short_strikes(
+            &[strike(roof), strike(near_it), strike(far_off)],
+            eye,
+            statue,
+        );
+        assert_eq!(got, 1);
+        assert_eq!(short_strikes(&[], eye, statue), 0);
     }
 
     #[test]
