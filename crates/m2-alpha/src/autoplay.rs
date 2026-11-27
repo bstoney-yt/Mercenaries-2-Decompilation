@@ -134,20 +134,53 @@ fn beacon_mark(marks: &[Mark], from: Vec3) -> Option<&Mark> {
 }
 
 /// Whether target `g` is a prop that rounds break (its template's damage
-/// row takes a `Bullet`, with health to wear: the ranges' targets): shot
-/// with her rifle rather than rockets or C4 (PmcCon033 round 11: C4 on
-/// each pistol-range target, 116 s against its 90 s to beat).
+/// row takes her round's kind, with health to wear: the ranges' targets):
+/// shot with her rifle rather than rockets or C4 (PmcCon033 round 11: C4
+/// on each pistol-range target, 116 s against its 90 s to beat).
+///
+/// Her round is her rifle's own, as the game wears props by it
+/// ([`crate::destruct`]: the round's damage times its `DamageKey`'s
+/// column of the target's row): the Anti-Material Rifle's key is not a
+/// `Bullet` (from samples: `0cce918f`, 90 damage), and PmcCon034's bonus
+/// statue (`_pmcoutpost_statueSolanobust_lowHP`, health 5) takes 0.1 of
+/// it, 9 a round, where it takes 0.025 of a `Bullet`: judged by the
+/// `Bullet` column it was passed over as unworn, and its time cut
+/// (`_MinusTime`) was never had (sniper3, 11-27). It is shot when its row
+/// takes at least [`ROUNDS_TAKEN`] of her round, or a clip of hers breaks
+/// it.
 fn takes_rounds(game: &Game, g: u32) -> bool {
     let (Some((p, _)), Some(w)) = (game.scene.props.get(g), game.scene.world.as_ref()) else {
         return false;
     };
     let db = &w.index.template_db;
-    !game.scene.props.sturdy.contains(&g)
-        && db
-            .durability
-            .get(&p.template)
-            .is_some_and(|d| !d.invincible && d.health > 0.0)
-        && crate::breakables::Makeup::of(db, p.template).bullet >= ROUNDS_TAKEN
+    let Some(d) = db
+        .durability
+        .get(&p.template)
+        .filter(|d| !d.invincible && d.health > 0.0)
+    else {
+        return false;
+    };
+    if game.scene.props.sturdy.contains(&g) {
+        return false;
+    }
+    let rifle = &game.combat.rifle;
+    let kind = crate::combat::round_kind(rifle.ammo.and_then(|a| a.key));
+    let scale = db
+        .modifiers
+        .get(&p.template)
+        .zip(db.damage.as_ref())
+        .and_then(|(&row, t)| t.scale(row, kind))
+        .unwrap_or(0.0);
+    let damage = rifle.ammo.map_or(rifle.damage, |a| a.damage);
+    worn_by_rounds(scale, damage, d.health, rifle.clip)
+}
+
+/// Whether a target whose row takes `scale` of a round doing `damage`,
+/// with `health`, is worn by rounds: it takes at least [`ROUNDS_TAKEN`] of
+/// each, or `clip` of them break it (the clip's length invented as the
+/// bound: what she fires before she reloads).
+fn worn_by_rounds(scale: f32, damage: f32, health: f32, clip: u32) -> bool {
+    scale >= ROUNDS_TAKEN || (scale > 0.0 && damage * scale * clip.max(1) as f32 >= health)
 }
 
 /// A target takes at least this much of a `Bullet`'s damage for her to
@@ -8191,6 +8224,21 @@ mod tests {
         assert!(at_perch(true, false, spot, here));
         assert!(!at_perch(false, false, spot, here));
         assert!(at_perch(true, true, spot, spot + Vec3::X * 0.5));
+    }
+
+    /// From samples: the Anti-Material Rifle's round (90 damage, 5 a clip)
+    /// against PmcCon034's bonus statue (health 5, 0.1 of that round's key)
+    /// is one round; a gallery target (1.0) is worn by any; a column that
+    /// takes a little and stands a clip (0.025 of 90 against 400) isn't.
+    #[test]
+    fn rounds_wear_what_a_clip_of_hers_breaks() {
+        assert!(worn_by_rounds(0.1, 90.0, 5.0, 5));
+        assert!(worn_by_rounds(1.0, 90.0, 10.0, 5));
+        assert!(!worn_by_rounds(0.025, 90.0, 400.0, 5));
+        assert!(!worn_by_rounds(0.0, 90.0, 5.0, 5));
+        // A round that takes a little, but a clip of it breaks the target:
+        // 0.025 of 25, 30 a clip, 18.75 against 5: worn.
+        assert!(worn_by_rounds(0.025, 25.0, 5.0, 30));
     }
 
     /// PmcCon034: her rounds into the roof by her count as short; one on
