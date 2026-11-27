@@ -253,6 +253,9 @@ def run(args) -> int:
         log.write(line + "\n")
         log.flush()
 
+    # The wall clock the times above count from, so clips.py can line a
+    # screen recording up with the route's marks and shots.
+    say(f"t0 epoch {t0:.3f}")
     exe = Path(args.xenia)
     pad = Pad()
     xl = out / "xenia.log"

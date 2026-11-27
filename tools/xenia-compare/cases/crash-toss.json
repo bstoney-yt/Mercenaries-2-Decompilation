@@ -1,0 +1,24 @@
+{
+  "name": "crash-toss",
+  "fix": "#723",
+  "caption": "Crashing a car knocks her down and she gets up by the 360's rule",
+  "summary": "OilCon020's Phoenix driven into a wreck with her in it.",
+  "start_state": "OilCon020 by the mission skip; in the Phoenix (Racing) 19 m from the start",
+  "duration": 14,
+  "fps": 30,
+  "size": "640x360",
+  "slowmo": 2.0,
+  "xenia": {
+    "routes": ["clip-oilcon020-wreck.txt"],
+    "start": "mark:crash",
+    "frames": "after",
+    "capture": "video"
+  },
+  "ours": {
+    "args": ["--mission", "--skip-to", "OilCon020", "--autoplay", "--mission-seconds", "120"],
+    "shots": {"from": 0, "to": 100, "fps": 10},
+    "start": "log:autoplay ([\\d.]+) s: .*(?:wrecked|crash)",
+    "wall": 900,
+    "offset": 0.0
+  }
+}
