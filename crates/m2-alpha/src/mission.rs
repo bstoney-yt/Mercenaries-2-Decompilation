@@ -5412,6 +5412,36 @@ impl MissionLink {
             .collect()
     }
 
+    /// The objects the scripts wait to die, where each stands now: what
+    /// they score (PmcCon018's vehicles and barrels).
+    pub fn deaths_watched(&self, game: &crate::game::Game) -> Vec<(u32, Vec3)> {
+        let State::Running(m) = &self.state else {
+            return Vec::new();
+        };
+        let w = m.world().borrow();
+        m.deaths_watched()
+            .into_iter()
+            .filter_map(|g| {
+                let at = game
+                    .scene
+                    .vehicles
+                    .iter()
+                    .find(|v| v.guid == Some(g) && !v.wrecked)
+                    .and_then(|v| {
+                        let m = game
+                            .scene
+                            .world
+                            .as_ref()?
+                            .physics
+                            .vehicle_transform(v.id?)?;
+                        Some(m.w_axis.truncate())
+                    })
+                    .or_else(|| w.objects.get(&g).map(|o| Vec3::from(o.position)))?;
+                Some((g, at))
+            })
+            .collect()
+    }
+
     /// The regions she must not leave, as the scripts watch them
     /// (`Event.Boundary` on "exit": PmcCon034's out-of-bounds, which
     /// cancels it): each outline with where it is placed and its turn.

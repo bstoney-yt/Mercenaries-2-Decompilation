@@ -945,6 +945,8 @@ pub struct Autoplay {
     /// Every region she has been kept within this contract (by guid): an
     /// "enter" watch on one of these is a boundary to go back into.
     pub boundaries: std::collections::HashSet<u32>,
+    /// The objects the scripts wait to die, and where (what they score).
+    pub death_watched: Vec<(u32, Vec3)>,
     /// What the scripts wait for her to see (`Event.ObjectIsVisible`:
     /// PmcCon001's hall column, which brings the tank through the wall):
     /// where each is, set each tick ([`crate::mission::MissionLink::
@@ -1690,7 +1692,13 @@ impl Autoplay {
             && matches!(&self.goal, Some(Goal::Blast { target, at })
                 if may_strike(&self.no_strike, *target)
                     && ((sturdy(target) && !cannon) || (spent && !gun(at) && !cannon)))
-            || matches!(self.goal, Some(Goal::Deliver(_)));
+            || matches!(self.goal, Some(Goal::Deliver(_)))
+            // Her weapons put away by the scripts, or her goal held outside
+            // her bounds, a strike on offer: what they score is struck
+            // (PmcCon018).
+            || (matches!(&self.goal, Some(Goal::Blast { target, .. })
+                    if self.death_watched.iter().any(|(g, _)| g == target))
+                && self.strike_scored(game));
         // A call she is no longer after is put away: the designator goes
         // with a weapon taken up (twice from the satellite's view).
         if !striking && (game.support.busy() || game.support.holding()) {
@@ -2105,6 +2113,24 @@ impl Autoplay {
                 format!(
                     "getting back into the {} at the wheel for the race",
                     game.scene.vehicles[i].spec.label
+                ),
+            ));
+        }
+        // Her weapons put away by the scripts and a strike to call (the
+        // airstrike challenge, PmcCon018: weapons off, two practice laser
+        // strikes, points for the vehicles and barrels it spawns): the
+        // thickest knot of what they wait to die, within her bounds.
+        // So too while her goal is held outside her bounds (the 11-27
+        // checks: its marker 106 m out, she stood at the edge 540 s with
+        // a practice laser in the menu and never called it).
+        if self.strike_scored(game)
+            && let Some((target, at, n)) = strike_knot(&self.death_watched, &self.keep)
+        {
+            return Some((
+                Goal::Blast { target, at },
+                format!(
+                    "striking {target:#x} and {} more the scripts score, by it",
+                    n - 1
                 ),
             ));
         }
@@ -6527,9 +6553,55 @@ fn strike_line(entries: &[Entry<'_>]) -> Option<usize> {
     entries.iter().position(|e| match e {
         Entry::Own(_) => true,
         // The scripts' own satellite guided bomb (the first contract's
-        // `VzaCon01_SatBomb`, #637): called in as theirs.
-        Entry::Stocked(s) => s.count > 0 && crate::support::Kind::from_freebie(&s.key).is_some(),
+        // `VzaCon01_SatBomb`, #637), and their laser-guided strikes
+        // (PmcCon018's "Practice Laser" freebies): called in as theirs.
+        Entry::Stocked(s) => {
+            s.count > 0
+                && (crate::support::Kind::from_freebie(&s.key).is_some()
+                    || s.key.to_ascii_lowercase().contains("laser"))
+        }
     })
+}
+
+/// Seconds her goal is held outside her bounds before the scripts' scored
+/// objects are struck instead (invented).
+const HELD_FOR: f32 = 5.0;
+
+impl Autoplay {
+    /// Whether what the scripts score is to be struck now: a strike in
+    /// the menu, on foot or driving (not swimming), with her weapons put
+    /// away by the scripts or her goal held outside her bounds for
+    /// [`HELD_FOR`].
+    fn strike_scored(&self, game: &Game) -> bool {
+        let Some(p) = game.scene.player.as_ref() else {
+            return false;
+        };
+        let held = self.held_since.is_some_and(|t| self.clock - t > HELD_FOR);
+        !p.swimming()
+            && (p.weapons_away() || held)
+            && strike_line(&game.support.entries()).is_some()
+    }
+}
+
+/// A strike's reach for counting what it takes with it (metres; invented:
+/// about a laser strike's blast).
+const KNOT_REACH: f32 = 15.0;
+
+/// Of `watched` (what the scripts wait to die, and where), the one with
+/// the most others within [`KNOT_REACH`] and inside `keep` (all, if none
+/// is kept): it, where, and how many it takes in. `None` for none.
+fn strike_knot(watched: &[(u32, Vec3)], keep: &[Keep]) -> Option<(u32, Vec3, usize)> {
+    let inside = |at: Vec3| keep.is_empty() || keep.iter().any(|k| k.holds(at));
+    let ours: Vec<&(u32, Vec3)> = watched.iter().filter(|(_, at)| inside(*at)).collect();
+    ours.iter()
+        .map(|(g, at)| {
+            let n = ours
+                .iter()
+                .filter(|(_, b)| b.distance(*at) <= KNOT_REACH)
+                .count();
+            (*g, *at, n)
+        })
+        .max_by(|a, b| a.2.cmp(&b.2).then(b.0.cmp(&a.0)))
 }
 
 /// Seconds she leaves the menu shut after calling one of the scripts'
@@ -7815,6 +7887,39 @@ mod tests {
         assert!(within(&k, Vec3::new(145.0, 0.0, 200.0)));
         assert!(!within(&k, Vec3::new(160.0, 0.0, 200.0)));
         assert!(within(&[], Vec3::new(160.0, 0.0, 200.0)));
+    }
+
+    /// PmcCon018: the strike goes where most of what the scripts score
+    /// stands together, inside her bounds.
+    #[test]
+    fn the_strike_goes_to_the_thickest_knot_inside() {
+        let at = |x: f32, z: f32| Vec3::new(x, 0.0, z);
+        let watched = [
+            (1, at(0.0, 0.0)),
+            (2, at(100.0, 0.0)),
+            (3, at(105.0, 5.0)),
+            (4, at(95.0, -6.0)),
+            (5, at(500.0, 0.0)),
+            (6, at(505.0, 0.0)),
+            (7, at(498.0, 3.0)),
+            (8, at(502.0, -4.0)),
+        ];
+        assert_eq!(strike_knot(&watched, &[]).map(|k| k.2), Some(4));
+        // Bounds round the first two knots only: the three by 100 m.
+        let keep = Keep {
+            guid: 9,
+            region: m2_assets::region::Region {
+                flags: 0,
+                unk_0x04: 0,
+                corners: vec![[-20.0, -20.0], [150.0, -20.0], [150.0, 20.0], [-20.0, 20.0]],
+            },
+            centre: [0.0, 0.0],
+            yaw: 0.0,
+        };
+        let (_, spot, n) = strike_knot(&watched, &[keep]).unwrap();
+        assert_eq!(n, 3);
+        assert!(spot.x > 90.0 && spot.x < 110.0);
+        assert_eq!(strike_knot(&[], &[]), None);
     }
 
     #[test]
