@@ -44,7 +44,7 @@
 use std::collections::{HashMap, HashSet};
 
 use m2_engine::ai_anchor::{ANCHORING_SPAWNER, Anchor, SPAWNER_RADIUS};
-use m2_engine::ai_mover::{Mover, PROBE, Sense, Side, State as MoverState, side_point};
+use m2_engine::ai_mover::{Mover, PROBE, Sense, Side, Spot, State as MoverState, side_point};
 use m2_engine::population::SpawnerSlot;
 use m2_engine::stagger::{Direction, Stagger};
 use m2_engine::tuning::HandGun;
@@ -270,15 +270,6 @@ const LAUNCHER_GAP: f32 = 4.0;
 /// see her together don't fire together (invented).
 const PAUSE_JITTER: f32 = 0.25;
 const PAUSE: (f32, f32) = (2.0, 6.0);
-/// A soldier lobs a grenade at where she hides once she has been out of
-/// his sight this long, seconds, within this reach, metres, and no
-/// sooner than this after his last (inferred).
-const GRENADE_AFTER: f32 = 4.0;
-const GRENADE_REACH: (f32, f32) = (8.0, 25.0);
-const GRENADE_GAP: f32 = 15.0;
-/// She counts as hiding where he last saw her while within this of it,
-/// metres: no grenades after her once she has driven or run off.
-const HIDING: f32 = 6.0;
 
 /// The enhanced, smarter soldiers: not the original game's. Off by
 /// default; every number is the alpha's own.
@@ -1308,7 +1299,11 @@ pub struct Npc {
     /// and kit their mixer didn't pick, [`People::dress`]); empty for the
     /// model's own.
     pub outfit: Vec<bool>,
-    grenade_wait: f32,
+    /// The grenade pause all fighters share (one global in the 360,
+    /// [`m2_engine::ai_mover::PAUSE`]): his copy, counted down, and a new
+    /// one he set this tick for [`People`] to hand to everyone.
+    grenade_pause: f32,
+    pub grenade_pause_set: Option<f32>,
     /// The smarter soldiers' settings (off: the original's).
     pub smart: SmarterAi,
     /// The armour class of what she is in (`ObjectHint`'s `Armor`, 1 to
@@ -1437,10 +1432,12 @@ pub struct Npc {
     /// [`crate::player::SWIM_SPEED`]).
     pub swim_speed: f32,
     /// Cover from her: the threat he wants cover from (asked of the cover
-    /// service this tick, [`People::find_cover`]), the spot it gave, and
-    /// seconds until he may ask again ([`m2_engine::ai_cover::RETRY`]).
+    /// service this tick, [`People::find_cover`]), the spot it gave and
+    /// its hint's `CoverAnimation`, and seconds until he may ask again
+    /// beyond his gun's reach ([`m2_engine::ai_mover::ASK_AGAIN`]).
     pub cover_ask: Option<Vec3>,
     pub cover_spot: Option<Vec3>,
+    pub cover_kind: u8,
     /// The cover object his spot is on and how long he has been heading
     /// there, for his claim ([`People::renew_cover_claims`]).
     pub cover_claim: Option<(u32, f32)>,
@@ -1773,7 +1770,8 @@ impl Npc {
             step: None,
             throws: None,
             outfit: Vec::new(),
-            grenade_wait: 0.0,
+            grenade_pause: 0.0,
+            grenade_pause_set: None,
             smart: SmarterAi::default(),
             target_armour: 1,
             target_hint: m2_engine::ai_target::HUMAN,
@@ -1805,6 +1803,7 @@ impl Npc {
             swim_speed: crate::player::SWIM_SPEED,
             cover_ask: None,
             cover_spot: None,
+            cover_kind: 0,
             cover_claim: None,
             cover_retry: 0.0,
             motion: m2_engine::on_foot::HumanMotion::default(),
@@ -2966,27 +2965,8 @@ impl Npc {
         }
         let smart = self.smart;
         let mut wanted = Vec3::ZERO;
-        // Grenades at her hiding place: she has been out of his sight a
-        // while, near enough.
-        self.grenade_wait -= dt;
-        let (after, gap) = if smart.enabled {
-            (smart.grenade_after, smart.grenade_gap)
-        } else {
-            (GRENADE_AFTER, GRENADE_GAP)
-        };
-        let reach = (goal - at).with_y(0.0).length();
-        if self.ai.grenades
-            && !self.ai.flags.no_grenades
-            && self.last_seen.is_some()
-            && self.unseen > after
-            && self.grenade_wait <= 0.0
-            // Hiding there, not driving off.
-            && threat.distance(goal) < HIDING
-            && (GRENADE_REACH.0..GRENADE_REACH.1).contains(&reach)
-        {
-            self.throws = Some(goal);
-            self.grenade_wait = gap;
-        }
+        // Grenades are the combat mover's (its state 14 and gate).
+        self.grenade_pause -= dt;
         // Smarter: hit, he runs for cover and stays down a while.
         if smart.enabled && smart.cover && std::mem::take(&mut self.hit) && self.cover.is_none() {
             self.cover = self
@@ -3013,21 +2993,23 @@ impl Npc {
         // (`HumanTakeCover`, 0x822B3970), held facing her. Within reach
         // again, the attack.
         let beyond = distance > self.fire_hint().range;
-        if !beyond {
+        if !beyond && self.mover.is_none() {
+            // Back within reach from taking cover: the combat mover starts
+            // afresh and asks for its own spots.
             self.cover_spot = None;
         }
-        // The cover gate (0x822C6B78, [`m2_engine::ai_cover::may_ask`]):
-        // its timer out and her 10 to 40 m off; after an attempt the timer
-        // is 15 to 25 s (0x822C7348).
+        // The cover ask (0x822C43B8, as `HumanTakeCover`'s entry state
+        // makes it): none out, none held, and 5 s since the last answer
+        // ([`m2_engine::ai_mover::ASK_AGAIN`]).
         self.cover_retry -= dt;
         if beyond
             && !hiding
             && self.cover_spot.is_none()
-            && m2_engine::ai_cover::may_ask(self.cover_retry, distance)
+            && self.cover_ask.is_none()
+            && self.cover_retry <= 0.0
         {
             self.cover_ask = Some(threat);
-            self.cover_retry = m2_engine::ai_cover::RETRY
-                + m2_engine::ai_cover::RETRY_SPREAD * rng.range(0.0, 1.0);
+            self.cover_retry = m2_engine::ai_mover::ASK_AGAIN;
         }
         let to_cover = self.push(self.ai.combat_speed);
         let covered = match self.cover_spot.filter(|_| beyond && !hiding) {
@@ -3083,6 +3065,22 @@ impl Npc {
                 combat_speed: self.ai.combat_speed,
                 pursue_speed: self.ai.pursue_speed,
                 sides,
+                spot: self.cover_spot.map(|at| Spot {
+                    at,
+                    animation: self.cover_kind,
+                }),
+                // The cover service answers every ask before his next tick
+                // (`serve_cover`); one still out (none served it) counts
+                // as answered with none.
+                asking: {
+                    self.cover_ask = None;
+                    false
+                },
+                // Inferred: every soldier may ask (mind +0x7F0 bit 4).
+                may_cover: true,
+                firing: self.burst > 0,
+                has_grenade: self.ai.grenades && !self.ai.flags.no_grenades,
+                grenade_pause_out: self.grenade_pause <= 0.0,
             };
             let mut roll = || rng.range(0.0, 1.0);
             let Some(mover) = self.mover.as_mut() else {
@@ -3097,6 +3095,27 @@ impl Npc {
                     self.spawn.unwrap_or(u32::MAX),
                     m2_engine::ai_mover::CALLOUT
                 );
+            }
+            if out.ask_cover {
+                self.cover_ask = Some(threat);
+            }
+            if let Some(seconds) = out.drop_spot
+                && let Some(spot) = self.cover_spot.take()
+            {
+                self.dither.mark_for(spot, seconds);
+                self.cover_claim = None;
+            }
+            if let Some(pause) = out.grenade_pause {
+                self.grenade_pause = pause;
+                self.grenade_pause_set = Some(pause);
+            }
+            if let Some(at) = out.throw {
+                eprintln!(
+                    "people: {:08x} throws a grenade {:.0} m",
+                    self.spawn.unwrap_or(u32::MAX),
+                    (at - self.character.position).with_y(0.0).length()
+                );
+                self.throws = Some(at);
             }
             if let Some(side) = out.side_step {
                 // Invented: the side-step action's clip is not wired, so he
@@ -5961,6 +5980,8 @@ impl People {
             .iter()
             .map(|n| (n.shooter, n.ai.modifier.unwrap_or(human)))
             .collect();
+        // The grenade pause one soldier sets holds for all (one global).
+        let mut shared_pause = None;
         for (i, npc) in self.npcs.iter_mut().enumerate() {
             npc.smart = self.smarter;
             npc.target_armour = npc.foe_armour.unwrap_or(self.target_armour).max(1);
@@ -6020,6 +6041,7 @@ impl People {
             fight_time::time(fight_time::CLAIMS, || {
                 Self::renew_cover_claim(&mut self.cover_claims, i as u32, npc, dt)
             });
+            shared_pause = npc.grenade_pause_set.take().or(shared_pause);
 
             let p = npc.character.position;
             crate::spans::time("people: checks", || {
@@ -6104,6 +6126,11 @@ impl People {
             }
             if let (Some(l), Some(id)) = (npc.launch.take(), npc.ragdoll) {
                 physics.launch_ragdoll(id, l.velocity, l.point);
+            }
+        }
+        if let Some(pause) = shared_pause {
+            for npc in &mut self.npcs {
+                npc.grenade_pause = pause;
             }
         }
         fight_time::time(fight_time::PATHS, || self.serve_paths(physics, hints));
@@ -9019,21 +9046,43 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_soldier_lobs_a_grenade_where_she_hides() {
+    fn a_soldier_throws_a_grenade_only_with_a_shot() {
+        // The combat mover's gate (0x822C6B78): he has a shot, her 10 to
+        // 40 m off, his wait and the shared pause out; then 15 to 25 s off.
         let physics = ground();
         let mut rng = Rng::default();
         let dt = 1.0 / 60.0;
-        let post = Brain::Post { facing: 0.0 };
-        let mut soldier = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, post, Some(1));
-        soldier.ai.pursue_speed = 0.0;
-        soldier.ai.combat_speed = 0.0;
-        soldier.update(&physics, &mut rng, None, dt);
-        // Seen 15 m off, then gone out of his sight.
-        for _ in 0..30 {
-            soldier.update(&physics, &mut rng, Some(Vec3::new(0.0, 1.2, 15.0)), dt);
-        }
-        assert!(soldier.alert);
-        // Hidden where he saw her (he can't see through the wall there).
+        let at = Vec3::new(0.0, 1.2, 15.0);
+        let her = Some(at);
+        let soldier = |id, no_grenades: bool, rng: &mut Rng| {
+            let post = Brain::Post { facing: 0.0 };
+            let mut n = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, post, Some(id));
+            n.ai.pursue_speed = 0.0;
+            n.ai.combat_speed = 0.0;
+            n.ai.flags.no_grenades = no_grenades;
+            n.update(&physics, rng, None, dt);
+            n
+        };
+        let throws = |n: &mut Npc, world: &Physics, at: Option<Vec3>, rng: &mut Rng| {
+            let mut thrown = Vec::new();
+            for _ in 0..60 * 8 {
+                n.update(world, rng, at, dt);
+                thrown.extend(n.throws.take());
+            }
+            thrown
+        };
+        let mut n = soldier(1, false, &mut rng);
+        let thrown = throws(&mut n, &physics, her, &mut rng);
+        assert_eq!(thrown.len(), 1, "one, then he waits 15 to 25 s");
+        assert!(thrown[0].distance(at) < 0.1);
+        // NoGrenades: none.
+        let mut held = soldier(2, true, &mut rng);
+        assert!(throws(&mut held, &physics, her, &mut rng).is_empty());
+        // Beyond 40 m: none.
+        let mut far = soldier(3, false, &mut rng);
+        let off = Some(Vec3::new(0.0, 1.2, 45.0));
+        assert!(throws(&mut far, &physics, off, &mut rng).is_empty());
+        // Hidden behind a wall after he saw her: no shot, none.
         let mut wall = ground();
         let shape = CollisionShape::mesh(
             &[
@@ -9047,38 +9096,17 @@ pub(crate) mod tests {
         .unwrap();
         wall.add_static(StaticKey::Cell(2), &shape, Vec3::ZERO, Quat::IDENTITY);
         wall.step(dt);
-        let mut thrown = Vec::new();
-        for _ in 0..60 * 6 {
-            soldier.update(&wall, &mut rng, Some(Vec3::new(0.0, 1.2, 15.0)), dt);
-            thrown.extend(soldier.throws.take());
-        }
-        assert_eq!(thrown.len(), 1, "one, then he waits");
-        assert!(thrown[0].distance(Vec3::new(0.0, 1.2, 15.0)) < 0.1);
-        // NoGrenades: none.
-        let post = Brain::Post { facing: 0.0 };
-        let mut held = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, post, Some(2));
-        held.ai.pursue_speed = 0.0;
-        held.ai.flags.no_grenades = true;
-        held.update(&physics, &mut rng, None, dt);
+        let mut hid = soldier(4, false, &mut rng);
         for _ in 0..30 {
-            held.update(&physics, &mut rng, Some(Vec3::new(0.0, 1.2, 15.0)), dt);
+            hid.update(&physics, &mut rng, her, dt);
         }
-        for _ in 0..60 * 6 {
-            held.update(&wall, &mut rng, Some(Vec3::new(0.0, 1.2, 15.0)), dt);
-            assert!(held.throws.take().is_none());
-        }
-        // Gone off (driven away): none either.
-        let post = Brain::Post { facing: 0.0 };
-        let mut left = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, post, Some(3));
-        left.ai.pursue_speed = 0.0;
-        left.update(&physics, &mut rng, None, dt);
+        assert!(hid.alert);
+        // Once out of his sight (half a second on), no throw.
         for _ in 0..30 {
-            left.update(&physics, &mut rng, Some(Vec3::new(0.0, 1.2, 15.0)), dt);
+            hid.update(&wall, &mut rng, her, dt);
+            hid.throws = None;
         }
-        for _ in 0..60 * 6 {
-            left.update(&physics, &mut rng, Some(Vec3::new(0.0, 1.2, 95.0)), dt);
-            assert!(left.throws.take().is_none());
-        }
+        assert!(throws(&mut hid, &wall, her, &mut rng).is_empty());
     }
 
     #[test]

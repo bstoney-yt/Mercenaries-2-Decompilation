@@ -7764,7 +7764,7 @@ mod picture_tests {
 /// best spot among the cover hints of the objects within the search radius
 /// of him ([`m2_engine::ai_cover`]), from the threat he named, away from
 /// his fellow soldiers (at most 15); none found, he asks again after
-/// [`m2_engine::ai_cover::RETRY`]. Rays are the physics' (the program's
+/// [`m2_engine::ai_mover::ASK_AGAIN`]. Rays are the physics' (the program's
 /// own filters are not modelled); the threat's eye is taken 1.3 m over
 /// where she stands (inferred).
 fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
@@ -7800,6 +7800,8 @@ fn serve_cover_untimed(world: &m2_engine::World, people: &mut crate::npc::People
         let mut cands = Vec::new();
         // Each candidate's cover object, for its claim.
         let mut objects: Vec<u32> = Vec::new();
+        // And its hint's `CoverAnimation`, for the combat mover.
+        let mut kinds: Vec<u8> = Vec::new();
         for (o, _) in world.near(centre, ai_cover::SEARCH) {
             let p = &world.index.objects[o];
             let Some(hints) = world.index.template_db.cover_hints.get(&p.template) else {
@@ -7816,6 +7818,7 @@ fn serve_cover_untimed(world: &m2_engine::World, people: &mut crate::npc::People
             for h in hints {
                 let c = ai_cover::candidates(&req, &placed, h);
                 objects.extend(std::iter::repeat_n(o as u32, c.len()));
+                kinds.extend(std::iter::repeat_n(h.animation, c.len()));
                 cands.extend(c);
             }
         }
@@ -7838,7 +7841,7 @@ fn serve_cover_untimed(world: &m2_engine::World, people: &mut crate::npc::People
         let found = picked.and_then(|(at, k)| {
             let object = objects[k];
             if people.cover_claims.claim(i as u32, object, centre, at) {
-                Some((at, object))
+                Some((at, object, kinds[k]))
             } else {
                 eprintln!(
                     "people: {:08x} cover at {at:.1} refused: claimed by another",
@@ -7850,8 +7853,9 @@ fn serve_cover_untimed(world: &m2_engine::World, people: &mut crate::npc::People
         });
         let n = &mut people.npcs[i];
         n.cover_ask = None;
-        n.cover_claim = found.map(|(_, object)| (object, 0.0));
-        let found = found.map(|(at, _)| at);
+        n.cover_claim = found.map(|(_, object, _)| (object, 0.0));
+        n.cover_kind = found.map_or(0, |(_, _, kind)| kind);
+        let found = found.map(|(at, _, _)| at);
         n.cover_spot = found;
         if let Some(at) = found {
             eprintln!(
