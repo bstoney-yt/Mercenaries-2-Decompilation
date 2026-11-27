@@ -169,6 +169,37 @@ pub struct Sense {
 pub struct Spot {
     pub at: Vec3,
     pub animation: u8,
+    /// The actions it gives (its +0x3C, +0x40, +0x48; 0 none), as the
+    /// cover service fills them (0x822CCBD0, 0x822CD0E0, 0x822CC908):
+    /// back into cover, settling in, and out of it (or the dive)
+    /// ([`spot_clips`]).
+    pub clips: [u32; 3],
+}
+
+/// The human state table's cover actions the spots give.
+pub const ENTER_COVER_LEFT: u32 = 0x5873_af69;
+pub const ENTER_COVER_RIGHT: u32 = 0x4809_f990;
+pub const ENTER_COVER_LEFT_IN_PLACE: u32 = 0x59c8_145d;
+pub const ENTER_COVER_RIGHT_IN_PLACE: u32 = 0xd9ce_3342;
+pub const ENTER_COVER_KNEEL: u32 = 0x3d37_e829;
+pub const EXIT_COVER: u32 = 0xe2bc_1dde;
+pub const DIVE_LEFT: u32 = 0x9bcb_d11c;
+pub const DIVE_RIGHT: u32 = 0xa20d_465b;
+
+/// A spot's actions (+0x3C, +0x40, +0x48) by its `CoverAnimation` and side
+/// (`left`: the cover service's side test, 0x822ED520, true), as the
+/// candidate builders fill them (0x822CCBD0 at 0x822CCE7C): SideStep, the
+/// way in and the way in in place on that side, and `ExitCover`; Dive, the
+/// dive the other way; Popup (0x822CC908), `EnterCoverKneel` to settle.
+pub fn spot_clips(animation: u8, left: bool) -> [u32; 3] {
+    match animation {
+        SIDE_STEP if left => [ENTER_COVER_LEFT, ENTER_COVER_LEFT_IN_PLACE, EXIT_COVER],
+        SIDE_STEP => [ENTER_COVER_RIGHT, ENTER_COVER_RIGHT_IN_PLACE, EXIT_COVER],
+        DIVE if left => [0, 0, DIVE_RIGHT],
+        DIVE => [0, 0, DIVE_LEFT],
+        POPUP => [0, ENTER_COVER_KNEEL, 0],
+        _ => [0; 3],
+    }
 }
 
 /// `CoverAnimation` Dive, SideStep and Popup (+0x54).
@@ -187,9 +218,8 @@ const AT_SPOT: f32 = 0.5;
 const AT_POPUP: f32 = 0.447;
 /// How near a destination counts as there: 0.1 squared (0x820BB468).
 const THERE: f32 = 0.316;
-/// The cover clips' stand-ins (invented: the spot's clips at +0x3C,
-/// +0x40, +0x48 are not wired): seconds a lean out or back and a dive
-/// take.
+/// The cover clips' stand-ins where a spot gives no action (invented):
+/// seconds a lean out or back and a dive take.
 pub const LEAN: f32 = 0.5;
 pub const DIVING: f32 = 1.0;
 /// A Popup spot's time down before he comes up again (0x820C7A20).
@@ -229,6 +259,10 @@ pub struct Out {
     pub grenade_pause: Option<f32>,
     /// Mark the spot bad for this many seconds and let it go.
     pub drop_spot: Option<f32>,
+    /// Play this action once (a cover clip of the spot's, or
+    /// [`EXIT_COVER`] at a Popup spot): the caller holds
+    /// [`Sense::one_shot`] while it runs.
+    pub play: Option<u32>,
 }
 
 /// The callout said when he starts closing in.
@@ -275,6 +309,9 @@ pub struct Mover {
     /// from it (+0x124 bit 0x20000).
     step: u8,
     fired: bool,
+    /// The state's (or the Popup step's) action has been asked for
+    /// (+0x124 bits 0x4000000, 0x2000000, 0x1000000).
+    played: bool,
 }
 
 impl Default for Mover {
@@ -302,6 +339,7 @@ impl Default for Mover {
             asked: false,
             step: 0,
             fired: false,
+            played: false,
         }
     }
 }
@@ -445,16 +483,38 @@ impl Mover {
                 self.stand(s);
                 self.step = 0;
                 self.fired = false;
+                self.played = false;
                 if self.current.state == State::Grenade {
                     out.grenade_pause = Some(rand() * PAUSE_START);
                 }
             }
             State::Dive => {
                 self.stand(s);
+                self.played = false;
                 out.drop_spot = Some(DIVE_BAD);
+            }
+            State::AtSpot | State::LeanOut | State::LeanBack => {
+                self.stand(s);
+                self.played = false;
             }
             _ => self.stand(s),
         }
+    }
+
+    /// Plays `action` once and says when it is over: asked for this tick,
+    /// over once the caller's one-shot has ended. With no action (0), over
+    /// after `fallback` seconds in the state.
+    fn clip_done(&mut self, action: u32, fallback: f32, s: &Sense, out: &mut Out) -> bool {
+        if action == 0 {
+            return self.t9c >= fallback;
+        }
+        if !self.played {
+            self.played = true;
+            self.t9c = 0.0;
+            out.play = Some(action);
+            return false;
+        }
+        self.t9c > 0.0 && !s.one_shot
     }
 
     fn exit(&mut self, s: &Sense) {
@@ -565,6 +625,10 @@ impl Mover {
                 if Self::off_spot(s, AT_SPOT) {
                     self.go(State::Decide, State::Idle);
                 } else if self.in_state >= 2.0 && !s.one_shot {
+                    // Its settling-in action first (+0x40), once.
+                    if spot.clips[1] != 0 && !self.clip_done(spot.clips[1], 0.0, s, out) {
+                        return;
+                    }
                     match spot.animation {
                         SIDE_STEP => self.go(State::LeanOut, State::Idle),
                         DIVE => self.go(State::Dive, State::Idle),
@@ -574,10 +638,15 @@ impl Mover {
                 }
             }
             State::LeanOut | State::LeanBack => {
-                if s.spot.is_none() {
+                let Some(spot) = s.spot else {
                     self.go(State::SpotLost, State::Idle);
-                } else if self.t9c >= LEAN {
-                    let next = if self.current.state == State::LeanOut {
+                    return;
+                };
+                // Out (+0x48, 0x822C5C80) or back in (+0x3C, 0x822C6028).
+                let out_of = self.current.state == State::LeanOut;
+                let action = spot.clips[if out_of { 2 } else { 0 }];
+                if self.clip_done(action, LEAN, s, out) {
+                    let next = if out_of {
                         State::LeanFire
                     } else {
                         State::AtSpot
@@ -600,11 +669,13 @@ impl Mover {
                 }
             }
             State::Dive => {
-                if self.t9c >= DIVING && !s.one_shot {
+                // Its dive (+0x48, 0x822C6208).
+                let action = s.spot.map_or(0, |spot| spot.clips[2]);
+                if self.clip_done(action, DIVING, s, out) {
                     self.back(State::Stand);
                 }
             }
-            State::Popup => self.popup(s),
+            State::Popup => self.popup(s, out),
             State::SpotLost => {
                 self.ask_wait = 0.0;
                 if !s.busy {
@@ -634,24 +705,36 @@ impl Mover {
 
     /// A Popup spot (0x822C6398): down, up after [`POPUP_DOWN`] s, a
     /// burst, the grenade gate, down again.
-    fn popup(&mut self, s: &Sense) {
+    fn popup(&mut self, s: &Sense, out: &mut Out) {
         if Self::off_spot(s, AT_POPUP) {
             self.go(State::SpotLost, State::Idle);
             return;
         }
+        let kneel = s.spot.map_or(0, |spot| spot.clips[1]);
         match self.step {
             0 => {
+                // Down: the spot's settling in (`EnterCoverKneel`, to the
+                // `CrouchCover` stance).
                 self.stance = Stance::Crouch;
-                if !s.one_shot {
+                if !s.one_shot && self.clip_done(kneel, 0.0, s, out) {
                     self.step = 1;
+                    self.played = false;
                     self.t9c = 0.0;
                 }
             }
             1 => {
                 if self.t9c > POPUP_DOWN && !s.held {
+                    self.step = 4;
+                    self.played = false;
+                }
+            }
+            4 => {
+                // Up: `ExitCover` (0x822C6398's step 2).
+                if self.clip_done(EXIT_COVER, 0.0, s, out) {
                     self.step = 2;
                     self.stance = Stance::Stand;
                     self.fired = false;
+                    self.played = false;
                 }
             }
             2 => {
@@ -664,7 +747,10 @@ impl Mover {
                     }
                 }
             }
-            _ => self.step = 0,
+            _ => {
+                self.step = 0;
+                self.played = false;
+            }
         }
     }
 
@@ -768,6 +854,7 @@ mod tests {
             any.throw = any.throw.or(o.throw);
             any.grenade_pause = o.grenade_pause.or(any.grenade_pause);
             any.drop_spot = any.drop_spot.or(o.drop_spot);
+            any.play = o.play.or(any.play);
         }
         any
     }
@@ -917,6 +1004,7 @@ mod tests {
         let spot = Spot {
             at: Vec3::new(4.0, 0.0, 0.0),
             animation: SIDE_STEP,
+            clips: [0; 3],
         };
         let got = Sense {
             spot: Some(spot),
@@ -939,6 +1027,7 @@ mod tests {
         let spot = Spot {
             at: Vec3::ZERO,
             animation: SIDE_STEP,
+            clips: [0; 3],
         };
         let s = Sense {
             spot: Some(spot),
@@ -973,6 +1062,7 @@ mod tests {
             spot: Some(Spot {
                 at: Vec3::ZERO,
                 animation: DIVE,
+                clips: [0; 3],
             }),
             ..sense()
         };
@@ -990,13 +1080,17 @@ mod tests {
             spot: Some(Spot {
                 at: Vec3::ZERO,
                 animation: POPUP,
+                clips: [0; 3],
             }),
             ..sense()
         };
         let mut m = at_state(State::Popup, State::Idle);
         run(&mut m, &s, 0.2, 0.5);
         assert_eq!(m.stance, Stance::Crouch);
-        run(&mut m, &s, 3.0, 0.5);
+        // Up after 3 s down, by `ExitCover` (asked for, then over: no
+        // clip held here).
+        let o = run(&mut m, &s, 3.4, 0.5);
+        assert_eq!(o.play, Some(EXIT_COVER));
         assert_eq!(m.stance, Stance::Stand);
         // Off the spot: lost.
         let off = Sense {
@@ -1039,6 +1133,52 @@ mod tests {
         }
         assert_eq!(throw_speed(10.0), 15.0);
         assert!((throw_speed(40.0) - 20.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_side_step_spot_plays_its_actions_and_waits_for_them() {
+        // The cover service's actions for a SideStep spot on the left
+        // (0x822CCBD0), a Dive the other way, a Popup's kneel.
+        assert_eq!(
+            spot_clips(SIDE_STEP, true),
+            [ENTER_COVER_LEFT, ENTER_COVER_LEFT_IN_PLACE, EXIT_COVER]
+        );
+        assert_eq!(spot_clips(DIVE, true), [0, 0, DIVE_RIGHT]);
+        assert_eq!(spot_clips(POPUP, false), [0, ENTER_COVER_KNEEL, 0]);
+        let spot = Spot {
+            at: Vec3::ZERO,
+            animation: SIDE_STEP,
+            clips: spot_clips(SIDE_STEP, false),
+        };
+        let s = Sense {
+            spot: Some(spot),
+            ..sense()
+        };
+        let mut m = at_state(State::AtSpot, State::Idle);
+        // After 2 s, the settling in, once.
+        let mut asked = None;
+        for _ in 0..30 {
+            asked = m.tick(&s, &mut || 0.5).play;
+            if asked.is_some() {
+                break;
+            }
+        }
+        assert_eq!(asked, Some(ENTER_COVER_RIGHT_IN_PLACE));
+        assert!(m.in_state >= 2.0);
+        // While its clip runs he stays; then out by `ExitCover`.
+        let busy = Sense {
+            one_shot: true,
+            ..s
+        };
+        let o = run(&mut m, &busy, 1.0, 0.5);
+        assert_eq!((m.state(), o.play), (State::AtSpot, None));
+        let o = run(&mut m, &s, 0.2, 0.5);
+        assert_eq!(m.state(), State::LeanOut);
+        assert_eq!(o.play, Some(EXIT_COVER));
+        run(&mut m, &busy, 1.0, 0.5);
+        assert_eq!(m.state(), State::LeanOut);
+        run(&mut m, &s, 0.2, 0.5);
+        assert_eq!(m.state(), State::LeanFire);
     }
 
     #[test]
