@@ -209,6 +209,28 @@ return 0
 /// `Loading.wad`).
 const FADE_WIPE: f64 = 2.0;
 
+/// `Pg.SaveGame("retry")` keeps the scripts' save data before it returns:
+/// from the 360 code, `lua_Pg_SaveGame` (0x823387C8) hands the slot to
+/// 0x8230C200, which for "retry" (0x820D3A34) records the players'
+/// places and writes the save there and then (0x8230C4A8), into a buffer
+/// of the game's own. Kept at the end of the scripts' tick instead (the
+/// port's earlier way), a contract that cancels in the same tick (or
+/// moves on) is saved as it stands then: a cancel a moment after
+/// `MrxTaskContract`'s `_Checkpoint` saved MecCon001 cancelled, and its
+/// Retry brought back only its briefing. The native is wrapped: after it
+/// returns, `__m2_keep_retry` writes the save at once.
+const RETRY_AT_CALL: &str = r#"
+local pg = rawget(_G, "Pg")
+if type(pg) ~= "table" or type(pg.SaveGame) ~= "function" then return false end
+local native = pg.SaveGame
+pg.SaveGame = function(slot, ...)
+    local r = native(slot, ...)
+    if slot == "retry" then __m2_keep_retry() end
+    return r
+end
+return true
+"#;
+
 /// Skip mode (which [`Mission::start`] turns on so the intro movies end
 /// at once) also has `MrxUtil.TeleportHeroesToLocations` skip the
 /// teleport and only call back: with the movies held for the game, the
@@ -944,8 +966,38 @@ impl Mission {
             script_join: false,
             joined: false,
         };
+        mission.keep_retry_at_call();
         mission.settle("set-up");
         Ok(mission)
+    }
+
+    /// Has `Pg.SaveGame("retry")` keep the retry save during the call, as
+    /// the 360's does ([`RETRY_AT_CALL`]).
+    fn keep_retry_at_call(&mut self) {
+        let world = self.world.clone();
+        let lua = self.host.lua();
+        let installed = lua
+            .create_function(move |lua, ()| {
+                let text = crate::savedata::generate(lua, BOOTSTRAP)?;
+                let n = text.len();
+                let mut w = world.borrow_mut();
+                w.retry_save = Some(text);
+                w.retry_kept = true;
+                Ok(n)
+            })
+            .and_then(|keep| lua.globals().set("__m2_keep_retry", keep))
+            .and_then(|()| {
+                lua.load(RETRY_AT_CALL)
+                    .set_name("=retry at call")
+                    .eval::<bool>()
+            });
+        match installed {
+            Ok(true) => {}
+            Ok(false) => self.log.push("retry at call: no Pg.SaveGame".into()),
+            Err(e) => self
+                .log
+                .push(format!("retry at call: {}", first_lines(&e.to_string()))),
+        }
     }
 
     /// The first entity of any layer (loaded or not) whose object script
@@ -2995,14 +3047,26 @@ end
                 commands.extend(self.report(&format!("{when}, {ran} modules loaded")));
             }
             let mut delivered = 0;
-            // The retry save the scripts take as a contract starts is kept
-            // now, as the 360's `Pg.SaveGame("retry")` keeps it before it
-            // returns ([`keep_retry`](Self::keep_retry)).
+            // The retry save the scripts take as a contract starts was kept
+            // during their call ([`RETRY_AT_CALL`]), as the 360's
+            // `Pg.SaveGame("retry")` keeps it before it returns; if not
+            // (the wrapper missing), now ([`keep_retry`](Self::keep_retry)).
+            let kept_at_call = std::mem::take(&mut self.world.borrow_mut().retry_kept);
             if commands
                 .iter()
                 .any(|c| matches!(c, Command::Save { slot } if slot == api::RETRY))
             {
-                match self.keep_retry() {
+                let kept = if kept_at_call {
+                    Ok(self
+                        .world
+                        .borrow()
+                        .retry_save
+                        .as_ref()
+                        .map_or(0, String::len))
+                } else {
+                    self.keep_retry()
+                };
+                match kept {
                     Ok(n) => self
                         .log
                         .push(format!("  save: the retry save kept, {n} bytes")),
@@ -3589,6 +3653,34 @@ pub(crate) fn is_exclusion(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// From the 360 code: `Pg.SaveGame("retry")` writes the save during
+    /// the call. The wrapped native keeps it before it returns, for the
+    /// retry slot only, so what the scripts do next in the same tick (a
+    /// cancel) is not in it.
+    #[test]
+    fn the_retry_save_is_kept_during_the_call() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            got = {}
+            Pg = { SaveGame = function(slot) got[#got + 1] = "native " .. slot return true end }
+            state = "active"
+            function __m2_keep_retry() got[#got + 1] = "kept " .. state end
+            "#,
+        )
+        .exec()
+        .unwrap();
+        assert!(lua.load(RETRY_AT_CALL).eval::<bool>().unwrap());
+        lua.load(r#"assert(Pg.SaveGame("retry")) state = "cancelled" Pg.SaveGame("autosave")"#)
+            .exec()
+            .unwrap();
+        let got: Vec<String> = lua.load("return got").eval().unwrap();
+        assert_eq!(got, ["native retry", "kept active", "native autosave"]);
+        // Without Pg.SaveGame, nothing is wrapped.
+        let bare = mlua::Lua::new();
+        assert!(!bare.load(RETRY_AT_CALL).eval::<bool>().unwrap());
+    }
+
     // `autogunship` is run, under the name its hash is of: the scripts'
     // globals are the module's name.
     #[test]
