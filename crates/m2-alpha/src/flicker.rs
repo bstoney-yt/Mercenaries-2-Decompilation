@@ -111,30 +111,51 @@ const SLOW: Pan = Pan {
     turn: 0.05 * std::f32::consts::PI / 180.0,
     step: 0.02,
 };
-/// Where to look from and at: from her eye to the nearest tree 8-60 m off
-/// (a few metres up its trunk), else along her facing.
+/// Where to look from and at: from her eye to the crown (4 m up its trunk)
+/// of the nearest tree 8-60 m off that nothing static stands in front of,
+/// else along her facing.
 fn aim(game: &Game) -> Option<(Vec3, Vec3, Option<f32>)> {
     let p = game.scene.player.as_ref()?;
     let eye = p.character.position + Vec3::Y * 1.7;
     let ahead = Vec3::new(p.facing.sin(), 0.0, p.facing.cos());
     let tree = game.scene.world.as_ref().and_then(|w| {
-        w.index
+        let mut trees: Vec<(f32, Vec3)> = w
+            .index
             .objects
             .iter()
             .filter(|o| m2_engine::world::tree_species(o.entity).is_some())
-            .map(|o| (o.position.distance(eye), o.position))
+            .map(|o| o.position + Vec3::Y * CROWN)
+            .map(|at| (at.distance(eye), at))
             .filter(|(d, _)| (8.0..=60.0).contains(d))
-            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .collect();
+        trees.sort_by(|a, b| a.0.total_cmp(&b.0));
+        trees.into_iter().find(|&(d, at)| {
+            // In sight: no wall or ground before the last few metres
+            // (its own trunk may stand there).
+            w.physics
+                .cast_ray(eye, (at - eye) / d, (d - SIGHT_SLACK).max(0.0))
+                .is_none()
+        })
     });
     Some(match tree {
-        Some((d, at)) => (eye, at + Vec3::Y * 4.0, Some(d)),
+        Some((d, at)) => (eye, at, Some(d)),
         None => (eye, eye + ahead * 20.0, None),
     })
 }
 
-/// Runs the check and exits: PASS when, on the slow pan, the game's
-/// picture (every map each frame, anti-aliasing on) flickers less than
-/// the same without anti-aliasing, and no more than the staggered maps.
+/// How much more than with the earlier sampling the game's picture may
+/// flicker (this check's choice, invented).
+const EARLIER_MARGIN: f64 = 1.1;
+
+/// Height of a tree's crown above its base, and how far short of it the
+/// sight line may be blocked (both this check's choice, invented).
+const CROWN: f32 = 4.0;
+const SIGHT_SLACK: f32 = 3.0;
+
+/// Runs the check and exits: PASS when a tree is in sight and, on the
+/// slow pan at it, the game's picture flickers no more than a tenth over
+/// the same picture with the renderer's earlier texture sampling (8x
+/// anisotropic, no LOD bias), drawn from the same view in the same run.
 pub fn check(
     backend: &mut WgpuBackend,
     game: &mut Game,
@@ -148,14 +169,17 @@ pub fn check(
     };
     match tree {
         Some(d) => eprintln!("flicker-check: from {eye:.1} at a tree {d:.1} m off ({at:.1})"),
-        None => eprintln!("flicker-check: no tree 8-60 m off; looking ahead from {eye:.1}"),
+        None => {
+            eprintln!("flicker-check: no tree in sight 8-60 m off; looking ahead from {eye:.1}")
+        }
     }
-    let (on_foot, camera, shadows, schedule, antialias) = (
+    let (on_foot, camera, shadows, schedule, antialias, earlier) = (
         game.on_foot,
         game.camera,
         game.picture.shadows,
         backend.shadow_schedule(),
         backend.antialias(),
+        backend.earlier_sampling(),
     );
     game.on_foot = false;
     let (w, h) = backend.size();
@@ -222,10 +246,14 @@ pub fn check(
         true,
     )?;
     let off = rate(backend, game, SLOW, "noshadow", every, false, true)?;
-    let pass = game_rate < no_aa && game_rate <= staggered + 1e-6;
+    backend.set_earlier_sampling(true);
+    let main = rate(backend, game, SLOW, "earlier", every, true, true)?;
+    backend.set_earlier_sampling(false);
+    let pass = tree.is_some() && game_rate <= main * EARLIER_MARGIN + 1e-6;
     eprintln!(
-        "flicker-check: slow pan: game {game_rate:.5}, no anti-aliasing {no_aa:.5}, staggered {staggered:.5}, shadows off {off:.5}, still {floor:.5}"
+        "flicker-check: slow pan: game {game_rate:.5}, earlier sampling {main:.5}, no anti-aliasing {no_aa:.5}, staggered {staggered:.5}, shadows off {off:.5}, still {floor:.5}"
     );
+    backend.set_earlier_sampling(earlier);
     backend.set_shadow_schedule(schedule);
     backend.set_antialias(antialias);
     game.picture.shadows = shadows;

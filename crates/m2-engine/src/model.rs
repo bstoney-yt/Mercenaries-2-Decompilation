@@ -33,13 +33,17 @@ use crate::physics::{CollisionShape, PathSolid};
 use crate::technique::Technique;
 
 /// An uploaded texture and what its pixels say about it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Uploaded {
     pub handle: TextureHandle,
     /// Its alpha cuts shapes out.
     pub alpha: bool,
     /// As a normal map, x is in alpha rather than red.
     pub alpha_x: bool,
+    /// Its mip LOD bias (see [`DecodedTexture::lod_bias`]).
+    pub lod_bias: f32,
+    /// Its header's flags (see [`DecodedTexture::flags`]).
+    pub flags: u16,
 }
 
 /// What a model material is cached by.
@@ -145,6 +149,8 @@ impl MaterialCache {
                     handle,
                     alpha,
                     alpha_x: alpha_holds_x(t),
+                    lod_bias: t.lod_bias,
+                    flags: t.flags,
                 })
             }
             _ => None,
@@ -376,6 +382,12 @@ impl MaterialCache {
             // the eye; ours did, under `M2_BEAM=old`.
             soft_edge: beam && old_beam,
             beam,
+            lod_bias: texture_hash
+                .and_then(|t| self.uploaded(t))
+                .map_or(0.0, |t| t.lod_bias),
+            texture_flags: texture_hash
+                .and_then(|t| self.uploaded(t))
+                .map_or(0, |t| t.flags),
             ..MaterialDesc::default()
         };
         let tinted = debug_tint(material, desc.texture.is_some());
@@ -2769,6 +2781,8 @@ mod tests {
             mips: vec![vec![255; 64]],
             alpha: true,
             linear: false,
+            lod_bias: 0.0,
+            flags: 0,
         };
         let (handle, alpha) = upload_texture(&mut backend, &t).unwrap();
         assert!(alpha);
@@ -2789,6 +2803,8 @@ mod tests {
             mips: vec![vec![1, 2, 3, 255]],
             alpha: false,
             linear: false,
+            lod_bias: 0.0,
+            flags: 0,
         };
         cache.add_texture(&mut backend, 10, Some(&t)).unwrap();
         cache.add_texture(&mut backend, 11, Some(&t)).unwrap();
@@ -2827,9 +2843,13 @@ mod tests {
             mips: vec![vec![1, 2, 3, 255]],
             alpha: false,
             linear: false,
+            lod_bias: 0.0,
+            flags: 0,
         };
         let cutout = DecodedTexture {
             alpha: true,
+            lod_bias: -1.0,
+            flags: 0x47,
             ..opaque.clone()
         };
         cache.add_texture(&mut backend, 10, Some(&opaque)).unwrap();
@@ -2958,6 +2978,8 @@ mod complete_mips_tests {
             mips,
             alpha: false,
             linear: false,
+            lod_bias: 0.0,
+            flags: 0,
         }
     }
 

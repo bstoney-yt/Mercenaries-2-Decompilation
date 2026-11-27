@@ -9,11 +9,12 @@
 //! 0x02  u16      height
 //! 0x04  u16      depth (always 1 so far)
 //! 0x06  u16      mip count
-//! 0x08  u16      flags; 0x20 is set on every specular map, the rest unknown
+//! 0x08  u16      flags; the sampler's (see below), and 0x20 on every
+//!                specular map
 //! 0x0A  u16      kind: 1 = 2D, 2 = cube
 //! 0x0C  u16      unknown (1 or 2)
 //! 0x0E  u32      D3DFORMAT ('DXT1', 'DXT5' or 21 = A8R8G8B8)
-//! 0x12  f32      probably the mip LOD bias
+//! 0x12  f32      the mip LOD bias
 //! 0x16  u32      bytes in the whole chain, every face and mip
 //! 0x1A  u16 x 4  mip masks of quality tiers Q0 to Q3 (bit n = mip n);
 //!                0xFFFF in Q3 means every mip
@@ -23,6 +24,13 @@
 //! side reaches 4 rather than going down to 1x1, but the header's mip count
 //! is authoritative. Mips are stored largest first with no padding. A cube
 //! map stores each face's whole chain in turn (+X, -X, +Y, -Y, +Z, -Z).
+//!
+//! The 360 reads 0x08 and 0x12 into the texture (0x82202EC8) and sets each
+//! sampler from them when it binds it (0x82203958): flag 0x01 point
+//! filtering with no mips, 0x80 anisotropic with no mips, otherwise linear
+//! with linear mips (0x40: nearest mip); 0x02, 0x04 and 0x08 clamp u, v
+//! and w; 0x10 is passed to a device state for one format only; and the
+//! bias goes into the fetch constant as is.
 //!
 //! # Streamed mips
 //!
@@ -184,7 +192,7 @@ pub struct TextureInfo {
     /// Field at 0x0C.
     pub unk_0x0c: u16,
     pub format: PixelFormat,
-    /// Field at 0x12; probably the mip LOD bias.
+    /// Field at 0x12: the mip LOD bias (0x82203958).
     pub lod_bias: f32,
     /// Bytes in the whole chain, as stored in the header.
     pub chain_len: u32,
