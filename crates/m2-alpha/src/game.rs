@@ -6723,8 +6723,9 @@ const WADE: f32 = 1.4;
 /// and where she lands, world space: the hardpoint of the seat's exit
 /// entrance at the hull's height (0x822A1B70 puts a ditching rider there;
 /// Invented for the animated exit, whose clip is not played), or beside
-/// the hull by the door when the way there is blocked (Invented stand-in
-/// for 0x822A13D0's clear point) or the hardpoint lies within the hull (a
+/// the vehicle at the clear point search's first place she fits when the
+/// way there is blocked ([`clear_point_indexed`], 0x822A13D0), or beside
+/// the hull by the door when the hardpoint lies within the hull (a
 /// boat's driver gets out at the seat itself).
 /// Her seat in `v` (its `SeatLink` name `her_seat`; `None`, the
 /// driver's), as [`exit_plan`] finds it.
@@ -6768,10 +6769,45 @@ fn exit_plan(
         blocked,
     );
     let place = match (kind, place) {
-        (ExitKind::Snap, _) | (_, None) => door_out(at, &v.spec),
+        // Her way out blocked: the clear point search's first place she
+        // fits (0x822A13D0 -> 0x8239F440); none, beside the hull by the
+        // door (the alpha's own).
+        (ExitKind::Snap, _) => clear_point(physics, v, at).unwrap_or_else(|| door_out(at, &v.spec)),
+        (_, None) => door_out(at, &v.spec),
         (_, Some(p)) => p,
     };
     (kind, place)
+}
+
+/// The clear point search (0x8239F440, from 0x822A13D0): the first of
+/// [`m2_engine::seats::clear_points`] round `v` (standing at `at`) where
+/// she fits, at the hull's height. From the 360 code but for the fit:
+/// here a clear ray from the vehicle's middle at 1.2 m to the place
+/// (inferred; the 360 tests her capsule there). The index it took with it.
+pub(crate) fn clear_point_indexed(
+    physics: &Physics,
+    v: &ParkedVehicle,
+    at: Mat4,
+) -> Option<(usize, Vec3)> {
+    let id = v.id?;
+    let (lo, hi) = v.spec.bounds;
+    let centre = at.transform_point3((lo + hi) * 0.5);
+    let base = at.transform_point3(Vec3::ZERO).y;
+    let ahead = at.transform_vector3(Vec3::Z);
+    let yaw = ahead.x.atan2(ahead.z);
+    let from = centre.with_y(base + 1.2);
+    m2_engine::seats::clear_points(centre, yaw, (hi - lo).length() * 0.5)
+        .into_iter()
+        .enumerate()
+        .find(|(_, q)| {
+            let way = q.with_y(from.y) - from;
+            physics.cast_ray_past(from, way, way.length(), id).is_none()
+        })
+        .map(|(k, q)| (k, q.with_y(base)))
+}
+
+fn clear_point(physics: &Physics, v: &ParkedVehicle, at: Mat4) -> Option<Vec3> {
+    clear_point_indexed(physics, v, at).map(|(_, q)| q)
 }
 
 /// Her way out of `v` (standing at `at`) from `her_seat` (else the

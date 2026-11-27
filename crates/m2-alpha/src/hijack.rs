@@ -2059,21 +2059,7 @@ impl Hijacks {
         let (lo, hi) = v.spec.bounds;
         let inside = (lo.x..=hi.x).contains(&local.x) && (lo.z..=hi.z).contains(&local.z);
         let clear = || {
-            let id = v.id?;
-            let centre = at.transform_point3((lo + hi) * 0.5);
-            let ahead = at.transform_vector3(Vec3::Z);
-            let yaw = ahead.x.atan2(ahead.z);
-            let from = centre.with_y(place.y + 1.2);
-            m2_engine::seats::clear_points(centre, yaw, (hi - lo).length() * 0.5)
-                .into_iter()
-                .enumerate()
-                .find(|(_, q)| {
-                    let way = q.with_y(from.y) - from;
-                    world
-                        .physics
-                        .cast_ray_past(from, way, way.length(), id)
-                        .is_none()
-                })
+            crate::game::clear_point_indexed(&world.physics, v, at)
                 .map(|(k, q)| (k, q.with_y(place.y)))
         };
         match (inside, inside.then(clear).flatten()) {
