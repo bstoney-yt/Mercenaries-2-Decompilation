@@ -43,6 +43,8 @@ available, (6) Correction, (7) Verification and (8) Risk.
 | [P5](#p5) | Collision materials: friction and restitution per surface not read | Behavioral | P3 | Data, Ghidra |
 | [P6](#p6) | Projectile guidance law, drag and range not established from code | Behavioral | P3 | Ghidra |
 | [P7](#p7) | Props as bodies: the fake-prop mass changer, prop-to-prop and prop-to-person contacts, crash rules on island objects' bodies | Behavioral | P2 | Ghidra, footage |
+| [P8](#p8) | Fast-mover sweep: the 360's per-body anti-tunnelling cast and plane limit vs. Rapier CCD on every body | Behavioral | P3 | Ghidra, footage |
+| [P9](#p9) | A vehicle's first-step settle: the dock trailers ease back less than the 360's after their kick; an empty car's brakes not traced | Behavioral | P3 | Ghidra, Xenia |
 | [I1](#i1) | Layer `Anchor` component not ported: anchor distances and threat-release bits unread | Behavioral | P2 | Ghidra, data |
 | [U6](#u6) | Flash text: one color per field, no kerning, HTML reduced to `<font color>` | Visual | P3 | Data census |
 | [M4](#m4) | Swimming depths, float height, speed and stroke rate invented | Animation/movement | P3 | Footage, Ghidra |
@@ -694,6 +696,41 @@ Refreshed 2026-11-27. Most of this gap is closed on `main`.
 6. **Correction:** Add a contact-modification hook that scales the vehicle's side by `min(1, m_prop / m_vehicle x ratio)` for fake props. Let debris meet debris once pieces start apart. Give island objects' bodies the crash rules, then drop #676's corrections.
 7. **Verification:** `--prop-bodies-check` and `--prop-limits-check` in a town (`--spawn 2800,-1100`), `--cargo-check` at OilCon020 (goods that came in as bodies must ride), `--wreck-blast-check` (blasts push body props), and Xenia drives into café furniture against the port's speed loss.
 8. **Risk:** Medium. Every prop that comes loose is now a body: watch frame time in dense towns, and goods on load beds.
+
+### P8
+
+**Fast-mover sweep (anti-tunnelling)** · Behavioral discrepancy · P3
+
+1. **Original:** From the 360 code:
+   - Each object rebuild (0x821831B0) ends by building a sweep object per body (0x82183FC8 -> 0x821A0A78; vtable 0x820C9460). It has a filter on layers 2..7 (0x824CD1A0) and a size at +0x6C.
+   - Its update (0x821A0E90) runs on every third call (a counter 0, 1, 2).
+     - When the body's speed x dt x a factor (0x820F9644) exceeds the size, and it has moved less than a bound (0x820D9F18) since the last cast, it casts from its last place to its place (0x82167400).
+     - It keeps the hit plane and the collider, and the last place otherwise.
+   - Its step (0x821A0C00) intersects the body's next move with that plane (0x82198DD8) and, if it would cross, limits it (vector code, not decoded).
+2. **Ours:** Rapier's continuous collision (`ccd_enabled`) is on for every loose piece, gun, vehicle chassis, turret body and ragdoll body (`Physics::add_piece`, `add_gun`, `add_vehicle_turned`, `add_asset_ragdoll`, `add_ragdoll`). It applies Rapier's own sweep every step and its own speed rule; it has none of the 360's period, factor, size or plane limit.
+3. **Difference:** Not measured. Expected: the port sweeps more often and on different terms; a fast body's stop at a thin wall may differ.
+4. **Likely cause:** Rapier's CCD stands in; the 360's sweep was found only while tracing the trailers (#769).
+5. **Evidence:** 360 code as listed. The factor 0x820F9644, the bound 0x820D9F18, and the size each body's sweep is given are not read. The limit in 0x821A0C00 is vector code.
+6. **Correction:** Read the constants and the limit. Then either drive Rapier's CCD per body by the 360's rule (the size, the factor, every third step), or port the sweep and its plane limit and turn Rapier's CCD off.
+7. **Verification:** A thin-wall test: a body at the 360's threshold speed against a 0.1 m wall. Footage or Xenia of a flung wreck or debris against a fence (#728's wreck spot).
+8. **Risk:** Medium. It changes every fast body's collisions: wrecks, debris, ragdolls and vehicles at speed.
+
+### P9
+
+**A vehicle's first steps after it is added** · Behavioral discrepancy · P3
+
+1. **Original:** From the 360 code and Xenia:
+   - The wheel set-up (0x8219EF90) starts each spring's last length at Cmp / L, with its contact (+0x34) at 0. The first wheel step finds no ground (0x8219F62C) and sets it to L, and the next one kicks by c × (L − cur) (0x8219F510). Xenia sub1 shows this order in the add frame for the dock's trailers; axle1's "no −0.15 step" was a poll miss.
+   - The axle push (0x821A08D8, hand-decoded) opposes the point velocity v + ω × (P − CoM), with its coefficients from 0x8219FE80. An empty car's coefficients aren't read.
+   - The trailers ease back along their length after the kick: the Fuel Trailer by 0.50 m and the Box Trailer by 0.25 m (Xenia sub1).
+   - The spring push goes along the contact plane's normal at the spring's top (0x8219F510). The car step then takes its level part off by the footing, x and z × (1 − C+0x178) (0x8219C27C). 0x8219E020 works the footing out before the car step (0x8219ECE8). Inferred: from the last step's ground, since C+0x178's writer is not found; Xenia p769b's El Grande kick, about 3° off its up on a 9° pad, supports this.
+2. **Ours:** the same first-step path and kick, with the level part stripped by the last step's footing (none on the kick). An unoccupied wheeled vehicle's axles now take the 360's no-input slowing; the port's invented parked hold (`HANDBRAKE` / `HOLD`) is removed for them. Engine-only, the Fuel Trailer comes to 0.37 m and the Box Trailer to 0.14 m.
+3. **Difference:** the Fuel Trailer about 0.13 m short and the Box Trailer about 0.11 m short of the 360's ease-back.
+4. **Likely cause:** not established. Candidates are the axle coefficients the 360 passes for an empty car, the push point (sway) during a kick, and the 360's 2 substeps per 1/30 s frame.
+5. **Evidence:** 360 code as listed; Xenia sub1, wheels2 and axle1 logs. `springs:` log lines (per spring and per step) for the watched vehicles.
+6. **Correction:** read 0x8219FE80 / 0x8219FB08 for a car with nobody at the wheel, or have Xenia log 0x821A08D8's arguments on a trailer's kick frames.
+7. **Verification:** `--parked-settle-check` at the dock (`--spawn 1265,392`), against sub1's rest poses.
+8. **Risk:** Low. It changes how far parked vehicles ease after they are added.
 
 ## UI
 

@@ -34,10 +34,6 @@ use m2_render::{DrawQueue, RenderBackend};
 /// prop).
 const CARGO_KG: f32 = 50.0;
 
-/// How far over the bed's floor goods sunk in it start, metres (invented:
-/// a hair, for the solver).
-const BED_CLEAR: f32 = 0.02;
-
 /// A prop riding loose on a vehicle's load bed ([`Props::load`]).
 #[derive(Clone, Copy, Debug)]
 struct Riding {
@@ -219,13 +215,20 @@ pub struct Props {
     /// are pulled that many times the world's gravity
     /// ([`Physics::set_debris_gravity`]).
     pub gravity_scales: HashMap<u32, f32>,
-    /// Shown since their model came in, their collision not yet up.
-    unwalled: HashSet<u32>,
+    /// Shown since their model came in, their collision (or body) not yet
+    /// up: built in order within the rebuild's budget each update
+    /// ([`BuildQueue`]).
+    unwalled: BuildQueue,
     /// Put up by the scripts from a template with no physics component
     /// ([`m2_engine::durability::physical`]): drawn, but with no
     /// collision, as on the 360 (the paradrop plane, whose jumpers are
     /// made inside it: q618g, 7 of 16 stood on it at 123 m).
     bodiless: HashSet<u32>,
+    /// Goods standing on a scripts' vehicle's load bed, not loaded yet
+    /// ([`Props::hold_on_bed`]): no collision of their own until they are
+    /// (Xenia p769a: OilCon020's crates had no body until their first
+    /// physics, after the El Grande under them slept).
+    held: HashSet<u32>,
     /// Those a vehicle broke some parts of, a part at a time (a hedge's
     /// sections, a gate's leaf): which parts, and the nodes that hides.
     parts_down: HashMap<u32, PartsDown>,
@@ -358,6 +361,54 @@ struct Near {
 /// How long uploading loaded models may take a frame (at least one is).
 const UPLOAD_BUDGET: Duration = Duration::from_millis(4);
 
+/// The rebuild's time each update ([`BuildQueue`]): from the 360 code, 0.01 s
+/// (0x820B7AE0, read in 0x82152780).
+const REBUILD_BUDGET: Duration = Duration::from_millis(10);
+
+/// The objects waiting for their collision or body, as the 360's object
+/// rebuild queue runs them (0x82152780, from the physics manager's update
+/// 0x82152B68):
+/// - in the order they were queued (first in, first built);
+/// - before each build the time since the loop began, by the time base
+///   (TBLr over 0x82E80668's rate), is checked against 0.01 s (0x820B7AE0),
+///   and once over it the loop stops (so at least one builds each update);
+/// - what is left stays queued, in order, for the next update.
+///
+/// The port measures with the wall clock ([`Instant`]). INFERRED: its build
+/// costs differ from the 360's, so where a batch splits differs.
+#[derive(Debug, Default)]
+pub(crate) struct BuildQueue {
+    order: std::collections::VecDeque<u32>,
+    queued: HashSet<u32>,
+}
+
+impl BuildQueue {
+    /// Queues `e` (once).
+    pub(crate) fn insert(&mut self, e: u32) -> bool {
+        let new = self.queued.insert(e);
+        if new {
+            self.order.push_back(e);
+        }
+        new
+    }
+
+    /// Whether `e` waits.
+    pub(crate) fn contains(&self, e: &u32) -> bool {
+        self.queued.contains(e)
+    }
+
+    /// The next to build, if `elapsed` since this update's loop began is
+    /// not over `budget` (checked before each build, 0x82152780).
+    pub(crate) fn next_within(&mut self, budget: Duration, elapsed: Duration) -> Option<u32> {
+        if elapsed > budget {
+            return None;
+        }
+        let e = self.order.pop_front()?;
+        self.queued.remove(&e);
+        Some(e)
+    }
+}
+
 /// Threads decoding models.
 const LOADERS: usize = 3;
 
@@ -488,6 +539,11 @@ impl Props {
         std::mem::take(&mut self.fallen)
     }
 
+    /// The template of shown prop `entity`.
+    pub fn template_of(&self, entity: u32) -> Option<u32> {
+        self.shown.get(&entity).map(|p| p.template)
+    }
+
     /// The model of shown prop `entity`, and where it stands.
     pub fn placed(&self, entity: u32) -> Option<(u32, Vec3)> {
         self.shown.get(&entity).map(|p| (p.model, p.position))
@@ -566,6 +622,7 @@ impl Props {
         stands(e)
             && !p.wrecked
             && !self.bodiless.contains(&e)
+            && !self.held.contains(&e)
             && !self.knocked.contains_key(&e)
             && !self.swings.contains_key(&e)
     }
@@ -743,28 +800,46 @@ impl Props {
         mass.is_some() && self.fling(physics, entity, velocity, spin)
     }
 
+    /// Holds `entity`, standing on a scripts' vehicle's load bed, without
+    /// collision of its own until it is loaded ([`load`](Self::load)): the
+    /// vehicle settles and sleeps under it rather than against it. From
+    /// Xenia p769a: the El Grande slept at 265.6 s with its 20 crates
+    /// standing in its bed, and they had no body until their first
+    /// physics from 281.3 s. Whether a hibernating object has collision on
+    /// the 360 is otherwise not traced. True if newly held.
+    pub fn hold_on_bed(&mut self, physics: &mut Physics, entity: u32) -> bool {
+        if self.cargo.contains_key(&entity) || !self.held.insert(entity) {
+            return false;
+        }
+        physics.remove_static(StaticKey::Entity(entity));
+        true
+    }
+
     /// Puts `entity` loose on the load bed of vehicle `index` (placed as
     /// `id`) where it stands, moving with it: a body of its own, its
     /// model's collision box, that lies on the bed's own shapes
     /// ([`Physics::add_bed`]) and slides, tips and falls off as the
     /// vehicle turns, brakes and hits (as the game's goods do: OilCon020's
     /// guns are lost off a driven pickup). Its standing collision goes.
-    /// It starts clear of `bed` (the vehicle's own collision, its space),
-    /// lifted out of the floor where it stood sunk in it (a layer's goods
-    /// stand a little in the bed as the truck settles on its springs, and
-    /// would drop through it). False unless both are in play and it has a
-    /// collision box.
+    /// It starts at its authored place, asleep, as the 360's goods do
+    /// (Xenia p769a), even where that is in the bed (the truck settled
+    /// under its authored goods). False unless both are in play and it has
+    /// a collision box.
     pub fn load(
         &mut self,
         physics: &mut Physics,
         entity: u32,
         (index, id): (usize, m2_engine::VehicleId),
-        bed: Option<&CollisionShape>,
     ) -> bool {
         // A body of its own from the start (the goods came in before the
         // vehicle): its bodies give way to its ride.
         if self.as_body.contains(&entity) {
             self.drop_bodies(physics, entity);
+        }
+        // Not before the rebuild has built it ([`BuildQueue`]): the 360's
+        // goods are bodies only once their object is built (0x82182848).
+        if self.unwalled.contains(&entity) {
+            return false;
         }
         let Some(p) = self.shown.get(&entity) else {
             return false;
@@ -796,29 +871,23 @@ impl Props {
         if let Some(m) = collision.material {
             piece.material = m;
         }
-        let mut at = Mat4::from_rotation_translation(p.rotation, p.position);
-        if let (Some(bed), Some(place)) = (bed, physics.vehicle_transform(id)) {
-            let local = place.inverse() * at;
-            let (lo, _) = box_around(local, bounds);
-            let lift = bed.lift_onto(box_around(local, bounds), BED_CLEAR);
-            if lift > 0.0 {
-                at = place * Mat4::from_translation(Vec3::Y * lift) * local;
-            }
-            // Where it starts, in the vehicle's frame: its box's bottom
-            // against the bed's floor under it (the floor is BED_CLEAR
-            // under the bottom once lifted).
-            let floor = if lift > 0.0 {
-                format!("bed floor {:.2}", lo.y + lift - BED_CLEAR)
-            } else {
-                "on or over the bed already".to_owned()
-            };
+        // At its authored place and turn, as the 360 adds it: Xenia p769a,
+        // every one of OilCon020's 20 crates got its body exactly where it
+        // was authored (to 1e-4 m, at rest), though the El Grande under
+        // them had settled (-0.20, +0.18, +0.03) m from its own authored
+        // place first. They lie in the bed's collision so, asleep, until
+        // something awake touches them.
+        let at = Mat4::from_rotation_translation(p.rotation, p.position);
+        if let Some(place) = physics.vehicle_transform(id) {
+            let (lo, _) = box_around(place.inverse() * at, bounds);
             eprintln!(
-                "cargo: {entity:#x} loaded: lifted {lift:.2} m, its bottom {:.2} -> {:.2} m up the vehicle ({floor})",
+                "cargo: {entity:#x} loaded at its authored place, its bottom {:.2} m up the vehicle (asleep {})",
                 lo.y,
-                lo.y + lift
+                physics.vehicle_asleep(id)
             );
         }
         let template = p.template;
+        self.held.remove(&entity);
         physics.remove_static(StaticKey::Entity(entity));
         // Asleep, at rest, until something awake touches it
         // ([`Physics::add_cargo`]).
@@ -865,6 +934,39 @@ impl Props {
                 let now = (inv * at).w_axis.truncate();
                 let then = r.loaded?.w_axis.truncate();
                 Some((e, now.distance(then), r.aboard))
+            })
+            .collect();
+        out.sort_by_key(|c| c.0);
+        out
+    }
+
+    /// How many goods ride vehicles. Log only.
+    pub fn cargo_count(&self) -> usize {
+        self.cargo.len()
+    }
+
+    /// Each of vehicle `index`'s goods (vehicle `id`): its offset from
+    /// where it was loaded, in the vehicle's frame, and whether its body is
+    /// asleep (`None` without one). By entity. Log only.
+    pub fn cargo_states(
+        &self,
+        physics: &Physics,
+        index: usize,
+        id: m2_engine::VehicleId,
+    ) -> Vec<(u32, Vec3, Option<bool>)> {
+        let Some(place) = physics.vehicle_transform(id) else {
+            return Vec::new();
+        };
+        let inv = place.inverse();
+        let mut out: Vec<(u32, Vec3, Option<bool>)> = self
+            .cargo
+            .iter()
+            .filter(|(_, r)| r.vehicle == index)
+            .filter_map(|(&e, r)| {
+                let at = physics.debris_place(r.piece)?;
+                let now = (inv * at).w_axis.truncate();
+                let then = r.loaded?.w_axis.truncate();
+                Some((e, now - then, physics.debris_asleep(r.piece)))
             })
             .collect();
         out.sort_by_key(|c| c.0);
@@ -2044,8 +2146,10 @@ impl Props {
             self.swings.remove(&e);
             self.unwalled.insert(e);
         }
-        // Those shown since their model came in: their collision.
-        for e in std::mem::take(&mut self.unwalled) {
+        // Those shown since their model came in: their collision, in the
+        // order they came, within the rebuild's budget ([`BuildQueue`]).
+        let started = Instant::now();
+        while let Some(e) = self.unwalled.next_within(REBUILD_BUDGET, started.elapsed()) {
             let Some(p) = self.shown.get(&e) else {
                 continue;
             };
@@ -2071,6 +2175,7 @@ impl Props {
                 && !self.knocked.contains_key(&e)
                 && !self.swings.contains_key(&e)
                 && !self.cargo.contains_key(&e)
+                && !self.held.contains(&e)
             {
                 self.make_body(physics, e);
                 continue;
@@ -2111,7 +2216,7 @@ impl Props {
         {
             let (hash, cpu) = self.decoded.swap_remove(i);
             self.asked.remove(&hash);
-            self.upload(backend, materials, source, physics, hash, cpu)?;
+            self.upload(backend, materials, source, hash, cpu)?;
             if started.elapsed() > UPLOAD_BUDGET {
                 break;
             }
@@ -2191,14 +2296,13 @@ impl Props {
         near
     }
 
-    /// Uploads model `hash`, loaded (or not), and gives the props using it
-    /// their collision.
+    /// Uploads model `hash`, loaded (or not), and queues the props using it
+    /// for their collision ([`BuildQueue`]).
     fn upload(
         &mut self,
         backend: &mut dyn RenderBackend,
         materials: &mut MaterialCache,
         source: &mut AssetSource<BufReader<File>>,
-        physics: &mut Physics,
         hash: u32,
         cpu: Result<(CpuModel, Vec<u32>, Option<GateModel>), String>,
     ) -> anyhow::Result<()> {
@@ -2228,6 +2332,7 @@ impl Props {
         if reach.is_finite() {
             self.widest = self.widest.max(reach);
         }
+        let mut queued = Vec::new();
         if let Some(shape) = &cpu.collision {
             let mut through = Vec::new();
             for (&e, p) in self.shown.iter().filter(|(_, p)| p.model == hash) {
@@ -2239,16 +2344,12 @@ impl Props {
                 }
                 // As at every other place its collision goes up
                 // ([`walled`](Self::walled)): q618h, the paradrop plane's
-                // model coming in after it was shown put its collision up
-                // here, bodiless or not.
+                // model coming in after it was shown put its collision up,
+                // bodiless or not. Queued for the rebuild ([`BuildQueue`]),
+                // as the 360 builds an object once its model's physics is
+                // in (0x82182848), not at once.
                 if self.walled(e, p) {
-                    physics.add_static_as(
-                        StaticKey::Entity(e),
-                        shape,
-                        p.position,
-                        p.rotation,
-                        p.preset,
-                    );
+                    queued.push(e);
                 }
             }
             if !through.is_empty() {
@@ -2290,6 +2391,9 @@ impl Props {
                 gate,
             }),
         );
+        for e in queued {
+            self.unwalled.insert(e);
+        }
         Ok(())
     }
 
@@ -3050,9 +3154,90 @@ mod tests {
     use super::*;
     use m2_engine::{CollisionShape, LoosePiece};
 
+    /// Goods standing on a scripts' vehicle's bed have no collision of
+    /// their own until loaded (Xenia p769a: the El Grande slept with its
+    /// crates standing in its bed, which had no bodies yet): held, their
+    /// standing collision goes and the rebuild doesn't put it back.
+    #[test]
+    fn goods_held_on_a_bed_have_no_collision_until_loaded() {
+        let mut physics = Physics::new();
+        let mut props = Props::default();
+        let prop = Prop {
+            model: 7,
+            position: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            wrecked: false,
+            template: 0,
+            named: false,
+            preset: Default::default(),
+        };
+        props.shown.insert(0x1225f9, prop);
+        let shape = CollisionShape::cuboid(Vec3::ONE);
+        physics.add_static(
+            StaticKey::Entity(0x1225f9),
+            &shape,
+            Vec3::ZERO,
+            Quat::IDENTITY,
+        );
+        assert!(props.walled(0x1225f9, &prop));
+        assert!(props.hold_on_bed(&mut physics, 0x1225f9));
+        assert!(!physics.has_static(StaticKey::Entity(0x1225f9)));
+        assert!(
+            !props.walled(0x1225f9, &prop),
+            "the rebuild would put it back"
+        );
+        // Held once.
+        assert!(!props.hold_on_bed(&mut physics, 0x1225f9));
+    }
+
     // Goods are added asleep and at rest (the 360's add, activation 0,
     // 0x82165958), and wake once something awake touches them: a moving
     // truck's bed, here a body dropped onto them.
+    // The rebuild builds in the order queued, checking its 0.01 s before
+    // each build (0x82152780): a batch over the budget is split across
+    // updates, the rest kept in order for the next; one under it builds in
+    // one update; at least one builds each update.
+    #[test]
+    fn the_rebuild_builds_in_order_within_its_budget() {
+        let mut q = BuildQueue::default();
+        for e in [5, 3, 9, 3, 7] {
+            q.insert(e);
+        }
+        // Each build "costs" 4 ms of a 10 ms budget: three this update.
+        let mut spent = Duration::ZERO;
+        let mut first = Vec::new();
+        while let Some(e) = q.next_within(REBUILD_BUDGET, spent) {
+            first.push(e);
+            spent += Duration::from_millis(4);
+        }
+        assert_eq!(first, vec![5, 3, 9], "in order, split by the budget");
+        assert!(q.contains(&7));
+        // The next update: the leftovers, in order.
+        let mut spent = Duration::ZERO;
+        let mut second = Vec::new();
+        while let Some(e) = q.next_within(REBUILD_BUDGET, spent) {
+            second.push(e);
+            spent += Duration::from_millis(4);
+        }
+        assert_eq!(second, vec![7]);
+        // Under the budget: all in one update.
+        for e in [1, 2] {
+            q.insert(e);
+        }
+        let all: Vec<u32> =
+            std::iter::from_fn(|| q.next_within(REBUILD_BUDGET, Duration::ZERO)).collect();
+        assert_eq!(all, vec![1, 2]);
+        // Even a long first build: one each update.
+        q.insert(4);
+        q.insert(6);
+        assert_eq!(q.next_within(REBUILD_BUDGET, Duration::ZERO), Some(4));
+        assert_eq!(
+            q.next_within(REBUILD_BUDGET, Duration::from_millis(30)),
+            None
+        );
+        assert!(q.contains(&6));
+    }
+
     // Goods loaded where their records overlap (0.3-0.5 m, as the El
     // Grande's do) go back to sleep together after the step they were
     // added at, at rest, and are not pushed apart (Xenia settle8: one
@@ -3082,6 +3267,45 @@ mod tests {
             // At most the one step Rapier runs a body just added awake
             // (a step of gravity, g dt² = 2.7 mm), not pushed apart.
             assert!((at - p).length() < 5e-3, "pushed from {p} to {at}");
+        }
+    }
+
+    // The same goods built over several updates, as the rebuild's budget
+    // splits a batch (0x82152780; Xenia settle8: 7, then 3 a tenth of a
+    // second later): those already asleep are not woken and pushed apart by
+    // the new ones' first contacts.
+    #[test]
+    fn overlapping_goods_loaded_over_several_updates_stay_put() {
+        let mut physics = crate::npc::tests::ground();
+        let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.4), 50.0);
+        let places = [
+            Vec3::new(0.0, 0.41, 0.0),
+            Vec3::new(0.35, 0.41, 0.0),
+            Vec3::new(0.0, 0.41, 0.45),
+            Vec3::new(0.3, 0.61, 0.3),
+        ];
+        let mut crates = Vec::new();
+        for &p in &places {
+            crates.push(physics.add_cargo(&piece, Mat4::from_translation(p)));
+            // The next update's build comes 6 steps on.
+            for _ in 0..6 {
+                physics.step(1.0 / 60.0);
+            }
+        }
+        for _ in 0..120 {
+            physics.step(1.0 / 60.0);
+        }
+        for (c, p) in crates.iter().zip(places) {
+            assert_eq!(physics.debris_asleep(*c), Some(true), "awake at {p}");
+            let at = physics.debris_place(*c).unwrap().w_axis.truncate();
+            // Not pushed apart: across, as good as still; down, at most a
+            // step of gravity for each later add Rapier wakes it for (three
+            // here, 2.7 mm each).
+            assert!(
+                (at - p).with_y(0.0).length() < 1e-3,
+                "pushed from {p} to {at}"
+            );
+            assert!((at.y - p.y).abs() < 9e-3, "dropped from {p} to {at}");
         }
     }
 

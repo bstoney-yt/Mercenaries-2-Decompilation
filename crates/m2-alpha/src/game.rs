@@ -143,6 +143,9 @@ pub struct Game {
     /// The scripts' vehicles whose load bed's goods were logged (taken up,
     /// or what stood near and why not), by index.
     beds_told: HashSet<usize>,
+    /// Log only: the goods loaded so far and how many frames more each
+    /// frame's sleep is logged after the last load ([`CARGO_WAKE_LOG`]).
+    cargo_watch: (usize, u32),
     /// The helicopters' winches ([`crate::winches`]).
     pub winches: crate::winches::Winches,
     /// Layer entities of the island's vehicles asked for so far.
@@ -153,11 +156,14 @@ pub struct Game {
     /// The island's vehicles placed and still watched: entity, body,
     /// where it was put and how, and how many steps logged so far
     /// ([`Game::log_first_steps`]).
-    just_placed: Vec<Watched>,
+    pub(crate) just_placed: Vec<Watched>,
     /// The scripts' (mission) vehicles placed as authored (their layer
     /// entity's `Transform`), by guid: where and turned how
     /// (`--parked-settle-check`).
     pub(crate) authored_guids: HashMap<u32, (Vec3, Quat)>,
+    /// The scripts' vehicles placed where they said ([`Put::Given`]), by
+    /// guid: where and turned how (`--parked-settle-check`).
+    pub(crate) given_guids: HashMap<u32, (Vec3, Quat)>,
     /// The island's traffic spawners and what they have out.
     pub traffic: crate::traffic::Traffic,
     /// A pursuit's gunships ([`crate::gunships`]).
@@ -584,11 +590,13 @@ impl Game {
             beds: HashMap::new(),
             bed_shapes: HashMap::new(),
             beds_told: HashSet::new(),
+            cargo_watch: (0, 0),
             winches: Default::default(),
             fetched: HashSet::new(),
             authored: HashMap::new(),
             just_placed: Vec::new(),
             authored_guids: HashMap::new(),
+            given_guids: HashMap::new(),
             traffic: crate::traffic::Traffic::default(),
             gunships: crate::gunships::Gunships::default(),
             pursuers: crate::pursuers::Pursuers::default(),
@@ -826,7 +834,10 @@ impl Game {
                     v,
                     at,
                     yaw,
-                    self.authored.get(&entity).copied(),
+                    self.authored
+                        .get(&entity)
+                        .copied()
+                        .map_or(Put::Rest, Put::Authored),
                 )
             {
                 eprintln!(
@@ -836,18 +847,7 @@ impl Game {
                 if let Some(id) = v.id
                     && let Some(m) = world.physics.vehicle_transform(id)
                 {
-                    let (_, turn, put) = m.to_scale_rotation_translation();
-                    self.just_placed.push(Watched {
-                        entity,
-                        id,
-                        put,
-                        turn,
-                        n: 0,
-                        crossed: 0,
-                        last: put,
-                        still: 0.0,
-                        moved: false,
-                    });
+                    self.just_placed.push(Watched::new(entity, id, m));
                 }
             }
         }
@@ -2026,12 +2026,6 @@ impl Game {
             .iter()
             .map(|v| self.beds.get(&v.spec.model).copied().flatten())
             .collect();
-        let shapes: Vec<BedShape> = self
-            .scene
-            .vehicles
-            .iter()
-            .map(|v| self.bed_shapes.get(&v.spec.model).cloned().flatten())
-            .collect();
         let focus = self.focus();
         // Vehicles under the water long enough sink.
         self.sink(dt);
@@ -2244,14 +2238,55 @@ impl Game {
                 dt,
             );
             run_over_pickups(world, &mut self.scene.flights, &self.scene.vehicles);
+            // Where she is, for the goods' hibernation (`knock_loose`).
+            let hero = self
+                .scene
+                .player
+                .as_ref()
+                .map_or(self.camera.position, |p| p.character.position);
             let knocked = knock_loose(
                 world,
                 &mut self.scene.props,
                 &self.scene.vehicles,
-                (&beds, &shapes, &mut self.beds_told),
+                (&beds, &mut self.beds_told),
                 &mut self.destruction,
                 self.scene.install.as_ref(),
+                hero,
             );
+            // Log only: for a while after goods are loaded, each frame,
+            // whether their vehicle and they sleep (what wakes a load).
+            let loaded = self.scene.props.cargo_count();
+            if loaded != self.cargo_watch.0 {
+                self.cargo_watch = (loaded, CARGO_WAKE_LOG);
+            }
+            if self.cargo_watch.1 > 0 {
+                self.cargo_watch.1 -= 1;
+                for (i, v) in self.scene.vehicles.iter().enumerate() {
+                    let Some(id) = v.id.filter(|_| self.scene.props.carrying(i)) else {
+                        continue;
+                    };
+                    let awake: Vec<String> = self
+                        .scene
+                        .props
+                        .cargo_states(&world.physics, i, id)
+                        .into_iter()
+                        .filter(|c| c.2 == Some(false))
+                        .map(|(e, d, _)| format!("{e:#x} {:.3}", d.length()))
+                        .collect();
+                    eprintln!(
+                        "cargo-wake: frame {} after the last load: the {} {}, {} of its goods awake [{}]",
+                        CARGO_WAKE_LOG - self.cargo_watch.1,
+                        v.spec.label,
+                        if world.physics.vehicle_asleep(id) {
+                            "asleep"
+                        } else {
+                            "awake"
+                        },
+                        awake.len(),
+                        awake.join("; ")
+                    );
+                }
+            }
             // Its vertical velocity a moment after each knock, against
             // just before (a kick up shows here).
             self.kicks.extend(
@@ -4564,6 +4599,10 @@ type Carrier = ((usize, m2_engine::VehicleId), Vec3);
 /// A vehicle model's own collision, which its load bed's goods lie on.
 type BedShape = Option<std::sync::Arc<m2_engine::CollisionShape>>;
 
+/// How many frames after goods are loaded `cargo-wake:` lines are
+/// logged (log only).
+const CARGO_WAKE_LOG: u32 = 90;
+
 /// The node of a vehicle model that is its load bed (the scripts count
 /// the goods on it there: PirCon002's `GetHardpointPosition(truck,
 /// "HP_Truckbed")`).
@@ -4841,9 +4880,10 @@ fn knock_loose(
     world: &mut World,
     props: &mut Props,
     vehicles: &[ParkedVehicle],
-    (beds, shapes, told): (&[Option<Vec3>], &[BedShape], &mut HashSet<usize>),
+    (beds, told): (&[Option<Vec3>], &mut HashSet<usize>),
     destruction: &mut Destruction,
     install: Option<&Install>,
+    hero: Vec3,
 ) -> Vec<(m2_engine::VehicleId, String, f32)> {
     let mut knocked = Vec::new();
     let mut met = Vec::new();
@@ -4853,7 +4893,6 @@ fn knock_loose(
         .enumerate()
     {
         let Some(id) = v.id else { continue };
-        let shape = shapes.get(index).and_then(|s| s.as_deref());
         // The scripts' vehicles with a load bed take up what stands on it
         // as soon as they are placed, standing or not: the scripts count
         // the goods on the bed from then on (PirCon002 counted none, and
@@ -4914,9 +4953,40 @@ fn knock_loose(
                 }
             }
             for e in near {
-                if !props.is_cargo(e)
-                    && on_bed(props, &standing, *b, e)
-                    && props.load(&mut world.physics, e, (index, id), shape)
+                // A good comes out of hibernation, and gets its bodies, only
+                // once she is within 1.2 x its template's `HibernationControl`
+                // `Distance` (100 m without one), flat, as every hibernating
+                // object does on the 360 (0x8225AE18 / 0x8225B5B8; research
+                // notes section 26). Xenia cargo1: the El Grande's crates
+                // OilCon020_Carbine_b (Distance 100) got bodies with her 119
+                // to 121 m away, the _global_gunboxA ones (65) at 76 to 78 m,
+                // the truck (250) at 240 m. The wake's per-frame budget
+                // (0x82BD21A4, 1000 and +300) is not ported.
+                let distance = props
+                    .template_of(e)
+                    .and_then(|t| world.index.template_db.hibernation.get(&t).copied())
+                    .unwrap_or(m2_engine::population::HIBERNATION_DEFAULT);
+                let awake = props.placed(e).is_some_and(|(_, at)| {
+                    (at - hero).with_y(0.0).length()
+                        <= distance * m2_engine::population::HIBERNATION_WAKE
+                });
+                // And only once the vehicle under it sleeps: Xenia p769a,
+                // the El Grande asleep at 265.6 s, its crates' first
+                // physics from 281.3 s (the 360's gate itself is not
+                // traced: inferred from that order).
+                if props.is_cargo(e) || !on_bed(props, &standing, *b, e) {
+                    continue;
+                }
+                // Until then it has no collision ([`Props::hold_on_bed`]).
+                if props.hold_on_bed(&mut world.physics, e) {
+                    eprintln!(
+                        "cargo: {e:#x} held on the {}'s bed without collision until loaded",
+                        v.spec.label
+                    );
+                }
+                if awake
+                    && world.physics.vehicle_asleep(id)
+                    && props.load(&mut world.physics, e, (index, id))
                 {
                     eprintln!("cargo: {e:#x} rides on the {}", v.spec.label);
                 }
@@ -5065,8 +5135,7 @@ fn run_into(
         StaticKey::Entity(e) if props.is_cargo(e) => false,
         StaticKey::Entity(e) => match carrier {
             Some((carrier, bed))
-                if on_bed(props, vehicle, bed, e)
-                    && props.load(&mut world.physics, e, carrier, None) =>
+                if on_bed(props, vehicle, bed, e) && props.load(&mut world.physics, e, carrier) =>
             {
                 eprintln!("cargo: {e:#x} rides on the {label}");
                 false
@@ -5666,18 +5735,53 @@ impl Game {
                     .map(|s| format!("{s:.3}"))
                     .collect();
                 eprintln!(
-                    "first step: island vehicle {:#x} {label}: moved {:.3} (dy {:+.3}), turned {:.2} deg, v {v:.3} (up {:+.3}), spin {:.3}, wheels down {down} of {wheels}, springs squeezed [{}] m, touching [{}]",
+                    "first step: island vehicle {:#x} {label} ({:?}): moved {:.3} (dy {:+.3}), turned {:.2} deg, v {v:.3} (up {:+.3}), spin {:.3}, wheels down {down} of {wheels}, springs squeezed [{}] m, touching [{}], bodies [{}]",
                     w.entity,
+                    id,
                     now.distance(w.put),
                     now.y - w.put.y,
                     w.turn.angle_between(now_turn).to_degrees(),
                     v.y,
                     physics.vehicle_spin(id),
                     squeeze.join(", "),
-                    touching()
+                    touching(),
+                    physics.vehicle_touching_bodies(id).join("; ")
+                );
+            }
+            // Its springs' first kick, step by step: the 360's first wheel
+            // step finds no ground, the second kicks (Xenia parkedcar1:
+            // -0.15, then the kick).
+            if (2..=3).contains(&n) {
+                eprintln!(
+                    "first steps: island vehicle {:#x} {label}: step {n} v_y {:+.3} (first wheel step without ground: the 360's L mode), asleep {}",
+                    w.entity,
+                    v.y,
+                    physics.vehicle_asleep(id)
+                );
+            }
+            // A watched vehicle's springs, step by step, its first 60 steps:
+            // each spring's length, ground and push, and its body's v and w
+            // (to set against Xenia sub1's per-frame W+0x08, v and w).
+            if FIRST_STEPS_WATCHED.contains(&w.entity) && n <= 60 {
+                let springs: Vec<String> = physics
+                    .vehicle_spring_steps(id)
+                    .iter()
+                    .map(|(cur, down, push)| {
+                        format!("{cur:+.3}{} {push:.0}", if *down { "" } else { " off" })
+                    })
+                    .collect();
+                eprintln!(
+                    "springs: island vehicle {:#x} {label} step {n}: v {v:.3} w {:.3}; [{}]",
+                    w.entity,
+                    physics.vehicle_spin(id),
+                    springs.join("; ")
                 );
             }
             if !FIRST_STEPS_WATCHED.contains(&w.entity) {
+                // Logged through its first contact (step 3), then let go.
+                if n < 3 {
+                    keep.push(w);
+                }
                 continue;
             }
             let speed = v.length();
@@ -5775,10 +5879,33 @@ impl Game {
     }
 }
 
+/// How [`place`] puts a vehicle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Put {
+    /// As its layer authored it: this whole turn, no fit, no drop.
+    Authored(Quat),
+    /// Where the scripts said (`Pg.Spawn`, or moved since): upright at the
+    /// yaw, no fit, no drop.
+    Given,
+    /// On the ground under it, fitted to it and let go over it (invented).
+    Rest,
+}
+
 /// The island vehicles [`Game::log_first_steps`] watches after they are
 /// placed (#766's B, C and E spots: the Phoenix, the Van (Green) and the
 /// M151 that left their authored places after their first second).
-const FIRST_STEPS_WATCHED: [u32; 3] = [0x10_d5d8, 0x12_b8fc, 0x13_3ba2];
+const FIRST_STEPS_WATCHED: [u32; 7] = [
+    0x10_d5d8,
+    0x12_b8fc,
+    0x13_3ba2,
+    // The Fuel and Box Trailers by AllCon003's dock (#769: the Fuel
+    // Trailers ease 0.78 m back along their length after their kick, the
+    // Box Trailers not).
+    0xf_0309,
+    0xf_030b,
+    0x1000_1ea5,
+    0x1000_1ea6,
+];
 /// The speeds whose first passing is logged, m/s.
 const WATCH_SPEEDS: [f32; 2] = [0.5, 2.0];
 /// Still this long, s, after moving: rested, the watch ends.
@@ -5787,10 +5914,29 @@ const WATCH_REST: f32 = 1.0;
 const WATCH_LONGEST: f32 = 60.0;
 
 /// One island vehicle [`Game::log_first_steps`] watches.
+impl Watched {
+    /// Watched from where vehicle `id` (layer entity or guid `entity`) was
+    /// just put, `m`.
+    pub(crate) fn new(entity: u32, id: m2_engine::VehicleId, m: Mat4) -> Self {
+        let (_, turn, put) = m.to_scale_rotation_translation();
+        Self {
+            entity,
+            id,
+            put,
+            turn,
+            n: 0,
+            crossed: 0,
+            last: put,
+            still: 0.0,
+            moved: false,
+        }
+    }
+}
+
 #[derive(Debug)]
-struct Watched {
+pub(crate) struct Watched {
     entity: u32,
-    id: m2_engine::VehicleId,
+    pub(crate) id: m2_engine::VehicleId,
     /// Where and how it was put.
     put: Vec3,
     turn: Quat,
@@ -5816,21 +5962,35 @@ struct Watched {
 /// (0x8218CAA8: 0x82185FE0 -> vfunc +0x128) with nothing reading the
 /// ground. The layers author them at rest (survey of 1397 state-layer
 /// and 35 static cars and tanks: 871 within 5 cm of the wheels' rest on
-/// the terrain). It is added asleep ([`Physics::sleep_vehicle`]). It
+/// the terrain). It is stepped from add (Xenia parkedcar1). It
 /// waits until there is something under it within
 /// [`AUTHORED_FLOOR`] (its deck or bridge loaded, not only the terrain far
 /// below): invented, the 360 makes it with its layer.
 ///
-/// Any other (a script's, `None`) is put on the ground at `at` facing
-/// `yaw`, tilted to the ground under its wheels, and let go [`DROP`] over
-/// it: **invented** (the 360's spawn, 0x82409B38, is not yet traced).
+/// One the scripts made or moved (`Pg.Spawn`, [`Put::Given`]) is put
+/// **where they said**, upright facing `yaw`, with no fit to the ground
+/// and no drop. From the 360 code: `Pg.Spawn` (0x82336B70 -> 0x82336490
+/// -> 0x82409B38) makes the object at the given position turned by the
+/// yaw alone, nothing reading the ground; the scripts work the height out
+/// themselves (14 `MrxSupport.GetSpawnHeight` calls; every vehicle
+/// `Pg.Spawn` in the scripts passes a computed place: the `spawncalls`
+/// example). A land vehicle waits until any ground under it has loaded
+/// (invented: the 360 has its world in; a helicopter is made in the air).
+///
+/// One with neither ([`Put::Rest`]: a layer's with no authored turn) is
+/// put on the ground at `at` facing `yaw`, tilted to the ground under its
+/// wheels, and let go [`DROP`] over it: **invented**.
 pub(crate) fn place(
     physics: &mut Physics,
     v: &mut ParkedVehicle,
     at: Vec3,
     yaw: f32,
-    authored: Option<Quat>,
+    put: Put,
 ) -> bool {
+    let authored = match put {
+        Put::Authored(q) => Some(q),
+        _ => None,
+    };
     // From a little above where the layers put it (so one under a bridge
     // or a gantry stays under it), else from well above.
     let ground = |p: Vec3| {
@@ -5860,13 +6020,22 @@ pub(crate) fn place(
         if !floor {
             return false;
         }
-        let id = physics.add_vehicle_turned(&v.spec, at, turn.normalize());
-        // Added asleep, as the 360's layer loader adds it (its bodies added
-        // with activation 0, 0x82165958; Xenia settle7: a fresh parked
-        // Phoenix asleep from its first sample), until its driver, a push
-        // or something awake touching it wakes it.
-        physics.sleep_vehicle(id);
-        v.id = Some(id);
+        // Stepped from the first step after it is added, then asleep by the
+        // 360's check once still ([`Physics::vehicle_asleep`]): Xenia
+        // parkedcar1, all six freshly streamed parked cars simulated from
+        // add (their springs' first kick, v_y +0.48 to +1.46) and asleep
+        // 0.87 to 2.75 s later. Goods, unlike vehicles, are added asleep
+        // ([`Physics::add_cargo`]).
+        v.id = Some(physics.add_vehicle_turned(&v.spec, at, turn.normalize()));
+        return true;
+    }
+    // As the scripts said: there, upright at its yaw, once any ground
+    // under it is in (a helicopter at once).
+    if put == Put::Given && !v.spec.is_boat() {
+        if !v.spec.is_helicopter() && ground(at).is_none() {
+            return false;
+        }
+        v.id = Some(physics.add_vehicle_turned(&v.spec, at, Quat::from_rotation_y(yaw)));
         return true;
     }
     // (Never where it came out NaN: round 88 lost the start boat, and her
@@ -6931,10 +7100,11 @@ mod tests {
 
     // A layer's parked vehicle is put as authored: where and as turned as
     // its `Transform` says (here a little tilted, 0.05 m over the ground),
-    // with no fit to the ground and no drop; a script's still rests on the
-    // ground under it and is let go DROP over it.
+    // with no fit to the ground and no drop; a script's where it said,
+    // upright at its yaw; one with neither rests on the ground and is let
+    // go DROP over it.
     #[test]
-    fn a_layer_vehicle_is_placed_as_authored_a_scripts_on_the_ground() {
+    fn a_layer_vehicle_is_placed_as_authored_a_scripts_where_it_said() {
         use m2_math::glam::{Quat, Vec3};
         let mut physics = m2_engine::Physics::new();
         let ground = m2_engine::CollisionShape::cuboid(Vec3::new(50.0, 0.5, 50.0));
@@ -6970,7 +7140,13 @@ mod tests {
         let turn = Quat::from_rotation_y(0.7) * Quat::from_rotation_x(0.03);
         let at = Vec3::new(3.0, 0.05, -2.0);
         let mut v = parked();
-        assert!(super::place(&mut physics, &mut v, at, 0.7, Some(turn)));
+        assert!(super::place(
+            &mut physics,
+            &mut v,
+            at,
+            0.7,
+            super::Put::Authored(turn)
+        ));
         let m = physics.vehicle_transform(v.id.unwrap()).unwrap();
         let (_, r, p) = m.to_scale_rotation_translation();
         assert!(p.distance(at) < 1e-3, "{p}");
@@ -6982,17 +7158,18 @@ mod tests {
             &mut high,
             at + Vec3::Y * 10.0,
             0.0,
-            Some(turn)
+            super::Put::Authored(turn)
         ));
         assert!(high.id.is_none());
-        // A script's: on the ground, let go DROP over its rest.
+        // One with no authored turn: on the ground, let go DROP over its
+        // rest.
         let mut s = parked();
         assert!(super::place(
             &mut physics,
             &mut s,
             Vec3::new(-10.0, 5.0, 0.0),
             0.0,
-            None
+            super::Put::Rest
         ));
         let y = physics.vehicle_transform(s.id.unwrap()).unwrap().w_axis.y;
         let rest = s.spec.ride_height();
@@ -7000,6 +7177,31 @@ mod tests {
             (y - (rest + super::DROP)).abs() < 0.05,
             "{y} against {rest}"
         );
+        // A script's: exactly where it said, upright at its yaw, even 0.4 m
+        // up; with no ground anywhere under it, it waits.
+        let mut g = parked();
+        let said = Vec3::new(10.0, 0.4, 5.0);
+        assert!(super::place(
+            &mut physics,
+            &mut g,
+            said,
+            1.2,
+            super::Put::Given
+        ));
+        let (_, r, p) = physics
+            .vehicle_transform(g.id.unwrap())
+            .unwrap()
+            .to_scale_rotation_translation();
+        assert!(p.distance(said) < 1e-3, "{p}");
+        assert!(r.angle_between(Quat::from_rotation_y(1.2)) < 1e-3);
+        let mut off = parked();
+        assert!(!super::place(
+            &mut physics,
+            &mut off,
+            Vec3::new(500.0, 0.4, 500.0),
+            0.0,
+            super::Put::Given
+        ));
     }
 
     // A rider sat inside a cab is blocked as the 360's capsule cast finds

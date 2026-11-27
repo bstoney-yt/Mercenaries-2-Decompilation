@@ -879,6 +879,12 @@ pub struct Springs {
     pub extra: f32,
     /// Its weight on the ground, of its plain weight (`GravityFactor`).
     pub gravity_factor: f32,
+    /// Each axle's wheel radius, metres (`FrontWheelRadius`,
+    /// `RearWheelRadius`): what the 360's wheel ray is cast with
+    /// (0x8219EF90 keeps it at the wheel's +0x108, 0x8219F510 casts L + it),
+    /// not the model's wheel. 0 without one: the model's is used
+    /// (inferred).
+    pub radius: (f32, f32),
 }
 
 impl Springs {
@@ -890,6 +896,7 @@ impl Springs {
         squeeze: (0.2, 0.2),
         extra: 0.0,
         gravity_factor: 2.0,
+        radius: (0.0, 0.0),
     };
 
     /// One axle's (front, the steering one, or back) strength, damp,
@@ -909,6 +916,13 @@ impl Springs {
     /// An axle's spring's unloaded length, metres.
     pub fn length(&self, front: bool) -> f32 {
         self.axle(front).2
+    }
+
+    /// The radius an axle's wheel ray is cast with: the template's, else
+    /// `model`'s wheel.
+    pub fn wheel_radius(&self, front: bool, model: f32) -> f32 {
+        let r = if front { self.radius.0 } else { self.radius.1 };
+        if r > 0.0 { r } else { model }
     }
 }
 
@@ -2150,6 +2164,7 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         ),
                         extra: f("ExtraInvisibleSpringLength", d.extra).max(0.0),
                         gravity_factor: f("GravityFactor", d.gravity_factor),
+                        radius: length("FrontWheelRadius", "RearWheelRadius", d.radius),
                     })
                 })(),
                 tyres: (|| {
@@ -2926,4 +2941,41 @@ mod tests {
         );
         close(b.slowing(false, 20.0, 0.0, 0.0, 1.0, 0.0), 1.5);
     }
+}
+
+/// One of a car's `_CarWheel` records: the node its wheel is at and whether
+/// it is on the back axle. The 360 code builds a car's wheels from these
+/// alone (0x8219B5A0 walks the object's wheel store 0x83651D2C, one wheel
+/// each through 0x8219EF90): the spring top is that node's place raised by
+/// its axle's squeeze length, and the record's +0x10 picks the axle (0 the
+/// front's fields, else the back's). A trailer's front "wheels" are its
+/// landing legs, its second axle no wheel at all (Xenia wheels2: the Fuel
+/// Trailer's two legs' springs at -0.28 m long at contact, its one axle's at
+/// 0.32).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CarWheel {
+    /// The node's name hash (field 0xF0AD2D6E, +0x0).
+    pub node: u32,
+    /// On the back axle (field 0xFA8F0BBF, +0x10, not 0).
+    pub back: bool,
+}
+
+/// Every template's `_CarWheel` records, by template id, in record order.
+pub fn car_wheels(db: &Layer<'_>) -> HashMap<u32, Vec<CarWheel>> {
+    let t = Table::new(db, "_CarWheel");
+    t.templates()
+        .map(|id| {
+            let wheels = t
+                .of_template(id)
+                .iter()
+                .filter_map(|r| {
+                    Some(CarWheel {
+                        node: t.word(r, 0xf0ad_2d6e)?,
+                        back: t.word(r, 0xfa8f_0bbf)? != 0,
+                    })
+                })
+                .collect();
+            (id, wheels)
+        })
+        .collect()
 }

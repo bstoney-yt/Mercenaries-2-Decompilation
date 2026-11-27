@@ -316,7 +316,7 @@ impl MaterialCache {
         } else if has(flags::BLENDED) {
             BlendMode::Translucent
         } else if alpha || has(flags::CUT_OUT) {
-            BlendMode::Masked { cutoff: 0.5 }
+            BlendMode::Masked { cutoff: ALPHA_REF }
         } else {
             BlendMode::Opaque
         };
@@ -575,6 +575,14 @@ pub const MODEL_TEXTURE_WIDTH: u32 = 2048;
 
 /// Material flags bits, read from which materials carry them (a survey of
 /// every model material); not confirmed in the game's code.
+/// The alpha test's reference for cut-out surfaces (leaves, fences): a
+/// pixel is drawn only where its alpha is above 77/255. From the 360 code:
+/// both of the draw-state setups (0x8256D998 and 0x8256DB78) set the alpha
+/// function to 4 (GREATER, `RB_COLORCONTROL` bits 0-2, 0x825963A8) and the
+/// reference to 0x4D (`RB_ALPHA_REF`, scaled by 1/255 at 0x82596348), and
+/// that reference setter has no other callers. No alpha-to-coverage.
+pub const ALPHA_REF: f32 = 77.0 / 255.0;
+
 pub mod flags {
     /// Alpha blended over what is behind: glass, blob shadows, water,
     /// boards (vehicle glass is 0x0091 where the body is 0x0080).
@@ -2835,7 +2843,12 @@ mod tests {
         assert_eq!(cache.material(&mut backend, &material(1, 10)).unwrap(), m);
 
         let m = cache.material(&mut backend, &material(2, 11)).unwrap();
-        assert_eq!(backend.material(m).blend, BlendMode::Masked { cutoff: 0.5 });
+        assert_eq!(
+            backend.material(m).blend,
+            BlendMode::Masked {
+                cutoff: 77.0 / 255.0
+            }
+        );
         assert!(!cache.is_translucent(m));
         // Glass: the blend bit set, its opacity in the colour's alpha.
         let mut glass = Material {

@@ -128,8 +128,9 @@ m2-alpha [options]
                          nearest parked vehicle and drive it forward first
                          (backing out first if it is boxed in, steering
                          round what it meets)
-  --drive-reverse        as --drive, but back up flat out for 4 s instead,
-                         logging the fastest (drive: reverse fastest)
+  --drive-reverse        as --drive, but back up flat out until the speed
+                         levels off (at most 30 s) instead, logging where
+                         (drive: reverse levels off) and the fastest
   --jump                 with --screenshot on the island: jump just before
                          the picture
   --throw                with --screenshot on the island: throw a grenade
@@ -226,6 +227,14 @@ m2-alpha [options]
                          play does and logs which it found
   --closeup              with --screenshot on foot: the picture from close by
                          her right side, to see her hands
+  --flicker-check        check: with --screenshot on foot, pan past the
+                         nearest tree as the game draws it, without its
+                         edge anti-aliasing, with the old staggered shadow
+                         maps and with shadows off; lists how much of the
+                         frame flickers in each and writes where
+                         (<out>-flicker-<pan>-<variant>.ppm) and its middle
+                         frame (<out>-frame-<pan>-<variant>.ppm); PASS or
+                         FAIL
   --pda                  with --screenshot: the picture with her PDA open
   --binoculars <zoom>    with --screenshot: the picture through her
                          binoculars at zoom 1..7, their screen up

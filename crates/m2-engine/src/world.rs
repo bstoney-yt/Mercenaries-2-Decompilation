@@ -235,6 +235,21 @@ pub struct TemplateInfo {
     pub human: bool,
 }
 
+/// The template a layer entity named `stem` (its name without the id), an
+/// instance of template `parent`, is: the one its name names, else the one
+/// it is an instance of. As both a state layer's vehicles and its props
+/// resolve it.
+fn entity_template<'a>(
+    templates: &'a Templates,
+    stem: &'a str,
+    parent: u32,
+) -> Option<(&'a str, &'a TemplateInfo)> {
+    match templates.get(stem) {
+        Some(t) => Some((stem, t)),
+        None => templates.by_id(parent),
+    }
+}
+
 /// The bit every template id has (the database's `UNIQ` ids).
 const TEMPLATE_BIT: u32 = 0x8000_0000;
 
@@ -324,6 +339,8 @@ pub struct Templates {
     pub winches: HashMap<u32, crate::winch::WinchParams>,
     /// Each template's `ConnectPoint`s, by id ([`crate::winch`]).
     pub connect_points: HashMap<u32, Vec<crate::winch::ConnectPoint>>,
+    /// Each template's `_CarWheel`s, by id ([`crate::tuning::car_wheels`]).
+    pub car_wheels: HashMap<u32, Vec<crate::tuning::CarWheel>>,
     /// The emitter each `EffectModel` template draws as a model, by its
     /// name hash.
     pub effect_models: HashMap<u32, crate::vehicle_parts::ModelEmitter>,
@@ -804,6 +821,23 @@ impl Templates {
             })
     }
 
+    /// The `_CarWheel`s of template `name` (an object's own), else of the
+    /// lowest id of `model`'s templates that have them.
+    pub fn car_wheels_for(&self, name: &str, model: u32) -> &[crate::tuning::CarWheel] {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.car_wheels.get(id))
+            .or_else(|| {
+                self.infos
+                    .iter()
+                    .filter(|(id, t)| t.model == Some(model) && self.car_wheels.contains_key(id))
+                    .map(|(&id, _)| id)
+                    .min()
+                    .and_then(|id| self.car_wheels.get(&id))
+            })
+            .map_or(&[], Vec::as_slice)
+    }
+
     /// The `ConnectPoint`s of template `name` (an object's own), else of
     /// the lowest id of `model`'s templates that have them.
     pub fn connect_points_for(&self, name: &str, model: u32) -> &[crate::winch::ConnectPoint] {
@@ -1185,6 +1219,7 @@ impl Templates {
             exhausts: crate::vehicle_parts::read(&db),
             winches: crate::winch::read(&db),
             connect_points: crate::winch::connect_points(&db),
+            car_wheels: crate::tuning::car_wheels(&db),
             effect_models: crate::vehicle_parts::effect_models(&db)
                 .into_iter()
                 .filter_map(|(name, model, emitter, fx)| {
@@ -2676,6 +2711,19 @@ impl WorldIndex {
                 continue;
             }
             let stem = names.get(&entity).map_or("", |n| member_stem(n));
+            // One whose template drives is the state layer's vehicle
+            // (`add_state_vehicles`), not also a prop: the 360's layer loader
+            // makes each entity once, with its template's physics
+            // (0x823E6AB8 -> 0x82408C30 -> the template's physics creator,
+            // 0x823FDB60 for a car), so a vehicle gets its vehicle body and
+            // no static of its model. q769: Fuel Trailer 0x94b0f, named by its
+            // model (`_oc_veh_semi_fueltrailer`), stood as a prop's static
+            // and a vehicle's body at once and touched itself.
+            if entity_template(&assets.templates, stem, p.parent)
+                .is_some_and(|(_, t)| t.vehicle.is_some())
+            {
+                continue;
+            }
             // A prop's template: one with a model, that neither drives
             // nor walks.
             let prop = |t: &TemplateInfo| match t {
@@ -2731,10 +2779,7 @@ impl WorldIndex {
         let names = layer.names();
         for &(entity, ref p) in &in_entity_order(&layer.placements()) {
             let stem = names.get(&entity).map_or("", |n| member_stem(n));
-            let template = match assets.templates.get(stem) {
-                Some(t) => Some((stem, t)),
-                None => assets.templates.by_id(p.parent),
-            };
+            let template = entity_template(&assets.templates, stem, p.parent);
             let Some((
                 name,
                 &TemplateInfo {
@@ -3467,6 +3512,41 @@ pub fn low_res_tile<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
+    // An entity named by its model (q769's `_oc_veh_semi_fueltrailer
+    // 0x00094b0f`), an instance of a vehicle template, resolves to that
+    // template, so the props pass it by; one named by a template resolves to
+    // it; a prop's resolves to its non-vehicle template.
+    #[test]
+    fn an_entity_named_by_its_model_resolves_to_its_vehicle_template() {
+        let mut db = Templates::default();
+        let trailer = TemplateInfo {
+            model: Some(7),
+            vehicle: Some(VehicleKind::Car),
+            engine: None,
+            person: false,
+            human: false,
+        };
+        let crate_ = TemplateInfo {
+            vehicle: None,
+            ..trailer
+        };
+        db.names.insert(0x8000_0001, "Fuel Trailer".to_owned());
+        db.infos.insert(0x8000_0001, trailer);
+        db.by_name.insert("fuel trailer".to_owned(), trailer);
+        db.names.insert(0x8000_0002, "Crate".to_owned());
+        db.infos.insert(0x8000_0002, crate_);
+        db.by_name.insert("crate".to_owned(), crate_);
+        let (name, t) = entity_template(&db, "_oc_veh_semi_fueltrailer", 0x8000_0001).unwrap();
+        assert_eq!(name, "Fuel Trailer");
+        assert!(t.vehicle.is_some());
+        let (name, t) = entity_template(&db, "Fuel Trailer", 0).unwrap();
+        assert_eq!(name, "Fuel Trailer");
+        assert!(t.vehicle.is_some());
+        let (_, t) = entity_template(&db, "crate_on_dock", 0x8000_0002).unwrap();
+        assert!(t.vehicle.is_none());
+        assert!(entity_template(&db, "nothing", 0x8000_0099).is_none());
+    }
+
     // A catalogue car takes its model's template's tuning (no template is
     // named by a model's name): `civ_veh_car_phoenix` is "Phoenix
     // (crappy)"'s model, 2000 kg; "Phoenix", Xenia's 2500 kg one, is

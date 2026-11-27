@@ -56,6 +56,21 @@
 //! the blur (none of `AtmosphereBase`'s 185 fields hashes to a motion
 //! name, gap-list renderer round): the program keeps it at 0.25 and
 //! raises it in the hero's survival mode.
+//!
+//! Anti-aliasing, as the 360's does it (`fs_antialias`): it draws with no
+//! multisampling (its targets are made with `MultiSampleType` 0,
+//! 0x82565FE0) and smooths edges in a pass of its own over the frame and
+//! its depth before the rest (`PgAntiAliasingFP`, run at 0x82567BE8 for
+//! every view that draws the world). Each pixel compares the linear depth
+//! (0 at the near plane, 1 at the far) of its opposite neighbours in four
+//! directions, as a share of its own; where they differ by
+//! `depthAntiAliasParams.x` (0.035) or more the pixel lies on an edge
+//! across that direction, and it is taken `depthAntiAliasParams.y` (0.8)
+//! of the way to the mean of its two neighbours along the edge, averaged
+//! over the edges it lies on. From the 360 code (the constants, 0.035 at
+//! 0x82DE8C34 and 0.8 at 0x820B8034, and the pass's place) and its shader
+//! (`shaders.bin` on the disc, as Xenia disassembles it): all of that.
+//! Inferred: that it reads the frame with the glows merged in.
 
 use std::cell::Cell;
 use std::time::Instant;
@@ -117,6 +132,9 @@ struct Post {
     mb_y: vec4<f32>,
     mb_w: vec4<f32>,
     mb_scale: vec4<f32>,
+    // The anti-aliasing (see `fs_antialias`): x the edge's depth step, y
+    // how far to smooth, z the near and w the far plane (0: off)
+    aa: vec4<f32>,
 };
 
 fn game_tone_map() -> bool {
@@ -347,6 +365,62 @@ fn fs_merge(v: Screen) -> @location(0) vec4<f32> {
     let g = textureSampleLevel(glow, linear, v.uv, 0.0).rgb;
     let display = min(pow(max(c.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2)) + g, vec3<f32>(150.0));
     return vec4<f32>(pow(display, vec3<f32>(2.2)), c.a);
+}
+
+// The frame's linear depth at pixel `p` (clamped to the frame), 0 at the
+// near plane and 1 at the far, as the game's `projectParams` give it.
+fn aa_depth(p: vec2<i32>) -> f32 {
+    let size = vec2<i32>(textureDimensions(depth_map));
+    let d = textureLoad(depth_map, clamp(p, vec2<i32>(0), size - 1), 0);
+    let z = min(post.dof.y / (d + post.dof.x), post.aa.w);
+    return (z - post.aa.z) / (post.aa.w - post.aa.z);
+}
+
+fn aa_colour(p: vec2<i32>) -> vec3<f32> {
+    let size = vec2<i32>(textureDimensions(source));
+    return textureLoad(source, clamp(p, vec2<i32>(0), size - 1), 0).rgb;
+}
+
+// The 360's anti-aliasing (its PgAntiAliasingFP): where the depths of a
+// pixel's opposite neighbours differ by a share of its own, it is
+// smoothed towards the two neighbours along that edge.
+@fragment
+fn fs_antialias(v: Screen) -> @location(0) vec4<f32> {
+    let p = vec2<i32>(v.position.xy);
+    let c = aa_colour(p);
+    let a = textureLoad(source, p, 0).a;
+    if post.aa.w <= 0.0 {
+        return vec4<f32>(c, a);
+    }
+    // Each direction's two neighbours across it, then the two along it.
+    var across = array<vec4<i32>, 4>(
+        vec4<i32>(0, -1, 0, 1),
+        vec4<i32>(-1, -1, 1, 1),
+        vec4<i32>(-1, 0, 1, 0),
+        vec4<i32>(-1, 1, 1, -1),
+    );
+    var along = array<vec4<i32>, 4>(
+        vec4<i32>(-1, 0, 1, 0),
+        vec4<i32>(-1, 1, 1, -1),
+        vec4<i32>(0, -1, 0, 1),
+        vec4<i32>(-1, -1, 1, 1),
+    );
+    let centre = aa_depth(p);
+    var sum = vec3<f32>(0.0);
+    var edges = 0.0;
+    for (var k = 0; k < 4; k = k + 1) {
+        let x = across[k];
+        let step = (aa_depth(p + x.xy) - aa_depth(p + x.zw)) / centre;
+        if abs(step) >= post.aa.x {
+            let y = along[k];
+            sum = sum + (aa_colour(p + y.xy) + aa_colour(p + y.zw)) * 0.5;
+            edges = edges + 1.0;
+        }
+    }
+    if edges <= 0.0 {
+        return vec4<f32>(c, a);
+    }
+    return vec4<f32>(c + (sum / edges - c) * post.aa.y, a);
 }
 
 // Each level down: the average of 2 x 2 blocks of the one above.
@@ -609,13 +683,14 @@ struct Uniforms {
     mb_y: [f32; 4],
     mb_w: [f32; 4],
     mb_scale: [f32; 4],
+    aa: [f32; 4],
 }
 
 /// The passes, by index: bright, blur across, blur down, composite, then
 /// log luminance and its reductions down to one texel, adaptation, the
 /// game's blur (see [`GAME_BLUR`]) and the merge of the glow layer
-/// ([`MERGE`]), which runs first.
-const PASSES: usize = GAME_BLUR + 3 + 3 * LEVELS;
+/// ([`MERGE`]) and the anti-aliasing ([`ANTIALIAS`]), which run first.
+const PASSES: usize = GAME_BLUR + 4 + 3 * LEVELS;
 /// Side of each luminance image, from the frame's down to one texel.
 const LUMINANCE: [u32; 5] = [256, 64, 16, 4, 1];
 /// Pass indices.
@@ -628,7 +703,10 @@ const ADAPT: usize = LOG_LUMINANCE + LUMINANCE.len();
 const GAME_BLUR: usize = ADAPT + 1;
 const COMBINE: usize = GAME_BLUR + 1 + 3 * LEVELS;
 /// The glow layer merged into the world (see `fs_merge`), first of all.
-const MERGE: usize = PASSES - 1;
+const MERGE: usize = PASSES - 2;
+/// The 360's anti-aliasing over the merged frame (see `fs_antialias`),
+/// next: every later pass reads its result.
+const ANTIALIAS: usize = PASSES - 1;
 /// The game's blur levels (its combine shader, 017, reads four).
 const LEVELS: usize = 4;
 /// What each of the game's blur levels divides the frame's sides by
@@ -653,6 +731,13 @@ const fn level_pass(level: usize, index: usize) -> usize {
     GAME_BLUR + 1 + 3 * level + index
 }
 
+/// The 360's anti-aliasing: the share of a pixel's own linear depth by
+/// which its opposite neighbours' must differ for an edge (0x82DE8C34),
+/// and how far an edge's pixel is taken to its neighbours along it
+/// (0x820B8034): its `depthAntiAliasParams`.
+pub const ANTIALIAS_STEP: f32 = 0.035;
+pub const ANTIALIAS_AMOUNT: f32 = 0.8;
+
 /// Targets and pipelines of the post pass.
 #[derive(Debug)]
 pub struct Post {
@@ -669,6 +754,11 @@ pub struct Post {
     game_blur: wgpu::RenderPipeline,
     game_combine: wgpu::RenderPipeline,
     merge: wgpu::RenderPipeline,
+    antialias: wgpu::RenderPipeline,
+    /// Whether the anti-aliasing runs (it does in the game), and the
+    /// frame's near and far planes for it.
+    antialias_on: Cell<bool>,
+    near_far: Cell<[f32; 2]>,
     /// The sun flare's texture group (black until one is set), which
     /// texture it holds, the flare's four turnings and its clock.
     flare_layout: wgpu::BindGroupLayout,
@@ -721,6 +811,8 @@ struct Images {
     /// and the world with them merged in, which every later pass reads.
     glow_layer: wgpu::TextureView,
     merged: wgpu::TextureView,
+    /// The world and glows before the anti-aliasing draws `merged`.
+    unsmoothed: wgpu::TextureView,
     /// Each pass's bind group, for each way round of `adapted`.
     groups: [[wgpu::BindGroup; PASSES]; 2],
 }
@@ -938,6 +1030,9 @@ impl Post {
             game_blur: pipeline("fs_game_blur", HDR_FORMAT),
             game_combine: pipeline("fs_game_combine", HDR_FORMAT),
             merge: pipeline("fs_merge", HDR_FORMAT),
+            antialias: pipeline("fs_antialias", HDR_FORMAT),
+            antialias_on: Cell::new(true),
+            near_far: Cell::new([0.0; 2]),
             layout,
             flare_layout,
             flare_group: std::cell::RefCell::new(flare_group),
@@ -1001,6 +1096,7 @@ impl Post {
         let combined = target(device, "blur", cw, ch);
         let glow_layer = target(device, "glow layer", width, height);
         let merged = target(device, "world and glows", width, height);
+        let unsmoothed = target(device, "world and glows, unsmoothed", width, height);
         let group = |i: usize, views: [&wgpu::TextureView; 5]| {
             // `BlurH0` (the game's first blur level, its image kept in [0])
             // for the composite's sun flare; elsewhere an image no post pass draws into.
@@ -1051,6 +1147,7 @@ impl Post {
             let spare = &combined;
             std::array::from_fn(|i| match i {
                 MERGE => group(i, [&hdr, &glow_layer, now, spare, spare]),
+                ANTIALIAS => group(i, [&unsmoothed, &glow[0], now, spare, spare]),
                 BRIGHT => group(i, [&merged, &glow[1], now, spare, spare]),
                 1 => group(i, [&glow[0], &hdr, now, spare, spare]),
                 2 => group(i, [&glow[1], &hdr, now, spare, spare]),
@@ -1098,6 +1195,7 @@ impl Post {
                 combined,
                 glow_layer,
                 merged,
+                unsmoothed,
                 groups,
             },
         )
@@ -1136,6 +1234,22 @@ impl Post {
     /// the depth of field turns depth back into distance with.
     pub fn set_projection(&self, p: &m2_math::glam::Mat4) {
         self.projection.set([p.z_axis.z, p.w_axis.z]);
+    }
+
+    /// The frame's near and far planes, which the anti-aliasing measures
+    /// depth between (as the game's `projectParams`).
+    pub fn set_near_far(&self, near: f32, far: f32) {
+        self.near_far.set([near, far]);
+    }
+
+    /// Runs the 360's anti-aliasing or not (it always runs in the game).
+    pub fn set_antialias(&self, on: bool) {
+        self.antialias_on.set(on);
+    }
+
+    /// Whether the anti-aliasing runs.
+    pub fn antialias(&self) -> bool {
+        self.antialias_on.get()
     }
 
     /// The frame's view and projection (`projection * view`): with the
@@ -1367,6 +1481,14 @@ impl Post {
                 mb_y: self.motion.get()[1],
                 mb_w: self.motion.get()[2],
                 mb_scale: [lighting.motion_blur, 0.0, 0.0, 0.0],
+                aa: {
+                    let [near, far] = self.near_far.get();
+                    if self.antialias_on.get() && far > near {
+                        [ANTIALIAS_STEP, ANTIALIAS_AMOUNT, near, far]
+                    } else {
+                        [0.0; 4]
+                    }
+                },
                 rain_mode: [
                     match overlay.map(|o| o.blend) {
                         None => 0.0,
@@ -1422,7 +1544,8 @@ impl Post {
             pass.set_bind_group(1, &*flare, &[]);
             pass.draw(0..3, 0..1);
         };
-        pass(&self.merge, &groups[MERGE], &self.sized.merged);
+        pass(&self.merge, &groups[MERGE], &self.sized.unsmoothed);
+        pass(&self.antialias, &groups[ANTIALIAS], &self.sized.merged);
         if game || lighting.adaptation.is_some() {
             pass(
                 &self.log_luminance,
@@ -1770,13 +1893,27 @@ mod tests {
         seen.push(COMBINE);
         let expected: Vec<usize> = (GAME_BLUR..=COMBINE).collect();
         assert_eq!(seen, expected);
-        assert_eq!(MERGE, PASSES - 1);
+        assert_eq!(ANTIALIAS, PASSES - 1);
+        assert_eq!(MERGE + 1, ANTIALIAS);
         assert_eq!(COMBINE + 1, MERGE);
         const { assert!(ADAPT < GAME_BLUR) };
         // Each level halves the one before.
         for pair in LEVEL_DIVISORS.windows(2) {
             assert_eq!(pair[1], pair[0] * 2);
         }
+    }
+
+    #[test]
+    fn the_antialiasing_takes_the_games_constants() {
+        // shaders.bin PgAntiAliasingFP literals: a depth step of 0.035 of
+        // the centre's depth across a pair marks an edge, and the edge
+        // pixel moves 0.8 of the way to the average along it.
+        assert_eq!(super::ANTIALIAS_STEP, 0.035);
+        assert_eq!(super::ANTIALIAS_AMOUNT, 0.8);
+        let s = super::SHADER;
+        assert!(s.contains("fn fs_antialias"));
+        assert!(s.contains("post.aa.x"));
+        assert!(s.contains("post.aa.y"));
     }
 
     #[test]

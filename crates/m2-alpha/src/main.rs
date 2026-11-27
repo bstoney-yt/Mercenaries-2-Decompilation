@@ -72,6 +72,7 @@ mod drop_zones;
 mod drops;
 mod entrance_marker;
 mod errlog;
+mod flicker;
 mod flights;
 mod flow;
 mod frametimes;
@@ -336,6 +337,10 @@ struct Options {
     /// With `--screenshot` on foot: take the picture close up from behind
     /// her, to see what hangs on her back.
     behind: bool,
+    /// `--flicker-check`: with `--screenshot` on foot, pan past the
+    /// nearest tree and measure flicker ([`flicker::check`]); exits 0 on a
+    /// PASS, 1 on a FAIL.
+    flicker_check: bool,
     /// With `--screenshot` on foot: give her this weapon in the
     /// launcher's place without taking it up (`--slung gl`: the crate's
     /// grenade launcher on her back while the carbine is up).
@@ -638,6 +643,10 @@ struct Options {
     /// `--parked-settle-check`: the layers' parked vehicles, placed as
     /// authored, keep to their authored pose ([`parked_settle_check`]).
     parked_settle_check: bool,
+    /// With `--parked-settle-check`: at least this many of the scripts'
+    /// vehicles placed where they said must be judged, or it fails
+    /// (`--settle-given <n>`).
+    settle_given: usize,
     /// With `--parked-settle-check`: at least this many vehicles must be
     /// judged here, or it fails (`--settle-least <n>`).
     settle_least: usize,
@@ -1117,6 +1126,9 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.parked_settle_check = true;
                 o.drive = true;
             }
+            "--settle-given" => {
+                o.settle_given = value()?.parse().context("--settle-given expects a count")?;
+            }
             "--prop-limits-check" => {
                 o.prop_limits_check = true;
                 o.drive = true;
@@ -1246,6 +1258,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--switch" => o.switch = true,
             "--pickup" => o.pickup = true,
             "--closeup" => o.closeup = true,
+            "--flicker-check" => o.flicker_check = true,
             "--pda" => o.pda = true,
             "--pda-zoom" => {
                 o.pda_zoom = value()?.parse().context("--pda-zoom expects a number")?;
@@ -1522,6 +1535,7 @@ const SCREENSHOT_ONLY: &[&str] = &[
     "--mission-shots",
     "--pipelines-check",
     "--pipeline-warm-check",
+    "--flicker-check",
 ];
 
 /// Those of [`SCREENSHOT_ONLY`] given without `--screenshot`, in the order
@@ -2156,6 +2170,7 @@ pub struct Showcase {
 /// Frames timed before a screenshot.
 const FRAMES_TIMED: u32 = 60;
 
+#[allow(clippy::too_many_arguments)]
 fn build_scene(
     backend: &mut dyn RenderBackend,
     install: Option<&Install>,
@@ -2164,11 +2179,13 @@ fn build_scene(
     sea_level: f32,
     mission: bool,
     hero: Hero,
+    park: bool,
 ) -> anyhow::Result<Game> {
     let mut scene = Scene::new(backend)?;
     scene.hero = hero;
-    // The catalogue's vehicles are no mission's.
-    scene.park = !mission;
+    // The catalogue's vehicles are no mission's, nor a check's of the
+    // game's own placings (`park`).
+    scene.park = park && !mission;
     if double_sided {
         scene.materials.set_double_sided(backend, true)?;
     }
@@ -3443,6 +3460,9 @@ fn screenshot(
         config.world.sea_level,
         options.mission,
         config.hero,
+        // Not by a check of how the layers' vehicles stand: the
+        // catalogue's are the port's own (q769h: two landed on trailers).
+        !options.parked_settle_check,
     )?;
     start_startup(
         &mut game,
@@ -4131,6 +4151,10 @@ fn screenshot(
         for line in describe_slung(&game) {
             eprintln!("behind: {line}");
         }
+    }
+    if options.flicker_check {
+        let ok = flicker::check(&mut backend, &mut game, fov, aspect, out)?;
+        errlog::exit(if ok { 0 } else { 1 });
     }
     if let (Some(reach), Some(link)) = (options.mission_look, &link) {
         look_at_marker(&mut backend, &mut game, link, reach, fov, aspect)?;
@@ -5429,6 +5453,7 @@ fn front_end_offscreen(
         config.world.sea_level,
         false,
         config.hero,
+        true,
     )?;
     let mut hud = ui::Hud::new();
     let mut shell = gamehud::GameHud::start_shell(install);
@@ -9057,7 +9082,15 @@ fn drive_for_screenshot(
         return prop_bodies_check(backend, game, fov, aspect, tick);
     }
     if options.parked_settle_check {
-        return parked_settle_check(backend, game, fov, aspect, tick, options.settle_least);
+        return parked_settle_check(
+            backend,
+            game,
+            fov,
+            aspect,
+            tick,
+            options.settle_given,
+            options.settle_least,
+        );
     }
     if options.prop_limits_check {
         return prop_limits_check(backend, game, fov, aspect, tick);
@@ -9240,7 +9273,11 @@ fn drive_for_screenshot(
         .map(|n| n.character.position)
         .collect();
     let mut reverse_fastest = 0.0f32;
-    for i in 0..240 {
+    // Backing up runs until its speed levels off (under 0.1 m/s gained
+    // over the last 2 s), for at most 30 s; ahead, 4 s.
+    let mut reverse_speeds: Vec<f32> = Vec::new();
+    let steps = if options.drive_reverse { 1800 } else { 240 };
+    for i in 0..steps {
         let steer = match (game.scene.world.as_ref(), driven(game)) {
             (Some(w), Some((id, hull))) if !ploughing => {
                 autoplay::steer_round(&w.physics, id, hull)
@@ -9262,6 +9299,17 @@ fn drive_for_screenshot(
             && let Some((_, speed)) = game.driving()
         {
             reverse_fastest = reverse_fastest.max(speed.abs());
+            reverse_speeds.push(speed.abs());
+            let n = reverse_speeds.len();
+            if n > 240 && reverse_speeds[n - 1] - reverse_speeds[n - 121] < 0.1 {
+                eprintln!(
+                    "drive: reverse levels off at {:.1} m/s ({:.0} km/h) after {:.1} s",
+                    reverse_speeds[n - 1],
+                    reverse_speeds[n - 1] * 3.6,
+                    n as f32 * tick
+                );
+                break;
+            }
         }
         if let Some(h) = &mut seats {
             h.seat(game, tick);
@@ -10290,8 +10338,18 @@ const CARGO_TRUCK: &str = "GunPickup";
 struct CargoWait {
     t: f32,
     put_at: Option<f32>,
+    /// When she was put at [`CARGO_APPROACH`] from the contract's truck.
+    near_at: Option<f32>,
     done: bool,
 }
+
+/// How far from the contract's truck she is first put, metres: within its
+/// `HibernationControl` reach (1.2 x 250 = 300 m: it comes out and its
+/// springs settle it) but beyond its crates' (1.2 x 100 and 1.2 x 65), as
+/// she comes up to it in Xenia cargo1 (the truck out with her 240 m away,
+/// asleep 2.6 s after; the crates out at 120 and 78 m, 18 and 22 s later).
+/// Once it sleeps she is put by it.
+const CARGO_APPROACH: f32 = 200.0;
 
 impl CargoWait {
     fn tick(
@@ -10327,18 +10385,31 @@ impl CargoWait {
                 .iter()
                 .position(|v| v.id.is_some() && !v.wrecked && v.spec.label.contains("El Grande"));
             if grande.is_none()
+                && self.near_at.is_none()
                 && let Some(at) = truck
             {
                 eprintln!(
-                    "cargo-check: she is put 8 m from the contract's truck {CARGO_TRUCK} at {at:.0}"
+                    "cargo-check: she is put {CARGO_APPROACH:.0} m from the contract's truck {CARGO_TRUCK} at {at:.0}"
                 );
                 if let Some(p) = game.scene.player.as_mut() {
                     p.driving = None;
-                    p.drop_at(at + Vec3::X * 8.0 + Vec3::Y * 2.0);
+                    p.drop_at(at + Vec3::X * CARGO_APPROACH + Vec3::Y * 2.0);
                 }
                 game.ride = None;
                 game.on_foot = true;
-                self.put_at = Some(self.t);
+                self.near_at = Some(self.t);
+                return false;
+            }
+            // Come up to it: once it is out and asleep (or after
+            // [`CARGO_WAIT`] s), she is put by it.
+            if self.near_at.is_some_and(|t| self.t - t <= CARGO_WAIT)
+                && !grande.is_some_and(|i| {
+                    vehicles[i]
+                        .id
+                        .zip(game.scene.world.as_ref())
+                        .is_some_and(|(id, w)| w.physics.vehicle_asleep(id))
+                })
+            {
                 return false;
             }
             let to_mark = grande.is_none().then(|| marks.first().copied()).flatten();
@@ -10671,6 +10742,35 @@ fn cargo_settle_check(game: &mut Game, tick: f32) {
                 "cargo-settle-check: {:.0} s: the {label} at {at:.2}, {off} off",
                 k as f32 * tick
             );
+            // Log only: whether the truck and each crate are asleep, and
+            // each crate's offset from where it was loaded (the truck's
+            // frame): what wakes the load.
+            if let Some(w) = game.scene.world.as_ref() {
+                let states: Vec<String> = game
+                    .scene
+                    .props
+                    .cargo_states(&w.physics, i, id)
+                    .into_iter()
+                    .map(|(e, d, asleep)| {
+                        let z = match asleep {
+                            Some(true) => "asleep",
+                            Some(false) => "awake",
+                            None => "gone",
+                        };
+                        format!("{e:#x} {z} {:+.3},{:+.3},{:+.3}", d.x, d.y, d.z)
+                    })
+                    .collect();
+                eprintln!(
+                    "cargo-settle-check: {:.0} s: the {label} {}; on its bed: {}",
+                    k as f32 * tick,
+                    if w.physics.vehicle_asleep(id) {
+                        "asleep"
+                    } else {
+                        "awake"
+                    },
+                    states.join("; ")
+                );
+            }
         }
     }
     let end = read(game);
@@ -14230,6 +14330,7 @@ impl App {
             self.config.world.sea_level,
             self.mission,
             self.config.hero,
+            true,
         )?;
         start_startup(
             &mut game,
@@ -16082,6 +16183,26 @@ impl ApplicationHandler for App {
 
 #[cfg(test)]
 mod tests {
+    // The dock's trailers are judged by how far back along their own
+    // length they rest against Xenia sub1's (0.50 m for the Fuel Trailer),
+    // whichever way they face.
+    #[test]
+    fn a_dock_trailer_is_judged_by_its_ease_back() {
+        use m2_math::glam::{Quat, Vec3};
+        let turn = Quat::from_rotation_y(1.62);
+        let authored = Vec3::new(1269.755, -27.547, 381.730);
+        let back = turn * Vec3::NEG_Z;
+        let at = |d: f32| authored + back * d + Vec3::NEG_Y * 0.07;
+        assert!(trailer_settled(at(0.42), authored, turn, 0.50, 0.7, 1.0, 0.0).is_ok());
+        assert!(trailer_settled(at(0.78), authored, turn, 0.50, 0.7, 1.0, 0.0).is_err());
+        assert!(trailer_settled(at(0.00), authored, turn, 0.50, 0.7, 1.0, 0.0).is_err());
+        // Forward instead of back.
+        assert!(trailer_settled(at(-0.50), authored, turn, 0.50, 0.7, 1.0, 0.0).is_err());
+        // Moving, or turned past 5 degrees.
+        assert!(trailer_settled(at(0.50), authored, turn, 0.50, 0.7, 1.0, 0.2).is_err());
+        assert!(trailer_settled(at(0.50), authored, turn, 0.50, 9.0, 1.0, 0.0).is_err());
+    }
+
     // The dock-side Dinghy is judged by its 360 rest on the bank: its drop,
     // its tilt and the way it tilts, and where it rests level.
     #[test]
@@ -16414,6 +16535,20 @@ mod tests {
         let o = parse_args(&args(&["--autoplay-avoid", "OilCon020,PmcCon031"])).unwrap();
         assert_eq!(o.autoplay_avoid, ["OilCon020", "PmcCon031"]);
         assert!(parse_args(&args(&[])).unwrap().autoplay_avoid.is_empty());
+    }
+
+    #[test]
+    fn the_flicker_check_is_an_offscreen_flag() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(
+            parse_args(&args(&["--flicker-check"]))
+                .unwrap()
+                .flicker_check
+        );
+        assert_eq!(
+            screenshot_only_ignored(&args(&["--flicker-check"])),
+            ["--flicker-check"]
+        );
     }
 
     #[test]
@@ -17516,6 +17651,46 @@ fn settle_touch_name(world: &m2_engine::World, key: Option<m2_engine::StaticKey>
 /// allowed; level movement must stay within a few centimetres.
 const BOAT_SETTLE: (f32, f32) = (0.05, 0.5);
 
+/// Where `--parked-settle-check` expects the dock's trailers to rest, by
+/// entity: metres back along their own length from their authored place,
+/// as Xenia sub1 measured (2026-11-26): the Fuel Trailer 0xF0309 0.50 m
+/// (1269.259, 381.708 from 1269.755, 381.730), the Box Trailer 0x10001EA5
+/// 0.25 m (1272.022, 397.758 from 1272.254, 397.668); each one's twin
+/// likewise. Their kick pitches them and they ease back as they land.
+const TRAILER_SETTLE: [(u32, f32); 4] = [
+    (0x000f_0309, 0.50),
+    (0x000f_030b, 0.50),
+    (0x1000_1ea5, 0.25),
+    (0x1000_1ea6, 0.25),
+];
+/// How far from [`TRAILER_SETTLE`]'s target a trailer may rest, metres.
+/// Invented.
+const TRAILER_SETTLE_WIDTH: f32 = 0.20;
+
+/// A dock trailer judged by [`TRAILER_SETTLE`]: at `now`, authored at
+/// `authored` turned `turn`; `back` its target. Its offset back along its
+/// own length (its authored -z) must be within [`TRAILER_SETTLE_WIDTH`] of
+/// it; it may not be turned past 5 degrees, on its side, or moving. Returns
+/// its offset back.
+fn trailer_settled(
+    now: m2_math::glam::Vec3,
+    authored: m2_math::glam::Vec3,
+    turn: m2_math::glam::Quat,
+    back: f32,
+    turned: f32,
+    up: f32,
+    speed: f32,
+) -> Result<f32, String> {
+    let along = -(now - authored).dot(turn * m2_math::glam::Vec3::Z);
+    let off = (along - back).abs();
+    if off > TRAILER_SETTLE_WIDTH || turned > SETTLE_MOST.1 || up <= 0.5 || speed >= SETTLE_MOST.2 {
+        return Err(format!(
+            "{along:.2} m back along its length (Xenia sub1 {back:.2} +-{TRAILER_SETTLE_WIDTH:.2}), {turned:.1} deg turned, up {up:.2}, {speed:.3} m/s"
+        ));
+    }
+    Ok(along)
+}
+
 /// The dock-side Dinghy 0xD5FBF's rest on the 360 (Xenia dinghy1,
 /// 2026-11-26): it falls from its authored pose onto the bank, not into
 /// the water, and lands rigidly: dropped 1.038 m, moved (0.0179, 0.0063)
@@ -17598,6 +17773,7 @@ fn parked_settle_check(
     fov: f32,
     aspect: f32,
     tick: f32,
+    given_least: usize,
     least: usize,
 ) -> anyhow::Result<()> {
     use m2_math::glam::{Quat, Vec3};
@@ -17619,6 +17795,8 @@ fn parked_settle_check(
     > = HashMap::new();
     let (mut passed, mut failed) = (0usize, Vec::new());
     let mut judged = std::collections::HashSet::new();
+    // The scripts' vehicles placed where they said, judged.
+    let mut given_judged = 0usize;
     let mut t = 0.0f32;
     while t < SETTLE_WATCH {
         game.step(Intent::default(), tick);
@@ -17635,7 +17813,11 @@ fn parked_settle_check(
             // guid, its layer entity's `Transform`).
             let authored = match (v.spot, v.guid) {
                 (Some((entity, at, _)), _) => game.authored_turn(entity).map(|t| (entity, at, t)),
-                (None, Some(g)) => game.authored_guids.get(&g).map(|&(at, t)| (g, at, t)),
+                (None, Some(g)) => game
+                    .authored_guids
+                    .get(&g)
+                    .or_else(|| game.given_guids.get(&g))
+                    .map(|&(at, t)| (g, at, t)),
                 _ => None,
             };
             let Some((key, at, turn)) = authored else {
@@ -17644,6 +17826,13 @@ fn parked_settle_check(
             if judged.contains(&key) || watched.contains_key(&key) {
                 continue;
             }
+            let given =
+                v.spot.is_none() && v.guid.is_some_and(|g| game.given_guids.contains_key(&g));
+            let label = if given {
+                format!("{} (where the scripts said)", v.spec.label)
+            } else {
+                v.spec.label.clone()
+            };
             // As it is placed: how far each corner of its hull's bottom is
             // over what is under it (past its own bodies; negative: in it),
             // to tell a hull put into the ground (q766 B: the Phoenix
@@ -17675,7 +17864,7 @@ fn parked_settle_check(
                     at,
                     turn,
                     0.0,
-                    v.spec.label.clone(),
+                    label,
                     std::collections::BTreeSet::new(),
                     None,
                 ),
@@ -17728,6 +17917,9 @@ fn parked_settle_check(
                 continue;
             }
             done.push(entity);
+            if label.ends_with("(where the scripts said)") {
+                given_judged += 1;
+            }
             let Some(v) = game
                 .scene
                 .vehicles
@@ -17750,6 +17942,50 @@ fn parked_settle_check(
             // its heading, so one rolling back at 0.6 m/s passed as still
             // (q769: two Fuel Trailers judged at -0.68 and -0.58 m/s).
             let speed = world.physics.vehicle_velocity(id).length();
+            // Every vehicle in the scene that is this entity, the layers' or
+            // the scripts' (#766: one per entity), so a run shows it is one.
+            // Log only.
+            let copies: Vec<String> = game
+                .scene
+                .vehicles
+                .iter()
+                .filter(|c| c.spot.is_some_and(|(e, _, _)| e == entity) || c.guid == Some(entity))
+                .map(|c| {
+                    let whose = if c.guid.is_some() {
+                        "the scripts'"
+                    } else {
+                        "the layers'"
+                    };
+                    let at =
+                        c.id.and_then(|i| world.physics.vehicle_transform(i))
+                            .map_or("unplaced".to_owned(), |m| {
+                                format!("{:.2}", m.w_axis.truncate())
+                            });
+                    format!("{whose} {:?} at {at}", c.id)
+                })
+                .collect();
+            eprintln!(
+                "parked-settle-check: {entity:#x} {label}: {} copies of this entity in the scene [{}]",
+                copies.len(),
+                copies.join("; ")
+            );
+            // A trailer (q769: Fuel Trailers 0.4-0.5 m off): its wheels as
+            // its spec has them and its pitch now, 5 s on. Log only.
+            if v.spec.label.to_ascii_lowercase().contains("trailer") {
+                let ahead = m.transform_vector3(Vec3::Z).normalize_or_zero();
+                let pitch = ahead.y.clamp(-1.0, 1.0).asin().to_degrees();
+                let wheels: Vec<String> = v
+                    .spec
+                    .wheels
+                    .iter()
+                    .map(|w| format!("{:.2}", w.centre))
+                    .collect();
+                eprintln!(
+                    "parked-settle-check: {entity:#x} {label}: pitch {pitch:+.1} deg at {SETTLE_AFTER} s; {} wheels at [{}] (model space)",
+                    wheels.len(),
+                    wheels.join(", ")
+                );
+            }
             // A boat floats where the water puts it (`game::place`: level,
             // at its float depth), not at its authored height or tilt: it
             // is judged by its own rule.
@@ -17807,6 +18043,23 @@ fn parked_settle_check(
             // step's velocity read 0.06 m/s on every vehicle at rest).
             let instant = speed;
             let speed = mark.map_or(instant, |p| now_at.distance(p) / SETTLE_STILL_OVER);
+            // The dock's trailers by Xenia sub1's rest ([`TRAILER_SETTLE`]).
+            if let Some(&(_, back)) = TRAILER_SETTLE.iter().find(|(e, _)| *e == entity) {
+                match trailer_settled(now_at, *at, *turn, back, turned, up, speed) {
+                    Ok(along) => {
+                        eprintln!(
+                            "parked-settle-check: {entity:#x} {label}: {along:.2} m back along its length (Xenia sub1 {back:.2} +-{TRAILER_SETTLE_WIDTH:.2}): kept"
+                        );
+                        passed += 1;
+                    }
+                    Err(why) => {
+                        let line = format!("{entity:#x} {label}: {why}");
+                        eprintln!("parked-settle-check: off: {line}");
+                        failed.push(line);
+                    }
+                }
+                continue;
+            }
             let ok = moved <= SETTLE_MOST.0
                 && turned <= SETTLE_MOST.1
                 && up > 0.5
@@ -17814,8 +18067,8 @@ fn parked_settle_check(
             if ok {
                 passed += 1;
             } else {
-                // Past its own bodies (q766 A: four Guntrucks' probe met
-                // their own hulls, -2.00).
+                // Past its own bodies (q769: a Fuel Trailer's tank, taller
+                // than the probe's 2 m start, met the probe at once).
                 let from = *at + Vec3::Y * 2.0;
                 let under = world
                     .physics
@@ -17848,8 +18101,15 @@ fn parked_settle_check(
         judged.len(),
         watched.len()
     );
+    eprintln!(
+        "parked-settle-check: {given_judged} of them the scripts' placed where they said (at least {given_least} asked)"
+    );
     if judged.is_empty() {
         eprintln!("parked-settle-check: FAIL no parked vehicle placed as authored here");
+    } else if given_judged < given_least {
+        eprintln!(
+            "parked-settle-check: FAIL {given_judged} of the scripts' vehicles placed where they said were judged, not at least {given_least}"
+        );
     } else if judged.len() < least {
         eprintln!(
             "parked-settle-check: FAIL {} judged here, not at least {least}",
