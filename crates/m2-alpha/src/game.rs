@@ -6723,15 +6723,19 @@ fn exit_plan(
     let exit = seating.zip(index).and_then(|(s, i)| s.exit_of(i));
     let (place, blocked) = exit_way(physics, v, her_seat, at);
     let up_y = at.transform_vector3(Vec3::Y).normalize_or_zero().y;
-    // A helicopter's landed share is not modelled: it counts as landed
-    // (Invented; 0x822A2B60 ditches from one in the air).
+    // A helicopter (its physics kind 4) whose ground time is 0.5 s or
+    // less, its +0x140 object's +0x4C, ditches (0x822A2B60), the ground
+    // time as the pilot's mind reads it ([`Physics::helicopter_airborne`]).
     let jolt = v.id.map_or(0.0, |id| physics.vehicle_jolt(id));
+    let airborne =
+        v.id.and_then(|id| physics.helicopter_airborne(id))
+            .unwrap_or(false);
     let kind = seats::exit_kind(
         seat,
         exit.map(|e| &e.params),
         velocity.length(),
         jolt,
-        false,
+        airborne,
         up_y,
         blocked,
     );
