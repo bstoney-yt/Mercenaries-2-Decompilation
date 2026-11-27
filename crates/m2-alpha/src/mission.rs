@@ -1056,6 +1056,8 @@ pub struct MissionLink {
     pub part_destroy_check: Option<PartDestroyCheck>,
     /// `--sat-blip-check` ([`SatBlipCheck`]).
     pub sat_blip_check: Option<SatBlipCheck>,
+    /// `--credits-check` ([`CreditsCheck`]).
+    pub credits_check: Option<CreditsCheck>,
     /// The face rigs and sets read, and the sets the scripts mounted
     /// ([`m2_engine::lip_sync`]).
     faces: m2_engine::lip_sync::Library,
@@ -1323,6 +1325,7 @@ impl MissionLink {
             check_building_damage: None,
             part_destroy_check: None,
             sat_blip_check: None,
+            credits_check: None,
             prop_nodes: HashMap::new(),
             faces: Default::default(),
             movies: false,
@@ -3288,6 +3291,9 @@ impl MissionLink {
         }
         if let Some(check) = &mut self.sat_blip_check {
             check.tick(game, mission, dt);
+        }
+        if let Some(check) = &mut self.credits_check {
+            check.tick(mission, dt);
         }
         // A pursuit run out: the scripts read level 0 again.
         let pursued = !game.scene.people.pursuit.is_empty();
@@ -6795,6 +6801,89 @@ impl ObjectSoundCheck {
     }
 }
 
+/// `--credits-check`: the ending's credits, started as the end of the
+/// story starts them, and followed to the front end.
+///
+/// From the scripts (`WifMissionFlow`, read 2026-11-27): after the final
+/// contract's cinematic the flow calls `_ClientStartCredits`, which opens
+/// a full-screen Flash widget playing the `credits` movie with
+/// `_ClientEndCredits` as its set-up; that hooks the movie's `creditsEnd`
+/// event to `_ClientQuitToShell`, which leaves the game for the front
+/// end. This check wraps `_ClientQuitToShell` to count its call, starts
+/// the credits once the scripts have run [`CREDITS_START`] seconds, and
+/// logs each step: `credits-check: PASS` once the movie has sent
+/// `creditsEnd` and the quit runs, `FAIL` after [`CREDITS_LIMIT`].
+#[derive(Debug, Default)]
+pub struct CreditsCheck {
+    t: f32,
+    started: bool,
+    done: bool,
+}
+
+/// When the check starts the credits, seconds after the scripts start.
+pub const CREDITS_START: f32 = 5.0;
+/// How long the credits may run before the check fails, seconds.
+pub const CREDITS_LIMIT: f32 = 900.0;
+
+impl CreditsCheck {
+    fn tick(&mut self, mission: &mut m2_game::mission::Mission, dt: f32) {
+        if self.done {
+            return;
+        }
+        self.t += dt;
+        if !self.started && self.t >= CREDITS_START {
+            self.started = true;
+            let ok: bool = mission
+                .lua()
+                .load(
+                    "if type(_ClientStartCredits) ~= 'function' then return false end \
+                     local quit = _ClientQuitToShell \
+                     __m2_credits_quit = 0 \
+                     _ClientQuitToShell = function(...) \
+                         __m2_credits_quit = __m2_credits_quit + 1 \
+                         if type(quit) == 'function' then return quit(...) end \
+                     end \
+                     _ClientStartCredits() \
+                     return true",
+                )
+                .eval()
+                .unwrap_or(false);
+            if ok {
+                eprintln!(
+                    "credits-check: the scripts' credits started at {:.1} s",
+                    self.t
+                );
+            } else {
+                self.done = true;
+                eprintln!("credits-check: FAIL the scripts have no _ClientStartCredits");
+            }
+            return;
+        }
+        if !self.started {
+            return;
+        }
+        let quits: i64 = mission
+            .lua()
+            .globals()
+            .get("__m2_credits_quit")
+            .unwrap_or(0);
+        if quits > 0 {
+            self.done = true;
+            eprintln!(
+                "credits-check: PASS creditsEnd came after {:.1} s of credits; the quit to the front end ran",
+                self.t - CREDITS_START
+            );
+        } else if self.t - CREDITS_START > CREDITS_LIMIT {
+            self.done = true;
+            eprintln!("credits-check: FAIL no creditsEnd in {CREDITS_LIMIT:.0} s of credits");
+        } else if (self.t / 60.0).floor() != ((self.t - dt) / 60.0).floor() {
+            eprintln!(
+                "credits-check: {:.0} s of credits, no creditsEnd yet",
+                self.t - CREDITS_START
+            );
+        }
+    }
+}
 /// `--sat-blip-check`: the satellite bomb's square on the radar, put on
 /// and taken off by the game's own scripts. Two seconds into play a
 /// `Smart Bomb Projectile` is spawned 60 m over her and blipped as the
