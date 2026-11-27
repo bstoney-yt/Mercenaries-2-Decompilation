@@ -3957,6 +3957,12 @@ impl Game {
     }
 
     /// Where the world streams around.
+    /// Whether vehicle `i` stands in the water: a quarter or more of its
+    /// box under it, counting towards its sinking, or sunk ([`Game::sink`]).
+    pub fn vehicle_in_water(&self, i: usize) -> bool {
+        self.in_water.contains_key(&i) || self.sunk.contains(&i)
+    }
+
     pub fn focus(&self) -> Vec3 {
         match self.walking() {
             Some(p) => p.character.position,
@@ -7120,6 +7126,23 @@ fn switch_weapon(
 
 #[cfg(test)]
 mod tests {
+
+    /// #809's 11-27 PmcCon031: the flung R90 lay on the water and sank
+    /// under her. A vehicle counting towards its sinking, or sunk, is in
+    /// the water; one on land isn't.
+    #[test]
+    fn a_vehicle_in_the_water_says_so() {
+        let mut backend = m2_render::NullBackend::new();
+        let scene = Scene::new(&mut backend).unwrap();
+        let mut game = Game::new(scene, FlyCamera::looking_at(Vec3::ZERO, Vec3::Z));
+        assert!(!game.vehicle_in_water(3));
+        game.in_water.insert(3, 1.0);
+        assert!(game.vehicle_in_water(3));
+        game.in_water.remove(&3);
+        game.sunk.insert(3);
+        assert!(game.vehicle_in_water(3));
+        assert!(!game.vehicle_in_water(4));
+    }
 
     // Out of a vehicle that died under her: 10 m/s at 45 degrees, 7.07
     // out from its origin towards her and 7.07 up (0x82428EA0, the live
