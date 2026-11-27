@@ -2011,8 +2011,13 @@ impl Npc {
     }
 
     /// Takes `damage`; at no health left, falls: true if it killed.
-    /// `push` (m/s) shoves the body if it kills or is dead already.
+    /// `push` (m/s) shoves the body if it kills or is dead already. A
+    /// follower's death logs what killed them: the damage, the hit, and
+    /// the code that dealt it (its caller), so a hostage's loss can be
+    /// traced (OilCon002, nightly 2026-11-26).
+    #[track_caller]
     pub fn hurt(&mut self, damage: f32, push: Vec3) -> bool {
+        let by = std::panic::Location::caller();
         let clips = self.clips;
         let last_hit = self.last_hit.take();
         if !self.alive {
@@ -2033,9 +2038,11 @@ impl Npc {
             self.died = true;
             if matches!(self.brain, Brain::Follow { .. }) {
                 eprintln!(
-                    "people: {:08x} following her is killed at {:.1}",
+                    "people: {:08x} following her is killed at {:.1}: {damage:.1} damage, hit {last_hit:?}, push {push:.1}, dealt at {}:{}",
                     self.spawn.unwrap_or(0),
-                    self.character.position
+                    self.character.position,
+                    by.file(),
+                    by.line()
                 );
             }
             self.killed_by_her = true;
