@@ -18,6 +18,7 @@ pub mod ai_anchor;
 pub mod ai_close;
 pub mod ai_cover;
 pub mod ai_dither;
+pub mod ai_investigate;
 pub mod ai_mover;
 pub mod ai_plan;
 pub mod ai_sense;

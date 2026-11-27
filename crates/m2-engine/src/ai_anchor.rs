@@ -23,8 +23,9 @@
 //! the test is over the ground). [`Anchor::hold`], which applies the
 //! clamp to a velocity for a mover that steers by one, is the port's.
 //!
-//! Not ported: the mind's state that walks an AI back once it is beyond
-//! 0.6 of the radius (822B49C8), and the goal a `SpawnerType` 3 spawner
+//! 822B49C8, once taken for a walk back, is `HumanInvestigate`'s step:
+//! its walk to a noise stops once beyond 0.6 of the radius
+//! ([`crate::ai_investigate`]). Not ported: the goal a `SpawnerType` 3 spawner
 //! gives the one it sends (to its place, at haste 0.5).
 
 use m2_math::glam::{Vec2, Vec3};
