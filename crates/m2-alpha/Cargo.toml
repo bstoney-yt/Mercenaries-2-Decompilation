@@ -25,6 +25,7 @@ m2-net.workspace = true
 m2-render = { workspace = true, features = ["wgpu"] }
 m2-sys.workspace = true
 mlua.workspace = true
+png = "0.18"
 profiling = { version = "1", features = ["profile-with-tracy"], optional = true }
 serde.workspace = true
 toml.workspace = true

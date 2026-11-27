@@ -2632,6 +2632,7 @@ dependencies = [
  "mimalloc",
  "mlua",
  "ndk-context",
+ "png",
  "profiling",
  "serde",
  "toml",

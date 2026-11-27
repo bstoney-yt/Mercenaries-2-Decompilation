@@ -112,6 +112,10 @@ fn arrived(t: f32, in_place: bool) -> bool {
 pub struct Game {
     pub scene: Scene,
     pub camera: FlyCamera,
+    /// Photo mode, while it is on ([`crate::photo`]): its camera stands in
+    /// for every other in [`Game::view`]; nothing here ticks meanwhile
+    /// (the app stops calling [`Game::tick`]).
+    pub photo: Option<crate::photo::PhotoMode>,
     /// The menus' Brightness and shadows ([`Picture`]).
     pub picture: Picture,
     /// Playing as Jennifer rather than flying the camera.
@@ -578,6 +582,7 @@ impl Game {
         );
         Self {
             picture: Picture::default(),
+            photo: None,
             scene,
             camera,
             on_foot,
@@ -3953,7 +3958,10 @@ impl Game {
             .as_ref()
             .and_then(|s| s.view)
             .or(self.script_view.map(|(eye, forward)| (eye, eye + forward)));
+        let photo = self.photo.as_ref().map(|p| p.camera.view(aspect));
         let mut view = match (self.walking(), shot) {
+            // Photo mode's camera, over every other.
+            _ if photo.is_some() => photo.unwrap_or_default(),
             // A scene's shot of the scripts' (the HQ's briefings).
             (Some(_), Some((eye, at))) => FlyCamera::looking_at(eye, at).view(fov, aspect),
             (p, _) => match p {
@@ -3974,6 +3982,7 @@ impl Game {
         }
         if let Some((a, b)) = self.support.shake_turn()
             && self.support.looking().is_none()
+            && self.photo.is_none()
         {
             view.view = Mat4::from_rotation_x(a) * Mat4::from_rotation_y(b) * view.view;
         }

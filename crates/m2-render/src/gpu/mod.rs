@@ -853,6 +853,10 @@ pub struct AdapterSummary {
 /// [`RenderBackend`] on wgpu.
 #[derive(Debug)]
 pub struct WgpuBackend {
+    /// A copy of the next window frame is asked for
+    /// ([`request_capture`](Self::request_capture)), and the last one taken.
+    capture_wanted: bool,
+    captured: Option<(u32, u32, Vec<u8>)>,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -1051,6 +1055,11 @@ impl WgpuBackend {
             .get_default_config(&adapter, width.max(1), height.max(1))
             .ok_or_else(|| BackendError::Device("surface not supported by the adapter".into()))?;
         let caps = surface.get_capabilities(&adapter);
+        // Copying a frame out (photo mode's pictures), where the surface
+        // allows it.
+        if caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+            config.usage |= wgpu::TextureUsages::COPY_SRC;
+        }
         if let Some(srgb) = caps.formats.iter().copied().find(|f| f.is_srgb()) {
             config.format = srgb;
         }
@@ -1545,6 +1554,8 @@ impl WgpuBackend {
             materials: FastMap::default(),
             frame: None,
             spare: None,
+            capture_wanted: false,
+            captured: None,
             frames: 0,
             timer,
             submitted: [None, None],
@@ -2074,43 +2085,32 @@ impl WgpuBackend {
         let Target::Offscreen { texture, .. } = &self.target else {
             return Err(BackendError::Unsupported("reading back a window"));
         };
-        let row = self.width * 4;
-        let padded_row = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: u64::from(padded_row * self.height),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        encoder.copy_texture_to_buffer(
-            texture.as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_row),
-                    rows_per_image: None,
-                },
-            },
-            texture.size(),
-        );
-        self.queue.submit([encoder.finish()]);
-        let (tx, rx) = std::sync::mpsc::channel();
-        buffer.map_async(wgpu::MapMode::Read, .., move |r| {
-            let _ = tx.send(r);
-        });
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(device_error)?;
-        rx.recv().map_err(device_error)?.map_err(device_error)?;
-        let mapped = buffer.get_mapped_range(..).map_err(device_error)?;
-        let mut out = Vec::with_capacity((row * self.height) as usize);
-        for y in 0..self.height {
-            let start = (y * padded_row) as usize;
-            out.extend_from_slice(&mapped[start..start + row as usize]);
+        read_texture(&self.device, &self.queue, texture, self.width, self.height)
+    }
+
+    /// Asks for a copy of the next window frame as it is presented (offscreen,
+    /// [`read_pixels`](Self::read_pixels) reads any frame). False where the
+    /// window's surface can't be copied from.
+    pub fn request_capture(&mut self) -> bool {
+        let ok = match &self.target {
+            Target::Window { config, .. } => config.usage.contains(wgpu::TextureUsages::COPY_SRC),
+            Target::Offscreen { .. } => true,
+        };
+        self.capture_wanted = ok;
+        ok
+    }
+
+    /// The frame copied after [`request_capture`](Self::request_capture):
+    /// width, height and RGBA bytes, rows top down.
+    pub fn take_capture(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+        if self.capture_wanted
+            && let Target::Offscreen { .. } = self.target
+            && let Ok(px) = self.read_pixels()
+        {
+            self.capture_wanted = false;
+            return Some((self.width, self.height, px));
         }
-        Ok(out)
+        self.captured.take()
     }
 
     /// The format an overlay draws in: the frame's without sRGB where the
@@ -3778,6 +3778,18 @@ impl WgpuBackend {
                 let gamma = overlay_view(&frame.texture, format);
                 let overlay = over(&gamma, &mut overlay);
                 self.queue.submit(std::iter::once(commands).chain(overlay));
+                if self.capture_wanted {
+                    self.capture_wanted = false;
+                    let (w, h) = (frame.texture.width(), frame.texture.height());
+                    let mut px = read_texture(&self.device, &self.queue, &frame.texture, w, h)?;
+                    if matches!(
+                        config.format.remove_srgb_suffix(),
+                        wgpu::TextureFormat::Bgra8Unorm
+                    ) {
+                        px.chunks_exact_mut(4).for_each(|p| p.swap(0, 2));
+                    }
+                    self.captured = Some((w, h, px));
+                }
                 self.queue.present(frame);
                 if let Some(t) = &self.timer {
                     t.after_submit(&self.device);
@@ -3802,6 +3814,58 @@ impl WgpuBackend {
         palette.clear();
         self.spare = Some((draws, uniforms, slots, palette));
     }
+}
+
+/// Copies `texture` (4 bytes a texel, `width` x `height`) back to the CPU,
+/// rows top down, waiting for the GPU.
+fn read_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, BackendError> {
+    let row = width * 4;
+    let padded_row = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: u64::from(padded_row * height),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_row),
+                rows_per_image: None,
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit([encoder.finish()]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    buffer.map_async(wgpu::MapMode::Read, .., move |r| {
+        let _ = tx.send(r);
+    });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(device_error)?;
+    rx.recv().map_err(device_error)?.map_err(device_error)?;
+    let mapped = buffer.get_mapped_range(..).map_err(device_error)?;
+    let mut out = Vec::with_capacity((row * height) as usize);
+    for y in 0..height {
+        let start = (y * padded_row) as usize;
+        out.extend_from_slice(&mapped[start..start + row as usize]);
+    }
+    Ok(out)
 }
 
 /// What the materials' texture array needs of the device
