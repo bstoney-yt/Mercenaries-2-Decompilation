@@ -1868,7 +1868,16 @@ impl Npc {
             return false;
         }
         match self.swim {
-            None if depth > crate::player::SWIM_START => {
+            // From the 360 code: in only where the water is half their
+            // standing capsule over their feet (0x82171330). Depth alone
+            // isn't enough: with no ground found under them (inside a
+            // slope, or standing on what the ray misses), the depth reads
+            // infinite on land, and a soldier 13 m over the sea was put
+            // into it and sank under the beach (rules-check, VzaCon001's
+            // vza_beachguard_3).
+            None if depth > crate::player::SWIM_START
+                && at.y + 0.5 * self.character.height <= water =>
+            {
                 eprintln!(
                     "people: {:08x} out of their depth ({depth:.1} m) at {at:.1}: swims",
                     self.spawn.unwrap_or(u32::MAX)
@@ -3587,7 +3596,7 @@ impl Npc {
                 // Put out of a boat over deep water: into it, to swim
                 // (the next tick finds them out of their depth).
                 if let Some(w) = physics.water_at(p.x, p.z) {
-                    self.character.position.y = w - crate::player::SWIM_FLOAT;
+                    self.character.position.y = w - 0.5 * self.character.height - 0.01;
                     self.landed = true;
                 }
             }
@@ -9995,6 +10004,34 @@ pub(crate) mod tests {
     // they float at the surface, fire nothing, make for the shore and
     // stand up where it shallows; one put out of a boat over deep water
     // swims too.
+    // Rules-check: a beach guard 13 m over the sea, no ground found under
+    // him, read an infinite depth and was put into the water under the
+    // beach. Swimming starts only with the water half his height over
+    // his feet (0x82171330).
+    #[test]
+    fn no_ground_under_him_high_over_the_sea_is_not_swimming() {
+        let mut physics = Physics::new();
+        physics.step(1.0 / 60.0);
+        physics.set_water(-35.4);
+        let mut rng = Rng::default();
+        let mut npc = Npc::new(
+            0,
+            &rig(),
+            Vec3::new(0.0, -21.8, 0.0),
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(1),
+        );
+        npc.landed = true;
+        npc.update(&physics, &mut rng, None, 1.0 / 60.0);
+        assert!(!npc.swimming());
+        assert!(
+            npc.character.position.y > -30.0,
+            "{}",
+            npc.character.position
+        );
+    }
+
     #[test]
     fn out_of_their_depth_they_swim_to_the_shore_and_stand_up() {
         // Dry ground at 0 for z < 5, a shelf 0.8 m under the sea to z 10,
@@ -10020,7 +10057,8 @@ pub(crate) mod tests {
         let mut npc = Npc::new(
             0,
             &rig(),
-            Vec3::new(0.0, -1.3, 25.0),
+            // Their feet 0.95 m under the surface: in at once.
+            Vec3::new(0.0, -1.95, 25.0),
             0.0,
             Brain::Post { facing: 0.0 },
             Some(1),
