@@ -257,6 +257,9 @@ const LANDING_DRY: f32 = 0.3;
 /// How far (metres) short of a way out, towards her, the water must be
 /// shallow enough to stand in. Invented.
 const LANDING_WADE: f32 = 2.0;
+/// How deep the water there may be, metres (invented: about where she
+/// wades rather than swims, as the swim rule gives no depth of its own).
+const LANDING_WADE_DEEP: f32 = 0.68;
 /// Ways out she doesn't get out at before she is hopped out. Invented.
 const STRANDED_HOP: u32 = 2;
 /// A thing to blow up lower than this (metres) over the waterline is on
@@ -6126,7 +6129,7 @@ fn landing(physics: &Physics, at: Vec3, toward: Vec3, tried: &[Vec3]) -> Option<
                 // (round 32's AllCon002: 2900 tries at banks 1 m up).
                 let back = spot + (at - spot).with_y(0.0).normalize_or_zero() * LANDING_WADE;
                 let (by, _) = ground(back.x, back.z, water)?;
-                (water - by < crate::player::SWIM_STOP * 0.8).then_some(spot)
+                (water - by < LANDING_WADE_DEEP).then_some(spot)
             })
             .min_by(|a, b| a.distance(toward).total_cmp(&b.distance(toward)))
     })

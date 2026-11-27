@@ -3399,12 +3399,9 @@ impl Scene {
                     .filter(|_| named)
                     .and_then(|db| db.own_rifle(&p.role))
                     .map(|(name, gun)| (name.to_owned(), gun));
-                // Their template's own swimming pace ashore (its
-                // `SwimJogSpeed`, the middle of its paces, as hers is).
-                let swim = db
-                    .filter(|_| named)
-                    .and_then(|db| db.swim_speeds(&p.role))
-                    .map(|s| s[1]);
+                // Their template's own swimming paces (they swim ashore
+                // at its `SwimJogSpeed`, the middle of them, as she does).
+                let swim = db.filter(|_| named).and_then(|db| db.swim_speeds(&p.role));
                 match template {
                     Some(rig) => {
                         eprintln!(

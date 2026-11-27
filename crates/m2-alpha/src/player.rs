@@ -64,14 +64,12 @@ const FLOOR_SAME: f32 = 0.25;
 /// in-air states (0x82171330, 0x82171270) switch to swimming when
 /// `feet + 0.5 x height <= water` (the half height kept at the
 /// character input's +8, 0x821778F4), 0.9 m for the 1.8 m capsule every
-/// hero and soldier has. She stands again where it is shallower than
-/// [`SWIM_STOP`] (invented: the 360 leaves the water once her swimming
-/// shape is pushed up more than its radius out of it, 0x821715F8, and that
-/// shape's place on her is not read, so the alpha floats her at
-/// [`SWIM_FLOAT`] and stands her up a little shallower than she starts,
-/// so the shore's slope doesn't flick her in and out).
+/// hero and soldier has. She stands again once the ground holds her swim
+/// shape's bottom more than its radius over the water: the swim state
+/// (0x821715F8) keeps `ProxyCapsuleRadius` at its +0xC (0x821771C4,
+/// 0x821777FC), and its full speed, the most it pulls her to the surface
+/// at, at its +8 (0x82177830).
 pub const SWIM_START: f32 = 0.9;
-pub const SWIM_STOP: f32 = 0.85;
 /// How far her model's origin hangs under the surface while she swims
 /// (drawn so; the 360 floats the swim shape's bottom at the surface),
 /// metres: the stroke's body lies flat (its highest node only 0.11 m
@@ -561,16 +559,17 @@ impl Player {
     /// Swims her when the water under her is out of her depth
     /// ([`SWIM_START`]), `direction` the way she is told to go: she floats
     /// at the surface ([`SWIM_FLOAT`]), goes at her swimming speed for her pace ([`Player::swim_speeds`]) and plays
-    /// the stroke, her weapon away. Where it shallows again
-    /// ([`SWIM_STOP`]) she stands up with the climb-out. True while she
+    /// the stroke, her weapon away. Where the ground lifts her out again
+    /// (its rule at [`SWIM_START`]) she stands up with the climb-out. True while she
     /// swims: the rest of the step (running, jumping, aiming) is left
     /// out.
     ///
     /// From samples (the on-foot tables): the `Swim` stance's `EnterSwim`
     /// handle (cca02d6b) gives the looped stroke c846e6fd, which the
     /// transition table enters from any handle; `Upright` `ExitSwim`
-    /// (e5653a8b) gives the climb-out 97c840ed. The depths, speed and
-    /// the stroke's rate when still are invented. The water is the sea or,
+    /// (e5653a8b) gives the climb-out 97c840ed. From the 360 code: the
+    /// depths and speeds ([`SWIM_START`]). Invented: the stroke's rate when
+    /// still. The water is the sea or,
     /// higher, the game's water heights there (rivers, pools, lakes:
     /// [`Physics::water_at`]).
     fn update_swim(&mut self, physics: &Physics, direction: Vec3, speed: f32, dt: f32) -> bool {

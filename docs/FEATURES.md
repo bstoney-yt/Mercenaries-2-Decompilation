@@ -40,7 +40,7 @@ and a feature counts as done when the scripts get what they ask for.
 | Hero upgrades and costumes (wardrobe at HQ) | partial | `Player.SetOutfit` and profile upgrade fields read (`game.rs`, `mission.rs`); per-upgrade stat effects not audited |
 | Walk, run, sprint, crouch, jump | partial | Speeds fitted to clips, instant starts and stops, full air control: GAPS M1, M2, A5 |
 | Animation transitions and layering | partial | Blend times from the 360 (`blend.rs`), state table read (`human_states.rs`); time scale, partition mask and gait selection still ours: GAPS A2 to A4 |
-| Swimming | partial | Runs; depths, speeds and stroke rate invented: GAPS M4 |
+| Swimming | partial | In, float and out by the 360 swim state for her and people (`player.rs`, `npc.rs`); the drawn float depth, the stroke rate when still and the swimmers' way ashore invented: GAPS M4 |
 | Ladders | done | `ladders.rs`, `m2-engine/ladder.rs` |
 | Third-person camera on foot | partial | Distances invented (GAPS M3); pad turn curve differs (#690, #692) |
 | Health, regeneration, survival mode under 10 health | done | #695 merged |

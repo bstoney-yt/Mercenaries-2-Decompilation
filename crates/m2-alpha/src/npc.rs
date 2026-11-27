@@ -378,9 +378,9 @@ pub struct PersonKind {
     pub gun: Option<HandGun>,
     pub model: GpuModel,
     pub rig: Rig,
-    /// How fast they swim ashore, m/s: their template's `SwimJogSpeed`
-    /// ([`m2_engine::tuning::SWIM_SPEEDS`]); `None` for a role's.
-    pub swim: Option<f32>,
+    /// Their template's swimming paces, m/s: walk, jog, run and sprint
+    /// ([`crate::player::SWIM_SPEEDS`]); `None` for a role's.
+    pub swim: Option<[f32; 4]>,
     /// Their template's `_HumanPhysics` paces and turn
     /// ([`m2_engine::on_foot::HumanMotion`]); `None` keeps the program's
     /// defaults.
@@ -1434,9 +1434,13 @@ pub struct Npc {
     through: bool,
     /// In the water out of their depth: they swim ([`NpcSwim`]).
     pub swim: Option<NpcSwim>,
-    /// How fast they swim, m/s (their kind's [`PersonKind::swim`], else
-    /// [`crate::player::SWIM_SPEED`]).
+    /// How fast they swim, m/s (their kind's [`PersonKind::swim`] jog,
+    /// else [`crate::player::SWIM_SPEED`]).
     pub swim_speed: f32,
+    /// Their swim state's full speed, the larger of their `SwimRunSpeed`
+    /// and `SwimSprintSpeed` (0x82177830): the most it pulls them to the
+    /// surface at, m/s.
+    pub swim_full: f32,
     /// Cover from her: the threat he wants cover from (asked of the cover
     /// service this tick, [`People::find_cover`]), the spot it gave, and
     /// seconds until he may ask again ([`m2_engine::ai_cover::RETRY`]).
@@ -1495,6 +1499,8 @@ pub struct NpcSwim {
     pub since: f32,
     pub shore: Option<Vec3>,
     look: f32,
+    /// Their standing capsule's height, for when they stand again.
+    stand: f32,
 }
 
 /// What a person shouts.
@@ -1804,6 +1810,7 @@ impl Npc {
             through: false,
             swim: None,
             swim_speed: crate::player::SWIM_SPEED,
+            swim_full: crate::player::SWIM_SPEEDS[2].max(crate::player::SWIM_SPEEDS[3]),
             cover_ask: None,
             cover_spot: None,
             cover_claim: None,
@@ -1844,10 +1851,22 @@ impl Npc {
     /// the climb-out. True while they swim or climb out: the rest of the
     /// tick (the fight, the brain's walking) is left out.
     ///
+    /// From the 360 code: every person's character has the hero's states
+    /// (built for each at 0x82177340), so they go in, float and come out
+    /// by her rules ([`crate::player::SWIM_START`]): in where the water is
+    /// half their standing capsule over their feet (0x82171330), the swim
+    /// shape a ball of their radius from their position up to 2r + 0.1;
+    /// each step their way half way to where they swim, and up or down
+    /// half way to the speed that closes the gap to the surface, at most
+    /// their full swimming speed (0x821715F8, [`Npc::swim_full`]); out once
+    /// the ground holds that shape more than its radius over the water
+    /// (the swim state's +0xC, `ProxyCapsuleRadius`: 0x821771C4,
+    /// 0x821777FC). Drawn [`crate::player::SWIM_FLOAT`] under it, as she is.
+    ///
     /// From samples: the stroke and the climb-out are the on-foot tables'
-    /// (see [`FightClips::swim`]). Invented: the depths, float and speed
-    /// are the player's, and making for the shore (the game's swimming AI
-    /// isn't read).
+    /// (see [`FightClips::swim`]). Invented: making for the shore (the
+    /// game's swimming AI isn't read) and how fast they swim there (their
+    /// jog).
     fn update_swim(&mut self, physics: &Physics, dt: f32) -> bool {
         if self.climbing > 0.0 {
             self.climbing -= dt;
@@ -1867,16 +1886,20 @@ impl Npc {
             self.swim = None;
             return false;
         }
+        let radius = self.character.radius;
         match self.swim {
-            None if depth > crate::player::SWIM_START => {
+            None if at.y + 0.5 * self.character.height <= water => {
                 eprintln!(
                     "people: {:08x} out of their depth ({depth:.1} m) at {at:.1}: swims",
                     self.spawn.unwrap_or(u32::MAX)
                 );
+                let stand = self.character.height;
+                self.character.height = 2.0 * radius + 0.1;
                 self.swim = Some(NpcSwim {
                     since: 0.0,
                     shore: None,
                     look: 0.0,
+                    stand,
                 });
                 self.flee = None;
                 self.step = None;
@@ -1884,11 +1907,12 @@ impl Npc {
                 self.route = Route::default();
                 self.through = false;
             }
-            Some(_) if depth < crate::player::SWIM_STOP => {
+            Some(s) if self.character.grounded && at.y - radius > water => {
                 eprintln!(
                     "people: {:08x} in their depth ({depth:.1} m) at {at:.1}: stands",
                     self.spawn.unwrap_or(u32::MAX)
                 );
+                self.character.height = s.stand;
                 self.swim = None;
                 if let Some(g) = ground {
                     self.character.position.y = self.character.position.y.max(g);
@@ -1912,12 +1936,17 @@ impl Npc {
             swim.look = SHORE_LOOK_EVERY;
             swim.shore = shore(physics, at);
         }
-        let wanted = swim.shore.map_or(Vec3::ZERO, |s| {
+        let way = swim.shore.map_or(Vec3::ZERO, |s| {
             (s - at).with_y(0.0).normalize_or_zero() * self.swim_speed
         });
-        physics.move_character(&mut self.character, wanted, None, dt);
-        self.character.position.y = water - crate::player::SWIM_FLOAT;
-        self.character.velocity.y = 0.0;
+        let have = self.character.velocity.with_y(0.0);
+        let wanted = have * 0.5 + way * 0.5;
+        let s = self.swim_full;
+        let vy = 0.5 * self.character.velocity.y + 0.5 * (water - at.y).clamp(-s, s);
+        // move_character takes gravity off what it is given.
+        let v = vy + self.character.gravity * dt;
+        self.character.velocity.y = v;
+        physics.move_character(&mut self.character, wanted, Some(v), dt);
         if wanted.length_squared() > 0.01 {
             self.turn_to(wanted.x.atan2(wanted.z), dt);
         }
@@ -3512,7 +3541,14 @@ impl Npc {
     /// their feet instead.
     pub fn model_matrix(&self) -> Mat4 {
         let forward = self.rig.locomotion.as_ref().map_or(Vec2::Y, |l| l.forward);
-        let turned = Mat4::from_translation(self.character.position)
+        // Swimming, the model hangs under the swim shape's bottom, which
+        // floats at the surface, as hers does.
+        let sink = if self.swimming() {
+            crate::player::SWIM_FLOAT
+        } else {
+            0.0
+        };
+        let turned = Mat4::from_translation(self.character.position - Vec3::Y * sink)
             * Mat4::from_rotation_y(self.feet() - forward.x.atan2(forward.y));
         if self.alive || self.clips.die.is_some() {
             return turned;
@@ -3581,7 +3617,7 @@ impl Npc {
                 // Put out of a boat over deep water: into it, to swim
                 // (the next tick finds them out of their depth).
                 if let Some(w) = physics.water_at(p.x, p.z) {
-                    self.character.position.y = w - crate::player::SWIM_FLOAT;
+                    self.character.position.y = w - 0.5 * self.character.height - 0.01;
                     self.landed = true;
                 }
             }
@@ -4364,6 +4400,11 @@ const SHORE_LOOK_HIGH: f32 = 30.0;
 /// How far over a swimmer's origin the way to a shore is looked along,
 /// metres: about his chest, over the water (invented).
 const SHORE_CLEAR_UP: f32 = 0.6;
+/// How far over the water a shore's ground is to be for a swimmer to make
+/// for it, metres: the 360's way out of the water, the swim shape held
+/// more than its radius (0.4 m) over the surface (0x821715F8), and a
+/// little more (invented).
+const SHORE_DRY: f32 = 0.5;
 
 /// How deep the water at `water` is over the ground under `at`, metres
 /// (infinite with no ground under), and the ground's height.
@@ -4375,11 +4416,11 @@ fn depth_under(physics: &Physics, at: Vec3, water: f32) -> (f32, Option<f32>) {
     (ground.map_or(f32::INFINITY, |g| water - g), ground)
 }
 
-/// The nearest point to `at` where the water is shallow enough to stand
-/// in (under [`crate::player::SWIM_STOP`], or dry ground), looking out
+/// The nearest point to `at` where the ground is high enough over the
+/// water to climb out on ([`SHORE_DRY`], or dry ground), looking out
 /// ring by ring ([`SHORE_RINGS`]); within a ring, the first found going
-/// round from +z, of those with nothing in the way at the swimmer's
-/// chest short of the last metre (by the first contract's river, one
+/// round from +z, of those with nothing but climbable ground in the way
+/// at the swimmer's chest short of the last metre (by the first contract's river, one
 /// aimed through a bank's rocks swam 0.5 m/s against them). `None` if
 /// there is none within the last ring.
 fn shore(physics: &Physics, at: Vec3) -> Option<Vec3> {
@@ -4389,14 +4430,20 @@ fn shore(physics: &Physics, at: Vec3) -> Option<Vec3> {
             let way = Vec3::new(a.sin(), 0.0, a.cos());
             let p = at + way * r;
             let chest = at + Vec3::Y * SHORE_CLEAR_UP;
-            if physics.cast_ray(chest, way, (r - 1.0).max(0.1)).is_some() {
+            // A beach rising to their chest (ground they can climb) is the
+            // way out, not in the way.
+            let walkable = m2_engine::physics::MAX_SLOPE.cos();
+            if physics
+                .cast_ray(chest, way, (r - 1.0).max(0.1))
+                .is_some_and(|(_, n)| n.y < walkable)
+            {
                 return None;
             }
             // Looked down on from well above (a bank higher than the
             // water).
             let shallow = physics.water_at(p.x, p.z).is_none_or(|w| {
                 let (depth, ground) = depth_under(physics, p.with_y(w + SHORE_LOOK_HIGH), w);
-                ground.is_some() && depth < crate::player::SWIM_STOP * 0.8
+                ground.is_some() && depth < -SHORE_DRY
             });
             shallow.then_some(p)
         })
@@ -5964,11 +6011,10 @@ impl People {
             ];
             npc.her_visibility = self.her_visibility.unwrap_or(ON_FOOT_VISIBILITY);
             npc.her_audibility = self.her_audibility;
-            npc.swim_speed = self
-                .kinds
-                .get(npc.kind)
-                .and_then(|k| k.swim)
-                .unwrap_or(crate::player::SWIM_SPEED);
+            let swim = self.kinds.get(npc.kind).and_then(|k| k.swim);
+            let swim = swim.unwrap_or(crate::player::SWIM_SPEEDS);
+            npc.swim_speed = swim[1];
+            npc.swim_full = swim[2].max(swim[3]);
             npc.motion = self
                 .kinds
                 .get(npc.kind)
@@ -9987,26 +10033,30 @@ pub(crate) mod tests {
 
     // Soldiers walked the sea bed instead of swimming. Out of their depth
     // they float at the surface, fire nothing, make for the shore and
-    // stand up where it shallows; one put out of a boat over deep water
-    // swims too.
+    // stand up where the 360's swim state lets them out (0x821715F8: the
+    // ground holds the swim ball more than its radius over the water);
+    // one put out of a boat over deep water swims too.
     #[test]
     fn out_of_their_depth_they_swim_to_the_shore_and_stand_up() {
-        // Dry ground at 0 for z < 5, a shelf 0.8 m under the sea to z 10,
-        // the sea bed 2 m under beyond; the sea at -1.
+        // Dry ground at 0 for z < 5, a beach down to 2.5 m under the sea at
+        // z 15, the sea bed 2 m under beyond; the sea at -1.
         let mut physics = Physics::new();
-        let floor = |p: &mut Physics, key: u32, z0: f32, z1: f32, y: f32| {
+        let ramp = |p: &mut Physics, key: u32, z0: f32, z1: f32, y0: f32, y1: f32| {
             let v = [
-                Vec3::new(-50.0, y, z0),
-                Vec3::new(50.0, y, z0),
-                Vec3::new(50.0, y, z1),
-                Vec3::new(-50.0, y, z1),
+                Vec3::new(-50.0, y0, z0),
+                Vec3::new(50.0, y0, z0),
+                Vec3::new(50.0, y1, z1),
+                Vec3::new(-50.0, y1, z1),
             ];
             let shape = CollisionShape::mesh(&v, &[[0, 2, 1], [0, 3, 2]]).unwrap();
             p.add_static(StaticKey::Cell(key), &shape, Vec3::ZERO, Quat::IDENTITY);
         };
+        let floor = |p: &mut Physics, key: u32, z0: f32, z1: f32, y: f32| {
+            ramp(p, key, z0, z1, y, y);
+        };
         floor(&mut physics, 1, -50.0, 5.0, 0.0);
-        floor(&mut physics, 2, 5.0, 10.0, -1.8);
-        floor(&mut physics, 3, 10.0, 60.0, -3.0);
+        ramp(&mut physics, 2, 5.0, 15.0, 0.0, -2.5);
+        floor(&mut physics, 3, 15.0, 60.0, -3.0);
         physics.step(1.0 / 60.0);
         physics.set_water(-1.0);
         let mut rng = Rng::default();
@@ -10014,30 +10064,47 @@ pub(crate) mod tests {
         let mut npc = Npc::new(
             0,
             &rig(),
-            Vec3::new(0.0, -1.3, 25.0),
+            // Their feet 0.95 m under the surface: in at once.
+            Vec3::new(0.0, -1.95, 25.0),
             0.0,
             Brain::Post { facing: 0.0 },
             Some(1),
         );
         npc.landed = true;
         npc.alert = true;
-        for _ in 0..30 {
+        for _ in 0..240 {
             npc.update(&physics, &mut rng, Some(Vec3::new(0.0, 0.0, 0.0)), dt);
             assert!(!npc.fires);
         }
         assert!(npc.swimming());
+        // The swim ball's bottom floats at the surface, the model drawn
+        // under it.
         let p = npc.character.position;
-        assert!(
-            (p.y - (-1.0 - crate::player::SWIM_FLOAT)).abs() < 1e-3,
-            "{p}"
-        );
+        assert!((p.y - -1.0).abs() < 0.05, "{p}");
+        let drawn = npc.model_matrix().w_axis.y;
+        assert!((drawn - (p.y - crate::player::SWIM_FLOAT)).abs() < 1e-4);
         assert!(p.z < 25.0, "makes for the shore: {p}");
-        for _ in 0..60 * 15 {
+        // Still swimming where the beach is under 0.4 m of water: the 360
+        // lets them out only once the ground lifts the ball more than its
+        // radius over the surface.
+        let mut shallows = false;
+        for _ in 0..60 * 20 {
             npc.update(&physics, &mut rng, None, dt);
+            let p = npc.character.position;
+            if npc.swimming() && (6.0..8.0).contains(&p.z) {
+                shallows = true;
+            }
+            if !npc.swimming() {
+                break;
+            }
         }
+        assert!(shallows, "swam over the shallows");
         assert!(!npc.swimming());
+        // Out about where the beach is 0.4 m over the sea (the ball rests
+        // on the slope a little off its foot).
         let p = npc.character.position;
-        assert!(p.z < 10.0 && p.y > -1.9, "{p}");
+        assert!(p.z < 8.0 && p.y > -0.7, "{p}");
+        assert!((npc.character.height - 1.8).abs() < 1e-4);
 
         // Put out of a boat 20 m out: into the water, swimming.
         let mut npc = Npc::new(
