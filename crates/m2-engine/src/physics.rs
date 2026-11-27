@@ -1699,9 +1699,7 @@ pub fn float_depth(spec: &VehicleSpec) -> f32 {
         .float
         .rest_depth(WORLD_GRAVITY)
 }
-const BOAT_ROCK: f32 = 2.5;
 const BOAT_TOP: f32 = 18.0;
-const WRECK_FLOAT: f32 = 0.4;
 /// A boat's engine and drag when its template gives none (its own
 /// `_BoatPhysics` otherwise): the 360 record's defaults (0x823EA868).
 const BOAT: BoatTuning = BoatTuning {
@@ -2321,10 +2319,6 @@ struct GunHinge {
 /// A boat's hull in the water: what floats it, and what its driver asks
 /// of it.
 struct Hull {
-    /// Model space, at its origin's height: over its hull's footprint,
-    /// its corners, the middles of its sides and its middle. A wreck
-    /// floats on them ([`WRECK_FLOAT`]).
-    points: Vec<Vec3>,
     /// Its four float springs ([`BoatFloat`]): each one's corner of its
     /// hull's box, model space, at its origin's height (bow port, bow
     /// starboard, stern port, stern starboard, as 0x82199328 sets them),
@@ -4159,12 +4153,16 @@ impl Physics {
 
     /// Floats boats on the water ([`set_water`](Self::set_water)) and
     /// drives them as asked. An intact boat floats on its four springs as
-    /// the 360 code floats it ([`BoatFloat`]); a wreck on the points of
-    /// its waterline under the surface, each lifting it as deep as it is
-    /// (its whole weight with its origin [`FLOAT_DEPTH`] under, never more
-    /// than [`WRECK_FLOAT`] of it; invented). In the water a boat is
-    /// pushed and steered, slowed along, across and up and down as its
-    /// template's drag says ([`BoatTuning`]).
+    /// the 360 code floats it ([`BoatFloat`]), and in the water is pushed
+    /// and steered, slowed along, across and up and down as its template's
+    /// drag says ([`BoatTuning`]).
+    ///
+    /// A wreck has none of it. From the 360 code: the boat's set-up
+    /// (0x82188158) adds its boat action (0x82198FF8, the only thing that
+    /// reads the water for it) only while the object is not set up reduced
+    /// (+0x15, a health under 0.01, 0x821831B0), so a wreck keeps only its
+    /// bodies' gravity action (0x82180870) and sinks under its gravity
+    /// scale, slowed by nothing but its body's own damping.
     fn float_boats(&mut self, dt: f32) {
         let Some(water) = self.water else {
             return;
@@ -4191,53 +4189,15 @@ impl Physics {
             };
             let place = *b.position();
             let turn = Quat::from_array(place.rotation.to_array());
-            let at = vec3(place.translation);
-            let ahead = (turn * Vec3::Z).with_y(0.0).normalize_or_zero();
-            let wet = if v.wrecked {
-                let n = hull.points.len().max(1) as f32;
-                let lift = WORLD_GRAVITY * v.mass / n * dt;
-                let mut wet = 0.0;
-                for &q in &hull.points {
-                    let p = at + turn * q;
-                    let depth = water - p.y;
-                    if depth > 0.0 {
-                        wet += 1.0;
-                        let up = lift * (depth / FLOAT_DEPTH).min(WRECK_FLOAT);
-                        b.apply_impulse_at_point(vector(Vec3::Y * up), vector(p), true);
-                    }
-                }
-                wet / n
-            } else {
-                float_hull(hull, b, water, touched, dt)
-            };
+            if v.wrecked {
+                continue;
+            }
+            let wet = float_hull(hull, b, water, touched, dt);
             if wet == 0.0 {
                 continue;
             }
-            let ease = |rate: f32| 1.0 - (rate * dt * wet).min(1.0);
             let velocity = vec3(b.linvel());
-            let w = hull.water;
-            if v.wrecked {
-                // A wreck is slowed along, across and up and down as its
-                // template's drag says, level (invented: the 360's wreck
-                // has no boat action).
-                let side = Vec3::new(ahead.z, 0.0, -ahead.x);
-                let along = velocity.dot(ahead) * ease(w.drag[0]);
-                let across = velocity.dot(side) * ease(w.drag[1]);
-                let rise = velocity.y * ease(w.drag[2]);
-                b.set_linvel(vector(ahead * along + side * across + Vec3::Y * rise), true);
-            } else {
-                b.set_linvel(vector(boat_drag(hull, turn, velocity, dt)), true);
-            }
-            // An intact boat's helm turned it with its springs
-            // ([`float_hull`]); a wreck stops turning and rocking
-            // (invented).
-            if v.wrecked {
-                let spin = vec3(b.angvel());
-                let up = turn * Vec3::Y;
-                let yaw = spin.dot(up) * (1.0 - (3.0 * dt * wet).min(1.0));
-                let rock = (spin - up * spin.dot(up)) * ease(BOAT_ROCK);
-                b.set_angvel(vector(rock + up * yaw), true);
-            }
+            b.set_linvel(vector(boat_drag(hull, turn, velocity, dt)), true);
         }
     }
 
@@ -5449,16 +5409,10 @@ impl Physics {
                 &tuning,
             );
         }
-        // A boat floats on its waterline (its origin's height), over the
-        // footprint of its hull a little in from the edges.
+        // A boat floats on its float springs ([`BoatFloat`]).
         let boat = spec.is_boat();
         let hull = boat.then(|| {
             let (lo, hi) = spec.hull;
-            let at = |a: f32, b: f32, k: f32| a + (b - a) * (0.1 + 0.4 * k);
-            let points = (0..3)
-                .flat_map(|i| (0..3).map(move |j| (i as f32, j as f32)))
-                .map(|(i, j)| Vec3::new(at(lo.x, hi.x, i), 0.0, at(lo.z, hi.z, j)))
-                .collect();
             let water = spec.tuning.boat.unwrap_or(BOAT);
             // Its springs at its body's shape's box's corners (0x82199328
             // takes the box from the body's shape), else its hull's.
@@ -5479,7 +5433,6 @@ impl Physics {
                 (Vec3::new(hi.x, 0.0, lo.z), -lean, 0.0),
             ];
             Hull {
-                points,
                 springs,
                 wet: [None; 4],
                 helm: 0.0,
@@ -11413,6 +11366,30 @@ mod tests {
         let braked = run(-1.0, false, 1.0, Some(8.0));
         let steady = 23.0 * (-0.2f32).exp() - 15.0;
         assert!(braked < steady + 0.1 && braked > -6.0, "braked {braked}");
+    }
+
+    #[test]
+    fn a_wrecked_boat_has_no_boat_action_and_sinks() {
+        // 0x82188158 adds the boat action only to an object not set up
+        // reduced: a wreck floats on nothing and sinks to the seabed.
+        let run = |wreck: bool| {
+            let mut p = Physics::new();
+            p.set_water(0.0);
+            floor(&mut p, 1, 0.0, 0.0, -20.0, 200.0);
+            p.step(DT);
+            let id = p.add_vehicle(&boat(), Vec3::new(0.0, -0.3, 0.0), 0.0);
+            if wreck {
+                p.wreck_vehicle(id);
+            }
+            for _ in 0..240 {
+                p.step(DT);
+            }
+            p.vehicle_transform(id).unwrap().w_axis.y
+        };
+        let afloat = run(false);
+        let wreck = run(true);
+        assert!(afloat > -2.0, "the intact boat floats: {afloat}");
+        assert!(wreck < -15.0, "the wreck sinks: {wreck}");
     }
 
     #[test]
