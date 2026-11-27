@@ -742,6 +742,23 @@ fn sampler_index(desc: &MaterialDesc) -> u32 {
     (filter * 4 + usize::from(v) * 2 + usize::from(u)) as u32
 }
 
+/// The material maps' group layout: the texture array, then every sampler
+/// [`sampler_index`] can pick.
+fn maps_layout_entries() -> [wgpu::BindGroupLayoutEntry; 2] {
+    [
+        wgpu::BindGroupLayoutEntry {
+            count: std::num::NonZeroU32::new(MAX_TEXTURES),
+            ..texture_entry(0)
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: std::num::NonZeroU32::new(SAMPLERS as u32),
+        },
+    ]
+}
+
 /// A 2D float texture binding visible to the fragment stage.
 fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
@@ -1177,18 +1194,7 @@ impl WgpuBackend {
         // Every material's textures, and the samplers (see `TextureSlots`).
         let maps_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("material maps"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    count: std::num::NonZeroU32::new(MAX_TEXTURES),
-                    ..texture_entry(0)
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: std::num::NonZeroU32::new(2),
-                },
-            ],
+            entries: &maps_layout_entries(),
         });
         // Depth beneath and colour to mirror, for water: copies of the
         // depth buffer and the world's target made before the first water
@@ -3912,6 +3918,9 @@ mod material_slot_tests {
         assert_eq!(index(0x47, false), 11);
         assert_eq!(index(0x80, false), 12);
         assert!((0..=0xff).all(|f| (index(f, false) as usize) < SAMPLERS));
+        // The layout holds every sampler the bind group is given.
+        let [_, samplers] = maps_layout_entries();
+        assert_eq!(samplers.count.map(|n| n.get() as usize), Some(SAMPLERS));
     }
 
     #[test]
