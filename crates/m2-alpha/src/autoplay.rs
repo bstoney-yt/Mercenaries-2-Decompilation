@@ -292,7 +292,7 @@ const WAY_FAN: f32 = 1.4;
 const WALL: f32 = 0.8;
 const SLOW_NEAR: f32 = 30.0;
 const SLOW: f32 = 7.0;
-const STALL: f32 = 2.5;
+const STALL: f32 = 2.0;
 /// Seconds with no wheel on the ground and no way on before she rights
 /// her vehicle (the reset key, a player's) (invented). MecCon001's
 /// Monster Truck sat high-centred on a strip-mine rock, 0 of 4 wheels
@@ -5319,15 +5319,32 @@ impl Autoplay {
             .then(|| driving.and_then(|i| game.scene.vehicles.get(i)))
             .flatten()
             .and_then(|v| solid_ahead(&game.scene.world, v, pos, at, speed));
-        if let Some(hit) = rock
+        if let Some(o) = rock
             && self.clock - self.rock_logged > LOG_ROCK
         {
             self.rock_logged = self.clock;
             eprintln!(
-                "autoplay {:.1} s: racing, something solid ahead at {hit:.1} ({:.0} m off at {speed:.1} m/s): round it",
+                "autoplay {:.1} s: racing, something solid ahead at {:.1} ({:.0} m off at {speed:.1} m/s): round it",
                 self.clock,
-                (hit - pos).with_y(0.0).length()
+                o.point,
+                (o.point - pos).with_y(0.0).length()
             );
+        }
+        // What she would run into is kept out of from now on, as what she
+        // stuck on is, so her way goes round it before she touches it
+        // (#814's 11-27 check: the mine's boulders, objects 42914 and
+        // 42915, seen 23 m off at 15 m/s and run into all the same; she
+        // stalled wedged on them, 2 of 4 wheels down, and lost the race).
+        if let Some(o) = rock
+            && let Some((lo, hi)) = keep_off_box(&o, Vec2::new(at.x, at.z))
+            && !self.avoid.contains(&(lo, hi))
+        {
+            eprintln!(
+                "autoplay {:.1} s: keeping out of what stands ahead ({lo:.0} to {hi:.0}) from now on",
+                self.clock
+            );
+            self.avoid.push((lo, hi));
+            self.way = None;
         }
         let rock = rock.is_some();
         if racing && !rock && self.clock - self.best.1 < RACE_STRAIGHT_FOR {
@@ -6505,7 +6522,7 @@ fn solid_ahead(
     pos: Vec3,
     at: Vec3,
     speed: f32,
-) -> Option<Vec3> {
+) -> Option<m2_engine::path_search::Obstacle> {
     let (Some(w), Some(id)) = (world.as_ref(), v.id) else {
         return None;
     };
@@ -6527,7 +6544,27 @@ fn solid_ahead(
     w.physics
         .sweep_obstacle(from, from + (at - pos) * (reach / d), half, Some(id))
         .filter(|o| !o.ground)
-        .map(|o| o.point)
+}
+
+/// The ground box ([`AVOID_ROOM`] round it) of what a sweep met, to be
+/// kept out of: not one wider than [`AVOID_LARGEST`] (a building's
+/// batch), nor one standing where she is going (`goal`).
+fn keep_off_box(o: &m2_engine::path_search::Obstacle, goal: Vec2) -> Option<(Vec2, Vec2)> {
+    let (at, turn) = o.pose;
+    let (mut lo, mut hi) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
+    for k in 0..8 {
+        let c = Vec3::new(
+            if k & 1 == 0 { o.min.x } else { o.max.x },
+            if k & 2 == 0 { o.min.y } else { o.max.y },
+            if k & 4 == 0 { o.min.z } else { o.max.z },
+        );
+        let w = at + turn * c;
+        lo = lo.min(Vec2::new(w.x, w.z));
+        hi = hi.max(Vec2::new(w.x, w.z));
+    }
+    let (lo, hi) = (lo - Vec2::splat(AVOID_ROOM), hi + Vec2::splat(AVOID_ROOM));
+    ((hi - lo).max_element() < AVOID_LARGEST && !(goal.cmpge(lo).all() && goal.cmple(hi).all()))
+        .then_some((lo, hi))
 }
 
 /// How deep a boat's keel floats under the water, metres.
@@ -8256,7 +8293,6 @@ mod tests {
         assert_eq!(strike_knot(&[], &[]), None);
     }
 
-<<<<<<< HEAD
     /// PmcCon034's 11-27 check: 3 m from her spot, the statue in her
     /// eye's sight but her sight distrusted, she isn't there yet; within
     /// a metre, or trusted, she is.
@@ -8293,7 +8329,31 @@ mod tests {
         );
         assert_eq!(got, 1);
         assert_eq!(short_strikes(&[], eye, statue), 0);
-=======
+    }
+
+    /// #814's 11-27 check: the boulder she wedged on (object 42914, its
+    /// box about [-817, -2753] to [-812, -2749]) is kept out of, with room
+    /// round it, once seen ahead; not one where she is going, nor one a
+    /// building's size.
+    #[test]
+    fn what_stands_ahead_is_kept_out_of() {
+        let rock = |half: Vec3| m2_engine::path_search::Obstacle {
+            point: Vec3::new(-812.0, -20.4, -2749.0),
+            id: 0,
+            ground: false,
+            pose: (Vec3::new(-814.7, -21.4, -2750.9), Quat::IDENTITY),
+            min: -half,
+            max: half,
+        };
+        let boulder = rock(Vec3::new(2.5, 1.5, 2.0));
+        let goal = Vec2::new(-880.0, -2800.0);
+        let (lo, hi) = keep_off_box(&boulder, goal).unwrap();
+        assert!((lo - Vec2::new(-819.2, -2754.9)).length() < 0.01, "{lo}");
+        assert!((hi - Vec2::new(-810.2, -2746.9)).length() < 0.01, "{hi}");
+        assert_eq!(keep_off_box(&boulder, Vec2::new(-814.7, -2750.9)), None);
+        assert_eq!(keep_off_box(&rock(Vec3::new(30.0, 5.0, 30.0)), goal), None);
+    }
+
     /// MecCon001: off the throttle over a drop at 25.5 m/s, not at a walk
     /// or on the level.
     #[test]
