@@ -7243,7 +7243,7 @@ fn mission_for_screenshot(
             eprintln!(
                 "after contract tally {:.0} s: {}; {}; {}",
                 i as f32 * tick,
-                game.combat.tally.line(game.combat.fired.rifle),
+                game.combat.tally.line(game.combat.fired.total()),
                 game.scene.people.idle.line(),
                 game.scene.people.fight_summary()
             );

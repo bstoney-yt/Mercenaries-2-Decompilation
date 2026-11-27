@@ -6731,6 +6731,7 @@ mod tests {
             rifle,
             rockets,
             grenades,
+            ..Fired::default()
         };
         let none = Picked::default();
         // The rifle's rounds are the play's: a full clip and nine spare.
