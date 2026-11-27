@@ -45,7 +45,9 @@ use std::collections::{HashMap, HashSet};
 
 use m2_engine::ai_anchor::{ANCHORING_SPAWNER, Anchor, SPAWNER_RADIUS};
 use m2_engine::ai_investigate::{Do as InvestigateDo, Investigate, Sense as InvestigateSense};
-use m2_engine::ai_mover::{Mover, PROBE, Sense, Side, Spot, State as MoverState, side_point};
+use m2_engine::ai_mover::{
+    Mover, PROBE, Sense, Side, Spot, Stance as MoverStance, State as MoverState, side_point,
+};
 use m2_engine::population::SpawnerSlot;
 use m2_engine::stagger::{Direction, Stagger};
 use m2_engine::tuning::HandGun;
@@ -468,6 +470,9 @@ pub struct FightClips {
     /// `SidestepLeft` and `SidestepRight` for them, by both tables
     /// ([`Self::ACTION_KEYS`], [`crate::scene::Rig::for_character`]).
     pub side_steps: [Option<usize>; 2],
+    /// The idles of the mover's other two stances, `Crouched` and `Prone`
+    /// ([`m2_engine::ai_mover::Stance`]).
+    pub stances: [Option<usize>; 2],
 }
 
 /// The clips of the 14 directions a person dies in on foot
@@ -839,20 +844,40 @@ impl FightClips {
             knocked: find(Self::KNOCKED),
             getup: find(Self::GETUP),
             subdued: find(Self::SUBDUED),
-            side_steps: [Self::SIDESTEP_LEFT, Self::SIDESTEP_RIGHT].map(|a| {
-                let clip = *rig.theirs.get(&a)?;
-                rig.clips.iter().position(|c| c.hash == clip)
-            }),
+            side_steps: [("Upright", "SidestepLeft"), ("Upright", "SidestepRight")]
+                .map(|(s, a)| Self::by_action(rig, s, a)),
+            stances: [("Crouched", "Idle"), ("Prone", "Idle")]
+                .map(|(s, a)| Self::by_action(rig, s, a)),
         }
     }
 
-    /// The actions whose clips a person's rig keeps by the action's hash
-    /// ([`crate::scene::Rig::for_character`]), stance and action: the
-    /// combat mover's side-steps (0x822C7730 posts them; their hashes are
-    /// [`m2_engine::ai_mover::Side::action`]).
-    pub const ACTION_KEYS: [(&'static str, &'static str); 2] =
-        [("Upright", "SidestepLeft"), ("Upright", "SidestepRight")];
+    /// The actions whose clips a person's rig keeps
+    /// ([`crate::scene::Rig::for_character`], by [`Self::action_key`]),
+    /// stance and action: the combat mover's side-steps (0x822C7730 posts
+    /// them; their hashes are [`m2_engine::ai_mover::Side::action`]) and
+    /// the idles of the stances its `crouch` and `GoProne` messages lead to
+    /// (the human state table: `Crouched`, `Prone`).
+    pub const ACTION_KEYS: [(&'static str, &'static str); 4] = [
+        ("Upright", "SidestepLeft"),
+        ("Upright", "SidestepRight"),
+        ("Crouched", "Idle"),
+        ("Prone", "Idle"),
+    ];
+
+    /// How a rig keeps an action's clip: stance and action together (an
+    /// action's name is not unique across stances).
+    pub fn action_key(stance: &str, action: &str) -> u32 {
+        m2_assets::name_hash(&format!("{stance}.{action}"))
+    }
+
+    fn by_action(rig: &Rig, stance: &str, action: &str) -> Option<usize> {
+        let clip = *rig.theirs.get(&Self::action_key(stance, action))?;
+        rig.clips.iter().position(|c| c.hash == clip)
+    }
+    /// The side-steps' action hashes (for checking).
+    #[cfg(test)]
     pub const SIDESTEP_LEFT: u32 = 0x9424_7d15;
+    #[cfg(test)]
     pub const SIDESTEP_RIGHT: u32 = 0x0c69_7af4;
 
     /// When in `clip` a throw lets go of the grenade (its
@@ -3394,10 +3419,25 @@ impl Npc {
             shuffles,
             dt,
         );
+        // The stance the combat mover asks of his body (its +0x90: the
+        // `crouch` and `GoProne` messages, 0x822C8530): standing still in
+        // it, its stance's idle (the human state table's `Crouched` and
+        // `Prone` `Idle`). Moving, upright (inferred: the crouched and
+        // prone moves are not wired).
+        let low = match self.mover.map(|m| m.stance) {
+            Some(MoverStance::Crouch) => clips.stances[0],
+            Some(MoverStance::Low) => clips.stances[1],
+            _ => None,
+        }
+        .filter(|_| gait == Gait::Idle && shuffling.is_none());
         if self.striking <= 0.0 {
-            match shuffling {
-                Some((c, fresh, _)) => self.rig.shuffle_legs(c, fresh, &clips),
-                None => self.rig.hold_rifle(gait, &clips, carry),
+            match (shuffling, low) {
+                (_, Some(c)) => {
+                    self.rig.animator.set_upper(None);
+                    self.rig.play_gait(c);
+                }
+                (Some((c, fresh, _)), None) => self.rig.shuffle_legs(c, fresh, &clips),
+                (None, None) => self.rig.hold_rifle(gait, &clips, carry),
             }
         }
         if (ahead || shuffling.is_some()) && self.striking <= 0.0 {
@@ -9216,9 +9256,16 @@ pub(crate) mod tests {
         // A clip the rig doesn't have is no slot.
         let mut r = rig();
         let mut theirs = (*r.theirs).clone();
-        theirs.insert(FightClips::SIDESTEP_LEFT, 0x1234_5678);
+        theirs.insert(
+            FightClips::action_key("Upright", "SidestepLeft"),
+            0x1234_5678,
+        );
         r.theirs = std::sync::Arc::new(theirs);
         assert_eq!(FightClips::find(&r).side_steps, [None, None]);
+        assert_ne!(
+            FightClips::action_key("Crouched", "Idle"),
+            FightClips::action_key("Prone", "Idle")
+        );
         assert_eq!(
             m2_engine::ai_mover::Side::Left.action(),
             FightClips::SIDESTEP_LEFT
