@@ -1826,6 +1826,14 @@ impl MissionLink {
         }
     }
 
+    /// Whether fail fanfare `seq` lets a Retry retry ([`allows_retry`]).
+    pub fn fanfare_allows_retry(&self, seq: u64) -> bool {
+        match &self.state {
+            State::Running(m) => allows_retry(m.lua(), seq),
+            _ => true,
+        }
+    }
+
     /// Whether the scripts have a retry save kept (`Pg.SaveGame("retry")`
     /// at the contract's start), for the fail fanfare's Retry to load.
     pub fn has_retry(&self) -> bool {
@@ -5993,6 +6001,29 @@ const FANFARE_ANSWER: &str = "(function(t, bRetry)
     end
     t.fCallback(unpack(a))
 end)";
+
+/// Whether fanfare `seq` lets a Retry retry. From the scripts: a
+/// contract's fail fanfare (`MrxTaskContract`'s `Cancel2`, its line 450)
+/// is created with `bAllowRetry` the contract's `sStarter`, and `false` for
+/// a wager (`tRewards.nWager` or `nWagerPercent`: PmcCon034's shooting
+/// gallery); the HUD hands it to the fanfare's movie
+/// (`SetFanfareParameters`), and the fanfare's callback (its line 488 on)
+/// takes the answer as `(not bRetry) and bAllowRetry`, so with it `false`
+/// a Retry is a Continue: the contract goes back on offer and the retry
+/// save is never loaded (the sniper3 check of PmcCon034, 11-27: "she takes
+/// Retry", then 606 s on no contract). Any other value lets it retry.
+fn allows_retry(lua: &mlua::Lua, seq: u64) -> bool {
+    let Ok(callbacks) = lua.globals().get::<mlua::Table>("__m2_hud_callbacks") else {
+        return true;
+    };
+    let Ok(Some(t)) = callbacks.get::<Option<mlua::Table>>(seq) else {
+        return true;
+    };
+    !matches!(
+        t.get::<mlua::Value>("bAllowRetry"),
+        Ok(mlua::Value::Boolean(false))
+    )
+}
 
 fn waiting_fanfare(lua: &mlua::Lua) -> Option<u64> {
     let g = lua.globals();
@@ -10505,6 +10536,30 @@ mod tests {
         assert_eq!(count(&lua), 3);
         let said: Vec<String> = lua.load("return said").eval::<Vec<String>>().unwrap();
         assert_eq!(said, ["medium", "jammer", "medium"]);
+    }
+
+    #[test]
+    fn a_wagers_fail_fanfare_lets_no_retry_retry() {
+        // From the scripts: `Cancel2` creates a contract's fail fanfare
+        // with `bAllowRetry` its `sStarter` (a name), and `false` for a
+        // wager; a fanfare without the field is answered as before.
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            local cb = function() end
+            __m2_hud_callbacks = {
+                [1] = { sType = 'wager', bAllowRetry = false, fCallback = cb },
+                [2] = { sType = 'contract', bAllowRetry = 'Starter_Pmc', fCallback = cb },
+                [3] = { sType = 'contract', fCallback = cb },
+            }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        assert!(!allows_retry(&lua, 1), "a wager: no Retry");
+        assert!(allows_retry(&lua, 2));
+        assert!(allows_retry(&lua, 3));
+        assert!(allows_retry(&lua, 4), "no such call");
     }
 
     // The fail fanfare's answer reaches a contract's callback as the
