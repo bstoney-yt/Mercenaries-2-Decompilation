@@ -3188,7 +3188,11 @@ impl Scene {
             let has = |h: u32| spec.node_names.contains(&h);
             let found = driver.map(|p| (has(p.seat), p.door.map(has)));
             let seating = db.vehicle_seats_for(&spec.label, spec.model);
-            let spec = spec.with_driver_points(driver).with_seating(seating);
+            let wheels = db.car_wheels_for(&spec.label, spec.model);
+            let spec = spec
+                .with_driver_points(driver)
+                .with_seating(seating)
+                .with_car_wheels(wheels);
             eprintln!(
                 "driver: {}: seat {:?} door {:?} (seat data {driver:x?}, nodes found {found:?}; fixed markers {:?} {:?})",
                 spec.label, spec.seat, spec.door, markers.0, markers.1,
@@ -3740,8 +3744,15 @@ impl Scene {
                     v.gun,
                     &v.aims,
                 );
-                v.spec
-                    .lift_wheels(&mut nodes, &world.physics.vehicle_wheel_lift(id));
+                // Its drawn wheels lift with its springs only when they
+                // are the same wheels (a trailer's springs are at its legs
+                // and one axle, `VehicleSpec::spring_wheels`; its drawn
+                // wheels then stay at rest: the 360 turns them as fake
+                // wheels, `BoneCtrlFakeWheel`, not ported).
+                if v.spec.spring_wheels.is_none() {
+                    v.spec
+                        .lift_wheels(&mut nodes, &world.physics.vehicle_wheel_lift(id));
+                }
                 v.spec.spin_rotors(&mut nodes, v.rolled);
                 if !v.spec.tilts.is_empty() {
                     let speed = world.physics.vehicle_rolling(id);

@@ -50,7 +50,7 @@ use m2_math::glam::Vec3;
 use crate::combat::{self, Weapon};
 use crate::config::Config;
 use crate::flights::{Copter, Leaves, Load};
-use crate::game::{Game, get_out, place};
+use crate::game::{Game, Put, get_out, place};
 use crate::gamehud::{HudCall, Plain, RadarRegion};
 use crate::hero::Hero;
 use crate::ridehijack::{self, RideHijack};
@@ -6065,15 +6065,21 @@ impl Fleet {
                         .is_some_and(|o| {
                             let turn = o.rotation.map(m2_math::glam::Quat::from_array);
                             let at = Vec3::from(o.position);
+                            // As its layer authored it, or where the
+                            // scripts made or moved it.
+                            let put = turn.map_or(Put::Given, Put::Authored);
                             if w.winch.get(&g).is_some_and(Option::is_some)
                                 || game.scene.flights.carrying(g)
-                                || !place(physics, v, at, o.yaw, turn)
+                                || !place(physics, v, at, o.yaw, put)
                             {
                                 return false;
                             }
-                            // Placed as authored: for `--parked-settle-check`.
-                            if let Some(t) = turn.filter(|_| !v.spec.is_boat()) {
-                                as_authored.push((g, at, t));
+                            // For `--parked-settle-check`.
+                            if !v.spec.is_boat() {
+                                let given = turn.is_none();
+                                let t = turn
+                                    .unwrap_or_else(|| m2_math::glam::Quat::from_rotation_y(o.yaw));
+                                as_authored.push((g, at, t, given));
                             }
                             true
                         });
@@ -6098,8 +6104,25 @@ impl Fleet {
         if seated {
             game.scripts_seated = true;
         }
-        for (g, at, turn) in as_authored {
-            game.authored_guids.insert(g, (at, turn));
+        for (g, at, turn, given) in as_authored {
+            // Its first steps logged as an island vehicle's are (the
+            // contract's El Grande against Xenia p769b), log only.
+            if let Some(id) = game
+                .scene
+                .vehicles
+                .iter()
+                .find(|v| v.guid == Some(g))
+                .and_then(|v| v.id)
+                && let Some(m) = physics.vehicle_transform(id)
+                && !game.just_placed.iter().any(|w| w.id == id)
+            {
+                game.just_placed.push(crate::game::Watched::new(g, id, m));
+            }
+            if given {
+                game.given_guids.insert(g, (at, turn));
+            } else {
+                game.authored_guids.insert(g, (at, turn));
+            }
         }
         let now = mission.now();
         self.landing.retain(|_, until| *until > now);

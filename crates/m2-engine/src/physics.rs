@@ -1157,30 +1157,6 @@ impl CollisionShape {
         Some(from - toi)
     }
 
-    /// How far up goods filling the box `lo`..`hi` (this shape's space,
-    /// a vehicle's bed) go to stand `clear` over the bed's floor, 0 if
-    /// they stand on it or over it already. Goods sunk in it (the floor
-    /// under their top) come up to the floor under their middle; goods
-    /// wholly under it (authored 0.9 to 1.3 m under the El Grande's bed:
-    /// OilCon020's guns) come up onto the floor over them: the bed's
-    /// surface over their bottom, taken from as far over that as they
-    /// are tall (invented: the port's own correction, the 360's
-    /// attachment is not traced).
-    pub fn lift_onto(&self, (lo, hi): (Vec3, Vec3), clear: f32) -> f32 {
-        let (x, z) = ((lo.x + hi.x) * 0.5, (lo.z + hi.z) * 0.5);
-        if let Some(floor) = self.floor_under(x, hi.y, z) {
-            return (floor + clear - lo.y).max(0.0);
-        }
-        let up = r::Ray::new(vector(Vec3::new(x, lo.y, z)), vector(Vec3::Y));
-        let Some(toi) = self.shape.cast_local_ray(&up, 100.0, true) else {
-            return 0.0;
-        };
-        let under = lo.y + toi;
-        self.floor_under(x, under + (hi.y - lo.y) + 0.05, z)
-            .filter(|&f| f >= under - 1e-3)
-            .map_or(0.0, |floor| (floor + clear - lo.y).max(0.0))
-    }
-
     /// The box the shape fills, in its own space.
     pub fn bounds(&self) -> (Vec3, Vec3) {
         let b = self.shape.compute_local_aabb();
@@ -1593,7 +1569,7 @@ const SUSPENSION: f32 = 0.3;
 fn preloads(spec: &VehicleSpec, strength: impl Fn(bool) -> f32, mass_z: f32) -> Vec<f32> {
     let axle = |front: bool| {
         let z: Vec<f32> = spec
-            .wheels
+            .ground_wheels()
             .iter()
             .filter(|w| w.steers == front)
             .map(|w| w.centre.z)
@@ -1610,7 +1586,7 @@ fn preloads(spec: &VehicleSpec, strength: impl Fn(bool) -> f32, mass_z: f32) -> 
     } else {
         0.5
     };
-    spec.wheels
+    spec.ground_wheels()
         .iter()
         .map(|w| {
             let (share, n) = if w.steers {
@@ -1826,6 +1802,9 @@ struct VehicleBody {
     /// How well it stands on the ground under it now ([`Tyres::footing`];
     /// 1 on the flat).
     footing: f32,
+    /// The footing the springs' level parts are taken off by this step:
+    /// the last step's (none before its wheels have had ground).
+    last_footing: f32,
     /// Its weight on the ground, of its plain weight ([`Springs`]'s
     /// `gravity_factor`; 1 for a tank).
     gravity_factor: f32,
@@ -1870,6 +1849,9 @@ struct VehicleBody {
     hinge: Option<TurretHinge>,
     /// Held where it is ([`Physics::hold_vehicle`]): its body fixed.
     held: bool,
+    /// Each wheel's damper as the 360's wheel step runs it ([`Damper`]),
+    /// in wheel order; empty for a tank.
+    dampers: Vec<Damper>,
     /// How its body goes to sleep when it keeps still ([`Rest`]): a car's
     /// or a tank's (`None` for a boat or a helicopter, which never sleep
     /// here).
@@ -3047,6 +3029,130 @@ fn driven_rpm(
         .sum()
 }
 
+/// One wheel's spring as the 360's wheel step (0x8219F510) runs it, with
+/// what its set-up (0x8219EF90) gives it: its strength `k` and damp `c`
+/// (per kilogram, [`Springs`]), its unloaded length `length` (L = Extra +
+/// Exp + Cmp, the wheel's +0xF0) and its length at the last step `prev`
+/// (the wheel's +0x08 times L).
+///
+/// From the 360 code: the set-up starts `prev` at the spring's squeeze
+/// length Cmp (+0x08 = Cmp / L; L if L <= 0), not at the length the wheel
+/// really has. Each step the ray gives the length now, `cur` = t x (L + r)
+/// less r, with r the template's wheel radius ([`Springs::wheel_radius`]),
+/// not clamped below 0; the stretching speed is (cur - prev) / dt; the
+/// push is mass x (k x (L - cur) - c x speed) (0x8219F6D4), applied only
+/// when above 0 (0x8219F6DC) as the impulse push x dt (0x8219F714); then
+/// `prev` = cur (0x8219F798). So the first step a wheel is run, if its
+/// ground stands closer than Cmp, the damping reads a fast squeeze and
+/// kicks it up by c x (Cmp - cur) per wheel: the Fuel and Box Trailers'
+/// hop in Xenia trailers3/4 (v_y +2.20 and +2.23), none for the Austin cab
+/// (its ground is at Cmp) or the Phoenix.
+///
+/// A wheel finds ground only once its contact count (the wheel's +0x34)
+/// is above 0 (0x8219F62C); else the step pushes nothing and sets `prev`
+/// to L (0x8219F798 with L). The set-up zeroes the count (0x8219F224), and
+/// it is raised and lowered by an overlap listener (+1 at 0x82198EE8, -1 at
+/// 0x82198EF8: its +0x18), which the world's step feeds. So a vehicle's
+/// first wheel step, before any world step since it was added, finds no
+/// ground, and the next one kicks by c x (L - cur) per wheel: Xenia
+/// parkedcar1's Phoenix (-0.15, then +0.475; this gives +0.46), trailers3's
+/// Box Trailer (+5.29) and 0xF030B (+5.11). Inferred, not read: that
+/// the count is the wheel phantom's overlaps from the world's broad phase,
+/// so that one world step must run first; when the 360 builds a vehicle
+/// before a world step in its frame, its first wheel step has its ground
+/// (prev = Cmp: trailers4's +2.20 and +2.23), which the port, adding
+/// vehicles between steps, never does ([`Damper::ready`]).
+///
+/// Inferred: the push is along the contact's normal (the 360's is VMX),
+/// and 0x8262C120 gives the body's mass. Rapier pushes the spring part
+/// (`k x (L - cur)`, at least 0) itself; [`damp_wheels`] adds the rest
+/// (or takes Rapier's back on a step with no ground of the 360's).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Damper {
+    k: f32,
+    c: f32,
+    length: f32,
+    prev: f32,
+    /// Its contact count is up: a world step has run since its vehicle
+    /// was added.
+    ready: bool,
+    /// It had ground of the 360's this step: what the car step counts as a
+    /// wheel down (0x8219C338 counts the wheels whose contact timer the
+    /// step just set to 0.4).
+    grounded: bool,
+    /// The impulse [`damp_wheels`] gave this step along the contact's
+    /// normal (beyond Rapier's spring), N s: [`stand`] takes its level part
+    /// off with Rapier's.
+    extra: f32,
+}
+
+impl Damper {
+    /// As the 360's set-up leaves it: `prev` at the squeeze length.
+    fn new(k: f32, c: f32, length: f32, squeeze: f32) -> Self {
+        Self {
+            k,
+            c,
+            length,
+            prev: if length > 0.0 { squeeze } else { length },
+            ready: false,
+            grounded: false,
+            extra: 0.0,
+        }
+    }
+
+    /// One step with the spring `cur` long (`None` off the ground): the
+    /// push per kilogram the 360 gives it (at least 0; m/s² once times
+    /// the mass), and the spring part of it alone (at least 0), Rapier's.
+    fn step(&mut self, cur: Option<f32>, dt: f32) -> (f32, f32) {
+        // No ground of the 360's on its first step ([`Damper::ready`]).
+        let ready = std::mem::replace(&mut self.ready, true);
+        let Some(cur) = cur.filter(|_| ready) else {
+            self.prev = self.length;
+            self.grounded = false;
+            return (0.0, 0.0);
+        };
+        self.grounded = true;
+        let speed = (cur - self.prev) / dt.max(1e-6);
+        self.prev = cur;
+        let spring = self.k * (self.length - cur);
+        ((spring - self.c * speed).max(0.0), spring.max(0.0))
+    }
+}
+
+/// Runs each wheel's [`Damper`] after Rapier has cast and sprung it: the
+/// difference between the 360's whole push and Rapier's spring part, as
+/// an impulse along the contact's normal at the contact.
+fn damp_wheels(v: &mut VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
+    if v.dampers.is_empty() {
+        return;
+    }
+    let Some(body) = bodies.get_mut(v.controller.chassis) else {
+        return;
+    };
+    let mass = body.mass();
+    for (w, d) in v.controller.wheels().iter().zip(&mut v.dampers) {
+        let ray = w.raycast_info();
+        let cur = ray.is_in_contact.then_some(ray.suspension_length);
+        let (push, spring) = d.step(cur, dt);
+        // Rapier pushed its spring part already (none off the ground).
+        let rapier = if cur.is_some() {
+            (d.k * (d.length - ray.suspension_length)).max(0.0)
+        } else {
+            0.0
+        };
+        let _ = spring;
+        let extra = (push - rapier) * mass * dt;
+        d.extra = extra;
+        if extra != 0.0 {
+            body.apply_impulse_at_point(
+                vector(vec3(ray.contact_normal_ws) * extra),
+                ray.contact_point_ws,
+                true,
+            );
+        }
+    }
+}
+
 /// Works out how well a wheeled vehicle stands on the ground under it
 /// ([`Tyres::footing`], from the lean of its wheels' contacts' mean
 /// normal) and takes that share of the level part off each spring's push
@@ -3063,14 +3169,19 @@ fn stand(v: &mut VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
         return;
     };
     let wheels = v.controller.wheels();
+    // Of the wheels the 360's step gave ground ([`Damper::grounded`]).
     let normals: Vec<Vec3> = wheels
         .iter()
-        .map(|w| w.raycast_info())
+        .enumerate()
+        .filter(|(i, _)| v.dampers.get(*i).is_none_or(|d| d.grounded))
+        .map(|(_, w)| w.raycast_info())
         .filter(|r| r.is_in_contact)
         .map(|r| vec3(r.contact_normal_ws))
         .collect();
+    let strip = v.last_footing;
     if normals.is_empty() {
         v.footing = 0.0;
+        v.last_footing = 0.0;
         return;
     }
     let mean = normals.iter().sum::<Vec3>() / normals.len() as f32;
@@ -3078,17 +3189,23 @@ fn stand(v: &mut VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
         .min(1.0)
         .asin();
     v.footing = tyres.footing(tilt);
+    v.last_footing = v.footing;
     let Some(body) = bodies.get_mut(v.controller.chassis) else {
         return;
     };
-    for w in wheels {
+    for (i, w) in wheels.iter().enumerate() {
         let ray = w.raycast_info();
         if !ray.is_in_contact {
             continue;
         }
-        let push = w.wheel_suspension_force.min(w.max_suspension_force) * dt;
+        // Rapier's spring and the 360's damping ([`damp_wheels`]): the
+        // whole push, whose level part comes off by the footing (a damper's
+        // first-step kick on a 2-degree slope otherwise threw the dock's
+        // trailers 0.15 m/s sideways, q769j).
+        let damped = v.dampers.get(i).map_or(0.0, |d| d.extra);
+        let push = w.wheel_suspension_force.min(w.max_suspension_force) * dt + damped;
         let normal = vec3(ray.contact_normal_ws);
-        let level = normal.with_y(0.0) * push * v.footing;
+        let level = normal.with_y(0.0) * push * strip;
         body.apply_impulse_at_point(vector(-level), ray.contact_point_ws, true);
         // The 360 code pushes at the spring's top, not its contact
         // (0x8219F510 hands 0x8219C27C the push and the wheel's +0x48,
@@ -3981,6 +4098,7 @@ impl Physics {
             );
             v.controller.update_vehicle(dt, queries);
             if !v.wrecked {
+                damp_wheels(v, &mut w.bodies, dt);
                 stand(v, &mut w.bodies, dt);
                 if let Some(tank) = &mut v.tank {
                     run_tracks(tank, &v.controller, &mut w.bodies, dt);
@@ -4006,11 +4124,17 @@ impl Physics {
             // template's `GravityFactor` less one of its weight more
             // (from the 360 code, at 0x8219EE14, by its gravity of 10 m/s²,
             // [`GRAVITY_360`]).
+            // A wheel is down when the 360's step gave it ground
+            // ([`Damper::grounded`]: none on its first step).
             let wheels = v.controller.wheels();
-            let down = wheels
-                .iter()
-                .filter(|w| w.raycast_info().is_in_contact)
-                .count();
+            let down = if v.dampers.is_empty() {
+                wheels
+                    .iter()
+                    .filter(|w| w.raycast_info().is_in_contact)
+                    .count()
+            } else {
+                v.dampers.iter().filter(|d| d.grounded).count()
+            };
             if !v.wrecked && v.gravity_factor != 1.0 && down * 2 > wheels.len() {
                 let pull = (v.gravity_factor - 1.0) * v.mass * GRAVITY_360 * dt;
                 if let Some(b) = w.bodies.get_mut(v.controller.chassis) {
@@ -4422,7 +4546,18 @@ impl Physics {
                 .map(|v| v.controller.chassis)
                 .filter(|c| self.world.bodies.get(*c).is_some_and(|b| b.is_sleeping()))
                 .collect();
-            for c in beds {
+            // And the goods already asleep: the 360 builds a batch over
+            // several updates within its rebuild's budget (0x82152780;
+            // Xenia settle8: 7 crates, then 3 a tenth of a second later), each
+            // added inactive into the one island that stays asleep; the
+            // new one's first contacts with them would wake both in Rapier.
+            let asleep_goods: Vec<r::RigidBodyHandle> = self
+                .cargo_bodies
+                .iter()
+                .copied()
+                .filter(|c| self.world.bodies.get(*c).is_some_and(|b| b.is_sleeping()))
+                .collect();
+            for c in beds.into_iter().chain(asleep_goods) {
                 match self.cargo_sleep.iter_mut().find(|e| e.0 == c) {
                     Some(e) => e.1 = CARGO_SETTLE_STEPS,
                     None => self.cargo_sleep.push((c, CARGO_SETTLE_STEPS)),
@@ -5024,11 +5159,11 @@ impl Physics {
             Some(b) => {
                 let springs = spec.tuning.springs.unwrap_or(Springs::DEFAULT);
                 let mid = spec
-                    .wheels
+                    .ground_wheels()
                     .iter()
                     .map(|w| w.centre + Vec3::Y * springs.axle(w.steers).3)
                     .sum::<Vec3>()
-                    / spec.wheels.len() as f32;
+                    / spec.ground_wheels().len() as f32;
                 mid + Vec3::from(b.centre_of_mass) - centre
             }
             None => match spec.chassis.as_ref().filter(|_| chassis.is_some()) {
@@ -5247,8 +5382,10 @@ impl Physics {
         // every car down so, 0x8219EE14, and balances a bike after).
         let gravity_factor = springs.map_or(1.0, |s| s.gravity_factor);
         let preload = preloads(spec, |_| SPRING, centre.z);
-        let mut tops = Vec::with_capacity(spec.wheels.len());
-        for (w, &preload) in spec.wheels.iter().zip(&preload) {
+        let mut tops = Vec::with_capacity(spec.ground_wheels().len());
+        let mut dampers = Vec::new();
+        // Its springs at its template's wheels ([`VehicleSpec::ground_wheels`]).
+        for (w, &preload) in spec.ground_wheels().iter().zip(&preload) {
             // A tank driven as the 360 code drives it springs itself
             // ([`drive_tracks`]): Rapier only casts each point's ray, from
             // its squeeze up from the bottom of its track (its hardpoint)
@@ -5276,10 +5413,14 @@ impl Physics {
                 );
                 continue;
             }
+            let radius = springs.map_or(w.radius, |s| s.wheel_radius(w.steers, w.radius));
             let (stiffness, (squeezed, stretched), rest, top, travel) = match springs {
                 Some(s) => {
                     let (k, c, length, top) = s.axle(w.steers);
-                    (k, (c, c), length, top, length + w.radius)
+                    // Its damping is the 360's own ([`Damper`]), not
+                    // Rapier's: none here.
+                    dampers.push(Damper::new(k, c, length, top));
+                    (k, (0.0, 0.0), length, top, length + radius)
                 }
                 // A tank's are invented: longer than SUSPENSION by what
                 // its share of the weight squeezes them, so standing it
@@ -5305,7 +5446,7 @@ impl Physics {
                 // Forward = up x axle = +z.
                 -r::Vector::X,
                 rest,
-                w.radius,
+                radius,
                 &tuning,
             );
         }
@@ -5394,11 +5535,12 @@ impl Physics {
             controller,
             bed: false,
             mass: m,
-            steers: spec.wheels.iter().map(|w| w.steers).collect(),
+            steers: spec.ground_wheels().iter().map(|w| w.steers).collect(),
             tops,
             tyres,
             axles: Axle::standing(&tyres),
             footing: 1.0,
+            last_footing: 0.0,
             gravity_factor,
             tracked: spec.tracked,
             bike: bike.map(|tuning| Bike { tuning, steer: 0.0 }),
@@ -5421,6 +5563,7 @@ impl Physics {
             turret: (turret_colliders, spec.turret_mount()),
             hinge,
             held: false,
+            dampers,
             rest: (hull.is_none() && rotor.is_none()).then(Rest::default),
             before: Vec3::ZERO,
             spin_before: Vec3::ZERO,
@@ -5615,24 +5758,26 @@ impl Physics {
                 let on = v.steers.iter().filter(|&&s| s == front).count();
                 on as f32 / v.steers.len().max(1) as f32
             };
+            // Nobody at the wheel: its axles as the 360's for no input (no
+            // throttle, brake or steer), not a hold. The port's invented
+            // parked hold (`HANDBRAKE` / `HOLD` against the motion) is gone
+            // for a wheeled vehicle: no brake or hold of an empty car is
+            // found in the 360 code, and against Xenia sub1 it threw the
+            // dock's trailers back on their kick (-0.15 m/s at step 2,
+            // against the 360's -0.036; the Fuel Trailer at rest 0.75 m off,
+            // the 360's 0.50; the Box Trailer 0.005 off, the 360's 0.25),
+            // where without it they come to 0.33 and 0.22 m.
+            let _ = share;
             let axle = |front: bool| {
-                if controls.parked {
-                    let hard = if speed.abs() > PARKED_FAST {
-                        HOLD
-                    } else {
-                        HANDBRAKE
-                    };
-                    Axle {
-                        along: hard * share(front),
-                        across: t.grip(front, fast, 0.0, 0.0, 0.0),
-                        hold: true,
-                    }
+                let (open, pressed, held, steer) = if controls.parked {
+                    (0.0, 0.0, 0.0, 0.0)
                 } else {
-                    Axle {
-                        along: t.slowing(front, speed, open, pressed, held, steer),
-                        across: t.grip(front, fast, pressed, held, steer),
-                        hold: false,
-                    }
+                    (open, pressed, held, steer)
+                };
+                Axle {
+                    along: t.slowing(front, speed, open, pressed, held, steer),
+                    across: t.grip(front, fast, pressed, held, steer),
+                    hold: false,
                 }
             };
             [axle(true), axle(false)]
@@ -6229,6 +6374,56 @@ impl Physics {
     /// the box the thing touched fills, world space. To find what holds a
     /// stuck vehicle.
     #[allow(clippy::type_complexity)]
+    /// What vehicle `id`'s body touches that is not a static: each other
+    /// body's owner (another vehicle's chassis by its id, a loose piece by
+    /// its debris id, else a body) and whether it is awake. Log only.
+    pub fn vehicle_touching_bodies(&self, id: VehicleId) -> Vec<String> {
+        let Some(body) = self
+            .vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .and_then(|v| self.world.bodies.get(v.controller.chassis))
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for &c in body.colliders() {
+            for pair in self.world.narrow_phase.contact_pairs_with(c) {
+                if !pair.has_any_active_contact() {
+                    continue;
+                }
+                let other = if pair.collider1 == c {
+                    pair.collider2
+                } else {
+                    pair.collider1
+                };
+                if self.keys.contains_key(&other) {
+                    continue;
+                }
+                let Some(h) = self.world.colliders.get(other).and_then(|o| o.parent()) else {
+                    continue;
+                };
+                let awake = self.world.bodies.get(h).is_some_and(|b| !b.is_sleeping());
+                let owner = if let Some(v) = self
+                    .vehicles
+                    .iter()
+                    .position(|v| v.as_ref().is_some_and(|v| v.controller.chassis == h))
+                {
+                    format!("vehicle {v}")
+                } else if let Some(d) = self.debris.iter().position(|d| *d == Some(h)) {
+                    format!("debris {d}")
+                } else {
+                    "a body".to_owned()
+                };
+                let line = format!("{owner} ({})", if awake { "awake" } else { "asleep" });
+                if !out.contains(&line) {
+                    out.push(line);
+                }
+            }
+        }
+        out
+    }
+
     pub fn vehicle_touching(&self, id: VehicleId) -> Vec<(Option<StaticKey>, Vec3, (Vec3, Vec3))> {
         let Some(body) = self
             .vehicles
@@ -6572,6 +6767,32 @@ impl Physics {
     }
 
     /// A vehicle's velocity, m/s.
+    /// Each of a vehicle's springs this step: its length (L less its
+    /// squeeze, metres; below 0 when its ground stands above the wheel's
+    /// centre), whether the 360's step gave it ground, and its push
+    /// (Rapier's spring and the 360's damping, N s). Log only.
+    pub fn vehicle_spring_steps(&self, id: VehicleId) -> Vec<(f32, bool, f32)> {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return Vec::new();
+        };
+        v.controller
+            .wheels()
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                let ray = w.raycast_info();
+                let d = v.dampers.get(i);
+                let push = w.wheel_suspension_force.min(w.max_suspension_force) / 60.0
+                    + d.map_or(0.0, |d| d.extra);
+                (
+                    ray.suspension_length,
+                    d.map_or(ray.is_in_contact, |d| d.grounded),
+                    push,
+                )
+            })
+            .collect()
+    }
+
     pub fn vehicle_velocity(&self, id: VehicleId) -> Vec3 {
         self.vehicles
             .get(id.0)
@@ -10230,20 +10451,28 @@ mod tests {
         assert!(moved < MAX_LINEAR_SPEED * 2.0 * DT * 1.05, "{moved}");
     }
 
-    /// Drives a car with a bed 1 m up and eight 200 kg crates of 0.5 m on
-    /// it, put in `drop` metres under the bed's floor and lifted by
-    /// [`CollisionShape::lift_onto`] when `lift`, at full throttle for
-    /// 4 s on flat ground: its speed then (m/s) and its wheels down.
-    fn drive_with_crates(drop: f32, lift: bool) -> (f32, usize) {
+    #[test]
+    fn goods_added_asleep_in_a_sleeping_beds_collision_stay_asleep_and_still() {
+        // As the 360 adds OilCon020's crates (Xenia p769a): at their
+        // authored places, at rest, once the truck under them sleeps, and
+        // where that puts them in its bed's collision (the truck settled
+        // under them). Nothing awake touches them, so none moves.
         let mut p = Physics::new();
         floor(&mut p, 1, 0.0, 0.0, 0.0, 400.0);
         p.step(DT);
         let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
-        for _ in 0..120 {
+        let parked = VehicleControls {
+            parked: true,
+            ..VehicleControls::default()
+        };
+        let mut k = 0;
+        while !p.vehicle_asleep(id) && k < 600 {
+            p.drive(id, parked);
             p.step(DT);
+            k += 1;
         }
-        // Its bed's floor 1 m up, and the frame under it 0.3 m up (as a
-        // truck's `PHY2` has its chassis under the bed).
+        assert!(p.vehicle_asleep(id), "the car never slept");
+        // Its bed's plate 1.0 to 1.04 m up and the rails 0.3 m up.
         let sheet = |y: f32| {
             [
                 Vec3::new(-1.0, y, -2.2),
@@ -10252,81 +10481,48 @@ mod tests {
                 Vec3::new(-1.0, y, 0.0),
             ]
         };
-        let mut v = sheet(1.0).to_vec();
+        let mut v = sheet(1.04).to_vec();
+        v.extend(sheet(1.0));
         v.extend(sheet(0.3));
-        let bed = CollisionShape::mesh(&v, &[[0, 2, 1], [0, 3, 2], [4, 6, 5], [4, 7, 6]]).unwrap();
+        let t = [
+            [0, 2, 1],
+            [0, 3, 2],
+            [4, 6, 5],
+            [4, 7, 6],
+            [8, 10, 9],
+            [8, 11, 10],
+        ];
+        let bed = CollisionShape::mesh(&v, &t).unwrap();
         assert!(p.add_bed(id, &bed));
         let place = p.vehicle_transform(id).unwrap();
-        let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.25), 200.0);
-        let spots = [-0.6, -1.1, -1.6, -2.0]
+        let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::new(0.45, 0.13, 0.19), 13.0);
+        // Two in each of two rows: one through the plate, one on it, one
+        // under it, one overlapping its neighbour.
+        let spots = [
+            Vec3::new(-0.5, 0.98, -0.5),
+            Vec3::new(0.5, 1.2, -0.5),
+            Vec3::new(-0.5, 0.75, -1.2),
+            Vec3::new(0.3, 1.1, -1.2),
+        ];
+        let crates: Vec<(DebrisId, Mat4)> = spots
             .into_iter()
-            .flat_map(|z| [(-0.5, z), (0.5, z)]);
-        for (x, z) in spots {
-            let centre = Vec3::new(x, 1.27 - drop, z);
-            let lifted = if lift {
-                bed.lift_onto(
-                    (centre - Vec3::splat(0.25), centre + Vec3::splat(0.25)),
-                    0.02,
-                )
-            } else {
-                0.0
-            };
-            let at = place * Mat4::from_translation(centre + Vec3::Y * lifted);
-            p.add_cargo(&piece, at);
-        }
-        for _ in 0..240 {
-            p.drive(
-                id,
-                VehicleControls {
-                    throttle: 1.0,
-                    ..VehicleControls::default()
-                },
-            );
+            .map(|c| {
+                let at = place * Mat4::from_translation(c);
+                (p.add_cargo(&piece, at), at)
+            })
+            .collect();
+        for _ in 0..1200 {
+            p.drive(id, parked);
             p.step(DT);
         }
-        (p.vehicle_speed(id), p.vehicle_contacts(id).0)
-    }
-
-    #[test]
-    fn goods_put_in_under_the_bed_come_up_onto_it() {
-        let bed = CollisionShape::mesh(
-            &[
-                Vec3::new(-1.0, 1.0, -2.2),
-                Vec3::new(1.0, 1.0, -2.2),
-                Vec3::new(1.0, 1.0, 0.0),
-                Vec3::new(-1.0, 1.0, 0.0),
-            ],
-            &[[0, 2, 1], [0, 3, 2]],
-        )
-        .unwrap();
-        let crate_at = |y: f32| {
-            let c = Vec3::new(0.0, y, -1.0);
-            (c - Vec3::splat(0.25), c + Vec3::splat(0.25))
-        };
-        // On it: no lift; sunk in it: up to the floor; 1.1 m under it:
-        // up onto it too; off to the side: nothing to stand on.
-        assert_eq!(bed.lift_onto(crate_at(1.3), 0.02), 0.0);
-        assert!((bed.lift_onto(crate_at(1.1), 0.02) - 0.17).abs() < 1e-3);
-        assert!((bed.lift_onto(crate_at(0.17), 0.02) - 1.1).abs() < 1e-3);
-        let aside = (Vec3::new(3.0, 0.0, 0.0), Vec3::new(3.5, 0.5, 0.5));
-        assert_eq!(bed.lift_onto(aside, 0.02), 0.0);
-    }
-
-    #[test]
-    fn crates_put_in_under_the_bed_ride_without_holding_the_car() {
-        // OilCon020's guns stood 0.9 to 1.3 m under the El Grande's bed:
-        // ridden there, they jammed it.
-        let (on_speed, on_down) = drive_with_crates(0.0, false);
-        let (sunk_speed, sunk_down) = drive_with_crates(1.1, false);
-        let (lifted_speed, lifted_down) = drive_with_crates(1.1, true);
-        eprintln!(
-            "crates on the bed {on_speed:.1} m/s, {on_down} wheels down;              sunk {sunk_speed:.1} m/s, {sunk_down}; lifted {lifted_speed:.1} m/s, {lifted_down}"
-        );
-        assert!(on_speed > 5.0 && on_down == 4, "{on_speed} {on_down}");
-        assert!(
-            (lifted_speed - on_speed).abs() < 0.5 && lifted_down == 4,
-            "{lifted_speed} {lifted_down}"
-        );
+        assert!(p.vehicle_asleep(id), "the car woke");
+        for (c, at) in crates {
+            assert_eq!(p.debris_asleep(c), Some(true), "a crate woke");
+            // At most the one step Rapier runs a body just added awake
+            // (9 m/s² for 1/60 s: 2.5 mm).
+            let moved = p.debris_place(c).unwrap().w_axis.distance(at.w_axis);
+            assert!(moved < 0.003, "a crate moved {moved}");
+        }
     }
 
     #[test]
@@ -10469,6 +10665,7 @@ mod tests {
             damage: None,
             chassis: None,
             shapes: Default::default(),
+            spring_wheels: None,
             material: None,
             path_unseen: Default::default(),
             turret_shapes: Default::default(),
@@ -10669,6 +10866,7 @@ mod tests {
         squeeze: (0.1, 0.1),
         extra: 0.05,
         gravity_factor: 1.7,
+        radius: (0.0, 0.0),
     };
     /// Its engine and gearbox, its record's.
     const OFFROAD_ENGINE: EngineTuning = EngineTuning {
@@ -11386,7 +11584,10 @@ mod tests {
         let tilt = Quat::from_rotation_z(-30f32.to_radians());
         p.add_static(StaticKey::Cell(1), &shape, Vec3::ZERO, tilt);
         p.step(DT);
-        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.3, 0.0), 0.0);
+        // Put on the slope as a parked car is, turned to it (not level with
+        // its uphill wheels sunk in it: their springs' first step would
+        // throw it, as the 360's first wheel step does, [`Damper`]).
+        let id = p.add_vehicle_turned(&car(), tilt * Vec3::new(0.0, 0.3, 0.0), tilt);
         for _ in 0..240 {
             p.drive(
                 id,
@@ -12590,11 +12791,357 @@ mod tests {
         assert!((h.range(1.0, 0.0, 0.0) - 0.92).abs() < 1e-6);
     }
 
+    /// The 360's first-step vertical velocity change for a vehicle whose
+    /// wheels' springs are `cur` long at its first step (each with its
+    /// axle's k, c, L and Cmp), with a gravity factor `f`: each wheel's
+    /// [`Damper`] push (started at Cmp) over one step, less its weight.
+    fn first_kick(wheels: &[(f32, f32, f32, f32, f32)], f: f32) -> f32 {
+        let dt = 1.0 / 60.0;
+        let weight = WORLD_GRAVITY + (f - 1.0) * GRAVITY_360;
+        let mut dampers: Vec<Damper> = wheels
+            .iter()
+            .map(|&(k, c, length, squeeze, _)| Damper::new(k, c, length, squeeze))
+            .collect();
+        // Its first step: no ground (pushes nothing, and no wheel down, so
+        // no extra weight either: Xenia parkedcar1's Phoenix -0.150).
+        let mut v = 0.0;
+        for (d, w) in dampers.iter_mut().zip(wheels) {
+            assert_eq!(d.step(Some(w.4), dt).0, 0.0);
+            assert!(!d.grounded);
+        }
+        v -= WORLD_GRAVITY * dt;
+        // Its second: each spring from its whole length to where it is.
+        let push: f32 = dampers
+            .iter_mut()
+            .zip(wheels)
+            .map(|(d, w)| d.step(Some(w.4), dt).0)
+            .sum();
+        v + (push - weight) * dt
+    }
+
+    // A vehicle's first wheel step finds no ground (its contact count is
+    // 0 until a world step has run, 0x8219F62C), so its springs start the
+    // next one from their whole length and their damping kicks it up by c x
+    // (L - cur) per wheel. The installed templates at their authored poses
+    // (springs as cast with the template's wheel radius): the Phoenix's
+    // (25, 1.0, 0.35, 0.20 at 0.177, 0.139, 0.249, 0.227; gravity factor
+    // 1.7) +0.46 m/s, Xenia parkedcar1 +0.475; the Fuel Trailer's (front
+    // 4.5, 2.0, 0.70, 0.30 at -0.016; rear 15, 3.0, 0.55, 0.30 at 0.156)
+    // about 5.1, Xenia trailers3/4 0xF030B +5.11; the Box Trailer's (front
+    // 4.5, 1.7, 0.70, 0.30 at -0.125; rear 15, 3.0, 0.60, 0.30 at 0.172)
+    // about 5.2, Xenia trailers3 +5.29. (Not the Austin cab: at the port's
+    // squeeze, 0.205 on all six, this gives it +2.3, where Xenia's cabs land
+    // from a fall without a kick; open, see #769.)
+    #[test]
+    fn a_vehicles_springs_kick_on_its_first_step_with_ground() {
+        let pair = |w: (f32, f32, f32, f32, f32)| [w, w];
+        let phoenix: Vec<_> = [0.177, 0.139, 0.249, 0.227]
+            .iter()
+            .map(|&cur| (25.0, 1.0, 0.35, 0.20, cur))
+            .collect();
+        let v = first_kick(&phoenix, 1.7);
+        assert!((v - 0.46).abs() < 0.03, "phoenix {v}");
+        let fuel: Vec<_> = pair((4.5, 2.0, 0.70, 0.30, -0.016))
+            .into_iter()
+            .chain(pair((15.0, 3.0, 0.55, 0.30, 0.156)))
+            .collect();
+        let v = first_kick(&fuel, 2.0);
+        assert!((v - 5.11).abs() < 0.2, "fuel trailer {v}");
+        let boxed: Vec<_> = pair((4.5, 1.7, 0.70, 0.30, -0.125))
+            .into_iter()
+            .chain(pair((15.0, 3.0, 0.60, 0.30, 0.172)))
+            .collect();
+        let v = first_kick(&boxed, 2.0);
+        assert!((v - 5.29).abs() < 0.2, "box trailer {v}");
+    }
+
+    // A vehicle is stepped from add (Xenia parkedcar1): its first steps
+    // it is awake, kicked by its springs' first contact; once still it
+    // sleeps, and only then does the game take up goods onto its bed
+    // (m2-alpha, settle7/8's order: the El Grande asleep before its crates
+    // are bodies).
+    #[test]
+    fn a_vehicle_added_is_awake_until_it_has_settled() {
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, car().ride_height(), 0.0), 0.0);
+        p.step(DT);
+        assert!(!p.vehicle_asleep(id), "asleep on its first step");
+        let parked = VehicleControls {
+            parked: true,
+            ..Default::default()
+        };
+        let mut asleep_at = None;
+        for k in 0..600 {
+            p.drive(id, parked);
+            p.step(DT);
+            if p.vehicle_asleep(id) {
+                asleep_at = Some(k);
+                break;
+            }
+        }
+        let k = asleep_at.expect("never slept");
+        assert!(k > 30, "slept after only {k} steps");
+    }
+
+    // A trailer's springs go where its template's `_CarWheel`s say (the
+    // 360 builds its wheels from them, 0x8219B5A0): the Fuel Trailer's are
+    // its two landing legs (nodes at 0.14 m, front) and one of its two
+    // axles (back), not the model's four wheels; a car whose records name
+    // its own wheels keeps them.
+    #[test]
+    fn springs_go_where_the_templates_car_wheels_say() {
+        let mut spec = car();
+        spec.node_names = vec![0x10, 0x11, 0x12, 0x13];
+        spec.rest = vec![
+            Mat4::from_translation(Vec3::new(-0.54, 0.14, -3.0)),
+            Mat4::from_translation(Vec3::new(-0.76, 0.59, -10.3)),
+            Mat4::from_translation(Vec3::new(0.76, 0.59, -10.3)),
+            Mat4::from_translation(Vec3::new(0.38, 0.14, -3.0)),
+        ];
+        let records = [
+            crate::tuning::CarWheel {
+                node: 0x10,
+                back: false,
+            },
+            crate::tuning::CarWheel {
+                node: 0x11,
+                back: true,
+            },
+            crate::tuning::CarWheel {
+                node: 0x12,
+                back: true,
+            },
+            crate::tuning::CarWheel {
+                node: 0x13,
+                back: false,
+            },
+        ];
+        let s = spec.clone().with_car_wheels(&records);
+        let w = s.ground_wheels();
+        assert_eq!(w.len(), 4);
+        assert!(w[0].steers && !w[1].steers && !w[2].steers && w[3].steers);
+        assert!((w[0].centre.y - 0.14).abs() < 1e-6);
+        assert!((w[1].centre - Vec3::new(-0.76, 0.59, -10.3)).length() < 1e-6);
+        // Its drawn wheels stay the model's.
+        assert_eq!(s.wheels, spec.wheels);
+        // Records naming its own wheels: no change.
+        let mut own = spec.clone();
+        own.node_names = (0..own.wheels.len() as u32).collect();
+        own.rest = own
+            .wheels
+            .iter()
+            .map(|w| Mat4::from_translation(w.centre))
+            .collect();
+        let same: Vec<crate::tuning::CarWheel> = own
+            .wheels
+            .iter()
+            .enumerate()
+            .map(|(i, w)| crate::tuning::CarWheel {
+                node: i as u32,
+                back: !w.steers,
+            })
+            .collect();
+        assert!(own.with_car_wheels(&same).spring_wheels.is_none());
+        // None: no change.
+        assert!(spec.with_car_wheels(&[]).spring_wheels.is_none());
+    }
+
+    // What a vehicle's body touches that is no static is told by its
+    // owner: another vehicle's chassis by its id (the first-step log).
+    #[test]
+    fn a_vehicles_touches_name_their_owners() {
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let h = car().ride_height();
+        let a = p.add_vehicle(&car(), Vec3::new(0.0, h, 0.0), 0.0);
+        let b = p.add_vehicle(&car(), Vec3::new(0.5, h, 0.0), 0.0);
+        p.step(DT);
+        let told = p.vehicle_touching_bodies(a);
+        assert!(
+            told.iter()
+                .any(|t| t.starts_with(&format!("vehicle {}", b.0))),
+            "{told:?}"
+        );
+    }
+
+    // A vehicle's first-step kick follows its ground's normal, as the 360's
+    // does: the wheel step pushes along the contact plane's normal at the
+    // spring's top (0x8219F510), and the car step takes each push's level
+    // part off by the footing (x and z times 1 - C+0x178, 0x8219C27C), which
+    // 0x8219E020 works out before the wheel steps, so from the wheels'
+    // ground before this step: none on the kick (the first step has none).
+    // Xenia p769b: the El Grande's kick on its 9-degree pad, (-0.41, 1.98,
+    // -0.12), within about 3 degrees of its up. Inferred: that 0x8219E020
+    // reads the last step's ground (C+0x178's writer is not found).
+    #[test]
+    fn a_first_step_kick_on_a_slope_follows_its_ground() {
+        let mut spec = car();
+        spec.tuning.springs = Some(Springs {
+            strength: (4.5, 15.0),
+            damping: (2.0, 3.0),
+            stretch: (0.4, 0.25),
+            squeeze: (0.3, 0.3),
+            extra: 0.0,
+            gravity_factor: 2.0,
+            radius: (0.71, 0.57),
+        });
+        let rear = spec
+            .wheels
+            .iter()
+            .map(|w| w.centre.z)
+            .fold(f32::MAX, f32::min);
+        let front = spec
+            .wheels
+            .iter()
+            .map(|w| w.centre.z)
+            .fold(f32::MIN, f32::max);
+        let r = spec.wheels[0].radius;
+        let at = |x: f32, y: f32, z: f32, steers: bool| crate::vehicle::WheelSpec {
+            centre: Vec3::new(x, y, z),
+            radius: r,
+            width: 0.3,
+            steers,
+        };
+        spec.spring_wheels = Some(
+            vec![
+                at(-0.54, 0.14, front, true),
+                at(-0.76, 0.59, rear, false),
+                at(0.76, 0.59, rear, false),
+                at(0.38, 0.14, front, true),
+            ]
+            .into(),
+        );
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
+        let tilt = Quat::from_rotation_z(9f32.to_radians());
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            tilt * Vec3::new(0.0, -1.0, 0.0),
+            tilt,
+        );
+        let id = p.add_vehicle_turned(&spec, Vec3::ZERO, tilt);
+        p.step(DT);
+        p.step(DT);
+        let v = p.vehicle_velocity(id);
+        assert!(v.length() > 4.0, "no kick: {v}");
+        let normal = tilt * Vec3::Y;
+        let off = v.normalize().angle_between(normal).to_degrees();
+        assert!(
+            off < 3.0,
+            "kick {v} is {off:.1} deg off its ground's normal"
+        );
+    }
+
+    // A parked trailer (nobody at the wheel) on its legs and one axle, as
+    // the game builds the Fuel Trailer (its `_CarWheel` springs, its
+    // template's springs and tyres): its first-step kick pitches it, and
+    // with no hold of an empty car (none is found in the 360 code) its
+    // axles' tyres take only the 360's no-input slowing. Xenia sub1: v_x
+    // -0.036 along its length just after the kick; the port's invented
+    // parked hold made it -0.15.
+    #[test]
+    fn a_parked_trailers_kick_is_not_turned_into_a_slide() {
+        let mut spec = car();
+        spec.tuning.springs = Some(Springs {
+            strength: (4.5, 15.0),
+            damping: (2.0, 3.0),
+            stretch: (0.4, 0.25),
+            squeeze: (0.3, 0.3),
+            extra: 0.0,
+            gravity_factor: 2.0,
+            radius: (0.71, 0.57),
+        });
+        spec.tuning.tyres = Some(crate::tuning::Tyres {
+            rolling: (0.5, 0.5),
+            brake: (3.0, 2.0),
+            emergency: (0.1, 0.1),
+            side: (1.0, 1.0),
+            ..crate::tuning::Tyres::DEFAULT
+        });
+        let rear = spec
+            .wheels
+            .iter()
+            .map(|w| w.centre.z)
+            .fold(f32::MAX, f32::min);
+        let front = spec
+            .wheels
+            .iter()
+            .map(|w| w.centre.z)
+            .fold(f32::MIN, f32::max);
+        let r = spec.wheels[0].radius;
+        let at = |x: f32, y: f32, z: f32, steers: bool| crate::vehicle::WheelSpec {
+            centre: Vec3::new(x, y, z),
+            radius: r,
+            width: 0.3,
+            steers,
+        };
+        spec.spring_wheels = Some(
+            vec![
+                at(-0.54, 0.14, front, true),
+                at(-0.76, 0.59, rear, false),
+                at(0.76, 0.59, rear, false),
+                at(0.38, 0.14, front, true),
+            ]
+            .into(),
+        );
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let id = p.add_vehicle(&spec, Vec3::ZERO, 0.0);
+        let parked = VehicleControls {
+            parked: true,
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            p.drive(id, parked);
+            p.step(DT);
+        }
+        let v = p.vehicle_velocity(id);
+        assert!(v.y > 4.0, "no kick: {v}");
+        assert!(v.z.abs() < 0.08, "thrown along its length: {v}");
+    }
+
+    // The push is never a pull: a spring stretching fast enough that its
+    // damping outweighs it gives nothing (0x8219F6DC); off the ground it
+    // gives nothing and next touches as from its whole length.
+    #[test]
+    fn a_wheel_push_is_never_a_pull() {
+        let mut d = Damper::new(25.0, 3.0, 0.35, 0.20);
+        assert_eq!(d.prev, 0.20);
+        d.ready = true;
+        let (push, spring) = d.step(Some(0.34), 1.0 / 60.0);
+        assert_eq!(push, 0.0);
+        assert!(spring > 0.0);
+        assert_eq!(d.prev, 0.34);
+        assert_eq!(d.step(None, 1.0 / 60.0), (0.0, 0.0));
+        assert_eq!(d.prev, 0.35);
+        assert_eq!(Damper::new(25.0, 3.0, 0.0, 0.2).prev, 0.0);
+    }
+
     // Its springs hang as the 360 code hangs them: from their squeeze
     // above the model's wheels, as long as their lengths together. In the
     // air its wheels drop their stretch and the extra length below the
     // model's; standing on four of strength k with a gravity factor f,
-    // they are squeezed f g / 4k on average (the back pair more, carrying
+    // they are squeezed (g + (f - 1) 10) / 4k on average (the back pair more, carrying
     // more of the weight), so its wheels sit that much higher, and the
     // chassis that much less above its model's height.
     #[test]
@@ -12608,6 +13155,7 @@ mod tests {
                 squeeze: (0.15, 0.15),
                 extra: 0.05,
                 gravity_factor: f,
+                radius: (0.0, 0.0),
             };
             spec.tuning.springs = Some(springs);
             let mut p = Physics::new();
@@ -12620,12 +13168,15 @@ mod tests {
             for _ in 0..300 {
                 p.step(DT);
             }
-            let want = f * WORLD_GRAVITY / (4.0 * k);
+            // The world's gravity, and the 360's extra weight (f - 1) x its
+            // gravity of 10 (0x8219EE14, [`GRAVITY_360`]) on the springs.
+            let want = (WORLD_GRAVITY + (f - 1.0) * GRAVITY_360) / (4.0 * k);
             let sag = p.vehicle_suspension(id);
             let mean = sag.iter().sum::<f32>() / 4.0;
-            // Within 5%: Rapier's springs settle 2 to 4% short of what
-            // k c = f g says.
-            assert!((mean - want).abs() < 0.05 * want, "{k}: {sag:?} {want}");
+            // Within 1%: with the 360's own damper ([`Damper`]) the springs
+            // settle where they carry that weight (Rapier's damper had them
+            // 2 to 4% short).
+            assert!((mean - want).abs() < 0.01 * want, "{k}: {sag:?} {want}");
             assert!(sag[2] > sag[0], "{k}: {sag:?}");
             let lift = p.vehicle_wheel_lift(id);
             let mean_lift = lift.iter().sum::<f32>() / 4.0;

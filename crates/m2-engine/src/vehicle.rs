@@ -410,6 +410,12 @@ pub struct VehicleSpec {
     /// convex radius included. The 360 code builds its body from them
     /// (0x8216A290). Empty without them.
     pub shapes: std::sync::Arc<[Vec<Vec3>]>,
+    /// The wheels its springs are at, as the 360 code builds them from its
+    /// template's `_CarWheel` records ([`VehicleSpec::with_car_wheels`]),
+    /// when they differ from the model's [`wheels`](Self::wheels) (a
+    /// trailer's: its landing legs and one of its two axles). `None`: the
+    /// model's wheels.
+    pub spring_wheels: Option<std::sync::Arc<[WheelSpec]>>,
     /// Which of [`shapes`](Self::shapes) a path search doesn't see (their
     /// index): by its flags, a shape takes a vehicle's layer (0x8216C308,
     /// [`crate::collision_layers::VEHICLE`]) and the sweeps see layer 8
@@ -1060,6 +1066,7 @@ impl VehicleSpec {
             damage: crate::vehicle_damage::DamageModel::from_model(model).map(std::sync::Arc::new),
             chassis: None,
             shapes: Default::default(),
+            spring_wheels: None,
             material: None,
             path_unseen: Default::default(),
             turret_shapes: Default::default(),
@@ -1313,6 +1320,52 @@ impl VehicleSpec {
     }
 
     /// With its template's tuning: its mass and how far its gun tilts.
+    /// The wheels its springs are at ([`spring_wheels`](Self::spring_wheels),
+    /// else the model's).
+    pub fn ground_wheels(&self) -> &[WheelSpec] {
+        self.spring_wheels.as_deref().unwrap_or(&self.wheels)
+    }
+
+    /// With its springs at its template's `_CarWheel` nodes (0x8219B5A0,
+    /// 0x8219EF90): each at its node's place, on the front axle unless its
+    /// record says the back. A record whose node the model hasn't is left
+    /// out; with none (or no records, or a tracked or wheelless vehicle)
+    /// the model's wheels stay. Each takes the nearest model wheel's radius
+    /// and width (the cast uses the template's radius, [`Springs`]).
+    pub fn with_car_wheels(mut self, records: &[crate::tuning::CarWheel]) -> Self {
+        if records.is_empty() || self.tracked || self.wheels.is_empty() {
+            return self;
+        }
+        let wheels: Vec<WheelSpec> = records
+            .iter()
+            .filter_map(|r| {
+                let i = self.node_names.iter().position(|&h| h == r.node)?;
+                let centre = self.rest.get(i)?.w_axis.truncate();
+                let near = self.wheels.iter().min_by(|a, b| {
+                    a.centre
+                        .distance_squared(centre)
+                        .total_cmp(&b.centre.distance_squared(centre))
+                })?;
+                Some(WheelSpec {
+                    centre,
+                    radius: near.radius,
+                    width: near.width,
+                    steers: !r.back,
+                })
+            })
+            .collect();
+        let same = wheels.len() == self.wheels.len()
+            && wheels.iter().all(|w| {
+                self.wheels
+                    .iter()
+                    .any(|m| m.steers == w.steers && m.centre.distance(w.centre) < 0.05)
+            });
+        if !wheels.is_empty() && !same {
+            self.spring_wheels = Some(wheels.into());
+        }
+        self
+    }
+
     pub fn tuned(mut self, tuning: Option<VehicleTuning>) -> Self {
         let Some(t) = tuning else {
             return self;
@@ -1922,6 +1975,7 @@ mod tests {
             damage: None,
             chassis: None,
             shapes: Default::default(),
+            spring_wheels: None,
             material: None,
             path_unseen: Default::default(),
             turret_shapes: Default::default(),
