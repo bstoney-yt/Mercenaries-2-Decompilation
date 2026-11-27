@@ -694,8 +694,9 @@ pub struct DeathExit {
 /// The satellite-guided bomb's blasts, from the template database's
 /// laser-guided bomb ("Explosion (Airstike Bomb)" 80008e3f, its frag
 /// "Explosion (Airstrike Frag)" 8000a3df, and its final strike 8000af7d
-/// 2 s on): reach (metres) and damage at the heart, falling off to
-/// nothing at the edge (the falloff is invented). The frag is stopped by
+/// 2 s on): reach (metres) and damage at the heart, falling off as the
+/// 360 falls a blast off ([`m2_engine::durability::blast_damage`]) to
+/// their `MinDamage` (not read for these: taken as 0). The frag is stopped by
 /// what stands between: the radio's word is to get behind cover.
 pub const BOMB: (f32, f32) = (20.0, 100.0);
 pub const BOMB_FRAG: (f32, f32) = (50.0, 300.0);
@@ -7672,12 +7673,20 @@ impl Combat {
             of: Some(Blasted::Named(fx::BOMB)),
         });
         let hers = self.hero_damage;
-        self.harm(f, at, BOMB, false, (hers.explosion_large, "ExplosionLarge"));
+        self.harm(
+            f,
+            at,
+            BOMB,
+            0.0,
+            false,
+            (hers.explosion_large, "ExplosionLarge"),
+        );
         self.show_fx(fx::BOMB, at);
         self.harm(
             f,
             at + Vec3::Y,
             BOMB_FRAG,
+            0.0,
             true,
             (hers.bullet_large, "BulletLarge"),
         );
@@ -7739,6 +7748,7 @@ impl Combat {
         at: Vec3,
         radius: f32,
         damage: f32,
+        least: f32,
         template: Option<u32>,
     ) {
         let of = template.map(Blasted::Id);
@@ -7752,7 +7762,7 @@ impl Combat {
         });
         // The strikes' ordnance keys aren't read yet: an `Explosion`.
         let hers = self.hero_damage.explosion;
-        self.harm(f, at, (radius, damage), false, (hers, "Explosion"));
+        self.harm(f, at, (radius, damage), least, false, (hers, "Explosion"));
         self.show_fx(
             if radius >= BOMB.0 {
                 fx::BOMB
@@ -7795,6 +7805,7 @@ impl Combat {
         at: Vec3,
         radius: f32,
         damage: f32,
+        least: f32,
         template: u32,
     ) {
         self.sounds.push(Sound::Frag {
@@ -7803,7 +7814,7 @@ impl Combat {
         });
         // Frag, as the satellite bomb's: a `BulletLarge`.
         let hers = self.hero_damage.bullet_large;
-        self.harm(f, at, (radius, damage), false, (hers, "BulletLarge"));
+        self.harm(f, at, (radius, damage), least, false, (hers, "BulletLarge"));
     }
 
     /// The bomb's final strike at `at`, after it lands.
@@ -7814,7 +7825,7 @@ impl Combat {
             of: Some(Blasted::Named(fx::FINAL)),
         });
         let hers = self.hero_damage.explosion_large;
-        self.harm(f, at, BOMB_FINAL, false, (hers, "ExplosionLarge"));
+        self.harm(f, at, BOMB_FINAL, 0.0, false, (hers, "ExplosionLarge"));
         self.show_fx(fx::FINAL, at);
         self.effect(
             Effect::Fire {
@@ -7839,9 +7850,13 @@ impl Combat {
         f: &mut Field<'_>,
         at: Vec3,
         (radius, damage): (f32, f32),
+        least: f32,
         cover: bool,
         (hers, key): (f32, &str),
     ) {
+        // The 360's falloff (0x82291640): `max(least, damage x (1 - d /
+        // radius))` within the reach, `least` the template's `MinDamage`.
+        let at_d = |d: f32| m2_engine::durability::blast_damage(damage, least, radius, d);
         let key = Some(m2_assets::name_hash(key));
         let physics: &Physics = f.physics;
         let shielded = |to: Vec3| {
@@ -7859,16 +7874,15 @@ impl Combat {
             if d >= radius || shielded(chest) {
                 continue;
             }
-            let near = 1.0 - d / radius;
             let own = self.on_person(&f.people.npcs[j], key);
             self.launch_person(&mut f.people.npcs, j, at, (radius, UNTEMPLATED_FORCE));
             let n = &mut f.people.npcs[j];
-            killed |= n.hurt_by_blast(damage * near * own, Vec3::ZERO, key, at) && n.soldier;
+            killed |= n.hurt_by_blast(at_d(d) * own, Vec3::ZERO, key, at) && n.soldier;
         }
         let her = (f.player.driving.is_none() && f.player.landed)
             .then(|| f.player.character.position + Vec3::Y)
             .filter(|&p| p.distance(at) < radius && !shielded(p))
-            .map(|p| damage * (1.0 - p.distance(at) / radius) * hers);
+            .map(|p| at_d(p.distance(at)) * hers);
         let mut wrecking = Vec::new();
         for (i, v) in f.vehicles.iter().enumerate() {
             let Some(body) = v.id.and_then(|id| physics.vehicle_transform(id)) else {
@@ -7877,12 +7891,11 @@ impl Combat {
             let (lo, hi) = v.spec.bounds;
             let centre = body.transform_point3((lo + hi) * 0.5);
             let d = centre.distance(at);
-            let near = 1.0 - d / radius;
             if d < radius && !shielded(centre) {
-                wrecking.push((i, centre, near));
+                wrecking.push((i, centre, 1.0 - d / radius, d));
             }
         }
-        for (i, centre, near) in wrecking {
+        for (i, centre, near, d) in wrecking {
             let v = &mut f.vehicles[i];
             let Some(id) = v.id else { continue };
             if v.wrecked {
@@ -7890,9 +7903,9 @@ impl Combat {
             }
             let cell = blast_cell(self.damage_table.as_ref(), v, key);
             if let Some(body) = f.physics.vehicle_transform(id) {
-                v.blast_parts(body, at, radius, |p| damage * (1.0 - p / radius) * cell);
+                v.blast_parts(body, at, radius, |p| at_d(p) * cell);
             }
-            self.hurt_vehicle(f.physics, v, i, damage * near * cell);
+            self.hurt_vehicle(f.physics, v, i, at_d(d) * cell);
             if v.wrecked {
                 let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
                 let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass * near.max(0.3) * fudge(v);
@@ -7900,13 +7913,7 @@ impl Combat {
                     .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
             }
         }
-        self.blast_explosives(
-            f.explosives,
-            at,
-            radius,
-            |d| damage * (1.0 - d / radius),
-            key,
-        );
+        self.blast_explosives(f.explosives, at, radius, at_d, key);
         if let Some(d) = her {
             // For checking what hurts her (autoplay logs).
             eprintln!("blast: at {at:.1}, she takes {d:.0}");
@@ -9779,6 +9786,37 @@ mod tests {
         vehicles[0].spec.kind = "car".into();
         vehicles[0].spec.tuning.gun = None;
         assert_eq!(vehicles[0].rounds(), None);
+    }
+
+    /// An air strike's frag falls off as the 360 falls a blast off
+    /// (0x82291640): near its edge she takes its template's `MinDamage`,
+    /// not the little the falloff leaves.
+    #[test]
+    fn a_blast_near_its_edge_does_its_least() {
+        let taken = |least: f32| {
+            let mut physics = Physics::new();
+            let mut player = Player::new(9.0, 0.0, 0.0, None);
+            player.landed = true;
+            let mut people = People::default();
+            let arsenal = Arsenal::default();
+            let mut vehicles: Vec<ParkedVehicle> = Vec::new();
+            let mut combat = Combat::default();
+            let mut field = Field {
+                physics: &mut physics,
+                player: &mut player,
+                people: &mut people,
+                vehicles: &mut vehicles,
+                arsenal: &arsenal,
+                explosives: &mut [],
+            };
+            combat.harm_at(&mut field, Vec3::new(0.0, 1.0, 0.0), 10.0, 100.0, least, 0);
+            combat.tally.taken_blasts
+        };
+        let none = taken(0.0);
+        let least = taken(30.0);
+        assert!(none > 0.0);
+        // 9 m of 10: a tenth of 100 against the least 30.
+        assert!((least / none - 3.0).abs() < 0.05, "{none} vs {least}");
     }
 
     /// A round with no blast (a chain cannon's: no `Explosive` reached
