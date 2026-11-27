@@ -1,0 +1,42 @@
+# #742 (Jennifer): AllCon003 start (263, 153) -> M151 0x133BA2 (1044.6, 37.9, 168.0), ~780 m east, +72 m; slope + driverless.
+wait 25
+pokestr 83133F98 AllCon003
+poke 82B7C953 0
+tap_until start Continue_without 90
+wait 2
+press up 0.3
+wait 1
+press a 0.3
+until NOTICE 30 2
+press a 0.3
+until new_game 60 2
+press a 0.3
+until Mattias 30 2
+press down 0.3
+wait 2
+ocr charsel
+press a 0.3
+wait 3
+ocr card
+press a 0.3
+tap_until a Objective 150
+trackhero
+mark AllCon003 start
+ocr start
+walkcam 400 155 6 120 ls
+walkcam 550 160 6 120 ls
+walkcam 700 165 6 120 ls
+walkcam 850 166 6 120 ls
+walkcam 1000 168 6 120 ls
+walkcam 1040 168 4 60 ls
+ocr atm151
+enter 1044.6 168.0 3.0 8
+ocr inm151
+mark slope
+wait 20
+mark drive
+measure a 6
+mark bail
+press y 0.3
+wait 10
+mark done

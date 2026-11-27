@@ -46,6 +46,11 @@ Route files are one step per line (`#` comments):
     nearlog start <x> <z> <r> <name> | stop  log what was within r m of a point (vehicle + cargo)
     wreckwith <health|-> <drive s> [<car health, 0 = leave>]  wreck her vehicle with her in it (health pokes); log her health
     killnear <r> <x,y,z;...>       set health 0 near the points (runtime data)
+    fight3 <s> <cx> <cz> <r> [weak]  fight characters near a point at their live positions
+    poslog start <name> <r> | stop   her + characters near her at ~25 Hz
+    shootat <x> <z> <s> [weaken=<h>]  shoot the object there (optionally weakened first)
+    camlog start <name> [<hex offs>] | stop  active camera, vtable and fields at ~50 Hz
+    ram <s> <r>                    drive her car at the nearest living character
     poke <hex addr> <byte>         set a guest data byte (runtime flag only)
     trackhero                      follow the player's character by the 360 code's tables (xmem.Hero)
     trackfoot <x> <y> <z>|here     as track, for the hero on foot (here: where track was)
@@ -275,6 +280,9 @@ def run(args) -> int:
     tracker = None
     airlog_state: dict = {}
     nl_state: dict = {}
+    pl_state: dict = {}
+    cl_state: dict = {}
+    remembered_veh = None
 
     def shot(name: str) -> Path | None:
         nonlocal n
@@ -823,7 +831,7 @@ def run(args) -> int:
                 # the on-foot camera object (vtable 0x820F0290) and its fields, logged per sample
                 fset = next((t[7:] for t in w if t.startswith("fields=")), "foot")
                 w = [t for t in w if not t.startswith("fields=")]
-                if fset == "car":
+                if fset in ("car", "tank"):
                     # player 0's active camera (camera manager table 0x83457050, stride 0x620)
                     ab = gs.read(0x83457050, 4)
                     cobj = struct.unpack(">I", ab)[0] if ab else None
@@ -839,6 +847,8 @@ def run(args) -> int:
                                                                 0x750, 0x770, 0x9E0, 0x9E4, 0x648, 0x658, 0x65C, 0x664, 0x670)) + (("aim", 0x7CD, "b"),)
                 if fset == "car":
                     F_OFF = F_CAR
+                elif fset == "tank":  # CameraTank (vtable 0x820F0338): eased stick +0x620/+0x638, yaw/pitch speeds +0x644/+0x648
+                    F_OFF = tuple((f"o{off:03X}", off, "f") for off in (0x620, 0x624, 0x638, 0x63C, 0x644, 0x648, 0x600, 0x604, 0x610, 0x614))
 
                 def fields():
                     out = []
@@ -1283,6 +1293,366 @@ def run(args) -> int:
                         n += 1
                         say(f"killnear: {k:#x} at ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}) health {cur:.1f}/{mx:.0f} -> 0")
                 say(f"killnear: {n} set")
+            elif op == "fight3":
+                # fight3 <secs> <cx> <cz> <r> [weak] [standoff=<m>]: fight the living
+                # characters (health pool 0x83656558 keys 0x4000xxxx, health > 0) whose
+                # state records lie within <r> m of (cx, cz), nearest to her first, at
+                # their live positions. "weak": their health is set to 0.01 when first
+                # seen (runtime data), so any hit kills. Logs each kill (health 0).
+                import math
+                import xmem
+
+                secs, cx, cz, rr = float(w[1]), float(w[2]), float(w[3]), float(w[4])
+                weak = "weak" in w
+                stand_off = next((float(t[9:]) for t in w if t.startswith("standoff=")), 25.0)
+                # grenade=<m>: within that, throw an explosive (LB) every 5 s when lined up
+                gren = next((float(t[8:]) for t in w if t.startswith("grenade=")), 0.0)
+                last_gren, n_gren = 0.0, 0
+                g = xmem.Guest(p.pid)
+                hh = xmem.Hero(g)
+                cam = xmem.Camera(g)
+                hero = hh.character()
+                weakened, killed = set(), set()
+                end, last_say, last_scan, tgts = time.time() + secs, 0.0, 0.0, []
+                while time.time() < end:
+                    now = time.time()
+                    hp = hh.update()
+                    if hp is None:
+                        time.sleep(0.1)
+                        continue
+                    if now - last_scan > 0.5:
+                        last_scan = now
+                        tgts = []
+                        for k_, a_ in xmem.map_entries(g, 0x83656558).items():
+                            if k_ >> 28 != 4 or hero - 1 <= k_ <= hero + 8:
+                                continue
+                            mx_, cur_ = struct.unpack(">2f", g.read(a_, 8))
+                            if mx_ != 100.0:
+                                continue
+                            sa = hh.state_addr(k_)
+                            if not sa:
+                                continue
+                            pos_ = struct.unpack(">3f", g.read(sa, 12))
+                            if math.hypot(pos_[0] - cx, pos_[2] - cz) > rr or math.dist(pos_, hp) < 2.0:
+                                continue  # (records at her own spot are hers: drops5 locked onto one)
+                            if cur_ <= 0.0:
+                                if k_ in weakened and k_ not in killed:
+                                    killed.add(k_)
+                                    say(f"fight3: {k_:#x} down at ({pos_[0]:.1f}, {pos_[1]:.1f}, {pos_[2]:.1f}) ({len(killed)})")
+                                continue
+                            if weak and k_ not in weakened:
+                                g.write(a_ + 4, struct.pack(">f", 0.01))
+                            weakened.add(k_)
+                            tgts.append((math.dist(pos_, hp), k_, sa))
+                        tgts.sort()
+                        if not tgts:
+                            say(f"fight3: none left near ({cx:.0f}, {cz:.0f}); {len(killed)} down")
+                            break
+                    d0, tk, sa = tgts[0]
+                    tp = struct.unpack(">3f", g.read(sa, 12))
+                    d = math.hypot(tp[0] - hp[0], tp[2] - hp[2])
+                    yv, pv, cp = cam.yaw(), cam.pitch(), cam.pos()
+                    fire, ly, rx, ry = 0, 0.0, 0.0, 0.0
+                    if yv is not None and pv is not None and cp is not None:
+                        bearing = math.degrees(math.atan2(tp[0] - cp[0], tp[2] - cp[2]))
+                        err = (bearing - yv + 180) % 360 - 180
+                        rx = -cam_stick(err)
+                        hd = max(1.0, math.hypot(tp[0] - cp[0], tp[2] - cp[2]))
+                        perr = math.degrees(math.atan2(tp[1] + 1.0 - cp[1], hd)) - pv
+                        ry = cam_stick(perr)
+                        if d > stand_off:
+                            ly = 1.0
+                        elif abs(err) < 3 and abs(perr) < 3 and int(now * 2.5) % 2 == 0:
+                            fire = 255
+                        if now - last_say > 1.0:
+                            last_say = now
+                            say(f"fight3: {tk:#x} at {d:.0f} m, yaw err {err:+.0f}, pitch err {perr:+.0f}, {'advance' if ly else ('FIRE' if fire else 'aim')}; {len(tgts)} left, {len(killed)} down")
+                    bb = 0
+                    # stalled while advancing (drops6 stood 10 min at 20 m): jump (A) and sidestep for 0.6 s
+                    if ly > 0:
+                        st3 = getattr(hh, "_f3", None)
+                        if st3 is None or now - st3[0] > 2.0:
+                            if st3 is not None and math.dist(st3[1], hp) < 0.5:
+                                hh._f3_jump = now
+                            hh._f3 = (now, hp)
+                        if now - getattr(hh, "_f3_jump", 0.0) < 0.6:
+                            bb |= BTN["a"]
+                            lx_side = 1.0 if int(now) % 2 else -1.0
+                            apply(bb, 0, 0, lx_side, ly, rx, ry)
+                            time.sleep(0.04)
+                            continue
+                    if gren and yv is not None and d <= gren and abs(err) < 8 and now - last_gren > 5.0:
+                        last_gren, n_gren = now, n_gren + 1
+                        say(f"fight3: grenade {n_gren} at {tk:#x}, {d:.0f} m")
+                    if now - last_gren < 0.3:
+                        bb, fire = BTN["lb"], 0
+                    apply(bb, 0, fire, 0.0, ly, rx, ry)
+                    time.sleep(0.04)
+                apply()
+            elif op == "poslog":
+                # poslog start <name> <r> | stop: in the background at ~25 Hz, log
+                # her state-table record and every character record (health pool
+                # keys 0x4000xxxx) within <r> m of her at the start, to <name>.csv.
+                import csv, math, threading
+                import xmem
+
+                if w[1] == "stop":
+                    pl_state["stop"].set()
+                    pl_state["thread"].join(3)
+                    say("poslog: stopped")
+                else:
+                    name, rr = w[2], float(w[3])
+                    gp = xmem.Guest(p.pid)
+                    hp_ = xmem.Hero(gp)
+                    here, hero = hp_.update(), hp_.character()
+                    picks = [hero]
+                    for k_ in xmem.map_entries(gp, 0x83656558):
+                        if k_ >> 28 == 4 and not hero - 1 <= k_ <= hero + 8:
+                            sa = hp_.state_addr(k_)
+                            if sa and math.dist(struct.unpack(">3f", gp.read(sa, 12)), here) <= rr:
+                                picks.append(k_)
+                    say(f"poslog {name}: her + {len(picks) - 1} characters within {rr:.0f} m")
+                    ev = threading.Event()
+
+                    def ploop(picks=picks, name=name, ev=ev):
+                        with open(Path(args.out) / f"{name}.csv", "w", newline="") as fh:
+                            wr = csv.writer(fh)
+                            wr.writerow(["t", "handle", "x", "y", "z", "health", "stance", "action", "mode"])
+                            hm_ = xmem.map_entries(gp, 0x83656558)
+                            while not ev.is_set():
+                                tt = time.time() - t0
+                                try:  # bulk lookups once per pass (per-bucket probing stalled with many people)
+                                    sidx = hp_.table_index(hp_.STATES)
+                                    aidx = hp_.table_index(0x83657B94)
+                                except Exception:  # noqa: BLE001
+                                    sidx, aidx = {}, {}
+                                for k_ in picks:
+                                    sa = sidx.get(k_)
+                                    if not sa:
+                                        continue
+                                    b = gp.read(sa, 12)
+                                    a_ = hm_.get(k_)
+                                    hb_ = gp.read(a_ + 4, 4) if a_ else None
+                                    hv = struct.unpack(">f", hb_)[0] if hb_ and len(hb_) == 4 else float("nan")
+                                    try:
+                                        st_ = hp_.anim_state(k_, aidx) or (0, 0, 0)
+                                    except Exception:  # noqa: BLE001
+                                        st_ = (0, 0, 0)
+                                    if b:
+                                        wr.writerow([f"{tt:.3f}", f"{k_:#x}", *(f"{c:.3f}" for c in struct.unpack(">3f", b)), f"{hv:.2f}",
+                                                     *(f"{x:#010x}" for x in st_)])
+                                fh.flush()
+                                ev.wait(0.04)
+
+                    th_p = threading.Thread(target=ploop, daemon=True)
+                    th_p.start()
+                    pl_state.update(stop=ev, thread=th_p)
+            elif op == "shootat":
+                # shootat <x> <z> <secs> [weaken=<health>]: the object whose state record
+                # is nearest (x, z) (within 3 m, not hers) is set to <health> (runtime
+                # data, health pool +4) and shot (RT) with the camera aimed at its
+                # record + 0.5 m until its health is 0 or <secs> pass.
+                import math
+                import xmem
+
+                wv = next((float(t[7:]) for t in w if t.startswith("weaken=")), None)
+                g = xmem.Guest(p.pid)
+                hh = xmem.Hero(g)
+                cam = xmem.Camera(g)
+                hero = hh.character()
+                best = None
+                if w[1] == "veh":  # shootat veh <secs>: the vehicle `rememberveh` noted
+                    k_ = remembered_veh
+                    a_ = xmem.map_entries(g, 0x83656558).get(k_) if k_ else None
+                    sa = hh.state_addr(k_) if k_ else None
+                    pos_ = struct.unpack(">3f", g.read(sa, 12)) if sa else (0.0, 0.0, 0.0)
+                    tx, tz, secs = pos_[0], pos_[2], float(w[2])
+                    if a_ and sa:
+                        best = (0.0, k_, a_, sa)
+                else:
+                    tx, tz, secs = float(w[1]), float(w[2]), float(w[3])
+                for k_, a_ in (xmem.map_entries(g, 0x83656558).items() if best is None else ()):
+                    if hero - 1 <= k_ <= hero + 8:
+                        continue
+                    sa = hh.state_addr(k_)
+                    if sa:
+                        pos_ = struct.unpack(">3f", g.read(sa, 12))
+                        d_ = math.hypot(pos_[0] - tx, pos_[2] - tz)
+                        if d_ < 3 and (best is None or d_ < best[0]):
+                            best = (d_, k_, a_, sa)
+                if best is None:
+                    say("shootat: nothing there")
+                else:
+                    _, tk, ta, tsa = best
+                    if wv is not None:
+                        g.write(ta + 4, struct.pack(">f", wv))
+                    say(f"shootat: {tk:#x}, health {struct.unpack('>2f', g.read(ta, 8))}")
+                    end = time.time() + secs
+                    while time.time() < end:
+                        cur_ = struct.unpack(">f", g.read(ta + 4, 4))[0]
+                        if cur_ <= 0:
+                            say(f"shootat: {tk:#x} health 0 at +{secs - (end - time.time()):.1f} s")
+                            break
+                        tp = struct.unpack(">3f", g.read(tsa, 12))
+                        yv, pv, cp = cam.yaw(), cam.pitch(), cam.pos()
+                        if yv is None or cp is None:
+                            time.sleep(0.05)
+                            continue
+                        err = (math.degrees(math.atan2(tp[0] - cp[0], tp[2] - cp[2])) - yv + 180) % 360 - 180
+                        perr = math.degrees(math.atan2(tp[1] + 0.5 - cp[1], max(0.5, math.hypot(tp[0] - cp[0], tp[2] - cp[2])))) - pv
+                        fire = 255 if abs(err) < 4 and abs(perr) < 4 else 0
+                        apply(0, 0, fire, 0.0, 0.0, -cam_stick(err), cam_stick(perr))
+                        time.sleep(0.04)
+                    apply()
+            elif op == "camlog":
+                # camlog start <name> [<hex offsets...>] | stop: in the background at ~50 Hz,
+                # player 0's active camera (*(u32*)0x83457050), its vtable, the given
+                # fields (floats; a byte if the offset is odd), the camera block's yaw and
+                # pitch and the frame dt 0x82B7C730, to <name>.csv.
+                import csv, threading
+                import xmem
+
+                if w[1] == "stop":
+                    cl_state["stop"].set()
+                    cl_state["thread"].join(3)
+                    say("camlog: stopped")
+                else:
+                    name = w[2]
+                    offs = [int(x, 16) for x in w[3:]]
+                    gc = xmem.Guest(p.pid)
+                    camc = xmem.Camera(gc)
+                    ev = threading.Event()
+
+                    def cloop(name=name, offs=offs, ev=ev):
+                        with open(Path(args.out) / f"{name}.csv", "w", newline="") as fh:
+                            wr = csv.writer(fh)
+                            wr.writerow(["t", "cam", "vtable", *(f"o{o:03X}" for o in offs), "yaw", "pitch", "dt"])
+                            while not ev.is_set():
+                                b = gc.read(0x83457050, 4)
+                                c = struct.unpack(">I", b)[0] if b else 0
+                                vb = gc.read(c, 4) if c else None
+                                vals = []
+                                for o in offs:
+                                    if o % 2:
+                                        x = gc.read(c + o, 1) if c else None
+                                        vals.append(x[0] if x else "")
+                                    else:
+                                        x = gc.read(c + o, 4) if c else None
+                                        vals.append(f"{struct.unpack('>f', x)[0]:.5g}" if x else "")
+                                db = gc.read(0x82B7C730, 4)
+                                wr.writerow([f"{time.time() - t0:.3f}", f"{c:#x}", vb and f"{struct.unpack('>I', vb)[0]:#x}", *vals,
+                                             f"{camc.yaw() or 0:.3f}", f"{camc.pitch() or 0:.3f}", f"{struct.unpack('>f', db)[0]:.5f}" if db else ""])
+                                fh.flush()
+                                ev.wait(0.02)
+
+                    th_c = threading.Thread(target=cloop, daemon=True)
+                    th_c.start()
+                    cl_state.update(stop=ev, thread=th_c)
+                    say(f"camlog {name}: started")
+            elif op == "ram":
+                # ram <secs> <r>: in a car, drive (A) at the nearest living character
+                # (health pool key 0x4000xxxx, health > 0, within <r> m, not hers) by
+                # its live position; steer from her travel direction (stick right lowers
+                # the bearing, as for the boat). Stops when its health drops.
+                import math
+                import xmem
+
+                secs, rr = float(w[1]), float(w[2])
+                g = xmem.Guest(p.pid)
+                hh = xmem.Hero(g)
+                hero = hh.character()
+                here = hh.update()
+                best = None
+                for k_, a_ in xmem.map_entries(g, 0x83656558).items():
+                    if k_ >> 28 != 4 or hero - 1 <= k_ <= hero + 8:
+                        continue
+                    mx_, cur_ = struct.unpack(">2f", g.read(a_, 8))
+                    sa = hh.state_addr(k_)
+                    if mx_ != 100.0 or cur_ <= 0 or not sa:
+                        continue
+                    pos_ = struct.unpack(">3f", g.read(sa, 12))
+                    d_ = math.dist(pos_, here)
+                    if 3 < d_ <= rr and (best is None or d_ < best[0]):
+                        best = (d_, k_, a_, sa, cur_)
+                if best is None:
+                    say("ram: nobody in reach")
+                else:
+                    _, tk, ta, tsa, h0 = best
+                    say(f"ram: {tk:#x} at {best[0]:.0f} m, health {h0:.0f}")
+                    end, last_say, trail = time.time() + secs, 0.0, []
+                    while time.time() < end:
+                        hp_ = hh.update()
+                        tp = struct.unpack(">3f", g.read(tsa, 12))
+                        cur_ = struct.unpack(">f", g.read(ta + 4, 4))[0]
+                        if cur_ < h0 - 0.5:
+                            say(f"ram: hit {tk:#x}: health {h0:.0f} -> {cur_:.1f}")
+                            break
+                        now = time.time()
+                        trail = [(t_, q_) for t_, q_ in trail if now - t_ < 0.5] + [(now, hp_)]
+                        lx = 0.0
+                        want = math.degrees(math.atan2(tp[0] - hp_[0], tp[2] - hp_[2]))
+                        if len(trail) >= 2 and math.dist(trail[0][1], trail[-1][1]) > 0.5:
+                            (_, a0), (_, a1) = trail[0], trail[-1]
+                            head = math.degrees(math.atan2(a1[0] - a0[0], a1[2] - a0[2]))
+                        else:
+                            head = hh.facing() or want  # not moving yet (npchit2 stalled): the car's own facing
+                        err = (want - head + 180) % 360 - 180
+                        lx = max(-1.0, min(1.0, -err / 30.0))
+                        stuck_t = getattr(hh, "_ram_stuck", None)
+                        if len(trail) >= 2 and math.dist(trail[0][1], trail[-1][1]) < 0.3:
+                            if stuck_t is None:
+                                hh._ram_stuck = now
+                            elif now - stuck_t > 2.0:  # blocked: back off 1.5 s with the wheel the other way
+                                say("ram: stuck, backing off")
+                                apply(BTN["x"], 0, 0, -lx or 1.0, 0.0, 0.0, 0.0)
+                                time.sleep(1.5)
+                                hh._ram_stuck = None
+                                continue
+                        else:
+                            hh._ram_stuck = None
+                        apply(BTN["a"], 0, 0, lx, 0.0, 0.0, 0.0)
+                        if now - last_say > 1.0:
+                            last_say = now
+                            say(f"ram: {math.dist(tp, hp_):.0f} m, stick {lx:+.2f}")
+                        time.sleep(0.04)
+                    apply()
+            elif op == "rememberveh":
+                # rememberveh: note the handle of the vehicle she sits in (the health-pool record within 1 m of her,
+                # not hers), for `shootat veh`.
+                import math
+                import xmem
+
+                g = xmem.Guest(p.pid)
+                hh = xmem.Hero(g)
+                here, hero = hh.update(), hh.character()
+                remembered_veh = None
+                for k_ in xmem.map_entries(g, 0x83656558):
+                    if hero - 1 <= k_ <= hero + 8:
+                        continue
+                    sa = hh.state_addr(k_)
+                    if sa and math.dist(struct.unpack(">3f", g.read(sa, 12)), here) < 1.0:
+                        remembered_veh = k_
+                        break
+                say(f"rememberveh: {remembered_veh and hex(remembered_veh)}")
+            elif op == "pitchto":
+                # pitchto <deg> [<timeout>]: bring the camera's pitch to <deg> with stepped right-stick y (dead zone ~0.5)
+                import xmem
+
+                cam = xmem.Camera(xmem.Guest(p.pid))
+                want = float(w[1])
+                end = time.time() + (float(w[2]) if len(w) > 2 else 8.0)
+                while time.time() < end:
+                    pv = cam.pitch()
+                    if pv is None:
+                        break
+                    err = want - pv
+                    if abs(err) < 1.0:
+                        break
+                    apply(0, 0, 0, 0.0, 0.0, 0.0, (1.0 if err > 0 else -1.0) * (1.0 if abs(err) > 8 else 0.62))
+                    time.sleep(0.01)
+                apply()
+                time.sleep(0.3)
+                say(f"pitchto: camera pitch {cam.pitch():.2f} (wanted {want:.1f})")
             elif op == "poke":
                 # poke <guest hex address> <byte>: set one guest data byte, a
                 # runtime flag (never code, the XEX or files). E.g. 0x83134382 =
@@ -1292,9 +1662,13 @@ def run(args) -> int:
                 # the hero spawns.
                 import xmem
 
-                g = xmem.Guest(p.pid)
                 addr, val = int(w[1], 16), int(w[2])
-                ok = g.write(addr, bytes([val]))
+                for _ in range(60):
+                    g = xmem.Guest(p.pid)
+                    ok = g.write(addr, bytes([val])) and g.read(addr, 1) == bytes([val])
+                    if ok:
+                        break
+                    time.sleep(1.0)
                 say(f"poke {addr:#x} = {val}: {'ok' if ok else 'FAILED'}, reads back {g.read(addr, 1)}")
             elif op == "pokestr":
                 # pokestr <guest hex address> <text>: write a NUL-terminated string
@@ -1302,9 +1676,13 @@ def run(args) -> int:
                 # 0x83133F98, 64 bytes, as multiplayer.ini would set it at boot).
                 import xmem
 
-                g = xmem.Guest(p.pid)
                 addr, text = int(w[1], 16), w[2]
-                ok = g.write(addr, text.encode("ascii")[:63] + b"\x00")
+                for _ in range(60):  # guest memory may not be mapped yet early in boot
+                    g = xmem.Guest(p.pid)
+                    ok = g.write(addr, text.encode("ascii")[:63] + bytes(1)) and g.read(addr, len(text)) == text.encode("ascii")
+                    if ok:
+                        break
+                    time.sleep(1.0)
                 say(f"pokestr {addr:#x} = {text!r}: {'ok' if ok else 'FAILED'}, reads back {g.read(addr, len(text) + 1)}")
             elif op == "trackhero":
                 # trackhero: follow the local player's character through the

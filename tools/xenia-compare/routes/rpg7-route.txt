@@ -1,0 +1,35 @@
+# rpg7 (#719, Jennifer + GodMode): PmcCon004; chained 130 m hops (hopchain2, water-tolerant settle) to 0xB4E55; fight3 weak; walk onto the drop.
+wait 25
+pokestr 83133F98 PmcCon004
+poke 82B7C953 0
+poke 83134382 1
+tap_until start Continue_without 90
+wait 2
+press up 0.3
+wait 1
+press a 0.3
+until NOTICE 30 2
+press a 0.3
+until new_game 60 2
+press a 0.3
+until Mattias 30 2
+press down 0.3
+wait 2
+ocr charsel
+press a 0.3
+wait 3
+ocr card
+press a 0.3
+tap_until a Steal 150
+trackhero
+mark PmcCon004 start
+walkcam -791 1130 3 15
+wait 900
+ocr afterpoke
+fight3 90 -3270 -2621 25 weak
+wait 3
+walkcam -3270 -2621 1.0 20
+press b 0.3
+wait 2
+ocr after
+mark done

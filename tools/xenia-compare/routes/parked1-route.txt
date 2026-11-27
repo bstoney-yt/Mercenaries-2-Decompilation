@@ -1,0 +1,49 @@
+# parked1 + hold1 (Jennifer + GodMode), OilCon020 crates walk: (a) Phoenix 0x10D5D8 (~3037, -7.03, -641) from first load, stand ~40 m off 30 s; (b) El Grande 0xFA056 (2756.2, -33.77, -422.7), parked tilted ~9-10 deg: 60 s untouched, bump 3 s, 30 s, enter+exit, 30 s.
+wait 25
+pokestr 83133F98 OilCon020
+poke 82B7C953 0
+poke 83134382 1                           # GodMode (runtime flag, before the hero spawns)
+tap_until start Continue_without 90
+wait 2
+press up 0.3
+wait 1
+press a 0.3
+until NOTICE 30 2
+press a 0.3
+until new_game 60 2
+press a 0.3
+until Mattias 30 2
+press down 0.3
+wait 2
+ocr charsel
+press a 0.3
+wait 3
+ocr card
+press a 0.3
+tap_until a Steal 150
+trackhero
+mark OilCon020 start
+walkcam 2700 -1070 6 90 ls
+walkcam 2762 -1121 6 90 ls
+walkcam 2860 -1050 6 90 ls
+walkcam 2954 -972 6 90 ls
+walkcam 2949 -926 6 90 ls
+walkcam 2943 -897 6 90 ls
+walkcam 2941 -692 6 90 ls
+walkcam 3000 -660 4 90 ls
+mark holdphoenix
+wait 30
+walkcam 2850 -570 6 90 ls
+walkcam 2761 -455 6 90 ls
+walkcam 2745 -420 2 60 ls
+mark parked_untouched
+wait 60
+mark bump
+walkcam 2756.2 -422.7 0.3 3
+wait 30
+mark enterexit
+enter 2756.2 -422.7 3.0 8
+wait 2
+press y 0.3
+wait 30
+mark done

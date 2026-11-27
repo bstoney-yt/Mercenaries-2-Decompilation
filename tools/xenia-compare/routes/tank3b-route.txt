@@ -1,0 +1,32 @@
+# tank3b (Jennifer + GodMode): ChiCon001; her proxy poked next to M1A2 0xB4BC2, then the tank lifted +10 m (tankpoke.py); fall logged per step.
+wait 25
+pokestr 83133F98 ChiCon001
+poke 82B7C953 0
+tap_until start Continue_without 90
+wait 2
+press up 0.3
+wait 1
+press a 0.3
+until NOTICE 30 2
+press a 0.3
+until new_game 60 2
+press a 0.3
+until Mattias 30 2
+press down 0.3
+wait 2
+ocr charsel
+press a 0.3
+wait 3
+ocr card
+press a 0.3
+tap_until a Steal 150
+trackhero
+mark ChiCon001 start
+camlog start tank3cam
+walkcam -2382 1120 3 15
+wait 30
+ocr afterpoke
+mark nearpoke
+wait 100
+ocr after
+mark done
