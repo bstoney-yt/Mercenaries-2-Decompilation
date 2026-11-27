@@ -30,13 +30,26 @@
 //!   the next waits `10 + rand x 15` s; neither clear: decide.
 //! - 16 (0x822C7CA0/7CC0): straight to its return.
 //!
-//! Not yet (rounds c and d): the cover states (3 to 9, 12, 17), the
-//! grenade (14), state 13. Their ids are kept; the states reached only
-//! through them are unreachable until then, and fall back to deciding.
+//! - 3 to 9 and 17, cover (0x822C56E0 to 0x822C6728, 0x822C62E0/6330/
+//!   6398): asked for in deciding and fighting standing (0x822C43B8; the
+//!   next ask 5 s after an answer). A granted spot is gone to, settled at
+//!   for 2 s, then used by its `CoverAnimation`: SideStep leans out, fires
+//!   a burst, leans back; Dive dives (the spot bad for 20 s) and fights
+//!   standing; Popup ducks 3 s and comes up for a burst. A spot lost: he
+//!   decides again, free to ask at once.
+//! - 14, grenade (0x822C7208/72D0/7348): the gate (0x822C6B78) in
+//!   fighting standing, leaning out and popping up; the throw; his next
+//!   15 to 25 s off, the shared pause 0 to 7 s as it starts and 5 to 15 s
+//!   after.
+//!
+//! Not ported: `HumanTakeCover`'s entry (12) and the ordered action (13),
+//! which `HumanCombat` does not reach; they fall back to deciding.
 //!
 //! Inferred: the third stance (hash 0x5A86B86B) is lying; the side
 //! probes' axis (0x82855ED8) is his right. The callout's speech and the
-//! side-step actions' clips are the caller's to play.
+//! side-step actions' clips and the throw are the caller's to play.
+//! Invented: the cover clips' times ([`LEAN`], [`DIVING`]), as the
+//! spot's clips are not wired.
 
 use m2_math::glam::{Vec2, Vec3};
 
@@ -132,6 +145,70 @@ pub struct Sense {
     /// The side-step's probes, right and left, once asked for
     /// ([`Mover::probing`]): whether each came back clear.
     pub sides: Option<[bool; 2]>,
+    /// The spot the cover service granted him and still holds for him
+    /// (the block's +0x10 with +0x5C bit 0x80).
+    pub spot: Option<Spot>,
+    /// His cover ask is still out (+0x124 bit 0x8000000).
+    pub asking: bool,
+    /// He may ask for cover (mind +0x7F0 bit 4; inferred).
+    pub may_cover: bool,
+    /// A burst is under way (mind +0x128 & 0xF00000 at 0x300000).
+    pub firing: bool,
+    /// He has a grenade to throw (mind +0x4EC).
+    pub has_grenade: bool,
+    /// The grenade pause all fighters share (one global) has run out.
+    pub grenade_pause_out: bool,
+}
+
+/// A spot the cover service granted: where, and its hint's
+/// `CoverAnimation` ([`DIVE`], [`SIDE_STEP`], [`POPUP`]; 0 none).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Spot {
+    pub at: Vec3,
+    pub animation: u8,
+}
+
+/// `CoverAnimation` Dive, SideStep and Popup (+0x54).
+pub const DIVE: u8 = 1;
+pub const SIDE_STEP: u8 = 2;
+pub const POPUP: u8 = 3;
+
+/// Seconds after an answer before he asks for cover again (0x822C43B8,
+/// 0x820BAF84).
+pub const ASK_AGAIN: f32 = 5.0;
+/// How long a Dive spot is marked bad, seconds (0x822C6138, 0x820BB204).
+pub const DIVE_BAD: f32 = 20.0;
+/// How near a spot he must stay: at it (0x822C5920: 0.25 squared) and at
+/// a Popup one (0x822C6398: 0.2 squared), metres.
+const AT_SPOT: f32 = 0.5;
+const AT_POPUP: f32 = 0.447;
+/// How near a destination counts as there: 0.1 squared (0x820BB468).
+const THERE: f32 = 0.316;
+/// The cover clips' stand-ins (invented: the spot's clips at +0x3C,
+/// +0x40, +0x48 are not wired): seconds a lean out or back and a dive
+/// take.
+pub const LEAN: f32 = 0.5;
+pub const DIVING: f32 = 1.0;
+/// A Popup spot's time down before he comes up again (0x820C7A20).
+const POPUP_DOWN: f32 = 3.0;
+
+/// The grenade gate's range, metres (0x822C6B78: 0x820BAEEC, 0x820BAFA8).
+pub const GRENADE_NEAR: f32 = 10.0;
+pub const GRENADE_FAR: f32 = 40.0;
+/// After a throw his next waits `GRENADE_RETRY + GRENADE_SPREAD x rand`
+/// seconds (+0xB4, 0x822C7348); the shared pause is set to `PAUSE_START x
+/// rand` as a throw starts and `PAUSE + PAUSE_SPREAD x rand` once it is
+/// over (0x822C7208, 0x822C7348).
+pub const GRENADE_RETRY: f32 = 15.0;
+pub const GRENADE_SPREAD: f32 = 10.0;
+pub const PAUSE_START: f32 = 7.0;
+pub const PAUSE: f32 = 5.0;
+pub const PAUSE_SPREAD: f32 = 10.0;
+
+/// The speed a grenade is thrown at for a target `distance` metres off,
+/// m/s: 15 at 10 m to 20 at 40 m (0x822C6B78).
+pub fn throw_speed(distance: f32) -> f32 {
+    (distance - GRENADE_NEAR) * (1.0 / 30.0) * 5.0 + 15.0
 }
 
 /// What a tick asks of the caller beyond the block's own fields.
@@ -141,6 +218,14 @@ pub struct Out {
     pub callout: bool,
     /// Start the side-step action this way.
     pub side_step: Option<Side>,
+    /// Ask the cover service for a spot (0x822C43B8).
+    pub ask_cover: bool,
+    /// Throw a grenade at this (the target's position).
+    pub throw: Option<Vec3>,
+    /// Set the shared grenade pause to this many seconds.
+    pub grenade_pause: Option<f32>,
+    /// Mark the spot bad for this many seconds and let it go.
+    pub drop_spot: Option<f32>,
 }
 
 /// The callout said when he starts closing in.
@@ -178,6 +263,15 @@ pub struct Mover {
     /// (+0x124 bit 0x400000).
     side: u8,
     started: bool,
+    /// Seconds to his next cover ask (+0xB0) and grenade (+0xB4).
+    ask_wait: f32,
+    grenade_wait: f32,
+    /// A cover ask out from this block.
+    asked: bool,
+    /// A cover state's or the grenade's step (+0xA4), and a burst seen
+    /// from it (+0x124 bit 0x20000).
+    step: u8,
+    fired: bool,
 }
 
 impl Default for Mover {
@@ -200,6 +294,11 @@ impl Default for Mover {
             called: false,
             side: 0,
             started: false,
+            ask_wait: 0.0,
+            grenade_wait: 0.0,
+            asked: false,
+            step: 0,
+            fired: false,
         }
     }
 }
@@ -259,6 +358,8 @@ impl Mover {
         let mut out = Out::default();
         if self.current.state != State::Idle {
             self.side_wait -= s.dt;
+            self.ask_wait -= s.dt;
+            self.grenade_wait -= s.dt;
             self.in_state += s.dt;
             self.t9c += s.dt;
             self.ta0 += s.dt;
@@ -270,12 +371,47 @@ impl Mover {
             self.in_state = 0.0;
             self.t9c = 0.0;
             self.ta0 = 0.0;
-            self.enter(s, rand);
+            self.enter(s, rand, &mut out);
         }
         out
     }
 
-    fn enter(&mut self, s: &Sense, rand: &mut dyn FnMut() -> f32) {
+    /// The cover ask (0x822C43B8): whether a spot is held. An answer
+    /// come back puts the next ask [`ASK_AGAIN`] off.
+    fn ask_cover(&mut self, s: &Sense, out: &mut Out) -> bool {
+        if self.asked && !s.asking {
+            self.asked = false;
+            self.ask_wait = ASK_AGAIN;
+        }
+        if s.spot.is_some() {
+            return true;
+        }
+        if !self.asked && s.may_cover && self.ask_wait <= 0.0 {
+            self.asked = true;
+            out.ask_cover = true;
+        }
+        false
+    }
+
+    /// The grenade gate (0x822C6B78). Taken to pass: the area's bar
+    /// (+0xC bit 12) and the record's freshness (a shot means seen now);
+    /// the caller solves the arc.
+    fn grenade_gate(&self, s: &Sense) -> bool {
+        self.grenade_wait < 0.0
+            && s.has_grenade
+            && s.grenade_pause_out
+            && (GRENADE_NEAR..=GRENADE_FAR).contains(&s.ground_distance)
+            && s.has_shot
+            && !s.one_shot
+    }
+
+    /// He is further than `within` metres from his spot, or has none.
+    fn off_spot(s: &Sense, within: f32) -> bool {
+        s.spot
+            .is_none_or(|spot| Vec2::new(spot.at.x - s.at.x, spot.at.z - s.at.z).length() > within)
+    }
+
+    fn enter(&mut self, s: &Sense, rand: &mut dyn FnMut() -> f32, out: &mut Out) {
         match self.current.state {
             State::Decide => {
                 self.stand(s);
@@ -296,13 +432,31 @@ impl Mover {
                 self.side = 0;
                 self.started = false;
             }
-            _ => {}
+            State::ToSpot => {
+                if let Some(spot) = s.spot {
+                    self.dest = spot.at;
+                }
+                self.speed = s.combat_speed;
+            }
+            State::LeanFire | State::Popup | State::Grenade => {
+                self.stand(s);
+                self.step = 0;
+                self.fired = false;
+                if self.current.state == State::Grenade {
+                    out.grenade_pause = Some(rand() * PAUSE_START);
+                }
+            }
+            State::Dive => {
+                self.stand(s);
+                out.drop_spot = Some(DIVE_BAD);
+            }
+            _ => self.stand(s),
         }
     }
 
     fn exit(&mut self, s: &Sense) {
         match self.current.state {
-            State::Decide | State::Lie => self.stand(s),
+            State::Decide | State::Lie | State::ToSpot | State::AtSpot => self.stand(s),
             State::Stand | State::Crouch => {
                 self.stand(s);
                 self.speed = s.combat_speed;
@@ -322,7 +476,9 @@ impl Mover {
                 }
                 if self.hold > 0.0 {
                     self.hold -= s.dt;
-                } else if !s.held {
+                } else if self.ask_cover(s, out) {
+                    self.go(State::ToSpot, State::Idle);
+                } else if !self.asked && !s.held {
                     // 0x821B1298 mod 6000.
                     let r = ((rand() * 6000.0) as u32).min(5999);
                     let next = if r < 1000 && s.ground_distance >= 10.0 && s.may_crouch {
@@ -337,9 +493,15 @@ impl Mover {
             }
             State::Stand | State::Crouch => {
                 let standing = self.current.state == State::Stand;
+                if standing && self.ask_cover(s, out) {
+                    self.go(State::ToSpot, State::Idle);
+                    return;
+                }
                 if s.has_shot {
                     self.ta0 = 0.0;
-                    if self.t9c >= 0.5 {
+                    if self.t9c >= 0.5 && standing && self.grenade_gate(s) {
+                        self.go(State::Grenade, State::Stand);
+                    } else if self.t9c >= 0.5 {
                         self.speed = s.combat_speed;
                         if !standing {
                             self.stance = Stance::Crouch;
@@ -378,8 +540,128 @@ impl Mover {
             }
             State::SideStep => self.side_step(s, rand, out),
             State::Pass => self.back(State::Lie),
-            // Not yet ported (rounds c and d): unreachable until then.
-            _ => self.go(State::Decide, State::Idle),
+            State::ToSpot => {
+                if s.busy {
+                    return;
+                }
+                match s.spot {
+                    None => self.go(State::SpotLost, State::Idle),
+                    Some(spot) => {
+                        self.dest = spot.at;
+                        if !Self::off_spot(s, THERE) {
+                            self.back(State::AtSpot);
+                        }
+                    }
+                }
+            }
+            State::AtSpot => {
+                let Some(spot) = s.spot else {
+                    self.go(State::SpotLost, State::Idle);
+                    return;
+                };
+                if Self::off_spot(s, AT_SPOT) {
+                    self.go(State::Decide, State::Idle);
+                } else if self.in_state >= 2.0 && !s.one_shot {
+                    match spot.animation {
+                        SIDE_STEP => self.go(State::LeanOut, State::Idle),
+                        DIVE => self.go(State::Dive, State::Idle),
+                        POPUP => self.go(State::Popup, State::Idle),
+                        _ => {}
+                    }
+                }
+            }
+            State::LeanOut | State::LeanBack => {
+                if s.spot.is_none() {
+                    self.go(State::SpotLost, State::Idle);
+                } else if self.t9c >= LEAN {
+                    let next = if self.current.state == State::LeanOut {
+                        State::LeanFire
+                    } else {
+                        State::AtSpot
+                    };
+                    self.go(next, State::Idle);
+                }
+            }
+            State::LeanFire => {
+                if s.spot.is_none() {
+                    self.go(State::SpotLost, State::Idle);
+                    return;
+                }
+                self.fired |= s.firing;
+                if self.fired && !s.firing {
+                    if self.grenade_gate(s) {
+                        self.go(State::Grenade, State::LeanBack);
+                    } else {
+                        self.go(State::LeanBack, State::Idle);
+                    }
+                }
+            }
+            State::Dive => {
+                if self.t9c >= DIVING && !s.one_shot {
+                    self.back(State::Stand);
+                }
+            }
+            State::Popup => self.popup(s),
+            State::SpotLost => {
+                self.ask_wait = 0.0;
+                if !s.busy {
+                    self.go(State::Decide, State::Idle);
+                }
+            }
+            State::Grenade => {
+                if self.step == 0 {
+                    if !s.has_grenade {
+                        self.back(State::Decide);
+                    } else if !s.busy {
+                        self.step = 1;
+                        self.t9c = 0.0;
+                        out.throw = Some(target);
+                    }
+                } else if !s.one_shot && self.t9c >= 1.0 {
+                    self.grenade_wait = GRENADE_RETRY + rand() * GRENADE_SPREAD;
+                    out.grenade_pause = Some(PAUSE + rand() * PAUSE_SPREAD);
+                    self.back(State::Decide);
+                }
+            }
+            // `HumanTakeCover`'s entry and the ordered action: not reached
+            // by `HumanCombat`, not ported.
+            State::TakeCover | State::Ordered | State::Idle => self.go(State::Decide, State::Idle),
+        }
+    }
+
+    /// A Popup spot (0x822C6398): down, up after [`POPUP_DOWN`] s, a
+    /// burst, the grenade gate, down again.
+    fn popup(&mut self, s: &Sense) {
+        if Self::off_spot(s, AT_POPUP) {
+            self.go(State::SpotLost, State::Idle);
+            return;
+        }
+        match self.step {
+            0 => {
+                self.stance = Stance::Crouch;
+                if !s.one_shot {
+                    self.step = 1;
+                    self.t9c = 0.0;
+                }
+            }
+            1 => {
+                if self.t9c > POPUP_DOWN && !s.held {
+                    self.step = 2;
+                    self.stance = Stance::Stand;
+                    self.fired = false;
+                }
+            }
+            2 => {
+                self.fired |= s.firing;
+                if self.fired && !s.firing {
+                    if self.grenade_gate(s) {
+                        self.go(State::Grenade, State::Popup);
+                    } else {
+                        self.step = 3;
+                    }
+                }
+            }
+            _ => self.step = 0,
         }
     }
 
@@ -456,6 +738,12 @@ mod tests {
             combat_speed: 0.7,
             pursue_speed: 0.9,
             sides: None,
+            spot: None,
+            asking: false,
+            may_cover: false,
+            firing: false,
+            has_grenade: false,
+            grenade_pause_out: true,
         }
     }
 
@@ -463,7 +751,7 @@ mod tests {
     fn at_state(state: State, back: State) -> Mover {
         let mut m = Mover::start(Vec3::ZERO, 0.7);
         m.current = Slot { state, back };
-        m.enter(&sense(), &mut || 0.5);
+        m.enter(&sense(), &mut || 0.5, &mut Out::default());
         m
     }
 
@@ -473,6 +761,10 @@ mod tests {
             let o = m.tick(s, &mut || r);
             any.callout |= o.callout;
             any.side_step = any.side_step.or(o.side_step);
+            any.ask_cover |= o.ask_cover;
+            any.throw = any.throw.or(o.throw);
+            any.grenade_pause = o.grenade_pause.or(any.grenade_pause);
+            any.drop_spot = any.drop_spot.or(o.drop_spot);
         }
         any
     }
@@ -481,7 +773,7 @@ mod tests {
     fn decide_holds_half_a_second_to_a_second_then_rolls() {
         // rand 0.9: hold 0.95 s, roll 5400 -> standing.
         let mut m = Mover::start(Vec3::ZERO, 0.7);
-        m.enter(&sense(), &mut || 0.9);
+        m.enter(&sense(), &mut || 0.9, &mut Out::default());
         run(&mut m, &sense(), 0.9, 0.9);
         assert_eq!(m.state(), State::Decide);
         run(&mut m, &sense(), 0.2, 0.9);
@@ -600,6 +892,148 @@ mod tests {
         };
         run(&mut m, &blind, 5.3, 0.5);
         assert_eq!(m.state(), State::Decide);
+    }
+
+    #[test]
+    fn decide_asks_for_cover_and_waits_for_the_answer() {
+        let mut m = at_state(State::Decide, State::Idle);
+        let s = Sense {
+            may_cover: true,
+            ..sense()
+        };
+        // rand 0.5: a 0.75 s hold, then the ask.
+        let o = run(&mut m, &s, 0.9, 0.5);
+        assert!(o.ask_cover);
+        // The ask out: he waits.
+        let out = Sense { asking: true, ..s };
+        run(&mut m, &out, 1.0, 0.5);
+        assert_eq!(m.state(), State::Decide);
+        // A spot granted: to it.
+        let spot = Spot {
+            at: Vec3::new(4.0, 0.0, 0.0),
+            animation: SIDE_STEP,
+        };
+        let got = Sense {
+            spot: Some(spot),
+            ..s
+        };
+        run(&mut m, &got, 0.2, 0.5);
+        assert_eq!(m.state(), State::ToSpot);
+        assert_eq!(m.dest, spot.at);
+        // None: the roll, and the next ask 5 s off.
+        let mut m = at_state(State::Decide, State::Idle);
+        run(&mut m, &s, 0.9, 0.5);
+        let o = run(&mut m, &s, 0.2, 0.5);
+        assert!(!o.ask_cover);
+        assert_eq!(m.state(), State::Stand);
+        assert!((m.ask_wait - ASK_AGAIN).abs() < 0.3);
+    }
+
+    #[test]
+    fn a_side_step_spot_leans_out_fires_a_burst_and_leans_back() {
+        let spot = Spot {
+            at: Vec3::ZERO,
+            animation: SIDE_STEP,
+        };
+        let s = Sense {
+            spot: Some(spot),
+            ..sense()
+        };
+        let mut m = at_state(State::ToSpot, State::Idle);
+        run(&mut m, &s, 0.1, 0.5);
+        assert_eq!(m.state(), State::AtSpot);
+        run(&mut m, &s, 1.9, 0.5);
+        assert_eq!(m.state(), State::AtSpot);
+        run(&mut m, &s, 0.2, 0.5);
+        assert_eq!(m.state(), State::LeanOut);
+        run(&mut m, &s, LEAN + 0.1, 0.5);
+        assert_eq!(m.state(), State::LeanFire);
+        let burst = Sense { firing: true, ..s };
+        run(&mut m, &burst, 1.0, 0.5);
+        assert_eq!(m.state(), State::LeanFire);
+        run(&mut m, &s, 0.1, 0.5);
+        assert_eq!(m.state(), State::LeanBack);
+        run(&mut m, &s, LEAN + 0.1, 0.5);
+        assert_eq!(m.state(), State::AtSpot);
+        // The spot lost: decide, free to ask at once.
+        let lost = Sense { spot: None, ..s };
+        run(&mut m, &lost, 0.2, 0.5);
+        assert_eq!(m.state(), State::Decide);
+        assert!(m.ask_wait <= 0.0);
+    }
+
+    #[test]
+    fn a_dive_spot_is_marked_bad_and_he_fights_standing() {
+        let s = Sense {
+            spot: Some(Spot {
+                at: Vec3::ZERO,
+                animation: DIVE,
+            }),
+            ..sense()
+        };
+        let mut m = at_state(State::AtSpot, State::Idle);
+        let o = run(&mut m, &s, 2.2, 0.5);
+        assert_eq!(m.state(), State::Dive);
+        assert_eq!(o.drop_spot, Some(DIVE_BAD));
+        run(&mut m, &Sense { spot: None, ..s }, DIVING + 0.2, 0.5);
+        assert_eq!(m.state(), State::Stand);
+    }
+
+    #[test]
+    fn a_popup_spot_ducks_three_seconds_then_comes_up() {
+        let s = Sense {
+            spot: Some(Spot {
+                at: Vec3::ZERO,
+                animation: POPUP,
+            }),
+            ..sense()
+        };
+        let mut m = at_state(State::Popup, State::Idle);
+        run(&mut m, &s, 0.2, 0.5);
+        assert_eq!(m.stance, Stance::Crouch);
+        run(&mut m, &s, 3.0, 0.5);
+        assert_eq!(m.stance, Stance::Stand);
+        // Off the spot: lost.
+        let off = Sense {
+            at: Vec3::new(1.0, 0.0, 0.0),
+            ..s
+        };
+        run(&mut m, &off, 0.1, 0.5);
+        assert_eq!(m.state(), State::SpotLost);
+    }
+
+    #[test]
+    fn the_grenade_gate_throws_and_sets_both_waits() {
+        let s = Sense {
+            has_grenade: true,
+            ..sense()
+        };
+        let mut m = at_state(State::Stand, State::Idle);
+        let o = run(&mut m, &s, 0.7, 0.5);
+        assert_eq!(m.state(), State::Grenade);
+        assert_eq!(o.grenade_pause, Some(0.5 * PAUSE_START));
+        assert_eq!(o.throw, Some(Vec3::new(0.0, 0.0, 30.0)));
+        let o = run(&mut m, &s, 1.1, 0.5);
+        assert_eq!(m.state(), State::Stand);
+        assert_eq!(o.grenade_pause, Some(PAUSE + 0.5 * PAUSE_SPREAD));
+        assert!((m.grenade_wait - (GRENADE_RETRY + 0.5 * GRENADE_SPREAD)).abs() < 0.5);
+        // Out of range, or the shared pause still on: no throw.
+        for blocked in [
+            Sense {
+                ground_distance: 45.0,
+                ..s
+            },
+            Sense {
+                grenade_pause_out: false,
+                ..s
+            },
+        ] {
+            let mut m = at_state(State::Stand, State::Idle);
+            run(&mut m, &blocked, 0.7, 0.5);
+            assert_eq!(m.state(), State::Stand);
+        }
+        assert_eq!(throw_speed(10.0), 15.0);
+        assert!((throw_speed(40.0) - 20.0).abs() < 1e-5);
     }
 
     #[test]
