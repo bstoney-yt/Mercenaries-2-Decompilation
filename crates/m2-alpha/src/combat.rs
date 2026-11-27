@@ -2948,6 +2948,30 @@ impl Combat {
         self.rifle = rifle;
     }
 
+    /// Hands her `gun` as the contract's scripts give it, by what it
+    /// fires: a gun that fires rounds in the rifle's place
+    /// ([`scripted_rifle`](Self::scripted_rifle)); a launcher (PmcCon032's
+    /// `Grenade Launcher`) in the launcher's, up, one clip in and nothing
+    /// in reserve, the rifle's place left empty, as she was handed nothing
+    /// else.
+    ///
+    /// From samples: what a weapon fires is its ammunition's template
+    /// (the grenade launcher's `GL Projectile`, a lobbed round that bursts),
+    /// whatever the scripts' list puts it first; in the rifle's place it
+    /// fired hit-scan rounds with no burst, and the statues never broke
+    /// (nightly 2026-11-26). Which of her places the 360 shows it in is
+    /// the port's model ([`Rifle::slot`]).
+    pub fn scripted_gun(&mut self, gun: Rifle) {
+        if gun.slot() == Weapon::Rifle {
+            self.scripted_rifle(gun);
+            return;
+        }
+        self.carbine_only();
+        self.rifle_rounds = Rounds::default();
+        let clip = gun.clip.max(1);
+        self.equip_gun(gun, clip);
+    }
+
     /// Has her carry her own rifle `rifle` (free roam), full: a clip in
     /// and its template's spare clips.
     pub fn take_own_rifle(&mut self, rifle: Rifle) {
@@ -8379,6 +8403,27 @@ pub fn survival_check() -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// PmcCon032 hands her the grenade launcher alone: it goes up in the
+    /// launcher's place, a clip in, so it lobs its bursting rounds; a gun
+    /// that fires rounds still takes the rifle's place.
+    #[test]
+    fn a_scripted_launcher_is_held_as_a_launcher() {
+        use super::{Combat, Rifle, Rounds, Weapon};
+        let mut c = Combat::default();
+        let gl = Rifle::launcher(Weapon::GrenadeLauncher);
+        let clip = gl.clip.max(1);
+        c.scripted_gun(gl);
+        assert_eq!(c.weapon, Weapon::GrenadeLauncher);
+        assert_eq!(c.second, Some(Weapon::GrenadeLauncher));
+        assert_eq!(c.launcher_rounds, Some(Rounds::of(clip, clip)));
+        assert_eq!(c.rifle_rounds.total(), 0);
+        let mut c = Combat::default();
+        let rifle = c.carbine.clone();
+        c.scripted_gun(rifle);
+        assert_eq!(c.weapon, Weapon::Rifle);
+        assert_eq!(c.second, None);
+    }
+
     /// Knocked down for 5 s, she stands once that is past and her body
     /// has lain still half a second; tumbling, not before 19 s limp.
     #[test]

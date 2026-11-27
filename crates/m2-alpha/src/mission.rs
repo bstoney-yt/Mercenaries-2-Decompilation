@@ -4283,7 +4283,7 @@ impl MissionLink {
                                     "mission: her gun is the {} ({} a clip)",
                                     rifle.name, rifle.clip
                                 );
-                                game.combat.scripted_rifle(rifle);
+                                game.combat.scripted_gun(rifle);
                             }
                             None => game.combat.carbine_only(),
                         }
@@ -4310,6 +4310,15 @@ impl MissionLink {
                         } else if weapon.eq_ignore_ascii_case(CARBINE) {
                             game.combat.rifle_rounds.stored =
                                 (*rounds * combat::RIFLE_CLIP).min(combat::RIFLE_SPARE);
+                        } else if game.combat.second.is_some()
+                            && weapon.eq_ignore_ascii_case(&game.combat.launcher.name)
+                        {
+                            // Clips of the launcher she was handed, as for
+                            // a gun in the rifle's place.
+                            let clip = game.combat.launcher.clip.max(1);
+                            if let Some(r) = game.combat.launcher_rounds.as_mut() {
+                                r.stored = *rounds * clip;
+                            }
                         }
                     }
                     // The scripts anchor someone (`Ai.Anchor`): to the
