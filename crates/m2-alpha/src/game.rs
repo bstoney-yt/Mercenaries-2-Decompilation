@@ -1749,20 +1749,14 @@ impl Game {
                 self.throttle = 0.0;
                 let was_honking = std::mem::take(&mut self.honking);
                 // In a gunner's or passenger's seat (any but the driver's
-                // armed seat 0) nobody drives: it stops.
+                // armed seat 0) nobody drives: its inputs are cleared, as
+                // the 360's are when its driver leaves
+                // ([`driverless_controls`]).
                 let gunner = self.combat.seat > 0;
-                if let Some((id, v)) = id
-                    && !v.wrecked
+                if let Some((id, _)) = id
                     && gunner
                 {
-                    physics.drive(
-                        id,
-                        VehicleControls {
-                            // A helicopter holds its height.
-                            parked: !v.spec.is_helicopter(),
-                            ..VehicleControls::default()
-                        },
-                    );
+                    physics.drive(id, driverless_controls());
                     physics.strafe(id, 0.0);
                     physics.fly(id, 0.0);
                 } else if let Some((id, v)) = id
@@ -2092,17 +2086,13 @@ impl Game {
                     // vehicle's tracks stand still (playtest 5).
                     v.rolled += world.physics.vehicle_rolling(id) * dt;
                 }
-                // Nobody at the wheel: it brakes to a stop and stays put,
-                // on a hill too (a wreck drags on its rims, driven by
-                // nobody).
+                // Nobody at the wheel: its inputs are cleared, as the
+                // 360's are when its driver leaves ([`driverless_controls`]):
+                // it rolls on, slowed by its tyres, and a helicopter's lift
+                // is let go.
                 if driven != Some(i) {
-                    world.physics.drive(
-                        id,
-                        VehicleControls {
-                            parked: true,
-                            ..VehicleControls::default()
-                        },
-                    );
+                    world.physics.drive(id, driverless_controls());
+                    world.physics.fly(id, 0.0);
                 }
             }
             // The armies' patrols with a foe leave their paths for it.
@@ -7880,4 +7870,24 @@ fn vehicle_hint(t: &m2_engine::tuning::VehicleTuning) -> m2_engine::ai_target::H
 fn vehicle_threat(spec: &m2_engine::vehicle::VehicleSpec) -> f32 {
     let hints = spec.armed.iter().filter_map(|m| m.weapon.hint.as_ref());
     m2_engine::ai_target::threat(hints, m2_engine::ai_target::HUMAN, 0.0, true)
+}
+
+/// What a vehicle nobody drives is asked: nothing.
+///
+/// From the 360 code: when its rider gets out, moves seats or (an AI)
+/// leaves (0x8229EA68 from the exit 0x822A0F58, the seat move 0x822A7198
+/// and 0x822A2648; the `EnterSeat` and `Seated` states' exits
+/// 0x82443DE0, 0x82444270; the AI's 0x822D2E80), message 0x6C5F1491 goes
+/// to all three vehicle control queues (0x831B7420, 0x831B81D0,
+/// 0x831BA408). Each vehicle controller's handler zeroes every input it
+/// keeps on it: the car's steer, throttle, brake, handbrake and look
+/// (0x82189AC8: +0x28..+0x38 of its sim), and the others' (0x82188280,
+/// 0x8218C018, 0x82194298). No brake or handbrake is set. So it rolls on
+/// with no throttle, slowed by its tyres' rolling friction
+/// ([`m2_engine::tuning::Tyres::slowing`]), and a helicopter's lift is 0.
+///
+/// This replaces the alpha's invented rule (`parked`: brake hard to a stop
+/// and hold, even on a hill).
+pub fn driverless_controls() -> VehicleControls {
+    VehicleControls::default()
 }
