@@ -2902,6 +2902,12 @@ end
         self.events.exits_watched(&*self.world.borrow())
     }
 
+    /// The regions the scripts wait for her to come into
+    /// ([`crate::events::Events::entries_watched`]).
+    pub fn entries_watched(&self) -> Vec<u32> {
+        self.events.entries_watched(&*self.world.borrow())
+    }
+
     /// The objects the game found behind something solid from the camera
     /// (of those [`sight_watched`](Self::sight_watched) named): not on
     /// screen, though in view.

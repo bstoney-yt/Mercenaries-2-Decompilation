@@ -861,6 +861,8 @@ struct Way {
 /// does): its outline, placed at `centre` (x, z) turned by `yaw`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Keep {
+    /// The region's object.
+    pub guid: u32,
     pub region: m2_assets::region::Region,
     pub centre: [f32; 2],
     pub yaw: f32,
@@ -872,6 +874,45 @@ impl Keep {
         self.region.contains(self.centre, self.yaw, p.x, p.z)
     }
 }
+
+/// `goal` kept inside the regions in `keep` (the scripts cancel the
+/// contract when she leaves one; invented: how she keeps to them).
+/// Outside them all (she has left, and the scripts wait for her back), the
+/// nearest one's centre; inside one, a goal outside it is brought back
+/// along the way to [`KEEP_MARGIN`] inside its edge.
+pub fn keep_goal(keep: &[Keep], here: Vec3, goal: Vec3) -> Vec3 {
+    if keep.is_empty() || keep.iter().any(|k| k.holds(goal) && k.holds(here)) {
+        return goal;
+    }
+    let Some(k) = keep.iter().find(|k| k.holds(here)) else {
+        // Outside: back to the nearest region's middle.
+        let near = keep.iter().min_by(|a, b| {
+            let d = |k: &Keep| Vec3::new(k.centre[0], here.y, k.centre[1]).distance(here);
+            d(a).total_cmp(&d(b))
+        });
+        return near.map_or(goal, |k| Vec3::new(k.centre[0], here.y, k.centre[1]));
+    };
+    // The last point inside along the way, stepped in metres.
+    let way = (goal - here).with_y(0.0);
+    let len = way.length();
+    let dir = way / len.max(1e-3);
+    let mut inside = 0.0;
+    let mut t = 0.0;
+    while t <= len {
+        if !k.holds(here + dir * t) {
+            break;
+        }
+        inside = t;
+        t += 1.0;
+    }
+    let back = (inside - KEEP_MARGIN).max(0.0);
+    let out = here + dir * back;
+    Vec3::new(out.x, goal.y, out.z)
+}
+
+/// How far inside a kept region's edge she stops short of a goal beyond it
+/// (metres; invented).
+const KEEP_MARGIN: f32 = 4.0;
 
 /// A round of hers that would strike something this much short of the
 /// target (metres) has no clear shot at it (invented: more than a
@@ -896,6 +937,9 @@ pub struct Autoplay {
     /// The regions she must stay within (set each tick:
     /// [`crate::mission::MissionLink::kept_within`]).
     pub keep: Vec<Keep>,
+    /// Every region she has been kept within this contract (by guid): an
+    /// "enter" watch on one of these is a boundary to go back into.
+    pub boundaries: std::collections::HashSet<u32>,
     /// What the scripts wait for her to see (`Event.ObjectIsVisible`:
     /// PmcCon001's hall column, which brings the tank through the wall):
     /// where each is, set each tick ([`crate::mission::MissionLink::
@@ -1007,6 +1051,8 @@ pub struct Autoplay {
     /// her own level, [`perch`]), and since when; the spots no better.
     perch: Option<(Vec3, f32)>,
     perch_tried: Vec<Vec3>,
+    /// The last goal she was kept inside a boundary to (logged once).
+    clamp_said: Option<Vec3>,
     /// Where she is swimming to climb out of the water (see [`landing`]).
     landing: Option<Vec3>,
     /// Searches in a row for a spot to fire from that found none, and the
@@ -3112,8 +3158,25 @@ impl Autoplay {
         }
     }
 
-    /// Gets to `at`, on foot or in the vehicle she is in.
+    /// Gets to `at`, on foot or in the vehicle she is in; within the
+    /// regions the scripts keep her in ([`keep_goal`]).
     fn travel(&mut self, game: &mut Game, at: Vec3, arrive: f32, dt: f32) -> Intent {
+        let at = match game.scene.player.as_ref() {
+            Some(p) => {
+                let goal = keep_goal(&self.keep, p.character.position, at);
+                if goal.distance(at) > 0.5 && self.clamp_said.is_none_or(|s| s.distance(goal) > 5.0)
+                {
+                    eprintln!(
+                        "autoplay {:.1} s: keeping inside the scripts' boundary: going to {goal:.1} \
+                         rather than {at:.1}",
+                        self.clock
+                    );
+                    self.clamp_said = Some(goal);
+                }
+                goal
+            }
+            None => at,
+        };
         match game.scene.player.as_ref().and_then(|p| p.driving) {
             Some(i) => self.drive(game, i, at, arrive, dt),
             None => self.walk(game, at, arrive, dt),
@@ -7284,6 +7347,7 @@ mod tests {
         assert!((spot.y - 20.0).abs() < 0.1, "not on the roof: {spot}");
         // Bounds that end short of where it can be seen from: nowhere.
         let keep = Keep {
+            guid: 1,
             region: m2_assets::region::Region {
                 flags: 0,
                 unk_0x04: 0,
@@ -7666,6 +7730,44 @@ mod tests {
             seat_link: None,
             turret: None,
         }
+    }
+
+    fn square(half: f32) -> Keep {
+        Keep {
+            guid: 7,
+            region: m2_assets::region::Region {
+                flags: 0,
+                unk_0x04: 0,
+                corners: vec![[-half, -half], [half, -half], [half, half], [-half, half]],
+            },
+            centre: [100.0, 200.0],
+            yaw: 0.0,
+        }
+    }
+
+    /// PmcCon018: kept within its boundary, a goal beyond it is brought
+    /// back inside; outside it (its out-of-bounds timer running), back to
+    /// its middle; with nothing kept, as asked.
+    #[test]
+    fn goals_keep_inside_the_scripts_boundary() {
+        let k = [square(50.0)];
+        let here = Vec3::new(100.0, 3.0, 200.0);
+        // Inside to inside: as asked.
+        let g = Vec3::new(130.0, 1.0, 220.0);
+        assert_eq!(keep_goal(&k, here, g), g);
+        // Inside to 106 m out: stopped short of the edge, on the way.
+        let far = Vec3::new(206.0, 1.0, 200.0);
+        let got = keep_goal(&k, here, far);
+        assert!(k[0].holds(got), "{got}");
+        assert!(
+            got.x > 140.0 && got.x < 150.0 && (got.z - 200.0).abs() < 1e-3,
+            "{got}"
+        );
+        // Outside (she left): back to its middle.
+        let out = Vec3::new(170.0, 2.0, 200.0);
+        assert_eq!(keep_goal(&k, out, far), Vec3::new(100.0, 2.0, 200.0));
+        // Nothing kept: as asked.
+        assert_eq!(keep_goal(&[], here, far), far);
     }
 
     #[test]

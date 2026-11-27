@@ -5417,15 +5417,33 @@ impl MissionLink {
     /// (`Event.Boundary` on "exit": PmcCon034's out-of-bounds, which
     /// cancels it): each outline with where it is placed and its turn.
     pub fn kept_within(&self) -> Vec<crate::autoplay::Keep> {
+        self.regions_watched(true)
+    }
+
+    /// The regions the scripts wait for her to come into (`Event.Boundary`
+    /// on "enter"): a checkpoint's, or a boundary she has left while its
+    /// out-of-bounds timer runs (PmcCon018's), which the autoplay tells
+    /// apart by having kept her within it first.
+    pub fn entries_watched(&self) -> Vec<crate::autoplay::Keep> {
+        self.regions_watched(false)
+    }
+
+    fn regions_watched(&self, exits: bool) -> Vec<crate::autoplay::Keep> {
         let State::Running(m) = &self.state else {
             return Vec::new();
         };
         let w = m.world().borrow();
-        m.exits_watched()
+        let guids = if exits {
+            m.exits_watched()
+        } else {
+            m.entries_watched()
+        };
+        guids
             .into_iter()
             .filter_map(|g| {
                 let (r, o) = (w.regions.get(&g)?, w.objects.get(&g)?);
                 Some(crate::autoplay::Keep {
+                    guid: g,
                     region: r.clone(),
                     centre: [o.position[0], o.position[2]],
                     yaw: o.yaw,
