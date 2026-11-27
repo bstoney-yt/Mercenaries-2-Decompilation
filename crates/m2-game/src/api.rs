@@ -1178,6 +1178,10 @@ pub struct ScriptWorld {
     /// profile (0x8239ACB0). The game fills it in
     /// ([`crate::Mission::keep_retry`]).
     pub retry_save: Option<String>,
+    /// The retry save was taken during the scripts' `Pg.SaveGame("retry")`
+    /// call itself, since the scripts last ran
+    /// ([`crate::Mission`]'s `RETRY_AT_CALL`).
+    pub retry_kept: bool,
     /// `Pg.LoadIsRetry`: whether the last `Pg.LoadGame` was of the retry
     /// slot. From the 360 code: 0x8230C880 sets the byte at +0xC3D to
     /// `slot == "retry"` on every call, and `LoadIsRetry` (0x823389F8)
