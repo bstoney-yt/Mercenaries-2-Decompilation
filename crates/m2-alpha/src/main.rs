@@ -9299,9 +9299,25 @@ fn drive_for_screenshot(
             && let Some((_, speed)) = game.driving()
         {
             reverse_fastest = reverse_fastest.max(speed.abs());
+            // A knock (over 3 m/s lost in a tick: a bump, a kerb, the
+            // ground's lip) ends the measure: what it held before it is
+            // its top backing up there.
+            if let Some(&last) = reverse_speeds.last()
+                && last - speed.abs() > 3.0
+            {
+                eprintln!(
+                    "drive: reverse knocked from {last:.1} to {:.1} m/s after {:.1} s; it held {:.1} m/s ({:.0} km/h) before",
+                    speed.abs(),
+                    reverse_speeds.len() as f32 * tick,
+                    reverse_fastest,
+                    reverse_fastest * 3.6
+                );
+                break;
+            }
             reverse_speeds.push(speed.abs());
             let n = reverse_speeds.len();
-            if n > 240 && reverse_speeds[n - 1] - reverse_speeds[n - 121] < 0.1 {
+            // Level: within 0.1 m/s, up or down, over the last 2 s.
+            if n > 240 && (reverse_speeds[n - 1] - reverse_speeds[n - 121]).abs() < 0.1 {
                 eprintln!(
                     "drive: reverse levels off at {:.1} m/s ({:.0} km/h) after {:.1} s",
                     reverse_speeds[n - 1],
