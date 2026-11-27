@@ -8126,13 +8126,17 @@ pub const HER_PLAYER_RECORD: bool = true;
 /// (the on-foot tables' handle ade601a9, clip 0xAEB6C9BD; from samples),
 /// as the people do.
 /// Seconds from her ragdoll going limp to `KnockedDown` (her time down
-/// counting from then): from Xenia (the get-up runs getupa, getupb,
-/// getupc: `KnockedDown` 0x35365D24 0.33 to 0.36 s after the limp's
-/// mode `FULL` starts). What ends `Upright` `KnockDown` that soon is not
-/// traced in the 360 code; it is not the `KnockDown` clip (0xBE25DC0C,
-/// 1.0 s), which the port waited for, making her get-up some 0.7 s late
-/// (the port's 3.1 to 4.5 s down to idle against Xenia's 2.3 to 3.6 s).
-pub const KNOCKDOWN_ENTER: f32 = 0.33;
+/// counting from then). From the 360 code: `Upright` `KnockDown` has no
+/// stance and action row of its own (the catch-all handle 74A3B540, which
+/// no on-foot row gives), so it plays the on-foot table's stand-in clip
+/// (`NO_ANIMATION` 0x9D886544, 82801508 / 82801650), and its `Complete`,
+/// which the state table leads to `KnockedDown` `Idle`, comes as that
+/// clip ends (82420A00). The stand-in runs 0.300 s (10 frames, read from
+/// `vz.wad`). Xenia (getupa..c) sees `KnockedDown` 0x35365D24 0.33 to
+/// 0.36 s after the limp starts: the clip's end plus the step it is
+/// noticed on. The port waited for the 1.0 s `KnockDown` clip
+/// (0xBE25DC0C) instead, some 0.7 s late.
+pub const KNOCKDOWN_ENTER: f32 = 0.3;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct KnockedHer {
@@ -8450,9 +8454,9 @@ mod tests {
         }
         // 1.35 s, to the step (1.0 s of time down from 0.35 s in).
         assert!(t > 1.3 && t < 1.42, "{t} {k:?}");
-        // As Xenia has it: `KnockedDown` a third of a second in, well
-        // before her 1 s `KnockDown` clip would end.
-        const { assert!(KNOCKDOWN_ENTER > 0.3 && KNOCKDOWN_ENTER < 0.37) };
+        // The stand-in clip's 0.3 s (Xenia: 0.33 to 0.36 s, to the step),
+        // well before her 1 s `KnockDown` clip would end.
+        const { assert!(KNOCKDOWN_ENTER >= 0.3 && KNOCKDOWN_ENTER < 0.37) };
         // The still timer counts from the limp itself: 0.5 s still is met
         // before the time down, which decides.
         assert!(k.body.still > 1.25, "{k:?}");
