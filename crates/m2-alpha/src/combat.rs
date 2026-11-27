@@ -622,9 +622,11 @@ pub const MAX_GRENADES: u32 = 9;
 /// supply crate's 100 health: one blow opens it), and seconds before she
 /// can bash or fire again. People are reached, hurt and shoved as the 360
 /// does instead ([`m2_engine::melee`]).
-/// Invented, from the playthroughs. A person takes the blow times their
-/// damage table row's `MeleeBash` cell (from the data; no template's
-/// `DamageKey` is `MeleeBash`, so the blow's own size stays invented).
+/// Invented, from the playthroughs: the reach and arc for the world and
+/// vehicles. What a blow deals is the 360's: the damage table's
+/// `MeleeBash` cell of the row of what it strikes, as it is
+/// (0x8222B2E8), for people ([`m2_engine::melee`]) and the world alike
+/// ([`MELEE_ROUND`]).
 const BASH_REACH: f32 = 1.8;
 const BASH_ARC: f32 = 0.5;
 /// A vehicle whose up axis leans further than this from straight up
@@ -642,7 +644,13 @@ fn within_bash(feet: Vec3, ahead: Vec3, middle: Vec3, half: f32) -> bool {
     let to = (middle - feet).with_y(0.0);
     to.length() <= BASH_REACH + half && to.normalize_or_zero().dot(ahead) >= BASH_ARC
 }
+/// What a person takes of a blow without a damage table (invented: with
+/// one, the blow is their row's `MeleeBash` cell itself).
 const BASH_DAMAGE: f32 = 60.0;
+/// A blow's own `Damage` against what it strikes of the world: the 360's
+/// blow deals the struck object's `MeleeBash` cell itself (0x8222B2E8:
+/// the damage is set from 0x823987D0's cell, not scaled), so one of it.
+const MELEE_ROUND: f32 = 1.0;
 /// A person's `_HumanPhysics` `Mass`, kg (the registered default), that a
 /// bash's impulse moves ([`m2_engine::melee::shove`]).
 const BODY_MASS: f32 = 100.0;
@@ -656,6 +664,8 @@ fn body_height(n: &crate::npc::Npc) -> f32 {
         n.character.height
     }
 }
+/// A blow's damage against the supply crates, which are not worn through
+/// the damage table here (the alpha's own: their 100 health, one blow).
 const BASH_BREAK: f32 = 100.0;
 const BASH_GAP: f32 = 0.8;
 /// Heights of a blow over her feet, high and low, metres.
@@ -6848,7 +6858,10 @@ impl Combat {
                 at: from + ahead * t,
                 damage: BASH_BREAK,
                 key,
-                round: BASH_DAMAGE,
+                // The blow's damage is the cell itself (0x8222B2E8 reads
+                // the target's `MeleeBash` cell, 0x823987D0, and deals
+                // that): one of the cell.
+                round: MELEE_ROUND,
                 kind: m2_assets::name_hash("MeleeBash"),
             });
         }
@@ -8985,6 +8998,9 @@ mod tests {
         let s = combat.struck.first().copied().expect("struck");
         assert_eq!(s.key, Some(StaticKey::Entity(7)));
         assert!(s.at.y < 0.8 && s.damage >= 100.0, "{s:?}");
+        // What it wears of the world is the struck row's `MeleeBash` cell
+        // itself (0x8222B2E8): a blow of one.
+        assert_eq!((s.round, s.kind), (1.0, m2_assets::name_hash("MeleeBash")));
     }
 
     // With the damage table, a blow hurts by the row's `MeleeBash` cell:
