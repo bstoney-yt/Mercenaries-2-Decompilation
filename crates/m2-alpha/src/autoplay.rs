@@ -945,6 +945,13 @@ const STEP_IN_ARRIVE: f32 = 0.5;
 /// (metres; invented).
 const KEEP_MARGIN: f32 = 4.0;
 
+/// Whether she counts as at her perch `spot` from `here`: within
+/// [`PERCH_ARRIVE`] of it, or seeing the target already on the way, but
+/// not with her sight of it distrusted (her rounds struck short of it).
+fn at_perch(seen: bool, distrusted: bool, spot: Vec3, here: Vec3) -> bool {
+    (seen && !distrusted) || spot.with_y(0.0).distance(here.with_y(0.0)) < PERCH_ARRIVE
+}
+
 /// Rounds struck short of a target in a row before her eye's line to it is
 /// no longer trusted (invented).
 const SHORT_GIVE_UP: u32 = 5;
@@ -3968,7 +3975,12 @@ impl Autoplay {
                     .cast_ray(eye, dir, (len - SHOT_SHORT).max(0.0))
                     .is_none()
             });
-            let there = seen || spot.with_y(0.0).distance(here.with_y(0.0)) < PERCH_ARRIVE;
+            // Not where her sight is no longer trusted: from there her eye
+            // sees it but her rounds strike short (PmcCon034, the 11-27
+            // check of #812: "going to [2619.2, 21.7, -982.9]" 181 times,
+            // each at once counted as there because she saw the statue,
+            // and she never took the 3 m).
+            let there = at_perch(seen, self.distrust == Some(target), spot, here);
             if !there && self.clock - since < SPOT_GIVE_UP {
                 // Not `arrived` where she stood (walk would keep her there).
                 self.arrived = None;
@@ -8115,6 +8127,19 @@ mod tests {
         assert_eq!(n, 3);
         assert!(spot.x > 90.0 && spot.x < 110.0);
         assert_eq!(strike_knot(&[], &[]), None);
+    }
+
+    /// PmcCon034's 11-27 check: 3 m from her spot, the statue in her
+    /// eye's sight but her sight distrusted, she isn't there yet; within
+    /// a metre, or trusted, she is.
+    #[test]
+    fn a_distrusted_sight_does_not_count_as_at_the_perch() {
+        let here = Vec3::new(2616.6, 22.1, -981.4);
+        let spot = Vec3::new(2619.2, 21.7, -982.9);
+        assert!(!at_perch(true, true, spot, here));
+        assert!(at_perch(true, false, spot, here));
+        assert!(!at_perch(false, false, spot, here));
+        assert!(at_perch(true, true, spot, spot + Vec3::X * 0.5));
     }
 
     /// PmcCon034: her rounds into the roof by her count as short; one on
