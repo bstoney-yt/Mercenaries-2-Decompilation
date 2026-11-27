@@ -1661,11 +1661,9 @@ const RAGDOLL_SLACK: f32 = 0.02;
 const RAGDOLL_ANGULAR_DAMPING: f32 = 0.8;
 const RAGDOLL_MAX_SPEED: f32 = 132.0;
 const RAGDOLL_MAX_SPIN: f32 = 9.424_778;
-/// How quickly a wreck stops sliding and spinning, how hard its hull
-/// drags on the ground, and how far down its wheels' rims reach (of the
-/// radius from the centre): invented.
-const WRECK_DAMPING: f32 = 1.5;
-const WRECK_FRICTION: f32 = 0.9;
+/// How far down a wreck's wheels' rims reach (of the radius from the
+/// centre), for the box hull of one whose model gives no wrecked chassis
+/// body ([`Physics::wreck_vehicle`]): invented.
 const WRECK_RIM: f32 = 0.7;
 /// How fast tracks turn a hull standing still, radians per second.
 const TRACK_TURN: f32 = 0.9;
@@ -6958,8 +6956,14 @@ impl Physics {
             }
             return;
         }
-        body.set_linear_damping(WRECK_DAMPING);
-        body.set_angular_damping(WRECK_DAMPING);
+        // No wrecked chassis body in its model: the 360 still rebuilds it
+        // through the body builder (0x8216A290), so it slides and slows as
+        // a `PHY2` body of the commonest record does ([`BodyMaterial::COMMON`]:
+        // friction 0.3, no linear damping, 0.8 angular), not by the
+        // invented 1.5 damping and 0.9 friction it had.
+        let m = BodyMaterial::COMMON;
+        body.set_linear_damping(m.linear_damping);
+        body.set_angular_damping(m.angular_damping);
         // An invented box hull (the first collider; a turret's comes
         // after), which stopped at the wheels' centres, reaches down to the
         // rims and drags on the ground; a hull of its chassis's own shapes
@@ -6969,7 +6973,7 @@ impl Physics {
                 continue;
             };
             if c.shape().as_cuboid().is_none() {
-                c.set_friction(WRECK_FRICTION);
+                c.set_friction(m.friction);
                 continue;
             }
             if i > 0 {
@@ -6988,7 +6992,7 @@ impl Physics {
             let half = (top - bottom) * 0.5;
             c.set_shape(r::SharedShape::cuboid(cube.x, half, cube.z));
             c.set_translation_wrt_parent(vector(Vec3::new(at.x, bottom + half, at.z)));
-            c.set_friction(WRECK_FRICTION);
+            c.set_friction(m.friction);
         }
     }
 
@@ -13427,7 +13431,9 @@ mod tests {
         assert!(fast > 5.0, "{fast}");
         p.wreck_vehicle(id);
         // Nobody can drive it now, nor does the throttle it had push it.
-        for _ in 0..120 {
+        // It scrapes to a stop as a `PHY2` body of the commonest record
+        // does: friction 0.3, no linear damping; it slides on for seconds.
+        for _ in 0..900 {
             p.drive(
                 id,
                 VehicleControls {
