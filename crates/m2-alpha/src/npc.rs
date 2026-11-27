@@ -3719,18 +3719,17 @@ impl Npc {
                 }
             }
             // From the 360 code (0x822B1BD0): the spot is kept when they
-            // first stand there; moved more than 1 m from it (squared, in
-            // 3D) and in the living world, they go back to it.
+            // first stand there; while more than 1 m from it (squared, in
+            // 3D) and in the living world, they walk back to it, and stop
+            // once within it again: the same test each think, no other
+            // arrival.
             Brain::Post { facing } => {
                 let spot = *self.post_at.get_or_insert(at);
                 let off = spot - at;
-                if self.living_world
-                    && off.length_squared() > LIVING_WORLD_SLACK * LIVING_WORLD_SLACK
-                {
-                    self.returning = true;
-                }
+                self.returning = self.living_world
+                    && off.length_squared() > LIVING_WORLD_SLACK * LIVING_WORLD_SLACK;
                 let flat = off.with_y(0.0);
-                if self.returning && flat.length() > LIVING_WORLD_BACK {
+                if self.returning && flat.length() > 0.0 {
                     wanted = flat.normalize() * speed;
                 } else {
                     self.returning = false;
@@ -4635,9 +4634,6 @@ pub const PMC: &str = "Pmc";
 /// How far a person at a post may be pushed from their spot before they
 /// walk back to it, metres (0x822B1BD0 against 1.0, 0x820BAEE8, squared).
 pub const LIVING_WORLD_SLACK: f32 = 1.0;
-/// How near the spot they stop once walking back (invented: the 360's
-/// move goal's own arrival isn't traced).
-pub const LIVING_WORLD_BACK: f32 = 0.25;
 
 /// Seconds the soldiers of a faction she provoked fight her: the first of
 /// the pursuit level times the faction manager sets
@@ -9751,7 +9747,9 @@ pub(crate) mod tests {
                 .length()
         };
         let back = pushed(true);
-        assert!(back <= 1.0, "walked back: {back}");
+        // Back within the 1 m, and no nearer: 0x822B1BD0 stops at its own
+        // 1 m test, with no closer arrival.
+        assert!((0.6..=1.0).contains(&back), "walked back: {back}");
         let stays = pushed(false);
         assert!(stays > 2.5, "stays: {stays}");
     }
