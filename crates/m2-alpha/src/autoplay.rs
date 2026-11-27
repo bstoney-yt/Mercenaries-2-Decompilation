@@ -293,6 +293,18 @@ const WALL: f32 = 0.8;
 const SLOW_NEAR: f32 = 30.0;
 const SLOW: f32 = 7.0;
 const STALL: f32 = 2.5;
+/// Seconds with no wheel on the ground and no way on before she rights
+/// her vehicle (the reset key, a player's) (invented). MecCon001's
+/// Monster Truck sat high-centred on a strip-mine rock, 0 of 4 wheels
+/// down at full throttle, from 258 s till the race was lost at 267 s.
+const HIGH_CENTRED: f32 = 2.0;
+/// Least seconds between two rightings (invented).
+const RIGHT_GAP: f32 = 6.0;
+/// The ground this far below the vehicle 10 m on is a crest she slows for
+/// (metres; invented), above [`CREST_SPEED`] (m/s; invented): the Monster
+/// Truck took the strip mine's rock field at 25.5 m/s.
+const CREST_DROP: f32 = 2.0;
+const CREST_SPEED: f32 = 12.0;
 const REVERSE: f32 = 1.5;
 /// No headway (a metre closer) for this long, seconds: she jumps and
 /// sidesteps; for this long, she hops this far ahead (metres).
@@ -1003,6 +1015,10 @@ pub struct Autoplay {
     pub boundaries: std::collections::HashSet<u32>,
     /// The objects the scripts wait to die, and where (what they score).
     pub death_watched: Vec<(u32, Vec3)>,
+    /// Seconds high-centred (no wheel down, no way on), and when she last
+    /// righted her vehicle.
+    high_centred: f32,
+    righted: Option<f32>,
     /// What the scripts wait for her to see (`Event.ObjectIsVisible`:
     /// PmcCon001's hall column, which brings the tank through the wall):
     /// where each is, set each tick ([`crate::mission::MissionLink::
@@ -3681,8 +3697,64 @@ impl Autoplay {
                 self.reversing = None;
             }
         }
+        // Over a crest fast: off the throttle till it is passed.
+        let (down, drop) = game
+            .scene
+            .world
+            .as_ref()
+            .zip(game.scene.vehicles[i].id)
+            .map_or((1, 0.0), |(w, id)| {
+                (
+                    w.physics.vehicle_contacts(id).0,
+                    ground_drop(&w.physics, m, 10.0),
+                )
+            });
+        if throttle > 0.0 && crest_ahead(drop, speed) {
+            throttle = 0.0;
+        }
+        // High-centred (no wheel down and no way on): what holds it is kept
+        // out of, and she rights it, as a player would with the reset key.
+        self.high_centred = if down == 0 && speed.abs() < 1.0 {
+            self.high_centred + dt
+        } else {
+            0.0
+        };
+        let mut right = false;
+        if self.high_centred > HIGH_CENTRED
+            && self.righted.is_none_or(|t| self.clock - t > RIGHT_GAP)
+        {
+            self.high_centred = 0.0;
+            self.righted = Some(self.clock);
+            self.reversing = None;
+            right = true;
+            if let (Some(w), Some(id)) = (game.scene.world.as_ref(), game.scene.vehicles[i].id) {
+                for (key, _, (lo, hi)) in w.physics.vehicle_touching(id) {
+                    let (lo, hi) = (
+                        Vec2::new(lo.x, lo.z) - Vec2::splat(AVOID_ROOM),
+                        Vec2::new(hi.x, hi.z) + Vec2::splat(AVOID_ROOM),
+                    );
+                    if matches!(key, Some(k) if !matches!(k, StaticKey::Cell(_)))
+                        && (hi - lo).max_element() < AVOID_LARGEST
+                        && !self.avoid.contains(&(lo, hi))
+                    {
+                        eprintln!(
+                            "autoplay {:.1} s: keeping out of {} ({lo:.0} to {hi:.0}) from now on",
+                            self.clock,
+                            crate::static_name(w, key)
+                        );
+                        self.avoid.push((lo, hi));
+                    }
+                }
+            }
+            self.way = None;
+            eprintln!(
+                "autoplay {:.1} s: the {} is high-centred (no wheel down): righting it",
+                self.clock, game.scene.vehicles[i].spec.label
+            );
+        }
         Intent {
             movement: Vec2::new(steer, throttle),
+            right_vehicle: right,
             ..Intent::default()
         }
     }
@@ -6581,6 +6653,29 @@ fn aim(p: &Player, target: Vec3, dt: f32) -> (Vec2, f32) {
 /// Why a vehicle may be stuck: its speed, how it sits (nose up, rolled),
 /// how many wheels touch, what is just ahead of its bumper, how the
 /// ground rises ahead and what its body touches (where on the model).
+/// How far the ground `ahead` metres on along the vehicle at `m` lies
+/// below the ground under it (positive: lower), 0 where either is unknown.
+fn ground_drop(physics: &m2_engine::physics::Physics, m: Mat4, ahead: f32) -> f32 {
+    let ground = |p: Vec3| {
+        let top = p + Vec3::Y * 30.0;
+        physics
+            .cast_ray(top, Vec3::NEG_Y, 80.0)
+            .map(|(d, _)| top.y - d)
+    };
+    let here = m.transform_point3(Vec3::ZERO);
+    let flat = m.transform_vector3(Vec3::Z).with_y(0.0).normalize_or_zero();
+    match (ground(here), ground(here + flat * ahead)) {
+        (Some(a), Some(b)) => a - b,
+        _ => 0.0,
+    }
+}
+
+/// Whether she comes off the throttle for a crest: the ground drops more
+/// than [`CREST_DROP`] ahead and she is faster than [`CREST_SPEED`].
+fn crest_ahead(drop: f32, speed: f32) -> bool {
+    drop > CREST_DROP && speed > CREST_SPEED
+}
+
 pub(crate) fn stuck_report(
     world: &m2_engine::World,
     id: m2_engine::VehicleId,
@@ -8161,6 +8256,7 @@ mod tests {
         assert_eq!(strike_knot(&[], &[]), None);
     }
 
+<<<<<<< HEAD
     /// PmcCon034's 11-27 check: 3 m from her spot, the statue in her
     /// eye's sight but her sight distrusted, she isn't there yet; within
     /// a metre, or trusted, she is.
@@ -8197,6 +8293,15 @@ mod tests {
         );
         assert_eq!(got, 1);
         assert_eq!(short_strikes(&[], eye, statue), 0);
+=======
+    /// MecCon001: off the throttle over a drop at 25.5 m/s, not at a walk
+    /// or on the level.
+    #[test]
+    fn she_slows_for_a_crest() {
+        assert!(crest_ahead(3.0, 25.5));
+        assert!(!crest_ahead(3.0, 8.0));
+        assert!(!crest_ahead(0.5, 25.5));
+        assert!(!crest_ahead(-4.0, 25.5));
     }
 
     #[test]
