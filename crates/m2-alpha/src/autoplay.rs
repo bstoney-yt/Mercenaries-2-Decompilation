@@ -861,6 +861,8 @@ struct Way {
 /// does): its outline, placed at `centre` (x, z) turned by `yaw`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Keep {
+    /// The region's object.
+    pub guid: u32,
     pub region: m2_assets::region::Region,
     pub centre: [f32; 2],
     pub yaw: f32,
@@ -872,6 +874,76 @@ impl Keep {
         self.region.contains(self.centre, self.yaw, p.x, p.z)
     }
 }
+
+/// `goal` kept inside the regions in `keep` (the scripts cancel the
+/// contract when she leaves one; invented: how she keeps to them).
+/// Outside them all (she has left, and the scripts wait for her back), the
+/// nearest one's centre; inside one, a goal outside it is brought back
+/// along the way to [`KEEP_MARGIN`] inside its edge.
+pub fn keep_goal(keep: &[Keep], here: Vec3, goal: Vec3) -> Vec3 {
+    if keep.is_empty() || keep.iter().any(|k| k.holds(goal) && k.holds(here)) {
+        return goal;
+    }
+    let Some(k) = keep.iter().find(|k| k.holds(here)) else {
+        // Outside: back to the nearest region's middle.
+        let near = keep.iter().min_by(|a, b| {
+            let d = |k: &Keep| Vec3::new(k.centre[0], here.y, k.centre[1]).distance(here);
+            d(a).total_cmp(&d(b))
+        });
+        return near.map_or(goal, |k| Vec3::new(k.centre[0], here.y, k.centre[1]));
+    };
+    // The last point inside along the way, stepped in metres.
+    let way = (goal - here).with_y(0.0);
+    let len = way.length();
+    let dir = way / len.max(1e-3);
+    let mut inside = 0.0;
+    let mut t = 0.0;
+    while t <= len {
+        if !k.holds(here + dir * t) {
+            break;
+        }
+        inside = t;
+        t += 1.0;
+    }
+    let back = (inside - KEEP_MARGIN).max(0.0);
+    let out = here + dir * back;
+    Vec3::new(out.x, goal.y, out.z)
+}
+
+/// Whether `at` lies inside the regions in `keep` (anywhere, with none kept).
+fn within(keep: &[Keep], at: Vec3) -> bool {
+    keep.is_empty() || keep.iter().any(|k| k.holds(at))
+}
+
+/// Where she steps to: outside every region in `keep`, the nearest one's
+/// middle (at her height); with her fire locked by the scripts
+/// (`locked`), the nearest kept region she is outside of, though others
+/// hold her (PmcCon032, the 11-27 check of #815: kept within 3-4 regions
+/// at once, the contract's wide ones holding her, her fire locked and the
+/// gallery border 4 m off; she never stepped in). `None` when nothing is to
+/// be stepped into.
+pub fn step_in_point(keep: &[Keep], here: Vec3, locked: bool) -> Option<Vec3> {
+    if keep.is_empty() {
+        return None;
+    }
+    let inside_all_needed = !locked;
+    if inside_all_needed && keep.iter().any(|k| k.holds(here)) {
+        return None;
+    }
+    let k = keep.iter().filter(|k| !k.holds(here)).min_by(|a, b| {
+        let d = |k: &Keep| Vec3::new(k.centre[0], here.y, k.centre[1]).distance(here);
+        d(a).total_cmp(&d(b))
+    })?;
+    Some(Vec3::new(k.centre[0], here.y, k.centre[1]))
+}
+
+/// How near a kept region's middle she walks when stepping into it
+/// (metres; invented: well inside PmcCon032's 2.65 m border).
+const STEP_IN_ARRIVE: f32 = 0.5;
+
+/// How far inside a kept region's edge she stops short of a goal beyond it
+/// (metres; invented).
+const KEEP_MARGIN: f32 = 4.0;
 
 /// A round of hers that would strike something this much short of the
 /// target (metres) has no clear shot at it (invented: more than a
@@ -896,6 +968,11 @@ pub struct Autoplay {
     /// The regions she must stay within (set each tick:
     /// [`crate::mission::MissionLink::kept_within`]).
     pub keep: Vec<Keep>,
+    /// Every region she has been kept within this contract (by guid): an
+    /// "enter" watch on one of these is a boundary to go back into.
+    pub boundaries: std::collections::HashSet<u32>,
+    /// The objects the scripts wait to die, and where (what they score).
+    pub death_watched: Vec<(u32, Vec3)>,
     /// What the scripts wait for her to see (`Event.ObjectIsVisible`:
     /// PmcCon001's hall column, which brings the tank through the wall):
     /// where each is, set each tick ([`crate::mission::MissionLink::
@@ -1007,6 +1084,14 @@ pub struct Autoplay {
     /// her own level, [`perch`]), and since when; the spots no better.
     perch: Option<(Vec3, f32)>,
     perch_tried: Vec<Vec3>,
+    /// The last goal she was kept inside a boundary to (logged once).
+    clamp_said: Option<Vec3>,
+    /// Since when her goal has lain outside the regions she is kept in
+    /// (she is held at their edge): other actions may take over meanwhile
+    /// (PmcCon018: its marker 106 m out, she stood at the edge 540 s).
+    pub(crate) held_since: Option<f32>,
+    /// When she last said she was stepping into a kept region.
+    step_in_said: Option<f32>,
     /// Where she is swimming to climb out of the water (see [`landing`]).
     landing: Option<Vec3>,
     /// Searches in a row for a spot to fire from that found none, and the
@@ -1635,7 +1720,13 @@ impl Autoplay {
             && matches!(&self.goal, Some(Goal::Blast { target, at })
                 if may_strike(&self.no_strike, *target)
                     && ((sturdy(target) && !cannon) || (spent && !gun(at) && !cannon)))
-            || matches!(self.goal, Some(Goal::Deliver(_)));
+            || matches!(self.goal, Some(Goal::Deliver(_)))
+            // Her weapons put away by the scripts, or her goal held outside
+            // her bounds, a strike on offer: what they score is struck
+            // (PmcCon018).
+            || (matches!(&self.goal, Some(Goal::Blast { target, .. })
+                    if self.death_watched.iter().any(|(g, _)| g == target))
+                && self.strike_scored(game));
         // A call she is no longer after is put away: the designator goes
         // with a weapon taken up (twice from the satellite's view).
         if !striking && (game.support.busy() || game.support.holding()) {
@@ -1751,6 +1842,37 @@ impl Autoplay {
                 use_pressed: true,
                 ..Intent::default()
             };
+        }
+        // At the wheel outside every region she is kept in (the scripts'
+        // out-of-bounds timer running): straight back in, before anything
+        // else.
+        if let Some(p) = game.scene.player.as_ref()
+            && p.driving.is_some()
+            && !self.keep.is_empty()
+            && !within(&self.keep, p.character.position)
+        {
+            let home = keep_goal(&self.keep, p.character.position, p.character.position);
+            return self.travel(game, home, ARRIVE, dt);
+        }
+        // Outside a region the scripts keep her in, or wait for her to come
+        // back into: into it before anything else, on foot (PmcCon032: an
+        // "exit" from its gallery border 0x12D359 locks her fire, and only
+        // stepping back in frees it; the bot stood 4.1 m off, by the
+        // objective, and every trigger pull for 600 s was eaten).
+        if let Some(p) = game.scene.player.as_ref()
+            && p.driving.is_none()
+            && game.combat.manned.is_none()
+            && let Some(inside) =
+                step_in_point(&self.keep, p.character.position, game.combat.fire_lock)
+        {
+            if self.step_in_said.is_none_or(|t| self.clock - t > 10.0) {
+                self.step_in_said = Some(self.clock);
+                eprintln!(
+                    "autoplay {:.1} s: outside a region the scripts keep her in: stepping in at {inside:.1}",
+                    self.clock
+                );
+            }
+            return self.walk(game, inside, STEP_IN_ARRIVE, dt);
         }
         match self.goal.clone() {
             None => self.idle(game, dt),
@@ -2039,6 +2161,24 @@ impl Autoplay {
                 format!(
                     "getting back into the {} at the wheel for the race",
                     game.scene.vehicles[i].spec.label
+                ),
+            ));
+        }
+        // Her weapons put away by the scripts and a strike to call (the
+        // airstrike challenge, PmcCon018: weapons off, two practice laser
+        // strikes, points for the vehicles and barrels it spawns): the
+        // thickest knot of what they wait to die, within her bounds.
+        // So too while her goal is held outside her bounds (the 11-27
+        // checks: its marker 106 m out, she stood at the edge 540 s with
+        // a practice laser in the menu and never called it).
+        if self.strike_scored(game)
+            && let Some((target, at, n)) = strike_knot(&self.death_watched, &self.keep)
+        {
+            return Some((
+                Goal::Blast { target, at },
+                format!(
+                    "striking {target:#x} and {} more the scripts score, by it",
+                    n - 1
                 ),
             ));
         }
@@ -2817,8 +2957,12 @@ impl Autoplay {
                             && !game.scene.props.carrying(i)
                     })
                     .filter_map(|(i, _)| {
-                        let d = vehicle_at(game, i)?.w_axis.truncate().distance(m.at);
-                        (d < TAKE_NEAR).then_some((i, d))
+                        let at = vehicle_at(game, i)?.w_axis.truncate();
+                        let d = at.distance(m.at);
+                        // Not one standing outside her bounds: going for it
+                        // takes her out (PmcCon018, the 11-27 check of #811:
+                        // out by 36.9 s walking to an M151, cancelled 10 s on).
+                        (d < TAKE_NEAR && within(&self.keep, at)).then_some((i, d))
                     })
                     .min_by(|a, b| a.1.total_cmp(&b.1))
                     .map(|(i, _)| i)
@@ -3112,8 +3256,30 @@ impl Autoplay {
         }
     }
 
-    /// Gets to `at`, on foot or in the vehicle she is in.
+    /// Gets to `at`, on foot or in the vehicle she is in; within the
+    /// regions the scripts keep her in ([`keep_goal`]).
     fn travel(&mut self, game: &mut Game, at: Vec3, arrive: f32, dt: f32) -> Intent {
+        let at = match game.scene.player.as_ref() {
+            Some(p) => {
+                let goal = keep_goal(&self.keep, p.character.position, at);
+                let held = goal.distance(at) > 0.5;
+                match (held, self.held_since) {
+                    (true, None) => self.held_since = Some(self.clock),
+                    (false, Some(_)) => self.held_since = None,
+                    _ => {}
+                }
+                if held && self.clamp_said.is_none_or(|s| s.distance(goal) > 5.0) {
+                    eprintln!(
+                        "autoplay {:.1} s: keeping inside the scripts' boundary: going to {goal:.1} \
+                         rather than {at:.1}",
+                        self.clock
+                    );
+                    self.clamp_said = Some(goal);
+                }
+                goal
+            }
+            None => at,
+        };
         match game.scene.player.as_ref().and_then(|p| p.driving) {
             Some(i) => self.drive(game, i, at, arrive, dt),
             None => self.walk(game, at, arrive, dt),
@@ -3126,6 +3292,7 @@ impl Autoplay {
         let Some(here) = game.scene.player.as_ref().map(|p| p.character.position) else {
             return Intent::default();
         };
+        let at = keep_goal(&self.keep, here, at);
         let d = (at - here).with_y(0.0).length();
         let mut target = self.waypoint(game, None, here, at, RUN);
         if self.headway(game, at, self.left_to_go(here, at)) {
@@ -4795,6 +4962,19 @@ impl Autoplay {
         let Some(p) = game.scene.player.as_ref() else {
             return Intent::default();
         };
+        if p.driving.is_none()
+            && let Some(at) = vehicle_at(game, i).map(|m| m.w_axis.truncate())
+            && !within(&self.keep, at)
+            && !self.left_rides.contains(&i)
+        {
+            eprintln!(
+                "autoplay {:.1} s: the {} stands outside the scripts' boundary: left",
+                self.clock, game.scene.vehicles[i].spec.label
+            );
+            self.left_rides.push(i);
+            self.goal = None;
+            return Intent::default();
+        }
         if let Some(other) = p.driving {
             let speed = vehicle_state(game, other).map_or(0.0, |s| s.1);
             return self.press(speed);
@@ -6421,9 +6601,55 @@ fn strike_line(entries: &[Entry<'_>]) -> Option<usize> {
     entries.iter().position(|e| match e {
         Entry::Own(_) => true,
         // The scripts' own satellite guided bomb (the first contract's
-        // `VzaCon01_SatBomb`, #637): called in as theirs.
-        Entry::Stocked(s) => s.count > 0 && crate::support::Kind::from_freebie(&s.key).is_some(),
+        // `VzaCon01_SatBomb`, #637), and their laser-guided strikes
+        // (PmcCon018's "Practice Laser" freebies): called in as theirs.
+        Entry::Stocked(s) => {
+            s.count > 0
+                && (crate::support::Kind::from_freebie(&s.key).is_some()
+                    || s.key.to_ascii_lowercase().contains("laser"))
+        }
     })
+}
+
+/// Seconds her goal is held outside her bounds before the scripts' scored
+/// objects are struck instead (invented).
+const HELD_FOR: f32 = 5.0;
+
+impl Autoplay {
+    /// Whether what the scripts score is to be struck now: a strike in
+    /// the menu, on foot or driving (not swimming), with her weapons put
+    /// away by the scripts or her goal held outside her bounds for
+    /// [`HELD_FOR`].
+    fn strike_scored(&self, game: &Game) -> bool {
+        let Some(p) = game.scene.player.as_ref() else {
+            return false;
+        };
+        let held = self.held_since.is_some_and(|t| self.clock - t > HELD_FOR);
+        !p.swimming()
+            && (p.weapons_away() || held)
+            && strike_line(&game.support.entries()).is_some()
+    }
+}
+
+/// A strike's reach for counting what it takes with it (metres; invented:
+/// about a laser strike's blast).
+const KNOT_REACH: f32 = 15.0;
+
+/// Of `watched` (what the scripts wait to die, and where), the one with
+/// the most others within [`KNOT_REACH`] and inside `keep` (all, if none
+/// is kept): it, where, and how many it takes in. `None` for none.
+fn strike_knot(watched: &[(u32, Vec3)], keep: &[Keep]) -> Option<(u32, Vec3, usize)> {
+    let inside = |at: Vec3| keep.is_empty() || keep.iter().any(|k| k.holds(at));
+    let ours: Vec<&(u32, Vec3)> = watched.iter().filter(|(_, at)| inside(*at)).collect();
+    ours.iter()
+        .map(|(g, at)| {
+            let n = ours
+                .iter()
+                .filter(|(_, b)| b.distance(*at) <= KNOT_REACH)
+                .count();
+            (*g, *at, n)
+        })
+        .max_by(|a, b| a.2.cmp(&b.2).then(b.0.cmp(&a.0)))
 }
 
 /// Seconds she leaves the menu shut after calling one of the scripts'
@@ -7284,6 +7510,7 @@ mod tests {
         assert!((spot.y - 20.0).abs() < 0.1, "not on the roof: {spot}");
         // Bounds that end short of where it can be seen from: nowhere.
         let keep = Keep {
+            guid: 1,
             region: m2_assets::region::Region {
                 flags: 0,
                 unk_0x04: 0,
@@ -7666,6 +7893,143 @@ mod tests {
             seat_link: None,
             turret: None,
         }
+    }
+
+    fn square(half: f32) -> Keep {
+        Keep {
+            guid: 7,
+            region: m2_assets::region::Region {
+                flags: 0,
+                unk_0x04: 0,
+                corners: vec![[-half, -half], [half, -half], [half, half], [-half, half]],
+            },
+            centre: [100.0, 200.0],
+            yaw: 0.0,
+        }
+    }
+
+    /// PmcCon032: outside its gallery border (a pentagon about 2.65 m round
+    /// its middle) she steps to its middle; inside it, or with nothing
+    /// kept, nowhere.
+    #[test]
+    fn she_steps_into_a_border_she_is_outside() {
+        let border = Keep {
+            guid: 0x12d359,
+            region: m2_assets::region::Region {
+                flags: 0,
+                unk_0x04: 0,
+                corners: vec![
+                    [0.0, 2.65],
+                    [2.5, 0.8],
+                    [1.6, -2.1],
+                    [-1.6, -2.1],
+                    [-2.5, 0.8],
+                ],
+            },
+            centre: [2753.4, -753.1],
+            yaw: 0.0,
+        };
+        let out = Vec3::new(2757.2, -14.0, -751.5);
+        assert_eq!(
+            step_in_point(std::slice::from_ref(&border), out, false),
+            Some(Vec3::new(2753.4, -14.0, -753.1))
+        );
+        let inside = Vec3::new(2753.6, -14.0, -753.0);
+        assert!(border.holds(inside));
+        assert_eq!(
+            step_in_point(std::slice::from_ref(&border), inside, false),
+            None
+        );
+        assert_eq!(step_in_point(&[], out, false), None);
+        // The 11-27 log's shape: the contract's wide region holds her too.
+        let wide = Keep {
+            guid: 0x12d300,
+            region: m2_assets::region::Region {
+                flags: 0,
+                unk_0x04: 0,
+                corners: vec![
+                    [-200.0, -200.0],
+                    [200.0, -200.0],
+                    [200.0, 200.0],
+                    [-200.0, 200.0],
+                ],
+            },
+            centre: [2750.0, -750.0],
+            yaw: 0.0,
+        };
+        let both = [wide, border];
+        assert!(both[0].holds(out) && !both[1].holds(out));
+        // Fire free: held by the wide one, nothing to step into.
+        assert_eq!(step_in_point(&both, out, false), None);
+        // Fire locked: into the border she is outside of.
+        assert_eq!(
+            step_in_point(&both, out, true),
+            Some(Vec3::new(2753.4, -14.0, -753.1))
+        );
+        // Inside both, locked or not: nowhere.
+        assert_eq!(step_in_point(&both, inside, true), None);
+    }
+
+    /// PmcCon018: kept within its boundary, a goal beyond it is brought
+    /// back inside; outside it (its out-of-bounds timer running), back to
+    /// its middle; with nothing kept, as asked.
+    #[test]
+    fn goals_keep_inside_the_scripts_boundary() {
+        let k = [square(50.0)];
+        let here = Vec3::new(100.0, 3.0, 200.0);
+        // Inside to inside: as asked.
+        let g = Vec3::new(130.0, 1.0, 220.0);
+        assert_eq!(keep_goal(&k, here, g), g);
+        // Inside to 106 m out: stopped short of the edge, on the way.
+        let far = Vec3::new(206.0, 1.0, 200.0);
+        let got = keep_goal(&k, here, far);
+        assert!(k[0].holds(got), "{got}");
+        assert!(
+            got.x > 140.0 && got.x < 150.0 && (got.z - 200.0).abs() < 1e-3,
+            "{got}"
+        );
+        // Outside (she left): back to its middle.
+        let out = Vec3::new(170.0, 2.0, 200.0);
+        assert_eq!(keep_goal(&k, out, far), Vec3::new(100.0, 2.0, 200.0));
+        // Nothing kept: as asked.
+        assert_eq!(keep_goal(&[], here, far), far);
+        // A vehicle by its edge is within; one past it is not.
+        assert!(within(&k, Vec3::new(145.0, 0.0, 200.0)));
+        assert!(!within(&k, Vec3::new(160.0, 0.0, 200.0)));
+        assert!(within(&[], Vec3::new(160.0, 0.0, 200.0)));
+    }
+
+    /// PmcCon018: the strike goes where most of what the scripts score
+    /// stands together, inside her bounds.
+    #[test]
+    fn the_strike_goes_to_the_thickest_knot_inside() {
+        let at = |x: f32, z: f32| Vec3::new(x, 0.0, z);
+        let watched = [
+            (1, at(0.0, 0.0)),
+            (2, at(100.0, 0.0)),
+            (3, at(105.0, 5.0)),
+            (4, at(95.0, -6.0)),
+            (5, at(500.0, 0.0)),
+            (6, at(505.0, 0.0)),
+            (7, at(498.0, 3.0)),
+            (8, at(502.0, -4.0)),
+        ];
+        assert_eq!(strike_knot(&watched, &[]).map(|k| k.2), Some(4));
+        // Bounds round the first two knots only: the three by 100 m.
+        let keep = Keep {
+            guid: 9,
+            region: m2_assets::region::Region {
+                flags: 0,
+                unk_0x04: 0,
+                corners: vec![[-20.0, -20.0], [150.0, -20.0], [150.0, 20.0], [-20.0, 20.0]],
+            },
+            centre: [0.0, 0.0],
+            yaw: 0.0,
+        };
+        let (_, spot, n) = strike_knot(&watched, &[keep]).unwrap();
+        assert_eq!(n, 3);
+        assert!(spot.x > 90.0 && spot.x < 110.0);
+        assert_eq!(strike_knot(&[], &[]), None);
     }
 
     #[test]

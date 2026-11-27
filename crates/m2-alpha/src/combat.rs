@@ -500,8 +500,11 @@ const MG_DAMAGE: f32 = 45.0;
 const MG_RANGE: f32 = 500.0;
 
 /// How far gunners riding with her shoot when their weapon gives no
-/// `WeaponHint` range, metres (invented).
-const GUNNER_RANGE: f32 = 120.0;
+/// `WeaponHint`, metres: the fire controller's range without a hint
+/// record (0x822C95D8 at 0x822CA79C: 80.0, 0x820BAF98), its least range
+/// then 0. From the 360 code. (A mind whose +0x14 top byte is 0 reaches
+/// 1.1 times its range, 0x82DE8C20; taken as on foot, so not a rider.)
+const GUNNER_RANGE: f32 = 80.0;
 /// Gunfire puts soldiers this close on alert. From the 360 code: each shot
 /// a gun fires posts its message (0x2C49ADC9, 0x82283A10), and every mind
 /// hears it as loud as 30 / (d + 30), d its distance from the shot's line
@@ -2963,6 +2966,30 @@ impl Combat {
         self.carbine_only();
         self.rifle_rounds = Rounds::of(rifle.clip, rifle.clip);
         self.rifle = rifle;
+    }
+
+    /// Hands her `gun` as the contract's scripts give it, by what it
+    /// fires: a gun that fires rounds in the rifle's place
+    /// ([`scripted_rifle`](Self::scripted_rifle)); a launcher (PmcCon032's
+    /// `Grenade Launcher`) in the launcher's, up, one clip in and nothing
+    /// in reserve, the rifle's place left empty, as she was handed nothing
+    /// else.
+    ///
+    /// From samples: what a weapon fires is its ammunition's template
+    /// (the grenade launcher's `GL Projectile`, a lobbed round that bursts),
+    /// whatever the scripts' list puts it first; in the rifle's place it
+    /// fired hit-scan rounds with no burst, and the statues never broke
+    /// (nightly 2026-11-26). Which of her places the 360 shows it in is
+    /// the port's model ([`Rifle::slot`]).
+    pub fn scripted_gun(&mut self, gun: Rifle) {
+        if gun.slot() == Weapon::Rifle {
+            self.scripted_rifle(gun);
+            return;
+        }
+        self.carbine_only();
+        self.rifle_rounds = Rounds::default();
+        let clip = gun.clip.max(1);
+        self.equip_gun(gun, clip);
     }
 
     /// Has her carry her own rifle `rifle` (free roam), full: a clip in
@@ -5499,7 +5526,7 @@ impl Combat {
     /// `MaxAimAngleAi` cone round the vehicle's nose (0x822CAB34; turning
     /// to face him otherwise is the driver's, here hers). Inferred: that
     /// the turret then turns at its record's speeds within its arc. Without a weapon hint,
-    /// [`GUNNER_RANGE`] (invented).
+    /// [`GUNNER_RANGE`] (the 360's range without a hint).
     fn gunners_fire(&mut self, f: &mut Field<'_>, dt: f32) {
         let Some(i) = f.player.driving.filter(|&i| i < f.vehicles.len()) else {
             self.gunner_wait.clear();
@@ -8428,6 +8455,27 @@ pub fn survival_check() -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// PmcCon032 hands her the grenade launcher alone: it goes up in the
+    /// launcher's place, a clip in, so it lobs its bursting rounds; a gun
+    /// that fires rounds still takes the rifle's place.
+    #[test]
+    fn a_scripted_launcher_is_held_as_a_launcher() {
+        use super::{Combat, Rifle, Rounds, Weapon};
+        let mut c = Combat::default();
+        let gl = Rifle::launcher(Weapon::GrenadeLauncher);
+        let clip = gl.clip.max(1);
+        c.scripted_gun(gl);
+        assert_eq!(c.weapon, Weapon::GrenadeLauncher);
+        assert_eq!(c.second, Some(Weapon::GrenadeLauncher));
+        assert_eq!(c.launcher_rounds, Some(Rounds::of(clip, clip)));
+        assert_eq!(c.rifle_rounds.total(), 0);
+        let mut c = Combat::default();
+        let rifle = c.carbine.clone();
+        c.scripted_gun(rifle);
+        assert_eq!(c.weapon, Weapon::Rifle);
+        assert_eq!(c.second, None);
+    }
+
     /// Knocked down for 5 s, she stands once that is past and her body
     /// has lain still half a second; tumbling, not before 19 s limp.
     #[test]

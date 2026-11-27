@@ -6145,11 +6145,30 @@ fn mission_for_screenshot(
                     a.support_denied = true;
                 }
                 support_denials = denials;
-                let keep = link.kept_within();
+                let deaths = link.deaths_watched(game);
+                if deaths.len() != a.death_watched.len() {
+                    eprintln!(
+                        "autoplay: the scripts wait for {} object(s) to die",
+                        deaths.len()
+                    );
+                }
+                a.death_watched = deaths;
+                // The boundaries she is kept within, and one she has left
+                // while the scripts wait for her to come back into it (an
+                // out-of-bounds timer running: PmcCon018 cancels 10 s on).
+                let mut keep = link.kept_within();
+                a.boundaries.extend(keep.iter().map(|k| k.guid));
+                let kept: Vec<u32> = keep.iter().map(|k| k.guid).collect();
+                keep.extend(
+                    link.entries_watched()
+                        .into_iter()
+                        .filter(|k| a.boundaries.contains(&k.guid) && !kept.contains(&k.guid)),
+                );
                 if keep.len() != a.keep.len() {
                     eprintln!(
-                        "autoplay: kept within {} region(s) the scripts watch her leave",
-                        keep.len()
+                        "autoplay: kept within {} region(s) the scripts watch her leave: {:x?}",
+                        keep.len(),
+                        keep.iter().map(|k| k.guid).collect::<Vec<_>>()
                     );
                 }
                 a.keep = keep;

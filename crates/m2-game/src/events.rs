@@ -615,17 +615,47 @@ impl Events {
         out
     }
 
+    /// The objects pending `ObjectDeath` events wait to die (PmcCon018's
+    /// spawned vehicles and barrels, each adding to its points when it
+    /// does), for the autoplay to know what the scripts score.
+    pub fn deaths_watched(&self, world: &dyn World) -> Vec<u32> {
+        let s = self.store.borrow();
+        let mut out: Vec<u32> = s
+            .pending
+            .iter()
+            .filter(|p| p.kind == "ObjectDeath")
+            .filter_map(|p| s.live(p))
+            .flat_map(|h| objects(&h.params, 1, world))
+            .filter(|&g| !world.died(g))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// The regions pending `Boundary` events wait for something to leave
     /// (mode `"exit"`: PmcCon034's `PMCCon034OutOfBounds`, which cancels
     /// the contract), for the autoplay to keep her within.
     pub fn exits_watched(&self, world: &dyn World) -> Vec<u32> {
+        self.boundaries_watched(world, "exit")
+    }
+
+    /// The regions pending `Boundary` events wait for something to come
+    /// into (mode `"enter"`): once she has left a region watched on
+    /// "exit", PmcCon018's scripts wait on "enter" instead while their
+    /// out-of-bounds timer runs (10 s, then the contract is cancelled).
+    pub fn entries_watched(&self, world: &dyn World) -> Vec<u32> {
+        self.boundaries_watched(world, "enter")
+    }
+
+    fn boundaries_watched(&self, world: &dyn World, mode: &str) -> Vec<u32> {
         let s = self.store.borrow();
         let mut out: Vec<u32> = s
             .pending
             .iter()
             .filter(|p| p.kind == "Boundary")
             .filter_map(|p| s.live(p))
-            .filter(|h| text(&h.params, 3).as_deref() == Some("exit"))
+            .filter(|h| text(&h.params, 3).as_deref() == Some(mode))
             .filter_map(|h| boundary_of(&h.params, world))
             .collect();
         out.sort_unstable();

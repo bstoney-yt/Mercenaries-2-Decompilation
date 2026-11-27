@@ -2896,10 +2896,22 @@ end
         self.events.sight_watched(&*self.world.borrow())
     }
 
+    /// The objects the scripts wait to die
+    /// ([`crate::events::Events::deaths_watched`]).
+    pub fn deaths_watched(&self) -> Vec<u32> {
+        self.events.deaths_watched(&*self.world.borrow())
+    }
+
     /// The regions pending `Boundary` events wait for something to leave
     /// ([`crate::events::Events::exits_watched`]).
     pub fn exits_watched(&self) -> Vec<u32> {
         self.events.exits_watched(&*self.world.borrow())
+    }
+
+    /// The regions the scripts wait for her to come into
+    /// ([`crate::events::Events::entries_watched`]).
+    pub fn entries_watched(&self) -> Vec<u32> {
+        self.events.entries_watched(&*self.world.borrow())
     }
 
     /// The objects the game found behind something solid from the camera
