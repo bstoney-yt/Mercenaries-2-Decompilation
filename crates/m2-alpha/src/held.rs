@@ -159,6 +159,9 @@ pub struct Moves {
     /// `RunStop`: the slide to a stop after a run, the whole body
     /// ([`m2_engine::on_foot::RunStop`]).
     pub run_stop: Option<usize>,
+    /// `KnockDown`: the fall into a knockdown, whose end leads to
+    /// `KnockedDown` `Idle` ([`crate::combat::KnockedHer::entering`]).
+    pub knockdown: Option<usize>,
     /// Carrying someone: standing, walking and running, the `Carrying`
     /// locomotion node's gaits ([`hero_action::CARRY_GAITS`]).
     pub carrying: [Option<usize>; 3],
@@ -493,6 +496,11 @@ pub fn resolve(
             .map(|i| by_action(i.name(), table::RIFLE)),
         pickup: by_action("PickupWeapon", table::RIFLE),
         run_stop: by_action(m2_engine::on_foot::RUN_STOP_ACTION, table::RIFLE),
+        // `KnockDown` has no row of its own: it plays the stand-in
+        // (0.3 s), whose end completes it (82801650, 82420A00).
+        knockdown: table::action_handle(actions, "Upright", "KnockDown")
+            .and_then(|h| table::handle_clip_or_stand_in(t, h, who, table::RIFLE, fits))
+            .and_then(|p| index(p.clip)),
         // The carry's rows name no class and no one.
         carrying: hero_action::CARRY_GAITS.map(|h| {
             let p = table::handle_clip(t, h, who, table::RIFLE, fits)?;
@@ -544,6 +552,7 @@ mod tests {
             fall_impacts: [None, None],
             pickup: Some(9),
             run_stop: None,
+            knockdown: None,
             carrying: [Some(20), Some(21), Some(22)],
             states: None,
         }
