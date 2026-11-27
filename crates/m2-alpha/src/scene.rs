@@ -865,7 +865,7 @@ impl Rig {
                 if let Some(p) = action_handle(actions, stance, action)
                     .and_then(|h| handle_clip(on_foot, h, who, class, |c| index(c).is_some()))
                 {
-                    theirs.insert(m2_assets::name_hash(action), p.clip);
+                    theirs.insert(npc::FightClips::action_key(stance, action), p.clip);
                 }
             }
         }
