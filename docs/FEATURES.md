@@ -50,7 +50,8 @@ and a feature counts as done when the scripts get what they ask for.
 | Melee, including bashing | partial | Shove strength and blow size invented (#698) |
 | Grappling hook (helicopter hijack) | done | `grapple.rs` |
 | Binoculars | partial | Camera from the 360 in open #724 |
-| Parachute | unknown | No code; check whether the game has one before treating it as missing |
+| Parachute (player) | not in the original | No player parachute in the scripts or templates (2026-11-27 search of vz.wad); the `ParachuteA` template and its model are the paratroopers' chute |
+| Paratroopers' parachute | partial | Their drop and chute-shedding run (#618, `paradrop_check.rs`); the chute's model (`ParachuteA`) is not drawn |
 
 ## Weapons and support
 
@@ -80,7 +81,7 @@ and a feature counts as done when the scripts get what they ask for.
 | Vehicle disguise | partial | Rules on main; how fast it drops and recovers invented (#698) |
 | Vehicle damage, wrecks, sinking | done | #667, #673 |
 | Crash damage to parts | partial | Tier 3 item R31 |
-| Car radio music | unknown | Outpost radios play (`music_source.rs`); in-car radio not checked |
+| Radios (HQ, outposts, PMC radio) | done | Placed music sources play their script-filled playlists (`music_source.rs`; the PMC HQ radio is `MrxMusic.SetPmcRadio` filling `mu_src_radio`). No in-vehicle radio exists in the scripts |
 
 ## Factions and relations
 
@@ -99,12 +100,12 @@ and a feature counts as done when the scripts get what they ask for.
 | Feature | Status | Evidence and what is left |
 |---|---|---|
 | Cash and fuel, pickups, payouts | done | Pickups in play; kept in the save |
-| Penalty for killing civilians | unknown | Scripts' rule; not checked |
+| Penalty for killing civilians | done in code | The faction manager charges it on `Event.ObjectDeath` "civ && human" when her character is the killer (`ResolveCivCasualty`, `ChargeCivCasualty`); the port passes her as the killer (`Mission::kill_by`). Not yet seen in a recorded run |
 | Faction shops, stock growing with contracts | done | `--shop-check` |
 | PMC HQ and its moves | partial | PMC HQ proven; HQ moves only reached with `--skip-to` (BETA_ROADMAP R11) |
 | Recruits: Ewan (pilot), Eva (mechanic), Misha (jet pilot) | partial | Recruit contracts run; MecCon001 and JetCon001 fail in the nightly |
 | Ewan: fly her out, pick-ups at captured outposts | partial | Pause menu's fly-out wired; outpost pick-ups not checked |
-| Spare parts for Eva | unknown | A guide lists 100 to collect; no code reference; check the scripts |
+| Spare parts (job PmcJob001) | partial | The scripts' collection job: 100 objects labelled `SpareParts`, collected by proximity (`MrxTaskJobCollectType`, `m2_game::jobs`); not yet completed in a recorded run |
 
 ## Story and side content
 
@@ -113,7 +114,7 @@ and a feature counts as done when the scripts get what they ask for.
 | 52 story contracts | partial | Nightly 2026-11-26: 18 run, 3 pass (VzaCon001, PmcCon002, OilCon003); most failures are the test bot stuck, not yet split into bot or game faults |
 | Story played through without developer skip | missing | Never attempted (BETA_READINESS E6) |
 | Acts, map opening up, consequences | partial | Scripts run; act changes not proven in one save |
-| Ending: final contract, movie, credits | unknown | Never reached |
+| Ending: final contract, movie, credits | partial | The scripts' own flow (`WifMissionFlow`): the cinematic, then the `credits` Flash movie until it sends `creditsEnd`, then back to the front end (`Net.QuitGame`). The port runs the scripts and plays both movies, but the sequence has never been reached in a run |
 | Outposts: take them, troops flown in | partial | Scripts and test-bot support exist; not counted |
 | HVTs: verify (photo) or capture (stow and extract) | partial | Verify photo and StowHVT action exist; capture flight not checked |
 | Additional targets: buildings and billboards | partial | `m2-game/jobs.rs` handles bounty and collection jobs |
