@@ -3923,7 +3923,15 @@ impl Autoplay {
                     .world
                     .as_ref()
                     .filter(|_| self.perch_tried.len() < PERCH_TRIES)
-                    .and_then(|w| perch(&w.physics, at, here, &self.perch_tried, &self.keep));
+                    .and_then(|w| {
+                        perch(
+                            &w.physics,
+                            &target_points(game, target, at),
+                            here,
+                            &self.perch_tried,
+                            &self.keep,
+                        )
+                    });
                 eprintln!(
                     "autoplay {:.1} s: no clear shot at {target:#x} from {here:.1}: {}",
                     self.clock,
@@ -5952,11 +5960,12 @@ fn vantage(
 /// the one nearest the target.
 fn perch(
     physics: &Physics,
-    target: Vec3,
+    targets: &[Vec3],
     from: Vec3,
     tried: &[Vec3],
     keep: &[Keep],
 ) -> Option<Vec3> {
+    let target = *targets.first()?;
     // Her level's ground at (x, z), if there is some.
     let ground = |x: f32, z: f32| {
         let top = Vec3::new(x, from.y + PERCH_LEVEL + 0.5, z);
@@ -5990,9 +5999,15 @@ fn perch(
             {
                 continue;
             }
+            // Any part of it in sight from there (PmcCon034, the 11-27
+            // check of #812: from the HQ roof no spot saw the 19th
+            // statue's foot, the one point tried, for 590 s).
             let eye = spot + Vec3::Y * 1.6;
-            let (dir, len) = ((target - eye).normalize_or_zero(), target.distance(eye));
-            if physics.cast_ray(eye, dir, (len - 1.5).max(0.0)).is_some() {
+            let seen = targets.iter().any(|&t| {
+                let (dir, len) = ((t - eye).normalize_or_zero(), t.distance(eye));
+                physics.cast_ray(eye, dir, (len - 1.5).max(0.0)).is_none()
+            });
+            if !seen {
                 continue;
             }
             let cost = spot.distance(target);
@@ -6199,6 +6214,15 @@ fn crossing(game: &Game, i: usize, m: Mat4) -> Option<usize> {
 /// of the L300 she was to destroy from all her roof). `None` for none.
 fn visible_part(game: &Game, g: u32, at: Vec3, eye: Vec3) -> Option<Vec3> {
     let w = game.scene.world.as_ref()?;
+    target_points(game, g, at).into_iter().find(|&p| {
+        let (dir, len) = ((p - eye).normalize_or_zero(), p.distance(eye));
+        w.physics.cast_ray(eye, dir, (len - 1.5).max(0.0)).is_none()
+    })
+}
+
+/// Points of target `g` (a vehicle or a prop, standing at `at`) a shot may
+/// be aimed at: `at`, then its box's middle, sides and top.
+fn target_points(game: &Game, g: u32, at: Vec3) -> Vec<Vec3> {
     let placed = game
         .scene
         .vehicles
@@ -6213,10 +6237,7 @@ fn visible_part(game: &Game, g: u32, at: Vec3, eye: Vec3) -> Option<Vec3> {
             points.push(m.transform_point3(c + d * h));
         }
     }
-    points.into_iter().find(|&p| {
-        let (dir, len) = ((p - eye).normalize_or_zero(), p.distance(eye));
-        w.physics.cast_ray(eye, dir, (len - 1.5).max(0.0)).is_none()
-    })
+    points
 }
 
 fn vehicle_at(game: &Game, i: usize) -> Option<Mat4> {
@@ -7550,7 +7571,7 @@ mod tests {
             p.cast_ray(eye, dir, eye.distance(target) - 1.5).is_some(),
             "the roof hides it from its middle"
         );
-        let spot = perch(&p, target, from, &[], &[]).expect("somewhere on the roof");
+        let spot = perch(&p, &[target], from, &[], &[]).expect("somewhere on the roof");
         assert!(spot.z > 4.0 && spot.z < 10.0, "not by the edge: {spot}");
         assert!((spot.y - 20.0).abs() < 0.1, "not on the roof: {spot}");
         // Bounds that end short of where it can be seen from: nowhere.
@@ -7565,7 +7586,26 @@ mod tests {
             yaw: 0.0,
         };
         assert!(keep.holds(from) && !keep.holds(spot));
-        assert_eq!(perch(&p, target, from, &[], &[keep]), None);
+        assert_eq!(perch(&p, &[target], from, &[], &[keep]), None);
+        // Its foot hidden by a wall by it, its top above the wall in sight:
+        // a spot is found from its top (PmcCon034's 19th statue).
+        let wall = quad(
+            Vec3::new(-5.0, 0.0, 58.0),
+            Vec3::new(5.0, 0.0, 58.0),
+            Vec3::new(5.0, 3.0, 58.0),
+            Vec3::new(-5.0, 3.0, 58.0),
+        );
+        p.add_static(StaticKey::Cell(3), &wall, Vec3::ZERO, Quat::IDENTITY);
+        p.step(1.0 / 60.0);
+        let foot = Vec3::new(0.0, 0.5, 60.0);
+        let top = Vec3::new(0.0, 4.0, 60.0);
+        assert_eq!(
+            perch(&p, &[foot], from, &[], &[]),
+            None,
+            "its foot is hidden from everywhere"
+        );
+        let spot = perch(&p, &[foot, top], from, &[], &[]).expect("its top is seen");
+        assert!((spot.y - 20.0).abs() < 0.1, "{spot}");
     }
 
     // Ground under the sea (round 6's riverbed): no spot to fire from.
