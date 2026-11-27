@@ -51,7 +51,7 @@ and a feature counts as done when the scripts get what they ask for.
 | Grappling hook (helicopter hijack) | done | `grapple.rs` |
 | Binoculars | partial | Camera from the 360 in open #724 |
 | Parachute (player) | not in the original | No player parachute in the scripts or templates (2026-11-27 search of vz.wad); the `ParachuteA` template and its model are the paratroopers' chute |
-| Paratroopers' parachute | partial | Their drop and chute-shedding run (#618, `paradrop_check.rs`); the chute's model (`ParachuteA`) is not drawn |
+| Paratroopers' parachute | not in the original | The shipped game never drops paratroopers in normal play (no script spawns them or the paradrop plane; the placed paradrop locations name a template that does not exist), and the data has no chute model. The port runs the paradrop scripts when asked (#618) |
 
 ## Weapons and support
 
@@ -65,7 +65,7 @@ and a feature counts as done when the scripts get what they ask for.
 | Explosions: damage, push, rays | partial | Push on vehicles from the 360 (#728, #768); rays for all targets in open #758, #761 |
 | Support menu: buy in shops, call in with designators | done | `support.rs`, `--shop-check` covers the whole catalogue |
 | Air strikes, satellite bomb, bunker buster | done | `strikes.rs`, `m2-game/airstrike.rs` |
-| Helicopter deliveries (crates, vehicles) | partial | Flight path, heights and hover time invented (`flights.rs`) |
+| Helicopter deliveries (crates, vehicles) | partial | The flight is the 360's AI pilot task `HeliDeliver` (`heli_pilot.rs`); a vehicle load hangs on the helicopter's own winch cable and is let go by it (`winches.rs`). A crate still hangs rigidly under the hook (invented: the cable hooks vehicles only), as does any load before the helicopter's model loads |
 | Air defenses (SAM, AA) blocking support | done | Markers and script rules run (AllCon003, #688) |
 
 ## Vehicles
