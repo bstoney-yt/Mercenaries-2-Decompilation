@@ -3095,6 +3095,12 @@ impl Autoplay {
                 && !vehicles[i].guid.is_some_and(|g| {
                     live.iter().any(|m| m.target == g && m.kind == "destroy")
                 })
+                // Nor one standing in the water, if not a boat's (#809's
+                // 11-27 check of PmcCon031: she jumped for the flung R90,
+                // which lay on the water and sank under her, fell 11.7 m
+                // into the sea, swam out of the scripts' LR_PMCOOB and the
+                // contract was cancelled at 140.3 s).
+                && !game.vehicle_in_water(i)
                 && vehicle_at(game, i).is_some_and(|t| t.w_axis.truncate().distance(here) < within)
         };
         // The one she set out for while it is still close (round 6 turned
