@@ -1058,6 +1058,10 @@ pub struct Autoplay {
     perch_tried: Vec<Vec3>,
     /// The last goal she was kept inside a boundary to (logged once).
     clamp_said: Option<Vec3>,
+    /// Since when her goal has lain outside the regions she is kept in
+    /// (she is held at their edge): other actions may take over meanwhile
+    /// (PmcCon018: its marker 106 m out, she stood at the edge 540 s).
+    pub(crate) held_since: Option<f32>,
     /// Where she is swimming to climb out of the water (see [`landing`]).
     landing: Option<Vec3>,
     /// Searches in a row for a spot to fire from that found none, and the
@@ -3184,8 +3188,13 @@ impl Autoplay {
         let at = match game.scene.player.as_ref() {
             Some(p) => {
                 let goal = keep_goal(&self.keep, p.character.position, at);
-                if goal.distance(at) > 0.5 && self.clamp_said.is_none_or(|s| s.distance(goal) > 5.0)
-                {
+                let held = goal.distance(at) > 0.5;
+                match (held, self.held_since) {
+                    (true, None) => self.held_since = Some(self.clock),
+                    (false, Some(_)) => self.held_since = None,
+                    _ => {}
+                }
+                if held && self.clamp_said.is_none_or(|s| s.distance(goal) > 5.0) {
                     eprintln!(
                         "autoplay {:.1} s: keeping inside the scripts' boundary: going to {goal:.1} \
                          rather than {at:.1}",
