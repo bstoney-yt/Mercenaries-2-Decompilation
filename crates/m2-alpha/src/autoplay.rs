@@ -2206,7 +2206,12 @@ impl Autoplay {
         // So too while her goal is held outside her bounds (the 11-27
         // checks: its marker 106 m out, she stood at the edge 540 s with
         // a practice laser in the menu and never called it).
-        if self.strike_scored(game)
+        // Not off a contract with one on offer, though: the contract
+        // comes first, as below (the sniper3 check of PmcCon034, 11-27:
+        // her weapons put away by its cancel, she called satellite strikes
+        // on PmcJob001's targets for 600 s instead of taking it again).
+        if self.on_offer.is_empty()
+            && self.strike_scored(game)
             && let Some((target, at, n)) = strike_knot(&self.death_watched, &self.keep)
         {
             return Some((

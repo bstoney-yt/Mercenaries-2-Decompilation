@@ -2230,10 +2230,11 @@ fn build_scene(
 const AUTOPLAY_RETRIES: u32 = 8;
 
 /// Whether autoplay takes Retry on a failed contract's fanfare: when a
-/// retry save is kept for it and she has retried fewer than
-/// [`AUTOPLAY_RETRIES`] times; otherwise Continue.
-fn retry_or_continue(kept: bool, retries: u32) -> bool {
-    kept && retries < AUTOPLAY_RETRIES
+/// retry save is kept for it, the fanfare lets a Retry retry (`allowed`,
+/// [`mission::MissionLink::fanfare_allows_retry`]: not a wager's) and she
+/// has retried fewer than [`AUTOPLAY_RETRIES`] times; otherwise Continue.
+fn retry_or_continue(kept: bool, allowed: bool, retries: u32) -> bool {
+    kept && allowed && retries < AUTOPLAY_RETRIES
 }
 
 /// Free roam: the island's vehicles, people and state layers are those
@@ -7552,7 +7553,8 @@ fn mission_for_screenshot(
             && let Some(seq) = link.waiting_fanfare()
         {
             continue_due = None;
-            if retry_or_continue(link.has_retry(), retries) {
+            let allowed = link.fanfare_allows_retry(seq);
+            if retry_or_continue(link.has_retry(), allowed, retries) {
                 retries += 1;
                 eprintln!(
                     "autoplay: she takes Retry on the failed contract's fanfare (HUD call {seq}, retry {retries})"
@@ -7560,7 +7562,12 @@ fn mission_for_screenshot(
                 link.answer_fanfare(seq, true);
             } else {
                 eprintln!(
-                    "autoplay: she takes Continue on the failed contract's fanfare (HUD call {seq})"
+                    "autoplay: she takes Continue on the failed contract's fanfare (HUD call {seq}){}",
+                    if allowed {
+                        ""
+                    } else {
+                        ": it offers no Retry (a wager)"
+                    }
                 );
                 link.answer_fanfare(seq, false);
             }
@@ -16607,10 +16614,17 @@ mod tests {
 
     #[test]
     fn autoplay_retries_a_failed_contract_only_with_a_retry_save_and_not_forever() {
-        assert!(retry_or_continue(true, 0));
-        assert!(retry_or_continue(true, AUTOPLAY_RETRIES - 1));
-        assert!(!retry_or_continue(true, AUTOPLAY_RETRIES));
-        assert!(!retry_or_continue(false, 0), "no retry save: Continue");
+        assert!(retry_or_continue(true, true, 0));
+        assert!(retry_or_continue(true, true, AUTOPLAY_RETRIES - 1));
+        assert!(!retry_or_continue(true, true, AUTOPLAY_RETRIES));
+        assert!(
+            !retry_or_continue(false, true, 0),
+            "no retry save: Continue"
+        );
+        assert!(
+            !retry_or_continue(true, false, 0),
+            "a wager's fanfare: Continue"
+        );
     }
 
     #[test]
