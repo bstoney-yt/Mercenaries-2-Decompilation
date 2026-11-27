@@ -945,6 +945,23 @@ const STEP_IN_ARRIVE: f32 = 0.5;
 /// (metres; invented).
 const KEEP_MARGIN: f32 = 4.0;
 
+/// Rounds struck short of a target in a row before her eye's line to it is
+/// no longer trusted (invented).
+const SHORT_GIVE_UP: u32 = 5;
+
+/// How many of `struck` (this step's rounds and blows on the world) landed
+/// short of `target` on her side of it, as seen from `eye`: nearer her
+/// than half the way, and more than [`SHOT_SHORT`] from it. Invented: a
+/// strike that near her and that far from it is one of hers that met
+/// something in between.
+fn short_strikes(struck: &[crate::combat::Strike], eye: Vec3, target: Vec3) -> u32 {
+    let way = eye.distance(target);
+    struck
+        .iter()
+        .filter(|s| s.at.distance(eye) < way * 0.5 && s.at.distance(target) > SHOT_SHORT)
+        .count() as u32
+}
+
 /// A round of hers that would strike something this much short of the
 /// target (metres) has no clear shot at it (invented: more than a
 /// statue's depth).
@@ -1077,6 +1094,11 @@ pub struct Autoplay {
     rifle_kind: Option<u32>,
     /// The target whose shot she judges by her eye's line, not her aim's.
     trust_sight: Option<u32>,
+    /// A target whose shots from her eye's line struck short anyway: her
+    /// sight is not taken over her aim for it again ([`short_strikes`]).
+    distrust: Option<u32>,
+    /// Her rounds that struck short of the trusted target so far.
+    short_hits: u32,
     /// Whether her rifle, last aimed, had no clear shot (and nowhere on
     /// her level to see the target from).
     blocked_logged: bool,
@@ -3954,6 +3976,7 @@ impl Autoplay {
             // round 34: 122 spots on the MG platform in 150 s, each in
             // sight at once; the columns fall to her rounds from there).
             if seen
+                && self.distrust != Some(target)
                 && self
                     .perch_tried
                     .last()
@@ -3963,6 +3986,28 @@ impl Autoplay {
             }
             self.perch = None;
             self.steady = 0.0;
+        }
+        // Her sight taken over her aim, but her rounds strike short all the
+        // same (PmcCon034, the 11-26 nightly: 362 rounds into the roof she
+        // stood on, batch 0xd3c77, the statue 98 m off and 35 m below):
+        // that sight is not trusted again for this target, and she looks
+        // for another spot.
+        if self.trust_sight == Some(target) {
+            self.short_hits += short_strikes(&game.combat.struck, p.eye(), at);
+            if self.short_hits >= SHORT_GIVE_UP {
+                eprintln!(
+                    "autoplay {:.1} s: {} of her rounds struck short of {target:#x} from \
+                     [{:.1}, {:.1}, {:.1}]: her sight no longer trusted there",
+                    self.clock, self.short_hits, here.x, here.y, here.z
+                );
+                self.trust_sight = None;
+                self.distrust = Some(target);
+                self.perch_tried.push(here);
+                self.short_hits = 0;
+                self.steady = 0.0;
+            }
+        } else {
+            self.short_hits = 0;
         }
         // Only her time with a clear shot counts toward giving it up.
         let short = self.blocked_logged;
@@ -8030,6 +8075,31 @@ mod tests {
         assert_eq!(n, 3);
         assert!(spot.x > 90.0 && spot.x < 110.0);
         assert_eq!(strike_knot(&[], &[]), None);
+    }
+
+    /// PmcCon034: her rounds into the roof by her count as short; one on
+    /// the statue, or far from her, doesn't.
+    #[test]
+    fn rounds_on_her_own_roof_strike_short() {
+        let strike = |at: Vec3| crate::combat::Strike {
+            at,
+            damage: 10.0,
+            key: None,
+            round: 10.0,
+            kind: 0,
+        };
+        let eye = Vec3::new(2616.6, 23.8, -981.4);
+        let statue = Vec3::new(2687.0, -12.9, -1039.8);
+        let roof = Vec3::new(2621.0, 21.5, -985.0);
+        let near_it = statue + Vec3::new(1.0, 0.5, 0.0);
+        let far_off = Vec3::new(2900.0, 0.0, -700.0);
+        let got = short_strikes(
+            &[strike(roof), strike(near_it), strike(far_off)],
+            eye,
+            statue,
+        );
+        assert_eq!(got, 1);
+        assert_eq!(short_strikes(&[], eye, statue), 0);
     }
 
     #[test]
