@@ -910,6 +910,11 @@ pub fn keep_goal(keep: &[Keep], here: Vec3, goal: Vec3) -> Vec3 {
     Vec3::new(out.x, goal.y, out.z)
 }
 
+/// Whether `at` lies inside the regions in `keep` (anywhere, with none kept).
+fn within(keep: &[Keep], at: Vec3) -> bool {
+    keep.is_empty() || keep.iter().any(|k| k.holds(at))
+}
+
 /// How far inside a kept region's edge she stops short of a goal beyond it
 /// (metres; invented).
 const KEEP_MARGIN: f32 = 4.0;
@@ -1797,6 +1802,17 @@ impl Autoplay {
                 use_pressed: true,
                 ..Intent::default()
             };
+        }
+        // At the wheel outside every region she is kept in (the scripts'
+        // out-of-bounds timer running): straight back in, before anything
+        // else.
+        if let Some(p) = game.scene.player.as_ref()
+            && p.driving.is_some()
+            && !self.keep.is_empty()
+            && !within(&self.keep, p.character.position)
+        {
+            let home = keep_goal(&self.keep, p.character.position, p.character.position);
+            return self.travel(game, home, ARRIVE, dt);
         }
         match self.goal.clone() {
             None => self.idle(game, dt),
@@ -2863,8 +2879,12 @@ impl Autoplay {
                             && !game.scene.props.carrying(i)
                     })
                     .filter_map(|(i, _)| {
-                        let d = vehicle_at(game, i)?.w_axis.truncate().distance(m.at);
-                        (d < TAKE_NEAR).then_some((i, d))
+                        let at = vehicle_at(game, i)?.w_axis.truncate();
+                        let d = at.distance(m.at);
+                        // Not one standing outside her bounds: going for it
+                        // takes her out (PmcCon018, the 11-27 check of #811:
+                        // out by 36.9 s walking to an M151, cancelled 10 s on).
+                        (d < TAKE_NEAR && within(&self.keep, at)).then_some((i, d))
                     })
                     .min_by(|a, b| a.1.total_cmp(&b.1))
                     .map(|(i, _)| i)
@@ -3189,6 +3209,7 @@ impl Autoplay {
         let Some(here) = game.scene.player.as_ref().map(|p| p.character.position) else {
             return Intent::default();
         };
+        let at = keep_goal(&self.keep, here, at);
         let d = (at - here).with_y(0.0).length();
         let mut target = self.waypoint(game, None, here, at, RUN);
         if self.headway(game, at, self.left_to_go(here, at)) {
@@ -4858,6 +4879,19 @@ impl Autoplay {
         let Some(p) = game.scene.player.as_ref() else {
             return Intent::default();
         };
+        if p.driving.is_none()
+            && let Some(at) = vehicle_at(game, i).map(|m| m.w_axis.truncate())
+            && !within(&self.keep, at)
+            && !self.left_rides.contains(&i)
+        {
+            eprintln!(
+                "autoplay {:.1} s: the {} stands outside the scripts' boundary: left",
+                self.clock, game.scene.vehicles[i].spec.label
+            );
+            self.left_rides.push(i);
+            self.goal = None;
+            return Intent::default();
+        }
         if let Some(other) = p.driving {
             let speed = vehicle_state(game, other).map_or(0.0, |s| s.1);
             return self.press(speed);
@@ -7768,6 +7802,10 @@ mod tests {
         assert_eq!(keep_goal(&k, out, far), Vec3::new(100.0, 2.0, 200.0));
         // Nothing kept: as asked.
         assert_eq!(keep_goal(&[], here, far), far);
+        // A vehicle by its edge is within; one past it is not.
+        assert!(within(&k, Vec3::new(145.0, 0.0, 200.0)));
+        assert!(!within(&k, Vec3::new(160.0, 0.0, 200.0)));
+        assert!(within(&[], Vec3::new(160.0, 0.0, 200.0)));
     }
 
     #[test]
