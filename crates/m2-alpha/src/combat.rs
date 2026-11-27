@@ -4169,14 +4169,14 @@ impl Combat {
         // holder was within a few metres (seen in the --homing-check run:
         // no lock from 40 m, one at 7 m).
         let (lo, hi) = v.spec.bounds;
-        let at = f
-            .physics
-            .vehicle_transform(id)?
-            .transform_point3((lo + hi) * 0.5);
+        let place = f.physics.vehicle_transform(id)?;
+        let at = place.transform_point3((lo + hi) * 0.5);
         Some(crate::homing::Mark {
             id,
             at,
             radius: (hi - lo).length() * 0.5,
+            // Its box, as the 360's cone measures a target (0x822938C0).
+            shape: Some((place, lo, hi)),
             signature,
         })
     }

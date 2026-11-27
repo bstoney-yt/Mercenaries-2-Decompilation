@@ -58,13 +58,19 @@
 //! fired on a lock is an object of theirs while it flies, so
 //! `HomingMissile` blips it (m2-game `mission::homing`).
 //!
-//! **Invented / approximated:** the target is a sphere of its vehicle's
-//! bounds (0x822938C0 measures to its box); the line of sight is the port's
+//! - The cone measures a target to its box: the aim ray's point abreast
+//!   of it, taken into the target's own space, against the box there
+//!   (0x828561A8, 0x82855318: squared distance against the reach squared;
+//!   [`Shape::Box`]).
+//!
+//! **Invented / approximated:** which point of the target its distance
+//! and direction are taken to (the port's box middle; the 360's record
+//! keeps a point at +0x3C, not traced to what fills it); the line of sight is the port's
 //! ray to it; soldiers aim straight at the vehicle (so their cone always
 //! holds while they see it); a soldier's named target lasts the 3 s of
 //! 0x822AE598 (0x822C95D8's own time is not read).
 
-use m2_math::glam::{Quat, Vec3};
+use m2_math::glam::{Mat4, Quat, Vec3};
 
 /// A reset lock's time left (`FLT_MAX`, 0x820F8BFC).
 pub const CLEARED: f32 = f32::MAX;
@@ -243,12 +249,30 @@ impl Cone {
     /// Its score for a target at `at` of `radius` and `signature`
     /// (ground, air), from `origin` aiming along unit `dir`, if the target
     /// is in its cone (0x822938C0).
+    #[cfg(test)]
     pub fn score(
         &self,
         origin: Vec3,
         dir: Vec3,
         at: Vec3,
         radius: f32,
+        signature: [f32; 2],
+    ) -> Option<f32> {
+        self.score_shaped(origin, dir, at, Shape::Sphere(radius), signature)
+    }
+
+    /// As [`score`](Self::score), the target measured as `shape`: the
+    /// 360's cone takes the point of the aim ray abreast of the target into
+    /// the target's own space (0x828561A8 with its transform, +0x04 of
+    /// its record) and tests the squared distance from it to the target's
+    /// box (0x82855318 with its box, +0x24) against the cone's reach
+    /// squared (0x822938C0).
+    pub fn score_shaped(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        at: Vec3,
+        shape: Shape,
         signature: [f32; 2],
     ) -> Option<f32> {
         let sig = match self.kind {
@@ -271,13 +295,36 @@ impl Cone {
         let along = d / cos.max(1e-6);
         let abreast = origin + dir * along;
         let reach = self.cone.tan() * along;
-        let gap = (abreast.distance(at) - radius).max(0.0);
-        if gap > reach {
+        let gap2 = match shape {
+            Shape::Sphere(radius) => (abreast.distance(at) - radius).max(0.0).powi(2),
+            Shape::Box(place, lo, hi) => box_distance_sq(place, lo, hi, abreast),
+        };
+        if gap2 > reach * reach {
             return None;
         }
         let score = SCORE[0] * cos + SCORE[1] * (1.0 - d / self.range) + SCORE[2] * sig;
         (score > 0.0).then_some(score)
     }
+}
+
+/// What a homing weapon's cone measures a target as.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Shape {
+    /// A ball of this radius round its point.
+    Sphere(f32),
+    /// Its box, `lo`..`hi` in its own space, placed in the world by the
+    /// matrix (model to world), as the 360's cone takes it.
+    Box(Mat4, Vec3, Vec3),
+}
+
+/// The squared distance from `p` (world) to the box `lo`..`hi` placed by
+/// `place`: 0 inside it.
+pub fn box_distance_sq(place: Mat4, lo: Vec3, hi: Vec3, p: Vec3) -> f32 {
+    let local = place.inverse().transform_point3(p);
+    let nearest = local.clamp(lo, hi);
+    // The box's own scale is the model's: measured in the world.
+    let world = place.transform_point3(nearest);
+    world.distance_squared(p)
 }
 
 /// A missile's homing (0x82293280's record).
@@ -575,8 +622,11 @@ impl ScriptSide {
 pub struct Mark<T> {
     pub id: T,
     pub at: Vec3,
-    /// Half its bounds' diagonal (the sphere taken for its box).
+    /// Half its bounds' diagonal, for a target with no box.
     pub radius: f32,
+    /// Its box in its own space and where that stands: what the cone
+    /// measures (0x822938C0); `None` measures the sphere.
+    pub shape: Option<(Mat4, Vec3, Vec3)>,
     /// Ground and air signatures (`HomingTarget`).
     pub signature: [f32; 2],
 }
@@ -623,7 +673,10 @@ impl<T: Copy + PartialEq> Seeking<T> {
         let seen = mark.filter(|_| named).and_then(|m| {
             let dir = (m.at - from).normalize_or(Vec3::Z);
             let cone = Cone::of(seeker, true);
-            cone.score(from, dir, m.at, m.radius, m.signature)?;
+            let shape = m
+                .shape
+                .map_or(Shape::Sphere(m.radius), |(p, lo, hi)| Shape::Box(p, lo, hi));
+            cone.score_shaped(from, dir, m.at, shape, m.signature)?;
             Some((m.id, clear(from, dir, cone.range) == Some(m.id)))
         });
         let (event, target) = self.lock.step(dt, seeker.lock_time, seen)?;
@@ -702,6 +755,7 @@ mod tests {
             id: 3,
             at,
             radius: 4.0,
+            shape: None,
             signature: [0.0, 1.0],
         }
     }
@@ -800,6 +854,30 @@ mod tests {
         let far = player.score(o, ahead, z(300.0), 0.0, air).unwrap();
         assert!(near > far);
         assert!((near - (45.0 + 5.0 * (1.0 - 50.0 / 400.0) + 5.0)).abs() < 1e-4);
+    }
+
+    // The 360's cone measures a target to its box (0x822938C0), not a
+    // ball round it: a long, low vehicle above the aim line is out of the
+    // cone though the ball of its half diagonal would reach in.
+    #[test]
+    fn the_cone_measures_a_target_to_its_box() {
+        let player = Cone::of(&SAM, false);
+        let o = Vec3::ZERO;
+        let ahead = Vec3::Z;
+        let air = [0.0, 1.0];
+        let at = Vec3::new(0.0, 60.0, 200.0);
+        let (lo, hi) = (Vec3::new(-10.0, -0.5, -1.0), Vec3::new(10.0, 0.5, 1.0));
+        let radius = (hi - lo).length() * 0.5;
+        assert!(player.score(o, ahead, at, radius, air).is_some());
+        let placed = Shape::Box(Mat4::from_translation(at), lo, hi);
+        assert!(player.score_shaped(o, ahead, at, placed, air).is_none());
+        // Turned end on, its length reaches down to the line: in.
+        let turned =
+            Mat4::from_translation(at) * Mat4::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        let standing = Shape::Box(turned, lo, hi);
+        assert!(player.score_shaped(o, ahead, at, standing, air).is_some());
+        // Inside its box, the distance is none.
+        assert_eq!(box_distance_sq(Mat4::from_translation(at), lo, hi, at), 0.0);
     }
 
     // A missile flies straight its first 0.1 s, then turns by at most
