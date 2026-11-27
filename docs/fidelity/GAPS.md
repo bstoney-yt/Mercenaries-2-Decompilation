@@ -24,7 +24,7 @@ available, (6) Correction, (7) Verification and (8) Risk.
 | [A2](#a2) | Clip playback rate vs. ground speed uses an invented clamp; tables' time-scale limits unread | Animation/movement | P1 | Data, Ghidra |
 | [M1](#m1) | On-foot movement starts and stops instantly, with full air control | Animation/movement | P1 | Ghidra, footage |
 | [M2](#m2) | Walk, run and sprint speeds fitted to clip bands, not taken from the hero templates | Behavioral | P1 | Data, Ghidra |
-| [P1](#p1) | Vehicle handling: Rapier ray-cast vehicle with invented response shapes over the templates' fields | Behavioral | P1 | Ghidra, footage |
+| [P1](#p1) | Vehicle handling: ported from the 360 (engine, gearbox, steering, tyres, springs, tanks); spring push integration, the +0x174 speed sign and two bikes open | Behavioral | P3 | Ghidra, Xenia |
 | [P2](#p2) | Explosion push on vehicles and people is a fixed invented velocity; `MaxForce` read but unused | Behavioral | P1 | Ghidra |
 | [U1](#u1) | Flash renderer: gradients drawn in their first color, no filters, only multiply blend | Visual | P1 | Data census, footage |
 | [U2](#u2) | Action prompts and loading lines drawn by our own egui text, not the game's widgets | Visual | P1 | Data, footage |
@@ -441,45 +441,54 @@ P2
 
 ### P1
 
-**Vehicle handling model** · Behavioral discrepancy · P1
+**Vehicle handling model** · Behavioral discrepancy · P3 (was P1)
 
-1. **Original:** Recovered data: the vehicle templates' field values.
-   Their names were found by hash match (`EngineTorque`, `GearOptRPM`,
-   `TorqueFactorAtMinRPM`, `ClutchDelayTime`, `SteerMaxAngle`,
-   `FrontWheelSuspStrength`, `FrontWheelFrictionSide`, `FrontBrake`,
-   `HandbrakeInertia` and others, read in
-   `crates/m2-engine/src/tuning.rs`, whose docs call them "guesses that
-   hash to the fields' keys"). Inferred: what each field means. Also
-   inferred: that the game runs Havok's vehicle kit, since the names fit
-   it and the collision data is Havok 5.5. No consumer has been traced.
-2. **Ours:** Rapier's `DynamicRayCastVehicleController`
-   (`crates/m2-engine/src/physics.rs:1840`), driven by those fields under
-   their inferred meanings. On top of that sit invented response shapes
-   and fallbacks: top-speed easing, ground drag, climb help on hills,
-   track pull and a parked hold (`physics.rs:879` to `:1035`).
-3. **Difference:** Playtests have raised speed ("vehicles feel slower"),
-   hill climbing and bikes on their side. Each was tuned separately.
-4. **Likely cause:** Shared. The handling model is a conventional one fed
-   the original's parameters, so its response can't match.
-5. **Evidence:** Data: all template fields (we have these). 360 code: the
-   vehicle step, found from the readers of these fields' hashes. Footage:
-   the tank, jeep and boat clips already in use
-   (`gameplay/tank-vs-video.md`), for visible checks.
-6. **Correction:** Research comes first (stage F5). Recover the per-step
-   order (engine, transmission, brakes, steering, suspension, friction,
-   aerodynamics), the equations and the constants (consumer traced). Write
-   a small emulator of the recovered code, as was done for particle
-   forces. Reimplement it independently, and keep Rapier only for the
-   chassis body and collision.
-7. **Verification:** Deterministic tests per vehicle class: time from 0
-   to top speed, top speed, braking distance from 20 m/s, turn radius at
-   10 m/s, and suspension settle. Compare numerically with the emulator,
-   reporting the maximum absolute and relative error, accumulated over
-   600 steps. The existing examples (`drivetest`, `handlingtest`,
-   `susptest`, `steertest`, `biketest`) become the regression harness.
-8. **Risk:** Very high. Races, chases, autoplay contract completion and
-   co-op all depend on handling. Change one vehicle class at a time, and
-   re-run the race contracts and vehicle contracts before each merge.
+Refreshed 2026-11-27. Most of this gap is closed on `main`.
+
+1. **Original:** *Consumer traced* for the wheeled drive and tanks. From
+   the 360 code: the car set-up (0x8219B5A0, 0x8219BCA8), the springs
+   and wheel step (0x8219EF90, 0x8219F510), steering (0x821A020C), the
+   engine and gearbox (0x821A0528), the push and its fade by `MaxSpeed`
+   (0x8219C518, 0x8219C664), the tyres (0x8219C118), and the tank step
+   (0x821A49E8). Every one of the 21 tracked kinds on the island has a
+   `_TankPhysics` record and runs the tank step.
+2. **Ours:** `crates/m2-engine/src/physics.rs` and `tuning.rs` run those
+   steps. Rapier's ray-cast controller only casts the wheel rays and
+   applies the spring push. Since 2026-11-27 that push has no cap, as on
+   the 360, and the engine's push fades by `MaxSpeed` in reverse too. The
+   360's car code never reads `ReverseMaxSpeed`.
+3. **Difference (measured, `drivetest`):** 502 vehicles driven. All but
+   two reach 0.99 to 1.00 of their data's top speed. The Sidecar
+   Motorcycle reaches 0.52 and changes gear back and forth 5 times. The
+   Tank Bike reaches 0.90. Their gear ratios don't cause hunting, so the
+   cause is not authored and is not known yet.
+4. **Still open:**
+   - Rapier's spring push scales by one over the contact normal's dot
+     with the spring (clipped at 10), and its damping speed is the
+     contact's speed along it. The 360's push uses the spring's length
+     change over the step, with no such factor. Not yet compared
+     numerically.
+   - The sign of the car's speed at +0x174, which the fade and the tyres
+     read: a magnitude or a signed speed ahead. If it is signed, the 360
+     does not fade the push in reverse at all. Its writer is not found
+     (no `stfs` to it in 0x82190000 to 0x821A6000 but the set-up's zero).
+   - A parked or empty vehicle's hold (`HOLD`, `HANDBRAKE`,
+     `PARKED_FAST`). Open PR #742 covers it.
+   - `ROLL_REST`, the speed under which a vehicle counts as settling,
+     is invented.
+   - The fallback constants for a tracked vehicle without `_TankPhysics`
+     (`SUSPENSION`, `SPRING`, `TRACK_PULL`, `CLIMB_TRACKED` and the
+     rest) are invented, but no template uses them.
+5. **Evidence:** `drivetest`, `handlingtest` and `tanktest` (examples in
+   `m2-engine`). Xenia, for the two bikes' top speeds.
+6. **Correction:** Compare the spring push numerically with the 360
+   step. Find the writer of +0x174. Measure the Sidecar Motorcycle and
+   Tank Bike in Xenia before changing them.
+7. **Verification:** The three examples before and after, and the unit
+   tests in `physics.rs` (`a_cars_springs_have_no_cap_on_their_push`,
+   `an_engine_drives_a_car_to_its_max_speed`).
+8. **Risk:** Low for what is left. Races and chases already run on the
+   ported steps.
 
 ### P2
 
