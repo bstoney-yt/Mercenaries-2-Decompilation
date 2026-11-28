@@ -2431,6 +2431,13 @@ impl Npc {
 
     /// Whether they may go for another army: armed, on their feet, an
     /// army's, no pacifist, and not held by the scripts.
+    /// Whether he looks about at all: alive, on the ground and himself
+    /// (not down, not held). From the 360 code every such mind senses
+    /// (0x822DB5A8), armed or not.
+    fn perceives(&self) -> bool {
+        self.alive && self.landed && self.down.is_none() && !self.held
+    }
+
     fn can_war(&self) -> bool {
         self.alive
             && self.landed
@@ -5214,10 +5221,67 @@ impl People {
     /// of the armies theirs is at war with, her too if theirs fights her,
     /// and goes for the one their attack slot settles on
     /// ([`m2_engine::ai_target`]).
-    fn war(&mut self, physics: &Physics, threat: Option<Vec3>, dt: f32) {
-        if self.relations.is_empty() {
-            return;
+    /// Mind `i`'s look over its subjects when it does not fight: on its
+    /// lanes (0x822DB5A8), each due subject measured by the sense query
+    /// (0x822E89B0) after a sight line while the frame's
+    /// ([`m2_engine::ai_target::LOOKS_PER_FRAME`], 0x822E8DF8) last, and
+    /// merged into its records (0x822D6030); those it no longer finds age
+    /// out (0x822DE240). `subjects` are (number, chest, `Visibility`,
+    /// person, lane); `her` her chest and lane.
+    fn look_about(
+        &mut self,
+        i: usize,
+        physics: &Physics,
+        subjects: &[(u32, Vec3, f32, bool, usize)],
+        her: Option<(Vec3, usize)>,
+        looks: &mut usize,
+        dt: f32,
+    ) {
+        use m2_engine::ai_target::LOOKS_PER_FRAME;
+        let n = &mut self.npcs[i];
+        n.senses.tick(dt);
+        let due = n.lanes.tick(dt);
+        let known: Vec<u32> = n.senses.sighted().collect();
+        let block = n.sense_block();
+        let me = n.shooter;
+        let mut keep = Vec::new();
+        let her_subject = her.map(|(at, lane)| (HER, at, n.her_visibility, true, lane));
+        for (who, at, visibility, person, lane) in subjects
+            .iter()
+            .copied()
+            .filter(|s| s.0 != me)
+            .chain(her_subject)
+        {
+            if !due[lane] {
+                if known.contains(&who) {
+                    keep.push(who);
+                }
+                continue;
+            }
+            *looks += 1;
+            if *looks > LOOKS_PER_FRAME || !n.sees(physics, at, false) {
+                continue;
+            }
+            let audibility = if who == HER { n.her_audibility } else { 0.0 };
+            let subject = m2_engine::ai_sense::Subject {
+                position: at,
+                visibility,
+                audibility,
+                person,
+                object: false,
+                forgotten: false,
+            };
+            if let Some(r) = m2_engine::ai_sense::sense(&block, &subject, false, true) {
+                n.senses.merge(who, r);
+                keep.push(who);
+            }
         }
+        for w in known.iter().filter(|w| !keep.contains(w)) {
+            n.senses.lose(*w);
+        }
+    }
+
+    fn war(&mut self, physics: &Physics, threat: Option<Vec3>, dt: f32) {
         type Subject = (u32, &'static str, Vec3, f32, Arms, usize);
         use m2_engine::ai_target::{LOOKS_PER_FRAME, lane};
         // Each subject's perception lane, by its speed (0x822F1198; how
@@ -5268,6 +5332,25 @@ impl People {
         let bodies: Vec<_> = self.vehicle_subjects.iter().map(|v| v.vehicle).collect();
         self.calm(dt);
         for i in 0..self.npcs.len() {
+            // From the 360 code: every mind looks over its subjects on its
+            // lanes (0x822DB5A8 -> 0x822DB8C0 -> 0x822E8DF8, within the
+            // frame's queries), armed or not, at war or not. Those that
+            // can't fight only keep their records ([`Npc::perceives`]).
+            if (!self.npcs[i].can_war() || self.relations.is_empty()) && self.npcs[i].perceives() {
+                let subjects: Vec<(u32, Vec3, f32, bool, usize)> = all
+                    .iter()
+                    .map(|c| (c.0, c.2, c.3, matches!(c.4, Arms::Person(_)), c.5))
+                    .collect();
+                self.look_about(
+                    i,
+                    physics,
+                    &subjects,
+                    threat.map(|t| (t, her_lane)),
+                    &mut looks,
+                    dt,
+                );
+                continue;
+            }
             if !self.npcs[i].can_war() {
                 self.npcs[i].senses.forget_all();
                 if self.npcs[i].foe_at.take().is_some() {
@@ -5490,7 +5573,7 @@ impl People {
         let now: HashSet<u32> = self
             .npcs
             .iter()
-            .filter(|n| n.can_war())
+            .filter(|n| n.perceives())
             .map(|n| n.shooter)
             .collect();
         self.dropped_minds = self.sensing.difference(&now).copied().collect();
@@ -8864,6 +8947,26 @@ pub(crate) mod tests {
     // the 360 leaves the subject's own body out of the line check
     // (0x822E8DF8 puts its object in the request), so its hull 3 m out
     // does not hide it.
+    // 0x822DB5A8: every mind looks about, armed or not; a civilian with
+    // no gun keeps a record of her in sight, with no war on.
+    #[test]
+    fn an_unarmed_civilian_perceives_her_too() {
+        let physics = ground();
+        let mut people = People::default();
+        let post = Brain::Post { facing: 0.0 };
+        let mut n = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, post, None);
+        n.landed = true;
+        n.soldier = false;
+        n.her_visibility = 100.0;
+        people.npcs.push(n);
+        assert!(people.relations.is_empty());
+        for _ in 0..8 {
+            people.war(&physics, Some(Vec3::new(0.0, 1.5, 15.0)), 0.25);
+        }
+        let r = people.npcs[0].senses.get(HER).expect("a record of her");
+        assert!(r.sight > 0.0, "{r:?}");
+    }
+
     #[test]
     fn a_soldier_sees_a_tank_nose_on() {
         let mut physics = ground();
