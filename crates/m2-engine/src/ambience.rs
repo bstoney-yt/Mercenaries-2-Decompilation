@@ -42,6 +42,9 @@ use m2_assets::voice::TrackLoop;
 pub struct Bed {
     pub stream: usize,
     pub volume: f32,
+    /// Seconds it fades in and out over (its record's envelope,
+    /// [`m2_assets::voice::Record::envelope`]); `None`: at once.
+    pub envelope: Option<(f32, f32)>,
 }
 
 /// A layer of one-shots: a record's sounds by weight, once in each pass
@@ -106,6 +109,7 @@ impl AmbiencePlan {
                 .map(|v| Bed {
                     stream: v.1 as usize,
                     volume: record.volume,
+                    envelope: record.envelope,
                 })
         };
         if let Some(m) = table.mix(cue) {
@@ -246,6 +250,7 @@ mod tests {
             start: m2_assets::voice::StartDraw::FLAT,
             positional: true,
             exponent: 1.0,
+            envelope: None,
             variants,
         }
     }
@@ -308,7 +313,8 @@ mod tests {
             p.bed,
             Some(Bed {
                 stream: 12,
-                volume: 0.3
+                volume: 0.3,
+                envelope: None,
             })
         );
         assert_eq!(p.layers.len(), 2);

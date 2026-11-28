@@ -1486,6 +1486,15 @@ pub enum Blasted {
 /// A sound the fight makes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Sound {
+    /// A shooter let go of the trigger near `at` (her, or someone else:
+    /// `npc`): a spinning gun's loop stops there, with its tail. From the
+    /// 360 code: the loop starts as the trigger is pulled (0x82283070
+    /// posts 0x3A0AB2EF) and stops as it is let go (0x822832F8 posts
+    /// 0x603E7B14; both heard at 0x823617F8), not after a time.
+    TriggerUp {
+        at: Vec3,
+        npc: bool,
+    },
     /// A gun's shot: its template's sound set, if it has one (the cue it
     /// plays is the sound set's in the `Sounds` table,
     /// [`m2_engine::gun_sounds`]), and whether someone other than the
@@ -3905,6 +3914,21 @@ impl Combat {
         {
             self.drop_bomb(f, i);
         }
+        // Her trigger let go in a vehicle: its spinning gun stops.
+        if self.fire_held
+            && !trigger.fire
+            && let Some(id) = f
+                .player
+                .driving
+                .and_then(|i| f.vehicles.get(i))
+                .and_then(|v| v.id)
+            && let Some(body) = f.physics.vehicle_transform(id)
+        {
+            self.sounds.push(Sound::TriggerUp {
+                at: body.w_axis.truncate(),
+                npc: false,
+            });
+        }
         self.fire_held = trigger.fire;
         self.clock += dt;
         self.track_lock(f, dt);
@@ -5823,6 +5847,13 @@ impl Combat {
                 let (wait, burst) = gunner_burst(hint, gap, close, self.gunner_burst[k]);
                 self.gunner_wait[k] = wait;
                 self.gunner_burst[k] = burst;
+                // Its burst over, the gunner lets go (0x822832F8).
+                if burst == 0 {
+                    self.sounds.push(Sound::TriggerUp {
+                        at: centre,
+                        npc: true,
+                    });
+                }
                 self.gunner_rounds += 1;
             }
         }
@@ -6068,6 +6099,12 @@ impl Combat {
                     let (wait, burst) = gunner_burst(hint, gap, close, left);
                     gun.wait = wait;
                     gun.burst = burst;
+                    if burst == 0 {
+                        self.sounds.push(Sound::TriggerUp {
+                            at: centre,
+                            npc: true,
+                        });
+                    }
                 }
             }
         }
@@ -6153,6 +6190,12 @@ impl Combat {
             let clip = &mut g.clips[s.priority];
             if pilot && trigger == m2_engine::weapons::Trigger::Off {
                 clip.pilot_off(size);
+            }
+            if trigger == m2_engine::weapons::Trigger::Off {
+                self.sounds.push(Sound::TriggerUp {
+                    at: from,
+                    npc: true,
+                });
             }
             let loaded = if pilot {
                 clip.can_fire(size)

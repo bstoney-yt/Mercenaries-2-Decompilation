@@ -241,7 +241,7 @@ pub struct GameAudio {
     ambience_regions: Inside,
     /// Beds fading: voice, its gain now and where it goes (out: 0, then
     /// stopped).
-    zone_fades: Vec<(VoiceId, f32, f32)>,
+    zone_fades: Vec<(VoiceId, f32, f32, f32)>,
     seed: u64,
     /// The characters' voices, once read (on a thread: `English.wad`).
     voices: Option<Arc<Voices>>,
@@ -331,10 +331,16 @@ struct Spin {
     last: Instant,
 }
 
-/// A spinning gun's loop stops this long after its last round, and plays
-/// its tail; seconds (invented: three of the minigun's 900-a-minute
-/// rounds and a frame's slack).
-const SPIN_HOLD: f32 = 0.25;
+/// A spinning gun's loop stops, with its tail, as its shooter lets go
+/// of the trigger ([`Sound::TriggerUp`]): from the 360 code, the trigger
+/// starts and stops it (0x82283070, 0x822832F8, heard at 0x823617F8).
+/// One whose let-go never comes (its shooter killed or gone mid-burst)
+/// stops this long after its last round, seconds (the alpha's own
+/// safety, invented).
+const SPIN_LOST: f32 = 1.0;
+/// A let-go stops the loops of that kind of shooter this near it, metres
+/// (the alpha keeps its loops by place, not by gun: invented).
+const SPIN_LET_GO: f32 = 8.0;
 /// Rounds this close to a loop playing are that gun's, metres (invented).
 const SPIN_SAME: f32 = 4.0;
 
@@ -552,9 +558,6 @@ struct Zone {
     /// Seconds it has played (for the log).
     age: f32,
 }
-
-/// Seconds a bed fades in and out over as the region changes (invented).
-const ZONE_FADE: f32 = 2.0;
 
 /// How loud the music plays.
 const MUSIC_GAIN: f32 = 0.6;
@@ -2220,11 +2223,16 @@ impl GameAudio {
         let Some(sounds) = self.zone_sounds.clone() else {
             return false;
         };
-        // Beds fading in or out.
-        let step = dt / ZONE_FADE;
+        // Beds fading in or out, linearly over their envelope's seconds
+        // (as the 360's sound engine ramps a sound, 0x82838558; none: at
+        // once).
         let mut stopped = Vec::new();
-        for (voice, now, goal) in &mut self.zone_fades {
-            let rate = step * goal.max(*now).max(1e-3);
+        for (voice, now, goal, seconds) in &mut self.zone_fades {
+            let rate = if *seconds > 1e-4 {
+                dt / *seconds * goal.max(*now).max(1e-3)
+            } else {
+                f32::INFINITY
+            };
             *now += (*goal - *now).clamp(-rate, rate);
             let (v, g) = (*voice, *now);
             self.out.with(|m| m.set_gain(v, g));
@@ -2236,15 +2244,16 @@ impl GameAudio {
             self.out.with(|m| m.stop(*v));
         }
         self.zone_fades
-            .retain(|(v, now, goal)| !stopped.contains(v) && (now - goal).abs() > 1e-4);
+            .retain(|(v, now, goal, _)| !stopped.contains(v) && (now - goal).abs() > 1e-4);
         if cue != self.zone_cue {
             self.zone_cue = cue;
             if let Some(old) = self.zone.take()
                 && let Some(v) = old.bed
             {
                 let now = old.plan.bed.map_or(0.0, |b| b.volume);
+                let out = old.plan.bed.and_then(|b| b.envelope).map_or(0.0, |e| e.1);
                 self.zone_fades.retain(|f| f.0 != v);
-                self.zone_fades.push((v, now, 0.0));
+                self.zone_fades.push((v, now, 0.0, out));
             }
             let plan = cue.and_then(|c| sounds.plan(c));
             match (&plan, cue) {
@@ -2350,11 +2359,12 @@ impl GameAudio {
         }
         zone.bed_wanted = None;
         let volume = zone.plan.bed.map_or(0.0, |b| b.volume);
+        let fade_in = zone.plan.bed.and_then(|b| b.envelope).map_or(0.0, |e| e.0);
         let voice = self
             .out
             .with(|m| m.play(Play::flat(buffer).looped().gain(0.0)));
         zone.bed = Some(voice);
-        self.zone_fades.push((voice, 0.0, volume));
+        self.zone_fades.push((voice, 0.0, volume, fade_in));
     }
 
     /// Counts down to the next ambient sound: true when one is due.
@@ -2407,6 +2417,15 @@ impl GameAudio {
         let mut object_heard: Option<Vec3> = None;
         for sound in sounds {
             let (i, at, gain) = match *sound {
+                Sound::TriggerUp { at, npc } => {
+                    let (done, going): (Vec<Spin>, Vec<Spin>) = self
+                        .spins
+                        .drain(..)
+                        .partition(|s| s.npc == npc && s.at.distance(at) < SPIN_LET_GO);
+                    self.spins = going;
+                    self.spins_end(done);
+                    continue;
+                }
                 Sound::Shot {
                     at,
                     set,
@@ -2883,15 +2902,20 @@ impl GameAudio {
         }
     }
 
-    /// Stops the loops of guns that stopped firing, each with its tail
-    /// (`weapon_fire_tail`), where read.
+    /// Stops the loops whose let-go never came ([`SPIN_LOST`]).
     fn spins_stopped(&mut self) {
         let now = Instant::now();
         let (done, going): (Vec<Spin>, Vec<Spin>) = self
             .spins
             .drain(..)
-            .partition(|s| now.duration_since(s.last).as_secs_f32() > SPIN_HOLD);
+            .partition(|s| now.duration_since(s.last).as_secs_f32() > SPIN_LOST);
         self.spins = going;
+        self.spins_end(done);
+    }
+
+    /// Stops loops `done`, each with its tail (`weapon_fire_tail`), where
+    /// read.
+    fn spins_end(&mut self, done: Vec<Spin>) {
         for s in done {
             self.out.with(|m| m.stop(s.voice));
             let Some(tail) = self.gun_cues.cue(s.set, m2_engine::gun_sounds::FIRE_TAIL) else {
@@ -3902,6 +3926,7 @@ mod tests {
             start: m2_assets::voice::StartDraw::FLAT,
             positional: false,
             exponent: 1.0,
+            envelope: None,
             variants: vec![(table, stream, 1.0)],
         };
         m2_assets::CueTable {
