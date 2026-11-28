@@ -140,6 +140,19 @@ pub const VEHICLES: u32 = 0x4000_0000;
 /// ([`m2_engine::ai_target::Slot`]); the rest go by their
 /// [`Npc::shooter`] number.
 pub const HER: u32 = u32::MAX;
+/// Her horn's sound in a mind's records: the world object the 360 makes
+/// while she holds the horn ([`People::horn`]).
+pub const HORN: u32 = u32::MAX - 1;
+/// From how far her horn is heard and seen, metres, before a mind's
+/// `Hearing` and `Vision` scale them. From the 360 code: the player
+/// vehicle's update (0x8242E7A0) makes a world object of kind 0x55 at her
+/// as the horn goes down (0x822F1038), its +0x5C 30 (0x820BB1F8) and its
+/// +0x58 40 (0x820BAFA8), and moves it with her while it is held; the
+/// sense query (0x822E89B0) hears an object within its +0x5C and sees it
+/// within its +0x58. A plain object's record lasts 3 s
+/// ([`m2_engine::ai_sense::OBJECT_RECORD_LIFETIME`]).
+pub const HORN_HEARD_FROM: f32 = 30.0;
+pub const HORN_SEEN_FROM: f32 = 40.0;
 
 /// Soldiers come and go within these distances of the player, metres.
 /// Metres: one dropped from the air (a paratrooper) who falls below this
@@ -4253,6 +4266,8 @@ pub struct People {
     /// From how far she can be heard, metres: her own `Audibility` as
     /// she moves, or her vehicle's.
     pub her_audibility: f32,
+    /// Where her horn sounds while she holds it ([`HORN`]).
+    pub horn: Option<Vec3>,
     /// From how far she can be seen, metres: her vehicle's `Visibility`
     /// while she drives one that has one.
     pub her_visibility: Option<f32>,
@@ -5263,6 +5278,7 @@ impl People {
         };
         self.her_last = threat;
         let her_lane = lane_of(her_speed);
+        let horn = self.horn;
         // Sight checks so far this frame, across all of them.
         let mut looks = 0usize;
         let bodies: Vec<_> = self.vehicle_subjects.iter().map(|v| v.vehicle).collect();
@@ -5440,6 +5456,23 @@ impl People {
                         HER,
                         m2_engine::ai_target::score(d, current, in_slot, worth, seen),
                     );
+                }
+            }
+            // Her horn, heard and seen as any world object is (0x822E89B0):
+            // a record of it in every mind in reach. What the 360's minds
+            // then do with it is not traced (see [`HORN`]).
+            if let Some(h) = horn {
+                let subject = m2_engine::ai_sense::Subject {
+                    position: h,
+                    visibility: HORN_SEEN_FROM,
+                    audibility: HORN_HEARD_FROM,
+                    person: false,
+                    object: true,
+                    forgotten: false,
+                };
+                if let Some(r) = m2_engine::ai_sense::sense(&block, &subject, false, true) {
+                    n.senses.merge(HORN, r);
+                    keep.push(HORN);
                 }
             }
             // Those his looks no longer find stay on record, ageing out
@@ -8864,6 +8897,34 @@ pub(crate) mod tests {
     // the 360 leaves the subject's own body out of the line check
     // (0x822E8DF8 puts its object in the request), so its hull 3 m out
     // does not hide it.
+    // 0x8242E7A0 / 0x822E89B0: her horn is a world object every mind
+    // within its 30 m (times their Hearing) keeps a record of.
+    #[test]
+    fn her_horn_is_heard_within_its_reach() {
+        let physics = ground();
+        let heard = |d: f32| {
+            let mut people = People::default();
+            let post = Brain::Post { facing: 0.0 };
+            let mut n = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, post, Some(1));
+            n.faction = Some("Vza");
+            n.gun = Some(rifle());
+            n.landed = true;
+            people.npcs.push(n);
+            people.set_relations([(("Vza", "All"), -80.0)].into_iter().collect());
+            // Behind him, so out of sight: heard or not.
+            people.horn = Some(Vec3::new(0.0, 1.0, -d));
+            for _ in 0..4 {
+                people.war(&physics, None, 0.25);
+            }
+            people.npcs[0]
+                .senses
+                .get(HORN)
+                .is_some_and(|r| r.hearing > 0.0)
+        };
+        assert!(heard(20.0), "within 30 m");
+        assert!(!heard(45.0), "beyond 30 m and out of sight");
+    }
+
     #[test]
     fn a_soldier_sees_a_tank_nose_on() {
         let mut physics = ground();
