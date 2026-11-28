@@ -459,6 +459,17 @@ pub struct Record {
     /// there (see the `recorddist` example).
     pub positional: bool,
     pub exponent: f32,
+    /// Seconds it ramps in over as it starts and out over as it is
+    /// stopped, linearly; `None`: at once.
+    ///
+    /// From the 360 code: the sound engine's voice update (`0x82838558`)
+    /// reads a long record's block at 0x2C (a short one's, the engine's
+    /// default, `0x82E7DA50`): while its byte at +3 is set, the level is
+    /// scaled by the seconds played over the float at +4 until they pass
+    /// it, and once stopped (`0x828378E8`, state 3) down over the float
+    /// at +8; with it clear, a stop is at once. The ambience beds all set
+    /// it: 1.5 s out, 1.5 s (or 3 s) in.
+    pub envelope: Option<(f32, f32)>,
     pub variants: Vec<(u32, u32, f32)>,
 }
 
@@ -566,6 +577,8 @@ impl CueTable {
                     start: StartDraw::of(rec),
                     positional: rec[0x14] != 0,
                     exponent: f32::from_bits(word(0x24)),
+                    envelope: (rec[0xc] != 0 && rec[0x2f] != 0)
+                        .then(|| (f32::from_bits(word(0x30)), f32::from_bits(word(0x34)))),
                     variants: (first..size)
                         .step_by(12)
                         .filter(|at| at + 12 <= size)
@@ -581,6 +594,7 @@ impl CueTable {
                     start: StartDraw::FLAT,
                     positional: false,
                     exponent: 0.0,
+                    envelope: None,
                     variants: Vec::new(),
                 });
             }
@@ -1088,6 +1102,25 @@ mod tests {
     // The Semi's engine start: a header block holding a track header
     // followed by 0x100, 1.0 and -1, which reads like a looping cue of
     // its own; the cue is still found, with its one track.
+    // 0x82838558 / 0x828378E8: a long record's block at 0x2C ramps it
+    // in over +4 and out over +8 while its byte at +3 is set.
+    #[test]
+    fn a_long_records_envelope_is_its_ramps_in_and_out() {
+        let mut d = table(&[
+            line(1, RADIO, 10.0, 1000.0, 15),
+            line(2, RADIO, 10.0, 1000.0, 16),
+        ]);
+        let r = 0x20;
+        d[r + 0xc] = 1;
+        d[r + 0x2f] = 1;
+        d[r + 0x30..r + 0x34].copy_from_slice(&3.0f32.to_le_bytes());
+        d[r + 0x34..r + 0x38].copy_from_slice(&1.5f32.to_le_bytes());
+        let t = CueTable::parse_data(&d).unwrap();
+        assert_eq!(t.records[0].envelope, Some((3.0, 1.5)));
+        // A short record, or the flag clear: at once.
+        assert_eq!(t.records[1].envelope, None);
+    }
+
     #[test]
     fn a_track_header_in_a_cues_header_is_not_a_cue() {
         let mut d = table(&[
