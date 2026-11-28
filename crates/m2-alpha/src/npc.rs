@@ -1288,6 +1288,11 @@ pub struct Npc {
     pub alert: bool,
     /// Set by a tick when a soldier fires; the fight takes the shot.
     pub fires: bool,
+    /// Where his aim has wandered off his target, and what his rounds
+    /// have widened his gun's cone by: as the 360's AI aims and fires
+    /// ([`m2_engine::weapons::AimWander`], [`m2_engine::weapons::Bloom`]).
+    pub aim_wander: m2_engine::weapons::AimWander,
+    pub bloom: m2_engine::weapons::Bloom,
     /// Seconds before a vehicle can hurt them again ([`RAM_GAP`]).
     pub rammed: f32,
     cooldown: f32,
@@ -1764,6 +1769,8 @@ impl Npc {
             alive: true,
             alert: false,
             fires: false,
+            aim_wander: Default::default(),
+            bloom: Default::default(),
             rammed: 0.0,
             cooldown: 0.0,
             ai: AiProfile::default(),

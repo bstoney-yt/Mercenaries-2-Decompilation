@@ -205,6 +205,10 @@ pub struct AiProfile {
     pub aggressive: f32,
     pub offensive: f32,
     pub accuracy: f32,
+    /// `Ai` `Honorable`, 0..1: how much a target with its back to them is
+    /// missed ([`crate::weapons::AimWander`]); its registered default 0.8
+    /// (0x823ED6A0) where a template gives none.
+    pub honorable: f32,
     /// `Ai` speeds, fractions of a full sprint: moving about in a fight,
     /// chasing, and sprinting (VZ 0.3, 0.6, 1).
     pub combat_speed: f32,
@@ -244,6 +248,7 @@ impl Default for AiProfile {
             aggressive: 0.3,
             offensive: 0.5,
             accuracy: 0.4,
+            honorable: 0.8,
             combat_speed: 0.3,
             pursue_speed: 0.6,
             sprint_speed: 1.0,
@@ -315,6 +320,7 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, AiProfile> {
                 aggressive: get(&ai, "Aggressive", d.aggressive),
                 offensive: get(&ai, "Offensive", d.offensive),
                 accuracy: get(&ai, "Accuracy", d.accuracy),
+                honorable: get(&ai, "Honorable", d.honorable),
                 combat_speed: get(&ai, "CombatSpeed", d.combat_speed),
                 pursue_speed: get(&ai, "PursueSpeed", d.pursue_speed),
                 sprint_speed: get(&ai, "SprintSpeed", d.sprint_speed),

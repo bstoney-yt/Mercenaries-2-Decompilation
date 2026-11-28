@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use m2_engine::durability::BurnDown;
 use m2_engine::tuning::DamageTable;
-use m2_engine::weapons::{Ammo, Blast, Feel, Flight, SoldierSpread, Throwable, WeaponSpec};
+use m2_engine::weapons::{AimWander, Ammo, Blast, Feel, Flight, Throwable, WeaponSpec};
 use m2_engine::{GpuModel, Physics, Skeleton, StateFx, StaticKey, VehicleId};
 use m2_math::glam::{Mat4, Quat, Vec3};
 
@@ -548,8 +548,8 @@ const NPC_DAMAGE: f32 = 9.0 * 0.25;
 // `Health` with 7, 13 and 10 rounds; 6 a round needs 13 hits, so a kill in
 // 7 rounds needs at least 1.79 times). At 3, five hits kill at up to 15 m,
 // and the footage's rounds per kill hold the misses.
-/// A soldier's gun's `LowSkillScatter` when his template names no gun
-/// (the Assault Rifle's 1.5 degrees, as its round stands in above).
+/// A soldier's gun's cone, degrees, when its template isn't read (the
+/// Assault Rifle's `ScatterMin`-sized 1.5; invented).
 const NPC_CONE: f32 = 1.5;
 /// What blasts do to her, of their damage: the game's damage table's
 /// `Hero` row (all three heroes' `ModifierKey`) for the blasts'
@@ -3902,6 +3902,7 @@ impl Combat {
         for i in 0..f.people.npcs.len() {
             // Whom they go for, of another army, else her.
             let foe = f.people.npcs[i].foe_at;
+            self.npc_aim_step(f, i, foe.or(target), dt);
             if std::mem::take(&mut f.people.npcs[i].fires) {
                 let at = f.people.npcs[i].fire_at.take().or(foe).or(target);
                 self.npc_shoot(f, i, at);
@@ -4417,10 +4418,11 @@ impl Combat {
 
     /// A soldier's rocket from his launcher at her ([`crate::npc::Npc::launcher`]):
     /// from over his shoulder, at its template's speed from a person's
-    /// hands, bursting as its round says. His aim strays by his
-    /// `Accuracy` as his rounds do ([`SoldierSpread`], with the launcher's
-    /// own cone taken as none: inferred). A homing one is not locked on
-    /// (invented: no lock is read for soldiers).
+    /// hands, bursting as its round says. He aims at his wandered aim
+    /// point ([`AimWander`]) and the rocket strays within the launcher's
+    /// own cone as every gun's round does (0x82283A10, 0x822838B0). A
+    /// homing one is not locked on (invented: no lock is read for
+    /// soldiers).
     fn npc_launch(
         &mut self,
         f: &mut Field<'_>,
@@ -4433,9 +4435,16 @@ impl Combat {
         let Some(l) = n.launcher else { return };
         let from = n.chest() + Vec3::Y * 0.4;
         let distance = from.distance(aim);
-        let spread = SoldierSpread::new(distance, n.accuracy(), 0.0);
+        let aimed = n.aim_wander.aim(from, aim);
+        let feel = l.feel;
         let (a, b) = (self.random(), self.random());
-        let dir = spread.stray((aim - from).normalize_or(Vec3::Z), a, b);
+        let dir = m2_engine::weapons::stray_360(
+            (aimed - from).normalize_or(Vec3::Z),
+            feel.cone(0.0),
+            feel.center_bias(),
+            a,
+            b,
+        );
         // Over his shoulder is the top of his own body's capsule: it
         // passes through him, as the 360's projectile skips its owner (the
         // `--homing-check` run: without that, each soldier's rocket killed
@@ -4517,6 +4526,41 @@ impl Combat {
         });
     }
 
+    /// A soldier's think at aiming, `dt` seconds: with a target, his aim
+    /// wanders by his `Accuracy` and `Honorable` and how much she has her
+    /// back to him ([`AimWander`]); his gun's cone settles as hers does
+    /// ([`m2_engine::weapons::Bloom::settle`], the trigger held while he
+    /// fires). How much she faces away counts only for her on foot: a
+    /// soldier of another army, or her in a vehicle, is taken as side on
+    /// (inferred: the 360 reads the target's own facing).
+    fn npc_aim_step(&mut self, f: &mut Field<'_>, i: usize, target: Option<Vec3>, dt: f32) {
+        let n = &f.people.npcs[i];
+        if !n.alive {
+            return;
+        }
+        if let Some(feel) = n.gun.and_then(|g| self.feels.get(&g.template).copied()) {
+            let gap = n.gun.map_or(0.1, |g| 60.0 / g.rate_of_fire.max(1.0));
+            let held = n.fires;
+            f.people.npcs[i].bloom.settle(&feel, dt, gap, held, false);
+        }
+        let n = &f.people.npcs[i];
+        let (Some(at), true) = (target, n.alert) else {
+            return;
+        };
+        let away = if n.foe_at.is_none() && f.player.driving.is_none() {
+            let line = (at - n.chest()).with_y(0.0).normalize_or_zero();
+            let facing = f.player.facing;
+            Vec3::new(facing.sin(), 0.0, facing.cos()).dot(line)
+        } else {
+            0.0
+        };
+        let (s, k) = AimWander::miss(n.accuracy(), n.ai.honorable, away);
+        let wander = &mut f.people.npcs[i].aim_wander;
+        wander.step(s, k, dt, || {
+            m2_engine::weapons::normal_pick(|| self.random())
+        });
+    }
+
     fn npc_shoot(&mut self, f: &mut Field<'_>, i: usize, target: Option<Vec3>) {
         let Some(aim) = target else { return };
         let n = &f.people.npcs[i];
@@ -4547,30 +4591,27 @@ impl Combat {
             _ => (n.chest(), None),
         };
         let distance = from.distance(aim);
-        // His gun's cone (`LowSkillScatter`) and a miss of his own by
-        // range and `Accuracy` ([`SoldierSpread`]).
-        let cone = gun
-            .and_then(|g| self.feels.get(&g.template))
-            .map_or(NPC_CONE, |f| f.scatter[0]);
-        let accuracy = n.accuracy();
-        let ahead = (aim - from).normalize_or(Vec3::Z);
-        // A gun firing several rounds a shot (the shotgun's
-        // `iBulletsPerShot` 10): his miss aims the shot, and each round
-        // strays from that within the gun's cone (inferred: the cone as
-        // the pellets' spread, as it is for her own shotgun).
+        // From the 360 code: he aims at his wandered aim point
+        // ([`AimWander`], 0x822BFD90), and each round (each of a
+        // shotgun's pellets too) strays from that within his gun's cone
+        // as it stands, which it then widens, as hers do (0x82283A10,
+        // 0x822838B0). A gun whose template isn't read strays within
+        // [`NPC_CONE`] (invented).
+        let aimed = (n.aim_wander.aim(from, aim) - from).normalize_or(Vec3::Z);
         let pellets = gun.map_or(1, |g| g.pellets.max(1));
-        let (spread, aimed) = if pellets > 1 {
-            let (a, b) = (self.random(), self.random());
-            let shot = SoldierSpread::new(distance, accuracy, 0.0).stray(ahead, a, b);
-            let c = cone.max(0.0).to_radians();
-            (SoldierSpread { side: c, up: c }, shot)
-        } else {
-            (SoldierSpread::new(distance, accuracy, cone), ahead)
-        };
         let feel = gun.and_then(|g| self.feels.get(&g.template).copied());
         for k in 0..pellets {
+            let (cone, bias) = match feel {
+                Some(feel) => {
+                    let b = &mut f.people.npcs[i].bloom;
+                    let cone = feel.cone(b.added);
+                    b.shot(&feel);
+                    (cone, feel.center_bias())
+                }
+                None => (NPC_CONE, 1.0),
+            };
             let (a, b) = (self.random(), self.random());
-            let dir = spread.stray(aimed, a, b);
+            let dir = m2_engine::weapons::stray_360(aimed, cone, bias, a, b);
             let hit = cast_shot(
                 f.physics,
                 f.people,

@@ -1019,59 +1019,121 @@ impl AiClip {
     }
 }
 
-/// How far a soldier's rounds stray from where he aims: widths across,
-/// radians, sideways and up, each round a uniform pick within them
-/// ([`SoldierSpread::stray`]), as her own rounds scatter over her gun's
-/// cone. Two parts add up:
+/// Where a soldier's aim wanders off his target, as the 360's AI aims a
+/// gun (0x822BFD90, every think): an offset in the plane square to his
+/// line to the target, metres sideways and up, sprung towards a point
+/// picked at random and picked again once reached.
 ///
-/// - his gun's `LowSkillScatter` (`WeaponScatter`'s first field, degrees
-///   across: the sniper rifle's 0.1, the rifles' 0.8 to 1.5, the pistols'
-///   3, the machine pistols' 4, the shotgun's 3.5), the same both ways;
-/// - a miss of his own that grows with range and with what his
-///   `AiAttributes` `Accuracy` lacks of a perfect 1, twice as wide
-///   sideways as up (rounds 1-14's whole rule, scaled by
-///   [`SoldierSpread::MISS`]).
+/// From the 360 code:
 ///
-/// Provenance: the field's name and values are the template's (from
-/// samples, gap round 13); that it is a soldier's cone is inferred from
-/// its name ("low skill") and that its values are cones of the same size
-/// as `ScatterMin`'s; that it is degrees across as `ScatterMin` is, and
-/// that the two parts add, are inferred. The miss by range and
-/// `Accuracy` is invented (no field read gives it), and its scale is
-/// fitted so that a VZ soldier ([`SoldierSpread::VZ_ACCURACY`]) with the
-/// Assault Rifle hits at 20 m as often as under the old rule.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SoldierSpread {
-    pub side: f32,
-    pub up: f32,
+/// - How badly he aims ([`AimWander::miss`]): `s = (1 - a) k + a`, `a`
+///   0.7 of what his `Accuracy` lacks of 1 and `k` his `Honorable` (the
+///   AI attributes' field after `Accuracy`, registered 0.8: 0x823ED6A0)
+///   times how much the target faces away from him, `(cos + 1) / 2` of
+///   the angle between its facing and his line to it (0x822BFAC0): a
+///   target with its back to him is missed by the honourable.
+/// - The point aimed for (0x822BFCA8): at an angle `pi/2 + 0.3 pi n1`
+///   from his side, out `(n2 w + r) / (0.8 sin + 1.6)`, `n1` and `n2`
+///   normal picks, `r = (14 k + 1) s` and `w = 2 s (1 - s)`.
+/// - Its spring (0x822BFFC0): its pull is the gap to that point times
+///   0.3 plus the gap's change since the step before times 50, over the
+///   step; its speed is held to 5 m/s; within `sqrt(0.1 w + 0.05)` of the
+///   point it picks again.
+/// - Applied to the aim point times `(d - 2) / 38` of his distance `d`
+///   to it, nothing within 2 m and all of it from 40 m.
+///
+/// Not ported: the 360 aims a soldier missing by more than half
+/// (`s > 0.5`) at an object of one kind (its table 0x83653778) lying
+/// within 10 m of his target where there is one (0x822BF8A0); which
+/// objects those are is not read.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AimWander {
+    /// The offset now, metres: sideways (right of his line), up.
+    pub at: [f32; 2],
+    speed: [f32; 2],
+    goal: Option<[f32; 2]>,
+    gap: [f32; 2],
 }
 
-impl SoldierSpread {
-    /// A VZ soldier's `Accuracy` (the old rule's anchor).
-    pub const VZ_ACCURACY: f32 = 0.4;
-    /// The old rule's miss, scaled down so his gun's cone added to it
-    /// leaves the VZ soldier's Assault Rifle hitting as often at 20 m
-    /// (fitted with the `soldierspread` example).
-    pub const MISS: f32 = 0.75;
+impl AimWander {
+    /// The 360's `s` for a soldier of `accuracy` and `honorable` shooting
+    /// at a target facing `away` (the cosine of the angle between its
+    /// facing and his line to it; 0 for a target that has no facing).
+    pub fn miss(accuracy: f32, honorable: f32, away: f32) -> (f32, f32) {
+        let k = (honorable * (away + 1.0) * 0.5).max(0.0);
+        let a = (1.0 - accuracy) * 0.7;
+        ((1.0 - a) * k + a, k)
+    }
 
-    /// For a soldier of `accuracy` firing a gun of `low_skill` degrees
-    /// (`LowSkillScatter`) at `distance` metres.
-    pub fn new(distance: f32, accuracy: f32, low_skill: f32) -> Self {
-        let lack = ((1.0 - accuracy) / (1.0 - Self::VZ_ACCURACY)).clamp(0.2, 2.0);
-        let miss = Self::MISS * (0.02 + distance.max(0.0) * 0.004) * lack;
-        let cone = low_skill.max(0.0).to_radians();
-        Self {
-            side: cone + 2.0 * miss,
-            up: cone + miss,
+    /// The point it aims for, given its `s` and `k` ([`Self::miss`]) and
+    /// two normal picks.
+    pub fn goal(s: f32, k: f32, n1: f32, n2: f32) -> [f32; 2] {
+        let r = (k * 14.0 + 1.0) * s;
+        let w = 2.0 * (0.25 - (s - 0.5) * (s - 0.5));
+        let angle = std::f32::consts::FRAC_PI_2 + n1 * std::f32::consts::FRAC_PI_2 * 0.6;
+        let (sin, cos) = angle.sin_cos();
+        let out = (n2 * w + r) / (sin * 0.8 + 1.6);
+        [cos * out, sin * out]
+    }
+
+    /// One think `dt` seconds long for a soldier whose `s` and `k` are as
+    /// given; `normal` gives normal picks for a new point.
+    pub fn step(&mut self, s: f32, k: f32, dt: f32, mut normal: impl FnMut() -> f32) {
+        let goal = match self.goal {
+            Some(g) => g,
+            None => {
+                let n1 = normal();
+                let n2 = normal();
+                let g = Self::goal(s, k, n1, n2);
+                self.goal = Some(g);
+                g
+            }
+        };
+        let w = 2.0 * (0.25 - (s - 0.5) * (s - 0.5));
+        let gap = [goal[0] - self.at[0], goal[1] - self.at[1]];
+        for ((v, g), was) in self.speed.iter_mut().zip(gap).zip(self.gap) {
+            *v += (g * 0.3 + (g - was) * 50.0) * dt;
+        }
+        self.gap = gap;
+        let fast = self.speed[0] * self.speed[0] + self.speed[1] * self.speed[1];
+        if fast > 25.0 {
+            let k = 5.0 / (fast + 1e-4).sqrt();
+            self.speed = [self.speed[0] * k, self.speed[1] * k];
+        }
+        for (at, v) in self.at.iter_mut().zip(self.speed) {
+            *at += v * dt;
+        }
+        let left = [goal[0] - self.at[0], goal[1] - self.at[1]];
+        if left[0] * left[0] + left[1] * left[1] < w * 0.1 + 0.05 {
+            self.goal = None;
         }
     }
 
-    /// The way a round goes for an aim along unit `aim`, given two
-    /// uniform picks in [-0.5, 0.5).
-    pub fn stray(&self, aim: Vec3, a: f32, b: f32) -> Vec3 {
-        let side = aim.cross(Vec3::Y).normalize_or(Vec3::X);
-        let up = side.cross(aim).normalize_or(Vec3::Y);
-        (aim + side * (a * self.side) + up * (b * self.up)).normalize_or(aim)
+    /// Where he aims for a target at `target`, shooting from `from`.
+    pub fn aim(&self, from: Vec3, target: Vec3) -> Vec3 {
+        let line = target - from;
+        let d = line.length();
+        let scale = ((d - 2.0) / 38.0).clamp(0.0, 1.0);
+        if scale <= 0.0 {
+            return target;
+        }
+        let ahead = line / d;
+        let side = Vec3::new(ahead.z, 0.0, -ahead.x).normalize_or(Vec3::X);
+        let up = ahead.cross(side).normalize_or(Vec3::Y);
+        target + (side * self.at[0] + up * self.at[1]) * scale
+    }
+}
+
+/// A normal pick from uniform ones in [-0.5, 0.5) (the polar method, as
+/// the 360's 0x82856570).
+pub fn normal_pick(mut uniform: impl FnMut() -> f32) -> f32 {
+    loop {
+        let x = uniform() * 2.0;
+        let y = uniform() * 2.0;
+        let s = x * x + y * y;
+        if s > 0.0 && s < 1.0 {
+            return x * (-2.0 * s.ln() / s).sqrt();
+        }
     }
 }
 
@@ -2310,9 +2372,79 @@ mod tests {
         assert_eq!(g.rounds(3), 3);
     }
 
-    /// Share of rounds within 0.45 m of a mark `distance` ahead, by a
-    /// fixed xorshift, for `spread`.
-    fn hit_share(spread: SoldierSpread, distance: f32) -> f32 {
+    // 0x822BFAC0 / 0x822BFD90: how badly a soldier aims.
+    #[test]
+    fn a_soldiers_miss_grows_as_his_accuracy_lacks_and_her_back_is_turned() {
+        // Perfect, her facing him: no miss.
+        assert_eq!(AimWander::miss(1.0, 0.8, -1.0), (0.0, 0.0));
+        // A VZ soldier (0.4) with her side on: a = 0.42, k = 0.4.
+        let (s, k) = AimWander::miss(0.4, 0.8, 0.0);
+        assert!((k - 0.4).abs() < 1e-6);
+        assert!((s - (0.58 * 0.4 + 0.42)).abs() < 1e-6);
+        // Her back to him: the honourable miss by more.
+        assert!(AimWander::miss(0.4, 0.8, 1.0).0 > s);
+        assert_eq!(
+            AimWander::miss(0.4, 0.0, 1.0).0,
+            AimWander::miss(0.4, 0.0, -1.0).0
+        );
+    }
+
+    // 0x822BFCA8: the point he aims for.
+    #[test]
+    fn his_aim_point_is_picked_above_and_out_by_his_miss() {
+        let (s, k) = (0.652, 0.4);
+        // With both picks 0: straight up, out r / 2.4.
+        let g = AimWander::goal(s, k, 0.0, 0.0);
+        assert!(g[0].abs() < 1e-6);
+        assert!((g[1] - (14.0 * k + 1.0) * s / 2.4).abs() < 1e-5);
+        // A pick of 1 turns it 0.3 pi to the side, out further (the
+        // divisor falls with the sine).
+        let side = AimWander::goal(s, k, 1.0, 0.0);
+        let turn = side[0].atan2(side[1]).abs();
+        assert!((turn - 0.3 * std::f32::consts::PI).abs() < 1e-4, "{turn}");
+        assert!(side[0].hypot(side[1]) > g[1]);
+    }
+
+    // 0x822BFFC0: the spring, its 5 m/s, and the scale by range.
+    #[test]
+    fn his_aim_springs_to_the_point_then_picks_again() {
+        let mut w = AimWander::default();
+        let (s, k) = AimWander::miss(0.4, 0.8, 0.0);
+        let goal = AimWander::goal(s, k, 0.0, 0.0);
+        let mut picks = 0;
+        let dt = 1.0 / 30.0;
+        let mut fastest = 0.0f32;
+        let mut before = w.at;
+        for _ in 0..600 {
+            w.step(s, k, dt, || {
+                picks += 1;
+                0.0
+            });
+            let moved = (w.at[0] - before[0]).hypot(w.at[1] - before[1]) / dt;
+            fastest = fastest.max(moved);
+            before = w.at;
+            if picks > 2 {
+                break;
+            }
+        }
+        assert!(picks > 2, "reached its point and picked again");
+        assert!(fastest <= 5.0 + 1e-3, "{fastest}");
+        assert!(w.at[1] > 0.5 * goal[1]);
+        // Within 2 m none of it; at 21 m half; from 40 m all.
+        let w = AimWander {
+            at: [0.0, 1.0],
+            ..AimWander::default()
+        };
+        let her = Vec3::new(0.0, 1.0, 0.0);
+        assert_eq!(w.aim(Vec3::new(0.0, 1.0, -1.5), her), her);
+        let mid = w.aim(Vec3::new(0.0, 1.0, -21.0), her);
+        assert!((mid.y - 1.5).abs() < 1e-4, "{mid}");
+        let far = w.aim(Vec3::new(0.0, 1.0, -80.0), her);
+        assert!((far.y - 2.0).abs() < 1e-4, "{far}");
+    }
+
+    #[test]
+    fn normal_picks_are_normal() {
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut pick = || {
             seed ^= seed << 13;
@@ -2320,63 +2452,13 @@ mod tests {
             seed ^= seed << 17;
             (seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5
         };
-        let (n, at) = (20_000, Vec3::Z * distance);
-        let hits = (0..n)
-            .filter(|_| {
-                let dir = spread.stray(Vec3::Z, pick(), pick());
-                (dir * at.dot(dir)).distance(at) < 0.45
-            })
-            .count();
-        hits as f32 / n as f32
-    }
-
-    #[test]
-    fn soldiers_spread_by_their_guns_cone() {
-        let vz = SoldierSpread::VZ_ACCURACY;
-        // A perfect shot with the sniper rifle's 0.1 degrees still misses
-        // a little; the shotgun's 3.5 is wider than the carbine's 1.
-        let sniper = SoldierSpread::new(0.0, 1.0, 0.1);
-        assert!(sniper.up > 0.1f32.to_radians());
-        let (carbine, shotgun) = (
-            SoldierSpread::new(20.0, vz, 1.0),
-            SoldierSpread::new(20.0, vz, 3.5),
+        let n = 20_000;
+        let xs: Vec<f32> = (0..n).map(|_| normal_pick(&mut pick)).collect();
+        let mean = xs.iter().sum::<f32>() / n as f32;
+        let var = xs.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n as f32;
+        assert!(
+            mean.abs() < 0.03 && (var - 1.0).abs() < 0.05,
+            "{mean} {var}"
         );
-        assert!((shotgun.side - carbine.side - 2.5f32.to_radians()).abs() < 1e-6);
-        assert!((shotgun.up - carbine.up - 2.5f32.to_radians()).abs() < 1e-6);
-        // The miss is twice as wide sideways and grows with range.
-        let far = SoldierSpread::new(40.0, vz, 0.0);
-        assert!((far.side - 2.0 * far.up).abs() < 1e-6);
-        assert!(far.up > SoldierSpread::new(20.0, vz, 0.0).up);
-        // A negative cone counts as none.
-        assert_eq!(
-            SoldierSpread::new(20.0, vz, -1.0),
-            SoldierSpread::new(20.0, vz, 0.0)
-        );
-    }
-
-    #[test]
-    fn a_vz_soldiers_rifle_hits_at_20_m_as_before() {
-        // The old rule (0.1 rad up, 0.2 along the world's x and z, the
-        // same for every gun) hit 9.0% of his rounds at 20 m, over all
-        // headings (the soldierspread example). The fitted miss keeps his
-        // Assault Rifle (1.5 degrees) hitting as often.
-        let new = SoldierSpread::new(20.0, SoldierSpread::VZ_ACCURACY, 1.5);
-        let now = hit_share(new, 20.0);
-        assert!((now - 0.090).abs() < 0.01, "{now}");
-        // The machine pistols' 4 degrees hit less, the carbine's 1 more.
-        let vz = SoldierSpread::VZ_ACCURACY;
-        assert!(hit_share(SoldierSpread::new(10.0, vz, 4.0), 10.0) < 0.4);
-        assert!(hit_share(SoldierSpread::new(10.0, vz, 1.0), 10.0) > 0.74);
-    }
-
-    #[test]
-    fn a_stray_round_stays_within_the_widths() {
-        let s = SoldierSpread { side: 0.2, up: 0.1 };
-        let aim = Vec3::new(1.0, 0.0, 1.0).normalize();
-        let d = s.stray(aim, 0.5, -0.5);
-        let side = aim.cross(Vec3::Y).normalize();
-        assert!((d.dot(side) / d.dot(aim) - 0.1).abs() < 1e-5);
-        assert!((d.dot(Vec3::Y) / d.dot(aim) + 0.05).abs() < 1e-5);
-        assert!(s.stray(aim, 0.0, 0.0).distance(aim) < 1e-6);
     }
 }
