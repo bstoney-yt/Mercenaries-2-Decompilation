@@ -4294,7 +4294,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         // The seat is named by its type's letter (`d`, `p`, `g`, `c`): the
         // first free seat of that type, else the first of it.
         let kind = seat.as_bytes().first().copied().unwrap_or(b'd');
-        w.seat(guid, vehicle, instant, seat_not_driving(&seat));
+        // Its seat move is a getting in ("e"), instant or not. From the 360
+        // code: `lua_Vehicle_Enter` (0x82347558) seats an instant rider by
+        // 0x822A03F8, whose 0x822A0958 posts the seat message of kind 3,
+        // and `ObjectInSeat`'s test (0x82351C90) answers kind 3 with its
+        // "e" bit (its parse, 0x82351A80: e 1, x 2, i 4, o 8); "i" and "o"
+        // answer kind 0xB, which this call doesn't post. MecCon001's
+        // checkpoint restore seats her in its Monster Truck at once and
+        // waits for `{hero, uCar, "d", "e"}` before its assets count as
+        // loaded: read as "i", the wait never fired and a Retry after its
+        // checkpoint left the contract unstarted (the 11-27 diagnostic run).
+        w.seat(guid, vehicle, false, seat_not_driving(&seat));
         if let Some(s) = w
             .seats
             .by_type(vehicle, kind, true)
@@ -7401,6 +7411,33 @@ mod tests {
         assert!(events.update_shared(0.1, &world).is_empty());
         let seated: String = host.lua().globals().get("seated").unwrap();
         assert_eq!(seated, "in:0x00000001/0x00000032");
+    }
+
+    /// From the 360 code: an instant `Vehicle.Enter` posts the seat message
+    /// an "e" wait answers (MecCon001's `_SetupVehicles2`: an instant
+    /// Enter, then `ObjectInSeat {hero, uCar, "d", "e"}`), not one an "i"
+    /// wait does.
+    #[test]
+    fn an_instant_enter_answers_an_e_seat_wait() {
+        let (host, world) = setup();
+        let events = crate::events::Events::default();
+        events.install(host.lua()).unwrap();
+        host.lua()
+            .load(
+                r#"
+                log = ""
+                assert(Vehicle.Enter(50, 1, "d", true))
+                local function note(t) return function() log = log .. t end end
+                Event.Create(Event.ObjectInSeat, {1, 50, "d", "e"}, note("e "))
+                Event.Create(Event.ObjectInSeat, {1, 50, "d", "i"}, note("i "))
+                "#,
+            )
+            .exec()
+            .unwrap();
+        assert!(events.update_shared(0.1, &world).is_empty());
+        assert!(events.update_shared(0.1, &world).is_empty());
+        let log: String = host.lua().globals().get("log").unwrap();
+        assert_eq!(log, "e ");
     }
 
     #[test]
