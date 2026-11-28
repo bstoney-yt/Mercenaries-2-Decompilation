@@ -482,21 +482,27 @@ const MG_FLASH: f32 = 0.45;
 const CANNON_FLASH: f32 = 5.0;
 const CANNON_FIREBALL: f32 = 1.6;
 const CANNON_FLASH_TIME: f32 = 0.3;
-/// Vehicle guns: a tank's cannon (seconds to reload, shell speed m/s,
-/// where its template gives no rate of fire or ammunition) and the
-/// machine gun on anything else with a turret (seconds between rounds,
-/// damage, range). Invented, like the rest of the rules.
-const CANNON_RELOAD: f32 = 2.5;
+/// Vehicle guns without a template read: a tank's cannon (seconds to
+/// reload, shell speed m/s) and the machine gun on anything else with a
+/// turret (seconds between rounds, damage). From the 360 code: the fields'
+/// registered defaults, what a weapon or round that sets none has. The
+/// weapon schema (0x823EED38) registers `RateOfFire` 120 a minute
+/// (0x820B8024), the projectile's (0x823EFB30) `Velocity` 50 m/s
+/// (0x820B7FB8), the bullet's (0x823EFEF0) `Damage` 10 (0x820BAEEC).
+const DEFAULT_RATE_OF_FIRE: f32 = 120.0;
+const CANNON_RELOAD: f32 = 60.0 / DEFAULT_RATE_OF_FIRE;
 /// Her turret's gun fires at the crosshair when it points within this of
 /// it, radians; else along its barrel (invented; the 360 code's AI
 /// riders wait for no such thing, [`Combat::gunners_fire`]).
 const LAID: f32 = 0.06;
-const SHELL_SPEED: f32 = 150.0;
-const MG_GAP: f32 = 0.09;
+const SHELL_SPEED: f32 = 50.0;
+const MG_GAP: f32 = 60.0 / DEFAULT_RATE_OF_FIRE;
 /// A tank's machine gun beside its cannon, which the aim button fires: the
 /// AMX-30's linked machine gun fires 450 rounds a minute (its template).
 const TANK_MG_GAP: f32 = 60.0 / 450.0;
-const MG_DAMAGE: f32 = 45.0;
+const MG_DAMAGE: f32 = 10.0;
+/// How far a vehicle's machine-gun round is traced, metres (invented: a
+/// round's reach isn't a field; the bullets' own falloff applies).
 const MG_RANGE: f32 = 500.0;
 
 /// How far gunners riding with her shoot when their weapon gives no
