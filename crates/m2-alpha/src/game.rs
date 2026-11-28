@@ -2508,6 +2508,19 @@ impl Game {
                 .get(self.scene.hero.upgrade_template())
                 .copied()
         });
+        // Her horn, while held, is a world object minds hear and see
+        // (0x8242E7A0: made at her vehicle and moved with it).
+        self.scene.people.horn = self
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| p.driving)
+            .filter(|_| self.honking)
+            .and_then(|i| self.scene.vehicles.get(i))
+            .and_then(|v| v.id)
+            .zip(self.scene.world.as_ref())
+            .and_then(|(id, w)| w.physics.vehicle_transform(id))
+            .map(|m| m.w_axis.truncate());
         // And to hear her by: her own `Audibility` by the same, or her
         // vehicle's.
         let heard = self.scene.world.as_ref().and_then(|w| {
