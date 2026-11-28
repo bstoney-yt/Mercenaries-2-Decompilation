@@ -735,10 +735,11 @@ pub const CONTEXT_REACH: f32 = 2.0;
 ///
 /// From the scripts: the calls and their arguments, the level read back as
 /// `GetPursuitState().Level`, and the level times (`SetPursuitLevelTimes(120,
-/// 300)`). Inferred: that a level below 3 lasts the first time and level 3
-/// the second. Invented: what `SetPursuitSeconds` (5 s, the HUD gauge's own
-/// fill time) does to it (nothing here), and the times when no script set
-/// them.
+/// 300)`). From the 360 code: how long one lasts is the engine's clock's
+/// ([`PursuitClock`]): the seconds a level starts at (0x822384C0, from
+/// the level times or their defaults 200 and 400), run down a second at a
+/// time until it is over (0x82238020); `SetPursuitSeconds` sets them
+/// outright (0x82238570).
 #[derive(Debug, Default)]
 pub struct Pursuit {
     /// Seconds a pursuit lasts below level 3 and at it, once set.
@@ -914,10 +915,10 @@ impl PursuitClock {
 }
 
 impl Pursuit {
-    /// Seconds a pursuit of `level` lasts.
-    pub fn seconds(&self, level: i64) -> f32 {
-        let (low, high) = self.times.unwrap_or((120.0, 300.0));
-        if level >= 3 { high } else { low }
+    /// Seconds the pursuit under way lasts: what its clock has left
+    /// ([`PursuitClock::seconds`]); none when it is not under way.
+    pub fn seconds(&self) -> Option<f32> {
+        (self.clock.active && !self.clock.locked).then_some(self.clock.seconds as f32)
     }
 }
 
@@ -2676,11 +2677,16 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             let force = matches!(a.get(2), Some(Value::Boolean(true)));
             w.pursuit.clock.set(f, level as i32, force)
         };
-        let seconds = (!locked).then(|| w.pursuit.seconds(level));
-        w.commands.push(Command::Pursuit {
-            faction: name,
-            seconds,
-        });
+        // One the engine turned down (one locked, or one under way
+        // without force) changes nothing; one started lasts its clock's
+        // seconds, a locked one until cleared.
+        if started {
+            let seconds = if locked { None } else { w.pursuit.seconds() };
+            w.commands.push(Command::Pursuit {
+                faction: name,
+                seconds,
+            });
+        }
         Some(started && asked >= 1)
     }
     add(&pg, "SetPursuit", |w, _, a| {
@@ -6716,8 +6722,12 @@ mod tests {
         assert_eq!(
             world.borrow_mut().take_commands(),
             [
-                pursuit("oc", Some(120.0)),
-                pursuit("oc", Some(300.0)),
+                // The clock's start for each level (0x822384C0): level 1
+                // at half the first time (60), level 3 at the middle of
+                // the second and the most (500), no more than the second
+                // plus 100.
+                pursuit("oc", Some(60.0)),
+                pursuit("oc", Some(400.0)),
                 pursuit("allied", None),
                 Command::PursuitClear,
             ]
