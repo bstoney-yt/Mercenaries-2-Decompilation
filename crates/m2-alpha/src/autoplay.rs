@@ -1012,6 +1012,15 @@ fn short_strikes(struck: &[crate::combat::Strike], eye: Vec3, target: Vec3) -> u
 /// target (metres) has no clear shot at it (invented: more than a
 /// statue's depth).
 const SHOT_SHORT: f32 = 3.0;
+/// Seconds aimed at a target with no round of hers fired before it is
+/// passed over (invented).
+const UNFIRED_GIVE_UP: f32 = 5.0;
+
+/// Whether she has aimed at a target since `since` (now `now`) with no
+/// round fired: her rounds counted `at` then and `fired` now.
+fn gave_up_unfired(since: f32, now: f32, at: u32, fired: u32) -> bool {
+    fired == at && now - since >= UNFIRED_GIVE_UP
+}
 /// Within the scripts' bounds, what she can't shoot from where she is is
 /// passed over for this long (seconds; invented: short of PmcCon034's
 /// 90 s for all its targets).
@@ -1132,6 +1141,9 @@ pub struct Autoplay {
     /// The target she last shot at with her rifle, and for how long
     /// within reach (seconds).
     rifle_on: Option<(u32, f32)>,
+    /// The target she aims her rifle at, since when, and her rounds fired
+    /// then ([`UNFIRED_GIVE_UP`]).
+    unfired: Option<(u32, f32, u32)>,
     /// The templates of targets that stood through her rifle that long.
     rifle_failed: std::collections::HashSet<u32>,
     /// The templates of what she has broken with her rifle, and that of
@@ -4068,6 +4080,28 @@ impl Autoplay {
         } else {
             self.short_hits = 0;
         }
+        // Aimed at it this long and no round of hers fired at all: passed
+        // over (#856's check: 20 s on PmcCon034's bonus statue, her rifle
+        // rounds 5000 to 5000).
+        let fired = game.combat.fired.total();
+        match self.unfired {
+            Some((t, since, at)) if t == target => {
+                if gave_up_unfired(since, self.clock, at, fired) {
+                    eprintln!(
+                        "autoplay {:.1} s: no round of hers fired at {target:#x} in {UNFIRED_GIVE_UP} s: passing over it",
+                        self.clock
+                    );
+                    self.unfired = None;
+                    self.passed.push((target, self.clock + KEEP_PASS));
+                    self.rifle_on = None;
+                    return Intent::default();
+                }
+                if fired != at {
+                    self.unfired = Some((target, self.clock, fired));
+                }
+            }
+            _ => self.unfired = Some((target, self.clock, fired)),
+        }
         // Only her time with a clear shot counts toward giving it up.
         let short = self.blocked_logged;
         match &mut self.rifle_on {
@@ -6731,10 +6765,20 @@ pub fn starter_for(on_offer: &[String], talks: &[ActionAt], here: Vec3) -> Optio
 /// which contract until she is inside, so the nearest door is tried.
 /// Of places to go, a contract's only, where there are any.
 fn contract_first(places: Vec<&Mark>) -> Vec<&Mark> {
-    if places.iter().any(|m| for_a_contract(m)) {
-        places.into_iter().filter(|m| for_a_contract(m)).collect()
+    if !places.iter().any(|m| for_a_contract(m)) {
+        return places;
+    }
+    let mine: Vec<&Mark> = places.into_iter().filter(|m| for_a_contract(m)).collect();
+    // Of the contract's, its own objectives before its optional ones: an
+    // optional objective's targets are marked in the secondary colour
+    // (from the scripts: `MrxTaskObjective`'s `_GetTargetBlipColor` gives
+    // `GetSecondaryObjectiveRgb` for `bOptional`), as PmcCon034's bonus
+    // statue is (#856's 11-27 check: she went for it first, 72 m off where
+    // the gallery's were 98 m, and its 19 targets took 550 s for 2).
+    if mine.iter().any(|m| !m.secondary) {
+        mine.into_iter().filter(|m| !m.secondary).collect()
     } else {
-        places
+        mine
     }
 }
 
@@ -8371,6 +8415,43 @@ mod tests {
         );
         theirs.count = 0;
         assert_eq!(strike_line(&[Entry::Stocked(&theirs)]), None);
+    }
+
+    /// #856's 11-27 check of PmcCon034: its bonus statue (marked in the
+    /// secondary colour, 72 m off) waits for the gallery's targets (98 m
+    /// off); with only it left, it is taken.
+    #[test]
+    fn a_contracts_own_targets_come_before_its_optional_ones() {
+        let mark = |target: u32, at: Vec3, secondary: bool| Mark {
+            target,
+            kind: "destroy".to_owned(),
+            name: format!("mark {target:#x}"),
+            at,
+            alive: true,
+            mission: Some(crate::mission::MarkFor::Id("PmcCon034".to_owned())),
+            secondary,
+        };
+        let bonus = mark(0x4000_0233, Vec3::new(2663.6, -10.7, -938.5), true);
+        let gallery = mark(0xf30ba, Vec3::new(2687.0, -12.9, -1039.8), false);
+        let got: Vec<u32> = contract_first(vec![&bonus, &gallery])
+            .iter()
+            .map(|m| m.target)
+            .collect();
+        assert_eq!(got, [0xf30ba]);
+        let got: Vec<u32> = contract_first(vec![&bonus])
+            .iter()
+            .map(|m| m.target)
+            .collect();
+        assert_eq!(got, [0x4000_0233]);
+    }
+
+    /// The same check: 20 s aimed at the bonus statue, rounds 5000 to
+    /// 5000. Passed over after 5 s without a round; not while she fires.
+    #[test]
+    fn a_target_aimed_at_with_no_round_fired_is_given_up() {
+        assert!(!gave_up_unfired(12.4, 15.0, 0, 0));
+        assert!(gave_up_unfired(12.4, 17.4, 0, 0));
+        assert!(!gave_up_unfired(12.4, 32.4, 0, 3));
     }
 
     #[test]
