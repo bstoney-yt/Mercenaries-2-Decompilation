@@ -2548,6 +2548,12 @@ impl Npc {
         self.rig.advance(dt);
     }
 
+    /// Whether they are running from something ([`Self::panic`]).
+    #[cfg(test)]
+    pub fn flees(&self) -> bool {
+        self.flee.is_some()
+    }
+
     /// Runs from `danger` (those who don't fight, but story characters
     /// and armies' soldiers standing down).
     /// Someone already running, and not towards it, keeps going the way
