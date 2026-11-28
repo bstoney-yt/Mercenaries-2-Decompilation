@@ -3126,8 +3126,12 @@ fn damp_wheels(v: &mut VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
         let cur = ray.is_in_contact.then_some(ray.suspension_length);
         let (push, spring) = d.step(cur, dt);
         // Rapier pushed its spring part already (none off the ground).
+        // What Rapier really pushed, per kilogram: its spring scaled by one
+        // over the contact normal's dot with the spring (clipped at 10 on
+        // a steep contact, a kerb's face), which the 360's push hasn't, so
+        // the step's whole push is the 360's.
         let rapier = if cur.is_some() {
-            (d.k * (d.length - ray.suspension_length)).max(0.0)
+            w.wheel_suspension_force.min(w.max_suspension_force) / mass.max(1e-6)
         } else {
             0.0
         };
@@ -5395,7 +5399,16 @@ impl Physics {
                 max_suspension_travel: travel,
                 side_friction_stiffness: 1.0,
                 friction_slip: grip,
-                max_suspension_force: spec.mass * 40.0,
+                // The 360's wheel step pushes as hard as its spring and
+                // damp say, with no cap (0x8219F6CC..0x8219F754: mass x
+                // (strength x squeeze - damp x speed), applied when over
+                // 0); a tracked vehicle without `_TankPhysics` (none on
+                // the island) keeps the old cap.
+                max_suspension_force: if springs.is_some() {
+                    f32::MAX
+                } else {
+                    spec.mass * 40.0
+                },
             };
             controller.add_wheel(
                 vector(w.centre + Vec3::Y * top),
@@ -5637,7 +5650,7 @@ impl Physics {
         // least half its wheels down, its torque through the gear it is in
         // (nothing while its clutch delay runs) and off the handbrake,
         // shared out to its wheels ([`push_axles`]), fading over the last
-        // twentieth of its `MaxSpeed` (`ReverseMaxSpeed` in reverse). Its
+        // twentieth of its `MaxSpeed`, in reverse as well. Its
         // gearbox goes into reverse once it is all but still (under 2
         // km/h) with the brake held over 0.9 and the throttle under 0.1
         // for a tenth of a second, and back out once that has stopped for
@@ -5670,7 +5683,12 @@ impl Physics {
                     .get(v.controller.chassis)
                     .map_or(0.0, |b| driven_rpm(b, all, &v.steers, v.steering, e.split));
                 let torque = e.step(gb, dt, open, wheels, reverse);
-                let top = if gb.gear == 0 { e.reverse_speed } else { v.top };
+                // The fade is by `MaxSpeed` in every gear, reverse too: the
+                // push reads only the car's +0x180 (`MaxSpeed`) for it
+                // (0x8219C664); the record's `ReverseMaxSpeed`, copied to
+                // +0x184 at set-up (0x8219B5A0, 0x8219BCA8), is read by
+                // nothing in the car code.
+                let top = v.top;
                 let ease = ((top - speed.abs()) / (0.05 * top).max(1e-3)).clamp(0.0, 1.0);
                 if gb.clutch < 0.0 && !controls.brake {
                     v.drive = e.ratio(gb.gear).abs() * torque * ease;
@@ -11953,10 +11971,28 @@ mod tests {
         );
         let fastest = ahead.iter().copied().fold(0.0, f32::max);
         assert!(fastest < top * 1.03, "{fastest}");
+        // Backing up, its push fades by `MaxSpeed` too, not by
+        // `ReverseMaxSpeed`, which the 360's car code never reads
+        // (0x8219C664): its reverse gear takes it past 55 km/h.
         let back = run(-1.0, 12.0);
         let fastest = back.iter().copied().fold(0.0, f32::max);
-        assert!(fastest > 0.8 * engine.reverse_speed, "{fastest}");
-        assert!(fastest < engine.reverse_speed * 1.03, "{fastest}");
+        assert!(fastest > engine.reverse_speed * 1.03, "{fastest}");
+        assert!(fastest < top * 1.03, "{fastest}");
+    }
+
+    // A car's springs push as hard as their strength and damp say: the
+    // 360's wheel step has no cap on the push (0x8219F6CC..0x8219F754).
+    #[test]
+    fn a_cars_springs_have_no_cap_on_their_push() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 50.0);
+        p.step(DT);
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        let v = p.vehicles[id.0].as_ref().expect("a vehicle");
+        assert!(!v.controller.wheels().is_empty());
+        for w in v.controller.wheels() {
+            assert_eq!(w.max_suspension_force, f32::MAX);
+        }
     }
 
     // With its template's clutch delay, its gearbox changes up one gear at

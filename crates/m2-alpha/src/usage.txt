@@ -128,6 +128,9 @@ m2-alpha [options]
                          nearest parked vehicle and drive it forward first
                          (backing out first if it is boxed in, steering
                          round what it meets)
+  --drive-reverse        as --drive, but back up flat out until the speed
+                         levels off (at most 30 s) instead, logging where
+                         (drive: reverse levels off) and the fastest
   --jump                 with --screenshot on the island: jump just before
                          the picture
   --throw                with --screenshot on the island: throw a grenade

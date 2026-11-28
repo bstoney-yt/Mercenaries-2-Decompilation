@@ -680,9 +680,11 @@ pub struct EngineTuning {
     /// Of its most torque, what it gives at idle and at its most rpm
     /// (`TorqueFactorAtMinRPM` 0.8 and `TorqueFactorAtMaxRPM` 1.0).
     pub torque_at: (f32, f32),
-    /// Top speed backing up, m/s (`ReverseMaxSpeed`, km/h: 55). The
-    /// 360's push fades by `MaxSpeed` alone; where this is used isn't
-    /// traced.
+    /// The record's top speed backing up, m/s (`ReverseMaxSpeed`, km/h:
+    /// 55). Read but not driven by: the 360 code copies it to the car
+    /// (+0x184, at 0x8219B5A0 and 0x8219BCA8) and nothing in its car
+    /// code reads it back; the push fades by `MaxSpeed` in reverse too
+    /// (0x8219C664).
     pub reverse_speed: f32,
     /// How far over idle the engine runs as the clutch slips at a crawl,
     /// rpm, at full throttle (`GearSlipRPM`; 0, 1,000 or 2,000).

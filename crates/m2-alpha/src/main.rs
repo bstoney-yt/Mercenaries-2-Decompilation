@@ -229,6 +229,9 @@ struct Options {
     /// target once it is tracked (`--job-near <m>`, a test shortcut).
     job_near: Option<f32>,
     drive: bool,
+    /// With `--drive`: back up flat out instead of driving ahead, and
+    /// log the fastest it backs up (`drive: reverse`).
+    drive_reverse: bool,
     /// With `--screenshot` on foot: jump just before the picture.
     jump: bool,
     /// With `--screenshot` on foot: press jump ten times a second all the
@@ -931,6 +934,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--job-near" => o.job_near = Some(value()?.parse()?),
             "--drive" => o.drive = true,
+            "--drive-reverse" => {
+                o.drive = true;
+                o.drive_reverse = true;
+            }
             "--gunner" => o.gunner = true,
             "--jump" => o.jump = true,
             "--jump-spam" => o.jump_spam = true,
@@ -9297,18 +9304,61 @@ fn drive_for_screenshot(
         .iter()
         .map(|n| n.character.position)
         .collect();
-    for i in 0..240 {
+    let mut reverse_fastest = 0.0f32;
+    // Backing up runs until its speed levels off (under 0.1 m/s gained
+    // over the last 2 s), for at most 30 s; ahead, 4 s.
+    let mut reverse_speeds: Vec<f32> = Vec::new();
+    let steps = if options.drive_reverse { 1800 } else { 240 };
+    for i in 0..steps {
         let steer = match (game.scene.world.as_ref(), driven(game)) {
             (Some(w), Some((id, hull))) if !ploughing => {
                 autoplay::steer_round(&w.physics, id, hull)
             }
             _ => 0.0,
         };
+        // Backing up: straight back, the stick held down (the gearbox
+        // goes into reverse once she is all but still).
         let throttle = Intent {
-            movement: m2_math::glam::Vec2::new(steer, 1.0),
+            movement: if options.drive_reverse {
+                m2_math::glam::Vec2::NEG_Y
+            } else {
+                m2_math::glam::Vec2::new(steer, 1.0)
+            },
             ..Intent::default()
         };
         game.step(throttle, tick);
+        if options.drive_reverse
+            && let Some((_, speed)) = game.driving()
+        {
+            reverse_fastest = reverse_fastest.max(speed.abs());
+            // A knock (over 3 m/s lost in a tick: a bump, a kerb, the
+            // ground's lip) ends the measure: what it held before it is
+            // its top backing up there.
+            if let Some(&last) = reverse_speeds.last()
+                && last - speed.abs() > 3.0
+            {
+                eprintln!(
+                    "drive: reverse knocked from {last:.1} to {:.1} m/s after {:.1} s; it held {:.1} m/s ({:.0} km/h) before",
+                    speed.abs(),
+                    reverse_speeds.len() as f32 * tick,
+                    reverse_fastest,
+                    reverse_fastest * 3.6
+                );
+                break;
+            }
+            reverse_speeds.push(speed.abs());
+            let n = reverse_speeds.len();
+            // Level: within 0.1 m/s, up or down, over the last 2 s.
+            if n > 240 && (reverse_speeds[n - 1] - reverse_speeds[n - 121]).abs() < 0.1 {
+                eprintln!(
+                    "drive: reverse levels off at {:.1} m/s ({:.0} km/h) after {:.1} s",
+                    reverse_speeds[n - 1],
+                    reverse_speeds[n - 1] * 3.6,
+                    n as f32 * tick
+                );
+                break;
+            }
+        }
         if let Some(h) = &mut seats {
             h.seat(game, tick);
         }
@@ -9361,6 +9411,12 @@ fn drive_for_screenshot(
             driven_now.is_some_and(|v| v.wrecked),
             ploughing,
         );
+        if options.drive_reverse {
+            eprintln!(
+                "drive: reverse fastest {reverse_fastest:.1} m/s ({:.0} km/h)",
+                reverse_fastest * 3.6
+            );
+        }
         match verdict {
             Ok(()) => eprintln!("drive: PASS"),
             Err(why) => eprintln!("drive: FAIL {why}"),
