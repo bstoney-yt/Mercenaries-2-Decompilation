@@ -568,11 +568,6 @@ pub const STAGGER_CLIPS: [(Stagger, Direction, [u32; 4]); 12] = {
     ]
 };
 
-/// Over this speed over the ground a person hit counts as on the move
-/// for the stagger picked, m/s (invented: the 360 reads a field of the
-/// movement record whose meaning is not established).
-const STAGGER_MOVING: f32 = 0.5;
-
 /// Someone using a thing by one of its seats ([`crate::social`]): where
 /// they get on, where and which way they sit, and how long a use of the
 /// thing lasts (its `SocialUse` record's duration).
@@ -1288,6 +1283,10 @@ pub struct Npc {
     pub alert: bool,
     /// Set by a tick when a soldier fires; the fight takes the shot.
     pub fires: bool,
+    /// The pace their walking picked this tick ([`m2_engine::on_foot::pace`]):
+    /// what the 360 keeps in bits 0x3800 of the character record's +0x3C
+    /// (0x8217A56C), which the stagger picker reads as on the move.
+    pace_now: m2_engine::on_foot::Pace,
     /// Seconds before a vehicle can hurt them again ([`RAM_GAP`]).
     pub rammed: f32,
     cooldown: f32,
@@ -1764,6 +1763,7 @@ impl Npc {
             alive: true,
             alert: false,
             fires: false,
+            pace_now: m2_engine::on_foot::Pace::Still,
             rammed: 0.0,
             cooldown: 0.0,
             ai: AiProfile::default(),
@@ -2116,14 +2116,13 @@ impl Npc {
         if self.down.is_some() || self.swim.is_some() || !self.landed {
             return;
         }
-        let v = self.character.velocity;
         let Some(pick) = stagger::pick(
             &Person {
                 facing: self.facing,
                 player: false,
                 immune: false,
                 crouched: false,
-                moving: Vec2::new(v.x, v.z).length() > STAGGER_MOVING,
+                moving: self.pace_now != m2_engine::on_foot::Pace::Still,
                 since: self.since_stagger,
                 cooldown: stagger::COOLDOWN,
                 reset: stagger::RESET,
@@ -2582,7 +2581,12 @@ impl Npc {
         };
         let asked = Vec2::new(wanted.x, wanted.z);
         let full = self.motion.full_speed().max(1e-4);
-        let (_, pace) = on_foot::pace(&self.motion, asked.length() / full, false, 1.0, false);
+        let (picked, pace) = on_foot::pace(&self.motion, asked.length() / full, false, 1.0, false);
+        self.pace_now = if pace > 0.0 {
+            picked
+        } else {
+            on_foot::Pace::Still
+        };
         let asked = asked.normalize_or_zero() * pace;
         self.ground = on_foot::steer(self.ground, asked, dt);
         if self.ground.length_squared() > 1e-8 {
@@ -3530,6 +3534,8 @@ impl Npc {
     }
 
     fn update(&mut self, physics: &Physics, rng: &mut Rng, threat: Option<Vec3>, dt: f32) {
+        // Not walking this tick unless their walk picks a pace.
+        self.pace_now = m2_engine::on_foot::Pace::Still;
         // Their face goes on while they live; a dead face stays as it
         // was.
         if self.alive {
