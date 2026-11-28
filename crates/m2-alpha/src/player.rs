@@ -1956,9 +1956,24 @@ impl Player {
                 None => launch = true,
             }
         } else if let Leap::Windup(t, clip, at) = self.leap {
-            if !self.character.grounded || bashing {
-                // The ground went from under her: no jump (invented; the
-                // 360's take-off then goes on `Falling` to `InAir` `Fall`).
+            if !self.character.grounded && !bashing {
+                // The ground went from under her: no jump. From the state
+                // table (samples): both take-offs go on `Falling` to
+                // `InAir` `Fall`, and that lands on `OnGround` or
+                // `MovingOnGround` as a jump does, so she falls from where
+                // she stood with no jump's speed, in the air loop
+                // (inferred: the alpha's air clip stands for `Fall`'s).
+                if let Some(t) = self.moves.states.clone() {
+                    self.human.post(&t, human_state::message::FALLING);
+                }
+                self.leap = Leap::Air(0.0);
+                self.air_looped = true;
+                if let (Some((_, rig)), Some(air)) = (&mut self.model, self.clips.jump) {
+                    rig.animator
+                        .play_action(air, false, m2_engine::blend::action::JUMP);
+                }
+            } else if bashing {
+                // A bash cuts the take-off short (inferred, as before).
                 self.leap = Leap::No;
                 self.human = HumanState::default();
             } else if t + dt >= at {
@@ -2831,24 +2846,33 @@ mod tests {
                 .collect(),
             ..Action::default()
         };
-        let rise = [["JumpInAir", "Upright", "Jump"]];
+        let rise = [
+            ["JumpInAir", "Upright", "Jump"],
+            ["Falling", "InAir", "Fall"],
+        ];
         let states = HumanStates {
             unk_0x00: 5,
-            stances: vec![Stance {
-                name: "Upright".to_owned(),
-                actions: vec![
-                    action(
-                        "Idle",
-                        &[
-                            ["JumpMoving", "Upright", "JumpTakeoffMoving"],
-                            ["JumpStationary", "Upright", "JumpTakeoffStationary"],
-                        ],
-                    ),
-                    action("JumpTakeoffMoving", &rise),
-                    action("JumpTakeoffStationary", &rise),
-                    action("Jump", &[]),
-                ],
-            }],
+            stances: vec![
+                Stance {
+                    name: "Upright".to_owned(),
+                    actions: vec![
+                        action(
+                            "Idle",
+                            &[
+                                ["JumpMoving", "Upright", "JumpTakeoffMoving"],
+                                ["JumpStationary", "Upright", "JumpTakeoffStationary"],
+                            ],
+                        ),
+                        action("JumpTakeoffMoving", &rise),
+                        action("JumpTakeoffStationary", &rise),
+                        action("Jump", &[]),
+                    ],
+                },
+                Stance {
+                    name: "InAir".to_owned(),
+                    actions: vec![action("Fall", &[])],
+                },
+            ],
         };
         Moves {
             held: vec![crate::held::Held {
@@ -2887,11 +2911,12 @@ mod tests {
         p.moves = jump_moves();
         assert_eq!(p.jump_step(true, false, 0.2, 0.02), (Some(7), false));
         assert!(p.human.is("Upright", "JumpTakeoffStationary"));
-        // The ground gone from under her in the take-off: no jump.
+        // The ground gone from under her in the take-off: no jump, she
+        // falls (the table's `Falling` to `InAir` `Fall`).
         p.character.grounded = false;
         assert_eq!(p.jump_step(false, false, 0.2, 0.02), (None, false));
-        assert_eq!(p.leap, Leap::No);
-        assert!(p.human.is("Upright", "Idle"));
+        assert_eq!(p.leap, Leap::Air(0.0));
+        assert!(p.human.is("InAir", "Fall"));
     }
 
     /// She blinks from the start, flaps while her line plays, and a
