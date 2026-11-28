@@ -73,7 +73,7 @@ and a feature counts as done when the scripts get what they ask for.
 | Feature | Status | Evidence and what is left |
 |---|---|---|
 | Cars, trucks, jeeps: driving | partial | Tyres, springs, coast from the 360; engine, gears and parts of the response still on Rapier's controller with invented shapes: GAPS P1 |
-| Tanks | partial | Track drive and braking invented (`physics.rs`) |
+| Tanks | partial | Drive, tracks, steering and braking from the 360 (`_TankPhysics`, step 0x821A49E8, `drive_tracks`) for every shipped tank and tracked APC; the invented track model is only a fallback for a template without `_TankPhysics` (of the tank and APC models, only `AMX30_RUIN`, a wreck with no vehicle tuning at all, has none) |
 | Motorbikes | partial | Balance from the 360; fallback invented |
 | Boats | partial | Float and boat sim from the 360; wreck buoyancy invented |
 | Helicopters (player-flown) | partial | `_HelicopterPhysics` step from the 360; cameras in open #706, #711 |
