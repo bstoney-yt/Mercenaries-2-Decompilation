@@ -29,7 +29,9 @@
 //!     then it is `StaggerLong` (0x9DFC6A70);
 //!   - a direct hit staggers anyone not player-kind, and a player-kind
 //!     person only by a melee bash: `StaggerInPlace` (0x03CAA640) when a
-//!     field of their movement record is set ([`Person::moving`]) or
+//!     field of their movement record is set ([`Person::moving`]: bits
+//!     0x3800 of its +0x3C, the pace 0x82179350 picks from the stick,
+//!     inserted at 0x8217A56C; set once a pace past still is picked) or
 //!     their last stagger is at least `StaggerResetSeconds` ago, else
 //!     `StaggerShort` (0x3EB62604);
 //!   - the direction is by `a`, the person's heading less the heading of
@@ -55,8 +57,6 @@
 //! - The event's direction is the way the hit was travelling: a hit
 //!   facing the person head on then reads `Front`, and the heading to
 //!   turn to faces where it came from.
-//! - [`Person::moving`]: the field is bits 0x3800 of a word of the
-//!   movement record; that it means "on the move" is a reading.
 //! - Which way `a` turns. Headings here are this crate's, clockwise from
 //!   `+z` seen from above; if the original's turn the other way, `Left`
 //!   and `Right` are mirrored.
@@ -163,7 +163,8 @@ pub struct Person {
     /// What 0x8228CB80 says of a player-kind person (not traced).
     pub immune: bool,
     pub crouched: bool,
-    /// The movement record's field (read as "on the move").
+    /// Their character record's pace bits (0x3800 of +0x3C): a pace past
+    /// still was picked ([`crate::on_foot::Pace`]).
     pub moving: bool,
     /// Seconds since their last stagger; `None` before the first.
     pub since: Option<f32>,

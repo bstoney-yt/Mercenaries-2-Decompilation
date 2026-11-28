@@ -313,10 +313,6 @@ pub struct Bash {
 }
 
 /// Where she is in a jump.
-/// Over this speed over the ground she counts as on the move for the
-/// stagger picked, m/s (invented, as for the people: the 360 reads a
-/// field of the movement record whose meaning is not established).
-const STAGGER_MOVING: f32 = 0.5;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Leap {
@@ -2035,14 +2031,16 @@ impl Player {
         if !matches!(self.leap, Leap::No | Leap::Land(..)) {
             return false;
         }
-        let v = self.character.velocity;
+        // On the move: her stick picked a pace this step, what the 360
+        // keeps in bits 0x3800 of her character record's +0x3C
+        // (0x8217A56C, from 0x82179350) for the picker to read.
         let Some(pick) = stagger::pick(
             &Person {
                 facing: self.facing,
                 player: true,
                 immune,
                 crouched: self.aiming,
-                moving: v.x.hypot(v.z) > STAGGER_MOVING,
+                moving: self.pace != Pace::Still,
                 since: self.since_stagger,
                 cooldown: stagger::COOLDOWN,
                 reset: stagger::RESET,
