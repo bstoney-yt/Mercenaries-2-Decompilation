@@ -568,9 +568,6 @@ impl Default for HeroDamage {
 
 /// People are hit within this distance of the line from shins to head.
 const BODY_RADIUS: f32 = 0.3;
-/// How far ahead of his shoulder a soldier's rocket starts, m: past his
-/// body's radius (invented: the 360's projectile skips its owner).
-const LAUNCH_CLEAR: f32 = BODY_RADIUS + 0.2;
 /// What she loses put out of a vehicle sunk under her ([`Combat::sank_out`]).
 pub const SANK_OUT: f32 = 100.0;
 /// Health comes back after this many quiet seconds, at this rate a second.
@@ -1757,6 +1754,9 @@ enum Projectile {
         flown: f32,
         shell: bool,
         owner: Option<VehicleId>,
+        /// The person who fired it (their spawn), whom it passes through
+        /// as the 360's projectile skips its owner.
+        fired_by: Option<u32>,
         blast: Option<Blast>,
         homing: Option<crate::homing::Homing<Guide>>,
         /// Its round's `DamageKey` (`Rocket`): what a weak point it
@@ -4078,6 +4078,7 @@ impl Combat {
                     flown: 0.0,
                     shell: false,
                     owner: None,
+                    fired_by: None,
                     blast: ammo.burst(),
                     direct: ammo.damage,
                     homing: None,
@@ -4419,9 +4420,10 @@ impl Combat {
         let (a, b) = (self.random(), self.random());
         let dir = spread.stray((aim - from).normalize_or(Vec3::Z), a, b);
         // Over his shoulder is the top of his own body's capsule: it
-        // starts just clear of him, or it bursts on him at once (the
-        // `--homing-check` run: each soldier's rocket killed him).
-        let from = from + dir * LAUNCH_CLEAR;
+        // passes through him, as the 360's projectile skips its owner (the
+        // `--homing-check` run: without that, each soldier's rocket killed
+        // him).
+        let fired_by = n.spawn;
         let speed = Some(l.ammo.human_speed())
             .filter(|&v| v > 0.0)
             .unwrap_or(ROCKET_SPEED);
@@ -4440,6 +4442,7 @@ impl Combat {
             flown: 0.0,
             shell: false,
             owner: None,
+            fired_by,
             blast: l.ammo.burst(),
             direct: l.ammo.damage,
             homing,
@@ -5222,6 +5225,7 @@ impl Combat {
             flown: 0.0,
             shell: false,
             owner: None,
+            fired_by: None,
             blast: self.launcher.blast(),
             direct: self.launcher.ammo.map_or(0.0, |a| a.damage),
             homing,
@@ -5530,6 +5534,7 @@ impl Combat {
                     flown: 0.0,
                     shell: false,
                     owner: Some(id),
+                    fired_by: None,
                     blast: ammo.burst(),
                     direct: ammo.damage,
                     homing,
@@ -6112,6 +6117,7 @@ impl Combat {
                 flown: 0.0,
                 shell: homing.is_none(),
                 owner: Some(id),
+                fired_by: None,
                 blast,
                 direct,
                 homing,
@@ -6650,6 +6656,7 @@ impl Combat {
             flown: 0.0,
             shell: true,
             owner: None,
+            fired_by: None,
             blast: ammo.burst(),
             direct: ammo.damage,
             homing: None,
@@ -7180,6 +7187,7 @@ impl Combat {
                 flown,
                 shell,
                 owner,
+                fired_by,
                 blast,
                 homing,
                 key,
@@ -7226,7 +7234,9 @@ impl Combat {
                 }
                 let step = *velocity * dt;
                 let len = step.length();
-                let hit = cast_shot(f.physics, f.people, *at, step, len, None, *owner);
+                let skip =
+                    fired_by.and_then(|s| f.people.npcs.iter().position(|n| n.spawn == Some(s)));
+                let hit = cast_shot(f.physics, f.people, *at, step, len, skip, *owner);
                 if let Some((d, who)) = hit {
                     let burst = *at + step.normalize_or_zero() * d;
                     if *army {
@@ -11046,21 +11056,25 @@ mod tests {
     }
 
     // A soldier's rocket from over his shoulder (chest + 0.4 m) starts on
-    // his own capsule's top and met him at once; started LAUNCH_CLEAR
-    // along its way it leaves him, level or aimed down at a car.
+    // his own capsule's top: it passes through him, as the 360's projectile
+    // skips its owner, and meets the next one along.
     #[test]
-    fn a_soldiers_rocket_starts_clear_of_him() {
-        let feet = Vec3::ZERO;
-        let (a, seg) = (feet + Vec3::Y * 0.25, Vec3::Y * 1.45);
-        let shoulder = feet + Vec3::Y * (1.3 + 0.4);
-        assert_eq!(
-            ray_capsule(shoulder, Vec3::Z, a, seg, BODY_RADIUS),
-            Some(0.0)
-        );
-        for dir in [Vec3::Z, Vec3::new(0.0, -0.05, 1.0).normalize()] {
-            let from = shoulder + dir * LAUNCH_CLEAR;
-            assert_eq!(ray_capsule(from, dir, a, seg, BODY_RADIUS), None, "{dir}");
+    fn a_soldiers_rocket_passes_through_him() {
+        let physics = Physics::new();
+        let mut people = People::default();
+        for (k, z) in [(1, 0.0), (2, 10.0)] {
+            let post = crate::npc::Brain::Post { facing: 0.0 };
+            let at = Vec3::new(0.0, 0.0, z);
+            let mut n = crate::npc::Npc::new(0, &crate::npc::tests::rig(), at, 0.0, post, Some(k));
+            n.landed = true;
+            people.npcs.push(n);
         }
+        let shoulder = people.npcs[0].chest() + Vec3::Y * 0.4;
+        let hit = |skip| cast_shot(&physics, &people, shoulder, Vec3::Z, 30.0, skip, None);
+        assert_eq!(hit(None).and_then(|h| h.1), Some(0), "meets him at once");
+        let (d, who) = hit(Some(0)).expect("the next one");
+        assert_eq!(who, Some(1));
+        assert!(d > 9.0, "{d}");
     }
     /// PmcCon001 hands her an Assault Rifle, not the first contract's
     /// carbine: it is the gun in the rifle's place, one clip in and none
