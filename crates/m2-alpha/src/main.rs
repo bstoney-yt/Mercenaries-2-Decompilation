@@ -353,6 +353,10 @@ struct Options {
     take: bool,
     /// With `--aim` (or `--drive --look`): fire just before the picture.
     fire: bool,
+    /// `--fire-rounds N`: after the `--fire` shot, she holds the main gun's
+    /// trigger long enough for N more shells, then the coax's for 3 s,
+    /// and every vehicle round is logged (`vfire round:`).
+    fire_rounds: Option<u32>,
     /// `--homing-check`: her vehicle is seen by every homing weapon.
     homing_check: bool,
     /// `--paradrop-check`: with `--mission`, the Allied paradrop plane is
@@ -1313,6 +1317,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--riders" => o.riders = true,
             "--take" => o.take = true,
             "--fire" => o.fire = true,
+            "--fire-rounds" => {
+                o.fire = true;
+                o.fire_rounds = Some(value()?.parse().context("--fire-rounds expects a count")?)
+            }
             "--homing-check" => o.homing_check = true,
             "--paradrop-check" => o.paradrop_check = true,
             "--ditch-check" => {
@@ -9549,6 +9557,7 @@ fn drive_for_screenshot(
         fuel_check(game, tick);
     }
     if options.look != 0.0 || options.fire {
+        game.combat.log_rounds = options.fire_rounds.is_some();
         // Stop, then swing the camera and watch the turret follow.
         let brake = Intent {
             hold_jump: true,
@@ -9624,6 +9633,21 @@ fn drive_for_screenshot(
                     );
                 }
             }
+        }
+        if let Some(n) = options.fire_rounds {
+            // Long enough for N shells at the slowest cannon read (45 a
+            // minute), then the coax held.
+            let shells = (n as f32 * 60.0 / 45.0 / tick).ceil() as usize + 30;
+            let coax = (3.0 / tick).ceil() as usize;
+            for k in 0..shells + coax {
+                let trigger = combat::Trigger {
+                    fire: k < shells,
+                    aim: k >= shells,
+                    ..combat::Trigger::default()
+                };
+                game.step(Intent { trigger, ..brake }, tick);
+            }
+            eprintln!("vfire: {n} shells' time and 3 s of the coax held");
         }
         if options.fire {
             describe_vehicle_fire(game);

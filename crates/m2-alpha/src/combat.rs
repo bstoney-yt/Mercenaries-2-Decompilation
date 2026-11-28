@@ -2237,6 +2237,11 @@ pub struct Combat {
         std::collections::HashMap<(usize, usize, usize), (m2_engine::weapons::Bloom, f32)>,
     /// Seconds of fighting so far.
     clock: f32,
+    /// Log every vehicle round's aim, stray, cone and impact (checks).
+    pub log_rounds: bool,
+    /// The last vehicle round's cone and angle off its aim, degrees
+    /// ([`Combat::mount_stray`]), for that log.
+    last_stray: (f32, f32),
     /// Rounds those guns fired (pilots' and gunners'), and seconds to
     /// the next log line of them.
     pilot_rounds: [u32; 2],
@@ -2644,6 +2649,8 @@ impl Default for Combat {
             pilot_guns: std::collections::HashMap::new(),
             mount_blooms: std::collections::HashMap::new(),
             clock: 0.0,
+            log_rounds: false,
+            last_stray: (0.0, 0.0),
             pilot_rounds: [0; 2],
             pilot_dry: 0,
             pilot_log: 0.0,
@@ -5517,27 +5524,24 @@ impl Combat {
         // [`m2_engine::weapons::stray_360`]). Its trigger counts as held
         // between rounds no more than two gaps apart (inferred).
         let feel = w.feel;
-        let now = self.clock;
-        let (mut bloom, last) = self
-            .mount_blooms
-            .get(&(i, seat_ix, priority))
-            .copied()
-            .unwrap_or((m2_engine::weapons::Bloom::default(), f32::NEG_INFINITY));
-        let since = (now - last).min(60.0);
-        bloom.settle(&feel, since, gap, since <= 2.0 * gap, false);
-        let mut stray = |c: &mut Self| {
-            let cone = feel.cone(bloom.added);
-            bloom.shot(&feel);
-            let (a, b) = (c.random(), c.random());
-            m2_engine::weapons::stray_360(aim, cone, feel.center_bias(), a, b)
-        };
+        let mount = (i, seat_ix, priority);
+        let stray = |c: &mut Self| c.mount_stray(mount, &feel, gap, aim);
         let one = stray(self);
         match w.flight() {
             m2_engine::weapons::Flight::Round => {
                 for k in 0..w.pellets.max(1) {
+                    let line = aim;
                     let aim = if k == 0 { one } else { stray(self) };
                     let hit = cast_shot(f.physics, f.people, from, aim, MG_RANGE, None, Some(id));
                     let to = hit.map_or(from + aim * MG_RANGE, |h| from + aim * h.0);
+                    self.log_round(
+                        f.physics,
+                        &format!("mount {i}/{seat_ix}/{priority} {}", w.name),
+                        from,
+                        from + line * (goal - from).length(),
+                        aim,
+                        hit.map(|_| to),
+                    );
                     self.effect(Effect::Tracer { from, to }, 0.07);
                     let damage = ammo.damage_at(hit.map_or(MG_RANGE, |h| h.0));
                     let on_props = RIFLE_DAMAGE * damage / CARBINE_ROUND;
@@ -5649,10 +5653,69 @@ impl Combat {
                 });
             }
         }
-        self.mount_blooms
-            .insert((i, seat_ix, priority), (bloom, now));
         alarm(f.people, from);
         Some(gap)
+    }
+
+    /// One round's way out of vehicle weapon `mount` (vehicle, seat,
+    /// weapon) feeling as `feel`, `gap` seconds between its rounds, aimed
+    /// along `aim`: within its cone as it stands, settled since its last
+    /// round, which the round then widens (0x82283A10, 0x822838B0,
+    /// 0x8227F7A8; see [`Combat::fire_mount`]).
+    fn mount_stray(
+        &mut self,
+        mount: (usize, usize, usize),
+        feel: &Feel,
+        gap: f32,
+        aim: Vec3,
+    ) -> Vec3 {
+        let now = self.clock;
+        let (mut bloom, last) = self
+            .mount_blooms
+            .get(&mount)
+            .copied()
+            .unwrap_or((m2_engine::weapons::Bloom::default(), f32::NEG_INFINITY));
+        let since = (now - last).min(60.0);
+        bloom.settle(feel, since, gap, since <= 2.0 * gap, false);
+        let cone = feel.cone(bloom.added);
+        bloom.shot(feel);
+        self.mount_blooms.insert(mount, (bloom, now));
+        let (a, b) = (self.random(), self.random());
+        let dir = m2_engine::weapons::stray_360(aim, cone, feel.center_bias(), a, b);
+        self.last_stray = (cone, dir.angle_between(aim).to_degrees());
+        dir
+    }
+
+    /// With [`Combat::log_rounds`]: a vehicle round's line, aimed at
+    /// `goal` along `aim`, gone along `dir` from `from`, and where it
+    /// meets the world (`at`, else the first hit along its line).
+    fn log_round(
+        &self,
+        physics: &Physics,
+        what: &str,
+        from: Vec3,
+        goal: Vec3,
+        dir: Vec3,
+        at: Option<Vec3>,
+    ) {
+        if !self.log_rounds {
+            return;
+        }
+        let at = at.or_else(|| {
+            physics
+                .cast_ray(from, dir, 1000.0)
+                .map(|(d, _)| from + dir * d)
+        });
+        let (cone, off) = self.last_stray;
+        let miss = at.map(|p| {
+            let along = (p - from).dot(dir).max(0.0);
+            (from + (goal - from).normalize_or_zero() * along).distance(p)
+        });
+        eprintln!(
+            "vfire round: {what} from {from:.1} aimed at {goal:.1}, {off:.3} deg off its aim in a {cone:.2} deg cone; hits {} ({} m off the aim line)",
+            at.map_or("nothing".to_owned(), |p| format!("{p:.1}")),
+            miss.map_or("-".to_owned(), |m| format!("{m:.2}")),
+        );
     }
 
     /// Those riding with her in vehicle `i`'s gunner seats (friendly
@@ -6167,6 +6230,24 @@ impl Combat {
             // Its template's rate of fire (45 a minute for the AMX-30's)
             // and shell speed (72 m/s).
             self.reload = gun.map_or(CANNON_RELOAD, |g| 60.0 / g.rate_of_fire.max(1.0));
+            // Its shell strays as every gun's round does, within its
+            // weapon's own cone ([`Combat::mount_stray`]; 0x82283A10).
+            let line = aim;
+            let aim = match gun.and_then(|g| self.feels.get(&g.weapon).copied()) {
+                Some(feel) => self.mount_stray((i, usize::MAX, 0), &feel, self.reload, aim),
+                None => {
+                    self.last_stray = (0.0, 0.0);
+                    aim
+                }
+            };
+            self.log_round(
+                f.physics,
+                "cannon shell",
+                from,
+                from + line * (goal - from).length(),
+                aim,
+                None,
+            );
             let speed = gun.map_or(SHELL_SPEED, |g| g.velocity.max(1.0));
             let burn = gun.and_then(|g| g.flash).unwrap_or(CANNON_FLASH_TIME);
             // Its gun template's round's blast and kind (a tank shell's
@@ -6246,9 +6327,19 @@ impl Combat {
             }
             let ammo = w.ammo;
             self.firing = ammo.template;
-            self.firing = ammo.template;
+            // Its round strays as every gun's does ([`Combat::mount_stray`]).
+            let line = aim;
+            let aim = self.mount_stray((i, usize::MAX, 1), &w.feel, w.gap(), aim);
             let hit = cast_shot(f.physics, f.people, from, aim, MG_RANGE, None, Some(id));
             let to = hit.map_or(from + aim * MG_RANGE, |h| from + aim * h.0);
+            self.log_round(
+                f.physics,
+                &format!("coax {}", w.name),
+                from,
+                from + line * (goal - from).length(),
+                aim,
+                hit.map(|_| to),
+            );
             self.effect(Effect::Tracer { from, to }, 0.07);
             let damage = ammo.damage_at(hit.map_or(MG_RANGE, |h| h.0));
             if let Some((d, Some(j))) = hit
