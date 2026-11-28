@@ -500,8 +500,11 @@ const MG_DAMAGE: f32 = 45.0;
 const MG_RANGE: f32 = 500.0;
 
 /// How far gunners riding with her shoot when their weapon gives no
-/// `WeaponHint` range, metres (invented).
-const GUNNER_RANGE: f32 = 120.0;
+/// `WeaponHint`, metres: the fire controller's range without a hint
+/// record (0x822C95D8 at 0x822CA79C: 80.0, 0x820BAF98), its least range
+/// then 0. From the 360 code. (A mind whose +0x14 top byte is 0 reaches
+/// 1.1 times its range, 0x82DE8C20; taken as on foot, so not a rider.)
+const GUNNER_RANGE: f32 = 80.0;
 /// Gunfire puts soldiers this close on alert. From the 360 code: each shot
 /// a gun fires posts its message (0x2C49ADC9, 0x82283A10), and every mind
 /// hears it as loud as 30 / (d + 30), d its distance from the shot's line
@@ -5582,7 +5585,7 @@ impl Combat {
     /// `MaxAimAngleAi` cone round the vehicle's nose (0x822CAB34; turning
     /// to face him otherwise is the driver's, here hers). Inferred: that
     /// the turret then turns at its record's speeds within its arc. Without a weapon hint,
-    /// [`GUNNER_RANGE`] (invented).
+    /// [`GUNNER_RANGE`] (the 360's range without a hint).
     fn gunners_fire(&mut self, f: &mut Field<'_>, dt: f32) {
         let Some(i) = f.player.driving.filter(|&i| i < f.vehicles.len()) else {
             self.gunner_wait.clear();
